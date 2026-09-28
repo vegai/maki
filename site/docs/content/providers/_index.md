@@ -62,7 +62,9 @@ The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discov
 | Strong | claude-opus-4-6 | $5.00 / $25.00 | 200K ctx / 128K out |
 | Strong | claude-opus-4-7 | $5.00 / $25.00 | 200K ctx / 128K out |
 | Strong | claude-opus-4-8 | $5.00 / $25.00 | 200K ctx / 128K out |
+| Strong | claude-opus-5-5 | $4.00 / $20.00 | 200K ctx / 128K out |
 | Strong | **claude-opus-5** (default) | $5.00 / $25.00 | 200K ctx / 128K out |
+| Strong | claude-fable-5-1 | $10.00 / $50.00 | 200K ctx / 128K out |
 | Strong | claude-fable-5 | $10.00 / $50.00 | 200K ctx / 128K out |
 | Strong | claude-opus-4-0, claude-opus-4-1 | $15.00 / $75.00 | 200K ctx / 32K out |
 
