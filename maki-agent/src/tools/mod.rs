@@ -631,6 +631,8 @@ pub fn cli_tool_ctx() -> ToolContext {
 pub mod test_support {
     use std::borrow::Cow;
 
+    use maki_config::{DefaultEffect, PermissionsConfig};
+
     use crate::{Envelope, EventSender, ToolOutput};
 
     use super::*;
@@ -776,6 +778,25 @@ pub mod test_support {
 
     pub fn stub_ctx(mode: &AgentMode) -> ToolContext {
         stub_ctx_with(mode, None, None)
+    }
+
+    /// [`stub_ctx_with`] for a session whose working directory is {dir}.
+    pub fn stub_ctx_in(
+        dir: &Path,
+        event_tx: Option<&EventSender>,
+        tool_use_id: Option<&str>,
+    ) -> ToolContext {
+        let mut ctx = stub_ctx_with(&AgentMode::Build, event_tx, tool_use_id);
+        ctx.permissions = Arc::new(PermissionManager::new(
+            PermissionsConfig {
+                default: DefaultEffect::Allow,
+                ..Default::default()
+            },
+            dir.to_path_buf(),
+            ProjectConfig::discover(dir),
+            Arc::default(),
+        ));
+        ctx
     }
 
     #[cfg(test)]
