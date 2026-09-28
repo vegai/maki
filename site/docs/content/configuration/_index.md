@@ -253,6 +253,24 @@ maki.setup({
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
 | `timeout_secs` | integer | `120` | 5 | Kill the command after this many seconds. A call's `timeout` param overrides it. |
 
+### `plugins.claude_code`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `artifact_dir` | string | `""` | - | Absolute path of the directory for coding snapshots and their changes. Defaults to `claude_code/changes` in the maki state directory. On the project's filesystem, maki can clone the dependencies instead of copying them. Expiry removes only the artifacts maki made there. |
+| `artifact_ttl_hours` | integer | `24` | 1 | Remove a coding artifact after this many hours without a write. |
+| `config_dir` | string | `""` | - | Absolute path of a Claude Code config directory for maki, in place of `$CLAUDE_CONFIG_DIR` or `~/.claude`. Use it to give maki a different Claude login. |
+| `deny_read` | string | `""` | - | Extra paths Claude cannot read, relative to the session's directory and comma-separated, for example `config/prod.yml,certs/**`. As in `.gitignore`, a pattern without a `/` matches at any depth. They add to the default `.env*` and `secrets/` rules, and coding snapshots never contain them. |
+| `dependencies` | string | `""` | - | Untracked directories a coding snapshot copies from the project, comma-separated, for example `node_modules`. The copy is a copy-on-write clone when the filesystem supports it. |
+| `executable` | string | `"claude"` | - | The Claude Code executable. |
+| `max_concurrent` | integer | `2` | 1 | The maximum number of Claude Code processes that run at the same time. |
+| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
+| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `model` | string | `"sonnet"` | - | Model alias for calls that do not pick one. |
+| `prepare` | string | `""` | - | Shell command to run in each coding snapshot before Claude starts, for example `npm ci` or `python -m venv .venv && .venv/bin/pip install -e .`. It runs as you, outside the sandbox and with network access, so the worker can use what it fetches. |
+| `prepare_timeout_secs` | integer | `300` | 1 | Stop the `prepare` command after this many seconds. |
+| `timeout_secs` | integer | `600` | 30 | Stop a task after this many seconds, at most 1800. The snapshot and `prepare` of a coding task count, and time spent waiting for a free slot does not. A call's `timeout` parameter overrides it, within the same limits. |
+
 ### `plugins.code_execution`
 
 | Field | Type | Default | Min | Description |
