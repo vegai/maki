@@ -6,7 +6,7 @@ use arc_swap::ArcSwap;
 use serde_json::{Value, json};
 use tracing::{error, info, warn};
 
-use maki_providers::provider::Provider;
+use maki_providers::provider::{Provider, RequestScope};
 use maki_providers::{
     ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, ImageSource, Message, Model, RequestOptions,
     Role, StopReason, StreamResponse,
@@ -444,7 +444,10 @@ impl<'h> Agent<'h> {
                 tools: tools.as_ref(),
                 opts: self.opts,
                 output_budget: self.config.max_turn_output,
-                session_id: self.session_id.as_ref(),
+                scope: RequestScope {
+                    session_id: self.session_id.as_ref(),
+                    cwd: self.permissions.cwd(),
+                },
                 retry: self.timeouts.retry,
             },
             Some(self.gauge),
@@ -891,6 +894,7 @@ impl<'h> Agent<'h> {
             &self.config,
             instructions,
             carry_len,
+            self.permissions.cwd(),
             self.timeouts.retry,
         )
         .await?;

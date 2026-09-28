@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::env;
+use std::path::Path;
 
 use maki_config::AgentConfig;
+use maki_providers::provider::RequestScope;
 use maki_providers::retry::RetryPolicy;
 use maki_providers::{
     ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, Message, Model, RequestOptions, Role,
@@ -186,6 +188,7 @@ pub(super) async fn compact_history(
     config: &AgentConfig,
     instructions: Option<&str>,
     carry_len: usize,
+    cwd: &Path,
     retry: RetryPolicy,
 ) -> Result<(TokenUsage, String), AgentError> {
     let compact_start = std::time::Instant::now();
@@ -211,7 +214,10 @@ pub(super) async fn compact_history(
                 tools: &empty_tools,
                 opts: RequestOptions::default(),
                 output_budget: SUMMARY_OUTPUT_BUDGET,
-                session_id: hooks.session_id,
+                scope: RequestScope {
+                    session_id: hooks.session_id,
+                    cwd,
+                },
                 retry,
             },
             // A stripped, collapsed rewrite of the transcript, far smaller than
@@ -314,6 +320,7 @@ pub async fn compact(
     hooks: &AgentHooks<'_>,
     config: &AgentConfig,
     instructions: Option<&str>,
+    cwd: &Path,
     retry: RetryPolicy,
 ) -> Result<DoneReason, AgentError> {
     let size_before = gauge.size();
@@ -342,6 +349,7 @@ pub async fn compact(
         config,
         steer.instructions.as_deref(),
         0,
+        cwd,
         retry,
     )
     .await
@@ -598,6 +606,7 @@ pub(super) fn auto_compact_enabled() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::Mutex;
 
     use maki_providers::provider::{BoxFuture, Provider};
@@ -621,6 +630,7 @@ mod tests {
     const POST: &str = "Re-read plan.md and agent.md";
     const OVERFLOW_MESSAGE: &str = "prompt is too long";
     const OVERFLOW_STATUS: u16 = 413;
+    const ANY_CWD: &str = "/";
     /// Shorter than [`NEW_RESULT`], so the budget-burn case below is the only
     /// reason it collapses.
     const OLD_RESULT: &str = "old";
@@ -744,6 +754,7 @@ mod tests {
             &test_hooks(&registry, None, &model, cancel),
             config,
             instructions,
+            Path::new(ANY_CWD),
             RetryPolicy::default(),
         )
         .await
@@ -768,6 +779,7 @@ mod tests {
             &AgentConfig::default(),
             None,
             carry_len,
+            Path::new(ANY_CWD),
             RetryPolicy::default(),
         )
         .await
@@ -1020,6 +1032,7 @@ mod tests {
             &test_hooks(&registry, None, &model, &cancel),
             &AgentConfig::default(),
             instructions,
+            Path::new(ANY_CWD),
             RetryPolicy::default(),
         )
         .await;

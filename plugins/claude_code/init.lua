@@ -74,7 +74,8 @@ local opts = maki.api.register_options(output_limits.extend({
   max_concurrent = {
     default = 2,
     min = 1,
-    desc = "The maximum number of Claude Code processes that run at the same time.",
+    desc = "The maximum number of plugin calls that run Claude Code at the same time. The claude-code "
+      .. "provider has its own limit with the same value, so up to twice this many can run together.",
   },
   timeout_secs = {
     default = 600,

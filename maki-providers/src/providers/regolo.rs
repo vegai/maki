@@ -24,6 +24,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     fallback_max_output: Some(120_000),
     fallback_context_window: 120_000,
     models_toml: include_str!("../../models/regolo.toml"),
+    models_of: None,
     pricing_schedule: None,
     build: Build::Declared,
     aperture: Some(ApertureRoute {

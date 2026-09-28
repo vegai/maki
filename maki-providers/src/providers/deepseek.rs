@@ -25,6 +25,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     fallback_max_output: Some(384_000),
     fallback_context_window: 1_000_000,
     models_toml: include_str!("../../models/deepseek.toml"),
+    models_of: None,
     pricing_schedule: Some(&PEAK_HOURS),
     build: Build::Declared,
     aperture: Some(ApertureRoute {

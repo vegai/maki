@@ -45,6 +45,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     fallback_max_output: None,
     fallback_context_window: 128_000,
     models_toml: include_str!("../../models/mistral.toml"),
+    models_of: None,
     pricing_schedule: None,
     build: Build::Declared,
     aperture: Some(ApertureRoute {

@@ -34,6 +34,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     fallback_max_output: Some(128_000),
     fallback_context_window: 200_000,
     models_toml: NO_CURATED_MODELS,
+    models_of: None,
     pricing_schedule: None,
     build: Build::Declared,
     aperture: Some(ApertureRoute {
