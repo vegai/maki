@@ -58,10 +58,11 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     fallback_max_output: Some(65_536),
     fallback_context_window: 1_000_000,
     models_toml: include_str!("../../models/google.toml"),
+    models_of: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
-        with_auth: create_with_auth,
+        with_auth: Some(create_with_auth),
     }),
     aperture: Some(ApertureRoute {
         path_prefix: GEMINI_PATH_PREFIX,

@@ -529,12 +529,16 @@ fn write_section(out: &mut String, spec: &ProviderSpec) {
     };
     let _ = writeln!(out, "- **Env var**: {auth_line}");
 
-    if let [url] = docs.api_urls {
-        let _ = writeln!(out, "- **API**: `{url}`");
-    } else {
-        let _ = writeln!(out, "- **API endpoints**:");
-        for url in docs.api_urls {
-            let _ = writeln!(out, "  - `{url}`");
+    match docs.api_urls {
+        [] => {}
+        [url] => {
+            let _ = writeln!(out, "- **API**: `{url}`");
+        }
+        urls => {
+            let _ = writeln!(out, "- **API endpoints**:");
+            for url in urls {
+                let _ = writeln!(out, "  - `{url}`");
+            }
         }
     }
 
