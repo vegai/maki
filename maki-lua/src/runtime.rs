@@ -3668,6 +3668,7 @@ async fn run_tool_call(
         let Some(tool_keys) = owner.tools.get(&*tool) else {
             return ToolCallReply::err(format!("tool not found: {tool}"));
         };
+        ctx.permissions = owner.permissions.clone();
         match lua.registry_value(&tool_keys.handler) {
             Ok(f) => f,
             Err(e) => return ToolCallReply::err(strip_traceback(&e)),
