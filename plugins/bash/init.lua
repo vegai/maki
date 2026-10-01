@@ -107,6 +107,12 @@ local function rtk_rewrite(command, ctx)
   if config and not config.rtk then
     return nil
   end
+  local cmd = command:match("^%s*(.-)%s*$")
+  -- The rewrite runs after the user approved the command. rtk rewrites single
+  -- commands, and a script must run exactly as the user saw it.
+  if cmd:find("\n", 1, true) then
+    return nil
+  end
 
   if rtk_available == nil then
     local id = maki.fn.jobstart("rtk --version")
@@ -123,7 +129,6 @@ local function rtk_rewrite(command, ctx)
     return nil
   end
 
-  local cmd = command:match("^%s*(.-)%s*$")
   if cmd:match("^cargo ") and cmd:find(" -- ", 1, true) then
     return nil
   end
