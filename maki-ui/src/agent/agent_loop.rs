@@ -229,7 +229,7 @@ impl AgentLoop {
         // vars, instructions and slots a run would use.
         let system = self.system_prompt(&self.lua_handle.collect_prompt_slots_async().await);
         let base = base_tools(&self.vars, &model, &self.config, self.mcp.is_some(), false);
-        let tools = agent::request_tools(&base, self.mcp.as_ref());
+        let tools = agent::request_tools(&base, self.mcp.as_ref(), &model);
         let hooks = AgentHooks {
             registry: ToolRegistry::global(),
             session_id: Some(&self.session_id),
@@ -249,6 +249,7 @@ impl AgentLoop {
             &hooks,
             &self.config,
             instructions,
+            self.permissions.cwd(),
             self.timeouts.retry,
         )
         .await

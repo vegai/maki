@@ -93,6 +93,8 @@ You can add your own themes too. Drop a `<name>.toml` file into `themes/` inside
 
 Diff signs use `diff_old_sign` and `diff_new_sign`, which default to `diff_old` and `diff_new`. These styles are applied after `code_block`, so their properties take precedence. Diff gutters use `diff_old_line_nr` and `diff_new_line_nr`, which default to `diff_line_nr`.
 
+The input caret uses `cursor` when the terminal has focus and `cursor_unfocused` when focus is lost. `cursor_unfocused` defaults to `cursor`, so themes only need it when the two should differ. Terminals that do not report focus events keep the focused caret.
+
 Themes use 24-bit colors by default, but not every terminal can show them. Maki checks the environment, terminfo, and the terminal itself, and when truecolor is missing it quietly falls back to the closest of the 256 classic terminal colors. If detection gets it wrong, set `MAKI_TRUECOLOR=1` to force truecolor or `MAKI_TRUECOLOR=0` to force the fallback.
 
 Theme files can also name terminal colors instead of giving hex values, using the same names as Helix: `default`, `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `gray`, `light-red`, `light-green`, `light-yellow`, `light-blue`, `light-magenta`, `light-cyan`, `light-gray`, and `white`. Write them exactly as listed. `lightgray`, `light_gray` and `LIGHT-GRAY` are all rejected. `default` means the terminal default. Maki also takes a number from `0` to `255` to pick a palette entry by index, which Helix does not.
@@ -250,6 +252,24 @@ maki.setup({
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
 | `timeout_secs` | integer | `120` | 5 | Kill the command after this many seconds. A call's `timeout` param overrides it. |
+
+### `plugins.claude_code`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `artifact_dir` | string | `""` | - | Absolute path of the directory for coding snapshots and their changes. Defaults to `claude_code/changes` in the maki state directory. On the project's filesystem, maki can clone the dependencies instead of copying them. Expiry removes only the artifacts maki made there. |
+| `artifact_ttl_hours` | integer | `24` | 1 | Remove a coding artifact after this many hours without a write. |
+| `config_dir` | string | `""` | - | Absolute path of a Claude Code config directory for maki, in place of `$CLAUDE_CONFIG_DIR` or `~/.claude`. Use it to give maki a different Claude login. |
+| `deny_read` | string | `""` | - | Extra paths Claude cannot read, relative to the session's directory and comma-separated, for example `config/prod.yml,certs/**`. As in `.gitignore`, a pattern without a `/` matches at any depth. They add to the default `.env*` and `secrets/` rules, and coding snapshots never contain them. |
+| `dependencies` | string | `""` | - | Untracked directories a coding snapshot copies from the project, comma-separated, for example `node_modules`. The copy is a copy-on-write clone when the filesystem supports it. |
+| `executable` | string | `"claude"` | - | The Claude Code executable. |
+| `max_concurrent` | integer | `2` | 1 | The maximum number of plugin calls that run Claude Code at the same time. The claude-code provider has its own limit with the same value, so up to twice this many can run together. |
+| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
+| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `model` | string | `"sonnet"` | - | Model alias for calls that do not pick one. |
+| `prepare` | string | `""` | - | Shell command to run in each coding snapshot before Claude starts, for example `npm ci` or `python -m venv .venv && .venv/bin/pip install -e .`. It runs as you, outside the sandbox and with network access, so the worker can use what it fetches. |
+| `prepare_timeout_secs` | integer | `300` | 1 | Stop the `prepare` command after this many seconds. |
+| `timeout_secs` | integer | `600` | 30 | Stop a task after this many seconds, at most 1800. The snapshot and `prepare` of a coding task count, and time spent waiting for a free slot does not. A call's `timeout` parameter overrides it, within the same limits. |
 
 ### `plugins.code_execution`
 

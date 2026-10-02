@@ -135,7 +135,7 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(unix)]
 mod probe {
     use std::fs::File;
-    use std::io::{Write, stdout};
+    use std::io::{IsTerminal, Write, stdin, stdout};
     use std::os::fd::{AsRawFd, RawFd};
     use std::time::{Duration, Instant};
 
@@ -174,8 +174,8 @@ mod probe {
     }
 
     fn open_tty() -> Option<(Option<File>, RawFd)> {
-        if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
-            return Some((None, libc::STDIN_FILENO));
+        if stdin().is_terminal() {
+            return Some((None, stdin().as_raw_fd()));
         }
         let file = File::open("/dev/tty").ok()?;
         let fd = file.as_raw_fd();

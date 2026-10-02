@@ -20,10 +20,12 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     api_key_env: ENV_VAR,
     family: ModelFamily::Synthetic,
     supports_thinking: true,
+    supports_deferred_tools: false,
     accepts_arbitrary_models: false,
     fallback_max_output: Some(32_000),
     fallback_context_window: 128_000,
     models_toml: include_str!("../../models/synthetic.toml"),
+    models_of: None,
     pricing_schedule: None,
     build: Build::Declared,
     aperture: Some(ApertureRoute {

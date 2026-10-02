@@ -32,7 +32,6 @@ context_window = 200000
 pricing = { input = 3.0, output = 15.0, cache_write = 3.75, cache_read = 0.3 }
 
 [[model]]
-# Introductory rates until 2026-09-01, then 3.00 / 15.00 / 3.75 / 0.30.
 prefixes = ["claude-sonnet-5"]
 tier = "medium"
 family = "claude"
@@ -95,6 +94,17 @@ context_window = 200000
 pricing = { input = 5.0, output = 25.0, cache_write = 6.25, cache_read = 0.5, fast = { input = 10.0, output = 50.0 } }
 
 [[model]]
+# Rates from https://platform.claude.com/docs/en/about-claude/pricing
+prefixes = ["claude-opus-5-5"]
+tier = "strong"
+family = "claude"
+vision = true
+default = false
+max_output_tokens = 128000
+context_window = 200000
+pricing = { input = 4.0, output = 20.0, cache_write = 5.0, cache_read = 0.2, fast = { input = 8.0, output = 40.0 } }
+
+[[model]]
 prefixes = ["claude-opus-5"]
 tier = "strong"
 family = "claude"
@@ -103,6 +113,16 @@ default = true
 max_output_tokens = 128000
 context_window = 200000
 pricing = { input = 5.0, output = 25.0, cache_write = 6.25, cache_read = 0.5, fast = { input = 10.0, output = 50.0 } }
+
+[[model]]
+prefixes = ["claude-fable-5-1"]
+tier = "strong"
+family = "claude"
+vision = true
+default = false
+max_output_tokens = 128000
+context_window = 200000
+pricing = { input = 10.0, output = 50.0, cache_write = 12.5, cache_read = 0.25 }
 
 [[model]]
 prefixes = ["claude-fable-5"]

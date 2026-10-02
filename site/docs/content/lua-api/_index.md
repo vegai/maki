@@ -374,7 +374,8 @@ Get package state without changing the installed set.
 - `{names?}` (`table?`) Package names. Omit for all managed packages.
 - `{opts?}` (`table?`) Reserved. Omit it.
 
-**Returns:** (`table`) Package records with `spec`, `path`, `rev`, and `active`.
+**Returns:** (`table?`, `string?`) Package records with `spec`, `path`, `rev`, and
+  `active`, or nil plus an error when the pack lockfile cannot be read.
 
 
 ## maki.api {#maki-api}
@@ -414,6 +415,12 @@ string or a table with richer output fields.
   - `description` (`string`) Required. Non-empty description shown to the model.
   - `schema` (`table`) Required. JSON Schema object describing the tool's input parameters.
   - `handler` (`function`) Required. Called with `(input, ctx)` when the tool is invoked.
+    `ctx:cwd()` returns the directory the calling session started
+    in. `/cd` does not change it, and under ACP it can differ from
+    `maki.uv.cwd()`.
+    `ctx:instructions()` returns the instruction text maki's prompt
+    loads there. Both need `fs_read`. Outside a handler, they return
+    nil and an error.
     Must return a string or a table with any of these fields:
     - `llm_output` (`string`) Text sent to the model.
     - `is_error` (`boolean`) When true, the result is treated as an error.
@@ -777,9 +784,9 @@ Listen for one or more events. Returns an id you can pass to
 Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
 `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
-`"SessionFocusChanged"`, `"SessionStatusChanged"`, `"TaskStatusChanged"`,
-`"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`, and
-`"FileIndexReady"`. Plugins can also fire their own events with
+`"SessionFocusChanged"`, `"SessionStatusChanged"`, `"SessionTitleChanged"`,
+`"TaskStatusChanged"`, `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`,
+and `"FileIndexReady"`. Plugins can also fire their own events with
 `exec_autocmds`.
 
 Every host event carries `data.session_id` except `"FileIndexReady"`,
@@ -813,6 +820,8 @@ name the session now running or focused. What each event adds:
   first focus at startup.
 - `"SessionStatusChanged"`: `data.status` (`"working"`, `"needs_input"`,
   or `"idle"`), `data.title`, and `data.focused` (boolean).
+- `"SessionTitleChanged"`: `data.title` and `data.focused` (boolean),
+  when the title changes (rename or auto-generation).
 - `"TaskStatusChanged"`: `data.id`, `data.name`, and `data.status`
   (`"working"`, `"done"`, or `"error"`), when a subagent starts or
   changes status. A task that comes back from disk already finished
@@ -1849,13 +1858,13 @@ maki.base64.decode({str})
 ```
 
 Decode a Base64-encoded {str} back to its original bytes. Like `vim.base64.decode`.
-Throws if {str} is not valid Base64.
 
 **Parameters:**
 
 - `{str}` (`string|buffer`) Base64-encoded text.
 
-**Returns:** (`string`) Decoded bytes as a string.
+**Returns:** (`string?`, `string?`) Decoded bytes as a string, or nil plus an error
+  message if {str} is not valid Base64.
 
 **Example:**
 
@@ -2002,10 +2011,23 @@ Requires the `run` [plugin permission](#plugin-permissions).
 
 - `{opts?}` (`table?`) Optional settings:
   - `cwd` (`string?`) working directory (tilde is expanded).
-  - `env` (`table?`) extra environment variables, `{ VAR = "value" }`.
-  - `on_stdout` (`function?`) called with `(job_id, line)` for each stdout line.
-  - `on_stderr` (`function?`) called with `(job_id, line)` for each stderr line.
-  - `on_exit` (`function?`) called with `(job_id, code)` when the process finishes.
+  - `env` (`table?`) environment variables, `{ VAR = "value" }`, added to
+    maki's environment.
+  - `clear_env` (`boolean?`) make `env` the whole environment, inheriting
+    nothing from maki (default false).
+  - `stdin` (`string?`) `"pipe"` to write to the job with `chansend`. Defaults
+    to `"null"`, no input. Neovim defaults to `"pipe"`, but a job that
+    reads an open pipe with no data hangs.
+  - `kill_group_on_exit` (`boolean?`) after the process exits, kill the
+    processes that remain in its process group before `on_exit` runs, such
+    as a background child that closed its output (default false, Unix
+    only).
+  - `on_stdout` (`function?`) called with `(job_id, line, "stdout")` for each
+    stdout line. Bytes that are not UTF-8 become U+FFFD, where Neovim
+    passes the raw bytes.
+  - `on_stderr` (`function?`) the same for each stderr line, with `"stderr"`.
+  - `on_exit` (`function?`) called with `(job_id, code, "exit")` when the
+    process stops.
   - `stdout` (`string|false?`) append stdout to this path, or `false` to
     discard it.
   - `stderr` (`string|false?`) same for stderr; both may name one path.
@@ -2018,15 +2040,20 @@ Requires the `run` [plugin permission](#plugin-permissions).
   - `name` (`string?`) handle for `jobfind`, unique among the live jobs this
     plugin can see. Starting a second job under a live name is an error.
 
-**Returns:** (`integer`) Job id.
+**Returns:** (`integer?`, `string?`) Job id, or nil plus an error message when the
+  process could not start (binary not found, bad `cwd`, redirect file not
+  writable).
 
 **Example:**
 
 ```lua
-local id = maki.fn.jobstart({ "rg", "--json", pattern, dir }, {
+local id, err = maki.fn.jobstart({ "rg", "--json", pattern, dir }, {
   on_stdout = function(_, line) print(line) end,
   on_exit = function(_, code) print("exit: " .. code) end,
 })
+if not id then
+  maki.log.warn("rg failed to start: " .. err)
+end
 ```
 
 ---
@@ -2088,14 +2115,14 @@ table with `stdout`, `stderr`, `exit_code`, and `truncated`. A job that
 already exited answers from its captured tail, so `truncated` says
 whether that tail ever lost a line (`tail` too small or 0, or the stream
 redirected away). Waiting on a live job collects every line and is never
-truncated. Returns `nil` if the job does not finish before the timeout.
+truncated.
 
 While waiting, the job's `on_stdout`, `on_stderr`, and `on_exit`
 callbacks fire as events arrive (like Neovim), so you can stream
 output into a buffer while parked here. An already-exited
 session-owned job answers from its snapshot and fires no callbacks.
 Task and plugin jobs leave the store on exit, so waiting after that
-is an error.
+answers nil plus an error.
 
 Requires the `run` [plugin permission](#plugin-permissions).
 
@@ -2104,13 +2131,14 @@ Requires the `run` [plugin permission](#plugin-permissions).
 - `{job_id}` (`integer`) Job id returned by `jobstart`.
 - `{timeout_ms?}` (`integer?`) Maximum wait in milliseconds (default 30000).
 
-**Returns:** (`table?`) `{ stdout, stderr, exit_code, truncated }`, or nil on timeout.
+**Returns:** (`table?`, `string?`) `{ stdout, stderr, exit_code, truncated }`, or
+  nil plus an error on timeout or an unknown job.
 
 **Example:**
 
 ```lua
 local id = maki.fn.jobstart("echo hello")
-local result = maki.fn.jobwait(id, 5000)
+local result, err = maki.fn.jobwait(id, 5000)
 if result then
   print(result.stdout)
 end
@@ -2245,6 +2273,67 @@ end
 
 ---
 
+### `maki.fn.chansend()` {#maki-fn-chansend}
+
+```lua
+maki.fn.chansend({id}, {data})
+```
+
+Write {data} to job {id}'s stdin. The job must be started with
+`stdin = "pipe"`. Like `vim.fn.chansend`, except an error returns nil and
+a message instead of 0. List items are joined with newlines, a newline
+inside an item becomes NUL, and no trailing newline is added. Unread data
+stays in memory, and a child that keeps the job's stdin open without
+reading holds it even after the job exits. Use `kill_group_on_exit` to
+stop such a child.
+
+Requires the `run` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{id}` (`integer`) Job id returned by `jobstart`.
+- `{data}` (`string|table`) Text to write, or a list of lines.
+
+**Returns:** (`integer?`, `string?`) Bytes in the queue for the job, or nil and an error.
+
+**Example:**
+
+```lua
+local id = maki.fn.jobstart({ "cat" }, { stdin = "pipe" })
+maki.fn.chansend(id, "hello\n")
+maki.fn.chanclose(id, "stdin")
+```
+
+---
+
+### `maki.fn.chanclose()` {#maki-fn-chanclose}
+
+```lua
+maki.fn.chanclose({id}, {stream?})
+```
+
+Close job {id}'s stdin, so the job reads end of file. Like
+`vim.fn.chanclose`, but only for the `"stdin"` stream: without a stream,
+Neovim closes every stream, while this closes stdin. The {stream}
+argument is kept, so a call written for Neovim works unchanged.
+
+Requires the `run` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{id}` (`integer`) Job id returned by `jobstart`.
+- `{stream?}` (`string?`) `"stdin"`, which is also the default.
+
+**Returns:** (`integer?`, `string?`) `1`, as Neovim returns, or nil and an error.
+
+**Example:**
+
+```lua
+maki.fn.chanclose(id, "stdin")
+```
+
+---
+
 ### `maki.fn.executable()` {#maki-fn-executable}
 
 ```lua
@@ -2268,6 +2357,37 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 ```lua
 if maki.fn.executable("rg") == 1 then
   -- use ripgrep
+end
+```
+
+---
+
+### `maki.fn.exepath()` {#maki-fn-exepath}
+
+```lua
+maki.fn.exepath({name})
+```
+
+The absolute path of the program {name} runs, or `""` if there is none,
+like Neovim's `vim.fn.exepath`. A name with a path separator resolves from
+the working directory. Other names are searched on `$PATH`, skipping files
+this process cannot run. Resolve a program once before running it from
+other directories, because a relative name can point elsewhere there.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{name}` (`string`) The name of a program (for example `"git"`), or a relative or absolute path.
+
+**Returns:** (`string`) Absolute path, or `""` if not found.
+
+**Example:**
+
+```lua
+local git = maki.fn.exepath("git")
+if git ~= "" then
+  maki.fn.jobstart({ git, "status" }, { cwd = "/tmp" })
 end
 ```
 
@@ -2347,8 +2467,7 @@ maki.fs.read({path})
 ```
 
 Read the entire file at {path} as a UTF-8 string.
-Files larger than 512 MiB return nil plus an error message.
-If the file contains bytes that are not valid UTF-8, this function throws.
+Files over 512 MiB or not valid UTF-8 return nil plus an error message.
 Use `read_bytes` for binary files.
 
 Requires the `fs_read` [plugin permission](#plugin-permissions).
@@ -3633,6 +3752,36 @@ maki.keymap.set("n", "<M-t>", function() maki.model.set({ thinking = "" }) end)
 
 ---
 
+### `maki.model.tier()` {#maki-model-tier}
+
+```lua
+maki.model.tier({name}, {provider?})
+```
+
+The model maki uses for a tier, the same one a subagent asking for that
+tier gets: your pick from the `/model` picker, else the curated default.
+`assigned` tells the two apart. Pass `provider` to prefer its models, the
+way subagents prefer the session's provider.
+
+**Parameters:**
+
+- `{name}` (`string`) `"weak"`, `"medium"`, `"strong"`, or `"compaction"`.
+- `{provider?}` (`string|nil`) Provider slug to resolve within first.
+
+**Returns:** (`table|nil`, `string|nil`) The model in the shape `info` returns, plus
+  `assigned` (boolean), true when you picked it for this tier. nil and nil
+  when no model fits the tier, nil and an error when the spec no longer
+  resolves.
+
+**Example:**
+
+```lua
+local m = maki.model.tier("weak", maki.model.get().provider)
+if m then maki.model.set(m.spec) end
+```
+
+---
+
 ### `maki.model.info()` {#maki-model-info}
 
 ```lua
@@ -4778,18 +4927,20 @@ maki.treesitter.language.add({lang}, {opts?})
 ```
 
 Registers {lang} for use with tree-sitter.
-Call this to confirm a language grammar is available. Throws if {lang} is unknown.
-Custom grammar paths are not yet supported.
+Call this to confirm a language grammar is available. Like
+`vim.treesitter.language.add`. Custom grammar paths are not yet supported.
 
 **Parameters:**
 
 - `{lang}` (`string`) Language name, e.g. `"rust"`.
 - `{opts?}` (`table?`) Options table (the `path` key is not yet supported).
 
+**Returns:** (`boolean?`, `string?`) `true`, or nil plus an error if {lang} is unknown.
+
 **Example:**
 
 ```lua
-maki.treesitter.language.add("lua")
+if not maki.treesitter.language.add("lua") then return end
 ```
 
 ---
@@ -6694,8 +6845,8 @@ Provides access to the working directory, home directory, and environment
 variables. None of these functions throw.
 
 Filesystem location queries (`cwd`, `os_homedir`) need `fs_read`, while
-`os_getenv` reads the process environment, where secrets live, so it needs
-`env`.
+`os_getenv` and `os_environ` read the process environment, which can
+hold secrets, so they need `env`.
 
 ```lua
 local home = maki.uv.os_homedir()
@@ -6765,6 +6916,48 @@ Requires the `env` [plugin permission](#plugin-permissions).
 
 ```lua
 local editor = maki.uv.os_getenv("EDITOR") or "vi"
+```
+
+---
+
+### `maki.uv.os_environ()` {#maki-uv-os_environ}
+
+```lua
+maki.uv.os_environ()
+```
+
+Return every environment variable as a `{ NAME = value }` table, like
+`vim.uv.os_environ`. Variables whose name or value is not UTF-8 are left
+out.
+
+Requires the `env` [plugin permission](#plugin-permissions).
+
+**Returns:** (`table`) Environment variables, with the name as the key.
+
+**Example:**
+
+```lua
+for name in pairs(maki.uv.os_environ()) do print(name) end
+```
+
+---
+
+### `maki.uv.os_uname()` {#maki-uv-os_uname}
+
+```lua
+maki.uv.os_uname()
+```
+
+Return the operating system's name and version, like `vim.uv.os_uname`.
+
+**Returns:** (`table`) `sysname` (for example "Linux", "Darwin" or "Windows_NT"),
+  `release`, `version` and `machine`. On Windows, `release` and `version`
+  are empty.
+
+**Example:**
+
+```lua
+if maki.uv.os_uname().sysname == "Linux" then print("on Linux") end
 ```
 
 

@@ -72,14 +72,16 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     api_key_env: ENV_VAR,
     family: ModelFamily::Glm,
     supports_thinking: false,
+    supports_deferred_tools: false,
     accepts_arbitrary_models: false,
     fallback_max_output: Some(16_000),
     fallback_context_window: 128_000,
     models_toml: include_str!("../../../models/zai.toml"),
+    models_of: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
-        with_auth: create_with_auth,
+        with_auth: Some(create_with_auth),
     }),
     aperture: Some(ApertureRoute {
         path_prefix: NO_PATH_PREFIX,
@@ -228,7 +230,9 @@ impl Provider for Zai {
             let auth = self.auth.lock().unwrap().clone();
             let mut buf = String::new();
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let mut body = self.compat.build_body(model, messages, system, tools);
+            let mut body =
+                self.compat
+                    .build_body(model, messages, system, tools, opts.thinking, auth.top_p);
             if model.supports_thinking() {
                 opts.thinking
                     .apply_reasoning_effort(&mut body, &dialect::GLM, model);

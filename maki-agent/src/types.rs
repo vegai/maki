@@ -147,6 +147,10 @@ pub struct TextOutput {
     /// has to re-parse its own llm output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<serde_json::Value>,
+    /// Deferred MCP tools this call loaded, by wire name; copied into the
+    /// [`ContentBlock::ToolResult`] for providers to expand.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loaded_tools: Vec<String>,
 }
 
 impl From<String> for TextOutput {
@@ -155,17 +159,14 @@ impl From<String> for TextOutput {
             text,
             instructions: None,
             state: None,
+            loaded_tools: Vec::new(),
         }
     }
 }
 
 impl From<&str> for TextOutput {
     fn from(text: &str) -> Self {
-        Self {
-            text: text.to_owned(),
-            instructions: None,
-            state: None,
-        }
+        text.to_owned().into()
     }
 }
 
@@ -181,6 +182,8 @@ impl<'de> Deserialize<'de> for TextOutput {
                 instructions: Option<Vec<InstructionBlock>>,
                 #[serde(default)]
                 state: Option<serde_json::Value>,
+                #[serde(default)]
+                loaded_tools: Vec<String>,
             },
         }
         match Raw::deserialize(deserializer)? {
@@ -189,10 +192,12 @@ impl<'de> Deserialize<'de> for TextOutput {
                 text,
                 instructions,
                 state,
+                loaded_tools,
             } => Ok(Self {
                 text,
                 instructions,
                 state,
+                loaded_tools,
             }),
         }
     }
@@ -306,6 +311,13 @@ impl ToolOutput {
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => t.instructions.as_deref(),
             Self::ReadCode { instructions, .. } => instructions.as_deref(),
             _ => None,
+        }
+    }
+
+    pub fn loaded_tools(&self) -> &[String] {
+        match self {
+            Self::Plain(t) | Self::Markdown(t) => &t.loaded_tools,
+            _ => &[],
         }
     }
 
@@ -542,6 +554,7 @@ pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
             tool_use_id: r.id,
             content: r.output.as_text(),
             is_error: r.is_error,
+            loaded_tools: r.output.loaded_tools().to_vec(),
         });
         if let ToolOutput::Image { source, .. } = r.output.as_ref() {
             images.push(ContentBlock::Image {
@@ -1250,6 +1263,7 @@ mod tests {
             text: FILTERABLE_TEXT.into(),
             instructions: None,
             state: Some(serde_json::json!({ "text": FILTERABLE_TEXT })),
+            loaded_tools: Vec::new(),
         }
     }
 
@@ -1743,6 +1757,7 @@ mod tests {
             text: "file contents".into(),
             instructions: Some(blocks),
             state: None,
+            loaded_tools: Vec::new(),
         });
         let json = serde_json::to_string(&output).unwrap();
         let parsed: ToolOutput = serde_json::from_str(&json).unwrap();
@@ -1801,6 +1816,7 @@ mod tests {
                 content: "do stuff".into(),
             }]),
             state: None,
+            loaded_tools: Vec::new(),
         });
         let text = output.as_text();
         assert!(text.contains("fn main()"), "{INCLUDES_MSG}");

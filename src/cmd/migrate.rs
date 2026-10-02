@@ -1,7 +1,7 @@
 use std::env;
 use std::fmt::Write;
 use std::fs;
-use std::io::{self, IsTerminal};
+use std::io::{self, ErrorKind, IsTerminal};
 use std::path::Path;
 
 #[cfg(unix)]
@@ -31,7 +31,7 @@ fn move_file(src: &Path, dst: &Path) -> Result<()> {
     }
     match fs::rename(src, dst) {
         Ok(()) => Ok(()),
-        Err(e) if is_cross_device(&e) => {
+        Err(e) if e.kind() == ErrorKind::CrossesDevices => {
             fs::copy(src, dst).with_context(|| format!("copy {} -> {}", tilde(src), tilde(dst)))?;
             #[cfg(unix)]
             {
@@ -45,22 +45,6 @@ fn move_file(src: &Path, dst: &Path) -> Result<()> {
         }
         Err(e) => Err(e).with_context(|| format!("move {} -> {}", tilde(src), tilde(dst))),
     }
-}
-
-#[cfg(unix)]
-fn is_cross_device(e: &std::io::Error) -> bool {
-    e.raw_os_error() == Some(libc::EXDEV)
-}
-
-#[cfg(windows)]
-fn is_cross_device(e: &std::io::Error) -> bool {
-    // ERROR_NOT_SAME_DEVICE
-    e.raw_os_error() == Some(17)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn is_cross_device(_e: &std::io::Error) -> bool {
-    false
 }
 
 fn move_auth(legacy_dir: &Path, target_dir: &Path) -> Result<()> {

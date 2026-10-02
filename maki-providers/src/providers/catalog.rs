@@ -762,7 +762,14 @@ impl CatalogTransport {
     ) -> Result<StreamResponse, AgentError> {
         match api_format {
             EndpointType::ChatCompletions => {
-                let mut body = self.chat_compat.build_body(model, messages, system, tools);
+                let mut body = self.chat_compat.build_body(
+                    model,
+                    messages,
+                    system,
+                    tools,
+                    opts.thinking,
+                    auth.top_p,
+                );
                 opts.thinking
                     .apply_reasoning_effort(&mut body, &dialect::PREFER_HIGH, model);
                 self.chat_compat
@@ -781,6 +788,7 @@ impl CatalogTransport {
                     &system_blocks,
                     tools,
                     opts.thinking,
+                    auth.top_p,
                 );
                 body["model"] = serde_json::json!(model.id);
                 body["stream"] = serde_json::json!(true);
@@ -1048,7 +1056,7 @@ mod tests {
     };
     use crate::model::{Model, ModelInfo, ModelPricing};
     use crate::provider::Provider;
-    use crate::providers::{ResolvedAuth, Timeouts, deepseek, opencode};
+    use crate::providers::{ResolvedAuth, Timeouts, anthropic, claude_code, deepseek, opencode};
     use crate::spec::ProviderRegistry;
     use crate::{AgentError, ModelFamily, ModelTier, RequestOptions};
     use test_case::test_case;
@@ -1975,6 +1983,28 @@ mod tests {
             Some("https://api.deepseek.com"),
             models,
         )
+    }
+
+    /// A provider running another provider's models, as claude-code runs the
+    /// Anthropic models, prices a new release from that provider's catalog
+    /// entry, so maki keeps each price once.
+    #[test]
+    fn a_provider_running_anothers_models_reads_their_catalog_entry() {
+        let (_tmp, state_dir) = temp_state_dir();
+        let models = HashMap::from([(
+            UNLISTED_MODEL.into(),
+            priced_row(UNLISTED_INPUT_PRICE, UNLISTED_OUTPUT_PRICE),
+        )]);
+        super::seed_catalog_for_tests(
+            catalog_index(anthropic::SLUG, "@ai-sdk/anthropic", None, models),
+            state_dir,
+        );
+
+        let model = Model::from_spec(&format!("{}/{UNLISTED_MODEL}", claude_code::SLUG)).unwrap();
+        assert_eq!(
+            (model.pricing.input, model.pricing.output),
+            (UNLISTED_INPUT_PRICE, UNLISTED_OUTPUT_PRICE)
+        );
     }
 
     #[test]

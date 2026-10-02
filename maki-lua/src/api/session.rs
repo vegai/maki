@@ -160,6 +160,7 @@ fn block_json(block: &ContentBlock) -> Option<serde_json::Value> {
             tool_use_id,
             content,
             is_error,
+            ..
         } => json!({
             "type": "tool_result",
             "tool_use_id": tool_use_id,
@@ -732,7 +733,7 @@ mod tests {
         ; "tool_use_keeps_id_name_and_input"
     )]
     #[test_case(
-        ContentBlock::ToolResult { tool_use_id: TOOL_ID.into(), content: TOOL_OUTPUT.into(), is_error: true },
+        ContentBlock::tool_result(TOOL_ID, TOOL_OUTPUT, true),
         Some(json!({ "type": "tool_result", "tool_use_id": TOOL_ID, "content": TOOL_OUTPUT, "is_error": true }))
         ; "tool_result_keeps_id_content_and_error_flag"
     )]

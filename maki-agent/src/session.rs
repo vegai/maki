@@ -252,11 +252,11 @@ mod tests {
     fn reopen_with_orphan(tmp: &TempDir) -> SessionTrack {
         let orphan = Message {
             role: Role::User,
-            content: vec![ContentBlock::ToolResult {
-                tool_use_id: ORPHAN_TOOL_ID.to_owned(),
-                content: ORPHAN_RESULT.into(),
-                is_error: false,
-            }],
+            content: vec![ContentBlock::tool_result(
+                ORPHAN_TOOL_ID,
+                ORPHAN_RESULT,
+                false,
+            )],
             ..Default::default()
         };
         push_turn(&mut track_on(tmp), MODEL_SPEC, |params| {

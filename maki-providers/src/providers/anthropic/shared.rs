@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::sync::LazyLock;
 
@@ -7,12 +8,17 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::model::Model;
+use crate::types::is_deferred_tool;
 use crate::{
     AgentError, ContentBlock, EMPTY_RESPONSE_MARKER, Message, ProviderEvent, Role, StopReason,
     StreamResponse, ThinkingConfig, TokenUsage,
 };
 
 pub(super) const BETA_TOOL_EXAMPLES_BEDROCK: &str = "tool-examples-2025-10-29";
+/// Unlocks `defer_loading` and `tool_reference` expansion. The direct API
+/// no longer requires it, but gateways that pin an older surface still do.
+pub(super) const BETA_DEFERRED_TOOLS: &str = "advanced-tool-use-2025-11-20";
+pub(super) const BETA_DEFERRED_TOOLS_BEDROCK: &str = "tool-search-tool-2025-10-19";
 
 /// The messages API refuses requests without max_tokens. Anthropic-kind
 /// models always get a window from the fallback table, so this only fires if
@@ -148,9 +154,81 @@ pub(crate) struct SystemBlock<'a> {
 #[derive(Serialize)]
 pub(crate) struct WireContentBlock<'a> {
     #[serde(flatten)]
-    pub inner: &'a ContentBlock,
+    pub inner: WireBlock<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
+}
+
+/// Only a tool result that loaded tools is rebuilt: `loaded_tools` is not a
+/// wire field, and the loads become `tool_reference` parts.
+#[derive(Serialize)]
+#[serde(untagged)]
+pub(crate) enum WireBlock<'a> {
+    Verbatim(&'a ContentBlock),
+    Rebuilt(Value),
+}
+
+impl WireBlock<'_> {
+    fn is_thinking(&self) -> bool {
+        matches!(self, Self::Verbatim(block) if block.is_thinking())
+    }
+}
+
+fn deferred_tool_names(tools: &Value) -> HashSet<&str> {
+    tools
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|t| is_deferred_tool(t))
+        .filter_map(|t| t["name"].as_str())
+        .collect()
+}
+
+/// Only a name the request still defers may be referenced: the API rejects
+/// a reference to a name it was not handed, so a load recorded while a
+/// server was up degrades to text once that server is gone. And it refuses
+/// a `tool_result` mixing references with anything else, so the text is
+/// displaced to a sibling block.
+fn wire_block<'a>(
+    block: &'a ContentBlock,
+    deferred: &HashSet<&str>,
+) -> (WireBlock<'a>, Option<&'a str>) {
+    let ContentBlock::ToolResult {
+        tool_use_id,
+        content,
+        is_error,
+        loaded_tools,
+    } = block
+    else {
+        return (WireBlock::Verbatim(block), None);
+    };
+    if loaded_tools.is_empty() {
+        return (WireBlock::Verbatim(block), None);
+    }
+    let text = if content.is_empty() {
+        EMPTY_RESPONSE_MARKER
+    } else {
+        content
+    };
+    let refs: Vec<Value> = loaded_tools
+        .iter()
+        .filter(|name| deferred.contains(name.as_str()))
+        .map(|name| json!({"type": "tool_reference", "tool_name": name}))
+        .collect();
+    let (parts, displaced) = if refs.is_empty() {
+        (vec![text_block(text)], None)
+    } else {
+        (refs, Some(text))
+    };
+    let mut result = json!({"type": "tool_result", "tool_use_id": tool_use_id, "content": parts});
+    if *is_error {
+        result["is_error"] = json!(true);
+    }
+    (WireBlock::Rebuilt(result), displaced)
+}
+
+fn text_block(text: &str) -> Value {
+    json!({"type": "text", "text": text})
 }
 
 #[derive(Serialize)]
@@ -170,41 +248,55 @@ fn is_replayable(block: &ContentBlock) -> bool {
 }
 
 /// A message left with no block at all is rejected too, so it falls back to
-/// the marker.
-fn wire_content(msg: &Message) -> Vec<WireContentBlock<'_>> {
-    let mut content: Vec<WireContentBlock<'_>> = msg
+/// the marker. Displaced texts go after every result, since the API wants
+/// all `tool_result` blocks first.
+fn wire_content<'a>(msg: &'a Message, deferred: &HashSet<&str>) -> Vec<WireContentBlock<'a>> {
+    let plain = |inner| WireContentBlock {
+        inner,
+        cache_control: None,
+    };
+    let mut displaced = Vec::new();
+    let mut content: Vec<WireContentBlock<'a>> = msg
         .content
         .iter()
         .filter(|block| is_replayable(block))
-        .map(|inner| WireContentBlock {
-            inner,
-            cache_control: None,
+        .map(|block| {
+            let (inner, text) = wire_block(block, deferred);
+            displaced.extend(text);
+            plain(inner)
         })
         .collect();
+    content.extend(
+        displaced
+            .into_iter()
+            .map(|text| plain(WireBlock::Rebuilt(text_block(text)))),
+    );
 
     if content.is_empty() {
-        content.push(WireContentBlock {
-            inner: &EMPTY_CONTENT,
-            cache_control: None,
-        });
+        content.push(plain(WireBlock::Verbatim(&EMPTY_CONTENT)));
     }
     content
 }
 
 /// The single Anthropic-protocol message encoder; every provider speaking
-/// that protocol must go through it.
-pub(crate) fn wire_messages(messages: &[Message]) -> Vec<WireMessage<'_>> {
+/// that protocol must go through it. `tools` must be the request's own
+/// array: it decides which recorded loads may replay as references.
+pub(crate) fn wire_messages<'a>(messages: &'a [Message], tools: &Value) -> Vec<WireMessage<'a>> {
+    let deferred = deferred_tool_names(tools);
     messages
         .iter()
         .map(|msg| WireMessage {
             role: &msg.role,
-            content: wire_content(msg),
+            content: wire_content(msg, &deferred),
         })
         .collect()
 }
 
-pub(super) fn build_wire_messages(messages: &[Message]) -> Vec<WireMessage<'_>> {
-    let mut wire = wire_messages(messages);
+pub(super) fn build_wire_messages<'a>(
+    messages: &'a [Message],
+    tools: &Value,
+) -> Vec<WireMessage<'a>> {
+    let mut wire = wire_messages(messages, tools);
     let first_cached = wire.len().saturating_sub(MESSAGE_CACHE_BREAKPOINTS);
 
     // The API rejects `cache_control` on thinking blocks, so walk back to
@@ -218,15 +310,23 @@ pub(super) fn build_wire_messages(messages: &[Message]) -> Vec<WireMessage<'_>> 
     wire
 }
 
+/// A deferred definition is not in the cached prefix and may not carry a
+/// breakpoint, so it goes on the last one that is.
 pub(super) fn build_wire_tools(tools: &Value) -> Value {
     let Some(arr) = tools.as_array() else {
         return tools.clone();
     };
     let mut out: Vec<Value> = arr.to_vec();
-    if let Some(last) = out.last_mut() {
+    if let Some(last) = out.iter_mut().rev().find(|t| !is_deferred_tool(t)) {
         last["cache_control"] = json!({"type": "ephemeral"});
     }
     Value::Array(out)
+}
+
+pub(super) fn has_deferred_tools(tools: &Value) -> bool {
+    tools
+        .as_array()
+        .is_some_and(|arr| arr.iter().any(is_deferred_tool))
 }
 
 pub(crate) fn build_request_body_with_system(
@@ -235,8 +335,9 @@ pub(crate) fn build_request_body_with_system(
     system_blocks: &[SystemBlock<'_>],
     tools: &Value,
     thinking: ThinkingConfig,
+    top_p: Option<f64>,
 ) -> Value {
-    let wire_messages = build_wire_messages(messages);
+    let wire_messages = build_wire_messages(messages, tools);
     let wire_tools = build_wire_tools(tools);
 
     let mut body = json!({
@@ -245,6 +346,11 @@ pub(crate) fn build_request_body_with_system(
         "messages": wire_messages,
         "tools": wire_tools,
     });
+    if let Some(top_p) = top_p
+        && !thinking.is_enabled()
+    {
+        body["top_p"] = json!(top_p);
+    }
 
     thinking.apply_to_body(&mut body, model);
     body
@@ -430,11 +536,17 @@ impl EventParser {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
     use test_case::test_case;
 
     use super::{
-        LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, long_context_window, strip_long_context,
+        LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, SystemBlock, build_request_body_with_system,
+        long_context_window, strip_long_context,
     };
+    use crate::model::{Model, ModelFamily, ModelPricing, ModelTier};
+    use crate::{Message, ThinkingConfig};
 
     #[test_case("claude-opus-4-8-1m", "claude-opus-4-8" ; "strips_suffix")]
     #[test_case("claude-opus-4-8", "claude-opus-4-8" ; "leaves_plain_id")]
@@ -447,5 +559,43 @@ mod tests {
     fn long_context_window_follows_suffix(model_id: &str, expected: Option<u32>) {
         assert_eq!(long_context_window(model_id), expected);
         assert!(LONG_CONTEXT_SUFFIX.ends_with("1m"));
+    }
+
+    fn test_model() -> Model {
+        Model {
+            id: "claude-test".into(),
+            provider: Arc::<str>::from("anthropic"),
+            tier: ModelTier::Medium,
+            family: ModelFamily::Claude,
+            supports_tool_examples_override: None,
+            thinking_override: None,
+            supports_vision_override: None,
+            supports_fast_override: None,
+            pricing: ModelPricing::default(),
+            subsidised_by: None,
+            discovered_free: false,
+            max_output_tokens: Some(8192),
+            turn_output_tokens: None,
+            context_window: 200_000,
+            thinking_fields: None,
+        }
+    }
+
+    #[test_case(ThinkingConfig::Off, true ; "off_sends_top_p")]
+    #[test_case(ThinkingConfig::Adaptive, false ; "thinking_omits_top_p")]
+    fn top_p_is_sent_unless_thinking(thinking: ThinkingConfig, sent: bool) {
+        let body = build_request_body_with_system(
+            &test_model(),
+            &[Message::user("hi".into())],
+            &[SystemBlock {
+                r#type: "text",
+                text: "sys",
+                cache_control: None,
+            }],
+            &json!([]),
+            thinking,
+            Some(0.8),
+        );
+        assert_eq!(body.get("top_p") == Some(&json!(0.8)), sent);
     }
 }

@@ -22,7 +22,7 @@ use crate::types::{
     EffortDialect, FALLBACK_MAX_THINKING_BUDGET, THINKING_ADAPTIVE, THINKING_OFF, dialect,
 };
 pub use maki_config::providers::ModelTier;
-use maki_config::providers::ThinkingFields;
+use maki_config::providers::{ProviderDef, ProvidersConfig, ThinkingFields};
 
 const PER_MILLION: f64 = 1_000_000.0;
 /// What a plugin's model row falls back to for a limit it leaves out.
@@ -369,11 +369,17 @@ fn is_snapshot_suffix(suffix: &str) -> bool {
 /// their base row, which also means `glm-5` answers for `glm-5.4`, a model it
 /// has never been checked against.
 fn names_exactly(entry: &ModelEntry, model_id: &str) -> bool {
-    entry.prefixes.iter().any(|prefix| {
-        model_id
-            .strip_prefix(prefix)
-            .is_some_and(|rest| rest.is_empty() || is_snapshot_suffix(rest))
-    })
+    entry
+        .prefixes
+        .iter()
+        .any(|prefix| is_same_model(model_id, prefix))
+}
+
+/// Returns true if {model_id} is {name} or a dated snapshot of it.
+pub(crate) fn is_same_model(model_id: &str, name: &str) -> bool {
+    model_id
+        .strip_prefix(name)
+        .is_some_and(|rest| rest.is_empty() || is_snapshot_suffix(rest))
 }
 
 /// Everything that can describe one model, ranked by how sure it is to be about
@@ -399,7 +405,7 @@ impl<'a> ModelSources<'a> {
             entry,
             exact,
             catalog: (!exact)
-                .then(|| catalog::model_meta_if_available(spec.slug, model_id))
+                .then(|| catalog::model_meta_if_available(spec.models_slug(), model_id))
                 .flatten(),
         }
     }
@@ -435,6 +441,12 @@ impl ModelFamily {
 }
 
 const FAST_PROVIDER: &str = "anthropic";
+
+fn deferred_tools_support(slug: &str, def: Option<&ProviderDef>) -> bool {
+    def.and_then(|def| def.supports_deferred_tools)
+        .or_else(|| ProviderRegistry::get(slug).map(|spec| spec.supports_deferred_tools))
+        .unwrap_or(false)
+}
 
 /// The thinking keys a `providers.toml` entry may lend a builtin local model
 /// (see [`maki_config::providers::overlays_local_thinking`]). Everything else
@@ -751,6 +763,19 @@ impl Model {
                         .is_some_and(|m| m.slug == FAST_PROVIDER)
             }
         }
+    }
+
+    /// Whether definitions may carry [`crate::DEFER_LOADING_KEY`] and load
+    /// through `tool_reference` blocks, so a mid-session load never rewrites
+    /// the cached tools prefix.
+    ///
+    /// The `providers.toml` row's word, else the built-in row's, else no. A
+    /// custom slug fronts a backend only its author knows, so it has to opt
+    /// in: a wrong `false` costs one cache rewrite per load, a wrong `true`
+    /// is a 400 or a definition the gateway silently drops.
+    pub fn supports_deferred_tools(&self) -> bool {
+        let config = ProvidersConfig::load_or_default();
+        deferred_tools_support(&self.provider, config.get(&self.provider))
     }
 
     /// Discovery has not answered yet, so the `false` from [`Self::supports_fast`]
@@ -1604,6 +1629,24 @@ mod tests {
     #[test_case("deepseek/my-custom-model",         false ; "unknown_generic_defaults_off")]
     fn vision_resolved_from_entry_or_family(spec: &str, expected: bool) {
         assert_eq!(Model::from_spec(spec).unwrap().supports_vision(), expected);
+    }
+
+    #[test_case("anthropic", None, true ; "anthropic_row_declares_it")]
+    #[test_case("openai", None, false ; "other_builtin")]
+    #[test_case("copilot", None, false ; "claude_behind_another_protocol")]
+    #[test_case("claude-gateway", None, false ; "custom_slug_must_opt_in")]
+    #[test_case("claude-gateway", Some(true), true ; "custom_slug_opted_in")]
+    #[test_case("anthropic", Some(false), false ; "providers_toml_outranks_the_builtin_row")]
+    fn deferred_tools_support_is_the_endpoints_declared_word(
+        slug: &str,
+        declared: Option<bool>,
+        expected: bool,
+    ) {
+        let def = ProviderDef {
+            supports_deferred_tools: declared,
+            ..ProviderDef::default()
+        };
+        assert_eq!(deferred_tools_support(slug, Some(&def)), expected);
     }
 
     #[test_case("claude-opus-5",    true  ; "entry_with_fast_pricing")]

@@ -662,6 +662,12 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///   description     (string)   Required. Non-empty description shown to the model.
 ///   schema          (table)    Required. JSON Schema object describing the tool's input parameters.
 ///   handler         (function) Required. Called with `(input, ctx)` when the tool is invoked.
+///                              `ctx:cwd()` returns the directory the calling session started
+///                              in. `/cd` does not change it, and under ACP it can differ from
+///                              `maki.uv.cwd()`.
+///                              `ctx:instructions()` returns the instruction text maki's prompt
+///                              loads there. Both need `fs_read`. Outside a handler, they return
+///                              nil and an error.
 ///                              Must return a string or a table with any of these fields:
 ///                                llm_output  (string)  Text sent to the model.
 ///                                is_error    (boolean) When true, the result is treated as an error.

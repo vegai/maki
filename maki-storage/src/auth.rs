@@ -22,6 +22,9 @@ const REFRESH_BUFFER_SECS: u64 = 60;
 const LOCK_SUFFIX: &str = ".lock";
 const LOCK_WAIT: Duration = Duration::from_secs(30);
 const LOCK_POLL: Duration = Duration::from_millis(50);
+/// RFC 7591 §3.2.1: a `client_secret_expires_at` of 0 means the secret never
+/// expires. Atlassian's MCP server registers clients this way.
+const CLIENT_SECRET_NEVER_EXPIRES: u64 = 0;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OAuthTokens {
@@ -238,6 +241,7 @@ pub fn load_mcp_auth(dir: &StateDir, server_name: &str, expected_url: &str) -> O
         return None;
     }
     if let Some(expires_at) = data.client_secret_expires_at
+        && expires_at != CLIENT_SECRET_NEVER_EXPIRES
         && now_millis() / 1000 >= expires_at
     {
         return None;
@@ -452,5 +456,19 @@ mod tests {
         let dir = StateDir::from_path(tmp.path().to_path_buf());
         save_mcp_auth(&dir, "srv", &data).unwrap();
         assert!(load_mcp_auth(&dir, "srv", lookup_url).is_none());
+    }
+
+    #[test_case(None ; "no_expiry")]
+    #[test_case(Some(CLIENT_SECRET_NEVER_EXPIRES) ; "zero_never_expires")]
+    #[test_case(Some(now_millis() / 1000 + 3_600) ; "future_expiry")]
+    fn mcp_auth_load_keeps_unexpired_client(client_secret_expires_at: Option<u64>) {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let data = McpAuthData {
+            client_secret_expires_at,
+            ..test_mcp_data()
+        };
+        save_mcp_auth(&dir, "srv", &data).unwrap();
+        assert!(load_mcp_auth(&dir, "srv", TEST_URL).is_some());
     }
 }

@@ -768,7 +768,13 @@ fn overlay_cursor(
     cursor_char_pos: usize,
     reversed: bool,
 ) -> (Vec<Span<'static>>, u16) {
-    let cursor_style = |style: Style| if reversed { style.reversed() } else { style };
+    let cursor_style = |style: Style| {
+        if reversed {
+            style.patch(theme::cursor_style())
+        } else {
+            style
+        }
+    };
     let mut result = Vec::new();
     let mut pos = 0;
     let mut cursor_col = None;
@@ -823,6 +829,7 @@ mod tests {
     use crate::components::scrollbar::SCROLLBAR_THUMB;
     use crate::selection::{ContentRegion, ScreenSelection, extract_selected_text};
     use ratatui::layout::{Position, Rect};
+    use ratatui::style::Color;
     use test_case::test_case;
 
     fn type_text(input: &mut InputBox, text: &str) {
@@ -1387,17 +1394,22 @@ mod tests {
     const CURSOR_STAYS_HIDDEN: &str = "the hardware cursor must never be shown";
     const NO_BLOCK_CURSOR_UNFOCUSED: &str =
         "an overlay owns the keyboard, so nothing may be reversed";
+    const CARET_FG: Color = Color::Rgb(0x12, 0x34, 0x56);
+    const CARET_BG: Color = Color::Rgb(0x65, 0x43, 0x21);
+    const CARET_UNFOCUSED_FG: Color = Color::Rgb(0x0f, 0x0f, 0x0f);
+    const CARET_THEME_WITH_CURSOR: &str = r##"
+[ui]
+"cursor" = { fg = "#123456", bg = "#654321" }
+"cursor_unfocused" = { fg = "#0f0f0f" }
+"##;
+    const CARET_THEME_WITHOUT_CURSOR: &str = "";
 
-    fn reversed_cells(
-        terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
-    ) -> Vec<Position> {
+    /// Finds the cells painted as the caret, whatever the loaded theme is.
+    fn caret_cells(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<Position> {
         let buf = terminal.backend().buffer();
         buf.area
             .positions()
-            .filter(|&p| {
-                buf.cell(p)
-                    .is_some_and(|c| c.modifier.contains(Modifier::REVERSED))
-            })
+            .filter(|&p| buf.cell(p).is_some_and(theme::is_caret_cell))
             .collect()
     }
 
@@ -1412,7 +1424,7 @@ mod tests {
     fn assert_cursor_at(rendered: &Rendered, expected: Option<Position>) {
         assert!(!rendered.terminal.backend().cursor_visible());
         assert_eq!(rendered.cursor, expected);
-        assert_eq!(reversed_cells(&rendered.terminal), Vec::from_iter(expected));
+        assert_eq!(caret_cells(&rendered.terminal), Vec::from_iter(expected));
     }
 
     fn render_cursor(input: &mut InputBox, width: u16, height: u16) -> Rendered {
@@ -1425,6 +1437,37 @@ mod tests {
             input.buffer.move_left();
         }
         render_cursor(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT)
+    }
+
+    /// The caret carries whatever paint the theme gives it: the explicit
+    /// `[ui] cursor` colors when set, the reversed fallback when not.
+    fn painted_caret() -> ratatui::buffer::Cell {
+        render_with_cursor_left("abc", 1)
+            .terminal
+            .backend()
+            .buffer()
+            .cell(Position::new(4, 1))
+            .expect("caret cell must be on screen")
+            .clone()
+    }
+
+    /// The caret carries whatever paint the theme gives it: the explicit
+    /// `[ui] cursor` colors when set, the reversed fallback when not, and
+    /// `[ui] cursor_unfocused` once the terminal reports lost focus.
+    #[test]
+    fn caret_honors_the_theme_cursor_styles() {
+        theme::set(theme::Theme::from_toml(CARET_THEME_WITHOUT_CURSOR).unwrap());
+        assert!(painted_caret().modifier.contains(Modifier::REVERSED));
+
+        theme::set(theme::Theme::from_toml(CARET_THEME_WITH_CURSOR).unwrap());
+        let cell = painted_caret();
+        assert_eq!(cell.fg, CARET_FG);
+        assert_eq!(cell.bg, CARET_BG);
+
+        theme::set_cursor_focused(false);
+        assert_eq!(painted_caret().fg, CARET_UNFOCUSED_FG);
+        theme::set_cursor_focused(true);
+        theme::set(theme::load_by_name("dracula").unwrap());
     }
 
     #[test_case("hello", 0, Position::new(7, 1) ; "ascii_at_end_of_line")]
@@ -1533,7 +1576,7 @@ mod tests {
             "{CURSOR_STAYS_HIDDEN}"
         );
         assert_eq!(
-            reversed_cells(&unfocused.terminal),
+            caret_cells(&unfocused.terminal),
             Vec::new(),
             "{NO_BLOCK_CURSOR_UNFOCUSED}"
         );

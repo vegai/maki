@@ -37,8 +37,8 @@ const USAGE_PATH: &str = "/api/oauth/usage";
 const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
 const OAUTH_BETA: &str = "oauth-2025-04-20";
 const MONEY_EXPONENT: u32 = 2;
-const LABEL_SESSION: &str = "Current session";
-const LABEL_WEEK_ALL: &str = "Current week (all models)";
+pub(crate) const LABEL_SESSION: &str = "Current session";
+pub(crate) const LABEL_WEEK_ALL: &str = "Current week (all models)";
 
 pub(crate) const SLUG: &str = "anthropic";
 pub(crate) const DISPLAY_NAME: &str = "Anthropic";
@@ -74,14 +74,16 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     api_key_env: ENV_VAR,
     family: ModelFamily::Claude,
     supports_thinking: true,
+    supports_deferred_tools: true,
     accepts_arbitrary_models: false,
     fallback_max_output: Some(128_000),
     fallback_context_window: 200_000,
     models_toml: include_str!("../../../models/anthropic.toml"),
+    models_of: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
-        with_auth: create_with_auth,
+        with_auth: Some(create_with_auth),
     }),
     aperture: Some(ApertureRoute {
         path_prefix: NO_PATH_PREFIX,
@@ -391,20 +393,12 @@ impl Anthropic {
         &self,
         body: &Value,
         event_tx: &Sender<ProviderEvent>,
-        fast: bool,
-        long_context: bool,
+        betas: &[&str],
     ) -> Result<StreamResponse, AgentError> {
         let json_body = serde_json::to_vec(body)?;
         let mut builder = self
             .build_request("POST", MESSAGES_PATH)
             .header("content-type", "application/json");
-        let mut betas = Vec::new();
-        if fast {
-            betas.push(FAST_MODE_BETA);
-        }
-        if long_context {
-            betas.push(shared::LONG_CONTEXT_BETA);
-        }
         if !betas.is_empty() {
             builder = builder.header("anthropic-beta", betas.join(","));
         }
@@ -441,13 +435,16 @@ impl Anthropic {
                 models.extend(discovered_model_infos(m));
             }
 
-            if !page.has_more {
-                break;
+            match page.last_id {
+                Some(cursor) if page.has_more && after_id.as_ref() != Some(&cursor) => {
+                    after_id = Some(cursor)
+                }
+                _ => break,
             }
-            after_id = page.last_id;
         }
 
         models.sort_by(|a, b| a.id.cmp(&b.id));
+        models.dedup_by(|a, b| a.id == b.id);
         Ok(models)
     }
 }
@@ -485,21 +482,30 @@ impl Provider for Anthropic {
                 }]
             };
 
+            let top_p = self.auth.lock().unwrap().top_p;
             let mut body = shared::build_request_body_with_system(
                 model,
                 messages,
                 &system_blocks,
                 tools,
                 opts.thinking,
+                top_p,
             );
             body["model"] = json!(shared::strip_long_context(&model.id));
             body["stream"] = json!(true);
-            let fast = apply_fast_mode(&mut body, model, opts);
-            let long_context = model.id.ends_with(shared::LONG_CONTEXT_SUFFIX);
+            let mut betas = Vec::new();
+            if apply_fast_mode(&mut body, model, opts) {
+                betas.push(FAST_MODE_BETA);
+            }
+            if model.id.ends_with(shared::LONG_CONTEXT_SUFFIX) {
+                betas.push(shared::LONG_CONTEXT_BETA);
+            }
+            if shared::has_deferred_tools(tools) {
+                betas.push(shared::BETA_DEFERRED_TOOLS);
+            }
 
-            debug!(model = %model.id, num_messages = messages.len(), thinking = ?opts.thinking, fast, long_context, "sending API request");
-            self.do_stream_request(&body, event_tx, fast, long_context)
-                .await
+            debug!(model = %model.id, num_messages = messages.len(), thinking = ?opts.thinking, ?betas, "sending API request");
+            self.do_stream_request(&body, event_tx, &betas).await
         })
     }
 
@@ -593,6 +599,8 @@ fn discovered_model_infos(m: ApiModelInfo) -> Vec<crate::model::ModelInfo> {
 #[derive(Deserialize)]
 struct ModelsPage {
     data: Vec<ApiModelInfo>,
+    /// OpenAI-shaped `/v1/models` replies (older LiteLLM) omit it: one page.
+    #[serde(default)]
     has_more: bool,
     last_id: Option<String>,
 }
@@ -634,6 +642,7 @@ pub(crate) async fn parse_sse(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{Canned, serve};
     use crate::{ContentBlock, EMPTY_RESPONSE_MARKER, ProviderEvent, Role, StopReason, TokenUsage};
     use serde_json::{Value, json};
     use shared::build_wire_messages;
@@ -983,11 +992,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
             Message::user("first".into()),
             message(Role::Assistant, vec![text_block("reply")]),
             message(Role::User, vec![
-                ContentBlock::ToolResult {
-                    tool_use_id: "t1".into(),
-                    content: "ok".into(),
-                    is_error: false,
-                },
+                ContentBlock::tool_result("t1", "ok", false),
                 text_block("second"),
             ]),
         ],
@@ -1007,7 +1012,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
         ; "skips_thinking_blocks"
     )]
     fn cache_control_placement(messages: Vec<Message>, expected: &[(usize, usize)]) {
-        let json: Value = serde_json::to_value(build_wire_messages(&messages)).unwrap();
+        let json: Value = serde_json::to_value(build_wire_messages(&messages, &json!([]))).unwrap();
 
         let marked: Vec<(usize, usize)> = json
             .as_array()
@@ -1033,7 +1038,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
             message(Role::Assistant, vec![text_block(" \n"), text_block("kept")]),
             message(Role::Assistant, vec![text_block("   ")]),
         ];
-        let json: Value = serde_json::to_value(build_wire_messages(&messages)).unwrap();
+        let json: Value = serde_json::to_value(build_wire_messages(&messages, &json!([]))).unwrap();
 
         assert_eq!(json[0]["content"].as_array().unwrap().len(), 1);
         assert_eq!(json[0]["content"][0]["text"], "kept");
@@ -1061,7 +1066,8 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
     )]
     fn wire_messages_replay_only_signed_thinking(content: Vec<ContentBlock>, expected: Value) {
         let messages = vec![message(Role::Assistant, content)];
-        let json: Value = serde_json::to_value(shared::wire_messages(&messages)).unwrap();
+        let json: Value =
+            serde_json::to_value(shared::wire_messages(&messages, &json!([]))).unwrap();
 
         assert_eq!(json[0]["content"], expected);
     }
@@ -1071,11 +1077,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
         let messages = vec![Message {
             role: Role::User,
             content: vec![
-                ContentBlock::ToolResult {
-                    tool_use_id: "t1".into(),
-                    content: "[image: pic.png 1KB]".into(),
-                    is_error: false,
-                },
+                ContentBlock::tool_result("t1", "[image: pic.png 1KB]", false),
                 ContentBlock::Image {
                     source: crate::ImageSource::new(
                         crate::ImageMediaType::Png,
@@ -1085,7 +1087,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
             ],
             ..Default::default()
         }];
-        let wire = build_wire_messages(&messages);
+        let wire = build_wire_messages(&messages, &json!([]));
         let json: Value = serde_json::to_value(&wire).unwrap();
 
         assert_eq!(json[0]["content"][0]["type"], "tool_result");
@@ -1102,6 +1104,152 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
                 "cache_control": {"type": "ephemeral"},
             })
         );
+    }
+
+    const DEFERRED_TOOL: &str = "srv__fetch";
+    const SEARCH_TEXT: &str = "Loaded 1 tool";
+
+    fn deferred_tools() -> Value {
+        json!([
+            {"name": "read", "input_schema": {}},
+            {"name": DEFERRED_TOOL, "input_schema": {}, "defer_loading": true},
+            {"name": "tool_search", "input_schema": {}},
+        ])
+    }
+
+    fn search_result(loaded: &[&str]) -> Vec<Message> {
+        vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: SEARCH_TEXT.into(),
+                is_error: false,
+                loaded_tools: loaded.iter().map(|s| s.to_string()).collect(),
+            }],
+            ..Default::default()
+        }]
+    }
+
+    fn wire_content(messages: &[Message], tools: &Value) -> Value {
+        let mut json: Value = serde_json::to_value(build_wire_messages(messages, tools)).unwrap();
+        json[0]["content"].take()
+    }
+
+    fn set_result<F: FnOnce(&mut String, &mut bool)>(messages: &mut [Message], f: F) {
+        let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = &mut messages[0].content[0]
+        else {
+            unreachable!()
+        };
+        f(content, is_error);
+    }
+
+    /// The API refuses a `tool_result` mixing references with anything else
+    /// (verified live: "Tool definitions ... cannot be mixed with other
+    /// content"), so the text moves to a sibling block. A name the request
+    /// does not defer is dropped from the references, since the API rejects
+    /// one it was not handed a definition for.
+    #[test_case(&[DEFERRED_TOOL] ; "all_deferred")]
+    #[test_case(&["gone__tool", DEFERRED_TOOL] ; "one_server_gone")]
+    fn loaded_deferred_tools_replay_as_tool_references(loaded: &[&str]) {
+        assert_eq!(
+            wire_content(&search_result(loaded), &deferred_tools()),
+            json!([
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "t1",
+                    "content": [{"type": "tool_reference", "tool_name": DEFERRED_TOOL}],
+                },
+                {
+                    "type": "text",
+                    "text": SEARCH_TEXT,
+                    "cache_control": {"type": "ephemeral"},
+                },
+            ])
+        );
+    }
+
+    #[test_case(&["gone__tool"], json!([]) ; "unknown_name")]
+    #[test_case(&[DEFERRED_TOOL], json!([{"name": DEFERRED_TOOL, "input_schema": {}}]) ; "name_no_longer_deferred")]
+    fn unreferencable_loads_replay_as_text_only(loaded: &[&str], tools: Value) {
+        assert_eq!(
+            wire_content(&search_result(loaded), &tools)[0]["content"],
+            json!([{"type": "text", "text": SEARCH_TEXT}])
+        );
+    }
+
+    /// A deferred tool called straight from the catalog records its load
+    /// even when the call failed.
+    #[test_case(&[DEFERRED_TOOL] ; "referenced")]
+    #[test_case(&["gone__tool"] ; "text_only")]
+    fn rebuilt_result_keeps_is_error(loaded: &[&str]) {
+        let mut messages = search_result(loaded);
+        set_result(&mut messages, |_, is_error| *is_error = true);
+        assert_eq!(
+            wire_content(&messages, &deferred_tools())[0]["is_error"],
+            true
+        );
+    }
+
+    /// The API rejects blank text blocks.
+    #[test_case(&[DEFERRED_TOOL], |content| &content[1]["text"] ; "displaced_text")]
+    #[test_case(&["gone__tool"], |content| &content[0]["content"][0]["text"] ; "in_place_text")]
+    fn empty_loading_result_replays_the_marker(loaded: &[&str], text_at: fn(&Value) -> &Value) {
+        let mut messages = search_result(loaded);
+        set_result(&mut messages, |content, _| content.clear());
+        let content = wire_content(&messages, &deferred_tools());
+        assert_eq!(text_at(&content), EMPTY_RESPONSE_MARKER);
+    }
+
+    /// Parallel calls share one user message, and the API wants every
+    /// `tool_result` ahead of other content, so displaced texts may not
+    /// interleave with the results they came from.
+    #[test]
+    fn displaced_texts_follow_every_result_in_the_message() {
+        const OTHER_DEFERRED: &str = "srv__list";
+        const OTHER_TEXT: &str = "listed";
+        let mut tools = deferred_tools();
+        tools
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name": OTHER_DEFERRED, "input_schema": {}, "defer_loading": true}));
+        let mut messages = search_result(&[DEFERRED_TOOL]);
+        messages[0].content.push(ContentBlock::ToolResult {
+            tool_use_id: "t2".into(),
+            content: OTHER_TEXT.into(),
+            is_error: false,
+            loaded_tools: vec![OTHER_DEFERRED.into()],
+        });
+        let content = wire_content(&messages, &tools);
+        let kinds: Vec<&str> = content
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["tool_result", "tool_result", "text", "text"]);
+        assert_eq!(content[2]["text"], SEARCH_TEXT);
+        assert_eq!(content[3]["text"], OTHER_TEXT);
+    }
+
+    #[test]
+    fn result_without_loads_replays_verbatim() {
+        assert_eq!(
+            wire_content(&search_result(&[]), &deferred_tools())[0]["content"],
+            SEARCH_TEXT
+        );
+    }
+
+    #[test]
+    fn tools_cache_breakpoint_skips_deferred_definitions() {
+        let tools = json!([
+            {"name": "read", "input_schema": {}},
+            {"name": DEFERRED_TOOL, "input_schema": {}, "defer_loading": true},
+        ]);
+        let wire = shared::build_wire_tools(&tools);
+        assert_eq!(wire[0]["cache_control"], json!({"type": "ephemeral"}));
+        assert!(wire[1].get("cache_control").is_none());
     }
 
     #[test]
@@ -1157,6 +1305,17 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
     }
 
     #[test]
+    fn models_page_without_has_more_is_one_page() {
+        let page: ModelsPage = serde_json::from_str(
+            r#"{"object": "list", "data": [{"id": "claude-opus-5", "object": "model"}]}"#,
+        )
+        .unwrap();
+
+        assert!(!page.has_more);
+        assert_eq!(page.data[0].id, "claude-opus-5");
+    }
+
+    #[test]
     fn list_models_adds_1m_variant_from_max_input_tokens() {
         // The real /v1/models payload hides the 1M window in `max_input_tokens`.
         let page: ModelsPage = serde_json::from_str(
@@ -1188,6 +1347,38 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
                 "claude-opus-4-8-1m".to_string(),
             ]
         );
+    }
+
+    const PAGE_WITHOUT_CURSOR: &[Canned] = &[Canned::json(
+        200,
+        r#"{"data": [{"id": "a"}], "has_more": true, "last_id": null}"#,
+    )];
+    const PAGE_A_WITH_MORE: Canned = Canned::json(
+        200,
+        r#"{"data": [{"id": "a"}], "has_more": true, "last_id": "a"}"#,
+    );
+    const TWO_PAGES: &[Canned] = &[
+        PAGE_A_WITH_MORE,
+        Canned::json(200, r#"{"data": [{"id": "b"}], "has_more": false}"#),
+    ];
+    const IGNORED_CURSOR: &[Canned] = &[PAGE_A_WITH_MORE, PAGE_A_WITH_MORE];
+
+    #[test_case(PAGE_WITHOUT_CURSOR, &["a"] ; "stops_when_has_more_without_last_id")]
+    #[test_case(IGNORED_CURSOR, &["a"] ; "stops_when_server_ignores_after_id")]
+    #[test_case(TWO_PAGES, &["a", "b"] ; "follows_last_id_cursor")]
+    fn list_models_pagination(script: &'static [Canned], expected: &[&str]) {
+        let (base_url, requests) = serve(script);
+        let auth = crate::providers::ResolvedAuth::for_test(Some(base_url), Vec::new());
+        let provider = Anthropic::with_auth(
+            Arc::new(Mutex::new(auth)),
+            crate::providers::Timeouts::default(),
+        );
+
+        let models = smol::block_on(provider.list_models()).unwrap();
+
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, expected);
+        assert_eq!(requests.lock().unwrap().len(), script.len());
     }
 
     #[test]

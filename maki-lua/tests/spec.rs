@@ -4,6 +4,7 @@ use maki_agent::tools::ToolRegistry;
 use maki_lua::PluginHost;
 use test_case::test_case;
 
+#[test_case("claude_code", include_str!("../../plugins/claude_code/tests/spec.lua") ; "claude_code_plugin_spec")]
 #[test_case("completion", include_str!("../../plugins/completion/tests/spec.lua") ; "completion_plugin_spec")]
 #[test_case("edit", include_str!("../../plugins/edit/tests/spec.lua") ; "edit_plugin_spec")]
 #[test_case("index", include_str!("../../plugins/index/tests/spec.lua") ; "index_plugin_spec")]

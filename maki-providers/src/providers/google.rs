@@ -53,14 +53,16 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     api_key_env: ENV_VAR,
     family: ModelFamily::Gemini,
     supports_thinking: true,
+    supports_deferred_tools: false,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(65_536),
     fallback_context_window: 1_000_000,
     models_toml: include_str!("../../models/google.toml"),
+    models_of: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
-        with_auth: create_with_auth,
+        with_auth: Some(create_with_auth),
     }),
     aperture: Some(ApertureRoute {
         path_prefix: GEMINI_PATH_PREFIX,
@@ -191,6 +193,7 @@ impl Google {
         system: &str,
         tools: &Value,
         thinking: ThinkingConfig,
+        top_p: Option<f64>,
     ) -> Value {
         let mut body = json!({
             "contents": convert_messages(messages),
@@ -204,6 +207,12 @@ impl Google {
 
         if let Some(max_output) = model.output_tokens() {
             body["generationConfig"]["maxOutputTokens"] = json!(max_output);
+        }
+        // Gemini ignores `topP` on models that dropped sampling params (3.6+)
+        // instead of erroring, and 2.5 thinking models accept it, so unlike
+        // Anthropic and OpenAI it rides along even when thinking is on.
+        if let Some(top_p) = top_p {
+            body["generationConfig"]["topP"] = json!(top_p);
         }
 
         let tool_decls = convert_tools(tools);
@@ -223,7 +232,8 @@ impl Google {
         event_tx: &Sender<ProviderEvent>,
         thinking: ThinkingConfig,
     ) -> Result<StreamResponse, AgentError> {
-        let body = self.build_body(model, messages, system, tools, thinking);
+        let top_p = self.auth.lock().unwrap().top_p;
+        let body = self.build_body(model, messages, system, tools, thinking, top_p);
         let url = self.stream_url(&model.id);
         let json_body = serde_json::to_vec(&body)?;
 
@@ -373,6 +383,7 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                     tool_use_id,
                     content,
                     is_error,
+                    ..
                 } => {
                     let parsed = serde_json::from_str::<Value>(content);
                     let mut response_val = match parsed {
@@ -769,12 +780,30 @@ mod tests {
             "be helpful",
             &json!([]),
             ThinkingConfig::Off,
+            None,
         );
 
         assert_eq!(body["contents"][0]["role"], "user");
         assert_eq!(body["systemInstruction"]["parts"][0]["text"], "be helpful");
         assert_eq!(body["generationConfig"]["maxOutputTokens"], 8192);
         assert!(body.get("tools").is_none());
+        assert!(body["generationConfig"].get("topP").is_none());
+    }
+
+    #[test_case(ThinkingConfig::Off ; "without_thinking")]
+    #[test_case(ThinkingConfig::Adaptive ; "with_thinking")]
+    fn google_build_body_sends_top_p(thinking: ThinkingConfig) {
+        let google = Google::with_auth(test_auth(), test_timeouts());
+        let messages = vec![Message::user("hello".into())];
+        let body = google.build_body(
+            &test_model(),
+            &messages,
+            "",
+            &json!([]),
+            thinking,
+            Some(0.8),
+        );
+        assert_eq!(body["generationConfig"]["topP"], 0.8);
     }
 
     #[test]
@@ -787,6 +816,7 @@ mod tests {
             "",
             &json!([]),
             ThinkingConfig::Adaptive,
+            None,
         );
 
         assert_eq!(
@@ -805,6 +835,7 @@ mod tests {
             "",
             &json!([]),
             ThinkingConfig::Budget(8192),
+            None,
         );
 
         // Clamped to the model's max thinking budget (half of 8192 output tokens).
@@ -873,11 +904,7 @@ mod tests {
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "call_1".into(),
-                    content: "file contents".into(),
-                    is_error: false,
-                }],
+                content: vec![ContentBlock::tool_result("call_1", "file contents", false)],
                 ..Default::default()
             },
         ];
@@ -902,11 +929,7 @@ mod tests {
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "call_1".into(),
-                    content: content.into(),
-                    is_error: false,
-                }],
+                content: vec![ContentBlock::tool_result("call_1", content, false)],
                 ..Default::default()
             },
         ];
@@ -927,11 +950,7 @@ mod tests {
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "call_1".into(),
-                    content: "boom".into(),
-                    is_error: true,
-                }],
+                content: vec![ContentBlock::tool_result("call_1", "boom", true)],
                 ..Default::default()
             },
         ];
@@ -970,11 +989,7 @@ mod tests {
         let messages = vec![Message {
             role: Role::User,
             content: vec![
-                ContentBlock::ToolResult {
-                    tool_use_id: "call_1".into(),
-                    content: "[image: pic.png 1KB]".into(),
-                    is_error: false,
-                },
+                ContentBlock::tool_result("call_1", "[image: pic.png 1KB]", false),
                 ContentBlock::Image {
                     source: crate::ImageSource::new(
                         crate::ImageMediaType::Png,

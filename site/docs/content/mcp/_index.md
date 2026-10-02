@@ -118,6 +118,21 @@ url = "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp?toolsets=all"
 
 Ask about an incident, and the model searches for something like `datadog logs`, gets back the few matching tools, and the other hundred definitions never enter the conversation.
 
+### Loads and the prompt cache
+
+Tool definitions sit at the front of the prompt, inside the cached prefix. Adding one there changes the prefix, so the next request rewrites the whole conversation at cache-write rates. On a long session that single rewrite can cost more than the search saved.
+
+On the Anthropic API (direct and Bedrock) a load never touches the tools array. Maki sends every deferred definition on every request, marked as deferred so it stays out of the context, and a search result points at its matches, which the API expands in place. Calling a deferred tool straight from the catalog loads it the same way. The array is the same bytes all session long, and a load costs only the few hundred tokens of the search result.
+
+```
+request N     tools: [read, edit, ..., 117 deferred, tool_search]   cache hit
+              model: tool_search("logs")
+result        3 matches, expanded by the API
+request N+1   tools: same bytes                                      cache hit
+```
+
+Other providers have no such mechanism, so a load adds the definition to the tools array and the cache is rebuilt once. A gateway speaking the Anthropic protocol may or may not pass the expansion through, so a custom provider gets the rebuild until its `providers.toml` row sets `supports_deferred_tools = true` (see [Provider fields](../providers/#provider-fields)).
+
 With 10 or fewer tools across all your servers there is no search step: at that size, searching costs more than it saves, so everything loads upfront. The top-level `defer_tools` key moves that line:
 
 ```toml

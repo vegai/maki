@@ -17,7 +17,7 @@ use super::openai_compat::{DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiC
 use super::{KeyRotation, ResolvedAuth, Timeouts};
 use crate::model::{Model, ModelInfo, ThinkingSupport};
 use crate::model_registry;
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, Provider, RequestScope};
 use crate::spec::{ProviderRegistry, ProviderSpec};
 use crate::types::{EffortDialect, ThinkingFallback, dialect, merge_body};
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
@@ -512,7 +512,9 @@ impl Provider for CompatProvider {
                 .await;
             }
 
-            let mut body = self.compat.build_body(model, messages, system, tools);
+            let mut body =
+                self.compat
+                    .build_body(model, messages, system, tools, opts.thinking, auth.top_p);
             self.openai.apply_body(&mut body, &ctx);
             if let Some(hook) = &self.build_body {
                 body = hook.call(body, &ctx).await?;
@@ -522,6 +524,28 @@ impl Provider for CompatProvider {
                 .do_stream(model, &headers, &body, event_tx, &auth)
                 .await
         })
+    }
+
+    /// A codec sends HTTP requests and has no use for the directory.
+    fn stream_message_in<'a>(
+        &'a self,
+        model: &'a Model,
+        messages: &'a [Message],
+        system: &'a str,
+        tools: &'a Value,
+        event_tx: &'a Sender<ProviderEvent>,
+        opts: RequestOptions,
+        scope: RequestScope<'a>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        self.stream_message(
+            model,
+            messages,
+            system,
+            tools,
+            event_tx,
+            opts,
+            scope.session_id,
+        )
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {

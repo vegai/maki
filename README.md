@@ -150,7 +150,7 @@ More info at the [official docs](https://maki.sh/docs).
 
 ## Community
 
-[![Discord](https://img.shields.io/discord/1543246528876126218?logo=discord&logoColor=white&label=discord&color=5865F2)](https://discord.gg/dEBhANTbX)
+[![Discord](https://img.shields.io/discord/1543246528876126218?logo=discord&logoColor=white&label=discord&color=5865F2)](https://discord.gg/8VKuA4naC3)
 
 ## Example config
 

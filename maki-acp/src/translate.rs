@@ -398,6 +398,7 @@ fn replay_user(msg: &Message, updates: &mut Vec<SessionUpdate>) {
                 tool_use_id,
                 content,
                 is_error,
+                ..
             } => updates.push(replay_tool_result(tool_use_id, content, *is_error)),
             MsgBlock::Image { source } => {
                 updates.push(SessionUpdate::UserMessageChunk(ContentChunk::new(
@@ -542,11 +543,7 @@ mod tests {
             ]),
             Message {
                 role: MsgRole::User,
-                content: vec![MsgBlock::ToolResult {
-                    tool_use_id: "tu-1".into(),
-                    content: "file.rs".into(),
-                    is_error: false,
-                }],
+                content: vec![MsgBlock::tool_result("tu-1", "file.rs", false)],
                 display_text: None,
                 ..Default::default()
             },
@@ -601,11 +598,7 @@ mod tests {
     fn replay_failed_tool_result_maps_to_failed_status() {
         let msg = Message {
             role: MsgRole::User,
-            content: vec![MsgBlock::ToolResult {
-                tool_use_id: "tu-err".into(),
-                content: "boom".into(),
-                is_error: true,
-            }],
+            content: vec![MsgBlock::tool_result("tu-err", "boom", true)],
             display_text: None,
             ..Default::default()
         };

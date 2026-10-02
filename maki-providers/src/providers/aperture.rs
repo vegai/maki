@@ -55,14 +55,16 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     api_key_env: NO_ENV_VAR,
     family: ModelFamily::Generic,
     supports_thinking: false,
+    supports_deferred_tools: false,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(16_384),
     fallback_context_window: 128_000,
     models_toml: NO_CURATED_MODELS,
+    models_of: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
-        with_auth: create_with_auth,
+        with_auth: Some(create_with_auth),
     }),
     aperture: None,
     login: Some(LoginConfig {
@@ -266,7 +268,8 @@ impl Aperture {
         )
         .or_else(|| {
             spec.native()
-                .map(|n| (n.with_auth)(auth, self.timeouts, self.system_prefix.clone()))
+                .and_then(|n| n.with_auth)
+                .map(|with_auth| with_auth(auth, self.timeouts, self.system_prefix.clone()))
         })
     }
 }
@@ -405,7 +408,9 @@ impl Provider for Aperture {
             let auth = auth.lock().unwrap().clone();
             let mut buf = String::new();
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let body = self.compat.build_body(model, messages, system, tools);
+            let body =
+                self.compat
+                    .build_body(model, messages, system, tools, opts.thinking, auth.top_p);
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
                 .await

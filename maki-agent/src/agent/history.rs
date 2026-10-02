@@ -243,11 +243,7 @@ pub fn close_dangling_tool_calls(messages: &mut Vec<Message>, note: &str) {
     }
     let error_results: Vec<ContentBlock> = last
         .tool_uses()
-        .map(|(id, _, _)| ContentBlock::ToolResult {
-            tool_use_id: id.to_owned(),
-            content: note.to_owned(),
-            is_error: true,
-        })
+        .map(|(id, _, _)| ContentBlock::tool_result(id.to_owned(), note.to_owned(), true))
         .collect();
     messages.push(Message {
         role: Role::User,
@@ -301,11 +297,7 @@ mod tests {
             role: Role::User,
             content: ids
                 .iter()
-                .map(|id| ContentBlock::ToolResult {
-                    tool_use_id: id.to_string(),
-                    content: "ok".into(),
-                    is_error: false,
-                })
+                .map(|id| ContentBlock::tool_result(id.to_string(), "ok", false))
                 .collect(),
             display_text: Some(String::new()),
             ..Default::default()

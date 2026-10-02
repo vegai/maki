@@ -6,7 +6,7 @@ use arc_swap::ArcSwap;
 use serde_json::{Value, json};
 use tracing::{error, info, warn};
 
-use maki_providers::provider::Provider;
+use maki_providers::provider::{Provider, RequestScope};
 use maki_providers::{
     ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, ImageSource, Message, Model, RequestOptions,
     Role, StopReason, StreamResponse,
@@ -19,7 +19,7 @@ use super::instructions::{CallInstructions, LoadedInstructions};
 use super::streaming::{StreamError, StreamRequest, stream_with_retry};
 use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
-use crate::mcp::McpSession;
+use crate::mcp::{McpSession, ToolDeferral};
 use crate::permissions::PermissionManager;
 use crate::tools::hook::Verdict;
 use crate::tools::{Deadline, FileAccess, LocalTools, RequestTools, ToolAudience, ToolContext};
@@ -329,7 +329,7 @@ impl<'h> Agent<'h> {
         self.gauge.seed_if_empty(
             self.history.as_slice(),
             &self.system,
-            request_tools(&self.tools, self.mcp.as_ref()).as_ref(),
+            request_tools(&self.tools, self.mcp.as_ref(), &self.model).as_ref(),
         );
 
         // Every frontend enters here, so busy time is measured here; a turn
@@ -434,7 +434,7 @@ impl<'h> Agent<'h> {
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
-        let tools = request_tools(&self.tools, self.mcp.as_ref());
+        let tools = request_tools(&self.tools, self.mcp.as_ref(), &self.model);
         let response = match stream_with_retry(
             StreamRequest {
                 provider: &*self.provider,
@@ -444,7 +444,10 @@ impl<'h> Agent<'h> {
                 tools: tools.as_ref(),
                 opts: self.opts,
                 output_budget: self.config.max_turn_output,
-                session_id: self.session_id.as_ref(),
+                scope: RequestScope {
+                    session_id: self.session_id.as_ref(),
+                    cwd: self.permissions.cwd(),
+                },
                 retry: self.timeouts.retry,
             },
             Some(self.gauge),
@@ -891,6 +894,7 @@ impl<'h> Agent<'h> {
             &self.config,
             instructions,
             carry_len,
+            self.permissions.cwd(),
             self.timeouts.retry,
         )
         .await?;
@@ -907,7 +911,7 @@ impl<'h> Agent<'h> {
         self.gauge.reset(
             self.history.as_slice(),
             &self.system,
-            request_tools(&self.tools, self.mcp.as_ref()).as_ref(),
+            request_tools(&self.tools, self.mcp.as_ref(), &self.model).as_ref(),
         );
         let context_size_after = self.gauge.size();
         let carry_from = self.history.len().saturating_sub(carry_len);
@@ -992,11 +996,15 @@ fn interrupt_message(message: String, images: Vec<ImageSource>) -> Message {
 /// Free-standing rather than a method, so a caller can hold the result and
 /// still reach `&mut self.gauge`, and so a frontend sizing the same prompt
 /// outside a run does not rebuild the array by hand.
-pub fn request_tools<'t>(tools: &'t RequestTools, mcp: Option<&McpSession>) -> Cow<'t, Value> {
+pub fn request_tools<'t>(
+    tools: &'t RequestTools,
+    mcp: Option<&McpSession>,
+    model: &Model,
+) -> Cow<'t, Value> {
     match mcp {
         Some(mcp) => {
             let mut tools = tools.definitions().clone();
-            mcp.extend_tools(&mut tools);
+            mcp.extend_tools(&mut tools, ToolDeferral::for_model(model));
             Cow::Owned(tools)
         }
         None => Cow::Borrowed(tools.definitions()),
@@ -1388,8 +1396,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn mcp_definitions_refresh_per_request() {
+    fn search_turn(model: Model) -> (Vec<Value>, ContentBlock) {
         smol::block_on(async {
             let provider = MockProvider::new(vec![
                 tool_use_response(
@@ -1400,20 +1407,60 @@ mod tests {
             ]);
             let captured = Arc::clone(&provider.requests);
             let mut history = History::new(Vec::new());
-            let (agent, _event_rx) = make_agent(provider, &mut history);
+            let (agent, _event_rx) = make_agent_with(Arc::new(provider), model, &mut history);
             let mut agent = agent.with_mcp(Some(crate::mcp::test_support::stub_session(&[(
                 "srv.fetch_issue",
                 "Fetch a GitHub issue",
             )])));
             agent.run(default_input()).await.unwrap();
 
-            let captured = captured.lock().unwrap();
-            assert_eq!(captured.len(), 2);
-            let first = tool_names(&captured[0].tools);
-            assert!(first.contains(&crate::mcp::TOOL_SEARCH_TOOL_NAME));
-            assert!(!first.contains(&"srv__fetch_issue"));
-            assert!(tool_names(&captured[1].tools).contains(&"srv__fetch_issue"));
-        });
+            let tools = captured
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| r.tools.clone())
+                .collect();
+            let result = history
+                .as_slice()
+                .iter()
+                .flat_map(|m| &m.content)
+                .find(|b| matches!(b, ContentBlock::ToolResult { .. }))
+                .cloned()
+                .unwrap();
+            (tools, result)
+        })
+    }
+
+    #[test]
+    fn mcp_definitions_refresh_per_request() {
+        let (tools, result) = search_turn(Model::from_spec("openai/gpt-5").unwrap());
+        assert_eq!(tools.len(), 2);
+        let first = tool_names(&tools[0]);
+        assert!(first.contains(&crate::mcp::TOOL_SEARCH_TOOL_NAME));
+        assert!(!first.contains(&"srv__fetch_issue"));
+        assert!(tool_names(&tools[1]).contains(&"srv__fetch_issue"));
+        assert!(
+            matches!(&result, ContentBlock::ToolResult { loaded_tools, .. } if loaded_tools == &["srv__fetch_issue"]),
+            "got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn native_deferral_keeps_tools_array_stable_across_a_load() {
+        let (tools, result) = search_turn(default_model());
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0], tools[1]);
+        let deferred = tools[0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "srv__fetch_issue")
+            .expect("deferred definition ships in the array");
+        assert!(maki_providers::is_deferred_tool(deferred));
+        assert!(
+            matches!(&result, ContentBlock::ToolResult { loaded_tools, .. } if loaded_tools == &["srv__fetch_issue"]),
+            "got: {result:?}"
+        );
     }
 
     fn small_context_model(context_window: u32, max_output_tokens: u32) -> Model {

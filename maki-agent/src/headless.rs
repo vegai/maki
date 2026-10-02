@@ -25,7 +25,7 @@ use crate::types::EventSender;
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, EventStreamGuard,
     ImageSource, InputSource, McpHandle, McpSession, PermissionsConfig, RunLedger, SessionEvents,
-    SessionMailbox, ToolOutputLines, event_stream,
+    SessionMailbox, ToolDeferral, ToolOutputLines, event_stream,
 };
 
 const SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -119,11 +119,13 @@ fn setup(
 }
 
 /// Names advertised to SDK clients: base tools plus what the first request
-/// would carry from MCP (always-load definitions and `tool_search`).
+/// would put in the model's context from MCP (always-load definitions and
+/// `tool_search`). Probed as [`ToolDeferral::Client`] because the native
+/// array lists every deferred definition too.
 fn advertised_tool_names(tools: &Value, mcp: Option<&McpSession>) -> Vec<String> {
     let mut probe = tools.clone();
     if let Some(mcp) = mcp {
-        mcp.extend_tools(&mut probe);
+        mcp.extend_tools(&mut probe, ToolDeferral::Client);
     }
     extract_tool_names(&probe)
 }

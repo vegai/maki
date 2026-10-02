@@ -3,7 +3,7 @@
 //! locally and works without a UI.
 
 use maki_lua_macro::{lua_fn, lua_table};
-use maki_providers::Model;
+use maki_providers::{Model, ModelTier, model_registry};
 use mlua::{Error as LuaError, Lua, Result as LuaResult, Table, Value};
 
 use crate::api::util::command::{ModelRequest, UiAction, ui_json_roundtrip};
@@ -92,6 +92,44 @@ fn info(lua: &Lua, spec: String) -> LuaResult<Pair<Table>> {
     }
 }
 
+/// The model maki uses for a tier, the same one a subagent asking for that
+/// tier gets: your pick from the `/model` picker, else the curated default.
+/// `assigned` tells the two apart. Pass `provider` to prefer its models, the
+/// way subagents prefer the session's provider.
+///
+/// @param name string `"weak"`, `"medium"`, `"strong"`, or `"compaction"`.
+/// @param provider string|nil Provider slug to resolve within first.
+/// @return (table|nil, string|nil) The model in the shape `info` returns, plus
+///   `assigned` (boolean), true when you picked it for this tier. nil and nil
+///   when no model fits the tier, nil and an error when the spec no longer
+///   resolves.
+/// @example
+/// local m = maki.model.tier("weak", maki.model.get().provider)
+/// if m then maki.model.set(m.spec) end
+#[lua_fn]
+fn tier(lua: &Lua, name: String, provider: Option<String>) -> LuaResult<Pair<Table>> {
+    let tier: ModelTier = match name.parse() {
+        Ok(tier) => tier,
+        Err(e) => return Ok(err_pair(e)),
+    };
+    let Some(spec) = provider
+        .and_then(|p| model_registry::spec_for_tier(&p, tier))
+        .or_else(|| model_registry::spec_for_tier_any(tier))
+    else {
+        return Ok((None, None));
+    };
+    let model = match Model::from_spec(&spec) {
+        Ok(model) => model,
+        Err(e) => return Ok(err_pair(format!("tier {tier} points at {spec}: {e}"))),
+    };
+    let tbl = model_info_table(lua, &model)?;
+    tbl.set(
+        "assigned",
+        model_registry::override_tiers(&spec).contains(&tier),
+    )?;
+    Ok((Some(tbl), None))
+}
+
 /// Reads the focused session's model, thinking level, and fast mode.
 /// `thinking` comes back in the spelling `set` accepts, so a table from here
 /// can go straight back in.
@@ -175,7 +213,7 @@ lua_table! {
     /// Without an interactive UI every function returns
     /// `nil, "no interactive UI attached"`.
     "maki.model" => pub(crate) fn create_model_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [get(tx), available(tx), set(tx), info()]
+    DOCS [get(tx), available(tx), set(tx), tier(), info()]
 }
 
 #[cfg(test)]
@@ -183,12 +221,31 @@ mod tests {
     use super::*;
     use crate::api::util::command::{NO_UI_ERR, UI_DROPPED_ERR, UiReply};
     use crate::api::util::convert::lua_to_json;
+    use maki_providers::model_registry;
+    use maki_storage::StateDir;
     use serde_json::{Value as Json, json};
+    use tempfile::TempDir;
     use test_case::test_case;
 
     const SPEC: &str = "anthropic/claude-opus-4-6";
     const THINKING: &str = "high";
     const UI_FAILURE: &str = "Model is not allowed by policy: anthropic/claude-opus-4-6";
+
+    /// Assignments live in a process-global registry, so a test that needs one
+    /// writes it and hands back the pair used to clear it afterwards. `unset`
+    /// only removes a matching spec, hence the spec is returned with the dir.
+    fn assign_tier(spec: &str, tier: ModelTier) -> (Lua, ModelTier, String) {
+        let dir = TempDir::new().unwrap();
+        let storage = StateDir::from_path(dir.path().to_path_buf());
+        model_registry::set_and_persist(spec.into(), tier, &storage);
+        (lua_with_model(None), tier, spec.into())
+    }
+
+    fn clear_tier(tier: ModelTier, spec: String) {
+        let dir = TempDir::new().unwrap();
+        let storage = StateDir::from_path(dir.path().to_path_buf());
+        model_registry::unset_and_persist(&spec, tier, &storage);
+    }
 
     fn lua_with_model(tx: Option<flume::Sender<UiAction>>) -> Lua {
         let lua = Lua::new();
@@ -292,6 +349,59 @@ mod tests {
         let (val, err) = eval(&lua, &format!("return model.info('{spec}')"));
         assert_eq!(err, None);
         assert_eq!(val["free"], expected);
+    }
+
+    /// `tier` answers the assigned model in the same shape `info` does, so a
+    /// plugin can hand the spec straight to `set`.
+    #[test]
+    fn tier_returns_the_assigned_model() {
+        let (lua, tier, spec) = assign_tier(SPEC, ModelTier::Strong);
+        let (val, err) = eval(&lua, "return model.tier('strong')");
+        clear_tier(tier, spec);
+        assert_eq!(err, None);
+        assert_eq!(val["spec"], json!(SPEC));
+        assert_eq!(val["tier"], json!("strong"));
+        assert_eq!(val["assigned"], json!(true));
+    }
+
+    /// An untouched slot still answers the curated default a subagent would
+    /// get, flagged so a plugin can tell it from a real pick.
+    #[test]
+    fn tier_without_an_assignment_falls_back_to_the_default() {
+        let (val, err) = eval(
+            &lua_with_model(None),
+            "return model.tier('weak', 'anthropic')",
+        );
+        assert_eq!(err, None);
+        assert_eq!(val["provider"], json!("anthropic"));
+        assert_eq!(val["tier"], json!("weak"));
+        assert_eq!(val["assigned"], json!(false));
+    }
+
+    #[test]
+    fn tier_with_nothing_to_resolve_answers_nil() {
+        let (val, err) = eval(&lua_with_model(None), "return model.tier('compaction')");
+        assert_eq!((val, err), (Json::Null, None));
+    }
+
+    /// A name maki does not know reports through the error slot, the same way
+    /// `set` reports a spec it cannot parse.
+    #[test]
+    fn tier_with_an_unknown_name_returns_an_error_pair() {
+        let (val, err) = eval(&lua_with_model(None), "return model.tier('turbo')");
+        assert_eq!(val, Json::Null);
+        assert!(err.is_some());
+    }
+
+    /// An assignment left over from a provider that is gone is an error, not a
+    /// silent `nil`: the user did pick something, it just no longer resolves.
+    #[test]
+    fn tier_with_a_stale_assignment_returns_an_error_pair() {
+        let (lua, tier, spec) = assign_tier("no-such-provider/nope", ModelTier::Weak);
+        let (val, err) = eval(&lua, "return model.tier('weak')");
+        clear_tier(tier, spec);
+        assert_eq!(val, Json::Null);
+        assert!(err.is_some());
     }
 
     /// An unresolvable spec answers `(nil, err)` instead of throwing.

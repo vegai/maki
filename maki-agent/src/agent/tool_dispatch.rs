@@ -18,7 +18,9 @@ use crate::tools::{
     CallOrigin, Deadline, FileKey, LocalTool, LocalToolFn, PermissionScopes, ToolAudience,
     ToolContext, truncate_bytes,
 };
-use crate::{AgentError, AgentEvent, CallRecord, ToolDoneEvent, ToolOutput, ToolStartEvent};
+use crate::{
+    AgentError, AgentEvent, CallRecord, TextOutput, ToolDoneEvent, ToolOutput, ToolStartEvent,
+};
 use maki_config::ToolKey;
 use maki_storage::id::SessionRef;
 
@@ -766,14 +768,14 @@ fn run_tool_search(
     let query = input["query"].as_str().unwrap_or_default();
     emit_raw_start(ctx, origin, &id, &tool_id, query.to_owned(), input);
     let (output, is_error) = match mcp.search_tools(query, origin) {
-        Ok(out) => (out, false),
-        Err(e) => (e, true),
+        Ok(found) => (found, false),
+        Err(e) => (e.into(), true),
     };
     ToolDoneEvent {
         call: None,
         id,
         tool: tool_id,
-        output: Arc::new(ToolOutput::Markdown(output.into())),
+        output: Arc::new(ToolOutput::Markdown(output)),
         is_error,
         annotation: None,
         written_path: None,
@@ -882,11 +884,11 @@ async fn execute_mcp_tool(
     ask: Option<&str>,
 ) -> ToolDoneEvent {
     emit_raw_start(ctx, origin, id, &tool, format!("mcp: {tool}"), input);
-    let done = |output: String, is_error: bool| ToolDoneEvent {
+    let done = |output: TextOutput, is_error: bool| ToolDoneEvent {
         call: None,
         id: id.to_owned(),
         tool: Arc::clone(&tool),
-        output: Arc::new(ToolOutput::Plain(output.into())),
+        output: Arc::new(ToolOutput::Plain(output)),
         is_error,
         annotation: None,
         written_path: None,
@@ -895,20 +897,26 @@ async fn execute_mcp_tool(
     let perm_tool = match ToolKey::parse(&tool) {
         Ok(k) => k,
         Err(e) => {
-            return done(format!("invalid MCP tool key '{tool}': {e}"), true);
+            return done(format!("invalid MCP tool key '{tool}': {e}").into(), true);
         }
     };
     if let Err(e) = gate_on_input(ctx, &perm_tool, id, input, ask).await {
-        return done(e, true);
+        return done(e.into(), true);
     }
 
-    // A permitted call counts as loading the tool, so its definition joins the
-    // next request; a denied one must not load anything.
-    mcp.mark_loaded(&tool, origin);
-    match mcp.call_tool(&tool, input).await {
-        Ok(text) => done(text, false),
-        Err(e) => done(e.to_string(), true),
-    }
+    // Only a permitted call loads the tool.
+    let loaded_tools = mcp.load_called(&tool, origin);
+    let (text, is_error) = match mcp.call_tool(&tool, input).await {
+        Ok(text) => (text, false),
+        Err(e) => (e.to_string(), true),
+    };
+    done(
+        TextOutput {
+            loaded_tools,
+            ..text.into()
+        },
+        is_error,
+    )
 }
 
 /// Deduplicates doom-loop repeats, then runs remaining calls in parallel.
@@ -1080,7 +1088,7 @@ mod tests {
     use super::*;
     use crate::cancel::CancelToken;
     use crate::mcp::test_support::stub_session;
-    use crate::mcp::tool_names;
+    use crate::mcp::{ToolDeferral, tool_names};
     use crate::permissions::{
         PERMISSION_DENIED_PREFIX, PermissionAnswer, PermissionManager, TaggedAnswer,
     };
@@ -2192,7 +2200,7 @@ mod tests {
             assert!(done.output.as_text().contains(PROBE_WIRE));
 
             let mut tools = serde_json::json!([]);
-            mcp.extend_tools(&mut tools);
+            mcp.extend_tools(&mut tools, ToolDeferral::Client);
             assert!(
                 tool_names(&tools).contains(&PROBE_WIRE),
                 "searched tool must join the next request"
@@ -2216,14 +2224,15 @@ mod tests {
     }
 
     #[test]
-    fn calling_deferred_mcp_tool_marks_it_loaded() {
+    fn calling_deferred_mcp_tool_loads_it_and_records_the_load_in_its_result() {
         smol::block_on(async {
             let mcp = stub_mcp(&[PROBE_QUALIFIED]);
             let done = dispatch(&mcp_ctx(&mcp), PROBE_WIRE, &serde_json::json!({})).await;
             assert_eq!(done.tool.as_ref(), PROBE_QUALIFIED, "must route to MCP");
+            assert_eq!(done.output.loaded_tools(), [PROBE_WIRE]);
 
             let mut tools = serde_json::json!([]);
-            mcp.extend_tools(&mut tools);
+            mcp.extend_tools(&mut tools, ToolDeferral::Client);
             assert_eq!(
                 tool_names(&tools),
                 vec![PROBE_WIRE],
@@ -2232,9 +2241,9 @@ mod tests {
         });
     }
 
-    /// `McpSession::new` rebuilds the loaded set from the `ToolUse` blocks in
-    /// history, which hold no nested call, so loading one here would make the
-    /// live tool array differ from the resumed one.
+    /// `McpSession::new` rebuilds the loaded set from history, which holds no
+    /// nested call, so loading one here would make the live tool array differ
+    /// from the resumed one.
     #[test_case(PROBE_WIRE, serde_json::json!({}), PROBE_QUALIFIED ; "tool_call")]
     #[test_case(TOOL_SEARCH_TOOL_NAME, serde_json::json!({"query": "probe"}), TOOL_SEARCH_TOOL_NAME ; "tool_search")]
     fn nested_call_reaches_mcp_without_loading_anything(name: &str, input: Value, routed: &str) {
@@ -2242,9 +2251,10 @@ mod tests {
             let mcp = stub_mcp(&[PROBE_QUALIFIED]);
             let done = dispatch_nested(&mcp_ctx(&mcp), name, &input).await;
             assert_eq!(done.tool.as_ref(), routed, "must route to MCP");
+            assert!(done.output.loaded_tools().is_empty());
 
             let mut tools = serde_json::json!([]);
-            mcp.extend_tools(&mut tools);
+            mcp.extend_tools(&mut tools, ToolDeferral::Client);
             assert_eq!(
                 tool_names(&tools),
                 vec![TOOL_SEARCH_TOOL_NAME],
@@ -2267,7 +2277,7 @@ mod tests {
             );
 
             let mut tools = serde_json::json!([]);
-            mcp.extend_tools(&mut tools);
+            mcp.extend_tools(&mut tools, ToolDeferral::Client);
             assert_eq!(
                 tool_names(&tools),
                 vec![TOOL_SEARCH_TOOL_NAME],
@@ -2493,7 +2503,10 @@ mod tests {
                 "plan mode must not block or deny the call, got: {text}"
             );
             let mut tools = serde_json::json!([]);
-            ctx.mcp.as_ref().unwrap().extend_tools(&mut tools);
+            ctx.mcp
+                .as_ref()
+                .unwrap()
+                .extend_tools(&mut tools, ToolDeferral::Client);
             assert!(
                 tool_names(&tools).contains(&&PROBE_WIRE.to_owned()[..]),
                 "a permitted plan-mode call must load the definition"
@@ -2513,8 +2526,12 @@ mod tests {
             assert!(done.is_error);
             let text = done.output.as_text();
             assert!(text.starts_with(PERMISSION_DENIED_PREFIX), "got: {text}");
+            assert!(done.output.loaded_tools().is_empty());
             let mut tools = serde_json::json!([]);
-            ctx.mcp.as_ref().unwrap().extend_tools(&mut tools);
+            ctx.mcp
+                .as_ref()
+                .unwrap()
+                .extend_tools(&mut tools, ToolDeferral::Client);
             assert!(
                 !tool_names(&tools).contains(&&PROBE_WIRE.to_owned()[..]),
                 "an unapproved call must not load the definition"

@@ -16,7 +16,7 @@ use tracing::{debug, warn};
 use url::{Host, Url};
 
 use crate::model::{Model, ModelEntry, ModelInfo, ModelTier, lookup_entry};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, Provider, RequestScope};
 use crate::spec::{BASES, ProviderRegistry, ProviderSpec};
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
@@ -310,9 +310,9 @@ fn honours_openai_wire(target: Target) -> bool {
 /// spec behind the target, because `codec = "google"` and `base = "google"`
 /// reach the same constructor and must answer alike.
 fn honours_system_prefix(target: Target) -> bool {
-    !target
+    target
         .spec()
-        .is_some_and(|spec| spec.slug == super::google::SLUG)
+        .is_none_or(|spec| spec.slug != super::google::SLUG)
 }
 
 pub fn is_valid_slug(s: &str) -> bool {
@@ -1139,6 +1139,29 @@ impl Provider for PluginProvider {
         })
     }
 
+    /// The inner provider is a codec or a native base from
+    /// [`BASES`](crate::spec::BASES), none of which uses the directory.
+    fn stream_message_in<'a>(
+        &'a self,
+        model: &'a Model,
+        messages: &'a [Message],
+        system: &'a str,
+        tools: &'a Value,
+        event_tx: &'a Sender<ProviderEvent>,
+        opts: RequestOptions,
+        scope: RequestScope<'a>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        self.stream_message(
+            model,
+            messages,
+            system,
+            tools,
+            event_tx,
+            opts,
+            scope.session_id,
+        )
+    }
+
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
             let result = self.models().await;
@@ -1206,10 +1229,13 @@ pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, Agent
 
     let inner = match entry.target {
         Target::Base(spec) => {
-            let native = spec.native().ok_or_else(|| AgentError::Config {
-                message: format!("base provider '{}' has no constructor", spec.slug),
-            })?;
-            (native.with_auth)(shared, timeouts, prefix)
+            let with_auth = spec
+                .native()
+                .and_then(|native| native.with_auth)
+                .ok_or_else(|| AgentError::Config {
+                    message: format!("base provider '{}' has no constructor", spec.slug),
+                })?;
+            with_auth(shared, timeouts, prefix)
         }
         Target::Codec(protocol) => codec::build(codec_options(&entry, protocol), shared, timeouts),
     };

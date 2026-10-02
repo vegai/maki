@@ -21,10 +21,12 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     api_key_env: ENV_VAR,
     family: ModelFamily::Generic,
     supports_thinking: true,
+    supports_deferred_tools: false,
     accepts_arbitrary_models: true,
     fallback_max_output: None,
     fallback_context_window: 200_000,
     models_toml: NO_CURATED_MODELS,
+    models_of: None,
     pricing_schedule: None,
     build: Build::Declared,
     aperture: Some(ApertureRoute {

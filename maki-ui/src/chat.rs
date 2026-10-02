@@ -769,6 +769,7 @@ fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
                 tool_use_id,
                 content,
                 is_error,
+                ..
             } = block
             {
                 map.insert(tool_use_id.as_str(), (*is_error, content.as_str()));
@@ -806,11 +807,7 @@ mod tests {
         let tool_result = Message {
             role: Role::User,
             content: vec![
-                ContentBlock::ToolResult {
-                    tool_use_id: TASK_ID.into(),
-                    content: USER_TEXT.into(),
-                    is_error: false,
-                },
+                ContentBlock::tool_result(TASK_ID, USER_TEXT, false),
                 ContentBlock::Image { source: image() },
             ],
             ..Default::default()
@@ -1104,11 +1101,7 @@ mod tests {
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "t1".into(),
-                    content: result.into(),
-                    is_error,
-                }],
+                content: vec![ContentBlock::tool_result("t1", result, is_error)],
                 ..Default::default()
             },
         ]
@@ -1144,11 +1137,7 @@ mod tests {
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "t1".into(),
-                    content: "hi".into(),
-                    is_error: false,
-                }],
+                content: vec![ContentBlock::tool_result("t1", "hi", false)],
                 ..Default::default()
             },
             Message {

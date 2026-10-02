@@ -62,7 +62,9 @@ The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discov
 | Strong | claude-opus-4-6 | $5.00 / $25.00 | 200K ctx / 128K out |
 | Strong | claude-opus-4-7 | $5.00 / $25.00 | 200K ctx / 128K out |
 | Strong | claude-opus-4-8 | $5.00 / $25.00 | 200K ctx / 128K out |
+| Strong | claude-opus-5-5 | $4.00 / $20.00 | 200K ctx / 128K out |
 | Strong | **claude-opus-5** (default) | $5.00 / $25.00 | 200K ctx / 128K out |
+| Strong | claude-fable-5-1 | $10.00 / $50.00 | 200K ctx / 128K out |
 | Strong | claude-fable-5 | $10.00 / $50.00 | 200K ctx / 128K out |
 | Strong | claude-opus-4-0, claude-opus-4-1 | $15.00 / $75.00 | 200K ctx / 32K out |
 
@@ -341,6 +343,15 @@ Aperture discovers models from your gateway. Set `APERTURE_HOST` to your Tailsca
 
 No hardcoded model catalog. Use any model ID supported by this provider. An API key is required.
 
+### Claude Code (experimental)
+
+- **Env var**: None. The provider is on only while the `claude_code` plugin is enabled in `init.lua`, and it shares some of the plugin's options. Log in with `claude auth login` on a claude.ai subscription.
+- **Features**: Experimental. Runs maki's agent loop on the Claude models of a Claude subscription, through the [`claude` CLI](https://code.claude.com/docs/en/cli-reference). maki runs every tool call itself.
+
+The models Claude Code offers your account, each with the context window Claude Code opens for it. Tiers and list prices come from the anthropic provider, or from models.dev for a release not yet in its table.
+
+The [Claude Code guide](/docs/claude-code/#experimental-provider) covers setup, limits and billing.
+
 ## Model Identifiers
 
 Models are referenced as `provider/model_id`:
@@ -422,9 +433,11 @@ supports_vision = false
 | `api_key` | string | Inline key (prefer the env var or `maki auth login`) |
 | `headers` | table | Extra HTTP headers sent on every request to this provider. Values expand `${VAR}` from the environment; an unset or empty variable fails the provider instead of sending a half-filled header. A same-name header (case-insensitive) replaces the built-in auth header and survives key rotation |
 | `default_model` | string | Used after login when no model is saved yet. On a custom entry it is also the startup fallback when no built-in or plugin provider is available. Without it, startup picks a declared `strong` or `medium` model |
+| `top_p` | f64 | Nucleus sampling probability, sent as `top_p` in the request body for OpenAI-compatible, Anthropic, Bedrock and Google providers. Claude and GPT models reject it while thinking is on, so it is dropped there. Never sent to Copilot or over the OpenAI responses path. Only sent when set, so the provider's own default applies otherwise. Must be in `(0, 1]` |
 | `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
 | `enable_free_models` | bool | Opencode only. Show free catalog models (default false) |
 | `subsidised_by` | string | Name of the flat subscription prepaying this provider (e.g. `"Max"`). Models bill $0 and show the published list price beside it as a reference. The list-price fallback needs `protocol = "anthropic"` |
+| `supports_deferred_tools` | bool | The endpoint can load a deferred MCP tool without rewriting the cached tools prefix (see [MCP](../mcp/#loads-and-the-prompt-cache)). True for Anthropic direct and Bedrock. A custom `protocol = "anthropic"` provider defaults to false and opts in here. Set it to false on a built-in pointed at a gateway without this support |
 | `models` | array | Declared models for custom providers (see below) |
 | `overrides` | table | Aperture only. Per-upstream model overrides (see below) |
 

@@ -21,10 +21,12 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     api_key_env: ENV_VAR,
     family: ModelFamily::Generic,
     supports_thinking: true,
+    supports_deferred_tools: false,
     accepts_arbitrary_models: false,
     fallback_max_output: Some(384_000),
     fallback_context_window: 1_000_000,
     models_toml: include_str!("../../models/deepseek.toml"),
+    models_of: None,
     pricing_schedule: Some(&PEAK_HOURS),
     build: Build::Declared,
     aperture: Some(ApertureRoute {

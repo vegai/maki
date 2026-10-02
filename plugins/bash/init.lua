@@ -22,10 +22,6 @@ local SEPARATOR = "──────"
 
 local rtk_available
 
-local function shell_quote(s)
-  return "'" .. s:gsub("'", "'\\''") .. "'"
-end
-
 local function unquote(s)
   local q = s:sub(1, 1)
   if (q == '"' or q == "'") and s:sub(-1) == q then
@@ -102,36 +98,45 @@ local function rtk_find_unsupported(cmd)
   return false
 end
 
+local function run_rtk(cmd)
+  local id = maki.fn.jobstart(cmd)
+  if not id then
+    return nil
+  end
+  local result = maki.fn.jobwait(id, RTK_REWRITE_TIMEOUT_MS)
+  if not result then
+    maki.fn.jobstop(id)
+  end
+  return result
+end
+
 local function rtk_rewrite(command, ctx)
   local config = ctx:config()
   if config and not config.rtk then
     return nil
   end
+  local cmd = command:match("^%s*(.-)%s*$")
+  -- The rewrite runs after the user approved the command. rtk rewrites single
+  -- commands, and a script must run exactly as the user saw it.
+  if cmd:find("\n", 1, true) then
+    return nil
+  end
 
   if rtk_available == nil then
-    local id = maki.fn.jobstart("rtk --version")
-    local result = maki.fn.jobwait(id, RTK_REWRITE_TIMEOUT_MS)
-    if result then
-      rtk_available = (result.exit_code == 0)
-    else
-      maki.fn.jobstop(id)
-      rtk_available = false
-    end
+    local result = run_rtk({ "rtk", "--version" })
+    rtk_available = result ~= nil and result.exit_code == 0
   end
 
   if not rtk_available then
     return nil
   end
 
-  local cmd = command:match("^%s*(.-)%s*$")
   if cmd:match("^cargo ") and cmd:find(" -- ", 1, true) then
     return nil
   end
 
-  local id = maki.fn.jobstart("rtk rewrite " .. shell_quote(command))
-  local result = maki.fn.jobwait(id, RTK_REWRITE_TIMEOUT_MS)
+  local result = run_rtk({ "rtk", "rewrite", command })
   if not result then
-    maki.fn.jobstop(id)
     return nil
   end
 
@@ -170,8 +175,6 @@ local function create_bash_view(command, ctx)
   end)
   return buf, view
 end
-
-local cwd = maki.uv.cwd() or "."
 
 local COMPLEX_TYPES = {
   command_substitution = true,
@@ -253,7 +256,7 @@ local function collect_commands(node, source)
 end
 
 local description = [[Execute a bash command.
-Commands run in ]] .. cwd .. [[ by default.
+Commands run in the session's working directory (see Environment) by default.
 
 - **DO NOT** use for file ops! Only git, builds, tests, and system commands.
 - Use `workdir` param instead of `cd <dir> && <cmd>` patterns.
@@ -433,7 +436,7 @@ maki.api.register_tool({
 
     view:append({ { "Waiting for output...", "dim" } })
 
-    maki.fn.jobstart(command, {
+    local job, err = maki.fn.jobstart(command, {
       cwd = workdir,
       env = { GIT_TERMINAL_PROMPT = "0" },
       on_stdout = function(_, line)
@@ -456,6 +459,9 @@ maki.api.register_tool({
         finish(code)
       end,
     })
+    if not job then
+      return { llm_output = "error: " .. err, is_error = true }
+    end
 
     -- Esc or deadline: hand back the lines streamed so far, so the model
     -- keeps what the user just watched instead of a bare error.

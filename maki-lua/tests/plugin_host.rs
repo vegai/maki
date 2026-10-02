@@ -240,6 +240,8 @@ const STRING_NAME_SCHEMA: &str = r#"{
 }"#;
 const JOB_BAD_CWD: &str = "~/definitely/not/a/dir";
 const JOB_BAD_CWD_ERR_PREFIX: &str = "cwd is not a directory: ";
+const JOB_UNKNOWN_ID: u32 = 999_999;
+const JOBWAIT_UNKNOWN_ERR: &str = "jobwait: unknown job id or already waited";
 const NIL_WITHOUT_JOBS_ERR: &str =
     "handler returned nil without calling ctx:finish() or starting jobs";
 const FINISH_CALLED_TWICE_ERR: &str = "ctx:finish() already called";
@@ -248,6 +250,9 @@ const TIMED_OUT_SUBSTR: &str = "timed out";
 const ALREADY_CALLED_ERR: &str = "already called";
 const UNKNOWN_FIELD_ERR: &str = "unknown field";
 const PERMISSION_DENIED_MSG: &str = "permission denied";
+const STDIN_MODE_ERR: &str = "jobstart: stdin must be \"pipe\" or \"null\"";
+const CHANCLOSE_STREAM_ERR: &str = "chanclose: you can close only \"stdin\"";
+const CHANSEND_DATA_ERR: &str = "chansend: data must be a string or a list";
 
 #[test]
 fn stdlib_globals_accessible() {
@@ -1729,6 +1734,27 @@ fn jobwait_fires_callbacks_while_waiting() {
 }
 
 #[test]
+fn jobwait_unknown_id_returns_err() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "wait_unknown",
+            description = "waits on a job id that never existed",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function()
+                local res, err = maki.fn.jobwait({JOB_UNKNOWN_ID})
+                return tostring(res) .. "|" .. tostring(err)
+            end
+        }})"#,
+    );
+    host.load_source("wait_unknown", &src).unwrap();
+    let out = exec_tool(&reg, "wait_unknown", serde_json::json!({})).unwrap();
+    assert_eq!(out, format!("nil|{JOBWAIT_UNKNOWN_ERR}"));
+}
+
+#[test]
 fn jobstart_invalid_cwd_errors_with_expanded_path() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -1739,7 +1765,7 @@ fn jobstart_invalid_cwd_errors_with_expanded_path() {
             schema = {MINIMAL_SCHEMA},
             audiences = {{ "main" }},
             handler = function(input, ctx)
-                local _, err = pcall(maki.fn.jobstart, "pwd", {{ cwd = "{JOB_BAD_CWD}" }})
+                local _, err = maki.fn.jobstart("pwd", {{ cwd = "{JOB_BAD_CWD}" }})
                 return tostring(err)
             end
         }})"#,
@@ -2947,6 +2973,28 @@ maki.api.register_tool({{
         .end_sessions_blocking([session], SessionEndReason::Shutdown);
 }
 
+/// A stdin mode, stream or payload a job cannot use is an error.
+#[test_case::test_case(r#"maki.fn.jobstart("true", { stdin = "file" })"#, STDIN_MODE_ERR ; "an_unknown_stdin_mode")]
+#[test_case::test_case(r#"maki.fn.chanclose(1, "stdout")"#, CHANCLOSE_STREAM_ERR ; "closing_stdout")]
+#[test_case::test_case("maki.fn.chansend(1, 42)", CHANSEND_DATA_ERR ; "a_number_to_send")]
+fn job_input_it_cannot_take_is_refused(call: &str, expected: &str) {
+    const TOOL: &str = "job_input";
+    let mut perms = maki_lua::PluginPermissions::denied();
+    perms.set(maki_lua::Permission::Run, true);
+    let src = perm_tool_src(
+        TOOL,
+        &format!(
+            r#"local ok, err = pcall(function() {call} end)
+                return tostring(ok) .. ":" .. tostring(err)"#
+        ),
+    );
+
+    let result = exec_tool_with_perms(perms, &src, TOOL, json!({})).unwrap();
+
+    assert!(result.starts_with("false"), "got: {result}");
+    assert!(result.contains(expected), "got: {result}");
+}
+
 /// `run` on its own is enough to start a job, but pointing a stream at a path
 /// is a write, so it costs `fs_write` too.
 #[test]
@@ -3244,11 +3292,11 @@ maki.api.register_tool({{
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function()
-        local ok, res = pcall(maki.fn.jobwait, job_id, 10000)
-        if not ok then
-            return {{ llm_output = "error: " .. tostring(res), is_error = true }}
+        local res, err = maki.fn.jobwait(job_id, 10000)
+        if not res then
+            return {{ llm_output = "error: " .. err, is_error = true }}
         end
-        return "exit:" .. tostring(res and res.exit_code) .. "|exit_cb:" .. tostring(exit_cb_result)
+        return "exit:" .. tostring(res.exit_code) .. "|exit_cb:" .. tostring(exit_cb_result)
     end,
 }})
 "#,
@@ -3686,6 +3734,25 @@ fn register_options_rejects_bad_spec(src: &str, expected: &str) {
         .load_source("opts_plugin", src)
         .expect_err("plugin load should fail");
     assert!(err.to_string().contains(expected), "got: {err}");
+}
+
+/// A plugin that fails after registering its options has them dropped with
+/// the rest of its load, so anything tracking loaded plugins, such as the
+/// claude-code provider, never sees it as loaded.
+#[test]
+fn a_plugin_that_fails_after_declaring_options_is_not_listed() {
+    const PLUGIN: &str = "fails_late";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        PLUGIN,
+        r#"
+        maki.api.register_options({ a = { default = 1, desc = "A." } })
+        error("an error after the options")
+        "#,
+    )
+    .expect_err("the load of the plugin must give an error");
+    assert!(!host.plugin_options().unwrap().contains_key(PLUGIN));
 }
 
 #[test]
@@ -5472,6 +5539,20 @@ fn perm_tool_src(name: &str, handler_body: &str) -> String {
     "run"
     ; "run_denied"
 )]
+#[test_case::test_case(
+    "chansend_deny",
+    r#"local ok, err = pcall(function() maki.fn.chansend(1, "x") end)
+                return tostring(err)"#,
+    "run"
+    ; "chansend_denied"
+)]
+#[test_case::test_case(
+    "chanclose_deny",
+    r#"local ok, err = pcall(function() maki.fn.chanclose(1) end)
+                return tostring(err)"#,
+    "run"
+    ; "chanclose_denied"
+)]
 fn denied_permission_blocks_api(tool_name: &str, handler_body: &str, expected_perm: &str) {
     let src = perm_tool_src(tool_name, handler_body);
     let result = exec_tool_with_perms(
@@ -5483,6 +5564,25 @@ fn denied_permission_blocks_api(tool_name: &str, handler_body: &str, expected_pe
     .unwrap();
     assert!(result.contains(PERMISSION_DENIED_MSG), "got: {result}");
     assert!(result.contains(expected_perm), "got: {result}");
+}
+
+/// `chanclose` returns what `vim.fn.chanclose` returns, so a call written for
+/// Neovim can check it.
+#[cfg(unix)]
+#[test]
+fn chanclose_returns_one_like_neovim() {
+    let src = perm_tool_src(
+        "chanclose_value",
+        r#"local id = maki.fn.jobstart({ "cat" }, { stdin = "pipe" })
+                local closed = maki.fn.chanclose(id, "stdin")
+                maki.fn.jobwait(id, 5000)
+                return "closed=" .. tostring(closed)"#,
+    );
+    let mut perms = maki_lua::PluginPermissions::denied();
+    perms.set(maki_lua::Permission::Run, true);
+    let result =
+        exec_tool_with_perms(perms, &src, "chanclose_value", serde_json::json!({})).unwrap();
+    assert!(result.contains("closed=1"), "got: {result}");
 }
 
 #[test]
@@ -5500,12 +5600,14 @@ fn user_plugin_with_fs_read_can_read_but_not_write() {
     assert!(result.contains("write=false"), "got: {result}");
 }
 
-/// Locating maki's own directories, or a program on `$PATH`, answers where a
-/// file lives and never what the environment holds. `fs_read` is what these
-/// cost, and it is also what they need, so `env` stays the key to the process
-/// environment alone.
+/// These calls locate maki's directories, a program on `$PATH` or the
+/// session's directory, or read the instruction files there. They reveal
+/// file locations or contents rather than the environment, so they need
+/// `fs_read`, and `env` stays reserved for the process environment.
 #[test_case::test_case("maki.env.state_dir()" ; "state_dir")]
 #[test_case::test_case(r#"maki.fn.executable("ls")"# ; "executable")]
+#[test_case::test_case("ctx:cwd()" ; "session_dir")]
+#[test_case::test_case("ctx:instructions()" ; "session_instructions")]
 fn location_queries_cost_fs_read(call: &str) {
     const TOOL: &str = "location_test";
     let src = perm_tool_src(
@@ -6553,12 +6655,9 @@ maki.api.register_tool({{
         job_id = maki.fn.jobstart("sleep 1", {{
             scope = {{ session = "{session}" }},
             on_exit = function(id, code)
-                local ok, res = pcall(maki.fn.jobwait, id, 2000)
-                if not ok then
-                    error("self-wait errored: " .. tostring(res))
-                end
-                if res == nil then
-                    error("self-wait timed out")
+                local res, err = maki.fn.jobwait(id, 2000)
+                if not res then
+                    error("self-wait failed: " .. err)
                 end
                 if res.exit_code ~= code then
                     error("self-wait code mismatch")
@@ -6574,12 +6673,9 @@ maki.api.register_tool({{
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function()
-        local ok, res = pcall(maki.fn.jobwait, job_id, 10000)
-        if not ok then
-            return {{ llm_output = "error: " .. tostring(res), is_error = true }}
-        end
-        if res == nil then
-            return {{ llm_output = "error: outer wait timed out", is_error = true }}
+        local res, err = maki.fn.jobwait(job_id, 10000)
+        if not res then
+            return {{ llm_output = "error: " .. err, is_error = true }}
         end
         return "exit:" .. tostring(res.exit_code)
     end,
@@ -6622,12 +6718,9 @@ maki.api.register_tool({{
             scope = {{ session = "{session}" }},
             on_stdout = function() maki.fs.write("{parked}", "parked") end,
         }})
-        local ok, res = pcall(maki.fn.jobwait, id, 25000)
-        if not ok then
-            return {{ llm_output = "error: " .. tostring(res), is_error = true }}
-        end
-        if res == nil then
-            return {{ llm_output = "error: jobwait timed out", is_error = true }}
+        local res, err = maki.fn.jobwait(id, 25000)
+        if not res then
+            return {{ llm_output = "error: " .. err, is_error = true }}
         end
         return "exit:" .. tostring(res.exit_code)
     end,
@@ -6682,14 +6775,11 @@ maki.api.register_tool({{
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function()
-        local ok, res = pcall(maki.fn.jobwait, job_id, 10000)
-        if not ok then
-            return {{ llm_output = "error: " .. tostring(res), is_error = true }}
+        local res, err = maki.fn.jobwait(job_id, 10000)
+        if not res then
+            return {{ llm_output = "error: " .. err, is_error = true }}
         end
-        if res == nil then
-            return {{ llm_output = "error: timed out", is_error = true }}
-        end
-                return "exit:" .. tostring(res.exit_code) .. "|stdout:" .. tostring(res.stdout)
+        return "exit:" .. tostring(res.exit_code) .. "|stdout:" .. tostring(res.stdout)
     end,
 }})
 "#
