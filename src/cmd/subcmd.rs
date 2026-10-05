@@ -586,7 +586,7 @@ pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMo
                 eprintln!("maki refreshed the claude-code model list ({count} models)")
             }
             Some(Err(e)) => refresh_failures.push(format!(
-                "maki cannot refresh the claude-code model list, and a saved list stays in use until it is a day old: {e}"
+                "maki cannot refresh the claude-code model list. A saved list remains valid for one day: {e}"
             )),
             None => {}
         }

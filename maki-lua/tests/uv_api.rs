@@ -34,8 +34,7 @@ fn os_getenv_returns_nil_for_missing_var() {
     .unwrap();
 }
 
-/// Cargo and nextest set it for the test process, so the test cannot pass
-/// by comparing two nils.
+/// Cargo and nextest set this variable, so two nil values cannot satisfy the assertion.
 #[test]
 fn os_environ_agrees_with_os_getenv() {
     setup()

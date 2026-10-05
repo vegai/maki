@@ -123,5 +123,11 @@ case $scenario in
   api_key) init ANTHROPIC_API_KEY; sleep 30 ;;
   other_arguments) init none; connect; generation tool_use; dispatch changed; sleep 30 ;;
   refused_then_quiet) init none; line '{"type":"assistant","error":"invalid_request","is_api_error_message":true,"message":{"model":"<synthetic>","content":[{"type":"text","text":"Prompt is too long"}]}}'; sleep 30 ;;
-  hang) init none; touch "$dir/hanging"; exec sleep 30 ;;
+  hang)
+    init none
+    sleep 240 </dev/null >/dev/null 2>&1 &
+    echo $! > "$dir/member-pid"
+    touch "$dir/hanging"
+    exec sleep 240
+    ;;
 esac

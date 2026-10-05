@@ -79,8 +79,7 @@ async fn run_btw(
     let tools = Value::Array(vec![]);
     let messages = maki_providers::adapt_images_for_model(&model, &messages).await;
 
-    // The request owns the sender and drops it when it ends, so the loop
-    // below runs out of events and stops.
+    // The request must own the sender so its completion closes the event channel.
     let stream_fut = async move {
         provider
             .stream_message_in(
@@ -125,18 +124,23 @@ async fn run_btw(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-    use std::sync::Mutex;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use flume::Sender;
     use futures_lite::FutureExt;
+    use maki_agent::AgentError;
+    use maki_providers::provider::{BoxFuture, Provider, RequestScope};
+    use maki_providers::{
+        ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
+        TokenUsage,
+    };
+    use maki_storage::id::SessionRef;
+    use serde_json::Value;
     use smol::Timer;
 
-    use maki_agent::AgentError;
-    use maki_providers::provider::BoxFuture;
-    use maki_providers::{ModelInfo, StreamResponse, TokenUsage};
-
-    use super::*;
+    use super::{BTW_REMINDER, BtwEvent, btw_question, run_btw};
 
     const Q: &str = "why sqlite?";
     const SESSION_DIR: &str = "/session/dir";
@@ -144,7 +148,6 @@ mod tests {
     const NEVER_ENDED: &str = "the side question did not stop";
     const END_LIMIT: Duration = Duration::from_secs(10);
 
-    /// Like claude-code, it runs only in the directory a request passes.
     #[derive(Default)]
     struct DirOnlyProvider {
         asked_in: Mutex<Option<PathBuf>>,
@@ -193,8 +196,6 @@ mod tests {
         }
     }
 
-    /// A side question runs in the session's directory, where claude-code
-    /// starts Claude Code, and ends with `Done` when its request ends.
     #[test]
     fn a_side_question_runs_in_the_session_directory_and_ends() {
         let provider = Arc::new(DirOnlyProvider::default());
@@ -225,7 +226,7 @@ mod tests {
         msg.content
             .iter()
             .filter_map(|b| match b {
-                maki_providers::ContentBlock::Text { text } => Some(text.as_str()),
+                ContentBlock::Text { text } => Some(text.as_str()),
                 _ => None,
             })
             .collect()

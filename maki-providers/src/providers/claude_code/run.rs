@@ -1,7 +1,5 @@
-//! The Claude Code process behind one request. Its process group stops
-//! whenever the request stops, including when maki drops the future, and the
-//! handoff server stops after the group, so no held call sees its connection
-//! close while Claude Code could still use it.
+//! Each request owns a Claude Code process group. Stop the group before the handoff server so
+//! held calls retain their connection during cleanup.
 
 use std::collections::VecDeque;
 use std::env;
@@ -15,15 +13,13 @@ use std::io::{self, Write};
 use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(target_os = "linux")]
+use std::os::unix::net::UnixStream;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, ExitStatus, Stdio};
-#[cfg(target_os = "linux")]
-use std::sync::OnceLock;
 use std::sync::{Arc, Mutex, PoisonError};
-#[cfg(target_os = "linux")]
-use std::thread;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -37,8 +33,6 @@ use futures_lite::{FutureExt, Stream, StreamExt};
 use rustix::io::Errno;
 #[cfg(target_os = "linux")]
 use rustix::process::{Pid, getuid, test_kill_process};
-#[cfg(target_os = "linux")]
-use rustix::process::{Signal, getppid, set_parent_process_death_signal};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use smol::process::{Child, ChildStdin, ChildStdout, Command};
@@ -48,6 +42,8 @@ use tracing::{debug, info, warn};
 
 use super::checks::{self, InitExpect, Profile, RULES};
 use super::error::Error;
+#[cfg(target_os = "linux")]
+use super::guard;
 use super::mcp::{self, Handoff};
 use super::stream::{
     CONTROL_RESPONSE, INITIALIZE, Offered, SUCCESS, Step, Turn, control_request, user_message,
@@ -100,34 +96,27 @@ const NO_THINKING: (&str, &str) = ("CLAUDE_CODE_DISABLE_THINKING", "1");
 /// nothing until its text. A model that always thinks does so even with
 /// thinking off, so the flag goes on every run.
 const SHOWN_THINKING: (&str, &str) = ("--thinking-display", "summarized");
-#[cfg(target_os = "linux")]
-const SPAWNER_THREAD: &str = "claude-code-spawner";
-#[cfg(target_os = "linux")]
-const NO_SPAWNER: &str = "the thread that starts Claude Code is gone";
 /// maki owns the history and compacts it itself.
 const NO_AUTO_COMPACT: (&str, &str) = ("DISABLE_AUTO_COMPACT", "1");
-/// Otherwise Claude Code resends a request that hit a stream error, without
-/// streaming.
+/// Otherwise Claude Code can resend a failed request without stream events.
 const NO_NONSTREAMING_FALLBACK: (&str, &str) = ("CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK", "1");
 /// maki retries a temporary API error itself. Claude Code's own retry would
 /// start a second generation inside one stream, which maki cannot tell from a
 /// broken stream.
 const NO_CLI_RETRIES: (&str, &str) = ("CLAUDE_CODE_MAX_RETRIES", "0");
-/// On Claude 5 models, Claude Code otherwise ends each request with a system
-/// message of its own, and puts the conversation's only cache mark on it. The
-/// next request has more transcript before that message, so it reads nothing
-/// of the conversation from the cache.
+/// On Claude 5 models, Claude Code puts the cache mark on its final system message. Disable
+/// that message so later requests reuse transcript blocks.
 const NO_MID_CONVERSATION_SYSTEM: (&str, &str) =
     ("CLAUDE_CODE_MODEL_CAPABILITIES", "-mid_conv_system");
 /// Claude Code loads nothing on its own, and only maki's handoff server can
 /// receive tool calls.
 const SETTINGS: &str = r#"{"disableAllHooks":true,"autoMemoryEnabled":false,"autoCompactEnabled":false,"claudeMdExcludes":["**"],"disableClaudeAiConnectors":true,"permissions":{"allow":["mcp__maki"]}}"#;
 const EMPTY_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
-/// Claude Code starts a call as soon as its block ends, while the model may
-/// keep writing the rest of the reply, and maki holds every call until the
-/// reply is done. Its HTTP MCP client gives up on a call after 60 s, and on a
-/// quiet server after 5 minutes, unless the server sets its own `timeout`.
-/// This is the largest value Claude Code accepts.
+/// Claude Code starts tool calls before the reply ends. maki holds them until the complete
+/// reply arrives.
+///
+/// The HTTP MCP client has short call and server timeouts. Use the largest accepted server
+/// timeout so the client cannot answer held calls.
 const HELD_CALL_TIMEOUT_MS: u64 = i32::MAX as u64;
 
 pub(crate) struct Limits {
@@ -224,14 +213,18 @@ pub(crate) enum Thinking {
 struct Group {
     child: Child,
     reaped: bool,
+    #[cfg(target_os = "linux")]
+    _lifetime: UnixStream,
 }
 
 impl Group {
     async fn spawn(command: process::Command) -> Result<Self, Error> {
-        spawn_bound(command).await.map_err(|source| Error::Io {
-            what: "start Claude Code",
-            source,
-        })
+        smol::unblock(move || spawn_piped(command))
+            .await
+            .map_err(|source| Error::Io {
+                what: "start Claude Code",
+                source,
+            })
     }
 
     /// Only while the unreaped leader's pid still names the group.
@@ -241,8 +234,8 @@ impl Group {
         }
     }
 
-    /// Kills whatever is left in the group before reaping the leader, so the
-    /// kill can never hit a new group that reused the pid.
+    /// Kill remaining group members before the leader reap so the pid cannot identify another
+    /// group.
     async fn wait(&mut self, deadline: Instant) -> Result<ExitStatus, Error> {
         let exited = self.exited_by(deadline).await;
         self.kill();
@@ -288,6 +281,10 @@ impl Drop for Group {
 }
 
 fn spawn_piped(command: process::Command) -> io::Result<Group> {
+    #[cfg(target_os = "linux")]
+    let mut command = command;
+    #[cfg(target_os = "linux")]
+    let lifetime = guard::bind(&mut command)?;
     let child = Command::from(command)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -296,56 +293,9 @@ fn spawn_piped(command: process::Command) -> io::Result<Group> {
     Ok(Group {
         child,
         reaped: false,
+        #[cfg(target_os = "linux")]
+        _lifetime: lifetime,
     })
-}
-
-/// Linux kills the child when maki dies, even from a signal that runs no
-/// destructor. It sends that signal when the spawning thread exits, so every
-/// child comes from one thread that lives as long as maki.
-#[cfg(target_os = "linux")]
-async fn spawn_bound(mut command: process::Command) -> io::Result<Group> {
-    type Spawn = (process::Command, Sender<io::Result<Group>>);
-    static SPAWNER: OnceLock<Option<Sender<Spawn>>> = OnceLock::new();
-    let maki = Pid::from_raw(process::id() as i32);
-    // SAFETY: prctl and getppid are async-signal-safe, and nothing here
-    // allocates.
-    unsafe {
-        command.pre_exec(move || {
-            set_parent_process_death_signal(Some(Signal::KILL))
-                .map_err(|errno| io::Error::from_raw_os_error(errno.raw_os_error()))?;
-            // maki died before the signal was set.
-            if getppid() != maki {
-                return Err(io::Error::from_raw_os_error(Errno::SRCH.raw_os_error()));
-            }
-            Ok(())
-        });
-    }
-    let gone = || io::Error::other(NO_SPAWNER);
-    let spawner = SPAWNER
-        .get_or_init(|| {
-            let (jobs, received) = flume::unbounded::<Spawn>();
-            thread::Builder::new()
-                .name(SPAWNER_THREAD.to_owned())
-                .spawn(move || {
-                    // A request cancelled while its process started drops the
-                    // group, here or in the channel, and so stops it.
-                    for (command, reply) in received.iter() {
-                        let _ = reply.send(spawn_piped(command));
-                    }
-                })
-                .ok()?;
-            Some(jobs)
-        })
-        .as_ref()
-        .ok_or_else(gone)?;
-    let (reply, answer) = flume::bounded(1);
-    spawner.send((command, reply)).map_err(|_| gone())?;
-    answer.recv_async().await.map_err(|_| gone())?
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn spawn_bound(command: process::Command) -> io::Result<Group> {
-    spawn_piped(command)
 }
 
 fn command(
@@ -403,10 +353,8 @@ fn private_dir(base: &Path, project: &Path) -> Result<(TempDir, PathBuf), Error>
     Ok((dir, path))
 }
 
-/// Names a private directory after maki's pid and its pid namespace, so a
-/// later maki in that namespace can remove it if this one dies first. A pid
-/// names the same process only within its namespace, and without one there
-/// is no owner a sweep could check.
+/// Include the pid namespace in the directory name. A later maki process can then identify
+/// dead owners with pids scoped to their own namespace.
 fn dir_prefix() -> String {
     #[cfg(target_os = "linux")]
     if let Some(namespace) = pid_namespace() {
@@ -631,10 +579,11 @@ async fn send(stdin: &mut Option<ChildStdin>, data: &str, deadline: Instant) -> 
     .await
 }
 
-/// The version and the policy can change between requests, so each request
-/// checks both before Claude Code starts in the project. Only temporary API
-/// errors and a stalled reply are retried, by maki's loop, because any other
-/// error may come after Claude Code already sent the request.
+/// Versions and policy can change between requests. Validate both before a process starts in
+/// the project.
+///
+/// Retry only temporary API errors and stalled replies. Other failures can occur after Claude
+/// Code sends the request.
 pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
     let started = Instant::now();
     let limits = req.limits;
@@ -701,10 +650,8 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
             what: "write the request files",
             source,
         })?;
-    // This function has the server, and not the work below, so the server
-    // closes only after the process group is reaped after an error, or
-    // killed on a cancel. No held call sees its connection close while
-    // Claude Code can still use that call.
+    // Keep the server outside the request future so process cleanup finishes first. Held
+    // calls must retain their connection until Claude Code stops.
     let mut server = Some(server);
     let (args, env) = run_args(&req, &model_arg, &mcp_file, &prompt_file);
     let tools = catalog.exposed();
@@ -910,8 +857,8 @@ async fn converse(
     let deadline = Instant::now() + limits.exit;
     drain(&mut turn, &mut lines, &handoffs, deadline, stopped).await?;
     let status = group.wait(deadline).await?;
-    // After the reap Claude Code makes no more calls, and closing the server
-    // ends the queue, so a call still queued gets checked too.
+    // After the reap, Claude Code cannot make calls. Stop the server to end the queue and
+    // validate all remaining calls.
     drop(server.take());
     queued_handoffs(&mut turn, handoffs, Instant::now() + limits.exit).await?;
     if !stopped && !status.success() {
@@ -1039,9 +986,7 @@ async fn probe(
     .await
 }
 
-/// Reads the version on every request instead of caching it: `claude
-/// --version` takes about 8 ms, and a cache would miss an upgrade between two
-/// requests.
+/// A CLI upgrade between requests invalidates a cached version.
 async fn checked_profile(
     executable: &Path,
     env: &[(String, String)],
@@ -1241,6 +1186,7 @@ mod tests {
     /// Set in the copy of the test binary that plays maki.
     const MAKI_ROLE: &str = "MAKI_TEST_PLAYS_MAKI";
     const KILLED_MAKI_TEST: &str = "a_killed_maki_takes_claude_code_along";
+    const MEMBER_PID: &str = "member-pid";
     const LONG_SLEEP_SECS: &str = "30";
     /// Much larger than a pipe buffer, so the write blocks when nobody reads.
     const UNREAD_PROMPT_BYTES: usize = 1 << 20;
@@ -1284,7 +1230,8 @@ mod tests {
     const LINGERING_MEMBER: &str = "sleep 30 </dev/null >/dev/null 2>&1 & echo $!";
 
     /// The call can reach the server before or after the generation ends,
-    /// which the stream tests pin in both orders. maki gets the whole batch with its own tool names and the
+    /// which the stream tests pin in both orders. maki gets the whole batch with its own tool
+    /// names and the
     /// final usage, and no process or private file is left behind.
     #[test_case("batch" ; "the_generation_first")]
     #[test_case("cut_line" ; "a_last_line_the_stop_cut_short")]
@@ -1425,9 +1372,8 @@ mod tests {
         assert!(fake.group_gone());
     }
 
-    /// A process that starts after its request was cancelled has no owner, so
-    /// its group stops, whether the request went before the spawner sent it or
-    /// before the request took it from the channel.
+    /// Cancellation can precede spawn completion or channel receipt. An unclaimed process
+    /// group must stop in either case.
     #[cfg(target_os = "linux")]
     #[test_case(true ; "before_the_send")]
     #[test_case(false ; "in_the_channel")]
@@ -1573,12 +1519,8 @@ mod tests {
         assert!(matches!(result, Err(Error::NotOffered(_))), "{result:?}");
     }
 
-    /// Nothing Claude Code does on its own can enter the conversation. Its
-    /// compaction is off in the environment and the checked settings, it
-    /// retries nothing, and it does not resend a request after a stream error.
-    /// Its MCP client also never gives up on a held call before maki ends the
-    /// request, and its cache mark stays on the transcript, where the next
-    /// request can read it back.
+    /// Only maki can compact or retry the conversation. Held calls must wait until maki stops
+    /// the request. Keep cache marks on the transcript.
     #[test]
     fn claude_code_neither_compacts_nor_retries_on_its_own() {
         let fake = Fake::new("text");
@@ -1704,8 +1646,9 @@ mod tests {
     /// die with maki rather than with the request. The test binary runs
     /// itself as that maki, with `TMPDIR` in a dir this test owns.
     #[cfg(target_os = "linux")]
-    #[test]
-    fn a_killed_maki_takes_claude_code_along() {
+    #[test_case(Signal::TERM, "sigterm" ; "sigterm")]
+    #[test_case(Signal::KILL, "sigkill" ; "sigkill")]
+    fn a_killed_maki_takes_claude_code_along(signal: Signal, case: &str) {
         if env::var_os(MAKI_ROLE).is_some() {
             let _ = smol::block_on(Fake::new("hang").request());
             return;
@@ -1713,7 +1656,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let (_, tests) = module_path!().split_once("::").unwrap();
         let mut maki = process::Command::new(env::current_exe().unwrap())
-            .args(["--exact", &format!("{tests}::{KILLED_MAKI_TEST}")])
+            .args(["--exact", &format!("{tests}::{KILLED_MAKI_TEST}::{case}")])
             .env(MAKI_ROLE, "1")
             .env("TMPDIR", temp.path())
             .stdout(Stdio::null())
@@ -1730,14 +1673,21 @@ mod tests {
         let fake_dir = hanging().unwrap();
         let pid = fs::read_to_string(fake_dir.join("pid")).unwrap();
         let pid = Pid::from_raw(pid.trim().parse().unwrap()).unwrap();
+        let member = fs::read_to_string(fake_dir.join(MEMBER_PID)).unwrap();
+        let running = || {
+            fs::read(format!("/proc/{}/cmdline", member.trim()))
+                .is_ok_and(|bytes| !bytes.is_empty())
+        };
+        assert!(running(), "the fake never started its descendant");
 
         let maki_pid = Pid::from_raw(maki.id().try_into().unwrap()).unwrap();
-        kill_process(maki_pid, Signal::TERM).unwrap();
+        kill_process(maki_pid, signal).unwrap();
         maki.wait().unwrap();
 
         let gone = wait_until(|| test_kill_process_group(pid).is_err());
         let _ = kill_process_group(pid, Signal::KILL);
         assert!(gone, "Claude Code outlived maki");
+        assert!(!running(), "a descendant outlived maki");
         let temp_base = fake_dir.join(TEMP_BASE);
         sweep_dead_owners(&temp_base);
         let left: Vec<_> = fs::read_dir(temp_base).unwrap().collect();
@@ -1956,8 +1906,7 @@ mod tests {
         );
     }
 
-    /// After the leader exits on its own, the rest of its group is stopped
-    /// before the leader is reaped, while its pid still names the group.
+    /// The unreaped leader reserves the group pid. Kill remaining group members before the reap.
     #[test]
     fn a_leader_that_exits_takes_its_group_along() {
         let here = env::current_dir().unwrap();

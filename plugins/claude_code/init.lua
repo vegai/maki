@@ -1,8 +1,7 @@
--- Runs one task in the user's Claude Code, on their claude.ai login. The
--- prompt goes out only after two processes pass the handshake: a probe in an
--- empty temporary directory, then the run. A hook that organization policy
--- keeps on runs when Claude Code starts, so the probe makes it run in that
--- empty directory rather than in the project.
+-- Send the task only after the probe and worker pass the handshake.
+--
+-- Managed hooks can run at startup. Run the probe in an empty directory so a rejected hook
+-- cannot write to the project.
 
 local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
@@ -18,8 +17,8 @@ local MODELS = { "sonnet", "opus", "haiku", "fable" }
 local PROBE_DIR_TEMPLATE = "maki-claude-code.XXXXXXXX"
 local DEFAULT_TMP_DIR = "/tmp"
 local MS_PER_SEC = jobs.MS_PER_SEC
--- Claude Code must pass its startup checks in this time, and so must each
--- helper process of a call that sets no time of its own.
+-- A stalled startup must not occupy a request slot indefinitely. Apply this limit to helpers
+-- without their own timeout.
 local STARTUP_TIMEOUT_SECS = 30
 local STARTUP_MS = STARTUP_TIMEOUT_SECS * MS_PER_SEC
 -- Each step of a coding snapshot, such as the copy, must finish in this time.
@@ -33,35 +32,34 @@ local ARTIFACTS_LEAF = "changes"
 local READ_PROFILE = "read"
 local CODE_PROFILE = "code"
 local ERROR_PREFIX = jobs.ERROR_PREFIX
-local STARTING = "Starting Claude Code..."
-local SNAPSHOTTING = "Taking a snapshot of the project..."
-local PREPARING = "Running the prepare command..."
+local STARTING = "Start Claude Code..."
+local SNAPSHOTTING = "Create a snapshot of the project..."
+local PREPARING = "Run the prepare command..."
 local ABANDONED = "The worker's snapshot stays in %s until maki removes it."
-local CHECKING = "Checking the login and policy of Claude Code %s"
+local CHECKING = "Validate the login and policy of Claude Code %s"
 local NO_SESSION_DIR = "maki cannot find the session's working directory: "
 -- A permission scope: "claude <profile> <model>".
 local SCOPE = "claude %s %s"
-local WAITING = "Waiting for a free Claude Code slot..."
+local WAITING = "Wait for a free Claude Code slot..."
 local ROUTE_OK = "claude.ai subscription%s on Claude Code %s, maki found no route conflict"
 local ROUTE_UNCONFIRMED = "maki could not confirm the route on Claude Code %s"
 local PROBE_RUN = "Claude Code started a run during its checks, before maki sent a prompt"
 local UNCHECKED_START = "Claude Code started its run before maki accepted its checks"
-local PREPARE_FAILED = "maki could not prepare the dependencies (%s). If a check uses them, report that the check "
-  .. "could not run, not that it passed."
-local UNSETTLED = "Some dependencies changed while maki copied them (%s), so they may mix two versions. "
+local PREPARE_FAILED = "maki could not prepare the dependencies (%s). Report any check that needs them as unavailable."
+local UNSETTLED = "Some dependencies changed while maki copied them (%s). They can contain parts of two versions. "
   .. "Mention this for every check that uses them."
 
 local description = [[Send a task to Claude through the user's Claude subscription.
 
-Claude cannot see this conversation, so put everything it needs in `prompt`. Give file paths rather than file contents.
-- `profile = "read"` (default): Claude reads, globs and greps the project. Use it to investigate code, and ask for short results with file:line locations.
-- `profile = "code"`: Claude edits files and runs commands in a private snapshot of the project, and returns its changes as an artifact. Nothing reaches the checkout until you review the changes and call claude_code_import. List the untracked files it needs in `include`.
-- The user sees the reply only when they open it in the tool view, so relay the important parts.]]
+Claude cannot see this conversation. Put all necessary task data in `prompt`. Give file paths instead of file contents.
+- `profile = "read"` (default): Claude reads, globs and greps the project. Ask for short results with file:line locations.
+- `profile = "code"`: Claude edits files and runs commands in a private project snapshot. It returns changes as an artifact. Review them before claude_code_import changes the checkout. List necessary untracked files in `include`.
+- The user must open the tool view to see the reply. Relay the parts necessary for the main task.]]
 
 local import_description =
-  [[Apply a claude_code coding artifact's changes to the checkout with one bash command, which the user must approve.
+  [[Apply a claude_code artifact's changes to the checkout with one approved bash command.
 
-If a file it changes also changed in the checkout since the snapshot, nothing applies. If the import stops partway, the error lists what it applied, and a second import applies the rest. Pass `paths` to import only some files.]]
+If a target changed since the snapshot, the import stops before any checkout change. A later conflict can stop import partway. The error lists applied changes. A retry preserves earlier backups and applies changes that remain safe. Use `paths` to select files.]]
 
 local opts = maki.api.register_options(output_limits.extend({
   executable = { default = "claude", desc = "The Claude Code executable." },
@@ -111,7 +109,8 @@ local opts = maki.api.register_options(output_limits.extend({
     default = "",
     desc = "Absolute path of the directory for coding snapshots and their changes. Defaults to "
       .. "`claude_code/changes` in the maki state directory. On the project's filesystem, maki can clone the "
-      .. "dependencies instead of copying them. Expiry removes only the artifacts maki made there.",
+      .. "dependencies with copy-on-write. Imports of replacements or deletions need hard links on the checkout filesystem. "
+      .. "Expiry removes only artifacts that maki created there.",
   },
   artifact_ttl_hours = {
     default = 24,
@@ -130,8 +129,6 @@ end
 if not valid_model[opts.model] then
   error("the `model` option must be one of " .. table.concat(MODELS, ", ") .. ", not " .. tostring(opts.model))
 end
--- Like the checks above, every option that does not depend on the session
--- is checked once, when the plugin loads.
 if opts.config_dir ~= "" and opts.config_dir:sub(1, 1) ~= "/" then
   error("the `config_dir` option must be an absolute path, not " .. opts.config_dir)
 end
@@ -284,11 +281,11 @@ local function claude_job_opts(cwd, env, stderr_tail)
   }
 end
 
--- The first problem stops the probe at once, so a probe that then hangs
--- cannot turn it into a timeout. The probe runs with the run's `env`, in a
--- directory under the user's own temporary directory (`spec.env`) rather
--- than in a coding call's artifact: a rejected call removes its artifact,
--- along with anything a policy hook wrote there.
+-- A failed check must stop the probe immediately. Otherwise a stalled probe can replace the
+-- refusal with a timeout.
+--
+-- Keep the probe outside a coding artifact. Refusal removes that artifact, but a managed
+-- hook's output must remain available.
 local function probe(call, spec, argv, env, confine)
   local dir, dir_err = probe_dir(spec.env, spec, call)
   if not dir then
@@ -395,21 +392,20 @@ local function snapshot_plan(input)
   return { include = include, dependencies = dependencies, root = root }
 end
 
--- The shell cannot read the checkout by any path (the session dir, the
--- repository root, a worktree's primary checkout and git common dir), the
--- login, maki's state and config, other artifacts or known credentials. It
--- can write only to its snapshot and tmp.
--- For each command the sandbox mounts an empty filesystem over every denied
--- folder, so the shell cannot see artifacts created after the worker starts
--- either. The worker's snapshot and tmp are made writable again, and its git
--- directory readable but not writable. Mounting the whole artifact
--- read-only would make the snapshot inside it read-only too. The sandbox
--- skips a denied path that does not exist.
+-- Deny every checkout alias, git directory, login path and credential path. This includes
+-- maki state, config and other artifacts.
+--
+-- Each sandbox command mounts empty filesystems over denied directories, including artifacts
+-- created after startup. Restore write access only to the snapshot and temporary directory.
+-- Keep the git directory read-only.
+--
+-- A read-only mount of the entire artifact would also block snapshot writes. The sandbox
+-- skips nonexistent denied paths.
 local function coding_confine(spec, artifact)
   local deny = table.clone(spec.checkout_dirs)
   deny[#deny + 1] = spec.config_dir
   deny[#deny + 1] = maki.fs.dirname(artifact.dir)
-  -- These four can be nil, and appending nil adds nothing.
+  -- Optional paths can be nil. Use explicit inserts so later paths remain in the list.
   deny[#deny + 1] = spec.git_dir
   deny[#deny + 1] = maki.env.state_dir()
   deny[#deny + 1] = maki.env.config_dir()
@@ -432,7 +428,11 @@ local function fill_snapshot(call, view, plan, artifact, cwd, env)
   end
   if opts.prepare ~= "" then
     view:append({ { PREPARING, "dim" } })
-    artifact.prepare_err = snapshot.prepare(call, artifact, opts.prepare, env, opts.prepare_timeout_secs * MS_PER_SEC)
+    artifact.prepare_err, err =
+      snapshot.prepare(call, artifact, opts.prepare, env, opts.prepare_timeout_secs * MS_PER_SEC)
+    if err then
+      return "maki cannot record the prepared snapshot: " .. err
+    end
   end
   view:append({ { STARTING, "dim" } })
   return nil
@@ -588,8 +588,8 @@ function Run.new(ctx, call, spec, confine, timeout_secs)
     answers = {},
     stderr_tail = {},
     has_progress = false,
-    -- Claude Code sends init only after reading the prompt, so an init
-    -- before the prompt means it skipped the handshake.
+    -- Claude Code sends init after it reads the prompt. An earlier init means it bypassed the
+    -- handshake.
     prompted = false,
     finished = false,
   }, Run)
@@ -693,8 +693,7 @@ function Run:on_answer(control)
   end
   if self:send(launch.user_message(self.task, self.spec.instructions)) then
     self.prompted = true
-    -- From here the snapshot holds the worker's work, and it stays until
-    -- maki removes it, so the user can look at it whatever the run's result.
+    -- Keep the worker snapshot regardless of the result so the user can inspect its work.
     self.call.artifact = nil
     maki.fn.chanclose(self.job_id, "stdin")
   end
@@ -860,9 +859,8 @@ local function run(input, ctx, call, timeout_secs)
   end
   local report = change_report(call, artifact, spec.cwd)
   call.artifact = nil
-  -- The report names the artifact the import needs, so the reply is
-  -- shortened to fit the report within the output limits, and the report
-  -- itself is never cut.
+  -- The report identifies the artifact necessary for import. Shorten the reply first so
+  -- output limits cannot remove the report.
   local report_lines = select(2, report:gsub("\n", "")) + 1
   local answer_lines = math.max(claude.max_lines - report_lines - 1, 1)
   local answer_bytes = math.max(claude.max_bytes - #report - 2, 1)
@@ -912,7 +910,7 @@ local function handler(input, ctx)
     ctx:live_buf(buf)
   end
   permit = semaphore:acquire()
-  -- Time spent waiting for a slot does not count toward the timeout.
+  -- Start the timeout only after slot acquisition.
   ctx:set_deadline(timeout_secs)
 
   local ok, reply = pcall(run, input, ctx, call, timeout_secs)
@@ -1014,7 +1012,11 @@ local function import_handler(input, ctx)
     end
   end
   if result.originals then
-    lines[#lines + 1] = "The previous versions stay in " .. result.originals .. " until maki removes the artifact."
+    lines[#lines + 1] = "The previous versions stay in "
+      .. result.originals
+      .. " and "
+      .. result.displaced
+      .. " until maki removes the artifact."
   end
   if result.unrecorded then
     lines[#lines + 1] = result.unrecorded

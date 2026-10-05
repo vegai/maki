@@ -1,6 +1,5 @@
-//! Why a Claude Code request stopped. maki retries only temporary API errors,
-//! where the API did not serve the request, because for any other error
-//! Claude Code may already have sent it.
+//! Retry only temporary API errors for requests the API did not serve. Other errors can occur
+//! after Claude Code sends a request.
 
 use std::io;
 use std::path::PathBuf;
@@ -24,8 +23,7 @@ const TEMPORARY_KINDS: &[(&str, u16)] = &[
 /// How much of a JSON value a message shows, enough to recognize it.
 const SHOWN_JSON_CHARS: usize = 200;
 
-/// Formats a JSON value for a message, cutting a long one so a huge value
-/// from Claude Code cannot flood the error.
+/// Limit JSON size so malformed CLI output cannot flood the error message.
 fn shown(value: &Value) -> String {
     let text = value.to_string();
     match text.char_indices().nth(SHOWN_JSON_CHARS) {
@@ -98,7 +96,7 @@ pub(crate) enum Error {
     #[error("`claude --version` printed nothing")]
     NoVersion,
     #[error(
-        "Claude Code failed to list the models a moment ago, and maki waits {} minutes or a refresh before asking again: {message}",
+        "Claude Code model discovery failed. maki will retry after {} minutes or an explicit refresh: {message}",
         wait.as_secs() / 60
     )]
     ListedRecently { message: String, wait: Duration },

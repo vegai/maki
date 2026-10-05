@@ -1,8 +1,7 @@
--- Cases that both the plugin's checks (`spec.lua`) and the provider's checks
--- (`checks.rs`) must decide the same way. A case with a `problem` must be
--- refused with a message containing it, and any other case accepted. The
--- provider embeds this file and reads the JSON between the long brackets, so
--- the file holds one JSON document and nothing else.
+-- Cases that both the plugin's checks (`spec.lua`) and the provider's checks (`checks.rs`)
+-- must decide the same way. A case with a `problem` must be refused with that message text,
+-- and any other case accepted. The provider embeds this file and reads the JSON between the
+-- long brackets, so the file holds one JSON document and nothing else.
 return maki.json.decode([==[
 {
   "versions": [

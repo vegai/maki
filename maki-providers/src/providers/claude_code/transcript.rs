@@ -1,6 +1,5 @@
-//! maki's system prompt, the conversation as a transcript in one user
-//! message, and maki's tools as the MCP catalog, under names Claude Code
-//! accepts and maki can map back.
+//! Use maki's system prompt and conversation transcript. The MCP catalog maps tool names to
+//! identifiers that Claude Code accepts.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -127,16 +126,11 @@ fn push_line(out: &mut String, value: &Value) {
     let _ = write!(out, "\n{value}");
 }
 
-/// The conversation as text blocks: the header, then one block per message.
-/// Anthropic caches a prefix only at block boundaries, and Claude Code puts
-/// its cache mark on the last block, so a new request can read every earlier
-/// message from the cache. Joined, the blocks are the transcript text, one
-/// JSON value per line.
+/// Anthropic caches prefixes at block boundaries. Keep each transcript message in a separate
+/// block so later requests reuse earlier messages.
 ///
-/// Each tool appears under the name the model sees, so the model can call it
-/// again by the name it reads. Thinking is left out, because its signature is
-/// valid only in the request that produced it. An image fails the request,
-/// because maki turns images into notes for models without vision.
+/// Use the tool names visible to the model. Omit thinking because its signature is valid only
+/// for its original request. Reject images after maki's image adaptation.
 pub(crate) fn transcript(messages: &[Message]) -> Result<Vec<String>, Error> {
     let mut blocks = vec![TRANSCRIPT_HEADER.to_owned()];
     for message in messages {
@@ -290,7 +284,11 @@ mod tests {
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::tool_result("toolu_1", "fn main() {}", false)],
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "toolu_1".into(),
+                    content: "fn main() {}".into(),
+                    is_error: false,
+                }],
                 ..Default::default()
             },
             Message::observation("the build broke".into()),
@@ -320,9 +318,8 @@ mod tests {
         );
     }
 
-    /// The prompt cache matches a prefix only at block boundaries, so a longer
-    /// history must keep every earlier block byte for byte and only add blocks
-    /// after them. The same history gives the same blocks.
+    /// Cache reuse needs identical earlier blocks. New history must append blocks without
+    /// changes to existing bytes.
     #[test]
     fn a_longer_history_only_adds_blocks_to_the_transcript() {
         let messages = history();

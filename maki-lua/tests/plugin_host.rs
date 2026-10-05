@@ -3713,9 +3713,8 @@ fn register_options_rejects_bad_spec(src: &str, expected: &str) {
     assert!(err.to_string().contains(expected), "got: {err}");
 }
 
-/// A plugin that fails after registering its options has them dropped with
-/// the rest of its load, so anything tracking loaded plugins, such as the
-/// claude-code provider, never sees it as loaded.
+/// A failed plugin load must remove its registered options so the provider cannot mistake it
+/// for a loaded plugin.
 #[test]
 fn a_plugin_that_fails_after_declaring_options_is_not_listed() {
     const PLUGIN: &str = "fails_late";

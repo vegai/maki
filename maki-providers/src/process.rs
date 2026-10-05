@@ -60,9 +60,7 @@ fn find_program_in(
     absolute(found).ok()
 }
 
-/// Returns the file names `name` can run as: `name` itself, or, when it has
-/// no extension, `name` with each extension in `extensions` (a `PATHEXT`),
-/// which is how Windows finds `git` as `git.exe`.
+/// Windows uses `PATHEXT` to resolve extensionless commands such as `git` to `git.exe`.
 fn spellings(name: &str, extensions: Option<&OsStr>) -> Vec<String> {
     match extensions.and_then(OsStr::to_str) {
         Some(extensions) if Path::new(name).extension().is_none() => extensions
@@ -88,9 +86,8 @@ fn group_of(pid: u32) -> Option<Pid> {
     i32::try_from(pid).ok().and_then(Pid::from_raw)
 }
 
-/// Blocks until the child `pid` exits, without reaping it. The zombie keeps
-/// its pid, which is the group id, so the kernel cannot hand it to another
-/// process. Returns false if it cannot wait for the child.
+/// Wait for exit without a reap. The zombie reserves its pid, which identifies the process
+/// group. Return false if the wait fails.
 #[cfg(unix)]
 pub fn wait_without_reaping(pid: u32) -> bool {
     let Some(pid) = group_of(pid) else {
@@ -114,10 +111,8 @@ pub fn kill_group(pid: u32) {
     if let Some(pid) = group_of(pid) {
         let _ = kill_process_group(pid, Signal::KILL);
     }
-    // `taskkill` finds the process by pid, and the pid belongs to it only
-    // while the caller holds the process handle, so this waits for the kill.
-    // A spawned `taskkill` could find the pid after the caller reaps and kill
-    // whatever reused it. Stopping many jobs waits for each in turn.
+    // Hold the process handle until `taskkill` completes. Otherwise the pid can identify
+    // another process before `taskkill` sends its signal.
     #[cfg(windows)]
     {
         let _ = Command::new("taskkill")

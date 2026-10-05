@@ -2981,6 +2981,7 @@ dependencies = [
  "isahc",
  "jiff",
  "keyring",
+ "libc",
  "maki-config",
  "maki-storage",
  "open",

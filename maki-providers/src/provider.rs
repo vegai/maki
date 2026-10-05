@@ -155,8 +155,7 @@ struct UnconfiguredProvider;
 const STATIC_FALLBACK: &str = "using static fallback";
 const NO_FALLBACK: &str = "there is no model list";
 
-/// Returns the rows maki knows without asking, and a warning saying whether
-/// there are any. A provider running another provider's models has none.
+/// A provider that uses another provider's model table has no curated rows of its own.
 fn failed_listing(spec: &ProviderSpec, error: &AgentError) -> ModelBatch {
     let models: Vec<String> = spec
         .listed_rows()

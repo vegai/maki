@@ -35,9 +35,7 @@ M.WORKERS = {
 }
 local RULES = require("claude_rules")
 
---- Returns true if {value} came from a JSON array. `ipairs` skips an
---- object's entries, so a check that walks a list with `ipairs` would pass
---- an object without reading it.
+--- `ipairs` skips object entries. Require a JSON array so an object cannot bypass list validation.
 function M.is_list(value)
   if type(value) ~= "table" then
     return false
@@ -65,10 +63,10 @@ end
 -- Limits for a call's `timeout` and for the option.
 M.MIN_TIMEOUT_SECS = 30
 M.MAX_TIMEOUT_SECS = 1800
--- The minimum is the only version rule, because each call checks every
--- login, setting, hook and tool it does not know, and every plugin that is
--- not built in. To try a new version, run the live tests in
--- `maki-lua/tests/claude_code/qualify.rs`.
+-- The minimum version supplies the necessary protocol. Each call must validate every login,
+-- setting, hook, tool and plugin input.
+--
+-- Run the live tests in `maki-lua/tests/claude_code/qualify.rs` to qualify a new CLI version.
 local MINIMUM_VERSION = table.concat(RULES.minimum_version, ".")
 -- `uname` names in lower case. Path rules, symlinks and process cleanup
 -- differ per OS.
@@ -276,13 +274,11 @@ function M.config_dir(configured, home)
   return dir
 end
 
--- A worktree's `.git` file names its git directory, whose `commondir` leads
--- to the primary `.git`. Returns the primary checkout, an error, and the git
--- directory that holds the checkout's objects: the primary `.git`, or for a
--- submodule, which has no `commondir`, its own git directory. An unreadable
--- file, or a `commondir` naming a missing directory, is an error, because
--- then the primary checkout's local settings cannot be checked. The path is
--- resolved lexically, as Claude Code and the provider resolve it.
+-- A worktree's `.git` file identifies its git directory. `commondir` leads to the primary
+-- checkout. A submodule has its own git directory.
+--
+-- Unreadable git paths must stop validation because the primary checkout can contain local
+-- settings. Resolve paths lexically, as Claude Code does.
 local function main_checkout(git_file)
   local text, err = maki.fs.read(git_file)
   if not text then
@@ -313,12 +309,8 @@ local function main_checkout(git_file)
   return maki.fs.basename(common) == ".git" and maki.fs.dirname(common) or nil, nil, common
 end
 
---- Returns the directories whose `.claude/settings.local.json` Claude Code
---- can read from {cwd}: {cwd} (some Claude Code versions), the repository
---- root, and a worktree's primary checkout. It walks up to `.git` without
---- running git. The second value is an error, and the third is the git
---- directory outside {cwd} that holds the project's objects, for a worktree
---- or a submodule.
+--- Local settings can exist in the session directory, repository root and primary checkout.
+--- Git objects can also reside outside the session directory.
 function M.local_settings_dirs(cwd)
   local dirs, seen = {}, {}
   local function add(dir)
@@ -390,11 +382,8 @@ function M.in_checkout(path, spec)
   return spec.git_dir ~= nil and M.within(path, spec.git_dir)
 end
 
---- Returns the files that `--setting-sources ""` ignores. Managed settings
---- still apply, and the handshake checks them. Claude Code reads the
---- project's `settings.json` only in the working directory (checked on
---- 2.1.284 from a subdirectory), but `settings.local.json` in every dir of
---- {local_dirs}.
+--- Managed settings still apply and need handshake validation. Claude Code reads project
+--- settings in its working directory and local settings in each `local_dirs` entry.
 function M.skipped_settings(config_dir, cwd, local_dirs)
   local paths = {
     maki.fs.joinpath(config_dir, RULES.settings_file),
@@ -568,9 +557,8 @@ function M.sandbox_problem(sandbox, confine)
   return nil
 end
 
---- Returns nil only when the settings are maki's plus safe managed keys,
---- every hook is off, no readable root is added, maki's deny rules apply,
---- and a {worker} that runs commands stays within {confine}.
+--- Only maki settings and safe managed restrictions can pass. The worker shell must also
+--- remain inside `confine`.
 local function deny_rules(extra)
   local rules = {}
   for i, pattern in ipairs(assert(M.denied_paths(extra))) do

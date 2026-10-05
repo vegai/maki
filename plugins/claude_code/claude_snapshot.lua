@@ -181,7 +181,13 @@ local function snapshot_paths(call, artifact, spec)
       return nil, untracked_err
     end
     for _, path in ipairs(workspace.listed_paths(untracked)) do
-      take(path)
+      local dependency = false
+      for _, dir in ipairs(spec.dependencies) do
+        dependency = dependency or path:sub(1, #dir + 1) == dir .. "/"
+      end
+      if not dependency then
+        take(path)
+      end
     end
   end
   local unusual = workspace.first_non_utf8(paths)
@@ -192,7 +198,7 @@ local function snapshot_paths(call, artifact, spec)
   if #submodules > 0 then
     artifact.notes[#artifact.notes + 1] = SUBMODULES_LEFT_OUT .. shown(submodules)
   end
-  return paths
+  return paths, nil, files
 end
 
 -- The project's exclusions apply, because the worker's shell can read the
@@ -395,7 +401,7 @@ end
 --- `dependencies`. A dependency that changed during the copy sets
 --- `artifact.unsettled`.
 function M.fill(call, artifact, spec)
-  local paths, paths_err = snapshot_paths(call, artifact, spec)
+  local paths, paths_err, tracked = snapshot_paths(call, artifact, spec)
   if not paths then
     return paths_err
   end
@@ -408,7 +414,7 @@ function M.fill(call, artifact, spec)
   if copy_err then
     return "maki cannot copy the project: " .. copy_err
   end
-  local dependencies, deps_err = copy_dependencies(call, artifact, spec, paths)
+  local dependencies, deps_err = copy_dependencies(call, artifact, spec, tracked)
   if not dependencies then
     return deps_err
   end
@@ -432,7 +438,7 @@ function M.fill(call, artifact, spec)
       kept[#kept + 1] = path
     end
   end
-  return commit_base(call, artifact, kept, dependencies) or consistency_problem(call, artifact, spec)
+  return commit_base(call, artifact, kept, spec.dependencies) or consistency_problem(call, artifact, spec)
 end
 
 --- An import rewrites the manifest, so the sweep keeps the artifact of an
@@ -565,6 +571,7 @@ end
 --- `prepare` runs as the user, outside the sandbox, with maki's environment
 --- and the artifact's `TMPDIR`. maki removes any links it made out of the
 --- snapshot.
+--- Returns the command error, then any fatal sanitation or baseline error.
 function M.prepare(call, artifact, command, env, timeout_ms)
   local _, err = call:run_quick(
     { "sh", "-c", command },
@@ -572,9 +579,9 @@ function M.prepare(call, artifact, command, env, timeout_ms)
   )
   local dropped, links_err = drop_escaping_links(call, artifact, env)
   if not dropped then
-    return err or links_err
+    return err, links_err
   end
-  return err or commit_prepared(call, artifact)
+  return err, commit_prepared(call, artifact)
 end
 
 --- Writes nothing inside the snapshot, because the worker controls it and a
@@ -759,8 +766,8 @@ local function select_changes(manifest, paths)
   return todo, skipped
 end
 
---- The import writes the artifact's objects after checking them against
---- their ids. It never reads the snapshot folder, which the user can edit.
+--- The user can edit the snapshot after collection. Import only artifact objects whose bytes
+--- match their ids.
 local function check_import(call, env, artifact, todo)
   local current, current_err = checkout_state(call, env, artifact, todo)
   if not current then
@@ -880,26 +887,27 @@ function M.import(ctx, call, spec)
   local _, record_err = maki.fs.atomic_write(artifact.manifest_path, maki.json.encode(artifact.manifest))
   local unrecorded = record_err and UNRECORDED:format(record_err) or nil
   local originals = replaced and maki.fs.joinpath(artifact.dir, workspace.IMPORT_ORIGINALS) or nil
+  local displaced = maki.fs.joinpath(artifact.dir, workspace.IMPORT_DISPLACED)
   if #landed == #todo then
     return {
       applied = workspace.summary(todo),
       skipped = skipped,
       originals = originals,
+      displaced = replaced and displaced or nil,
       unrecorded = unrecorded,
       -- The command can still fail after its last write, and its error and
       -- any leftovers belong in the reply.
       failure = failure,
     }
   elseif #landed == 0 then
-    return nil, "maki imported no changes: " .. failure
+    return nil, "maki imported no changes: " .. failure .. "\nExamine any preserved files in " .. artifact.dir .. "."
   end
   local applied, missed = {}, {}
   for _, change in ipairs(todo) do
     local list = artifact.manifest.imported[change.path] and applied or missed
     list[#list + 1] = change.path
   end
-  local kept = originals and " The versions it replaced are in " .. originals .. " until maki removes the artifact."
-    or ""
+  local kept = originals and " The preserved versions are in " .. originals .. " and " .. displaced .. "." or ""
   return nil, M.stopped_partway(applied, missed, kept .. (unrecorded and " " .. unrecorded or ""), failure)
 end
 

@@ -77,10 +77,8 @@ pub const FIXTURE_GLOBAL_RULE: &str = "Write the replies in English.";
 /// this lets only one test at a time move it.
 static WORKING_DIR: Mutex<()> = Mutex::new(());
 
-/// The developer's Claude Code login. First use points the process's home
-/// and XDG directories at the fixture and removes `CLAUDE_CONFIG_DIR`, so
-/// neither maki nor the fakes read any developer config, such as the global
-/// `AGENTS.md`.
+/// Keep only the developer's Claude Code login. Fixture home and XDG directories isolate maki
+/// config and instruction files.
 static DEVELOPER_LOGIN: LazyLock<PathBuf> = LazyLock::new(|| {
     assert!(
         env::var_os(NEXTEST).is_some(),
@@ -96,11 +94,8 @@ static DEVELOPER_LOGIN: LazyLock<PathBuf> = LazyLock::new(|| {
     for (name, folder) in USER_DIR_VARS {
         let dir = root.join(folder);
         fs::create_dir_all(&dir).unwrap();
-        // SAFETY: changing a variable is sound only while no other thread
-        // reads the environment. First use happens before the test starts
-        // any thread, the assert above holds the tests to `cargo nextest`,
-        // which gives every test its own process, and in `claude_code_env`
-        // each test also holds a lock.
+        // SAFETY: nextest gives each test its own process. Environment changes precede all
+        // test threads. Environment tests also hold a lock.
         unsafe { env::set_var(name, dir) };
     }
     // SAFETY: the same rule as above.
@@ -201,11 +196,8 @@ pub fn wait_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
     false
 }
 
-/// Returns each path under `dir` with its bytes, a link's target as its
-/// bytes and a directory's as none, so a diff shows every file a process
-/// wrote, deleted or created, and every new directory. `.git` is left out,
-/// because git maintenance, which a commit can start in the background, may
-/// write there at any time.
+/// Exclude `.git` because background git maintenance can change it after a commit. Record all
+/// other paths and bytes, including symlink targets.
 pub fn contents(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     let mut found = BTreeMap::new();
     let mut pending = vec![dir.to_path_buf()];
@@ -299,8 +291,7 @@ pub fn try_load(opts: Map<String, Value>) -> Result<(Arc<ToolRegistry>, PluginHo
     Ok((reg, host))
 }
 
-/// Returns `fut`'s output, or panics after `limit`, so a call that never
-/// returns fails its test instead of hanging the run.
+/// A lost reply must fail the test so the suite can continue.
 pub async fn within<T>(limit: Duration, fut: impl Future<Output = T>) -> T {
     let expired = async {
         Timer::after(limit).await;

@@ -1977,9 +1977,7 @@ mod tests {
         )
     }
 
-    /// A provider running another provider's models, as claude-code runs the
-    /// Anthropic models, prices a new release from that provider's catalog
-    /// entry, so maki keeps each price once.
+    /// Use the source provider's catalog so new model prices have one canonical entry.
     #[test]
     fn a_provider_running_anothers_models_reads_their_catalog_entry() {
         let (_tmp, state_dir) = temp_state_dir();

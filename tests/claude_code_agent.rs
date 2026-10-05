@@ -1,20 +1,9 @@
-//! maki's agent on the experimental `claude-code` provider, through the
-//! `maki -p` binary. The provider is on only while the claude_code plugin
-//! is, which a fake `claude` shows without spending quota.
+//! Use fixture config and state to isolate maki from developer settings. The fake CLI spends
+//! no subscription quota.
 //!
-//! One live run with the installed `claude` CLI covers what a provider test
-//! cannot:
-//! - The tool calls the agent makes under maki's permissions.
-//! - A call that a rule denies.
-//! - A research subagent, whose smaller tool set makes a different catalog.
+//! The live agent test uses the installed CLI and the developer's login. Run it only on request:
 //!
-//! The live run spends a little of the caller's subscription, so it runs
-//! only on request:
-//! `cargo nextest run -p maki --test claude_code_agent --run-ignored only -E 'test(/live_/)'`.
-//!
-//! maki's config and state directory live in a fixture, so the developer's
-//! maki config cannot affect a run. The live run keeps the Claude Code
-//! login.
+//! `cargo nextest run -p maki --test claude_code_agent --run-ignored only -E 'test(/live_/)'`
 #![cfg(target_os = "linux")]
 
 use std::env;
@@ -283,10 +272,8 @@ fn live_the_agent_runs_its_tools_through_claude_code() {
     );
 }
 
-/// The provider is on only while the claude_code plugin is. Without the
-/// plugin, a run stops before any `claude` starts, even one first on `PATH`,
-/// and with it the provider starts the `claude` the plugin's `executable`
-/// names.
+/// Plugin enablement must control provider availability and executable selection before any
+/// CLI process starts.
 #[test_case(false, PLUGIN_OFF ; "without_the_plugin")]
 #[test_case(true, TOO_OLD ; "with_the_plugin")]
 fn the_provider_is_on_with_the_plugin(plugin: bool, want: &str) {

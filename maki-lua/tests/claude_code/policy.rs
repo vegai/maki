@@ -135,7 +135,7 @@ const TOOL_USE_ID: &str = "toolu_ask";
 /// The smallest `timeout` a call takes.
 const RUN_TIMEOUT_SECS: u64 = 30;
 const SPENT_BEFORE_CANCEL: &[&str] = &["7 in", "2.0k cache read", "300 cache write", "out unknown"];
-const WAITING: &str = "Waiting for a free Claude Code slot";
+const WAITING: &str = "Wait for a free Claude Code slot";
 const FIRST_ID: &str = "toolu_first";
 const SECOND_ID: &str = "toolu_second";
 /// Stopped at the probe, before the run in the project started.
@@ -170,8 +170,6 @@ const WORKING: &str = "working";
 const HANG_SECS: u64 = DEADLINE.as_secs() * 2;
 /// Makes the fake add a file named {HOSTILE_NAME}.
 const CODE_HOSTILE: &str = "code_hostile";
-/// Makes the fake turn `src/lib.rs` into a folder, add a file whose name is
-/// not UTF-8, add a file whose name has an escape byte, and add `src/new.rs`.
 const CODE_RETYPE: &str = "code_retype";
 /// Makes the fake write Claude Code config at the root and in subdirectories,
 /// plus an edit.
@@ -333,9 +331,7 @@ impl Project {
     }
 }
 
-/// A fake `claude` in its own directory, where it records every call, so a
-/// test can see which stages ran, what the child received, and whether a
-/// prompt came. Each test gets its own fake and project.
+/// Each test owns its fake CLI and project so recorded requests cannot overlap.
 struct FakeClaude {
     dir: TempDir,
     project: Project,
@@ -481,8 +477,7 @@ fn restored(prompt: &str, state: Option<Value>, clicks: Vec<usize>) -> RestoreIt
     }
 }
 
-/// A call that never returns means a permit was not released or a reply was
-/// not sent, so the test fails here instead of hanging.
+/// A lost permit or reply must fail the test so the suite can continue.
 async fn within_deadline<T>(fut: impl Future<Output = T>) -> T {
     within(DEADLINE, fut).await
 }
@@ -689,9 +684,7 @@ fn a_hook_policy_keeps_on_never_runs_in_the_project() {
     assert_eq!(fake.log("prompt"), "");
 }
 
-/// An option no call could use fails the plugin's load instead of being
-/// silently adjusted: a limit longer than a call may run, or a model name
-/// that is not an alias.
+/// Reject unusable options at plugin load so no call can silently use a different configuration.
 #[test_case("timeout_secs", json!(MAX_TIMEOUT_SECS + 1), TIMEOUT_TOO_LONG ; "a_timeout_past_the_maximum")]
 #[test_case("model", json!(FULL_MODEL_ID), BAD_MODEL_OPTION ; "a_full_model_id")]
 fn an_unusable_option_is_refused_at_load(name: &str, value: Value, want: &str) {
@@ -705,10 +698,8 @@ fn an_unusable_option_is_refused_at_load(name: &str, value: Value, want: &str) {
     assert!(err.to_string().contains(want), "got: {err}");
 }
 
-/// A file that cannot be checked or read could hold an API key helper, so it
-/// must stop the start rather than count as missing. These tests avoid mode
-/// bits, because root reads through them, and instead use a config
-/// "directory" that is a file and a settings "file" that is a directory.
+/// Unreadable settings can hide an API key helper. Use invalid file types because root can
+/// bypass file mode restrictions.
 #[test_case(true, CANNOT_CHECK ; "config_dir_cannot_be_searched")]
 #[test_case(false, CANNOT_READ ; "settings_file_cannot_be_read")]
 fn settings_that_cannot_be_inspected_are_refused(config_is_a_file: bool, want: &str) {
@@ -725,9 +716,7 @@ fn settings_that_cannot_be_inspected_are_refused(config_is_a_file: bool, want: &
     assert_eq!(fake.log("calls"), "");
 }
 
-/// A settings file that is not a JSON object could hide an API key helper
-/// from the check, so it stops the call the way a helper does. An empty object
-/// is fine.
+/// Settings must be JSON objects so an API key helper cannot bypass the checks.
 #[test_case("[1]", Some(NOT_AN_OBJECT) ; "an_array")]
 #[test_case("[]", Some(NOT_AN_OBJECT) ; "an_empty_array")]
 #[test_case(BROKEN_SETTINGS, Some(SYNTAX_ERROR_AT) ; "a_syntax_error")]
@@ -1119,9 +1108,8 @@ fn a_restored_answer_rebuilds_its_header() {
     }
 }
 
-/// A descendant that closed the run's output holds no stream the job waits
-/// on, so only killing the whole process group stops it once the run exits,
-/// whether the run replied or was stopped.
+/// A descendant can close its output descriptors and survive the leader. Only a process group
+/// kill stops it.
 #[test_case(STRAY_THEN_ANSWER, Ok(ANSWER) ; "from_a_run_that_answered")]
 #[test_case(STRAY_THEN_API_KEY, Err(API_KEY_STOP) ; "from_a_run_stopped_at_init")]
 fn a_stray_descendant_dies_with_its_run(scenario: &str, want: Result<&str, &str>) {

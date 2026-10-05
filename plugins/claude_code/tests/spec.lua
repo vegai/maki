@@ -611,9 +611,8 @@ local function write_file(path, content)
   maki.fs.write(path, content)
 end
 
--- Outside a repository the walk goes up to the filesystem root. The
--- temporary directory can itself be in a repository, so it cannot host that
--- case, and a missing path has only the filesystem root above it.
+-- Temporary directories can belong to a repository. Use a nonexistent path to exercise the
+-- walk to the filesystem root.
 case("local_settings_dirs_outside_a_repository", function()
   local cwd = "/no-such-dir-for-the-claude-code-spec/work"
   local dirs, err = launch.local_settings_dirs(cwd)

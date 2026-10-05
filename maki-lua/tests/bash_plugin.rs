@@ -50,9 +50,7 @@ fn put_first_on_path(dir: &Path) {
     unsafe { env::set_var(PATH, env::join_paths(entries).unwrap()) };
 }
 
-/// A script must run exactly as the user approved it, and rtk rewrites single
-/// commands, so a command with more than one line skips the rewrite. One
-/// line is rewritten, even with a newline at its end.
+/// rtk rewrites single commands. A multiline script must execute exactly as the user approved it.
 #[test_case(TWO_LINE_COMMAND, SECOND_LINE_OUTPUT ; "a_multi_line_command_runs_as_approved")]
 #[test_case(ONE_LINE_COMMAND, REWRITTEN ; "a_single_line_is_rewritten")]
 #[test_case(ONE_LINE_WITH_NEWLINE, REWRITTEN ; "a_single_line_ending_in_a_newline_is_rewritten")]

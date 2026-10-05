@@ -1,13 +1,15 @@
-//! Experimental: maki's agent loop on the Claude models of the user's Claude
-//! Code subscription. A reply that calls tools stops at the first call that
-//! Claude Code sends to maki's handoff server, and maki runs the calls with
-//! its own tools and permissions. The provider is on only while the
-//! `claude_code` plugin is enabled, so one setting turns on both.
+//! Experimental Claude Code provider for maki's agent loop. The handoff server holds tool
+//! calls until maki stops Claude Code.
+//!
+//! maki executes the calls with its own tools and permissions. The plugin setting enables
+//! both the plugin and the provider.
 
 mod checks;
 mod error;
 #[cfg(all(test, target_os = "linux"))]
 mod fake;
+#[cfg(target_os = "linux")]
+mod guard;
 #[cfg(all(test, target_os = "linux"))]
 mod live;
 mod mcp;
@@ -99,7 +101,6 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     api_key_env: NO_KEY_ENV,
     family: ModelFamily::Claude,
     supports_thinking: true,
-    supports_deferred_tools: false,
     accepts_arbitrary_models: false,
     fallback_max_output: None,
     fallback_context_window: 200_000,
@@ -170,8 +171,7 @@ impl PluginOptions {
     }
 }
 
-/// The host calls this after loading the config and before building any
-/// provider.
+/// Load plugin options before provider construction so both use the same configuration.
 pub fn follow_plugins(enabled_plugins: &[String], options: &HashMap<String, Map<String, Value>>) {
     let enabled = enabled_plugins.iter().any(|name| name == PLUGIN);
     *PLUGIN_OPTIONS
@@ -210,12 +210,11 @@ fn config_error(message: impl Display) -> AgentError {
     }
 }
 
-/// A temporary API error reaches maki's retry loop with its status, a
-/// stalled reply is a timeout, and a rejected request reads as it does from
-/// the anthropic provider, so maki compacts a conversation that is too
-/// large. All other errors are configuration errors, which maki does not
-/// retry, because a startup or a handoff that never came most likely
-/// repeats.
+/// Temporary API errors and stalled replies enter maki's retry loop. Oversized
+/// conversations remain overflow errors so maki can compact them.
+///
+/// Other failures are configuration errors. A retry can repeat a startup or handoff
+/// failure, or send a request twice.
 fn agent_error(error: Error) -> AgentError {
     if let Some(secs) = error.stalled() {
         warn!(%error, "claude-code: the reply stalled");
@@ -454,9 +453,8 @@ impl ClaudeCode {
             .await
     }
 
-    /// A listing starts `claude --version`, the probe and up to four window
-    /// processes, so the list is kept for 24 hours and a failure for 5
-    /// minutes. A `fresh` listing asks Claude Code regardless.
+    /// Model discovery starts up to six processes. Cache successful lists for 24 hours
+    /// and failures for five minutes. `fresh` bypasses both caches.
     async fn list(&self, cwd: &Path, fresh: bool) -> Result<Vec<Listed>, Error> {
         let key = (
             self.executable.clone(),
@@ -741,10 +739,8 @@ mod tests {
         }
     }
 
-    /// An overflow stays an overflow whatever Claude Code prints on stderr.
-    /// A rate limit, an overload, a server error or a reply that stopped for
-    /// calls it never made goes to maki's retry loop, with or without a
-    /// status, and a login error does not.
+    /// Preserve overflow errors regardless of stderr. Retry temporary API errors and
+    /// empty tool-call turns. Login errors must stop the request.
     #[test_case(refused(INVALID, None) => (true, false) ; "an_overflow")]
     #[test_case(Error::WithStderr { error: Box::new(refused(INVALID, None)), stderr: "noise".into() } => (true, false) ; "an_overflow_with_stderr")]
     #[test_case(refused(RATE_LIMITED, None) => (false, true) ; "a_rate_limit")]
@@ -759,9 +755,8 @@ mod tests {
         (error.is_context_overflow(), error.is_retryable())
     }
 
-    /// A reply that stopped streaming is a timeout, as the anthropic provider
-    /// reports a stalled stream, and a startup or a handoff that never came
-    /// is not retried.
+    /// Stalled replies use the normal stream timeout. Startup and handoff failures must
+    /// stop without a retry.
     #[test_case(Error::Stalled(300) => Some(RetryKind::Timeout) ; "a_stalled_reply")]
     #[test_case(Error::WithStderr { error: Box::new(Error::Stalled(300)), stderr: "noise".into() } => Some(RetryKind::Timeout) ; "a_stalled_reply_with_stderr")]
     #[test_case(Error::StartupLate(60) => None ; "a_late_startup")]
@@ -777,17 +772,15 @@ mod tests {
         PluginOptions::from_table(table.as_object())
     }
 
-    /// Without the plugin, the provider stops before looking for `claude` and
-    /// says how to enable the plugin.
+    /// An unloaded plugin must disable the provider before executable discovery.
     #[test]
     fn it_is_off_without_the_plugin() {
         let err = create_with(None, Timeouts::default()).err().unwrap();
         assert!(err.to_string().contains(PLUGIN_OFF), "got: {err}");
     }
 
-    /// Claude Code runs the Anthropic models, so they resolve as in the
-    /// anthropic provider, dated snapshots included, and a turn's list price
-    /// is the API price.
+    /// Resolve models and prices through the anthropic provider so dated snapshots share
+    /// their source model metadata.
     #[test_case("claude-opus-5-5" ; "a_release")]
     #[test_case("claude-haiku-4-5-20251001" ; "a_dated_snapshot")]
     fn a_model_reads_as_the_anthropic_provider_reads_it(id: &str) {
@@ -1069,8 +1062,7 @@ mod on_the_fake {
         through_the_provider(&fake, &model, &linked, &env::temp_dir()).unwrap();
     }
 
-    /// `$TMPDIR` can lead into the project through a link, so the probe
-    /// directory's resolved path is checked, and the request stops before a
+    /// `TMPDIR` can resolve into the project through a symlink. Refuse that path before a
     /// policy hook can run there.
     #[test]
     fn a_temp_dir_that_leads_into_the_project_is_refused() {
@@ -1151,9 +1143,8 @@ mod on_the_fake {
         assert_eq!(prepared.config_dir, home.path().join(CLAUDE_DIR));
     }
 
-    /// A list from the last 24 hours, for this `claude` and login, answers
-    /// without starting Claude Code. An older list, or one for another login,
-    /// is fetched again and saved.
+    /// Cache reuse must depend on age, executable and login. A cache hit must start no
+    /// Claude Code process.
     #[test_case(Duration::ZERO, None, false ; "a_fresh_list")]
     #[test_case(STALE_LIST, None, true ; "a_stale_list")]
     #[test_case(Duration::ZERO, Some(OTHER_LOGIN), true ; "a_list_of_another_login")]
@@ -1254,8 +1245,8 @@ mod on_the_fake {
         assert_eq!(fake.log("versions").lines().count(), 1);
     }
 
-    /// A failed listing answers for a while without starting Claude Code, and
-    /// a refresh asks again.
+    /// A failed discovery must suppress repeat CLI launches until expiry or an explicit
+    /// refresh.
     #[test]
     fn a_failed_listing_is_remembered_until_a_refresh() {
         let fake = Fake::new("text");

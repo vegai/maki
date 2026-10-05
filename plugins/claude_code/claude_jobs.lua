@@ -1,7 +1,7 @@
--- The processes of one call. Each is a plugin job, so its exit still
--- arrives after a cancel stops the call, and the slot waits for every exit.
--- A `sleep` job enforces each time limit, because its exit arrives even when
--- queued calls hold every Lua slot, while a Lua timer would wait for one.
+-- Plugin jobs report exit after cancellation, so a slot must wait for every process.
+--
+-- Use a `sleep` job for timeouts. Its exit arrives even when queued calls occupy every Lua
+-- slot and block Lua timers.
 
 local M = {}
 
@@ -217,10 +217,8 @@ function Call:run_to_end(argv, job_opts, how, timeout_ms)
   return code, lines
 end
 
---- Returns stdout, or nil and the error, plus true after a timeout. {spec}
---- has `env`, `cwd`, `stdin`, `timeout_ms` (default: the startup limit),
---- `keep_on_cancel`, and `inherit_env`, which adds `env` to maki's own
---- environment, without provider keys, instead of replacing it.
+--- The `inherit_env` option merges `env` into maki's environment without provider keys.
+--- Otherwise `env` supplies the entire child environment.
 function Call:run_quick(argv, spec)
   local shown = "`" .. table.concat(argv, " ") .. "`"
   local stderr_tail = {}

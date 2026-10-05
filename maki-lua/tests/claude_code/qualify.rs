@@ -1,16 +1,9 @@
-//! Qualifies a Claude Code version against the installed CLI, for the
-//! claude_code plugin. It spends a little of the caller's subscription, so
-//! it runs only on request:
+//! Live tests use the installed CLI and spend subscription quota. Run them only on request:
 //!
 //! `cargo nextest run -p maki-lua --test claude_code --run-ignored only -E 'test(/live_/)'`
 //!
-//! Every live test name starts with `live_`, so the filter skips the ignored
-//! tests that are merely slow.
-//!
-//! maki keeps no list of tested versions, so these tests are how to check a
-//! new one. They use the developer's Claude Code login, while the home, the
-//! user's other directories and every target are fixtures, so no real user
-//! file is a target and none of the user's instructions reach Claude.
+//! Each test uses fixture directories and the developer's Claude Code login. The `live_`
+//! filter excludes slow fixture tests.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -94,9 +87,8 @@ const SECRETS: [&str; 8] = [
 ];
 const AGENTS_CANARY: &str = "BANANA-42";
 const CLAUDE_MD_CANARY: &str = "ULTRAVIOLET-77";
-/// Claude Code would load `.claude/CLAUDE.md` as project memory, but maki
-/// does not pick it, so Claude Code must not load it and maki must not send
-/// it.
+/// Claude Code can load `.claude/CLAUDE.md` itself. maki must neither select this file nor
+/// let Claude Code load it.
 const AMBIENT_ONLY_FILE: &str = ".claude/CLAUDE.md";
 const AMBIENT_ONLY_CANARY: &str = "KIWI-9";
 /// In the only file without a read limit, so a read or search that finds it
@@ -119,9 +111,8 @@ const CONTENT_MODE: &str = "content";
 /// `type` or `head_limit`, could make the search miss the secrets.
 const SEARCH_KEYS: [&str; 4] = ["pattern", "path", "output_mode", "-n"];
 
-/// Tees the installed CLI's stdin and stdout into files the test can read,
-/// keeps its exit code for the plugin, and saves each run's arguments
-/// NUL-separated, so the test can start the CLI exactly as the plugin did.
+/// The wrapper records exact stdin, stdout and NUL-separated arguments so the control run can
+/// reproduce the plugin launch.
 const RECORDING_CLAUDE: &str = "#!/usr/bin/env bash\nset -o pipefail\n\
 [ \"$1\" = --version ] || printf '%s\\0' \"$@\" > \"@ARGV@\"\n\
 tee -a \"@STDIN@\" | \"@REAL@\" \"$@\" | tee -a \"@RAW@\"\n";
@@ -186,9 +177,6 @@ const LATER_SECRET: &str = "LATER-SECRET-3";
 /// over the checkout, so the write can succeed, and only the checkout itself
 /// shows it never changed.
 const MASKED_WRITE: &str = "shell_planted";
-/// A link to a checkout file that the worker's shell creates, so the worker
-/// can then write through it with Claude Code's Write tool, which runs
-/// outside the sandbox.
 const LINKED_FILE: &str = "linked.md";
 const ADDED_FILE: &str = "src/added.rs";
 const PLANTED_FILE: &str = "planted.txt";
@@ -200,8 +188,7 @@ const REPORTED_CHANGES: [&str; 2] = ["M notes.md", "A src/added.rs"];
 type Target = (&'static str, &'static str, &'static str);
 
 const ENV_FILE: Target = ("Read", "file_path", "proj/.env");
-/// The prompt names it both by absolute path and by `..` out of the project,
-/// and the model must try both spellings of the same target.
+/// The prompt uses two paths to the same denied target so both permission forms must work.
 const OUTSIDE_FILE: Target = ("Read", "file_path", "outside/secret.txt");
 /// The model must try each one, and every try must appear in Claude Code's
 /// permission denials, because a wrong path errors too.
@@ -234,10 +221,8 @@ const PROJECT_GLOB: Target = ("Glob", "path", "proj");
 /// difference.
 const MISSING: Target = ("Read", "file_path", "proj/src/missing.rs");
 
-/// The fixture's instruction file. Claude Code loads `AGENTS.md` only when it
-/// finds no `CLAUDE.md`, and `.claude/CLAUDE.md` counts as one, so each file
-/// needs its own project, and only the `CLAUDE.md` project also has
-/// `AMBIENT_ONLY_FILE`.
+/// Claude Code selects `AGENTS.md` only without a `CLAUDE.md`. Separate projects keep each
+/// instruction-file case independent.
 enum Canary {
     ClaudeMd,
     AgentsMd,
@@ -554,17 +539,8 @@ fn ask(executable: &Path, project: &Path, prompt: &str) -> Result<String, String
     smol::block_on(tool_reply(&reg, &session, TOOL, input))
 }
 
-/// Checks the CLI's tool calls from its recorded output rather than its
-/// reply. All of these must hold:
-/// - The model tried every denied target and the permissions denied it,
-///   symlink aliases and the `deny_read` path included.
-/// - A missing file errored without a denial.
-/// - An unlimited read, a search and a whole-project listing did not error.
-/// - No secret reached the model, and the project did not change.
-/// - Claude Code loaded no instruction file itself, per its list of loaded
-///   files under the plugin's arguments. A control run first shows what that
-///   list holds when loading is on.
-/// - maki sent the file it picks over stdin, and not `AMBIENT_ONLY_FILE`.
+/// Recorded tool calls identify actual denials. Model text alone cannot establish that the
+/// permissions protected a target.
 #[test]
 #[ignore = "runs the installed claude CLI on the subscription of the caller"]
 fn live_reads_are_refused_and_instructions_stay_out() {
@@ -699,16 +675,8 @@ fn live_reads_are_refused_and_instructions_stay_out() {
     }
 }
 
-/// Tests the coding profile. The worker edits files, writes files and runs
-/// commands in its snapshot. Its file writes to the live checkout, or
-/// anywhere else outside the snapshot, show up in Claude Code's permission
-/// denials. Its shell runs in the sandbox: it can write its temporary
-/// directory but cannot read the checkout's secrets or use the network, and
-/// its writes into the checkout change nothing. A write the sandbox blocks
-/// can still succeed, so the test checks that the checkout, `.git`
-/// included, stays unchanged until the import, which then applies the bytes
-/// the artifact recorded. The worker also cannot read a file that appears
-/// beside the artifact after the sandbox was set.
+/// Permission denials alone cannot establish sandbox protection. Compare checkout bytes and
+/// git state before import, then compare the imported artifact bytes.
 #[test]
 #[ignore = "runs the installed claude CLI on the subscription of the caller"]
 fn live_a_coding_worker_changes_only_its_snapshot() {

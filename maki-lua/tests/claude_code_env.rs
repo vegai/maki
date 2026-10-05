@@ -1,11 +1,8 @@
-//! Tests that change the whole process's environment: `TMPDIR`, `HOME`, a
-//! login token, or a `PATH` that puts a held `mktemp` or `rmdir`, or a `cp`
-//! that edits the checkout, first. Each runs in a fresh empty repository
-//! rather than the checkout, whose Claude Code settings could skew the
-//! result. They live in their own test binary and take turns under one
-//! lock, so no other test sees the changed environment. maki fixes its
-//! state directory once per process, so the default layout test also needs
-//! its own process, which nextest gives every test.
+//! Environment tests use fresh repositories so checkout settings cannot affect the result.
+//! Each test holds the environment lock.
+//!
+//! nextest gives each test its own process. This also isolates the state directory, which
+//! maki selects once per process.
 #![cfg(target_os = "linux")]
 
 use std::env;
@@ -37,15 +34,12 @@ use support::{
 };
 
 const VERSION_ONLY: &str = "#!/bin/sh\necho '@VERSION@ (Claude Code)'\n";
-/// Makes the directory with the installed `mktemp`, writes its name to a
-/// marker, and withholds the name until the test releases it, which happens
-/// only after the host stopped the cancelled call, when no stopped handler
-/// can receive it.
+/// Withhold the directory name until cancellation ends the handler. This exposes a directory
+/// that arrives after its owner stops.
 const HELD_MKTEMP: &str = "#!/bin/sh\ndir=$(\"@REAL@\" \"$@\") || exit 1\nprintf '%s\\n' \"$dir\" > \"@MARKER@\"\n@WAIT_FOR_RELEASE@\nprintf '%s\\n' \"$dir\"\n";
 /// Removes the directory and then fails, like the second of two removals.
 const LOSES_TO_ANOTHER_REMOVAL: &str = "#!/bin/sh\n\"@REAL@\" \"$@\"\nexit 1\n";
-/// Holds the removal until the test releases it, so a call that replied
-/// without waiting for its `rmdir` returns first.
+/// Hold `rmdir` so a premature reply reaches the test before cleanup completes.
 const HELD_REMOVAL: &str =
     "#!/bin/sh\ntouch \"@MARKER@\"\n@WAIT_FOR_RELEASE@\nexec \"@REAL@\" \"$@\"\n";
 /// Answers the handshake like a clean subscription login, in the mode it was
@@ -78,8 +72,7 @@ done
 const CLONE_REFUSING_CP: &str = "#!/bin/sh\ncase \" $* \" in *\" --reflink=always \"*) echo \"$0: failed to clone 'x' from 'y': @REFUSED@\" >&2; exit 1 ;; esac\nexec \"@REAL@\" \"$@\"\n";
 const FULL_COPY: &str = "as a full copy, because the filesystem cannot clone it";
 const NO_CLONE: &str = "maki cannot clone the dependency";
-/// Copies with the installed `cp`, and after copying the project runs
-/// @ACTION@ in the project at @MARKER@, like a change during the snapshot.
+/// Copy the project first, then run @ACTION@ at @MARKER@ to simulate a concurrent edit.
 const DISTURBING_CP: &str = "#!/bin/sh\n\"@REAL@\" \"$@\" || exit\ncase \" $* \" in *\" --parents \"*) cd \"@MARKER@\" && @ACTION@ ;; esac\n";
 const EDIT_FILE: &str = "echo edited >> src/lib.rs";
 const MAKE_EXECUTABLE: &str = "chmod +x src/lib.rs";
@@ -112,7 +105,7 @@ const CANNOT_RUN: &str = "maki cannot run ";
 const ARTIFACT_MARKER: &str = ".maki-claude-code-artifact";
 const MANIFEST: &str = "manifest.json";
 /// Older than the default artifact time limit of a day.
-const STALE_AGE: Duration = Duration::from_hours(48);
+const STALE_AGE: Duration = Duration::from_secs(48 * 60 * 60);
 
 /// Each test holds this lock while it runs, because these tests change the
 /// whole process's environment and a threaded harness would run them at
@@ -151,9 +144,8 @@ struct EnvVar {
 impl EnvVar {
     fn set(name: &'static str, value: impl AsRef<OsStr>) -> Self {
         let before = env::var_os(name);
-        // SAFETY: nextest runs each test in its own process, which
-        // `Scenario::enter` checks, so no other test's thread reads the
-        // environment, and every plugin host starts after the change.
+        // SAFETY: `Scenario::enter` enforces a separate nextest process. Each plugin host
+        // starts after the environment change.
         unsafe { env::set_var(name, value) };
         Self { name, before }
     }
@@ -352,10 +344,8 @@ fn a_cancel_while_mktemp_runs_leaves_no_dir() {
     );
 }
 
-/// maki can exit right after rejecting a call, killing an unfinished
-/// `rmdir`, so a rejected call returns only once its probe directory is
-/// gone. The fake answers no checks, so the call stops when the probe
-/// exits.
+/// maki can exit immediately after a refusal and kill incomplete cleanup. The reply must wait
+/// until the probe directory is gone.
 #[test]
 fn a_refusal_comes_after_the_probe_dir_is_gone() {
     let _scenario = Scenario::enter();
@@ -436,10 +426,8 @@ fn a_dir_already_removed_is_not_named_left_behind() {
     assert!(!err.contains(LEFT_BEHIND), "got: {err}");
 }
 
-/// An `rmdir` that cannot start raises inside the probe's exit handler. The
-/// call must still return its reply and the directory without waiting for
-/// its timeout. `PATH` holds only the tools the call uses before the
-/// cleanup.
+/// A cleanup process can fail to start inside an exit callback. The caller must still receive
+/// a reply before its timeout.
 #[test]
 fn a_cleanup_that_cannot_start_still_ends_the_call() {
     let _scenario = Scenario::enter();
@@ -479,9 +467,8 @@ fn a_clock_that_cannot_start_stops_the_call() {
     assert!(err.contains(&want), "got: {err}");
 }
 
-/// A file that changes, turns executable or gets a new link target during
-/// the copy would hand the worker a state the checkout never had, so the
-/// call stops, names the file and removes the artifact.
+/// Concurrent file changes can produce a snapshot state that never existed. Refuse that
+/// snapshot and remove its artifact.
 #[test_case(EDIT_FILE, "src/lib.rs" ; "an_edit")]
 #[test_case(MAKE_EXECUTABLE, "src/lib.rs" ; "an_executable_bit")]
 #[test_case(RETARGET_LINK, "src/link" ; "a_link_target")]
@@ -497,10 +484,8 @@ fn a_change_during_the_copy_is_refused(action: &str, disturbed: &str) {
     );
 }
 
-/// Dependencies are too large to compare file by file, so a dependency that
-/// changed during the copy is reported to the worker and in the reply
-/// rather than stopping the call, which a dev server writing its cache would
-/// otherwise do every time.
+/// Dependency trees are too large for file comparisons. Report concurrent changes so a
+/// development server can update its cache without repeated call failures.
 #[test]
 fn a_dependency_changed_during_the_copy_is_reported() {
     let _scenario = Scenario::enter();

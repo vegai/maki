@@ -145,11 +145,11 @@ fn lookup_round(reply: &StreamResponse, word: &str, meaning: &str) -> Message {
     assert_eq!(input["word"], Value::from(word));
     Message {
         role: Role::User,
-        content: vec![ContentBlock::tool_result(
-            id,
-            format!("{word}: {meaning}"),
-            false,
-        )],
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: id.into(),
+            content: format!("{word}: {meaning}"),
+            is_error: false,
+        }],
         ..Default::default()
     }
 }
@@ -233,8 +233,8 @@ fn live_thinking_settings_are_accepted(model: &str, thinking: Thinking) {
     answer(&reply);
 }
 
-/// Claude Code shows the thinking text only with a flag that its help leaves
-/// out, so a version that drops or ignores the flag shows no thinking.
+/// Claude Code help omits the flag for thinking text. This test detects versions that remove
+/// or ignore that flag.
 #[test]
 #[ignore = "runs the claude CLI on the subscription of the caller"]
 fn live_thinking_reaches_maki_as_text() {
@@ -362,10 +362,8 @@ fn live_a_second_request_reads_the_first_from_the_cache(model: &str) {
     );
 }
 
-/// Claude Code starts each call as soon as its block ends, and maki holds the
-/// call until the whole reply is done. A long second call keeps the first one
-/// held for more than the minute after which Claude Code's MCP client would
-/// otherwise give up on it and answer it itself.
+/// A long second call holds the first beyond the MCP client's default timeout. The server
+/// timeout must prevent a premature client answer.
 #[test]
 #[ignore = "runs the claude CLI on the subscription of the caller"]
 fn live_a_call_held_past_a_minute_comes_back_to_maki() {

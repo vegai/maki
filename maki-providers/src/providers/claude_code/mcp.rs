@@ -1,8 +1,7 @@
-//! The loopback MCP server one request's Claude Code connects to. It lists
-//! maki's tools and holds every call without answering, so Claude Code waits
-//! on the first call until maki kills it and runs the tools itself. It
-//! answers only on 127.0.0.1, and only a client with the request's bearer
-//! token.
+//! One request owns this loopback MCP server. The server holds tool calls until maki stops
+//! Claude Code and executes the tools.
+//!
+//! Only clients on 127.0.0.1 with the request's bearer token can connect.
 
 use std::future::Future;
 use std::io;
@@ -81,7 +80,7 @@ struct Shared {
     read_limit: Duration,
 }
 
-/// Dropping it closes every connection unanswered, held calls included.
+/// Keep connection ownership in one task so cancellation also stops held calls.
 pub(crate) struct Server {
     port: u16,
     shared: Arc<Shared>,
@@ -122,8 +121,6 @@ pub(crate) async fn serve(
     })
 }
 
-/// Serves each connection from `incoming` until the task running this is
-/// dropped, which drops every connection too.
 async fn accept_loop(
     mut incoming: impl Stream<Item = io::Result<TcpStream>> + Unpin,
     shared: Arc<Shared>,
@@ -470,7 +467,7 @@ mod tests {
     const UNKNOWN_VERSION: &str = "2099-01-01";
     const TOOL: &str = "read";
     const TOOL_USE_ID: &str = "toolu_1";
-    /// Bounds each wait, so a broken test fails instead of hanging.
+    /// A failed handoff must fail the test so the suite can continue.
     const WAIT: Duration = Duration::from_secs(5);
     /// A body length the request announces but never sends.
     const BODY_NEVER_SENT: usize = 1000;

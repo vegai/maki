@@ -176,9 +176,8 @@ impl ProviderSpec {
         self.models_of.unwrap_or(self.slug)
     }
 
-    /// The rows a model list shows without asking the provider. A provider
-    /// running another's models has none, because that table lists every
-    /// model of the vendor rather than the ones this route offers.
+    /// A source provider's table can contain models unavailable on this route. Leave
+    /// discovery to the route provider.
     pub fn listed_rows(&self) -> &'static [ModelEntry] {
         match self.models_of {
             Some(_) => &[],

@@ -1,8 +1,5 @@
-//! Runs `claude_workspace`'s import command on an on-disk checkout and
-//! artifact repository. A wrapped `git` or `chmod` holds the command at a
-//! chosen call: right after staging a blob, at its last check, or while it
-//! writes its new files. The test then changes the checkout or kills the
-//! command there, and checks the outcome.
+//! Tests execute the import on real checkout and artifact repositories. Wrapped commands
+//! pause at filesystem operations so tests can inject concurrent edits.
 
 use std::env;
 use std::ffi::OsString;
@@ -25,8 +22,6 @@ use super::support::{
     wait_for_release, wait_until,
 };
 
-/// Runs the installed tool, and when its arguments contain @HOLD_ON@, waits
-/// for the release before returning.
 const HELD: &str = r#"#!/bin/sh
 case " $* " in
 *"@HOLD_ON@"*) "@REAL@" "$@" || exit; touch "@HELD@"; @WAIT_FOR_RELEASE@ ;;
@@ -52,6 +47,12 @@ const BROKEN_GIT_CONFIG: &str = "[core\n";
 const STAGE: &str = "stage.a1b2c3";
 /// The last check hashes the file the import replaces next.
 const LAST_CHECK: Hold = ("git", " -- ./src/lib.rs ");
+const AFTER_KEEP: Hold = ("ln", " ./src/lib.rs ");
+const AFTER_MOVE: Hold = ("mv", " ./src/lib.rs ");
+const DISPLACED: &str = "displaced";
+const EDITOR_SAVE: &str = "editor-save";
+const CANNOT_PRESERVE: &str = "cannot preserve open-file writes";
+const NEW_FILE_PREFIX: &str = ".maki-import-";
 /// The last new file gets its mode, in the folder the command made for it,
 /// after the file beside the edited one was written.
 const WRITING: Hold = ("chmod", " -x -- ./src/new/");
@@ -258,7 +259,6 @@ impl Import {
         command
     }
 
-    /// Runs all of `script` in the test's directory without holding it.
     fn run(&self, script: &str) -> Output {
         fs::File::create(self.marker("release")).unwrap();
         self.command(script).output().unwrap()
@@ -317,9 +317,7 @@ fn a_change_while_blobs_stage_is_refused(link: bool) {
     }
 }
 
-/// The command enters the checkout before its checks and writes by relative
-/// path, so a checkout swapped for a link after the checks cannot redirect
-/// the writes to the link's target.
+/// Relative paths must keep writes in the original checkout if its directory becomes a symlink.
 #[test]
 fn a_checkout_swapped_for_a_link_after_the_checks_keeps_the_writes() {
     let import = Import::new(LAST_CHECK);
@@ -375,14 +373,12 @@ fn a_mode_change_lands_with_the_same_bytes() {
     assert_ne!(mode & OWNER_EXECUTE, 0, "mode {mode:o}");
 }
 
-/// If a rename fails partway, files already renamed stay in place and the
-/// rest are untouched. Every file the import replaces was kept in the
-/// originals before the first rename.
+/// A failed installation preserves earlier changes and all original files.
 #[test]
-fn a_rename_that_fails_partway_keeps_what_landed_and_every_original() {
+fn a_link_that_fails_partway_keeps_what_landed_and_every_original() {
     let import = Import::new(STAGING);
     let added = import.project.join(ADDED);
-    import.failing("mv", &Path::new(CURRENT_DIR).join(ADDED));
+    import.failing("ln", &Path::new(CURRENT_DIR).join(ADDED));
 
     let out = import.run(&import.script);
     assert!(!out.status.success());
@@ -413,9 +409,11 @@ fn a_killed_import_leaves_nothing_outside_its_artifact() {
 /// replaced file, at its new name, even after the import checked it. The
 /// replaced file keeps a name in the artifact, so the written data is not
 /// lost.
-#[test]
-fn a_write_through_a_descriptor_opened_before_is_kept_in_the_artifact() {
-    let import = Import::new(LAST_CHECK);
+#[test_case(LAST_CHECK ; "after_validation")]
+#[test_case(AFTER_KEEP ; "after_backup")]
+#[test_case(AFTER_MOVE ; "after_removal")]
+fn a_write_through_a_descriptor_opened_before_is_kept_in_the_artifact(hold: Hold) {
+    let import = Import::new(hold);
     let mut writer = fs::OpenOptions::new()
         .write(true)
         .open(import.target())
@@ -432,6 +430,70 @@ fn a_write_through_a_descriptor_opened_before_is_kept_in_the_artifact() {
         fs::read_to_string(import.artifact.join(ORIGINALS).join(TARGET)).unwrap(),
         NEWER
     );
+}
+
+#[test_case(AFTER_KEEP, true ; "before_removal")]
+#[test_case(AFTER_MOVE, false ; "after_removal")]
+fn an_atomic_editor_save_survives_import(hold: Hold, succeeds: bool) {
+    let import = Import::new(hold);
+    let child = import.start_held();
+    let replacement = import.project.join(EDITOR_SAVE);
+    fs::write(&replacement, NEWER).unwrap();
+    fs::rename(replacement, import.target()).unwrap();
+    let output = import.release(child);
+
+    assert_eq!(output.status.success(), succeeds);
+    let saved = if succeeds {
+        import.artifact.join(DISPLACED).join(STAGE).join(TARGET)
+    } else {
+        import.target()
+    };
+    assert_eq!(fs::read_to_string(saved).unwrap(), NEWER);
+    assert_eq!(
+        fs::read_to_string(import.artifact.join(ORIGINALS).join(TARGET)).unwrap(),
+        ORIGINAL
+    );
+}
+
+#[test]
+fn a_failed_hard_link_stops_before_any_checkout_write() {
+    let import = Import::new(STAGING);
+    import.failing("ln", &Path::new(CURRENT_DIR).join(TARGET));
+    let mut writer = fs::OpenOptions::new()
+        .write(true)
+        .open(import.target())
+        .unwrap();
+    let output = import.run(&import.script);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains(CANNOT_PRESERVE));
+    writer.write_all(NEWER.as_bytes()).unwrap();
+    writer.set_len(NEWER.len() as u64).unwrap();
+    assert_eq!(fs::read_to_string(import.target()).unwrap(), NEWER);
+    assert!(!import.project.join(ADDED).exists());
+}
+
+#[test]
+fn a_retry_cannot_overwrite_a_preserved_save() {
+    let import = Import::new(LAST_CHECK);
+    import.failing("ln", Path::new(NEW_FILE_PREFIX));
+    let child = import.start_held();
+    fs::write(import.target(), NEWER).unwrap();
+    let output = import.release(child);
+    assert!(!output.status.success());
+    assert!(!import.target().exists());
+
+    fs::write(import.target(), ORIGINAL).unwrap();
+    fs::create_dir(import.artifact.join(STAGE)).unwrap();
+    let output = import.run(&import.script);
+    assert!(!output.status.success());
+    assert_eq!(fs::read_to_string(import.target()).unwrap(), ORIGINAL);
+    for saved in [
+        import.artifact.join(ORIGINALS).join(TARGET),
+        import.artifact.join(DISPLACED).join(STAGE).join(TARGET),
+    ] {
+        assert_eq!(fs::read_to_string(saved).unwrap(), NEWER);
+    }
 }
 
 /// A kill skips the command's cleanup while its new files wait beside their
@@ -487,9 +549,7 @@ fn a_cleanup_that_cannot_clear_a_folder_fails() {
     );
 }
 
-/// The command runs git on the artifact's repository without the user's
-/// global or system config, like the collect step, so a config git cannot
-/// parse does not affect the import.
+/// User git config must not affect the artifact repository or the import.
 #[test]
 fn an_import_runs_git_without_the_users_config() {
     let import = Import::new(STAGING);
@@ -510,11 +570,8 @@ fn an_import_runs_git_without_the_users_config() {
     assert_eq!(fs::read_to_string(import.target()).unwrap(), RECORDED);
 }
 
-/// Names reach the command only through shell quoting. A name with a quote,
-/// a command substitution, a space, a newline and a glob arrives byte for
-/// byte, and no part of it runs, in the import or its cleanup. The cleanup
-/// runs only after a failed import, which the full import in
-/// `policy::coding` cannot trigger.
+/// Paths can contain shell syntax. The import and its cleanup must preserve each path byte
+/// without execution.
 #[test]
 fn a_hostile_file_name_lands_as_it_is_and_runs_nothing() {
     let import = Import::named(STAGING, HOSTILE_EDITED, HOSTILE_ADDED);

@@ -326,10 +326,8 @@ mod tests {
     /// the cases take turns under a threaded harness.
     static PLUGIN_OPTIONS: Mutex<()> = Mutex::new(());
 
-    /// On `/reload`, a builtin that fails to load only warns. The claude-code
-    /// provider is on only while its plugin is loaded, a failed load also
-    /// stops the builtins after it, and an option below its minimum fails a
-    /// plugin's load.
+    /// A failed builtin load stops later builtins. Enable the provider only if its own plugin
+    /// completed its load.
     #[test_case(json!({}), None => true ; "a_plugin_that_loaded")]
     #[test_case(json!({ "max_concurrent": 0 }), None => false ; "a_plugin_that_failed_to_load")]
     #[test_case(json!({}), Some((OTHER_PLUGIN, json!({ "max_file_size_mb": 0 }))) => false ; "a_plugin_behind_one_that_failed")]

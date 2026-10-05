@@ -147,8 +147,8 @@ pub(crate) struct JobSpec {
     pub clear_env: bool,
     /// Give the job a stdin pipe for `chansend` instead of /dev/null.
     pub pipe_stdin: bool,
-    /// After the process exits, kill the processes that remain in its process
-    /// group before reporting the exit, so no child outlives the job unnoticed.
+    /// Kill remaining group members before the exit callback so descendants cannot outlive
+    /// the job.
     pub kill_group_on_exit: bool,
     pub stdout: Redirect,
     pub stderr: Redirect,
@@ -200,9 +200,8 @@ struct JobMeta {
     /// nothing ever reaches the tail there and an empty tail is no evidence
     /// the job stayed quiet.
     dropped_output: bool,
-    /// Set by the wait thread when it reaps the child, well before
-    /// `exit_code`, under the lock every kill holds from its state check to
-    /// its signal. See [`reap`].
+    /// The wait thread sets this under the signal lock before it updates `exit_code`. See
+    /// [`reap`].
     reap_state: Arc<Mutex<ReapState>>,
     exit_code: Option<i32>,
     /// Recorded at exit so elapsed time stops counting once the process is gone.
@@ -968,9 +967,8 @@ fn kill_group_once_leader_exits(pid: u32) {
 #[cfg(not(unix))]
 fn kill_group_once_leader_exits(_pid: u32) {}
 
-/// A job that started without a wait thread has nothing else to stop it, so
-/// dropping this kills its group, while the unreaped pid still names it, and
-/// then reaps the child.
+/// Without a wait thread, this guard must kill the group and reap the child. The unreaped pid
+/// still identifies the group.
 struct Unwatched(Option<Child>);
 
 impl Drop for Unwatched {
@@ -982,10 +980,8 @@ impl Drop for Unwatched {
     }
 }
 
-/// A signal to a reaped pid could hit whatever process reused it, so a job
-/// the wait thread reaped is skipped. The lock is held until the signal is
-/// sent, and [`reap`] needs the same lock, so nothing can reap the child
-/// between the check and the signal.
+/// A reaped pid can identify another process. Hold the lock until the signal completes so
+/// [`reap`] cannot release the pid first.
 fn kill_job(job: &JobMeta) {
     let state = ReapState::lock(&job.reap_state);
     if !state.reaped {
@@ -993,19 +989,14 @@ fn kill_job(job: &JobMeta) {
     }
 }
 
-/// Run a command in the background. A string runs through `bash -c` on Unix
-/// or `cmd /C` on Windows; a table is spawned as argv, with no shell in
-/// between (nothing in it can be read as a redirect, a pipe, or `$(...)`).
-/// You get back a job id that you can pass to `jobstop` or `jobwait` to
-/// control the process.
+/// Run a command in the background. A string uses `bash -c` on Unix or
+/// `cmd /C` on Windows. An argv table starts the process directly without
+/// shell interpretation. Use the returned job id with `jobstop` or `jobwait`.
 ///
-/// `stdout` and `stderr` route a stream to a file instead of into maki. A
-/// path is opened for append and handed to the child, so nothing is buffered
-/// here: no callback, no tail, no events for that stream, and it counts as
-/// truncated everywhere a tail is reported. That makes the two mutually
-/// exclusive with `on_stdout` / `on_stderr` for the same stream, and a path
-/// additionally needs the `fs_write` permission. To both persist and react,
-/// run one job writing the file and a second one tailing it.
+/// `stdout` and `stderr` can append directly to files. Redirected streams
+/// have no callbacks, tails or events and count as truncated in job reports.
+/// A redirect conflicts with the corresponding output callback and needs
+/// `fs_write`. Use separate writer and reader jobs to store and process output.
 ///
 /// @param cmd string|table Shell command, or an argv table like
 ///   `{ "tail", "-F", path }`.
@@ -1013,8 +1004,8 @@ fn kill_job(job: &JobMeta) {
 ///   `cwd` (string?) working directory (tilde is expanded).
 ///   `env` (table?) environment variables, `{ VAR = "value" }`, added to
 ///     maki's environment.
-///   `clear_env` (boolean?) make `env` the whole environment, inheriting
-///     nothing from maki (default false).
+///   `clear_env` (boolean?) use only `env` for the child
+///     environment (default false).
 ///   `stdin` (string?) `"pipe"` to write to the job with `chansend`. Defaults
 ///     to `"null"`, no input. Neovim defaults to `"pipe"`, but a job that
 ///     reads an open pipe with no data hangs.
@@ -1038,7 +1029,7 @@ fn kill_job(job: &JobMeta) {
 ///   `tail` (integer?) trailing lines per stream kept for `jobinfo`
 ///     (default 20, 0 disables, max 1024).
 ///   `name` (string?) handle for `jobfind`, unique among the live jobs this
-///     plugin can see. Starting a second job under a live name is an error.
+///     plugin can see. A second job with the same live name fails.
 /// @return (integer) Job id.
 /// @example
 /// local id = maki.fn.jobstart({ "rg", "--json", pattern, dir }, {
@@ -1371,13 +1362,13 @@ fn jobstop(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<()> {
     Ok(())
 }
 
-/// Write {data} to job {id}'s stdin. The job must be started with
-/// `stdin = "pipe"`. Like `vim.fn.chansend`, except an error returns nil and
-/// a message instead of 0. List items are joined with newlines, a newline
-/// inside an item becomes NUL, and no trailing newline is added. Unread data
-/// stays in memory, and a child that keeps the job's stdin open without
-/// reading holds it even after the job exits. Use `kill_group_on_exit` to
-/// stop such a child.
+/// Write {data} to job {id}'s stdin. Start the job with `stdin = "pipe"`.
+/// Unlike `vim.fn.chansend`, an error returns nil and a message instead of 0.
+/// List items use newline separators. A newline inside an item becomes NUL.
+/// The final item has no newline suffix.
+///
+/// Unread data stays in memory. A descendant can retain stdin after the job
+/// exits. Use `kill_group_on_exit` to stop that descendant and release the data.
 ///
 /// @param id integer Job id returned by `jobstart`.
 /// @param data string|table Text to write, or a list of lines.
@@ -1396,9 +1387,7 @@ fn chansend(lua: &Lua, #[ctx] plugin: Arc<str>, id: u32, data: Value) -> LuaResu
     }
 }
 
-/// Returns the bytes `chansend` writes for {data}: a string as it is, or a
-/// list of strings joined with newlines, a newline inside a string becoming
-/// NUL. A Lua string is bytes, UTF-8 or not, as in Neovim.
+/// List items can contain arbitrary bytes, as in Neovim. A newline inside an item becomes NUL.
 fn chansend_bytes(data: Value) -> LuaResult<Vec<u8>> {
     match data {
         Value::String(s) => Ok(s.as_bytes().to_vec()),
@@ -1611,11 +1600,12 @@ fn executable(_lua: &Lua, name: String) -> LuaResult<i32> {
     Ok(if found { 1 } else { 0 })
 }
 
-/// The absolute path of the program {name} runs, or `""` if there is none,
-/// like Neovim's `vim.fn.exepath`. A name with a path separator resolves from
-/// the working directory. Other names are searched on `$PATH`, skipping files
-/// this process cannot run. Resolve a program once before running it from
-/// other directories, because a relative name can point elsewhere there.
+/// Resolve {name} to an absolute executable path, or return `""` if no
+/// executable exists, as in Neovim's `vim.fn.exepath`.
+/// Names with a path separator resolve from the working directory. Other
+/// names resolve through `$PATH`, with files this process cannot execute
+/// excluded. Resolve the program before a directory change so a relative
+/// name cannot select a different executable.
 ///
 /// @param name string The name of a program (for example `"git"`), or a relative or absolute path.
 /// @return (string) Absolute path, or `""` if not found.
@@ -1795,8 +1785,7 @@ mod tests {
         }
     }
 
-    /// List items are bytes, as Neovim sends them, so an item that is not
-    /// UTF-8 goes through unchanged and a newline inside an item becomes NUL.
+    /// List items can contain arbitrary bytes, as in Neovim. A newline inside an item becomes NUL.
     #[test]
     fn chansend_sends_a_list_as_bytes() {
         let lua = Lua::new();

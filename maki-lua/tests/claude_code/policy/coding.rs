@@ -94,7 +94,6 @@ const STAGING_STEP: &str = "staged ";
 const IMPORT_TEMP: &str = ".maki-import-";
 /// An artifact's repository, next to its snapshot.
 const ARTIFACT_GIT: &str = "git";
-const READ_ONLY_DIR: u32 = 0o555;
 const SHA1: &str = "sha1";
 const SHA256: &str = "sha256";
 const HOSTILE_CONTENT: &str = "hostile\n";
@@ -103,7 +102,6 @@ const COMMAND_FOR_A_SHA: &str = "$(touch pwned)aaaaaaaaaaaaaaaaaaaaaaaaaa";
 const NOT_WRITTEN_BY_MAKI: &str = "has a manifest that maki did not write";
 const FOR_ANOTHER_CHECKOUT: &str = "contains changes for";
 const UNRECORDED: &str = "maki could not record this in the artifact";
-const OWNER_DIR: u32 = 0o755;
 const EXECUTABLE_MODE: u32 = 0o755;
 const PREPARE_FAILED: &str = "the prepare command stopped with an error";
 /// Longer than `DEADLINE`, so a stop that fails makes the test fail while it
@@ -117,6 +115,10 @@ const TRUNCATION_LINES: usize = 2;
 /// lock file.
 const PREPARED_FILE: &str = "lock.json";
 const PREPARE_WRITES_LOCK: &str = "printf 'locked\\n' > lock.json";
+const CREATE_DEPENDENCY: &str =
+    "mkdir -p node_modules/pkg; printf 'module.exports = 1;\\n' > node_modules/pkg/index.js";
+const BREAK_BASELINE: &str = "git config core.repositoryformatversion 999";
+const CANNOT_RECORD_PREPARED: &str = "maki cannot record the prepared snapshot";
 const PREPARED_NOTE: &str = "the prepare command changed lock.json";
 const WORKER_EDIT: &str = "worker\n";
 const PREPARED_LINK: &str = "prepared_link";
@@ -179,13 +181,18 @@ maki.api.register_tool({
 "#;
 const FAILED_AFTER_WRITES: &str = "killed after its last write";
 /// Set for every test process and never passed to Claude Code.
+const HOLD_IMPORT: &str = r#"
+local jobstart = maki.fn.jobstart
+maki.fn.jobstart = function(command, opts)
+  return jobstart([==[ln() { touch '@HELD@'; : > '@PIPE@'; command ln "$@"; }
+]==] .. command, opts)
+end
+"#;
+const IMPORT_HELD: &str = "import-held";
+const IMPORT_RELEASE: &str = "import-release";
 const USER_ONLY_VARIABLE: &str = "CARGO_MANIFEST_DIR";
 const PREPARED_ENV: &str = "prepared_env.txt";
 
-/// An on-disk git repository for coding calls: committed files, a file
-/// whose name git must quote, a dirty edit, an untracked input, credentials
-/// and Claude Code config that a snapshot skips, a link inside the project
-/// and one pointing out of it.
 fn coding_repo(project: &Path, object_format: &str) {
     fs::remove_dir(project.join(".git")).unwrap();
     for (path, content) in [
@@ -378,46 +385,6 @@ fn run_tool(
     smol::block_on(within_deadline(tool_reply(reg, ctx, tool, input)))
 }
 
-/// A readerless pipe standing in for the first file an import keeps, in a
-/// folder where the import cannot replace it. Dropping it, however the test
-/// ends, lets a copy blocked on the pipe continue so the folder can be
-/// removed.
-struct HeldPipe {
-    dir: PathBuf,
-    pipe: PathBuf,
-}
-
-impl HeldPipe {
-    fn plant(dir: &Path) -> Self {
-        fs::create_dir_all(dir).unwrap();
-        let pipe = dir.join("lib.rs");
-        assert!(
-            Command::new("mkfifo")
-                .arg(&pipe)
-                .status()
-                .unwrap()
-                .success()
-        );
-        fs::set_permissions(dir, fs::Permissions::from_mode(READ_ONLY_DIR)).unwrap();
-        Self {
-            dir: dir.to_path_buf(),
-            pipe,
-        }
-    }
-}
-
-impl Drop for HeldPipe {
-    fn drop(&mut self) {
-        // Opening the pipe read-write never blocks, and it releases a waiting
-        // writer.
-        let _ = Command::new("sh")
-            .args(["-c", ": <> \"$1\"", "sh"])
-            .arg(&self.pipe)
-            .status();
-        let _ = fs::set_permissions(&self.dir, fs::Permissions::from_mode(OWNER_DIR));
-    }
-}
-
 /// Returns every import temporary file in or under `dir`.
 fn temp_files(dir: &Path) -> Vec<PathBuf> {
     contents(dir)
@@ -437,11 +404,6 @@ fn artifact_id(reply: &str) -> String {
     after.split(',').next().unwrap().to_owned()
 }
 
-/// A coding call works on a snapshot of the checkout as it is, dirty edits
-/// and the call's inputs included, minus the credentials, the Claude Code
-/// config and the links out of the project. The worker edits files and runs
-/// commands there, the call returns its changes as a list, and the checkout
-/// stays untouched.
 #[test]
 fn a_coding_run_changes_a_snapshot_and_never_the_checkout() {
     let include = &[UNTRACKED_INPUT];
@@ -549,9 +511,8 @@ fn denied_reads(filesystem: &Value) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The worker must not reach the checkout by another path. From a worktree,
-/// the primary checkout and the git common dir hold the same project, and
-/// from a subdirectory, so does the rest of the repository.
+/// A worktree and its primary checkout share git objects. Deny every path that can expose the
+/// original project.
 #[test_case(true ; "from_a_worktree")]
 #[test_case(false ; "from_a_subdirectory")]
 fn the_sandbox_denies_every_path_to_the_checkout(from_worktree: bool) {
@@ -677,9 +638,8 @@ fn an_import_lands_what_was_recorded_whatever_the_snapshot_holds() {
     );
 }
 
-/// A name that is not UTF-8 cannot pass through maki to a process, and the
-/// job reader drops any listing containing it, so the call stops and names
-/// the file rather than work on a snapshot without it.
+/// A non-UTF-8 name cannot pass through the Lua process API. Stop the call so the snapshot
+/// cannot silently omit it.
 #[test]
 fn a_file_name_maki_cannot_pass_on_is_refused() {
     let coding = Coding::new();
@@ -757,9 +717,7 @@ fn an_import_rechecks_each_file_after_its_approval(path: &str) {
     assert_eq!(fs::read_to_string(&target).unwrap(), NEWER_WORK);
 }
 
-/// Every original is kept before the first write. If one cannot be kept,
-/// here the deleted file's, the import stops before changing anything, and
-/// the full import runs once the problem is gone.
+/// Failure to preserve any original must stop the import before the first checkout change.
 #[test]
 fn an_original_that_cannot_be_kept_changes_no_file() {
     let (coding, reg, _host, id) = Coding::coded(CODE_EDIT);
@@ -788,9 +746,8 @@ fn an_original_that_cannot_be_kept_changes_no_file() {
     assert!(!project.join(DELETED_FILE).exists());
 }
 
-/// Manifest fields end up in the command the user approves, so a manifest
-/// maki did not write (here one with a command in place of an object id) or
-/// one for another checkout is refused before any command is built.
+/// Manifest fields enter an approved shell command. Reject manifests that collection cannot
+/// produce or that identify a different checkout.
 #[test_case(|manifest: &mut Value, _: &Path| manifest["changes"][0]["new_sha"] = json!(COMMAND_FOR_A_SHA), NOT_WRITTEN_BY_MAKI ; "a_command_for_an_object_id")]
 #[test_case(|manifest: &mut Value, outside: &Path| manifest["project"] = json!(outside), FOR_ANOTHER_CHECKOUT ; "another_checkout")]
 fn an_import_refuses_a_manifest_maki_did_not_write(tamper: fn(&mut Value, &Path), want: &str) {
@@ -855,37 +812,38 @@ fn a_denied_import_passes_on_the_guidance_and_not_its_command() {
     assert_eq!(contents(&coding.project()), before);
 }
 
-/// A cancel kills the command and its cleanup. Here it lands while the new
-/// files wait beside their targets, because keeping the first replaced file
-/// blocks on a readerless pipe. Once the command stops, the plugin removes
-/// the files and reads the checkout to show nothing changed, and the
-/// checkout is as it was.
+/// Pause the first backup link after staging. Cancellation must remove temporary files
+/// before the test examines the unchanged checkout.
 #[test]
 fn a_cancelled_import_leaves_the_checkout_as_it_was() {
-    if !mode_bits_hold() {
-        return;
-    }
-    let (coding, reg, _host, id) = Coding::coded(CODE_EDIT);
+    let coding = Coding::new();
+    let held = coding.artifacts.path().join(IMPORT_HELD);
+    let pipe = coding.artifacts.path().join(IMPORT_RELEASE);
+    assert!(
+        Command::new("mkfifo")
+            .arg(&pipe)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let prefix = HOLD_IMPORT
+        .replace("@HELD@", held.to_str().unwrap())
+        .replace("@PIPE@", pipe.to_str().unwrap());
+    let (reg, _host) = coding.host_with(&[], &(prefix + BASH_SRC));
+    let id = artifact_id(&coding.code(&reg, CODE_EDIT, &[]).unwrap());
     let project = coding.project();
-    let kept = coding
-        .artifacts
-        .path()
-        .join(&id)
-        .join(ORIGINALS)
-        .join("src");
-    let _held = HeldPipe::plant(&kept);
     let before = contents(&project);
     let mut ctx = coding.ctx(&reg);
     let (trigger, token) = CancelToken::new();
     ctx.cancel = token;
     let written = project.clone();
     let canceller = thread::spawn(move || {
-        let wrote_all = wait_until(DEADLINE, || {
-            temp_files(&written).iter().any(|temp| {
+        let paused = wait_until(DEADLINE, || held.exists());
+        let wrote_all = paused
+            && temp_files(&written).iter().any(|temp| {
                 fs::metadata(temp)
                     .is_ok_and(|meta| meta.permissions().mode() & EXECUTABLE_BITS != 0)
-            })
-        });
+            });
         trigger.cancel();
         wrote_all
     });
@@ -908,9 +866,7 @@ fn a_cancelled_import_leaves_the_checkout_as_it_was() {
     assert!(settled, "the import left {:?}", temp_files(&project));
 }
 
-/// A cancel during the snapshot, here while `prepare` runs, stops the copy
-/// and removes the artifact, dependencies included, instead of leaving it
-/// for the sweep a day later.
+/// Cancellation must remove the incomplete snapshot and its dependencies immediately.
 #[test]
 fn a_cancel_while_the_snapshot_is_made_discards_it() {
     let coding = Coding::new();
@@ -1124,9 +1080,7 @@ fn an_import_refuses_a_file_made_executable_during_approval() {
     );
 }
 
-/// Writes follow links, so the import stops if a file, a folder above it or
-/// the checkout was swapped for a link to a copy outside the checkout during
-/// approval, even when the copy matches the snapshot.
+/// A symlink swap must not redirect import writes outside the validated checkout.
 #[test_case("src" ; "a_folder_above_it")]
 #[test_case("" ; "the_checkout")]
 fn an_import_refuses_a_link_swapped_in_during_approval(swapped: &str) {
@@ -1150,8 +1104,7 @@ fn an_import_refuses_a_link_swapped_in_during_approval(swapped: &str) {
     );
 }
 
-/// `prepare` runs outside the sandbox, after the snapshot's links were
-/// checked, so a link `prepare` makes out of the snapshot is removed too
+/// `prepare` runs outside the sandbox and can create external links. Remove these links
 /// before the worker starts.
 #[test]
 fn a_link_prepare_makes_out_of_the_snapshot_is_dropped() {
@@ -1196,6 +1149,7 @@ fn prepare_runs_with_the_users_environment() {
 #[test_case(EXITS_AS_A_TIMEOUT_WOULD, 60, EXITED_WITH_124 ; "that_exits_as_a_timeout_would")]
 fn a_failed_prepare_reaches_the_worker_and_the_reply(command: &str, limit_secs: u64, detail: &str) {
     let coding = Coding::new();
+    let command = format!("{PREPARE_WRITES_LOCK}; {command}");
     let (reg, _host) = coding.host(&[
         ("prepare", json!(command)),
         ("prepare_timeout_secs", json!(limit_secs)),
@@ -1209,12 +1163,58 @@ fn a_failed_prepare_reaches_the_worker_and_the_reply(command: &str, limit_secs: 
         coding.fake.log("prompt").contains(PREPARE_TOLD),
         "maki did not tell the worker"
     );
+    assert!(reply.contains(PREPARED_NOTE), "{reply}");
+    assert!(!reply.contains(&format!("A {PREPARED_FILE}")), "{reply}");
+    let snapshot = coding
+        .artifacts
+        .path()
+        .join(artifact_id(&reply))
+        .join(SNAPSHOT_DIR);
+    assert!(snapshot.join(PREPARED_FILE).exists());
 }
 
-/// The listed dependency directories go into the snapshot without showing
-/// as changes, and the worker's writes to them never reach the checkout. A
-/// Python virtual environment is not copied, because its scripts hard-code
-/// its path in the checkout.
+#[test_case(false ; "successful_command")]
+#[test_case(true ; "failed_command")]
+fn an_unrecorded_prepare_baseline_stops_the_worker(fails: bool) {
+    let coding = Coding::new();
+    let command = if fails {
+        format!("{BREAK_BASELINE}; {EXITS_AS_A_TIMEOUT_WOULD}")
+    } else {
+        BREAK_BASELINE.to_owned()
+    };
+    let (reg, _host) = coding.host(&[("prepare", json!(command))]);
+    let error = coding.code(&reg, CODE_EDIT, &[]).unwrap_err();
+
+    assert!(error.contains(CANNOT_RECORD_PREPARED), "{error}");
+    assert!(coding.fake.log("prompt").is_empty());
+}
+
+#[test_case(false ; "included_dependency")]
+#[test_case(true ; "prepared_dependency")]
+fn dependency_exclusions_do_not_depend_on_copying(prepared: bool) {
+    let coding = Coding::new();
+    if !prepared {
+        write(&coding.project().join(DEPENDENCY), DEPENDENCY_CONTENT);
+    }
+    let mut options = vec![("dependencies", json!(NODE_MODULES))];
+    if prepared {
+        options.push(("prepare", json!(CREATE_DEPENDENCY)));
+    }
+    let (reg, _host) = coding.host(&options);
+    let included = if prepared {
+        &[][..]
+    } else {
+        &[NODE_MODULES][..]
+    };
+    let reply = coding.code(&reg, CODE_EDIT, included).unwrap();
+
+    assert!(coding.fake.log("snapshot_listing").contains(DEPENDENCY));
+    assert!(!reply.contains(&format!("M {DEPENDENCY}")), "{reply}");
+    assert!(!reply.contains(&format!("A {DEPENDENCY}")), "{reply}");
+}
+
+/// Dependency paths stay outside the import. Python virtual environment scripts contain
+/// absolute paths, so preparation must recreate them.
 #[test]
 fn dependencies_come_along_but_never_as_changes() {
     let coding = Coding::new();
@@ -1289,11 +1289,8 @@ fn dependency_copies_keep_the_snapshot_exclusions() {
     }
 }
 
-/// A dependency directory is copied into the snapshot and kept out of the
-/// changes, whatever its name, without any project ignore rule.
-/// A name that looks like a `find` expression is still a directory: when
-/// `find` read it as `-print`, the whole project showed as changed during
-/// the copy.
+/// Dependency names can resemble `find` expressions. They must remain path arguments
+/// regardless of project ignore rules.
 #[test_case(EXPRESSION_NAMED_DIR, EXPRESSION_NAMED_DEPENDENCY ; "named_like_an_expression")]
 #[test_case(UNICODE_DEPENDENCY_DIR, UNICODE_DEPENDENCY ; "named_outside_ascii")]
 fn a_dependency_dir_is_copied_and_never_a_change(dir: &str, file: &str) {
@@ -1356,8 +1353,7 @@ fn the_sweep_takes_only_stale_artifacts(files: &[&str], fresh_manifest: bool, sw
     );
 }
 
-/// An artifact directory inside the checkout is refused before anything is
-/// created or removed there, even an artifact already in it.
+/// An artifact directory inside the checkout can expose project files to cleanup.
 #[test_case(false ; "that_does_not_exist_yet")]
 #[test_case(true ; "that_holds_an_old_artifact")]
 fn an_artifact_dir_inside_the_checkout_changes_nothing_there(exists: bool) {
@@ -1397,9 +1393,8 @@ fn an_artifact_dir_beside_the_session_in_the_checkout_is_refused(from_worktree: 
     assert!(!inside.exists(), "maki made the artifact directory");
 }
 
-/// A dangling link or an unreadable folder on the way to the artifact
-/// directory stops the call with an error naming it, instead of being taken
-/// as a folder to create.
+/// An inaccessible parent can hide an existing artifact directory. Refuse the path before
+/// creation or cleanup.
 #[test_case(true, LINK_TO_NOWHERE ; "through_a_dangling_link")]
 #[test_case(false, CANNOT_READ ; "through_an_unreadable_folder")]
 fn an_artifact_dir_maki_cannot_follow_is_refused(dangling: bool, problem: &str) {
@@ -1423,9 +1418,8 @@ fn an_artifact_dir_maki_cannot_follow_is_refused(dangling: bool, problem: &str) 
     assert!(err.contains(base.path().to_str().unwrap()), "got: {err}");
 }
 
-/// The artifact directory must be absolute and free of `..`, since a `..`
-/// after a missing folder means nothing until the folder exists. The plugin
-/// refuses either when it loads, before anything is created or removed.
+/// A `..` component after a nonexistent directory has no resolved target. Refuse these
+/// artifact paths at plugin load.
 #[test_case(false, ARTIFACT_DIR_RELATIVE ; "a_relative_path")]
 #[test_case(true, ARTIFACT_DIR_CLIMBS ; "a_path_that_climbs")]
 fn an_artifact_dir_it_cannot_trust_is_refused(climbs: bool, problem: &str) {
@@ -1566,9 +1560,8 @@ fn changes_the_import_cannot_apply_are_left_to_the_user() {
     assert!(project.join(ESCAPE_NAME).exists());
 }
 
-/// A name that survives only with proper shell quoting goes from the
-/// worker's snapshot through the collect step, the manifest check and the
-/// approved command, arriving byte for byte with no part of it run.
+/// Worker paths can contain shell syntax. Preserve their bytes through collection, manifest
+/// validation and import without execution.
 #[test]
 fn a_hostile_file_name_lands_through_the_whole_import() {
     let (coding, reg, _host, id) = Coding::coded(CODE_HOSTILE);

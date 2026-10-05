@@ -47,8 +47,8 @@ M.ADDED, M.DELETED = ADDED, DELETED
 local TYPE_CHANGED = "T"
 local TYPE_KIND = "type"
 M.TYPE_KIND = TYPE_KIND
--- A link can point out of the project, and a submodule or a type change is
--- more than a file, so the user applies these by hand.
+-- Symlinks, submodules and type changes can affect paths outside an ordinary file import. The
+-- user must apply these changes manually.
 local IMPORTABLE = { text = true, binary = true, mode = true }
 -- Manifest fields end up in the command the user approves, so any other
 -- value is refused.
@@ -73,10 +73,13 @@ local IMPORT_NOTE = "claude_code_import: "
 local NOTHING_IMPORTED = "so maki imported no changes"
 local IMPORT_CHANGED = "changed in the checkout after the snapshot, " .. NOTHING_IMPORTED
 local ARTIFACT_GONE = "is no longer in the artifact, " .. NOTHING_IMPORTED
+local IMPORT_NO_LINK = "cannot preserve open-file writes. Inspect the backup or put artifact_dir "
+  .. "on the checkout filesystem."
 M.IMPORT_ORIGINALS = "originals"
+M.IMPORT_DISPLACED = "displaced"
 M.STAGE_TEMPLATE = "stage.XXXXXX"
--- Each import has its own stage folder, and its temporary files carry the
--- stage name, so the cleanup of one import leaves the files of another.
+-- Each attempt needs unique stage and temporary paths so its cleanup cannot remove another
+-- attempt's files.
 local TEMP_PREFIX = ".maki-import-"
 local TEMP_RANDOM = "XXXXXX"
 
@@ -244,8 +247,8 @@ function M.bash_quote(text)
   end))
 end
 
---- Escapes the control bytes of {path}, which a terminal can run as
---- commands, and each byte above ASCII of a name that is not UTF-8.
+--- Terminal control bytes can execute commands. Escape them and non-UTF-8 path bytes before
+--- display.
 function M.printable(path)
   return (
     path:gsub(utf8.len(path) and "%c" or "[%c\128-\255]", function(char)
@@ -483,18 +486,12 @@ function M.temp_name(stage)
   return TEMP_PREFIX .. artifact .. "." .. name:match("[^.]+$") .. "."
 end
 
---- The user can take a long time to approve, so the command checks
---- everything again when it runs. It first stages each blob from {git_dir}
---- in {stage}, a new folder in {artifact}, then checks each file and the
---- folders above it, and exits before writing if any of them differs from
---- the snapshot. It enters {project} first and uses relative paths, so a
---- checkout swapped for a link after that cannot redirect the writes.
----
---- Each new file is written next to its target, and all of them are renamed
---- into place at the end. A replaced or deleted file keeps a hard link in the
---- originals, so a write through a descriptor opened earlier is not lost. A
---- kill skips the cleanup, so `leftovers_script` runs after any import that
---- failed.
+--- The command stages blobs, then validates the checkout before any write.
+--- Relative paths stay in {project} even if its name becomes a link.
+--- Hard links preserve writes through open descriptors. Renamed originals
+--- also preserve atomic editor saves that replace those inodes. New files
+--- use links that cannot overwrite a save made after the original moved.
+--- A failed import runs `leftovers_script` to remove its temporary files.
 function M.import_script(changes, project, git_dir, artifact, stage)
   local words = {}
   for name, value in pairs(GIT_UNCONFIGURED) do
@@ -539,6 +536,7 @@ function M.import_script(changes, project, git_dir, artifact, stage)
       .. '&& [ "$(mode "$1")" = "$3" ] || changed "$1"; }',
     'absent() { [ ! -e "$1" ] && [ ! -L "$1" ] || changed "$1"; }',
     "originals=" .. M.bash_quote(artifact .. "/" .. M.IMPORT_ORIGINALS),
+    "displaced=" .. M.bash_quote(artifact .. "/" .. M.IMPORT_DISPLACED .. "/" .. stage:match("[^/]+$")),
     "stage=" .. M.bash_quote(stage),
     "declare -A temp_of=()",
     'trap \'rm -rf -- "$stage"; rm -f -- "${temp_of[@]}"\' EXIT',
@@ -550,10 +548,12 @@ function M.import_script(changes, project, git_dir, artifact, stage)
       .. '"); temp_of[$1]=$temp; '
       .. 'cat -- "$stage/$2" > "$temp"; if [ -e "$1" ]; then chmod --reference="$1" -- "$temp"; '
       .. 'else chmod "$fresh" -- "$temp"; fi; chmod "$3" -- "$temp"; }',
-    'keep() { folders "$1"; mkdir -p -- "$originals/${1%/*}"; '
-      .. 'ln -f -- "$1" "$originals/$1" 2>/dev/null || cp -p -- "$1" "$originals/$1"; }',
-    'put() { folders "$1"; mv -fT -- "${temp_of[$1]}" "$1"; }',
-    'drop() { folders "$1"; rm -f -- "$1"; }',
+    'keep() { folders "$1"; mkdir -p -- "$originals/${1%/*}" "$displaced/${1%/*}"; '
+      .. '[ "$1" -ef "$originals/$1" ] || ln -T -- "$1" "$originals/$1" || { printf "%s\\n" '
+      .. M.bash_quote(IMPORT_NOTE .. IMPORT_NO_LINK)
+      .. ' >&2; exit 1; }; }',
+    'put() { folders "$1"; ln -T -- "${temp_of[$1]}" "$1"; }',
+    'drop() { folders "$1"; mv -fT -- "$1" "$displaced/$1"; }',
   }
   -- Every original is kept before the first write, so a failed keep (a full
   -- disk, say) stops the import before it changes anything. Each path starts
@@ -584,6 +584,9 @@ function M.import_script(changes, project, git_dir, artifact, stage)
       end
       local flag = change.new_mode == EXECUTABLE_MODE and "+x" or "-x"
       news[#news + 1] = "new " .. path .. " " .. change.new_sha .. " " .. flag
+      if change.status ~= ADDED then
+        writes[#writes + 1] = "drop " .. path
+      end
       writes[#writes + 1] = "put " .. path
     end
   end

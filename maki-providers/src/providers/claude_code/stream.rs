@@ -1,9 +1,7 @@
-//! Decodes one request's Claude Code output into maki's response. Model text
-//! is ignored until the handshake passes and the init event matches how
-//! Claude Code was started. A reply that calls tools is complete once the
-//! whole generation has arrived and one of its calls is held: the held call
-//! shows Claude Code is handing the batch to maki, and the stream holds every
-//! call. A reply without calls is complete at its result.
+//! Model text must wait for the handshake and the validated init event. Tool-call replies
+//! need both the complete generation and a held call.
+//!
+//! The held call establishes the handoff to maki. Text replies complete at their result event.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, PoisonError};
@@ -135,8 +133,7 @@ pub(crate) struct Turn<'a> {
     rejected: bool,
     /// The last plan report said the plan's limit is used up.
     plan_rejected: bool,
-    /// An API error in the middle of a reply comes before the result, and
-    /// only the result has its status, so the request waits for it.
+    /// An API error can precede the result. Wait for the result because only it has the status.
     refusal: Option<Refusal>,
     /// A reply that stopped with a block missing waits for the result too,
     /// which can name an API error as the cause.
@@ -667,9 +664,8 @@ impl<'a> Turn<'a> {
         if !self.complete {
             return Ok(Step::Nothing);
         }
-        // Claude Code sends each block before `message_stop`, except the text
-        // its output filter drops, so a block missing now was lost, and the
-        // result can say why.
+        // Claude Code sends blocks before `message_stop`, except those its output filter
+        // removes. Wait for the result to explain any other absent block.
         let sendable = self
             .started
             .iter()
@@ -709,9 +705,8 @@ impl<'a> Turn<'a> {
                 return Err(Error::CallDiffers(parked.name.clone()));
             }
         }
-        // Claude Code hands maki no call from a cut reply, and the last call
-        // may be incomplete, so the reply comes back cut without its calls,
-        // as a cut text reply does.
+        // Claude Code hands over no calls from a cut reply. Its last call can be incomplete,
+        // so return only the text.
         if self.truncated() {
             return Ok(Step::Done);
         }
@@ -743,7 +738,8 @@ impl<'a> Turn<'a> {
         })
     }
 
-    /// A missing count fails the request rather than showing as zero.
+    /// An absent usage count must fail the request. Zero would conceal incomplete protocol
+    /// data.
     pub fn response(self) -> Result<StreamResponse, Error> {
         let stop_reason = if self.truncated() {
             StopReason::MaxTokens
@@ -826,8 +822,8 @@ fn continuation(event: &Value) -> bool {
             .is_some_and(|blocks| blocks.iter().all(|block| block["type"] == TEXT_BLOCK))
 }
 
-/// Claude Code leaves a message out of its output when its only block is
-/// blank text or a placeholder, and each block is a message of its own.
+/// Each block becomes a separate message. Claude Code omits messages that contain only blank
+/// text or a placeholder.
 fn dropped_by_claude_code(text: &str) -> bool {
     js_trim(text).is_empty() || DROPPED_TEXTS.contains(&text)
 }
@@ -1063,8 +1059,7 @@ mod tests {
             } else {
                 feeds.chain(parks).collect()
             };
-            // Like the supervisor, keep checking events after the end and
-            // stop at an error.
+            // A late protocol error must invalidate the reply even after its completion.
             let mut done = false;
             for input in inputs {
                 let step = match input {
@@ -1109,11 +1104,8 @@ mod tests {
         )
     }
 
-    /// Each of these stops the request mid-generation: a question maki does
-    /// not accept, a hook policy kept on, a compaction maki turned off, a
-    /// second start even with the same id, an unreadable block, a call
-    /// without a name, an error result, an unknown event, and a line that is
-    /// not an event.
+    /// Unexpected protocol data must stop the request before an unvalidated reply reaches the
+    /// user.
     #[test_case(json!({ "type": "control_request", "request": { "subtype": "can_use_tool" } }).to_string() => matches Err(Error::Asked(_)) ; "a_question")]
     #[test_case(json!({ "type": "system", "subtype": "hook_started", "hook_event": "Stop" }).to_string() => matches Err(Error::HookStarted(_)) ; "a_hook")]
     #[test_case(json!({ "type": "system", "subtype": "compact_boundary" }).to_string() => matches Err(Error::Compacted) ; "a_compaction")]
@@ -1170,9 +1162,8 @@ mod tests {
         .0
     }
 
-    /// Claude Code hands maki no call from a cut reply, and the last call may
-    /// be incomplete, so the reply comes back cut with its text alone, and
-    /// maki asks the model to go on.
+    /// Claude Code hands over no calls from a cut reply. Return only text so maki can request
+    /// a continuation.
     #[test]
     fn a_tool_batch_cut_at_the_output_cap_comes_back_without_its_calls() {
         let lines = reply(
@@ -1253,8 +1244,8 @@ mod tests {
         assert_eq!(ids, [FIRST_CALL, SECOND_CALL]);
     }
 
-    /// The prompt cache reuses the blocks an earlier request sent, so each
-    /// transcript block stays a text block of its own, in order, on one line.
+    /// Each transcript block must retain its bytes and position so later requests can reuse
+    /// the cached prefix.
     #[test]
     fn each_transcript_block_is_a_text_block_of_its_own() {
         let blocks = ["first".to_owned(), "second\nline".to_owned()];
@@ -1382,9 +1373,8 @@ mod tests {
         [reply.to_string(), result.to_string()]
     }
 
-    /// A rate limit after the plan report says the plan is used up cannot pass
-    /// before the window resets, so it is not a temporary error. Any other
-    /// rate limit is one.
+    /// A used-up plan cannot serve another request before its window resets. Its rate limit
+    /// must not enter the temporary-error retry path.
     #[test_case(PLAN_REJECTED, true ; "a_used_up_plan")]
     #[test_case("allowed", false ; "a_plan_with_room_left")]
     fn a_used_up_plan_is_not_retried(status: &str, used_up: bool) {
@@ -1414,11 +1404,8 @@ mod tests {
         );
     }
 
-    /// An API error can stop a reply in the middle of a block. The error
-    /// names the cause, with the status from the result, so a rate limit goes
-    /// to maki's retry loop, and a used-up plan does not. The lost block
-    /// alone says nothing. The sequence is what 2.1.284 sent for an error
-    /// event after a text delta.
+    /// Only the result supplies the status of a mid-reply API error. A missing block alone
+    /// cannot identify the retry path.
     #[test_case(None, false ; "a_rate_limit")]
     #[test_case(Some(PLAN_REJECTED), true ; "a_used_up_plan")]
     fn an_api_error_in_the_middle_of_a_reply_names_the_cause(plan: Option<&str>, used_up: bool) {
@@ -1558,9 +1545,8 @@ mod tests {
         )
     }
 
-    /// Claude Code sends each block as a message of its own and leaves out a
-    /// message that holds only blank text or one of its placeholders, though
-    /// the block's start already streamed.
+    /// Claude Code can omit an output message after its block start event. Blank text and
+    /// placeholder blocks must pass this exception.
     #[test_case("\n\n" ; "blank_text")]
     #[test_case(NO_CONTENT ; "no_content")]
     #[test_case(INTERRUPTED ; "an_interruption")]

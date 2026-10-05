@@ -255,7 +255,7 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `artifact_dir` | string | `""` | - | Absolute path of the directory for coding snapshots and their changes. Defaults to `claude_code/changes` in the maki state directory. On the project's filesystem, maki can clone the dependencies instead of copying them. Expiry removes only the artifacts maki made there. |
+| `artifact_dir` | string | `""` | - | Absolute path of the directory for coding snapshots and their changes. Defaults to `claude_code/changes` in the maki state directory. On the project's filesystem, maki can clone the dependencies with copy-on-write. Imports of replacements or deletions need hard links on the checkout filesystem. Expiry removes only artifacts that maki created there. |
 | `artifact_ttl_hours` | integer | `24` | 1 | Remove a coding artifact after this many hours without a write. |
 | `config_dir` | string | `""` | - | Absolute path of a Claude Code config directory for maki, in place of `$CLAUDE_CONFIG_DIR` or `~/.claude`. Use it to give maki a different Claude login. |
 | `deny_read` | string | `""` | - | Extra paths Claude cannot read, relative to the session's directory and comma-separated, for example `config/prod.yml,certs/**`. As in `.gitignore`, a pattern without a `/` matches at any depth. They add to the default `.env*` and `secrets/` rules, and coding snapshots never contain them. |

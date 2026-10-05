@@ -93,10 +93,8 @@ pub(crate) struct LuaCtx {
     session_id: Option<SessionRef>,
     task_id: Option<Arc<str>>,
     pub(crate) finish_tx: Option<flume::Sender<ToolCallReply>>,
-    /// The calling plugin's permissions, for methods that reach outside the
-    /// call. The ctx is built off the Lua thread, and only the Lua thread
-    /// holds the plugin map with the permissions, so this stays
-    /// `PluginPermissions::denied()` until `run_tool_call` sets it.
+    /// The ctx starts outside the Lua thread, which owns the plugin permissions. Keep
+    /// permissions denied until `run_tool_call` assigns them.
     pub(crate) permissions: PluginPermissions,
 }
 

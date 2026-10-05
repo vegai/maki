@@ -56,11 +56,8 @@ const POLICY: &str = "policy";
 const ALL_DISABLED: &str = "allDisabled";
 const DISABLED: &str = "disabled";
 
-/// The route rules. The only version rule is the first Claude Code release
-/// with the flags and control requests maki uses. There is deliberately no
-/// list of tested versions, because each request checks every login,
-/// setting, hook and tool it does not know, and every plugin that is not
-/// built in.
+/// The minimum version supplies the necessary flags and control requests. Each request must
+/// validate all login, setting, hook, tool and plugin inputs.
 #[derive(Debug, Deserialize)]
 pub(crate) struct Rules {
     pub minimum_version: [u64; 3],
@@ -78,8 +75,7 @@ pub(crate) struct Rules {
     pub route_env: Vec<String>,
     pub route_env_prefixes: Vec<String>,
     pub harmless_env: Vec<String>,
-    /// Ignoring a file that sets one of these keys would change the login
-    /// without anyone noticing.
+    /// These keys can change the login even in settings that maki ignores.
     pub route_settings: Vec<String>,
     pub login_method_key: String,
     pub subscription_login_method: String,
@@ -204,11 +200,9 @@ pub(crate) fn child_env(
     (env, withheld)
 }
 
-/// `None` for a submodule's `.git` file, which has no `commondir`. An
-/// unreadable file, or a `commondir` naming a missing directory, is an
-/// error, because then the primary checkout's local settings cannot be
-/// checked. The path is resolved lexically, as Claude Code and the plugin
-/// resolve it.
+/// A submodule has no `commondir` and returns `None`. Unreadable git paths must fail
+/// because the primary checkout can contain local settings. Resolve paths lexically, as
+/// Claude Code and the plugin do.
 fn main_checkout(git_file: &Path) -> io::Result<Option<PathBuf>> {
     let text = fs::read_to_string(git_file)?;
     let Some(gitdir) = text.trim().strip_prefix(GITDIR_PREFIX) else {
@@ -264,9 +258,8 @@ pub(crate) fn local_settings_dirs(cwd: &Path) -> Result<Vec<PathBuf>, Error> {
     Ok(dirs)
 }
 
-/// Returns `configured`, or `.claude` in `home`, with an empty value counting
-/// as unset. The checks and each child resolve the path from different
-/// directories, so it must be absolute.
+/// Use `configured`, or `.claude` in `home`. Treat an empty value as unset. The checks and
+/// each child resolve the path from different directories, so it must be absolute.
 pub(crate) fn config_dir(
     configured: Option<OsString>,
     home: Option<OsString>,
@@ -482,8 +475,7 @@ fn plugins_problem(plugins: &Value) -> Option<Problem> {
         .map(|plugin| Problem::Plugin(plugin[SOURCE].clone()))
 }
 
-/// `None` only when there is no API key, the mode is the default, the tools
-/// are exactly maki's handoff tools, and the handoff server is connected.
+/// The API key, mode, tool catalog and handoff connection must all satisfy the route checks.
 pub(crate) fn init_problem(event: &Value, expect: &InitExpect<'_>) -> Option<Problem> {
     if event[API_KEY_SOURCE] != RULES.no_key_source.as_str() {
         return Some(Problem::StartedWithKey(event[API_KEY_SOURCE].clone()));
@@ -595,9 +587,8 @@ mod tests {
         assert_eq!(withheld, [API_KEY_ENV, BEDROCK_ENV]);
     }
 
-    /// Each section holds cases with an input and the verdict that both the
-    /// plugin and the provider must reach: a case with a `problem` is refused
-    /// with a message containing it.
+    /// Both implementations must reach the same verdict and report the same refusal text for
+    /// each shared case.
     #[test_case("versions" ; "versions")]
     #[test_case("env" ; "env")]
     #[test_case("config_dirs" ; "config_dirs")]
