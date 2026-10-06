@@ -10,7 +10,9 @@ use serde_json::{Value, json};
 use tracing::{debug, error, warn};
 
 use crate::agent::CallInstructions;
-use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, ToolDeferral, UNKNOWN_MCP, is_wire_name};
+use crate::mcp::{
+    McpSession, TOOL_SEARCH_TOOL_NAME, ToolDeferral, UNKNOWN_MCP, is_wire_name, wire_tool_name,
+};
 use crate::task_set::TaskSet;
 use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict};
 use crate::tools::registry::{InstalledHook, RegisteredTool, Tool, ToolInvocation};
@@ -120,7 +122,10 @@ pub async fn run(
     ctx: &ToolContext,
     origin: CallOrigin,
 ) -> ToolDoneEvent {
-    let resolved = resolve(ctx, name);
+    let mut resolved = resolve(ctx, name);
+    if !offered(ctx, &resolved) {
+        resolved.route = Route::Unknown;
+    }
     let name = resolved.name;
     let hook = Hook::of(ctx, &resolved, origin);
 
@@ -419,6 +424,23 @@ fn resolve<'a>(ctx: &'a ToolContext, name: &'a str) -> Resolved<'a> {
     Resolved { name, route }
 }
 
+fn offered(ctx: &ToolContext, resolved: &Resolved<'_>) -> bool {
+    match &resolved.route {
+        Route::Native(entry) => {
+            ctx.tool_filter
+                .offers(resolved.name, entry.tool.audience(), ctx.audience)
+        }
+        Route::Local(tool) => {
+            tool.audience.contains(ctx.audience) && ctx.tool_filter.matches_local(resolved.name)
+        }
+        Route::Mcp(_, qualified) => ctx
+            .tool_filter
+            .matches_external_names(&[qualified, &wire_tool_name(qualified)]),
+        Route::ToolSearch(_) => ctx.tool_filter.matches_external(resolved.name),
+        Route::Unknown => false,
+    }
+}
+
 /// One callable name, as [`resolve`] would route it.
 pub struct Callable {
     /// The name to dispatch. Always what `resolve` was asked, never an alias.
@@ -448,15 +470,14 @@ pub struct Callable {
 ///
 /// Recompute per call: MCP republishes its index whenever a server comes or goes.
 pub fn callable(ctx: &ToolContext) -> Vec<Callable> {
-    let filter = &ctx.tool_filter;
     let mut out: Vec<Callable> = Vec::new();
     let mut claimed: HashSet<String> = HashSet::new();
     // A name belongs to the first source dispatch would reach, claimed before
     // any filter runs: a registry tool this audience may not call still owns its
     // name, or MCP would publish a way around it.
-    let mut claim = |name: &str, audience: ToolAudience| {
+    let mut claim = |name: &str, route: Route<'_>| {
         let first = claimed.insert(name.to_owned());
-        first && audience.contains(ctx.audience)
+        first && offered(ctx, &Resolved { name, route })
     };
     let entry_of = |name: &str, source, audience, schema| Callable {
         name: name.to_owned(),
@@ -469,13 +490,13 @@ pub fn callable(ctx: &ToolContext) -> Vec<Callable> {
     let mut local: Vec<(&String, &LocalTool)> = ctx.local_tools.iter().collect();
     local.sort_by(|a, b| a.0.cmp(b.0));
     for (name, tool) in local {
-        if claim(name, tool.audience) {
+        if claim(name, Route::Local(tool)) {
             out.push(entry_of(name, SOURCE_LOCAL, tool.audience, None));
         }
     }
     for entry in ctx.registry.iter().iter() {
         let audience = entry.tool.audience();
-        if !claim(entry.name(), audience) || !filter.matches(entry.name()) {
+        if !claim(entry.name(), Route::Native(entry.clone())) {
             continue;
         }
         out.push(entry_of(
@@ -492,7 +513,14 @@ pub fn callable(ctx: &ToolContext) -> Vec<Callable> {
         for name in names {
             // MCP has no audience system: a server is reachable or it is not,
             // and a session holding one already offers its tools to the model.
-            if claim(&name, ToolAudience::all()) {
+            let route = if name == TOOL_SEARCH_TOOL_NAME {
+                Route::ToolSearch(mcp)
+            } else if let Some(qualified) = mcp.resolve(&name) {
+                Route::Mcp(mcp, qualified)
+            } else {
+                continue;
+            };
+            if claim(&name, route) {
                 out.push(entry_of(&name, SOURCE_MCP, ToolAudience::all(), None));
             }
         }
@@ -572,7 +600,10 @@ async fn run_inner(
         Route::Unknown => {
             warn!(tool = %name, "unknown tool");
             let mut text = format!("{UNKNOWN_TOOL_PREFIX}: {name}");
-            if ctx.mcp.is_some() && is_wire_name(name) {
+            if ctx.mcp.is_some()
+                && is_wire_name(name)
+                && matches!(resolve(ctx, name).route, Route::Unknown)
+            {
                 text = format!("{text}. {MCP_SERVER_GONE}");
             }
             ToolDoneEvent {
@@ -775,10 +806,11 @@ fn run_tool_search(
     let query = input["query"].as_str().unwrap_or_default();
     emit_raw_start(ctx, origin, &id, &tool_id, query.to_owned(), input);
     let deferral = ToolDeferral::for_model(&ctx.model);
-    let (output, is_error) = match mcp.search_tools(query, origin, deferral) {
-        Ok(found) => (found, false),
-        Err(e) => (e.into(), true),
-    };
+    let (output, is_error) =
+        match mcp.search_tools_filtered(query, origin, deferral, &ctx.tool_filter) {
+            Ok(found) => (found, false),
+            Err(e) => (e.into(), true),
+        };
     ToolDoneEvent {
         call: None,
         id,
@@ -1094,6 +1126,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::agent::request_tools;
     use crate::cancel::CancelToken;
     use crate::mcp::test_support::stub_session;
     use crate::mcp::{ToolDeferral, tool_names};
@@ -1110,7 +1143,7 @@ mod tests {
     use crate::tools::{
         BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
         PermissionScopes, RequestTools, TOOL_NAME_FIELD, Tool, ToolAudience, ToolExecResult,
-        ToolHook, local_tool,
+        ToolFilter, ToolHook, local_tool,
     };
     use crate::{AgentMode, Envelope, EventSender, InstructionBlock};
 
@@ -2386,6 +2419,7 @@ mod tests {
         ctx.config.disabled_tools = disabled.iter().map(|n| (*n).to_owned()).collect();
         let tools = RequestTools::build(
             &ctx.registry,
+            &ctx.local_tools,
             &Vars::new(),
             &ctx.model,
             &ctx.config,
@@ -2396,6 +2430,233 @@ mod tests {
         ctx.tool_filter = Arc::clone(tools.filter());
 
         assert_eq!(tool_names(tools.definitions()), [OTHER_WIRE]);
+        assert_eq!(callable_names(&ctx), [OTHER_WIRE]);
+        let done = smol::block_on(dispatch(&ctx, PROBE_WIRE, &json!({})));
+        assert!(done.is_error);
+        assert_eq!(
+            done.output.as_text(),
+            format!("{UNKNOWN_TOOL_PREFIX}: {PROBE_WIRE}")
+        );
+    }
+
+    #[test_case(CallOrigin::Model, ToolAudience::MAIN, true ; "model_filter")]
+    #[test_case(CallOrigin::Nested, ToolAudience::MAIN, true ; "nested_filter")]
+    #[test_case(CallOrigin::Model, ToolAudience::RESEARCH_SUB, false ; "model_audience")]
+    #[test_case(CallOrigin::Nested, ToolAudience::RESEARCH_SUB, false ; "nested_audience")]
+    fn unoffered_local_tool_never_starts(
+        origin: CallOrigin,
+        audience: ToolAudience,
+        filtered: bool,
+    ) {
+        let started = Arc::new(AtomicBool::new(false));
+        let record = Arc::clone(&started);
+        let mut ctx = local_ctx(CLIENT_NAME, move |_| {
+            record.store(true, Ordering::SeqCst);
+            Ok(CHILD_TEXT.to_owned())
+        });
+        ctx.audience = audience;
+        if filtered {
+            ctx.tool_filter = Arc::new(ToolFilter::AllExcept(vec![CLIENT_NAME.to_owned()]));
+        } else {
+            Arc::get_mut(&mut ctx.local_tools)
+                .unwrap()
+                .get_mut(CLIENT_NAME)
+                .unwrap()
+                .audience = ToolAudience::MAIN;
+        }
+        let done = smol::block_on(run(
+            TEST_ID.to_owned(),
+            CLIENT_NAME,
+            &json!({}),
+            &ctx,
+            origin,
+        ));
+        assert!(done.is_error);
+        assert_eq!(
+            done.output.as_text(),
+            format!("{UNKNOWN_TOOL_PREFIX}: {CLIENT_NAME}")
+        );
+        assert!(!started.load(Ordering::SeqCst));
+    }
+
+    #[test_case(false, false, false ; "registry_backed_client_tool")]
+    #[test_case(true, false, false ; "session_local_tool")]
+    #[test_case(false, true, false ; "client_tool_explicitly_denied")]
+    #[test_case(true, true, false ; "session_local_tool_explicitly_denied")]
+    #[test_case(false, false, true ; "client_tool_excluded_by_host")]
+    fn local_tools_bypass_allow_lists_but_keep_denials(
+        assembled: bool,
+        disabled: bool,
+        excluded: bool,
+    ) {
+        let started = Arc::new(AtomicBool::new(false));
+        let record = Arc::clone(&started);
+        let mut ctx = local_ctx(CLIENT_NAME, move |_| {
+            record.store(true, Ordering::SeqCst);
+            Ok(CHILD_TEXT.to_owned())
+        });
+        ctx.registry = registry_with(&[CLIENT_NAME, PROBE_WIRE, OTHER_WIRE]);
+        ctx.config.allowed_tools = vec![OTHER_WIRE.to_owned()];
+        if disabled {
+            ctx.config.disabled_tools = vec![CLIENT_NAME.to_owned()];
+        }
+        let tools = if assembled {
+            RequestTools::assembled(
+                json!([
+                    { TOOL_NAME_FIELD: CLIENT_NAME },
+                    { TOOL_NAME_FIELD: PROBE_WIRE },
+                    { TOOL_NAME_FIELD: OTHER_WIRE },
+                ]),
+                &ctx.local_tools,
+                &ctx.config,
+                &ctx.model,
+            )
+        } else {
+            RequestTools::build(
+                &ctx.registry,
+                &ctx.local_tools,
+                &Vars::new(),
+                &ctx.model,
+                &ctx.config,
+                if excluded { &[CLIENT_NAME] } else { &[] },
+                false,
+                false,
+            )
+        };
+        ctx.tool_filter = Arc::clone(tools.filter());
+        let denied = disabled || excluded;
+        let names = tool_names(tools.definitions());
+        assert_eq!(names.contains(&CLIENT_NAME), !denied);
+        assert!(!names.contains(&PROBE_WIRE));
+        assert!(names.contains(&OTHER_WIRE));
+        assert_eq!(
+            callable_names(&ctx).contains(&CLIENT_NAME.to_owned()),
+            !denied
+        );
+        for origin in [CallOrigin::Model, CallOrigin::Nested] {
+            started.store(false, Ordering::SeqCst);
+            let done = smol::block_on(run(
+                TEST_ID.to_owned(),
+                CLIENT_NAME,
+                &json!({}),
+                &ctx,
+                origin,
+            ));
+            assert_eq!(done.is_error, denied);
+            assert_eq!(started.load(Ordering::SeqCst), !denied);
+            let expected = if denied {
+                format!("{UNKNOWN_TOOL_PREFIX}: {CLIENT_NAME}")
+            } else {
+                CHILD_TEXT.to_owned()
+            };
+            assert_eq!(done.output.as_text(), expected);
+        }
+    }
+
+    #[test_case(PROBE_WIRE, CallOrigin::Model ; "model_tool")]
+    #[test_case(PROBE_WIRE, CallOrigin::Nested ; "nested_tool")]
+    #[test_case(TOOL_SEARCH_TOOL_NAME, CallOrigin::Model ; "model_search")]
+    #[test_case(TOOL_SEARCH_TOOL_NAME, CallOrigin::Nested ; "nested_search")]
+    fn filtered_mcp_route_is_unknown(name: &str, origin: CallOrigin) {
+        let mut ctx = mcp_ctx(&stub_mcp(&[PROBE_QUALIFIED]));
+        ctx.tool_filter = Arc::new(ToolFilter::AllExcept(vec![name.to_owned()]));
+        assert!(!callable_names(&ctx).contains(&name.to_owned()));
+        let done = smol::block_on(run(
+            TEST_ID.to_owned(),
+            name,
+            &json!({ SEARCH_QUERY_FIELD: SEARCH_QUERY }),
+            &ctx,
+            origin,
+        ));
+        assert!(done.is_error);
+        assert_eq!(
+            done.output.as_text(),
+            format!("{UNKNOWN_TOOL_PREFIX}: {name}")
+        );
+    }
+
+    #[test_case(PROBE_WIRE, PROBE_QUALIFIED, false ; "wire_filter_blocks_qualified_call")]
+    #[test_case(PROBE_QUALIFIED, PROBE_WIRE, false ; "qualified_filter_blocks_wire_call")]
+    #[test_case(PROBE_WIRE, PROBE_QUALIFIED, true ; "wire_denial_overrides_qualified_allow_list")]
+    #[test_case(PROBE_QUALIFIED, PROBE_WIRE, true ; "qualified_denial_overrides_wire_allow_list")]
+    fn a_filtered_mcp_name_cannot_use_its_other_spelling(
+        blocked: &str,
+        called: &str,
+        allow_list: bool,
+    ) {
+        let mut ctx = mcp_ctx(&stub_mcp(&[PROBE_QUALIFIED]));
+        ctx.config.disabled_tools = vec![blocked.to_owned()];
+        if allow_list {
+            ctx.config.allowed_tools = vec![called.to_owned()];
+        }
+        ctx.tool_filter = Arc::new(ToolFilter::from_config(&ctx.config, &ctx.model, &[]));
+        assert!(!callable_names(&ctx).contains(&PROBE_WIRE.to_owned()));
+        let done = smol::block_on(dispatch(&ctx, called, &json!({})));
+        assert_eq!(
+            done.output.as_text(),
+            format!("{UNKNOWN_TOOL_PREFIX}: {called}")
+        );
+    }
+
+    #[test_case(PROBE_WIRE ; "wire_name")]
+    #[test_case(PROBE_QUALIFIED ; "qualified_name")]
+    fn a_filtered_mcp_tool_stays_out_of_catalog_and_search(blocked: &str) {
+        let mut ctx = mcp_ctx(&stub_mcp(&[PROBE_QUALIFIED, OTHER_QUALIFIED]));
+        ctx.config.disabled_tools = vec![blocked.to_owned()];
+        let tools = RequestTools::build(
+            &ctx.registry,
+            &ctx.local_tools,
+            &Vars::new(),
+            &ctx.model,
+            &ctx.config,
+            &[],
+            false,
+            true,
+        );
+        ctx.tool_filter = Arc::clone(tools.filter());
+        let definitions = request_tools(&tools, ctx.mcp.as_ref(), ToolDeferral::Client).to_string();
+        assert!(!definitions.contains(PROBE_WIRE), "{definitions}");
+        let done = smol::block_on(dispatch(
+            &ctx,
+            TOOL_SEARCH_TOOL_NAME,
+            &json!({ SEARCH_QUERY_FIELD: SEARCH_QUERY }),
+        ));
+        assert!(!done.is_error);
+        assert!(!done.output.as_text().contains(PROBE_WIRE));
+        assert_eq!(
+            tool_names(&request_tools(
+                &tools,
+                ctx.mcp.as_ref(),
+                ToolDeferral::Client
+            )),
+            [TOOL_SEARCH_TOOL_NAME]
+        );
+    }
+
+    #[test_case(OTHER_WIRE ; "wire_name")]
+    #[test_case(OTHER_QUALIFIED ; "qualified_name")]
+    fn an_mcp_allow_list_publishes_the_allowed_tool_without_search(allowed: &str) {
+        let mut ctx = mcp_ctx(&stub_mcp(&[PROBE_QUALIFIED, OTHER_QUALIFIED]));
+        ctx.config.allowed_tools = vec![allowed.to_owned()];
+        let tools = RequestTools::build(
+            &ctx.registry,
+            &ctx.local_tools,
+            &Vars::new(),
+            &ctx.model,
+            &ctx.config,
+            &[],
+            false,
+            true,
+        );
+        ctx.tool_filter = Arc::clone(tools.filter());
+        assert_eq!(
+            tool_names(&request_tools(
+                &tools,
+                ctx.mcp.as_ref(),
+                ToolDeferral::Client
+            )),
+            [OTHER_WIRE]
+        );
         assert_eq!(callable_names(&ctx), [OTHER_WIRE]);
     }
 
@@ -2408,6 +2669,7 @@ mod tests {
         ctx.registry = registry_with(&[PROBE_WIRE, OTHER_WIRE]);
         let tools = RequestTools::assembled(
             serde_json::json!([{ TOOL_NAME_FIELD: OTHER_WIRE }]),
+            &ctx.local_tools,
             &ctx.config,
             &ctx.model,
         );

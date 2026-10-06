@@ -84,17 +84,62 @@ pub struct DescriptionContext<'a> {
 pub enum ToolFilter {
     #[default]
     All,
-    Only(Vec<String>),
+    Only {
+        allowed: Vec<String>,
+        excluded: Vec<String>,
+    },
     AllExcept(Vec<String>),
+    // Caller-supplied arrays restrict registry tools. MCP tools arrive separately.
+    Published {
+        names: Vec<String>,
+        base: Box<Self>,
+    },
 }
 
 impl ToolFilter {
     pub fn matches(&self, name: &str) -> bool {
+        self.matches_names(&[name])
+    }
+
+    fn matches_names(&self, names: &[&str]) -> bool {
         match self {
             Self::All => true,
-            Self::Only(allowed) => allowed.iter().any(|n| n == name),
-            Self::AllExcept(blocked) => !blocked.iter().any(|n| n == name),
+            Self::Only { allowed, excluded } => {
+                allowed.iter().any(|n| names.contains(&n.as_str()))
+                    && !excluded.iter().any(|n| names.contains(&n.as_str()))
+            }
+            Self::AllExcept(blocked) => !blocked.iter().any(|n| names.contains(&n.as_str())),
+            Self::Published {
+                names: published,
+                base,
+            } => published.iter().any(|n| names.contains(&n.as_str())) && base.matches_names(names),
         }
+    }
+
+    pub fn matches_external(&self, name: &str) -> bool {
+        self.matches_external_names(&[name])
+    }
+
+    pub fn matches_external_names(&self, names: &[&str]) -> bool {
+        match self {
+            Self::Published { base, .. } => base.matches_external_names(names),
+            _ => self.matches_names(names),
+        }
+    }
+
+    /// Hosts add protocol tools such as `structured_output` outside the registry allow list.
+    pub fn matches_local(&self, name: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only { excluded, .. } | Self::AllExcept(excluded) => {
+                !excluded.iter().any(|n| n == name)
+            }
+            Self::Published { base, .. } => base.matches_local(name),
+        }
+    }
+
+    pub fn offers(&self, name: &str, audience: ToolAudience, caller: ToolAudience) -> bool {
+        self.matches(name) && audience.contains(caller)
     }
 
     pub fn excluding(self, names: &[&str]) -> Self {
@@ -103,12 +148,17 @@ impl ToolFilter {
         }
         match self {
             Self::All => Self::AllExcept(names.iter().map(|s| (*s).to_owned()).collect()),
-            Self::Only(allowed) => Self::Only(
-                allowed
-                    .into_iter()
-                    .filter(|n| !names.iter().any(|x| *x == n))
-                    .collect(),
-            ),
+            Self::Only {
+                allowed,
+                mut excluded,
+            } => {
+                for &name in names {
+                    if !excluded.iter().any(|n| n == name) {
+                        excluded.push(name.to_owned());
+                    }
+                }
+                Self::Only { allowed, excluded }
+            }
             Self::AllExcept(mut blocked) => {
                 for &n in names {
                     if !blocked.iter().any(|b| b == n) {
@@ -117,6 +167,16 @@ impl ToolFilter {
                 }
                 Self::AllExcept(blocked)
             }
+            Self::Published {
+                names: published,
+                base,
+            } => Self::Published {
+                names: published
+                    .into_iter()
+                    .filter(|n| !names.contains(&n.as_str()))
+                    .collect(),
+                base: Box::new(base.excluding(names)),
+            },
         }
     }
 
@@ -124,14 +184,10 @@ impl ToolFilter {
         let base = if config.allowed_tools.is_empty() {
             Self::All
         } else {
-            Self::Only(
-                config
-                    .allowed_tools
-                    .iter()
-                    .filter(|s| is_builtin_tool(s))
-                    .cloned()
-                    .collect(),
-            )
+            Self::Only {
+                allowed: config.allowed_tools.clone(),
+                excluded: Vec::new(),
+            }
         };
         let mut exclude: Vec<&str> = extra_exclude.to_vec();
         exclude.extend(capability_exclusions(model));
@@ -163,8 +219,10 @@ impl RequestTools {
     /// The one place a run's tool array is built. Host exclusions (a client
     /// that cannot service `question`) go through here and nowhere else, so
     /// the array and the filter always agree on them.
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         registry: &ToolRegistry,
+        local_tools: &LocalTools,
         vars: &crate::template::Vars,
         model: &Model,
         config: &AgentConfig,
@@ -173,8 +231,12 @@ impl RequestTools {
         mcp: bool,
     ) -> Self {
         let filter = ToolFilter::from_config(config, model, excluded);
+        let mut definition_filter = filter.clone();
+        if let ToolFilter::Only { allowed, .. } = &mut definition_filter {
+            allowed.extend(local_tools.keys().cloned());
+        }
         let ctx = DescriptionContext {
-            filter: &filter,
+            filter: &definition_filter,
             audience: ToolAudience::MAIN,
             workflow,
             mcp,
@@ -185,17 +247,15 @@ impl RequestTools {
         }
     }
 
-    /// For an array the host built itself, like a Lua subagent publishing what
-    /// its caller picked. The filter is read back off that array, so the names
-    /// the model was shown and the names a script may reach are one set, and
-    /// the caller's `only`/`except` never has to be passed twice. MCP names are
-    /// never matched against this filter and stay reachable.
-    ///
-    /// An array nobody can read a name out of says nothing about intent, so it
-    /// falls back to the config's filter instead of an `Only` of nothing that
-    /// would leave the session unable to do anything. An array that is
-    /// genuinely empty is an answer, and is kept as one.
-    pub fn assembled(definitions: Value, config: &AgentConfig, model: &Model) -> Self {
+    /// The caller's array restricts registry tools. Config also filters MCP tools.
+    /// Session-local tools keep explicit denials but bypass registry allow lists.
+    /// Missing names fall back to the config filter. An empty array offers no registry tools.
+    pub fn assembled(
+        mut definitions: Value,
+        local_tools: &LocalTools,
+        config: &AgentConfig,
+        model: &Model,
+    ) -> Self {
         let published: Option<Vec<String>> = definitions.as_array().and_then(|defs| {
             let names: Vec<String> = defs
                 .iter()
@@ -203,10 +263,25 @@ impl RequestTools {
                 .collect();
             (defs.is_empty() || !names.is_empty()).then_some(names)
         });
-        let filter = published.map_or_else(
-            || ToolFilter::from_config(config, model, &[]),
-            ToolFilter::Only,
-        );
+        let base = ToolFilter::from_config(config, model, &[]);
+        let filter = match published {
+            Some(names) => ToolFilter::Published {
+                names,
+                base: Box::new(base),
+            },
+            None => base,
+        };
+        if let Some(defs) = definitions.as_array_mut() {
+            defs.retain(|def| {
+                def[TOOL_NAME_FIELD].as_str().is_none_or(|name| {
+                    if local_tools.contains_key(name) {
+                        filter.matches_local(name)
+                    } else {
+                        filter.matches(name)
+                    }
+                })
+            });
+        }
         Self {
             definitions,
             filter: Arc::new(filter),
@@ -845,7 +920,12 @@ mod tests {
         write_matches: bool,
     ) {
         let model = Model::from_spec(TEST_MODEL_SPEC).unwrap();
-        let tools = RequestTools::assembled(definitions, &AgentConfig::default(), &model);
+        let tools = RequestTools::assembled(
+            definitions,
+            &LocalTools::default(),
+            &AgentConfig::default(),
+            &model,
+        );
         assert_eq!(tools.filter().matches(READ_TOOL_NAME), read_matches);
         assert_eq!(tools.filter().matches(WRITE_TOOL_NAME), write_matches);
     }
@@ -861,6 +941,39 @@ mod tests {
             filter.matches(READ_TOOL_NAME),
             "unrelated tools stay enabled"
         );
+    }
+
+    #[test_case("claude_code" ; "plugin")]
+    #[test_case("claude_code_import" ; "plugin_import")]
+    #[test_case("srv__probe" ; "mcp")]
+    #[test_case("future_plugin" ; "late_registration")]
+    fn an_allow_list_keeps_non_builtin_names(name: &str) {
+        let model = Model::from_spec(TEST_MODEL_SPEC).unwrap();
+        let config = AgentConfig {
+            allowed_tools: vec![name.to_owned()],
+            ..Default::default()
+        };
+        let filter = ToolFilter::from_config(&config, &model, &[]);
+        assert!(filter.matches(name));
+        assert!(!filter.matches(READ_TOOL_NAME));
+    }
+
+    #[test]
+    fn a_published_array_cannot_override_config_denials() {
+        let model = Model::from_spec(TEST_MODEL_SPEC).unwrap();
+        let config = AgentConfig {
+            disabled_tools: vec![WRITE_TOOL_NAME.to_owned()],
+            ..Default::default()
+        };
+        let tools = RequestTools::assembled(
+            serde_json::json!([{ TOOL_NAME_FIELD: WRITE_TOOL_NAME }]),
+            &LocalTools::default(),
+            &config,
+            &model,
+        );
+        assert!(!tools.filter().matches(WRITE_TOOL_NAME));
+        assert!(tools.definitions().as_array().unwrap().is_empty());
+        assert!(tools.filter().matches_external("srv__probe"));
     }
 
     #[test_case(30,  "30s timeout"   ; "seconds_only")]

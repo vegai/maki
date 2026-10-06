@@ -1,16 +1,30 @@
-//! Tests the task plugin's structured-output policy end-to-end: real plugin
-//! source, real `maki.json` / `maki.async`, with model I/O replaced by
-//! scriptable Lua stubs.
+//! Tests the task plugin's structured-output policy with real schema validation.
+//! Scripted providers exercise subagent dispatch, and Lua stubs isolate retry
+//! and cleanup policy.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use maki_agent::tools::ToolRegistry;
+use maki_agent::agent::tool_dispatch;
 use maki_agent::tools::test_support::stub_ctx;
+use maki_agent::tools::{CallOrigin, ToolFilter, ToolRegistry};
 use maki_agent::{AgentMode, ToolOutput};
 use maki_lua::PluginHost;
+use maki_providers::provider::{BoxFuture, Provider};
+use maki_providers::{
+    AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
+    StopReason, StreamResponse, TokenUsage,
+};
+use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
+use test_case::test_case;
 
 const TASK_PLUGIN_SRC: &str = include_str!("../../plugins/task/init.lua");
+const TEST_MODEL_SPEC: &str = "anthropic/claude-haiku-4-5";
+const READ_TOOL: &str = "read";
+const TASK_CALL_ID: &str = "structured_task";
+const STRUCTURED_CALL_ID: &str = "structured_result";
+const STRUCTURED_RESULT: &str = r#"{"n":42}"#;
+const INHERIT_MODEL: &str = "maki.agent.resolve_model = function() return {} end";
 
 // Mirrors of the plugin's error contracts and policy numbers.
 const STRUCTURED_OUTPUT_TOOL: &str = "structured_output";
@@ -517,4 +531,129 @@ fn raising_prompt_does_not_leak_semaphore_permit() {
     // Pool is full again (released == acquired), so this cannot block.
     let out = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_PLAIN, None)).unwrap();
     assert_eq!(out, PLAIN_TEXT);
+}
+
+#[derive(Default)]
+struct StructuredOutputProvider {
+    requests: Mutex<Vec<Value>>,
+}
+
+impl Provider for StructuredOutputProvider {
+    fn stream_message<'a>(
+        &'a self,
+        _: &'a Model,
+        _: &'a [Message],
+        _: &'a str,
+        tools: &'a Value,
+        _: &'a flume::Sender<ProviderEvent>,
+        _: RequestOptions,
+        _: Option<&'a SessionRef>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        Box::pin(async move {
+            let mut requests = self.requests.lock().unwrap();
+            let call = requests.is_empty()
+                && tools
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"].as_str() == Some(STRUCTURED_OUTPUT_TOOL));
+            requests.push(tools.clone());
+            Ok(StreamResponse {
+                input_transformations: Vec::new(),
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![if call {
+                        ContentBlock::ToolUse {
+                            id: STRUCTURED_CALL_ID.to_owned(),
+                            name: STRUCTURED_OUTPUT_TOOL.to_owned(),
+                            input: serde_json::from_str(STRUCTURED_RESULT).unwrap(),
+                            thought_signature: None,
+                        }
+                    } else {
+                        ContentBlock::Text {
+                            text: PLAIN_TEXT.to_owned(),
+                        }
+                    }],
+                    ..Default::default()
+                },
+                usage: TokenUsage::default(),
+                stop_reason: Some(if call {
+                    StopReason::ToolUse
+                } else {
+                    StopReason::EndTurn
+                }),
+            })
+        })
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+#[test_case(false, false ; "unfiltered")]
+#[test_case(true, false ; "task_and_read_allow_list")]
+#[test_case(false, true ; "explicit_denial")]
+#[test_case(true, true ; "explicit_denial_with_allow_list")]
+fn structured_task_respects_local_tool_policy(allow_list: bool, denied: bool) {
+    let registry = Arc::clone(ToolRegistry::global_arc());
+    let host = PluginHost::new(Arc::clone(&registry)).unwrap();
+    host.load_source(
+        "task_policy",
+        &format!("{INHERIT_MODEL}\n{TASK_PLUGIN_SRC}"),
+    )
+    .unwrap();
+    let provider = Arc::new(StructuredOutputProvider::default());
+    let mut ctx = stub_ctx(&AgentMode::Build);
+    ctx.registry = registry;
+    ctx.model = Arc::new(Model::from_spec(TEST_MODEL_SPEC).unwrap());
+    ctx.provider = provider.clone();
+    if allow_list {
+        ctx.config.allowed_tools = vec![TASK_TOOL.to_owned(), READ_TOOL.to_owned()];
+    }
+    if denied {
+        ctx.config.disabled_tools = vec![STRUCTURED_OUTPUT_TOOL.to_owned()];
+    }
+    ctx.tool_filter = Arc::new(ToolFilter::from_config(&ctx.config, &ctx.model, &[]));
+    let done = smol::block_on(tool_dispatch::run(
+        TASK_CALL_ID.to_owned(),
+        TASK_TOOL,
+        &json!({
+            "description": SCENARIO_HAPPY,
+            "prompt": TASK_PROMPT,
+            "output_schema": {
+                "type": "object",
+                "properties": { "n": { "type": "integer" } },
+                "required": ["n"],
+                "additionalProperties": false,
+            },
+        }),
+        &ctx,
+        CallOrigin::Model,
+    ));
+    assert_eq!(done.is_error, denied, "{}", done.output.as_text());
+    let expected = if denied {
+        STRUCTURED_MISSING_ERROR
+    } else {
+        STRUCTURED_RESULT
+    };
+    assert_eq!(done.output.as_text(), expected);
+    let requests = provider.requests.lock().unwrap();
+    assert!(!requests.is_empty());
+    for tools in requests.iter() {
+        let names: Vec<&str> = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.contains(&STRUCTURED_OUTPUT_TOOL), !denied);
+        if allow_list {
+            assert!(
+                names
+                    .iter()
+                    .all(|name| [READ_TOOL, STRUCTURED_OUTPUT_TOOL].contains(name))
+            );
+        }
+    }
 }

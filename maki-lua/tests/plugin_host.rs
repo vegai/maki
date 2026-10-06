@@ -3739,6 +3739,24 @@ fn register_options_rejects_bad_spec(src: &str, expected: &str) {
     assert!(err.to_string().contains(expected), "got: {err}");
 }
 
+/// A failed plugin load must remove its registered options so the provider cannot mistake it
+/// for a loaded plugin.
+#[test]
+fn a_plugin_that_fails_after_declaring_options_is_not_listed() {
+    const PLUGIN: &str = "fails_late";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        PLUGIN,
+        r#"
+        maki.api.register_options({ a = { default = 1, desc = "A." } })
+        error("an error after the options")
+        "#,
+    )
+    .expect_err("the load of the plugin must give an error");
+    assert!(!host.plugin_options().unwrap().contains_key(PLUGIN));
+}
+
 #[test]
 fn builtin_opts_flow_from_setup_plugins() {
     let reg = fresh_registry();

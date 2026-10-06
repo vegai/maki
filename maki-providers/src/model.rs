@@ -348,11 +348,17 @@ fn is_snapshot_suffix(suffix: &str) -> bool {
 /// their base row, which also means `glm-5` answers for `glm-5.4`, a model it
 /// has never been checked against.
 fn names_exactly(entry: &ModelEntry, model_id: &str) -> bool {
-    entry.prefixes.iter().any(|prefix| {
-        model_id
-            .strip_prefix(prefix)
-            .is_some_and(|rest| rest.is_empty() || is_snapshot_suffix(rest))
-    })
+    entry
+        .prefixes
+        .iter()
+        .any(|prefix| is_same_model(model_id, prefix))
+}
+
+/// Returns true if {model_id} is {name} or a dated snapshot of it.
+pub(crate) fn is_same_model(model_id: &str, name: &str) -> bool {
+    model_id
+        .strip_prefix(name)
+        .is_some_and(|rest| rest.is_empty() || is_snapshot_suffix(rest))
 }
 
 /// Everything that can describe one model, ranked by how sure it is to be about
@@ -374,7 +380,8 @@ impl<'a> ModelSources<'a> {
     fn resolve(spec: &'a ProviderSpec, model_id: &str) -> Self {
         let entry = lookup_entry(spec.models(), model_id);
         let exact = entry.is_some_and(|entry| names_exactly(entry, model_id));
-        let catalog_slug = plugin::base_spec(spec.slug).map_or(spec.slug, |base| base.slug);
+        let catalog_slug =
+            plugin::base_spec(spec.slug).map_or(spec.models_slug(), ProviderSpec::models_slug);
         Self {
             entry,
             exact,
@@ -667,13 +674,17 @@ impl Model {
         self.thinking_override == Some(ThinkingSupport::Required)
     }
 
-    /// Vision support, most specific first: per-model override, discovery,
-    /// [`ModelSources`], the family default.
+    /// Vision requires an image-capable transport. Model support then follows
+    /// per-model overrides, discovery, [`ModelSources`] and the family default.
     pub fn supports_vision(&self) -> bool {
+        let spec = ProviderRegistry::for_slug(&self.provider);
+        if spec.is_some_and(|spec| !spec.accepts_images) {
+            return false;
+        }
         if let Some(vision) = self.supports_vision_override {
             return vision;
         }
-        let Some(spec) = ProviderRegistry::for_slug(&self.provider) else {
+        let Some(spec) = spec else {
             return self.family.supports_vision();
         };
         model_registry::discovered(spec.slug, &self.id)

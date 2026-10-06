@@ -9,7 +9,7 @@ use maki_agent::prompt::ResolvedSlots;
 use maki_agent::session::Resumed;
 use maki_agent::template;
 use maki_agent::template::Vars;
-use maki_agent::tools::{FileAccess, RequestTools, ToolAudience, ToolRegistry};
+use maki_agent::tools::{FileAccess, LocalTools, RequestTools, ToolAudience, ToolRegistry};
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
     CancelToken, DoneReason, Envelope, EventSender, History, Instructions, McpCommand, PromptRole,
@@ -34,6 +34,7 @@ fn base_tools(
 ) -> RequestTools {
     RequestTools::build(
         ToolRegistry::global(),
+        &LocalTools::default(),
         vars,
         model,
         config,
@@ -267,6 +268,7 @@ impl AgentLoop {
             &hooks,
             &self.config,
             compaction.instructions.as_deref(),
+            self.permissions.cwd(),
             self.timeouts.retry,
         )
         .await

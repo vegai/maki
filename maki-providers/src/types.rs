@@ -826,6 +826,16 @@ pub mod dialect {
             off: Some(OFF)
         },
     }
+
+    /// Claude Code's `--effort`, for its models with adaptive thinking.
+    /// Claude Code's default is adaptive, so Adaptive maps to no level. It is
+    /// not in [`NAMES`], because it is a `claude` CLI flag rather than a wire
+    /// format a plugin can pick.
+    pub const CLAUDE_CODE: EffortDialect = EffortDialect {
+        supported: &[Low, Medium, High, XHigh, Max],
+        adaptive: None,
+        off: None,
+    };
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -949,7 +959,7 @@ impl ThinkingConfig {
     /// Models from [`ADAPTIVE_SINCE`] on reject `type: "enabled"` with a 400. A
     /// version check, not an allowlist, so future releases and new families
     /// work automatically.
-    fn requires_adaptive(model_id: &str) -> bool {
+    pub(crate) fn requires_adaptive(model_id: &str) -> bool {
         claude_version(model_id).is_some_and(|(family, version)| {
             version
                 >= if family == OPUS {
@@ -1704,6 +1714,16 @@ mod tests {
             }
             assert_eq!(dialect::name_of(d), Some(*name));
         }
+    }
+
+    /// The Claude Code dialect is not in [`dialect::NAMES`]. `Effort::snap`
+    /// walks its levels too, and a dialect with the same fields as a named
+    /// one would make `name_of` return that name.
+    #[test]
+    fn the_claude_code_dialect_is_well_formed_and_has_no_name() {
+        let levels = dialect::CLAUDE_CODE.supported;
+        assert!(levels.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(dialect::name_of(&dialect::CLAUDE_CODE), None);
     }
 
     #[test_case(ThinkingConfig::Off, "claude-opus-4-5", json!({}) ; "off")]

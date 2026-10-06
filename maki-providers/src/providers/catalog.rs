@@ -1082,7 +1082,7 @@ mod tests {
     };
     use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
     use crate::provider::Provider;
-    use crate::providers::{ResolvedAuth, Timeouts, opencode};
+    use crate::providers::{ResolvedAuth, Timeouts, anthropic, claude_code, opencode};
     use crate::spec::ProviderRegistry;
     use crate::{AgentError, ModelFamily, ModelTier, RequestOptions};
     use test_case::test_case;
@@ -2012,6 +2012,26 @@ mod tests {
             Some(BUILTIN_BASE_URL),
             models,
         )
+    }
+
+    /// Use the source provider's catalog so new model prices have one canonical entry.
+    #[test]
+    fn a_provider_running_anothers_models_reads_their_catalog_entry() {
+        let (_tmp, state_dir) = temp_state_dir();
+        let models = HashMap::from([(
+            UNLISTED_MODEL.into(),
+            priced_row(UNLISTED_INPUT_PRICE, UNLISTED_OUTPUT_PRICE),
+        )]);
+        super::seed_catalog_for_tests(
+            catalog_index(anthropic::SLUG, "@ai-sdk/anthropic", None, models),
+            state_dir,
+        );
+
+        let model = Model::from_spec(&format!("{}/{UNLISTED_MODEL}", claude_code::SLUG)).unwrap();
+        assert_eq!(
+            (model.pricing.input, model.pricing.output),
+            (UNLISTED_INPUT_PRICE, UNLISTED_OUTPUT_PRICE)
+        );
     }
 
     #[test]

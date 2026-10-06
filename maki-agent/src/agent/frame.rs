@@ -14,6 +14,7 @@
 //! read them. That stays true after a resume, a rewind or a rebuilt frame,
 //! and there is no side state to drift out of sync.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -112,6 +113,8 @@ pub(crate) fn fingerprint(context: &RunContext, mcp: Option<&McpSession>, model:
     let mut hasher = Sha256::new();
     hasher.update(context.tools.definitions().to_string());
     hasher.update([0]);
+    hasher.update(format!("{:?}", context.tools.filter()));
+    hasher.update([0]);
     hasher.update(&context.authored);
     if mcp.is_some() {
         hasher.update([0]);
@@ -121,6 +124,21 @@ pub(crate) fn fingerprint(context: &RunContext, mcp: Option<&McpSession>, model:
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+pub fn request_tools<'t>(
+    tools: &'t RequestTools,
+    mcp: Option<&McpSession>,
+    deferral: ToolDeferral,
+) -> Cow<'t, Value> {
+    match mcp {
+        Some(mcp) => {
+            let mut definitions = tools.definitions().clone();
+            mcp.extend_tools_filtered(&mut definitions, deferral, tools.filter());
+            Cow::Owned(definitions)
+        }
+        None => Cow::Borrowed(tools.definitions()),
+    }
 }
 
 /// The in-memory half of a frame. The first run of a process rebuilds it from
@@ -135,10 +153,7 @@ pub(crate) struct LiveFrame {
 
 impl LiveFrame {
     pub(crate) fn build(tools: RequestTools, mcp: Option<&McpSession>, model: &Model) -> Self {
-        let mut wire = tools.definitions().clone();
-        if let Some(mcp) = mcp {
-            mcp.extend_tools(&mut wire, ToolDeferral::for_model(model));
-        }
+        let wire = request_tools(&tools, mcp, ToolDeferral::for_model(model)).into_owned();
         Self { tools, wire }
     }
 
@@ -167,7 +182,7 @@ impl LiveFrame {
         deferral: ToolDeferral,
     ) -> &[Value] {
         let before = self.wire.as_array().map_or(0, Vec::len);
-        mcp.append_late_tools(&mut self.wire, deferral);
+        mcp.append_late_tools_filtered(&mut self.wire, deferral, self.tools.filter());
         self.wire.as_array().map_or(&[], |wire| &wire[before..])
     }
 }
@@ -283,6 +298,7 @@ mod tests {
     use super::*;
     use crate::AgentConfig;
     use crate::mcp::test_support::stub_session;
+    use crate::tools::LocalTools;
     use serde_json::json;
     use test_case::test_case;
 
@@ -291,6 +307,9 @@ mod tests {
     const HINT_KEY: &str = "memory/after_instructions";
     const NATIVE_MODEL: &str = "anthropic/claude-opus-5";
     const CLIENT_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+    const BASE_TOOL: &str = "read";
+    const MCP_TOOL: &str = "srv.probe";
+    const MCP_WIRE: &str = "srv__probe";
 
     fn facts() -> LiveFacts {
         LiveFacts {
@@ -340,6 +359,7 @@ mod tests {
             authored.into(),
             RequestTools::assembled(
                 json!([{ "name": tools }]),
+                &LocalTools::default(),
                 &AgentConfig::default(),
                 &model(NATIVE_MODEL),
             ),
@@ -361,6 +381,54 @@ mod tests {
             fingerprint(&context("a", ""), Some(&mcp), &native),
             fingerprint(&context("a", ""), Some(&mcp), &model(CLIENT_MODEL)),
             "a model without tool search shapes the MCP entries another way"
+        );
+    }
+
+    #[test]
+    fn changed_policy_rebuilds_a_restored_frame_with_the_same_base_tools() {
+        let model = model(NATIVE_MODEL);
+        let mcp = stub_session(&[(MCP_TOOL, "Probe")]);
+        let mut history = History::new(Vec::new());
+        let initial = context(BASE_TOOL, "");
+        let base_tools = initial.tools.definitions().clone();
+        assert_eq!(
+            fit_frame(&mut history, initial, Some(&mcp), &model),
+            FrameFit::Built
+        );
+        assert!(
+            history
+                .live_frame()
+                .unwrap()
+                .wire
+                .to_string()
+                .contains(MCP_WIRE)
+        );
+
+        let mut restored = History::new(Vec::new()).with_frame(history.frame().cloned());
+        let restricted = RunContext::fixed(
+            String::new(),
+            RequestTools::assembled(
+                base_tools.clone(),
+                &LocalTools::default(),
+                &AgentConfig {
+                    disabled_tools: vec![MCP_TOOL.into()],
+                    ..Default::default()
+                },
+                &model,
+            ),
+        );
+        assert_eq!(restricted.tools.definitions(), &base_tools);
+        assert_eq!(
+            fit_frame(&mut restored, restricted, Some(&mcp), &model),
+            FrameFit::Rebuilt
+        );
+        assert!(
+            !restored
+                .live_frame()
+                .unwrap()
+                .wire
+                .to_string()
+                .contains(MCP_WIRE)
         );
     }
 }

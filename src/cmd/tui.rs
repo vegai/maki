@@ -29,6 +29,29 @@ const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous conf
 const MODEL_FALLBACK_WARNING: &str = "model resolution failed, keeping previous model";
 const POLICY_GRANT_NOTICE: &str = "folder trusted by trust.paths pattern";
 
+fn tool_filter_warnings(cli: &Cli, registry: &ToolRegistry) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (flag, names) in [
+        ("--allowed-tools", &cli.allowed_tools),
+        ("--disallowed-tools", &cli.disallowed_tools),
+    ] {
+        for name in names {
+            let name = normalize_tool_name(name);
+            if registry.get(&name).is_some() {
+                continue;
+            }
+            let mut warning = format!("no loaded tool matches '{name}' in {flag}.");
+            let suggestion = name.replace('-', "_");
+            if suggestion != name && registry.get(&suggestion).is_some() {
+                warning.push_str(&format!(" Did you mean '{suggestion}'?"));
+            }
+            warning.push_str(" The entry remains active for tools that load later.");
+            warnings.push(warning);
+        }
+    }
+    warnings
+}
+
 /// One generation of the app: everything torn down and rebuilt on `/reload`.
 /// Dropping it joins the Lua thread via `PluginHost::drop`.
 struct Stack {
@@ -107,14 +130,13 @@ fn load_config(
             .allowed_tools
             .iter()
             .map(|t| normalize_tool_name(t))
-            .collect::<Result<Vec<_>>>()?;
+            .collect();
     }
     if !cli.disallowed_tools.is_empty() {
-        config.agent.disabled_tools.extend(
-            cli.disallowed_tools
-                .iter()
-                .filter_map(|t| normalize_tool_name(t).ok()),
-        );
+        config
+            .agent
+            .disabled_tools
+            .extend(cli.disallowed_tools.iter().map(|t| normalize_tool_name(t)));
     }
     config.validate()?;
     Ok(config)
@@ -182,6 +204,7 @@ fn build_stack(
         },
     )?;
 
+    warnings.extend(tool_filter_warnings(cli, ToolRegistry::global()));
     let commands = discover_commands(cli.no_commands, launch.cwd);
 
     setup::remember_thinking(&mut config.session_defaults, launch.storage);

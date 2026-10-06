@@ -46,14 +46,16 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     family: ModelFamily::Generic,
     supports_thinking: false,
     supports_deferred_tools: false,
+    accepts_images: true,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(100_000),
     fallback_context_window: 200_000,
     models_toml: include_str!("../../../models/copilot.toml"),
+    models_of: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
-        with_auth: create_with_auth,
+        with_auth: Some(create_with_auth),
     }),
     aperture: None,
     login: Some(LoginConfig {

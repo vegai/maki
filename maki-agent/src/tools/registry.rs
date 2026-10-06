@@ -495,10 +495,10 @@ impl ToolRegistry {
         let snapshot = self.tools.load();
         let mut out = Vec::with_capacity(snapshot.len());
         for entry in snapshot.iter() {
-            if !entry.tool.audience().contains(ctx.audience) {
-                continue;
-            }
-            if !ctx.filter.matches(entry.name()) {
+            if !ctx
+                .filter
+                .offers(entry.name(), entry.tool.audience(), ctx.audience)
+            {
                 continue;
             }
             let description = vars.apply(&entry.tool.description(ctx)).into_owned();

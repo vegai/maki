@@ -44,8 +44,8 @@ use self::error::McpError;
 use self::http::HttpTransport;
 use self::stdio::StdioTransport;
 use self::transport::McpTransport;
-use crate::tools::CallOrigin;
 use crate::tools::schema::sanitize_tool_input_schema;
+use crate::tools::{CallOrigin, ToolFilter};
 use crate::types::TextOutput;
 
 const SEPARATOR: &str = ".";
@@ -393,14 +393,32 @@ impl McpSession {
     /// deferred behind one `tool_search` catalog of names. Names already in
     /// the array are skipped.
     pub fn extend_tools(&self, tools: &mut Value, deferral: ToolDeferral) {
-        self.add_missing(tools, deferral, Arrival::WithFrame);
+        self.extend_tools_filtered(tools, deferral, &ToolFilter::All);
+    }
+
+    pub fn extend_tools_filtered(
+        &self,
+        tools: &mut Value,
+        deferral: ToolDeferral,
+        filter: &ToolFilter,
+    ) {
+        self.add_missing(tools, deferral, Arrival::WithFrame, filter);
     }
 
     /// Adds published tools the frame's array lacks, after everything it has,
     /// so every request stays a prefix of the next. Nothing is ever removed,
     /// and a tool whose server went away fails at dispatch.
     pub fn append_late_tools(&self, tools: &mut Value, deferral: ToolDeferral) {
-        self.add_missing(tools, deferral, Arrival::Late);
+        self.append_late_tools_filtered(tools, deferral, &ToolFilter::All);
+    }
+
+    pub fn append_late_tools_filtered(
+        &self,
+        tools: &mut Value,
+        deferral: ToolDeferral,
+        filter: &ToolFilter,
+    ) {
+        self.add_missing(tools, deferral, Arrival::Late, filter);
     }
 
     /// The one place MCP definitions enter a tool array, so a frame grows by
@@ -414,7 +432,13 @@ impl McpSession {
     /// as deferred entries, the only addition that keeps the cache and the
     /// thinking bound to the prefix. A late `always_load` tool joins that way
     /// too: in full it would cost both.
-    fn add_missing(&self, tools: &mut Value, deferral: ToolDeferral, arrival: Arrival) {
+    fn add_missing(
+        &self,
+        tools: &mut Value,
+        deferral: ToolDeferral,
+        arrival: Arrival,
+        filter: &ToolFilter,
+    ) {
         let Some(arr) = tools.as_array_mut() else {
             debug_assert!(false, "tools must be a JSON array");
             return;
@@ -422,14 +446,15 @@ impl McpSession {
         let existing = wire_names(arr);
         let searchable = existing.contains(TOOL_SEARCH_TOOL_NAME);
         let idx = self.handle.index.load();
-        let defer = self.deferring(&idx, deferral);
+        // Without tool_search, deferred definitions would have no discovery path.
+        let defer =
+            filter.matches_external(TOOL_SEARCH_TOOL_NAME) && self.deferring(&idx, deferral);
         let loaded = self.lock_loaded();
         let mut cataloged: Vec<&ToolDescriptor> = Vec::new();
-        for d in idx
-            .descriptors
-            .iter()
-            .filter(|d| !existing.contains(d.wire_name()))
-        {
+        for d in idx.descriptors.iter().filter(|d| {
+            !existing.contains(d.wire_name())
+                && filter.matches_external_names(&[d.wire_name(), &d.qualified_name])
+        }) {
             let eager =
                 d.always_load && !(arrival == Arrival::Late && deferral == ToolDeferral::Native);
             if !defer || eager {
@@ -497,6 +522,16 @@ impl McpSession {
         origin: CallOrigin,
         deferral: ToolDeferral,
     ) -> Result<TextOutput, String> {
+        self.search_tools_filtered(query, origin, deferral, &ToolFilter::All)
+    }
+
+    pub fn search_tools_filtered(
+        &self,
+        query: &str,
+        origin: CallOrigin,
+        deferral: ToolDeferral,
+        filter: &ToolFilter,
+    ) -> Result<TextOutput, String> {
         let q = query.trim().to_lowercase();
         let tokens: Vec<&str> = q
             .split(|c: char| !c.is_alphanumeric())
@@ -510,6 +545,7 @@ impl McpSession {
             .descriptors
             .iter()
             .filter(|d| loadable(d, deferral))
+            .filter(|d| filter.matches_external_names(&[d.wire_name(), &d.qualified_name]))
             .filter_map(|d| {
                 let name = d.wire_name().to_lowercase();
                 let haystack = build_haystack(&d.definition);
@@ -1666,6 +1702,42 @@ mod tests {
         let mut tools = json!([]);
         empty.extend_tools(&mut tools, ToolDeferral::Native);
         assert_eq!(tool_names(&tools), vec![TOOL_SEARCH_TOOL_NAME]);
+    }
+
+    #[test_case(ToolDeferral::Native, false ; "native_deny_list")]
+    #[test_case(ToolDeferral::Native, true ; "native_allow_list")]
+    #[test_case(ToolDeferral::Client, false ; "client_deny_list")]
+    #[test_case(ToolDeferral::Client, true ; "client_allow_list")]
+    fn filtered_late_tools_stay_out_of_the_frame_and_search(
+        deferral: ToolDeferral,
+        allow_list: bool,
+    ) {
+        let filter = if allow_list {
+            ToolFilter::Only {
+                allowed: vec![ALPHA_WIRE.into(), TOOL_SEARCH_TOOL_NAME.into()],
+                excluded: Vec::new(),
+            }
+        } else {
+            ToolFilter::AllExcept(vec![LATE_WIRE.into()])
+        };
+        let srv = entry_with_tools("srv", vec![tool_def("srv", "alpha", "", json!({}))]);
+        let (mut inner, session) = setup_with_defer(vec![srv], 0);
+        let mut tools = json!([]);
+        session.extend_tools_filtered(&mut tools, deferral, &filter);
+        let initial = tools.clone();
+        inner.entries.push(entry_with_tools(
+            "late",
+            vec![tool_def("late", "beta", "", json!({}))],
+        ));
+        publish(&inner, &session.index, &session.snapshot);
+
+        let found = session
+            .search_tools_filtered(LATE_WIRE, CallOrigin::Model, deferral, &filter)
+            .unwrap();
+        assert!(found.loaded_tools.is_empty());
+        assert!(found.text.starts_with(SEARCH_NO_MATCH));
+        session.append_late_tools_filtered(&mut tools, deferral, &filter);
+        assert_eq!(tools, initial);
     }
 
     /// It runs before every request, and a name sent twice is a 400, so a

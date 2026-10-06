@@ -251,20 +251,15 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
         .and_then(|spec| Model::from_spec_with_policy(spec, &agent.model_policy).ok());
     let model = parsed.as_ref().unwrap_or(&agent.model);
 
-    let base = match (only, except) {
-        (Some(o), _) => ToolFilter::Only(o),
-        (_, Some(e)) => ToolFilter::AllExcept(e),
-        _ => ToolFilter::All,
+    let base = ToolFilter::from_config(&agent.config, model, &[]);
+    let filter = match (only, except) {
+        (Some(names), _) => ToolFilter::Published {
+            names,
+            base: Box::new(base),
+        },
+        (_, Some(names)) => base.excluding(&names.iter().map(String::as_str).collect::<Vec<_>>()),
+        _ => base,
     };
-    let disabled: Vec<&str> = agent
-        .config
-        .disabled_tools
-        .iter()
-        .map(String::as_str)
-        .collect();
-    let filter = base
-        .excluding(&disabled)
-        .excluding(maki_agent::tools::capability_exclusions(model));
 
     let vars = maki_agent::template::env_vars();
     let ctx_desc = DescriptionContext {
@@ -422,6 +417,7 @@ async fn call_tool(
 ///     `(string)` or `(nil, err)`. Optional `audiences` (string[]) gates who may
 ///     call it, the same way `maki.api.register_tool` does. The default is the
 ///     model alone, so a script cannot reach it through `code_execution`.
+///     Config allow lists do not restrict local tools. Explicit denials still apply.
 ///   `name` (string?) - display name for logs and UI.
 ///   `audience` (string?) - tool audience for capability gating. Default: `"general_sub"`.
 ///   `mcp` (boolean?) - give the session access to MCP tools. Their
@@ -603,7 +599,8 @@ async fn session(
     // The array is the caller's, and the filter comes out of it, so whatever
     // the caller left out is also a name this session cannot dispatch or bind
     // inside its sandbox.
-    let tools = RequestTools::assembled(tools_json, &agent_ctx.config, &model);
+    let local_tools = Arc::new(local_map);
+    let tools = RequestTools::assembled(tools_json, &local_tools, &agent_ctx.config, &model);
     let system = system.unwrap_or_default();
     let context: RunContextBuilder =
         Arc::new(move |_, _| RunContext::fixed(system.clone(), tools.clone()));
@@ -652,7 +649,7 @@ async fn session(
         cancel_slot,
         parent_event_tx: parent_tx,
         subagent_info,
-        local_tools: Arc::new(local_map),
+        local_tools,
         name,
         usage: TokenUsage::default(),
         usage_rx,

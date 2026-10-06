@@ -1,8 +1,9 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use flume::Sender;
 use futures_lite::future;
-use maki_providers::provider::Provider;
+use maki_providers::provider::{Provider, RequestScope};
 use maki_providers::{Message, Model, ProviderEvent, RequestOptions};
 use maki_storage::id::SessionRef;
 use serde_json::Value;
@@ -59,6 +60,7 @@ impl App {
             messages,
             tx,
             Some(session_id),
+            self.permissions.cwd().to_owned(),
         ))
         .detach();
     }
@@ -71,20 +73,29 @@ async fn run_btw(
     messages: Vec<Message>,
     btw_tx: Sender<BtwEvent>,
     session_id: Option<SessionRef>,
+    cwd: PathBuf,
 ) {
     let (event_tx, event_rx) = flume::unbounded();
     let tools = Value::Array(vec![]);
     let messages = maki_providers::adapt_images_for_model(&model, &messages).await;
 
-    let stream_fut = provider.stream_message(
-        &model,
-        &messages,
-        &system,
-        &tools,
-        &event_tx,
-        RequestOptions::default(),
-        session_id.as_ref(),
-    );
+    // The request must own the sender so its completion closes the event channel.
+    let stream_fut = async move {
+        provider
+            .stream_message_in(
+                &model,
+                &messages,
+                &system,
+                &tools,
+                &event_tx,
+                RequestOptions::default(),
+                RequestScope {
+                    session_id: session_id.as_ref(),
+                    cwd: &cwd,
+                },
+            )
+            .await
+    };
 
     let forward_fut = async {
         while let Ok(event) = event_rx.recv_async().await {
@@ -113,15 +124,110 @@ async fn run_btw(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use flume::Sender;
+    use futures_lite::FutureExt;
+    use maki_agent::AgentError;
+    use maki_providers::provider::{BoxFuture, Provider, RequestScope};
+    use maki_providers::{
+        ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
+        TokenUsage,
+    };
+    use maki_storage::id::SessionRef;
+    use serde_json::Value;
+    use smol::Timer;
+
+    use super::{BTW_REMINDER, BtwEvent, btw_question, run_btw};
 
     const Q: &str = "why sqlite?";
+    const SESSION_DIR: &str = "/session/dir";
+    const NO_DIR: &str = "the side question came without the directory of the session";
+    const NEVER_ENDED: &str = "the side question did not stop";
+    const END_LIMIT: Duration = Duration::from_secs(10);
+
+    #[derive(Default)]
+    struct DirOnlyProvider {
+        asked_in: Mutex<Option<PathBuf>>,
+    }
+
+    impl Provider for DirOnlyProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _model: &'a Model,
+            _messages: &'a [Message],
+            _system: &'a str,
+            _tools: &'a Value,
+            _event_tx: &'a Sender<ProviderEvent>,
+            _opts: RequestOptions,
+            _session_id: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async {
+                Err(AgentError::Config {
+                    message: NO_DIR.into(),
+                })
+            })
+        }
+
+        fn stream_message_in<'a>(
+            &'a self,
+            _model: &'a Model,
+            _messages: &'a [Message],
+            _system: &'a str,
+            _tools: &'a Value,
+            _event_tx: &'a Sender<ProviderEvent>,
+            _opts: RequestOptions,
+            scope: RequestScope<'a>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            *self.asked_in.lock().unwrap() = Some(scope.cwd.to_owned());
+            Box::pin(async {
+                Ok(StreamResponse {
+                    input_transformations: Vec::new(),
+                    message: Message::default(),
+                    usage: TokenUsage::default(),
+                    stop_reason: None,
+                })
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[test]
+    fn a_side_question_runs_in_the_session_directory_and_ends() {
+        let provider = Arc::new(DirOnlyProvider::default());
+        let (tx, rx) = flume::unbounded();
+
+        let run = run_btw(
+            provider.clone(),
+            crate::components::test_model(),
+            String::new(),
+            vec![btw_question(Q)],
+            tx,
+            None,
+            PathBuf::from(SESSION_DIR),
+        );
+        smol::block_on(run.or(async {
+            Timer::after(END_LIMIT).await;
+            panic!("{NEVER_ENDED}");
+        }));
+
+        assert!(matches!(rx.try_recv(), Ok(BtwEvent::Done)));
+        assert_eq!(
+            provider.asked_in.lock().unwrap().as_deref(),
+            Some(Path::new(SESSION_DIR))
+        );
+    }
 
     fn user_text(msg: &Message) -> String {
         msg.content
             .iter()
             .filter_map(|b| match b {
-                maki_providers::ContentBlock::Text { text } => Some(text.as_str()),
+                ContentBlock::Text { text } => Some(text.as_str()),
                 _ => None,
             })
             .collect()

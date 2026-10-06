@@ -35,10 +35,10 @@ use maki_lua::{
     PackCommand, PackPreparation, PlanRequest, SessionEndReason, SessionRequest, TaskRequest,
     UiAction, UiAttachment, UiReply,
 };
-use maki_providers::Timeouts;
 use maki_providers::models_cache::{ModelList, fetch_all_models_cached};
 use maki_providers::provider::{Provider, from_model};
 use maki_providers::{Message, Model};
+use maki_providers::{Timeouts, claude_code};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::model::persist_model;
@@ -1823,6 +1823,7 @@ impl<'t> EventLoop<'t> {
     }
 
     fn refresh_models(&self) {
+        claude_code::refresh_on_next_listing();
         fetch_models(
             Arc::clone(&self.ctx.available_models),
             Arc::clone(&self.ctx.model_policy),

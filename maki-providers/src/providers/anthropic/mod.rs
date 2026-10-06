@@ -40,8 +40,8 @@ const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
 const OAUTH_BETA: &str = "oauth-2025-04-20";
 const BLOCK_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 const MONEY_EXPONENT: u32 = 2;
-const LABEL_SESSION: &str = "Current session";
-const LABEL_WEEK_ALL: &str = "Current week (all models)";
+pub(crate) const LABEL_SESSION: &str = "Current session";
+pub(crate) const LABEL_WEEK_ALL: &str = "Current week (all models)";
 
 pub(crate) const SLUG: &str = "anthropic";
 pub(crate) const DISPLAY_NAME: &str = "Anthropic";
@@ -78,14 +78,16 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     family: ModelFamily::Claude,
     supports_thinking: true,
     supports_deferred_tools: true,
+    accepts_images: true,
     accepts_arbitrary_models: false,
     fallback_max_output: Some(128_000),
     fallback_context_window: 200_000,
     models_toml: include_str!("../../../models/anthropic.toml"),
+    models_of: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
-        with_auth: create_with_auth,
+        with_auth: Some(create_with_auth),
     }),
     aperture: Some(ApertureRoute {
         path_prefix: NO_PATH_PREFIX,

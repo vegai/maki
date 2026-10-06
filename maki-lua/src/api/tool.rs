@@ -91,8 +91,23 @@ fn dctx_json(ctx: &DescriptionContext) -> Value {
     });
     match ctx.filter {
         ToolFilter::All => {}
-        ToolFilter::Only(names) => obj["only"] = json!(names),
+        ToolFilter::Only { allowed, .. } => {
+            obj["only"] = json!(
+                allowed
+                    .iter()
+                    .filter(|name| ctx.filter.matches(name))
+                    .collect::<Vec<_>>()
+            );
+        }
         ToolFilter::AllExcept(names) => obj["except"] = json!(names),
+        ToolFilter::Published { names, base } => {
+            obj["only"] = json!(
+                names
+                    .iter()
+                    .filter(|name| base.matches(name))
+                    .collect::<Vec<_>>()
+            );
+        }
     }
     obj
 }
