@@ -387,6 +387,12 @@ impl PermissionManager {
         }
     }
 
+    /// The session's working directory, which an ACP client picks per
+    /// session.
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
     fn session_rules(&self) -> std::sync::MutexGuard<'_, Vec<PermissionRule>> {
         self.session_rules.lock().unwrap_or_else(|e| {
             warn!("permission mutex was poisoned, recovering");

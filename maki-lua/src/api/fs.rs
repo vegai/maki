@@ -121,7 +121,7 @@ async fn read_file(path: PathBuf, max_bytes: u64) -> IoResult<Vec<u8>> {
 }
 
 /// Read the entire file at {path} as a UTF-8 string.
-/// Files over 512 MiB or not valid UTF-8 return nil plus an error message.
+/// Files over 512 MiB or invalid UTF-8 return nil and an error message.
 /// Use `read_bytes` for binary files.
 ///
 /// @param path string Absolute or relative file path. `~/` is expanded to the home directory.
