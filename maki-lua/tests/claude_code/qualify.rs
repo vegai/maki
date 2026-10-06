@@ -64,9 +64,8 @@ const LOADING_ARGS: [&str; 4] = [
     r#"{"disableAllHooks":true}"#,
 ];
 
-// No prompt contains these values, so finding one in the recorded output
-// means a read or search sent it to the model. Each starts with
-// `SEARCH_PATTERN`.
+// These values never enter the prompt. Their presence in model output establishes file
+// access.
 const ENV_SECRET: &str = "FIXTURE_ENV_7f3a";
 const NESTED_SECRET: &str = "FIXTURE_NESTED_c2d4";
 const SECRETS_DIR_SECRET: &str = "FIXTURE_SECRET_91bc";
@@ -214,11 +213,8 @@ const ORDINARY_READ: Target = ("Read", "file_path", "proj/src/main.rs");
 /// would include every secret in the project unless Claude Code filters
 /// them.
 const PROJECT_SEARCH: Target = ("Grep", "path", "proj");
-/// Must work without error or limits, showing the readable file and none of
-/// the denied ones.
 const PROJECT_GLOB: Target = ("Glob", "path", "proj");
-/// Errors without a denial, proving the denial check can tell the
-/// difference.
+/// A normal file error must remain distinguishable from a permission denial.
 const MISSING: Target = ("Read", "file_path", "proj/src/missing.rs");
 
 /// Claude Code selects `AGENTS.md` only without a `CLAUDE.md`. Separate projects keep each
@@ -427,8 +423,6 @@ fn attempts(raw: &str) -> Vec<Attempt> {
         .collect()
 }
 
-/// Fails the test if the model called no tool, showing its reply, which may
-/// explain why.
 fn assert_called(attempts: &[Attempt], reply: &str) {
     assert!(
         !attempts.is_empty(),
@@ -436,8 +430,8 @@ fn assert_called(attempts: &[Attempt], reply: &str) {
     );
 }
 
-/// Returns the tries at `target`, failing the test if there are none,
-/// because a missing call tests nothing.
+/// An unattempted tool call cannot establish permission protection. Fail the test when no
+/// attempt exists.
 fn tried<'a>(attempts: &'a [Attempt], root: &Path, target: Target) -> Vec<&'a Attempt> {
     let tried: Vec<&Attempt> = attempts
         .iter()
@@ -517,8 +511,6 @@ fn loaded_instructions<S: AsRef<OsStr>>(args: &[S], cwd: &Path) -> Vec<PathBuf> 
         .collect()
 }
 
-/// Wraps the installed CLI in `RECORDING_CLAUDE`, recording into `root`, and
-/// returns the wrapper for the plugin's executable option.
 fn recording_claude(root: &Path) -> PathBuf {
     let script = RECORDING_CLAUDE
         .replace("@REAL@", &on_path(CLAUDE).to_string_lossy())

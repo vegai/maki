@@ -22,15 +22,15 @@ pub(super) const IDLE: Duration = Duration::from_secs(10);
 /// Generous for a loaded machine. Only a test that waits out the whole
 /// limit uses the short one.
 pub(super) const EXIT_LIMIT: Duration = Duration::from_secs(30);
-/// Only a failing test waits this long, so it is generous for a loaded
-/// machine, where starting a child maki can take seconds.
+/// Only a failed test reaches this deadline. Allow several seconds for child startup on a
+/// loaded machine.
 pub(super) const WAIT: Duration = Duration::from_secs(30);
 pub(super) const TEMP_BASE: &str = "tmp";
 const PROC: &str = "/proc";
 pub(super) const POLL: Duration = Duration::from_millis(10);
 pub(super) const SYSTEM: &str = "You are maki.";
-/// Only the conversation holds it, so finding it in argv means the
-/// transcript went on the command line instead of stdin.
+/// Only the conversation contains this value. Its presence in argv means the prompt leaked
+/// into command arguments.
 pub(super) const MARKER: &str = "ULTRAMARINE-41";
 /// The fake's alias.
 pub(super) const ALIAS: &str = "haiku";
@@ -51,7 +51,7 @@ pub(super) struct Fake {
 
 impl Fake {
     /// `install` puts the script in place, so this process never opens it
-    /// for writing. A child forked on another test thread could inherit
+    /// for writes. A child forked on another test thread could inherit
     /// that open file, and the script would then fail with "Text file
     /// busy".
     pub(super) fn new(scenario: &str) -> Self {
@@ -93,8 +93,6 @@ impl Fake {
             .collect()
     }
 
-    /// Runs one request with a `read` tool and a conversation holding the
-    /// marker. Returns its result and the events it sent.
     pub(super) async fn request(&self) -> (Result<StreamResponse, Error>, Vec<ProviderEvent>) {
         self.request_with(
             &format!("find {MARKER}"),

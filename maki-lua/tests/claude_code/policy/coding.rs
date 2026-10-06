@@ -1,5 +1,4 @@
-//! The code profile: coding calls in a snapshot of an on-disk git
-//! repository, and importing their changes.
+//! Coding profile tests use real repositories, private snapshots and filesystem imports.
 
 use std::env;
 use std::ffi::OsStr;
@@ -263,8 +262,6 @@ impl Coding {
         (reg, host)
     }
 
-    /// Runs a coding call on `prompt`, returning the host that ran it and the
-    /// id of the artifact it made.
     fn coded(prompt: &str) -> (Self, Arc<ToolRegistry>, PluginHost, String) {
         Self::coded_in(SHA1, prompt)
     }
@@ -323,8 +320,6 @@ impl Coding {
         run_tool(reg, &self.ctx(reg), IMPORT_TOOL, input)
     }
 
-    /// Imports `paths` from artifact `id` with maki's permissions, running
-    /// `meanwhile` while the import waits for the user's approval.
     fn import_approved_after(
         &self,
         reg: &Arc<ToolRegistry>,
@@ -335,7 +330,6 @@ impl Coding {
         self.import_answered(reg, id, paths, PermissionAnswer::AllowOnce, meanwhile)
     }
 
-    /// Like `import_approved_after`, with the user giving `answer`.
     fn import_answered(
         &self,
         reg: &Arc<ToolRegistry>,
@@ -791,8 +785,8 @@ fn an_import_that_cannot_be_recorded_says_so() {
     );
 }
 
-/// A denied import changes nothing and says so, passing on the user's
-/// guidance but not the approval command.
+/// Import denials must preserve the checkout and include the user's guidance.
+/// The reply must omit the command.
 #[test]
 fn a_denied_import_passes_on_the_guidance_and_not_its_command() {
     let (coding, reg, _host, id) = Coding::coded(CODE_EDIT);
@@ -812,8 +806,8 @@ fn a_denied_import_passes_on_the_guidance_and_not_its_command() {
     assert_eq!(contents(&coding.project()), before);
 }
 
-/// Pause the first backup link after staging. Cancellation must remove temporary files
-/// before the test examines the unchanged checkout.
+/// Pause the first backup link after all temporary files exist. Cancellation must remove
+/// them before the test examines the unchanged checkout.
 #[test]
 fn a_cancelled_import_leaves_the_checkout_as_it_was() {
     let coding = Coding::new();
@@ -930,8 +924,7 @@ fn a_refused_coding_call_keeps_what_a_policy_hook_wrote() {
     assert!(kept, "the file that the hook wrote in {dir:?} is missing");
 }
 
-/// What `prepare` writes sets up the worker rather than being its work, so
-/// it is never offered for import and a note lists it.
+/// Preparation changes belong to the worker baseline. They must stay outside the import.
 #[test]
 fn what_prepare_writes_is_not_offered_for_import() {
     let coding = Coding::new();
@@ -997,7 +990,7 @@ fn a_cancel_during_the_run_keeps_the_workers_snapshot() {
 }
 
 /// Every change can land and the command still fail. The reply says so,
-/// rather than reporting a clean import.
+/// and must not report a clean import.
 #[test]
 fn an_import_that_landed_and_still_failed_says_so() {
     let coding = Coding::new();
@@ -1032,9 +1025,8 @@ fn an_artifact_gone_during_approval_changes_no_file() {
     assert_eq!(contents(&coding.project()), before);
 }
 
-/// A coding call sweeps artifacts past their time limit, and an approval can
-/// outlast that limit. Starting an import redates its artifact, so a sweep
-/// during approval keeps it.
+/// Approval can outlast artifact expiry. Refresh the artifact timestamp at import startup
+/// so concurrent cleanup preserves it.
 #[test]
 fn a_sweep_while_approval_waits_keeps_the_artifact() {
     let (coding, reg, _host, id) = Coding::coded(CODE_EDIT);
@@ -1444,8 +1436,6 @@ fn an_artifact_dir_it_cannot_trust_is_refused(climbs: bool, problem: &str) {
     );
 }
 
-/// Returns a folder in `root` holding `files`, all last written before the
-/// sweep's time limit.
 fn old_folder(root: &Path, name: &str, files: &[&str]) -> PathBuf {
     let dir = root.join(name);
     fs::create_dir(&dir).unwrap();

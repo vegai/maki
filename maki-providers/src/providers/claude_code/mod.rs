@@ -180,8 +180,7 @@ pub fn follow_plugins(enabled_plugins: &[String], options: &HashMap<String, Map<
         enabled.then(|| PluginOptions::from_table(options.get(PLUGIN)));
 }
 
-/// A `/reload` that changes `max_concurrent` makes new slots, and running
-/// requests keep their old ones.
+/// New limits need new slots. Active requests retain their old slots until completion.
 fn slots() -> Arc<Semaphore> {
     let limit = plugin_options()
         .and_then(|options| options.max_concurrent)
@@ -422,8 +421,8 @@ impl ClaudeCode {
             .find(|(key, _)| key == TMPDIR_ENV)
             .map_or_else(env::temp_dir, |(_, value)| PathBuf::from(value));
         let (mut env, withheld) = checks::child_env(vars);
-        // Claude Code and the checks both treat an empty value as unset.
-        // Dropping it keeps the two in agreement.
+        // Claude Code treats an empty value as unset. Remove it so the child and route
+        // checks agree.
         env.retain(|(key, value)| key != CONFIG_DIR_ENV || !value.is_empty());
         if self.config_dir.is_some() {
             env.retain(|(key, _)| key != CONFIG_DIR_ENV);

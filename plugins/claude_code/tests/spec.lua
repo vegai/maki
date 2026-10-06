@@ -920,8 +920,7 @@ case("denied_reads_are_listed", function()
   eq(table.concat(stream:denials(), "|"), "Read .env|Read " .. OUTSIDE)
 end)
 
--- A field of the wrong type yields no name rather than raising, which would
--- turn a good reply into an error.
+-- Invalid field types must return no name so an exception cannot invalidate a good reply.
 case("denials_of_the_wrong_shape_are_shown_rather_than_raised", function()
   local stream = started()
   stream:feed(maki.json.encode({

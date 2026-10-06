@@ -129,7 +129,6 @@ const NO_ANSWER_IN_TIME: &str = "did not complete in time";
 const CRASH_REPORT: &[&str] = &["code 3", "before its result", "boom"];
 const LATE_CRASH_REPORT: &[&str] = &["code 3", "after its result", "boom"];
 const CANCEL_MARKER: &str = "[cancelled by user";
-/// One callback shows this line and records the usage beside it.
 const USAGE_PROGRESS: &str = "Read src/usage.rs";
 const TOOL_USE_ID: &str = "toolu_ask";
 /// The smallest `timeout` a call takes.
@@ -165,8 +164,7 @@ const BAD_MODEL_OPTION: &str = "the `model` option must be one of";
 const CODE_HANG: &str = "code_hang";
 /// The fake writes it once the hanging worker has started.
 const WORKING: &str = "working";
-/// Longer than `DEADLINE`, so if a kill fails, the test waiting on it fails
-/// before the process would stop on its own.
+/// Longer than `DEADLINE` so a failed process kill fails the test.
 const HANG_SECS: u64 = DEADLINE.as_secs() * 2;
 /// Makes the fake add a file named {HOSTILE_NAME}.
 const CODE_HOSTILE: &str = "code_hostile";
@@ -424,7 +422,6 @@ impl FakeClaude {
         smol::block_on(within_deadline(call(&reg, &self.ctx(None, None), prompt)))
     }
 
-    /// A tool context for a session working in this fake's project.
     fn ctx(&self, events: Option<&EventSender>, tool_use_id: Option<&str>) -> ToolContext {
         ctx_in(&self.project.path(), events, tool_use_id)
     }
@@ -876,8 +873,8 @@ fn output_after_the_result_is_checked(scenario: &str, want: Option<&str>) {
     }
 }
 
-/// One callback shows the view line and records the usage, so seeing the
-/// line proves the usage was counted before the cancel.
+/// The same callback records usage and updates the view. Its view line confirms that
+/// maki recorded the usage before cancellation.
 #[test]
 fn a_cancelled_run_keeps_what_it_spent() {
     let (scenario, progress, spent) = (USAGE_THEN_HANG, USAGE_PROGRESS, SPENT_BEFORE_CANCEL);

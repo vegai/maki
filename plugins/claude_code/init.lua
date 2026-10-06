@@ -869,9 +869,8 @@ local function run(input, ctx, call, timeout_secs)
   return claude:build(outcome)
 end
 
--- Removes the artifact now rather than leaving it for the sweep. It waits
--- for the last process to exit, because a stopped copy can keep writing
--- until then.
+-- Wait for all processes before artifact removal. A stopped copy can still write until its
+-- process exits.
 local function discard_unkept(call)
   local artifact = call.artifact
   if artifact then

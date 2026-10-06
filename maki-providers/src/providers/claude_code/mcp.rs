@@ -471,7 +471,7 @@ mod tests {
     const WAIT: Duration = Duration::from_secs(5);
     /// A body length the request announces but never sends.
     const BODY_NEVER_SENT: usize = 1000;
-    /// Far longer than reading a request that did arrive takes.
+    /// A generous deadline limits only failed test requests.
     const SHORT_READ_LIMIT: Duration = Duration::from_millis(500);
 
     fn tools() -> Vec<McpTool> {

@@ -57,8 +57,8 @@ for link do
 done
 ]]
 
--- Bytes that could break the job reader become `?`. The `./` keeps `find`
--- from reading a directory named like `-delete` as an expression.
+-- Replace bytes that can break the job reader with `?`. Prefix paths with `./`
+-- so names such as `-delete` cannot become `find` expressions.
 local CHANGED_SINCE = [[find "./$1" -cnewer "$2" -print | LC_ALL=C tr -c '\n[:print:]' '?']]
 
 local function shown(paths)
@@ -689,7 +689,7 @@ local function checkout_state(call, env, artifact, changes, keep_on_cancel)
 end
 
 --- Manifest fields end up in the command the user approves, so the manifest
---- must come from a collect step for {spec.project}. Opening it rewrites it,
+--- must come from a collect step for {spec.project}. The open operation rewrites it,
 --- because the sweep goes by its date and the approval can outlast the
 --- artifact's time limit.
 local function open_import(spec)

@@ -21,8 +21,8 @@ use tempfile::{TempDir, tempdir};
 use test_case::test_case;
 
 const GLOSSARY: &str = "glossary.txt";
-/// Only the glossary contains it, so a reply quoting it proves the subagent
-/// read the file.
+/// Only the glossary contains this value. A reply with it establishes that the subagent
+/// read the glossary.
 const MEANING: &str = "FIRST-LETTER-7";
 const DENY_BASH: &str = "[bash]\ndeny = [\"*\"]\n";
 const PROMPT: &str = "Do the two steps, in sequence, with your tools. Then reply.\n\
@@ -139,8 +139,6 @@ impl Fixture {
         path
     }
 
-    /// Runs `maki -p` on `model` with `prompt` in the project, printing
-    /// `format`.
     fn maki(&self, model: &str, prompt: &str, format: &str) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_maki"));
         command
@@ -164,8 +162,6 @@ impl Fixture {
     }
 }
 
-/// Runs `maki -p` on `model` in a fixture with the plugin on and the caller's
-/// Claude Code login.
 fn run_maki(model: &str) -> Run {
     let fixture = Fixture::new();
     fixture.enable_plugin(None);
@@ -183,9 +179,7 @@ fn run_maki(model: &str) -> Run {
     Run { events }
 }
 
-/// Runs maki's `command` to completion within [`RUN_LIMIT`], reading both
-/// outputs as they arrive so a large stderr cannot fill its pipe and stall
-/// maki. Returns stdout and stderr.
+/// Read both output streams concurrently so stderr cannot fill its pipe and block maki.
 fn finish(mut command: Command) -> (Vec<u8>, String) {
     let mut child = command
         .stdout(Stdio::piped())

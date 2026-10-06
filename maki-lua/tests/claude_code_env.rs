@@ -191,8 +191,8 @@ fn fake_claude(dir: &Path, script: &str) -> PathBuf {
     executable(dir, "claude", &script.replace("@VERSION@", MINIMUM_VERSION))
 }
 
-/// The host must outlive a call's cleanup, because dropping it kills every
-/// plugin job, which in maki only happens at exit.
+/// Keep the host alive until call cleanup completes. Host shutdown kills all jobs,
+/// including cleanup processes.
 fn fake_host(claude: &Path, config_dir: &Path) -> (Arc<ToolRegistry>, PluginHost) {
     fake_host_with(claude, config_dir, Map::new())
 }
@@ -247,8 +247,8 @@ fn a_temp_dir_that_leads_into_the_project_is_refused() {
     }
 }
 
-/// Removing old artifacts can take long, so it runs in the background, and
-/// a call does not wait for it.
+/// Artifact cleanup can take a long time. It must run outside the Lua thread so subsequent
+/// calls can obtain slots.
 #[test]
 fn a_call_does_not_wait_for_the_sweep() {
     let _scenario = Scenario::enter();
@@ -642,14 +642,10 @@ fn the_default_artifact_root_hides_all_of_makis_state_but_the_workers_artifact()
     );
 }
 
-/// Runs a coding call on a project whose copy runs `action` in the project
-/// after each `cp`, also copying `dependencies`.
 fn code_while_the_copy_is_disturbed_by(action: &str, dependencies: &str) -> DisturbedCopy {
     code_with_cp(&DISTURBING_CP.replace("@ACTION@", action), dependencies)
 }
 
-/// Runs a coding call with the script `cp` in place of the installed one,
-/// also copying `dependencies`.
 fn code_with_cp(cp: &str, dependencies: &str) -> DisturbedCopy {
     let tools = tempdir().unwrap();
     let repo = tempdir().unwrap();

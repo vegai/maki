@@ -56,9 +56,8 @@ const NEW_FILE_PREFIX: &str = ".maki-import-";
 /// The last new file gets its mode, in the folder the command made for it,
 /// after the file beside the edited one was written.
 const WRITING: Hold = ("chmod", " -x -- ./src/new/");
-/// Writes the command importing the @CHANGES@ changes to @OUT@, and the
-/// command cleaning up after the import to @LEFTOVERS@. The names are long
-/// strings, so every byte arrives unchanged.
+/// Shell paths can contain arbitrary bytes. Long Lua strings preserve them in the generated
+/// import and cleanup commands.
 const GENERATE: &str = r#"
 local workspace = require("claude_workspace")
 local changes = ({
@@ -270,8 +269,7 @@ impl Import {
     }
 }
 
-/// The command at its hold. Dropping it kills the whole group, as a cancel
-/// does, so a test that fails before the release leaves no fake waiting.
+/// The guard must kill the paused command's entire group if a test fails before release.
 struct Held(Option<Child>);
 
 impl Drop for Held {
@@ -284,8 +282,6 @@ impl Drop for Held {
     }
 }
 
-/// Moves `target`, still holding the snapshot's bytes, to `outside`, and puts
-/// a link to it in its place.
 fn swap_for_a_link(target: &Path, outside: &Path) {
     fs::rename(target, outside).unwrap();
     symlink(outside, target).unwrap();

@@ -71,8 +71,6 @@ const STDERR_TAIL_LINES: usize = 10;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 #[cfg(unix)]
 const PRIVATE_DIR_MODE: u32 = 0o700;
-/// How many processes read the models' context windows, each taking a share
-/// of the models.
 const WINDOW_PROCESSES: usize = 4;
 const SET_MODEL: &str = "set_model";
 const CONTEXT_USAGE: &str = "get_context_usage";
@@ -368,8 +366,8 @@ fn pid_namespace() -> Option<u64> {
     fs::metadata(PID_NAMESPACE).ok().map(|meta| meta.ino())
 }
 
-/// Sweeps each base once, off the async threads, because removing can take
-/// long.
+/// Artifact cleanup can take a long time. Run it outside the async threads and scan each
+/// base once.
 #[cfg(target_os = "linux")]
 fn sweep_once(base: &Path) {
     static SWEPT: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
@@ -560,8 +558,8 @@ async fn send_handshake(stdin: &mut Option<ChildStdin>, deadline: Instant) -> Re
     Ok(())
 }
 
-/// A process that stops reading can block a write larger than the pipe
-/// buffer, so the write has a deadline.
+/// A process that ignores stdin can block a write larger than the pipe buffer. Bound the
+/// write with a deadline.
 async fn send(stdin: &mut Option<ChildStdin>, data: &str, deadline: Instant) -> Result<(), Error> {
     let pipe = stdin.as_mut().ok_or(Error::NoStdin)?;
     async {
@@ -1429,8 +1427,7 @@ mod tests {
         assert!(matches!(result, Err(Error::ExitLate)), "{result:?}");
     }
 
-    /// A process that stops reading after its checks cannot hold a request
-    /// past the startup limit, whatever the prompt length.
+    /// A process that ignores stdin after its checks must not hold a request indefinitely.
     #[test]
     fn a_prompt_nobody_reads_times_out() {
         let fake = Fake::new("stops_reading");
@@ -1752,7 +1749,7 @@ mod tests {
     }
 
     /// The models come from the account answer, each once, by the id it runs
-    /// and with the window Claude Code opens for it. Listing sends no prompt,
+    /// and with the window Claude Code opens for it. Model discovery sends no prompt,
     /// and the list is still correct without the windows.
     #[test_case(true ; "with_their_windows")]
     #[test_case(false ; "without_windows")]

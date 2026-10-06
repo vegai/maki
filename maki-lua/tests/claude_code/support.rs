@@ -67,10 +67,8 @@ const NEXTEST: &str = "NEXTEST";
 const CLAUDE_DIR: &str = ".claude";
 /// maki's global instructions in the XDG config directory.
 const GLOBAL_INSTRUCTIONS: &str = "maki/AGENTS.md";
-/// The fixture's global instructions. A prompt containing them proves maki
-/// read the fixture rather than the developer's config. The live tests send
-/// them to the model, so they avoid saying this is a test, which could make
-/// the model refuse.
+/// These instructions distinguish fixture config from developer config. Live prompts must
+/// avoid test labels so the model treats them as ordinary instructions.
 pub const FIXTURE_GLOBAL_RULE: &str = "Write the replies in English.";
 
 /// All threads share one working directory, so under a threaded harness
@@ -102,8 +100,8 @@ static DEVELOPER_LOGIN: LazyLock<PathBuf> = LazyLock::new(|| {
     unsafe { env::remove_var(CLAUDE_CONFIG_ENV) };
     let global = root.join(FIXTURE_CONFIG_DIR).join(GLOBAL_INSTRUCTIONS);
     fs::create_dir_all(global.parent().unwrap()).unwrap();
-    // Another test process may be reading the file, so the rename swaps it
-    // in one step.
+    // Another test process can read this file. Atomic rename prevents a partial instruction
+    // file.
     let staged = global.with_extension(process::id().to_string());
     fs::write(&staged, FIXTURE_GLOBAL_RULE).unwrap();
     fs::rename(&staged, &global).unwrap();
@@ -132,8 +130,8 @@ impl Drop for WorkingDir {
     }
 }
 
-/// Root reads and writes through mode bits, so a test relying on them
-/// cannot check a limit as root.
+/// Root can bypass mode restrictions. Skip tests that depend on those restrictions when
+/// they do not apply.
 pub fn mode_bits_hold() -> bool {
     !geteuid().is_root()
 }
@@ -153,7 +151,6 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
-/// Writes `content` at `path`, creating any missing folders.
 pub fn write(path: &Path, content: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, content).unwrap();
