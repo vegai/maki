@@ -414,6 +414,12 @@ string or a table with richer output fields.
   - `description` (`string`) Required. Non-empty description shown to the model.
   - `schema` (`table`) Required. JSON Schema object describing the tool's input parameters.
   - `handler` (`function`) Required. Called with `(input, ctx)` when the tool is invoked.
+    `ctx:cwd()` returns the directory the calling session started
+    in. `/cd` does not change it, and under ACP it can differ from
+    `maki.uv.cwd()`.
+    `ctx:instructions()` returns the instruction text maki's prompt
+    loads there. Both need `fs_read`. Outside a handler, they return
+    nil and an error.
     Must return a string or a table with any of these fields:
     - `llm_output` (`string`) Text sent to the model.
     - `is_error` (`boolean`) When true, the result is treated as an error.
@@ -1978,19 +1984,14 @@ local id = maki.fn.jobstart("git status", {
 maki.fn.jobstart({cmd}, {opts?})
 ```
 
-Run a command in the background. A string runs through `bash -c` on Unix
-or `cmd /C` on Windows; a table is spawned as argv, with no shell in
-between (nothing in it can be read as a redirect, a pipe, or `$(...)`).
-You get back a job id that you can pass to `jobstop` or `jobwait` to
-control the process.
+Run a command in the background. A string uses `bash -c` on Unix or
+`cmd /C` on Windows. An argv table starts the process directly without
+shell interpretation. Use the returned job id with `jobstop` or `jobwait`.
 
-`stdout` and `stderr` route a stream to a file instead of into maki. A
-path is opened for append and handed to the child, so nothing is buffered
-here: no callback, no tail, no events for that stream, and it counts as
-truncated everywhere a tail is reported. That makes the two mutually
-exclusive with `on_stdout` / `on_stderr` for the same stream, and a path
-additionally needs the `fs_write` permission. To both persist and react,
-run one job writing the file and a second one tailing it.
+`stdout` and `stderr` can append directly to files. Redirected streams
+have no callbacks, tails or events and count as truncated in job reports.
+A redirect conflicts with the corresponding output callback and needs
+`fs_write`. Use separate writer and reader jobs to store and process output.
 
 Requires the `run` [plugin permission](#plugin-permissions).
 
@@ -2002,10 +2003,23 @@ Requires the `run` [plugin permission](#plugin-permissions).
 
 - `{opts?}` (`table?`) Optional settings:
   - `cwd` (`string?`) working directory (tilde is expanded).
-  - `env` (`table?`) extra environment variables, `{ VAR = "value" }`.
-  - `on_stdout` (`function?`) called with `(job_id, line)` for each stdout line.
-  - `on_stderr` (`function?`) called with `(job_id, line)` for each stderr line.
-  - `on_exit` (`function?`) called with `(job_id, code)` when the process finishes.
+  - `env` (`table?`) environment variables, `{ VAR = "value" }`, added to
+    maki's environment.
+  - `clear_env` (`boolean?`) use only `env` for the child
+    environment (default false).
+  - `stdin` (`string?`) `"pipe"` to write to the job with `chansend`. Defaults
+    to `"null"`, no input. Neovim defaults to `"pipe"`, but a job that
+    reads an open pipe with no data hangs.
+  - `kill_group_on_exit` (`boolean?`) after the process exits, kill the
+    processes that remain in its process group before `on_exit` runs, such
+    as a background child that closed its output (default false, Unix
+    only).
+  - `on_stdout` (`function?`) called with `(job_id, line, "stdout")` for each
+    stdout line. Bytes that are not UTF-8 become U+FFFD, where Neovim
+    passes the raw bytes.
+  - `on_stderr` (`function?`) the same for each stderr line, with `"stderr"`.
+  - `on_exit` (`function?`) called with `(job_id, code, "exit")` when the
+    process stops.
   - `stdout` (`string|false?`) append stdout to this path, or `false` to
     discard it.
   - `stderr` (`string|false?`) same for stderr; both may name one path.
@@ -2016,7 +2030,7 @@ Requires the `run` [plugin permission](#plugin-permissions).
   - `tail` (`integer?`) trailing lines per stream kept for `jobinfo`
     (default 20, 0 disables, max 1024).
   - `name` (`string?`) handle for `jobfind`, unique among the live jobs this
-    plugin can see. Starting a second job under a live name is an error.
+    plugin can see. A second job with the same live name fails.
 
 **Returns:** (`integer`) Job id.
 
@@ -2245,6 +2259,67 @@ end
 
 ---
 
+### `maki.fn.chansend()` {#maki-fn-chansend}
+
+```lua
+maki.fn.chansend({id}, {data})
+```
+
+Write {data} to job {id}'s stdin. Start the job with `stdin = "pipe"`.
+Unlike `vim.fn.chansend`, an error returns nil and a message instead of 0.
+List items use newline separators. A newline inside an item becomes NUL.
+The final item has no newline suffix.
+
+Unread data stays in memory. A descendant can retain stdin after the job
+exits. Use `kill_group_on_exit` to stop that descendant and release the data.
+
+Requires the `run` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{id}` (`integer`) Job id returned by `jobstart`.
+- `{data}` (`string|table`) Text to write, or a list of lines.
+
+**Returns:** (`integer?`, `string?`) Bytes in the queue for the job, or nil and an error.
+
+**Example:**
+
+```lua
+local id = maki.fn.jobstart({ "cat" }, { stdin = "pipe" })
+maki.fn.chansend(id, "hello\n")
+maki.fn.chanclose(id, "stdin")
+```
+
+---
+
+### `maki.fn.chanclose()` {#maki-fn-chanclose}
+
+```lua
+maki.fn.chanclose({id}, {stream?})
+```
+
+Close job {id}'s stdin, so the job reads end of file. Like
+`vim.fn.chanclose`, but only for the `"stdin"` stream: without a stream,
+Neovim closes every stream, while this closes stdin. The {stream}
+argument is kept, so a call written for Neovim works unchanged.
+
+Requires the `run` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{id}` (`integer`) Job id returned by `jobstart`.
+- `{stream?}` (`string?`) `"stdin"`, which is also the default.
+
+**Returns:** (`integer?`, `string?`) `1`, as Neovim returns, or nil and an error.
+
+**Example:**
+
+```lua
+maki.fn.chanclose(id, "stdin")
+```
+
+---
+
 ### `maki.fn.executable()` {#maki-fn-executable}
 
 ```lua
@@ -2268,6 +2343,38 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 ```lua
 if maki.fn.executable("rg") == 1 then
   -- use ripgrep
+end
+```
+
+---
+
+### `maki.fn.exepath()` {#maki-fn-exepath}
+
+```lua
+maki.fn.exepath({name})
+```
+
+Resolve {name} to an absolute executable path, or return `""` if no
+executable exists, as in Neovim's `vim.fn.exepath`.
+Names with a path separator resolve from the working directory. Other
+names resolve through `$PATH`, with files this process cannot execute
+excluded. Resolve the program before a directory change so a relative
+name cannot select a different executable.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{name}` (`string`) The name of a program (for example `"git"`), or a relative or absolute path.
+
+**Returns:** (`string`) Absolute path, or `""` if not found.
+
+**Example:**
+
+```lua
+local git = maki.fn.exepath("git")
+if git ~= "" then
+  maki.fn.jobstart({ git, "status" }, { cwd = "/tmp" })
 end
 ```
 
@@ -2347,8 +2454,7 @@ maki.fs.read({path})
 ```
 
 Read the entire file at {path} as a UTF-8 string.
-Files larger than 512 MiB return nil plus an error message.
-If the file contains bytes that are not valid UTF-8, this function throws.
+Files over 512 MiB or invalid UTF-8 return nil and an error message.
 Use `read_bytes` for binary files.
 
 Requires the `fs_read` [plugin permission](#plugin-permissions).
@@ -6694,8 +6800,8 @@ Provides access to the working directory, home directory, and environment
 variables. None of these functions throw.
 
 Filesystem location queries (`cwd`, `os_homedir`) need `fs_read`, while
-`os_getenv` reads the process environment, where secrets live, so it needs
-`env`.
+`os_getenv` and `os_environ` read the process environment, which can
+hold secrets, so they need `env`.
 
 ```lua
 local home = maki.uv.os_homedir()
@@ -6765,6 +6871,48 @@ Requires the `env` [plugin permission](#plugin-permissions).
 
 ```lua
 local editor = maki.uv.os_getenv("EDITOR") or "vi"
+```
+
+---
+
+### `maki.uv.os_environ()` {#maki-uv-os_environ}
+
+```lua
+maki.uv.os_environ()
+```
+
+Return every environment variable as a `{ NAME = value }` table, like
+`vim.uv.os_environ`. Variables whose name or value is not UTF-8 are left
+out.
+
+Requires the `env` [plugin permission](#plugin-permissions).
+
+**Returns:** (`table`) Environment variables, with the name as the key.
+
+**Example:**
+
+```lua
+for name in pairs(maki.uv.os_environ()) do print(name) end
+```
+
+---
+
+### `maki.uv.os_uname()` {#maki-uv-os_uname}
+
+```lua
+maki.uv.os_uname()
+```
+
+Return the operating system's name and version, like `vim.uv.os_uname`.
+
+**Returns:** (`table`) `sysname` (for example "Linux", "Darwin" or "Windows_NT"),
+  `release`, `version` and `machine`. On Windows, `release` and `version`
+  are empty.
+
+**Example:**
+
+```lua
+if maki.uv.os_uname().sysname == "Linux" then print("on Linux") end
 ```
 
 

@@ -14,7 +14,7 @@ use maki_config::providers::{
 };
 use maki_providers::provider::fetch_all_models;
 use maki_providers::spec::Owner;
-use maki_providers::{ProviderData, catalog_providers};
+use maki_providers::{ProviderData, Timeouts, catalog_providers, claude_code, refresh_catalog};
 use maki_providers::{copilot_auth, openai_auth, plugin, xai_auth};
 use maki_storage::StateDir;
 use maki_storage::auth::ProviderCredentials;
@@ -573,11 +573,22 @@ pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMo
     // Model listing calls plugin hooks, so the host outlives the fetch.
     let (_host, config) = super::cli_stack(no_plugins, no_jit, trust_mode)?;
 
-    let mut refresh_failure = None;
+    let mut refresh_failures = Vec::new();
     if refresh {
-        match maki_providers::refresh_catalog() {
+        match refresh_catalog() {
             Ok(()) => eprintln!("models.dev catalog has been refreshed"),
-            Err(e) => refresh_failure = Some(e),
+            Err(e) => refresh_failures.push(format!(
+                "catalog refresh failed, keeping existing cache: {e}"
+            )),
+        }
+        match claude_code::refresh_models(Timeouts::from(&config.provider)) {
+            Some(Ok(count)) => {
+                eprintln!("maki refreshed the claude-code model list ({count} models)")
+            }
+            Some(Err(e)) => refresh_failures.push(format!(
+                "maki cannot refresh the claude-code model list. A saved list remains valid for one day: {e}"
+            )),
+            None => {}
         }
     }
 
@@ -594,8 +605,8 @@ pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMo
         None,
     ));
 
-    if let Some(e) = refresh_failure {
-        bail!("catalog refresh failed, keeping existing cache: {e}");
+    if !refresh_failures.is_empty() {
+        bail!("{}", refresh_failures.join("\n"));
     }
     Ok(())
 }

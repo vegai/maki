@@ -250,20 +250,15 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
         .and_then(|spec| Model::from_spec_with_policy(spec, &agent.model_policy).ok());
     let model = parsed.as_ref().unwrap_or(&agent.model);
 
-    let base = match (only, except) {
-        (Some(o), _) => ToolFilter::Only(o),
-        (_, Some(e)) => ToolFilter::AllExcept(e),
-        _ => ToolFilter::All,
+    let base = ToolFilter::from_config(&agent.config, model, &[]);
+    let filter = match (only, except) {
+        (Some(names), _) => ToolFilter::Published {
+            names,
+            base: Box::new(base),
+        },
+        (_, Some(names)) => base.excluding(&names.iter().map(String::as_str).collect::<Vec<_>>()),
+        _ => base,
     };
-    let disabled: Vec<&str> = agent
-        .config
-        .disabled_tools
-        .iter()
-        .map(String::as_str)
-        .collect();
-    let filter = base
-        .excluding(&disabled)
-        .excluding(maki_agent::tools::capability_exclusions(model));
 
     let vars = maki_agent::template::env_vars();
     let ctx_desc = DescriptionContext {

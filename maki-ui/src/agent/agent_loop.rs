@@ -249,6 +249,7 @@ impl AgentLoop {
             &hooks,
             &self.config,
             instructions,
+            self.permissions.cwd(),
             self.timeouts.retry,
         )
         .await

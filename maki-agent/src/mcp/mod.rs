@@ -44,8 +44,8 @@ use self::error::McpError;
 use self::http::HttpTransport;
 use self::stdio::StdioTransport;
 use self::transport::McpTransport;
-use crate::tools::CallOrigin;
 use crate::tools::schema::sanitize_tool_input_schema;
+use crate::tools::{CallOrigin, ToolFilter};
 
 const SEPARATOR: &str = ".";
 const WIRE_SEPARATOR: &str = "__";
@@ -357,6 +357,10 @@ impl McpSession {
     /// what's left deferred, so loading tools mid-session can never flip
     /// the remainder into the context.
     pub fn extend_tools(&self, tools: &mut Value) {
+        self.extend_tools_filtered(tools, &ToolFilter::All);
+    }
+
+    pub fn extend_tools_filtered(&self, tools: &mut Value, filter: &ToolFilter) {
         let Some(arr) = tools.as_array_mut() else {
             debug_assert!(false, "tools must be a JSON array");
             return;
@@ -366,12 +370,15 @@ impl McpSession {
             .filter_map(|t| t["name"].as_str().map(String::from))
             .collect();
         let idx = self.handle.index.load();
-        let defer =
-            idx.descriptors.iter().filter(|d| !d.always_load).count() > self.handle.defer_tools;
+        // Without tool_search, deferred definitions would have no discovery path.
+        let defer = filter.matches_external(TOOL_SEARCH_TOOL_NAME)
+            && idx.descriptors.iter().filter(|d| !d.always_load).count() > self.handle.defer_tools;
         let loaded = self.lock_loaded();
         let mut deferred: Vec<&ToolDescriptor> = Vec::new();
         for d in idx.descriptors.iter() {
-            if existing.contains(d.wire_name()) {
+            if existing.contains(d.wire_name())
+                || !filter.matches_external_names(&[d.wire_name(), &d.qualified_name])
+            {
                 continue;
             }
             if !defer || d.always_load || loaded.contains(&*d.qualified_name) {
@@ -399,6 +406,15 @@ impl McpSession {
     /// request; a nested one only reports the names, which the sandbox can
     /// already call.
     pub fn search_tools(&self, query: &str, origin: CallOrigin) -> Result<String, String> {
+        self.search_tools_filtered(query, origin, &ToolFilter::All)
+    }
+
+    pub fn search_tools_filtered(
+        &self,
+        query: &str,
+        origin: CallOrigin,
+        filter: &ToolFilter,
+    ) -> Result<String, String> {
         let q = query.trim().to_lowercase();
         let tokens: Vec<&str> = q
             .split(|c: char| !c.is_alphanumeric())
@@ -412,6 +428,7 @@ impl McpSession {
             .descriptors
             .iter()
             .filter(|d| !d.always_load)
+            .filter(|d| filter.matches_external_names(&[d.wire_name(), &d.qualified_name]))
             .filter_map(|d| {
                 let name = d.wire_name().to_lowercase();
                 let haystack = build_haystack(&d.definition);

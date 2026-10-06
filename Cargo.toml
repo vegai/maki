@@ -131,7 +131,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 flume = { version = "0.11", default-features = false, features = ["async", "select"] }
 fs4 = "1"
 pin-project-lite = "0.2"
-rustix = { version = "1", default-features = false, features = ["process"] }
+rustix = { version = "1", default-features = false, features = ["fs", "process", "system"] }
 humantime = "2"
 semver = "1"
 toml = "0.8"

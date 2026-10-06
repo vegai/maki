@@ -248,6 +248,9 @@ const TIMED_OUT_SUBSTR: &str = "timed out";
 const ALREADY_CALLED_ERR: &str = "already called";
 const UNKNOWN_FIELD_ERR: &str = "unknown field";
 const PERMISSION_DENIED_MSG: &str = "permission denied";
+const STDIN_MODE_ERR: &str = "jobstart: stdin must be \"pipe\" or \"null\"";
+const CHANCLOSE_STREAM_ERR: &str = "chanclose: you can close only \"stdin\"";
+const CHANSEND_DATA_ERR: &str = "chansend: data must be a string or a list";
 
 #[test]
 fn stdlib_globals_accessible() {
@@ -2947,6 +2950,28 @@ maki.api.register_tool({{
         .end_sessions_blocking([session], SessionEndReason::Shutdown);
 }
 
+/// A stdin mode, stream or payload a job cannot use is an error.
+#[test_case::test_case(r#"maki.fn.jobstart("true", { stdin = "file" })"#, STDIN_MODE_ERR ; "an_unknown_stdin_mode")]
+#[test_case::test_case(r#"maki.fn.chanclose(1, "stdout")"#, CHANCLOSE_STREAM_ERR ; "closing_stdout")]
+#[test_case::test_case("maki.fn.chansend(1, 42)", CHANSEND_DATA_ERR ; "a_number_to_send")]
+fn job_input_it_cannot_take_is_refused(call: &str, expected: &str) {
+    const TOOL: &str = "job_input";
+    let mut perms = maki_lua::PluginPermissions::denied();
+    perms.set(maki_lua::Permission::Run, true);
+    let src = perm_tool_src(
+        TOOL,
+        &format!(
+            r#"local ok, err = pcall(function() {call} end)
+                return tostring(ok) .. ":" .. tostring(err)"#
+        ),
+    );
+
+    let result = exec_tool_with_perms(perms, &src, TOOL, json!({})).unwrap();
+
+    assert!(result.starts_with("false"), "got: {result}");
+    assert!(result.contains(expected), "got: {result}");
+}
+
 /// `run` on its own is enough to start a job, but pointing a stream at a path
 /// is a write, so it costs `fs_write` too.
 #[test]
@@ -3686,6 +3711,24 @@ fn register_options_rejects_bad_spec(src: &str, expected: &str) {
         .load_source("opts_plugin", src)
         .expect_err("plugin load should fail");
     assert!(err.to_string().contains(expected), "got: {err}");
+}
+
+/// A failed plugin load must remove its registered options so the provider cannot mistake it
+/// for a loaded plugin.
+#[test]
+fn a_plugin_that_fails_after_declaring_options_is_not_listed() {
+    const PLUGIN: &str = "fails_late";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        PLUGIN,
+        r#"
+        maki.api.register_options({ a = { default = 1, desc = "A." } })
+        error("an error after the options")
+        "#,
+    )
+    .expect_err("the load of the plugin must give an error");
+    assert!(!host.plugin_options().unwrap().contains_key(PLUGIN));
 }
 
 #[test]
@@ -5472,6 +5515,20 @@ fn perm_tool_src(name: &str, handler_body: &str) -> String {
     "run"
     ; "run_denied"
 )]
+#[test_case::test_case(
+    "chansend_deny",
+    r#"local ok, err = pcall(function() maki.fn.chansend(1, "x") end)
+                return tostring(err)"#,
+    "run"
+    ; "chansend_denied"
+)]
+#[test_case::test_case(
+    "chanclose_deny",
+    r#"local ok, err = pcall(function() maki.fn.chanclose(1) end)
+                return tostring(err)"#,
+    "run"
+    ; "chanclose_denied"
+)]
 fn denied_permission_blocks_api(tool_name: &str, handler_body: &str, expected_perm: &str) {
     let src = perm_tool_src(tool_name, handler_body);
     let result = exec_tool_with_perms(
@@ -5483,6 +5540,25 @@ fn denied_permission_blocks_api(tool_name: &str, handler_body: &str, expected_pe
     .unwrap();
     assert!(result.contains(PERMISSION_DENIED_MSG), "got: {result}");
     assert!(result.contains(expected_perm), "got: {result}");
+}
+
+/// `chanclose` returns what `vim.fn.chanclose` returns, so a call written for
+/// Neovim can check it.
+#[cfg(unix)]
+#[test]
+fn chanclose_returns_one_like_neovim() {
+    let src = perm_tool_src(
+        "chanclose_value",
+        r#"local id = maki.fn.jobstart({ "cat" }, { stdin = "pipe" })
+                local closed = maki.fn.chanclose(id, "stdin")
+                maki.fn.jobwait(id, 5000)
+                return "closed=" .. tostring(closed)"#,
+    );
+    let mut perms = maki_lua::PluginPermissions::denied();
+    perms.set(maki_lua::Permission::Run, true);
+    let result =
+        exec_tool_with_perms(perms, &src, "chanclose_value", serde_json::json!({})).unwrap();
+    assert!(result.contains("closed=1"), "got: {result}");
 }
 
 #[test]
@@ -5500,12 +5576,14 @@ fn user_plugin_with_fs_read_can_read_but_not_write() {
     assert!(result.contains("write=false"), "got: {result}");
 }
 
-/// Locating maki's own directories, or a program on `$PATH`, answers where a
-/// file lives and never what the environment holds. `fs_read` is what these
-/// cost, and it is also what they need, so `env` stays the key to the process
-/// environment alone.
+/// These calls locate maki's directories, a program on `$PATH` or the
+/// session's directory, or read the instruction files there. They reveal
+/// file locations or contents rather than the environment, so they need
+/// `fs_read`, and `env` stays reserved for the process environment.
 #[test_case::test_case("maki.env.state_dir()" ; "state_dir")]
 #[test_case::test_case(r#"maki.fn.executable("ls")"# ; "executable")]
+#[test_case::test_case("ctx:cwd()" ; "session_dir")]
+#[test_case::test_case("ctx:instructions()" ; "session_instructions")]
 fn location_queries_cost_fs_read(call: &str) {
     const TOOL: &str = "location_test";
     let src = perm_tool_src(

@@ -153,6 +153,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/completion"),
     },
     BundledPlugin {
+        name: "claude_code",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/claude_code"),
+    },
+    BundledPlugin {
         name: "view_image",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/view_image"),
     },
@@ -564,7 +568,8 @@ impl PluginHost {
     }
 
     /// Option specs declared by loaded plugins via `maki.api.register_options`,
-    /// keyed by plugin name. Used by docgen.
+    /// keyed by plugin name. Docgen documents them, and the claude-code
+    /// provider is on while its plugin is in the result.
     pub fn plugin_options(&self) -> Result<PluginOptionSpecs, PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.inner

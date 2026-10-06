@@ -21,6 +21,7 @@ use crate::runtime::LUA_MEMORY_LIMIT;
 // Luau allows strings and buffers up to 1 GiB, but the VM budget is the binding
 // limit: a read the VM cannot hold dies with a Lua memory error instead.
 const MAX_READ_BYTES: u64 = LUA_MEMORY_LIMIT as u64;
+const NON_UTF8_CONTENT_ERR: &str = "non-utf8 content; use read_bytes";
 
 pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     maki_storage::paths::expand_tilde(Path::new(path))
@@ -120,8 +121,7 @@ async fn read_file(path: PathBuf, max_bytes: u64) -> IoResult<Vec<u8>> {
 }
 
 /// Read the entire file at {path} as a UTF-8 string.
-/// Files larger than 512 MiB return nil plus an error message.
-/// If the file contains bytes that are not valid UTF-8, this function throws.
+/// Files over 512 MiB or invalid UTF-8 return nil and an error message.
 /// Use `read_bytes` for binary files.
 ///
 /// @param path string Absolute or relative file path. `~/` is expanded to the home directory.
@@ -136,10 +136,9 @@ async fn read_file(path: PathBuf, max_bytes: u64) -> IoResult<Vec<u8>> {
 async fn read(_lua: Lua, path: String) -> LuaResult<Pair<String>> {
     let abs = make_absolute(&path)?;
     let bytes = try_pair!(read_file(abs, MAX_READ_BYTES).await);
-    match String::from_utf8(bytes) {
-        Ok(s) => Ok((Some(s), None)),
-        Err(_) => Err(mlua::Error::runtime("non-utf8 content; use read_bytes")),
-    }
+    Ok(pair(
+        String::from_utf8(bytes).map_err(|_| NON_UTF8_CONTENT_ERR),
+    ))
 }
 
 /// Read the entire file at {path} as raw bytes, returned as a Luau buffer.
@@ -1122,7 +1121,6 @@ mod tests {
     const FS_WRITE_PERMISSION: &str = "fs_write";
     #[cfg(unix)]
     const READ_LIMIT_ERROR: &str = "file exceeds the 536870912-byte read limit";
-    const NON_UTF8_ERROR: &str = "non-utf8 content; use read_bytes";
     const TEST_READ_LIMIT: u64 = 4;
     const TEST_PLUGIN: &str = "test";
 
@@ -1218,7 +1216,7 @@ mod tests {
     }
 
     #[test]
-    fn read_non_utf8_still_throws() {
+    fn read_non_utf8_returns_err() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("binary");
         std::fs::write(&path, b"\xff").unwrap();
@@ -1227,8 +1225,10 @@ mod tests {
         let tbl =
             create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
         let f: mlua::Function = tbl.get("read").unwrap();
-        let err = smol::block_on(f.call_async::<Value>(path.to_str().unwrap())).unwrap_err();
-        assert!(err.to_string().contains(NON_UTF8_ERROR));
+        let (text, err): (Option<String>, Option<String>) =
+            smol::block_on(f.call_async(path.to_str().unwrap())).unwrap();
+        assert_eq!(text, None);
+        assert_eq!(err.as_deref(), Some(NON_UTF8_CONTENT_ERR));
     }
 
     #[test]

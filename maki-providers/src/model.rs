@@ -369,11 +369,17 @@ fn is_snapshot_suffix(suffix: &str) -> bool {
 /// their base row, which also means `glm-5` answers for `glm-5.4`, a model it
 /// has never been checked against.
 fn names_exactly(entry: &ModelEntry, model_id: &str) -> bool {
-    entry.prefixes.iter().any(|prefix| {
-        model_id
-            .strip_prefix(prefix)
-            .is_some_and(|rest| rest.is_empty() || is_snapshot_suffix(rest))
-    })
+    entry
+        .prefixes
+        .iter()
+        .any(|prefix| is_same_model(model_id, prefix))
+}
+
+/// Returns true if {model_id} is {name} or a dated snapshot of it.
+pub(crate) fn is_same_model(model_id: &str, name: &str) -> bool {
+    model_id
+        .strip_prefix(name)
+        .is_some_and(|rest| rest.is_empty() || is_snapshot_suffix(rest))
 }
 
 /// Everything that can describe one model, ranked by how sure it is to be about
@@ -399,7 +405,7 @@ impl<'a> ModelSources<'a> {
             entry,
             exact,
             catalog: (!exact)
-                .then(|| catalog::model_meta_if_available(spec.slug, model_id))
+                .then(|| catalog::model_meta_if_available(spec.models_slug(), model_id))
                 .flatten(),
         }
     }

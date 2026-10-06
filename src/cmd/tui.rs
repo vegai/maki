@@ -107,14 +107,13 @@ fn load_config(
             .allowed_tools
             .iter()
             .map(|t| normalize_tool_name(t))
-            .collect::<Result<Vec<_>>>()?;
+            .collect();
     }
     if !cli.disallowed_tools.is_empty() {
-        config.agent.disabled_tools.extend(
-            cli.disallowed_tools
-                .iter()
-                .filter_map(|t| normalize_tool_name(t).ok()),
-        );
+        config
+            .agent
+            .disabled_tools
+            .extend(cli.disallowed_tools.iter().map(|t| normalize_tool_name(t)));
     }
     config.validate()?;
     Ok(config)

@@ -1,17 +1,16 @@
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use maki_lua_macro::{lua_fn, lua_table};
-use maki_providers::strip_provider_keys;
+use maki_providers::{process, strip_provider_keys};
 use maki_storage::id::MakiId;
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 use shell_words::join as shell_join;
@@ -37,12 +36,33 @@ const JOB_NOT_FOUND_ERR: &str = "job: not found";
 const BLANK_NAME_ERR: &str = "jobstart: name must be non-blank";
 const EMPTY_ARGV_ERR: &str = "jobstart: argv table must not be empty";
 const CMD_TYPE_ERR: &str = "jobstart: cmd must be a shell string or an argv table";
+const STDIN_MODE_ERR: &str = "jobstart: stdin must be \"pipe\" or \"null\"";
+const STDIN_PIPE: &str = "pipe";
+const STDIN_NULL: &str = "null";
+const NO_STDIN_ERR: &str = "job: stdin is not an open pipe";
+const CHANCLOSE_STREAM_ERR: &str = "chanclose: you can close only \"stdin\"";
+const CHANSEND_DATA_ERR: &str = "chansend: data must be a string or a list";
+const STDIN_STREAM: &str = "stdin";
+const STDOUT_STREAM: &str = "stdout";
+const STDERR_STREAM: &str = "stderr";
+const EXIT_EVENT: &str = "exit";
 
 #[derive(Clone)]
 pub(crate) enum JobEvent {
     Stdout(String),
     Stderr(String),
     Exit(i32),
+}
+
+impl JobEvent {
+    /// The third argument Neovim passes a job callback.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Stdout(_) => STDOUT_STREAM,
+            Self::Stderr(_) => STDERR_STREAM,
+            Self::Exit(_) => EXIT_EVENT,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -122,6 +142,14 @@ pub(crate) struct JobSpec {
     pub name: Option<String>,
     pub cwd: Option<String>,
     pub env: Option<HashMap<String, String>>,
+    /// `env` becomes the whole environment, with nothing inherited from maki,
+    /// so a variable the child must not see cannot leak in.
+    pub clear_env: bool,
+    /// Give the job a stdin pipe for `chansend` instead of /dev/null.
+    pub pipe_stdin: bool,
+    /// Kill remaining group members before the exit callback so descendants cannot outlive
+    /// the job.
+    pub kill_group_on_exit: bool,
     pub stdout: Redirect,
     pub stderr: Redirect,
     pub on_stdout: Option<RegistryKey>,
@@ -137,6 +165,9 @@ impl JobSpec {
             name: None,
             cwd: None,
             env: None,
+            clear_env: false,
+            pipe_stdin: false,
+            kill_group_on_exit: false,
             stdout: Redirect::Capture,
             stderr: Redirect::Capture,
             on_stdout: None,
@@ -157,6 +188,9 @@ struct JobMeta {
     on_stdout: Option<RegistryKey>,
     on_stderr: Option<RegistryKey>,
     on_exit: Option<RegistryKey>,
+    /// Feeds the writer thread that owns the child's stdin. Dropping it closes
+    /// stdin, which is what `chanclose` and removing the job do.
+    stdin: Option<flume::Sender<Vec<u8>>>,
     event_rx: Option<flume::Receiver<JobEvent>>,
     stdout_tail: VecDeque<String>,
     stderr_tail: VecDeque<String>,
@@ -166,9 +200,9 @@ struct JobMeta {
     /// nothing ever reaches the tail there and an empty tail is no evidence
     /// the job stayed quiet.
     dropped_output: bool,
-    /// Set by the wait thread the moment the child is reaped, which is well
-    /// before `exit_code`. Read by [`kill_job`].
-    reaped: Arc<AtomicBool>,
+    /// The wait thread sets this under the signal lock before it updates `exit_code`. See
+    /// [`reap`].
+    reap_state: Arc<Mutex<ReapState>>,
     exit_code: Option<i32>,
     /// Recorded at exit so elapsed time stops counting once the process is gone.
     elapsed_secs: Option<u64>,
@@ -274,6 +308,9 @@ impl JobStore {
             name,
             cwd,
             env,
+            clear_env,
+            pipe_stdin,
+            kill_group_on_exit,
             stdout,
             stderr,
             on_stdout,
@@ -281,10 +318,18 @@ impl JobStore {
             on_exit,
         } = spec;
         let mut command = cmd.build();
-        strip_provider_keys(&mut command)
+        // `clear_env` already keeps every key out.
+        if !clear_env {
+            strip_provider_keys(&mut command);
+        }
+        command
             .stdout(stdout.stdio()?)
             .stderr(stderr.stdio()?)
-            .stdin(Stdio::null());
+            .stdin(if pipe_stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            });
 
         #[cfg(unix)]
         {
@@ -304,6 +349,9 @@ impl JobStore {
             }
             command.current_dir(dir);
         }
+        if clear_env {
+            command.env_clear();
+        }
         if let Some(ref env_map) = env {
             for (k, v) in env_map {
                 command.env(k, v);
@@ -312,6 +360,9 @@ impl JobStore {
 
         let mut child = command.spawn().map_err(|e| e.to_string())?;
         let pid = child.id();
+        let (stdin_pipe, stdout_pipe, stderr_pipe) =
+            (child.stdin.take(), child.stdout.take(), child.stderr.take());
+        let mut unwatched = Unwatched(Some(child));
         let id = self.next_id;
         self.next_id += 1;
 
@@ -326,10 +377,10 @@ impl JobStore {
                             .name($name.into())
                             .spawn(move || {
                                 for line in BufReader::with_capacity(READER_BUF_SIZE, stream)
-                                    .lines()
+                                    .split(b'\n')
                                     .map_while(Result::ok)
                                 {
-                                    if tx.send(JobEvent::$variant(line)).is_err() {
+                                    if tx.send(JobEvent::$variant(text_line(line))).is_err() {
                                         break;
                                     }
                                 }
@@ -341,14 +392,24 @@ impl JobStore {
                 }
             };
         }
-        let stdout_handle = spawn_reader!(child.stdout.take(), "job-stdout", Stdout);
-        let stderr_handle = spawn_reader!(child.stderr.take(), "job-stderr", Stderr);
+        let stdin = stdin_pipe.map(spawn_stdin_writer).transpose()?;
+        let stdout_handle = spawn_reader!(stdout_pipe, "job-stdout", Stdout);
+        let stderr_handle = spawn_reader!(stderr_pipe, "job-stderr", Stderr);
 
-        let reaped = Arc::new(AtomicBool::new(false));
-        let wait_reaped = Arc::clone(&reaped);
+        let reap_state = Arc::new(Mutex::new(ReapState::default()));
+        let wait_reaped = Arc::clone(&reap_state);
+        let (child_tx, child_rx) = flume::bounded::<Child>(1);
         thread::Builder::new()
             .name("job-wait".into())
             .spawn(move || {
+                // The child arrives only after this thread starts, so after a
+                // spawn error `unwatched` stops it.
+                let Ok(child) = child_rx.recv() else {
+                    return;
+                };
+                if kill_group_on_exit {
+                    kill_group_once_leader_exits(pid);
+                }
                 // Reaping frees the pid, and that pid is the process group
                 // `kill_job` signals. The readers only return once every
                 // descendant dropped the pipes, so joining them first keeps a
@@ -359,11 +420,12 @@ impl JobStore {
                 if let Some(h) = stderr_handle {
                     let _ = h.join();
                 }
-                let code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
-                wait_reaped.store(true, Ordering::Relaxed);
-                let _ = event_tx.send(JobEvent::Exit(code));
+                let _ = event_tx.send(JobEvent::Exit(reap(child, &wait_reaped)));
             })
             .map_err(|e| e.to_string())?;
+        if let Some(child) = unwatched.0.take() {
+            let _ = child_tx.send(child);
+        }
 
         self.jobs.insert(
             id,
@@ -376,6 +438,7 @@ impl JobStore {
                 on_stdout,
                 on_stderr,
                 on_exit,
+                stdin,
                 event_rx: Some(event_rx),
                 stdout_tail: VecDeque::new(),
                 stderr_tail: VecDeque::new(),
@@ -384,7 +447,7 @@ impl JobStore {
                     (&stdout, &stderr),
                     (Redirect::Capture, Redirect::Capture)
                 ),
-                reaped,
+                reap_state,
                 exit_code: None,
                 elapsed_secs: None,
                 replay_exit: None,
@@ -499,6 +562,9 @@ impl JobStore {
         }
         job.exit_code = Some(code);
         job.elapsed_secs = Some(job.started.elapsed().as_secs());
+        // A session job's record outlives the process, and the writer thread
+        // waits on this sender until it drops.
+        job.stdin = None;
         let session_plugin = job.session_plugin().cloned();
         drop_callbacks(lua, job);
         match session_plugin {
@@ -641,6 +707,41 @@ impl JobStore {
         }
     }
 
+    pub fn send(
+        &self,
+        job_id: u32,
+        task_id: Option<u64>,
+        plugin: &str,
+        data: Vec<u8>,
+    ) -> Result<usize, &'static str> {
+        let job = self
+            .jobs
+            .get(&job_id)
+            .filter(|job| job.can_access(task_id, plugin))
+            .ok_or(JOB_NOT_FOUND_ERR)?;
+        let len = data.len();
+        job.stdin
+            .as_ref()
+            .ok_or(NO_STDIN_ERR)?
+            .send(data)
+            .map_err(|_| NO_STDIN_ERR)?;
+        Ok(len)
+    }
+
+    pub fn close_stdin(
+        &mut self,
+        job_id: u32,
+        task_id: Option<u64>,
+        plugin: &str,
+    ) -> Result<(), &'static str> {
+        let job = self
+            .jobs
+            .get_mut(&job_id)
+            .filter(|job| job.can_access(task_id, plugin))
+            .ok_or(JOB_NOT_FOUND_ERR)?;
+        job.stdin.take().map(drop).ok_or(NO_STDIN_ERR)
+    }
+
     pub fn kill_owner(&mut self, lua: &Lua, owner: &JobOwner) -> Vec<u32> {
         let ids = self
             .jobs
@@ -772,6 +873,24 @@ fn drop_callbacks(lua: &Lua, job: &mut JobMeta) {
     }
 }
 
+/// Writing to a pipe the child does not read blocks, so writes happen on
+/// their own thread instead of the Lua thread. The thread ends, closing
+/// stdin, when every sender drops or the child stops reading.
+fn spawn_stdin_writer(mut stdin: ChildStdin) -> Result<flume::Sender<Vec<u8>>, String> {
+    let (tx, rx) = flume::unbounded::<Vec<u8>>();
+    thread::Builder::new()
+        .name("job-stdin".into())
+        .spawn(move || {
+            for chunk in rx {
+                if stdin.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(tx)
+}
+
 fn shell_command(cmd: &str) -> Command {
     #[cfg(unix)]
     {
@@ -787,57 +906,119 @@ fn shell_command(cmd: &str) -> Command {
     }
 }
 
-/// Signalling a reaped pid would hit whoever the kernel handed it to next, so
-/// skip the jobs the wait thread already reaped. Until then the child is a
-/// zombie, and a zombie group leader keeps its pid and pgid off the free list,
-/// so the group is still the right target. The flag carries no data of its
-/// own, hence `Relaxed`.
-fn kill_job(job: &JobMeta) {
-    if job.reaped.load(Ordering::Relaxed) {
-        return;
-    }
-    #[cfg(unix)]
-    {
-        use rustix::process::{Pid, Signal, kill_process_group};
-        if let Ok(raw) = i32::try_from(job.pid)
-            && let Some(pid) = Pid::from_raw(raw)
-        {
-            let _ = kill_process_group(pid, Signal::KILL);
-        }
-    }
-    #[cfg(windows)]
-    {
-        let _ = Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &job.pid.to_string()])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+/// Shared by the wait thread and every kill, under one lock that a kill holds
+/// from its state check to its signal.
+#[derive(Default)]
+struct ReapState {
+    reaped: bool,
+}
+
+impl ReapState {
+    /// A panic elsewhere must not block a reap or a kill.
+    fn lock(state: &Mutex<Self>) -> MutexGuard<'_, Self> {
+        state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
-/// Run a command in the background. A string runs through `bash -c` on Unix
-/// or `cmd /C` on Windows; a table is spawned as argv, with no shell in
-/// between (nothing in it can be read as a redirect, a pipe, or `$(...)`).
-/// You get back a job id that you can pass to `jobstop` or `jobwait` to
-/// control the process.
+/// Waits for {child} to exit, then reaps it under the {state} lock, so no
+/// kill can hit a freed pid. The wait itself is outside the lock, so a kill
+/// never waits on the child. Until the reap no other process can get the
+/// pid: the zombie keeps it on Unix, the open process handle on Windows.
+fn reap(mut child: Child, state: &Mutex<ReapState>) -> i32 {
+    let lock = || ReapState::lock(state);
+    #[cfg(unix)]
+    let status = if process::wait_without_reaping(child.id()) {
+        let mut state = lock();
+        let status = child.wait();
+        state.reaped = true;
+        status
+    } else {
+        // With no exit to wait for, the reap waits by itself, outside the
+        // lock every kill uses. The kills stop first.
+        tracing::warn!(
+            pid = child.id(),
+            "maki cannot wait for the job without reaping it, so a stop cannot kill it"
+        );
+        lock().reaped = true;
+        child.wait()
+    };
+    #[cfg(not(unix))]
+    let status = child.wait();
+    #[cfg(not(unix))]
+    {
+        lock().reaped = true;
+    }
+    drop(child);
+    status.map_or(-1, |status| status.code().unwrap_or(-1))
+}
+
+/// A descendant that closed its output keeps no reader open, so it can
+/// outlive the leader unseen. Only this thread reaps the leader, and has not
+/// yet, so the group is still the right target.
+#[cfg(unix)]
+fn kill_group_once_leader_exits(pid: u32) {
+    if process::wait_without_reaping(pid) {
+        process::kill_group(pid);
+    }
+}
+
+/// Windows jobs have no process group to kill this way, so a job there stops
+/// only with its own process.
+#[cfg(not(unix))]
+fn kill_group_once_leader_exits(_pid: u32) {}
+
+/// Without a wait thread, this guard must kill the group and reap the child. The unreaped pid
+/// still identifies the group.
+struct Unwatched(Option<Child>);
+
+impl Drop for Unwatched {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            process::kill_group(child.id());
+            let _ = child.wait();
+        }
+    }
+}
+
+/// A reaped pid can identify another process. Hold the lock until the signal completes so
+/// [`reap`] cannot release the pid first.
+fn kill_job(job: &JobMeta) {
+    let state = ReapState::lock(&job.reap_state);
+    if !state.reaped {
+        process::kill_group(job.pid);
+    }
+}
+
+/// Run a command in the background. A string uses `bash -c` on Unix or
+/// `cmd /C` on Windows. An argv table starts the process directly without
+/// shell interpretation. Use the returned job id with `jobstop` or `jobwait`.
 ///
-/// `stdout` and `stderr` route a stream to a file instead of into maki. A
-/// path is opened for append and handed to the child, so nothing is buffered
-/// here: no callback, no tail, no events for that stream, and it counts as
-/// truncated everywhere a tail is reported. That makes the two mutually
-/// exclusive with `on_stdout` / `on_stderr` for the same stream, and a path
-/// additionally needs the `fs_write` permission. To both persist and react,
-/// run one job writing the file and a second one tailing it.
+/// `stdout` and `stderr` can append directly to files. Redirected streams
+/// have no callbacks, tails or events and count as truncated in job reports.
+/// A redirect conflicts with the corresponding output callback and needs
+/// `fs_write`. Use separate writer and reader jobs to store and process output.
 ///
 /// @param cmd string|table Shell command, or an argv table like
 ///   `{ "tail", "-F", path }`.
 /// @param opts table? Optional settings:
 ///   `cwd` (string?) working directory (tilde is expanded).
-///   `env` (table?) extra environment variables, `{ VAR = "value" }`.
-///   `on_stdout` (function?) called with `(job_id, line)` for each stdout line.
-///   `on_stderr` (function?) called with `(job_id, line)` for each stderr line.
-///   `on_exit` (function?) called with `(job_id, code)` when the process finishes.
+///   `env` (table?) environment variables, `{ VAR = "value" }`, added to
+///     maki's environment.
+///   `clear_env` (boolean?) use only `env` for the child
+///     environment (default false).
+///   `stdin` (string?) `"pipe"` to write to the job with `chansend`. Defaults
+///     to `"null"`, no input. Neovim defaults to `"pipe"`, but a job that
+///     reads an open pipe with no data hangs.
+///   `kill_group_on_exit` (boolean?) after the process exits, kill the
+///     processes that remain in its process group before `on_exit` runs, such
+///     as a background child that closed its output (default false, Unix
+///     only).
+///   `on_stdout` (function?) called with `(job_id, line, "stdout")` for each
+///     stdout line. Bytes that are not UTF-8 become U+FFFD, where Neovim
+///     passes the raw bytes.
+///   `on_stderr` (function?) the same for each stderr line, with `"stderr"`.
+///   `on_exit` (function?) called with `(job_id, code, "exit")` when the
+///     process stops.
 ///   `stdout` (string|false?) append stdout to this path, or `false` to
 ///     discard it.
 ///   `stderr` (string|false?) same for stderr; both may name one path.
@@ -848,7 +1029,7 @@ fn kill_job(job: &JobMeta) {
 ///   `tail` (integer?) trailing lines per stream kept for `jobinfo`
 ///     (default 20, 0 disables, max 1024).
 ///   `name` (string?) handle for `jobfind`, unique among the live jobs this
-///     plugin can see. Starting a second job under a live name is an error.
+///     plugin can see. A second job with the same live name fails.
 /// @return (integer) Job id.
 /// @example
 /// local id = maki.fn.jobstart({ "rg", "--json", pattern, dir }, {
@@ -877,6 +1058,15 @@ fn jobstart(
             .get::<Table>("env")
             .ok()
             .map(|t| t.pairs::<String, String>().filter_map(Result::ok).collect());
+        spec.clear_env = opts.get::<Option<bool>>("clear_env")?.unwrap_or(false);
+        spec.kill_group_on_exit = opts
+            .get::<Option<bool>>("kill_group_on_exit")?
+            .unwrap_or(false);
+        spec.pipe_stdin = match opts.get::<Option<String>>("stdin")?.as_deref() {
+            None | Some(STDIN_NULL) => false,
+            Some(STDIN_PIPE) => true,
+            Some(_) => return Err(mlua::Error::runtime(STDIN_MODE_ERR)),
+        };
         spec.name = job_name(opts)?;
         spec.on_stdout = callback_key(lua, opts, "on_stdout")?;
         spec.on_stderr = callback_key(lua, opts, "on_stderr")?;
@@ -1172,6 +1362,78 @@ fn jobstop(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<()> {
     Ok(())
 }
 
+/// Write {data} to job {id}'s stdin. Start the job with `stdin = "pipe"`.
+/// Unlike `vim.fn.chansend`, an error returns nil and a message instead of 0.
+/// List items use newline separators. A newline inside an item becomes NUL.
+/// The final item has no newline suffix.
+///
+/// Unread data stays in memory. A descendant can retain stdin after the job
+/// exits. Use `kill_group_on_exit` to stop that descendant and release the data.
+///
+/// @param id integer Job id returned by `jobstart`.
+/// @param data string|table Text to write, or a list of lines.
+/// @return (integer?, string?) Bytes in the queue for the job, or nil and an error.
+/// @example
+/// local id = maki.fn.jobstart({ "cat" }, { stdin = "pipe" })
+/// maki.fn.chansend(id, "hello\n")
+/// maki.fn.chanclose(id, "stdin")
+#[lua_fn(guard = Run)]
+fn chansend(lua: &Lua, #[ctx] plugin: Arc<str>, id: u32, data: Value) -> LuaResult<Pair<usize>> {
+    let bytes = chansend_bytes(data)?;
+    let task_id = active_task_id(lua);
+    match with_jobs(lua, |store| store.send(id, task_id, &plugin, bytes)) {
+        Ok(len) => Ok((Some(len), None)),
+        Err(e) => Ok(err_pair(e)),
+    }
+}
+
+/// List items can contain arbitrary bytes, as in Neovim. A newline inside an item becomes NUL.
+fn chansend_bytes(data: Value) -> LuaResult<Vec<u8>> {
+    match data {
+        Value::String(s) => Ok(s.as_bytes().to_vec()),
+        Value::Table(lines) => Ok(lines
+            .sequence_values::<mlua::String>()
+            .map(|line| {
+                line.map(|line| {
+                    line.as_bytes()
+                        .iter()
+                        .map(|&byte| if byte == b'\n' { b'\0' } else { byte })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<LuaResult<Vec<_>>>()?
+            .join(&b'\n')),
+        _ => Err(mlua::Error::runtime(CHANSEND_DATA_ERR)),
+    }
+}
+
+/// Close job {id}'s stdin, so the job reads end of file. Like
+/// `vim.fn.chanclose`, but only for the `"stdin"` stream: without a stream,
+/// Neovim closes every stream, while this closes stdin. The {stream}
+/// argument is kept, so a call written for Neovim works unchanged.
+///
+/// @param id integer Job id returned by `jobstart`.
+/// @param stream string? `"stdin"`, which is also the default.
+/// @return (integer?, string?) `1`, as Neovim returns, or nil and an error.
+/// @example
+/// maki.fn.chanclose(id, "stdin")
+#[lua_fn(guard = Run)]
+fn chanclose(
+    lua: &Lua,
+    #[ctx] plugin: Arc<str>,
+    id: u32,
+    stream: Option<String>,
+) -> LuaResult<Pair<i32>> {
+    if stream.is_some_and(|s| s != STDIN_STREAM) {
+        return Err(mlua::Error::runtime(CHANCLOSE_STREAM_ERR));
+    }
+    let task_id = active_task_id(lua);
+    match with_jobs(lua, |store| store.close_stdin(id, task_id, &plugin)) {
+        Ok(()) => Ok((Some(1), None)),
+        Err(e) => Ok(err_pair(e)),
+    }
+}
+
 /// Drop an exited session-owned job from the store. Running jobs are left
 /// alone; use `jobstop` to kill those. Unknown ids are a no-op.
 ///
@@ -1301,18 +1563,20 @@ pub(crate) async fn deliver_job_event(lua: &Lua, job_id: u32, event: &JobEvent) 
     if let JobEvent::Exit(code) = event {
         with_jobs(lua, |store| store.complete(lua, job_id, *code));
     }
-    if let Some(callback) = callback {
-        let arg = match event {
-            JobEvent::Stdout(line) | JobEvent::Stderr(line) => {
-                Value::String(lua.create_string(line)?)
-            }
-            JobEvent::Exit(code) => Value::Integer(*code as i64),
-        };
-        lua.create_thread(callback)?
-            .into_async::<()>((job_id, arg))?
-            .await?;
+    match callback {
+        Some(callback) => call_back(lua, callback, job_id, event).await,
+        None => Ok(()),
     }
-    Ok(())
+}
+
+async fn call_back(lua: &Lua, callback: Function, job_id: u32, event: &JobEvent) -> LuaResult<()> {
+    let arg = match event {
+        JobEvent::Stdout(line) | JobEvent::Stderr(line) => Value::String(lua.create_string(line)?),
+        JobEvent::Exit(code) => Value::Integer((*code).into()),
+    };
+    lua.create_thread(callback)?
+        .into_async::<()>((job_id, arg, event.name()))?
+        .await
 }
 
 /// Check whether {name} can be found on `$PATH` or is an absolute path
@@ -1334,6 +1598,31 @@ fn executable(_lua: &Lua, name: String) -> LuaResult<i32> {
         .unwrap_or(false)
         || Path::new(&name).is_file();
     Ok(if found { 1 } else { 0 })
+}
+
+/// Resolve {name} to an absolute executable path, or return `""` if no
+/// executable exists, as in Neovim's `vim.fn.exepath`.
+/// Names with a path separator resolve from the working directory. Other
+/// names resolve through `$PATH`, with files this process cannot execute
+/// excluded. Resolve the program before a directory change so a relative
+/// name cannot select a different executable.
+///
+/// @param name string The name of a program (for example `"git"`), or a relative or absolute path.
+/// @return (string) Absolute path, or `""` if not found.
+/// @example
+/// local git = maki.fn.exepath("git")
+/// if git ~= "" then
+///   maki.fn.jobstart({ git, "status" }, { cwd = "/tmp" })
+/// end
+#[lua_fn(guard = FsRead)]
+fn exepath(_lua: &Lua, name: String) -> LuaResult<String> {
+    Ok(find_program_here(&name)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default())
+}
+
+fn find_program_here(name: &str) -> Option<PathBuf> {
+    process::find_program(name, &env::current_dir().ok()?)
 }
 
 /// Read the viewport of the focused chat transcript, like Neovim's
@@ -1407,13 +1696,27 @@ lua_table! {
         jobstart(perms, plugin, fs_write), jobstop(perms, plugin), jobforget(perms, plugin),
         jobwait(perms, plugin), jobinfo(perms, plugin), joblist(perms, plugin),
         jobattach(perms, plugin), jobfind(perms, plugin),
-        executable(perms),
+        chansend(perms, plugin), chanclose(perms, plugin),
+        executable(perms), exepath(perms),
         winsaveview(tx), winrestview(tx),
     ]
 }
 
+/// Returns {bytes} as one line of a job's output, without its line ending.
+/// A byte that is not UTF-8 becomes U+FFFD, so the following lines still
+/// arrive and a reader checking each line sees this one.
+fn text_line(mut bytes: Vec<u8>) -> String {
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::fs;
+
     use super::*;
     use crate::api::util::command::{NO_UI_ERR, WinView};
 
@@ -1424,6 +1727,40 @@ mod tests {
     const EXIT_WITHOUT_REAP: &str =
         "an exit event must mean the child was reaped, or a later kill can signal a recycled pid";
     const NEVER_EXITED: &str = "job never reported its exit";
+    #[cfg(target_os = "linux")]
+    const ZOMBIE: char = 'Z';
+    /// Exits only after the test writes `@GO@`, so it can neither exit nor be
+    /// reaped before the test holds the lock.
+    #[cfg(target_os = "linux")]
+    const EXITS_ONCE_TOLD: &str = "until [ -e '@GO@' ]; do sleep 0.01; done";
+    #[cfg(target_os = "linux")]
+    const GO_MARKER: &str = "go";
+    /// The shell exits at once, leaving a reader on its stdin that sees end of
+    /// file only after the writer thread releases the pipe. The script keeps
+    /// stdin itself, because a background job gets /dev/null.
+    #[cfg(unix)]
+    const STDIN_HOLDER: &str = "{ cat >/dev/null; touch '@EOF@'; } <&0 >/dev/null 2>&1 &";
+    #[cfg(unix)]
+    const EOF_MARKER: &str = "eof";
+    #[cfg(unix)]
+    const BAD_BYTE_BETWEEN_LINES: &str = r"printf 'first\n\377\nlast\r\n'";
+    #[cfg(unix)]
+    const PIPED_LINE: &str = "hello";
+    #[cfg(unix)]
+    const KEPT_VARIABLE: (&str, &str) = ("MAKI_JOB_ENV", "kept");
+    #[cfg(unix)]
+    const NEVER_ENDS: &str = "sleep 30";
+    #[cfg(unix)]
+    const ECHOES_STDIN: &str = "cat";
+    const FIRST_LINE: &[u8] = b"first";
+    const NOT_UTF8_LINE: &[u8] = b"latin\xe9";
+    const LINE_WITH_NEWLINE: &[u8] = b"two\nparts";
+    const LINE_WITH_NUL: &[u8] = b"two\0parts";
+    #[cfg(unix)]
+    const PRINTS_ENV: &str = "env";
+    /// Keeps a `sleep` that closed all its output, and prints its pid.
+    #[cfg(target_os = "linux")]
+    const LEFT_ITS_OUTPUT: &str = "sleep 30 >/dev/null 2>&1 </dev/null & echo $!";
 
     /// Pull events until {id} reports its exit, so assertions run against a
     /// job that is certainly done.
@@ -1445,6 +1782,36 @@ mod tests {
             }
             assert!(Instant::now() < deadline, "{NEVER_EXITED}");
             thread::sleep(JOB_POLL_INTERVAL);
+        }
+    }
+
+    /// List items can contain arbitrary bytes, as in Neovim. A newline inside an item becomes NUL.
+    #[test]
+    fn chansend_sends_a_list_as_bytes() {
+        let lua = Lua::new();
+        let lines = lua
+            .create_sequence_from([
+                lua.create_string(FIRST_LINE).unwrap(),
+                lua.create_string(NOT_UTF8_LINE).unwrap(),
+                lua.create_string(LINE_WITH_NEWLINE).unwrap(),
+            ])
+            .unwrap();
+        let expected = [
+            FIRST_LINE,
+            b"\n".as_slice(),
+            NOT_UTF8_LINE,
+            b"\n".as_slice(),
+            LINE_WITH_NUL,
+        ]
+        .concat();
+        assert_eq!(chansend_bytes(Value::Table(lines)).unwrap(), expected);
+    }
+
+    /// What `deliver_job_event` does with {event}, minus the callback.
+    fn deliver(store: &mut JobStore, lua: &Lua, id: u32, event: &JobEvent) {
+        store.record_event(id, event);
+        if let JobEvent::Exit(code) = event {
+            store.complete(lua, id, *code);
         }
     }
 
@@ -1481,12 +1848,13 @@ mod tests {
             on_stdout,
             on_stderr: None,
             on_exit,
+            stdin: None,
             event_rx: None,
             stdout_tail: VecDeque::new(),
             stderr_tail: VecDeque::new(),
             tail_cap: DEFAULT_TAIL,
             dropped_output: false,
-            reaped: Arc::new(AtomicBool::new(false)),
+            reap_state: Arc::new(Mutex::new(ReapState::default())),
             exit_code: None,
             elapsed_secs: None,
             replay_exit: None,
@@ -1682,6 +2050,25 @@ mod tests {
             }
         }
         assert!(got_exit, "should receive exit event for completed job");
+    }
+
+    /// A line that is not UTF-8 arrives as text with U+FFFD for its bad
+    /// bytes, and the lines after it still arrive.
+    #[cfg(unix)]
+    #[test]
+    fn a_line_that_is_not_utf8_arrives_and_so_do_the_rest() {
+        let mut store = make_store();
+        let id = store
+            .start(JobSpec::new(plugin_owner(), BAD_BYTE_BETWEEN_LINES))
+            .unwrap();
+        let lines: Vec<String> = collect_until_exit(id, || store.next_plugin_event())
+            .into_iter()
+            .filter_map(|(_, event)| match event {
+                JobEvent::Stdout(line) => Some(line),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines, ["first", "\u{FFFD}", "last"]);
     }
 
     #[test]
@@ -1923,9 +2310,8 @@ mod tests {
         assert!(store.jobs.contains_key(&id), "detach must keep the job");
 
         for (_, event) in collect_until_exit(id, || store.next_plugin_event()) {
-            store.record_event(id, &event);
+            deliver(&mut store, &lua, id, &event);
         }
-        store.complete(&lua, id, 3);
 
         let snap = store
             .snapshot(id, None, TEST_PLUGIN)
@@ -1976,7 +2362,7 @@ mod tests {
             .expect("clock has enough history");
         store.jobs.insert(1, job);
 
-        store.complete(&lua, 1, 0);
+        deliver(&mut store, &lua, 1, &JobEvent::Exit(0));
         let at_exit = store.snapshot(1, None, TEST_PLUGIN).unwrap().elapsed_secs;
         assert!(
             at_exit >= PAST_SECS,
@@ -2023,7 +2409,7 @@ mod tests {
         store
             .jobs
             .insert(1, stub_job(session_owner(MakiId::generate()), None, None));
-        store.complete(lua, 1, code);
+        deliver(store, lua, 1, &JobEvent::Exit(code));
     }
 
     #[test]
@@ -2034,6 +2420,223 @@ mod tests {
             shell_words::split(&row).unwrap(),
             ARGV,
             "the row a user reads must quote what the shell would have eaten"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn piped_stdin_reaches_the_job_until_it_is_closed() {
+        let line = PIPED_LINE;
+        let mut store = make_store();
+        let id = store
+            .start(JobSpec {
+                pipe_stdin: true,
+                ..JobSpec::new(task_owner(1), JobCommand::Argv(vec![ECHOES_STDIN.into()]))
+            })
+            .unwrap();
+        let data = format!("{line}\n").into_bytes();
+        let len = data.len();
+        assert_eq!(store.send(id, Some(1), TEST_PLUGIN, data), Ok(len));
+        store.close_stdin(id, Some(1), TEST_PLUGIN).unwrap();
+
+        let events = collect_until_exit(id, || store.next_event(&task_owner(1)));
+        let out: Vec<&str> = events
+            .iter()
+            .filter_map(|(_, event)| match event {
+                JobEvent::Stdout(l) => Some(l.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(out, [line]);
+        assert!(
+            events.iter().any(|(_, e)| matches!(e, JobEvent::Exit(0))),
+            "after the close of stdin, cat must exit"
+        );
+    }
+
+    /// The exited job's record stays for `joblist`, so `complete` must drop
+    /// the sender too, or the writer thread waits on it forever.
+    #[cfg(unix)]
+    #[test]
+    fn a_completed_session_job_lets_its_stdin_writer_go() {
+        let lua = Lua::new();
+        let dir = tempfile::tempdir().unwrap();
+        let eof = dir.path().join(EOF_MARKER);
+        let owner = session_owner(MakiId::generate());
+        let mut store = make_store();
+        let id = store
+            .start(JobSpec {
+                pipe_stdin: true,
+                ..JobSpec::new(
+                    owner.clone(),
+                    STDIN_HOLDER
+                        .replace("@EOF@", &eof.to_string_lossy())
+                        .as_str(),
+                )
+            })
+            .unwrap();
+        for (_, event) in collect_until_exit(id, || store.next_event(&owner)) {
+            deliver(&mut store, &lua, id, &event);
+        }
+        assert!(store.jobs[&id].exit_code.is_some());
+        let deadline = Instant::now() + JOB_EXIT_TIMEOUT;
+        while !eof.exists() && Instant::now() < deadline {
+            thread::sleep(JOB_POLL_INTERVAL);
+        }
+        assert!(
+            eof.exists(),
+            "the writer thread keeps stdin open after the job completed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test_case::test_case(false ; "without_a_pipe")]
+    #[test_case::test_case(true ; "after_closing_it")]
+    fn writing_to_a_closed_or_missing_stdin_is_an_error(pipe_stdin: bool) {
+        let mut store = make_store();
+        let id = store
+            .start(JobSpec {
+                pipe_stdin,
+                ..JobSpec::new(task_owner(1), NEVER_ENDS)
+            })
+            .unwrap();
+        if pipe_stdin {
+            store.close_stdin(id, Some(1), TEST_PLUGIN).unwrap();
+        }
+        assert_eq!(
+            store.send(id, Some(1), TEST_PLUGIN, b"x".to_vec()),
+            Err(NO_STDIN_ERR)
+        );
+        assert_eq!(
+            store.close_stdin(id, Some(1), TEST_PLUGIN),
+            Err(NO_STDIN_ERR)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clear_env_leaves_only_the_given_variables() {
+        let (var, value) = KEPT_VARIABLE;
+        let path = env::var("PATH").unwrap();
+        let mut store = make_store();
+        let id = store
+            .start(JobSpec {
+                env: Some(HashMap::from([
+                    ("PATH".to_string(), path.clone()),
+                    (var.to_string(), value.to_string()),
+                ])),
+                clear_env: true,
+                ..JobSpec::new(task_owner(1), JobCommand::Argv(vec![PRINTS_ENV.into()]))
+            })
+            .unwrap();
+
+        let mut lines: Vec<String> = collect_until_exit(id, || store.next_event(&task_owner(1)))
+            .into_iter()
+            .filter_map(|(_, event)| match event {
+                JobEvent::Stdout(line) => Some(line),
+                _ => None,
+            })
+            .collect();
+        lines.sort();
+        assert_eq!(lines, [format!("{var}={value}"), format!("PATH={path}")]);
+    }
+
+    /// A kill holds the lock from its state check to its signal. Meanwhile the
+    /// exited child must stay an unreaped zombie, so no other process can get
+    /// its pid and its exit is not reported yet.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_kill_in_progress_keeps_the_child_unreaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let go = dir.path().join(GO_MARKER);
+        let mut store = make_store();
+        let id = store
+            .start(JobSpec::new(
+                task_owner(1),
+                EXITS_ONCE_TOLD
+                    .replace("@GO@", &go.to_string_lossy())
+                    .as_str(),
+            ))
+            .unwrap();
+        let (pid, reaped) = (store.jobs[&id].pid, Arc::clone(&store.jobs[&id].reap_state));
+        let kill_in_progress = reaped.lock().unwrap();
+        fs::write(&go, "").unwrap();
+        let zombie = || {
+            fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(')')
+                    .is_some_and(|(_, rest)| rest.trim_start().starts_with(ZOMBIE))
+            })
+        };
+        let deadline = Instant::now() + JOB_EXIT_TIMEOUT;
+        while !zombie() && Instant::now() < deadline {
+            thread::sleep(JOB_POLL_INTERVAL);
+        }
+        assert!(
+            zombie(),
+            "the child did not become a zombie that is not reaped"
+        );
+        assert!(
+            store.next_event(&task_owner(1)).is_none(),
+            "maki gave an exit while a kill held the lock"
+        );
+        drop(kill_in_progress);
+        collect_until_exit(id, || store.next_event(&task_owner(1)));
+    }
+
+    /// A job whose setup fails after it started has no wait thread, so only
+    /// the guard stops and reaps it. Otherwise a zombie would hold its pid
+    /// until maki exits.
+    #[cfg(unix)]
+    #[test]
+    fn an_unwatched_job_is_killed_and_reaped() {
+        use std::os::unix::process::CommandExt;
+
+        let child = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
+        drop(Unwatched(Some(child)));
+        assert_eq!(
+            rustix::process::test_kill_process(pid),
+            Err(rustix::io::Errno::SRCH)
+        );
+    }
+
+    /// The `sleep` holds none of the job's pipes, so without the group kill
+    /// nothing waits for it or stops it after the shell exits.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_child_that_left_its_output_dies_with_the_leader() {
+        let mut store = make_store();
+        let id = store
+            .start(JobSpec {
+                kill_group_on_exit: true,
+                ..JobSpec::new(
+                    task_owner(1),
+                    JobCommand::Argv(vec!["sh".into(), "-c".into(), LEFT_ITS_OUTPUT.into()]),
+                )
+            })
+            .unwrap();
+        let child: u32 = collect_until_exit(id, || store.next_event(&task_owner(1)))
+            .into_iter()
+            .find_map(|(_, event)| match event {
+                JobEvent::Stdout(line) => line.trim().parse().ok(),
+                _ => None,
+            })
+            .expect("the shell printed the child's pid");
+        // A killed child stays a zombie until its new parent reaps it, and a
+        // zombie has an empty cmdline.
+        let running =
+            || fs::read(format!("/proc/{child}/cmdline")).is_ok_and(|cmdline| !cmdline.is_empty());
+        let deadline = Instant::now() + JOB_EXIT_TIMEOUT;
+        while running() && Instant::now() < deadline {
+            thread::sleep(JOB_POLL_INTERVAL);
+        }
+        assert!(
+            !running(),
+            "the child in the background continued after its job"
         );
     }
 
@@ -2085,7 +2688,7 @@ mod tests {
         assert_eq!(store.find_named(NAME, None, "other-plugin"), None);
         assert_eq!(store.find_named("absent", None, TEST_PLUGIN), None);
 
-        store.complete(&lua, 1, 0);
+        deliver(&mut store, &lua, 1, &JobEvent::Exit(0));
 
         assert_eq!(
             store.find_named(NAME, None, TEST_PLUGIN),
@@ -2125,7 +2728,7 @@ mod tests {
         // Rewind the start so a second round of bookkeeping would show up in
         // the elapsed time instead of hiding in the same second.
         store.jobs.get_mut(&1).unwrap().started = Instant::now() - REWIND;
-        store.complete(&lua, 1, CODE);
+        deliver(&mut store, &lua, 1, &JobEvent::Exit(CODE));
         assert_eq!(
             store.jobs[&1].elapsed_secs, at_exit,
             "a replayed exit must not restate when the job died"
@@ -2227,7 +2830,7 @@ mod tests {
                 plugin: Arc::from(plugin),
             };
             store.jobs.insert(id, stub_job(owner, None, None));
-            store.complete(&lua, id, 0);
+            deliver(store, &lua, id, &JobEvent::Exit(0));
         };
 
         exit_job(&mut store, QUIET_JOB, QUIET_PLUGIN);
@@ -2296,7 +2899,7 @@ mod tests {
             "running job must stay"
         );
 
-        store.complete(&lua, 1, 0);
+        deliver(&mut store, &lua, 1, &JobEvent::Exit(0));
         assert!(
             store
                 .list(Some(session), None, TEST_PLUGIN)
@@ -2328,10 +2931,10 @@ mod tests {
             store.record_event(id, &event);
         }
         assert!(
-            store.jobs[&id].reaped.load(Ordering::Relaxed),
+            store.jobs[&id].reap_state.lock().unwrap().reaped,
             "{EXIT_WITHOUT_REAP}"
         );
-        store.complete(&lua, id, 0);
+        deliver(&mut store, &lua, id, &JobEvent::Exit(0));
         store.kill(id, None, TEST_PLUGIN);
         let snap = store
             .snapshot(id, None, TEST_PLUGIN)
