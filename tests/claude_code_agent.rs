@@ -46,6 +46,17 @@ const PLUGIN_OFF: &str = "enable the claude_code plugin in init.lua";
 const OWNER_ONLY: u32 = 0o700;
 const CLAUDE_CONFIG_ENV: &str = "CLAUDE_CONFIG_DIR";
 const PATH: &str = "PATH";
+const CLAUDE_TOOL: &str = "claude_code";
+const IMPORT_TOOL: &str = "claude_code_import";
+const STREAM_FORMAT: &str = "stream-json";
+const REVIEW_INIT: &str = r#"maki.setup({ plugins = {
+  claude_code = { enabled = true, executable = "@EXECUTABLE@" },
+  bash = { enabled = false }, write = { enabled = false }, edit = { enabled = false },
+  task = { enabled = false }, memory = { enabled = false }, code_execution = { enabled = false },
+  batch = { enabled = false }, todo_write = { enabled = false }, question = { enabled = false },
+  webfetch = { enabled = false }, websearch = { enabled = false }, skill = { enabled = false },
+} })"#;
+const REVIEW_TOOLS: [&str; 6] = ["glob", "grep", "index", "list", "read", "view_image"];
 /// maki takes these from the caller's environment, so the child can find its
 /// tools and the `claude` CLI.
 const PASSED: [&str; 4] = [PATH, "USER", "LANG", "TERM"];
@@ -293,6 +304,42 @@ fn the_provider_is_on_with_the_plugin(plugin: bool, want: &str) {
     assert_eq!(result["is_error"], true, "{result}");
     let reason = result["result"].as_str().unwrap_or_default();
     assert!(reason.contains(want), "got: {reason}");
+}
+
+#[test_case("--disallowed-tools", "claude_code,claude_code_import", &REVIEW_TOOLS ; "deny_plugin_tools_keeps_the_provider")]
+#[test_case("--allowed-tools", "ClaudeCode", &[CLAUDE_TOOL] ; "allow_a_plugin_tool")]
+#[test_case("--allowed-tools", "claude_code_import", &[IMPORT_TOOL] ; "allow_a_plugin_subtool")]
+fn cli_filters_plugin_tools_in_the_init_event(flag: &str, names: &str, expected: &[&str]) {
+    let fixture = Fixture::new();
+    let claude = stand_in(&fixture.dir("bin"));
+    let init = REVIEW_INIT.replace("@EXECUTABLE@", &claude.to_string_lossy());
+    fs::write(fixture.dir("config/maki").join("init.lua"), init).unwrap();
+    let mut command = fixture.maki(MODEL, PROMPT, STREAM_FORMAT);
+    command.args([flag, names]);
+    let (stdout, stderr) = finish(command);
+    let events: Vec<Value> = String::from_utf8(stdout)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            serde_json::from_str(line).unwrap_or_else(|error| panic!("{error}: {line}\n{stderr}"))
+        })
+        .collect();
+    let init = events
+        .iter()
+        .find(|event| event["type"] == "system" && event["subtype"] == "init")
+        .unwrap_or_else(|| panic!("no init event: {events:?}\n{stderr}"));
+    let mut tools: Vec<&str> = init["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|name| name.as_str().unwrap())
+        .collect();
+    tools.sort_unstable();
+    assert_eq!(tools, expected);
+    assert!(
+        claude.with_extension(RAN_EXTENSION).exists(),
+        "the enabled provider must still run its CLI checks"
+    );
 }
 
 fn stand_in(dir: &Path) -> PathBuf {

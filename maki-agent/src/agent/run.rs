@@ -999,9 +999,9 @@ fn interrupt_message(message: String, images: Vec<ImageSource>) -> Message {
 pub fn request_tools<'t>(tools: &'t RequestTools, mcp: Option<&McpSession>) -> Cow<'t, Value> {
     match mcp {
         Some(mcp) => {
-            let mut tools = tools.definitions().clone();
-            mcp.extend_tools(&mut tools);
-            Cow::Owned(tools)
+            let mut definitions = tools.definitions().clone();
+            mcp.extend_tools_filtered(&mut definitions, tools.filter());
+            Cow::Owned(definitions)
         }
         None => Cow::Borrowed(tools.definitions()),
     }

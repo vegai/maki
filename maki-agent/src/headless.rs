@@ -120,12 +120,8 @@ fn setup(
 
 /// Names advertised to SDK clients: base tools plus what the first request
 /// would carry from MCP (always-load definitions and `tool_search`).
-fn advertised_tool_names(tools: &Value, mcp: Option<&McpSession>) -> Vec<String> {
-    let mut probe = tools.clone();
-    if let Some(mcp) = mcp {
-        mcp.extend_tools(&mut probe);
-    }
-    extract_tool_names(&probe)
+fn advertised_tool_names(tools: &RequestTools, mcp: Option<&McpSession>) -> Vec<String> {
+    extract_tool_names(&agent::request_tools(tools, mcp))
 }
 
 pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
@@ -155,7 +151,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
         .mcp_handle
         .clone()
         .map(|h| McpSession::new(h, &params.resumed.history));
-    let tool_names = advertised_tool_names(tools.definitions(), mcp.as_ref());
+    let tool_names = advertised_tool_names(&tools, mcp.as_ref());
 
     let (guard, events) = event_stream();
     let event_tx = guard.sender(0);
@@ -296,7 +292,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
         .mcp_handle
         .clone()
         .map(|h| McpSession::new(h, &params.resumed.history));
-    let tool_names = advertised_tool_names(tools.definitions(), mcp.as_ref());
+    let tool_names = advertised_tool_names(&tools, mcp.as_ref());
 
     let (guard, events) = event_stream();
     let base_tx = guard.sender(0);
@@ -506,6 +502,7 @@ mod tests {
     const BODY_EVENT: &str = "the body's event must be delivered before the close";
     const STILL_WORKING: &str = "await_shutdown must not return while the task still works";
     const TASK_DROPPED: &str = "await_shutdown dropped a task that had work left";
+    const MODEL_SPEC: &str = "anthropic/claude-sonnet-4-5";
 
     #[test]
     fn extract_tool_names_filters_valid_entries() {
@@ -516,9 +513,14 @@ mod tests {
     #[test]
     fn advertised_names_show_tool_search_not_deferred_tools() {
         let base = serde_json::json!([{"name": "read"}]);
+        let tools = RequestTools::assembled(
+            base.clone(),
+            &AgentConfig::default(),
+            &Model::from_spec(MODEL_SPEC).unwrap(),
+        );
         let mcp =
             crate::mcp::test_support::stub_session(&[("srv.fetch_issue", "Fetch a GitHub issue")]);
-        let names = advertised_tool_names(&base, Some(&mcp));
+        let names = advertised_tool_names(&tools, Some(&mcp));
         assert_eq!(
             names,
             vec!["read", crate::mcp::TOOL_SEARCH_TOOL_NAME],
@@ -529,7 +531,7 @@ mod tests {
             serde_json::json!([{"name": "read"}]),
             "probing must not bake MCP entries into the base tools"
         );
-        assert_eq!(advertised_tool_names(&base, None), vec!["read"]);
+        assert_eq!(advertised_tool_names(&tools, None), vec!["read"]);
     }
 
     /// The ordering the SDK exit rests on: the stream ends when the run ends,

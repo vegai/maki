@@ -1,10 +1,6 @@
 use std::path::PathBuf;
 
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
-use color_eyre::Result;
-use color_eyre::eyre::bail;
-
-use maki_agent::tools::{all_builtin_tool_names, is_builtin_tool};
 
 use crate::print::OutputFormat;
 
@@ -100,7 +96,7 @@ pub struct Cli {
     #[arg(long)]
     pub exit_on_done: bool,
 
-    /// Pre-approve tools (comma-separated). Accepts PascalCase (Claude Code) or snake_case.
+    /// Allowed tools (comma-separated). Accepts PascalCase (Claude Code) or snake_case.
     #[arg(long, value_delimiter = ',', visible_alias = "allowedTools")]
     pub allowed_tools: Vec<String>,
 
@@ -356,7 +352,10 @@ pub enum AuthAction {
     Status,
 }
 
-pub fn normalize_tool_name(name: &str) -> Result<String> {
+pub fn normalize_tool_name(name: &str) -> String {
+    if name.contains(['_', '.', '-']) {
+        return name.to_owned();
+    }
     let mut result = String::with_capacity(name.len() + 4);
     for (i, c) in name.chars().enumerate() {
         if c.is_ascii_uppercase() {
@@ -368,14 +367,7 @@ pub fn normalize_tool_name(name: &str) -> Result<String> {
             result.push(c);
         }
     }
-    if !is_builtin_tool(&result) {
-        bail!(
-            "unknown tool '{}'. Valid tools: {}",
-            name,
-            all_builtin_tool_names().join(", ")
-        );
-    }
-    Ok(result)
+    result
 }
 
 #[cfg(test)]
@@ -389,20 +381,14 @@ mod tests {
     #[test_case("Bash", "bash")]
     #[test_case("CodeExecution", "code_execution")]
     #[test_case("code_execution", "code_execution"; "snake_passthrough")]
+    #[test_case("ClaudeCode", "claude_code"; "plugin_pascal_case")]
+    #[test_case("claude_code_import", "claude_code_import"; "plugin_passthrough")]
+    #[test_case("srv__GetDocs", "srv__GetDocs"; "mcp_wire_case_is_preserved")]
+    #[test_case("srv.GetDocs", "srv.GetDocs"; "mcp_qualified_case_is_preserved")]
+    #[test_case("NonExistentTool", "non_existent_tool"; "a_tool_can_register_later")]
+    #[test_case("MultiEdit", "multi_edit"; "normalization_does_not_resolve_aliases")]
     fn normalize_tool_name_valid_inputs(input: &str, expected: &str) {
-        assert_eq!(normalize_tool_name(input).unwrap(), expected);
-    }
-
-    #[test]
-    fn normalize_tool_name_rejects_unknown() {
-        let result = normalize_tool_name("NonExistentTool");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unknown tool"));
-    }
-
-    #[test]
-    fn normalize_tool_name_multi_edit_rejects_snake_variant() {
-        assert!(normalize_tool_name("MultiEdit").is_err());
+        assert_eq!(normalize_tool_name(input), expected);
     }
 
     /// `--session-id` with `-c` stays legal: continue the latest, but write
