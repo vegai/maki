@@ -7,11 +7,22 @@ local M = {}
 
 M.ERROR_PREFIX = "claude_code: "
 M.LEFT_BEHIND = "maki did not remove: "
+M.CLOCK = "sleep"
 local STDERR_TAIL_LINES = 10
 M.MS_PER_SEC = 1000
 
 local Call = {}
 Call.__index = Call
+
+function M.clock(seconds)
+  return { M.CLOCK, string.format("%.3f", seconds) }
+end
+
+function M.clock_problem(code)
+  if code ~= 0 then
+    return "the timeout clock exited with code " .. code
+  end
+end
 
 function M.with_stderr(head, stderr_tail)
   return #stderr_tail > 0 and head .. ":\n" .. table.concat(stderr_tail, "\n") or head
@@ -56,6 +67,11 @@ end
 
 function Call:answer()
   self.answered = true
+  local left_behind = self.left_behind
+  self.left_behind = {}
+  for _, dir in ipairs(left_behind) do
+    self:leave(dir)
+  end
   self:settle()
 end
 
@@ -64,8 +80,11 @@ function Call:start(argv, job_opts, on_exit)
   job_opts.kill_group_on_exit = true
   job_opts.on_exit = function(id, code)
     self.alive = self.alive - 1
-    on_exit(id, code)
+    local ok, err = pcall(on_exit, id, code)
     self:settle()
+    if not ok then
+      error(err, 0)
+    end
   end
   local id, err = maki.fn.jobstart(argv, job_opts)
   if not id then
@@ -75,24 +94,24 @@ function Call:start(argv, job_opts, on_exit)
   return id
 end
 
---- {how} has `on_exit(id, code, timed_out)`, `timeout_ms`, and
+--- {how} has `on_exit(id, code, clock_code)`, `timeout_ms`, and
 --- `keep_on_cancel` for a job that a kill could interrupt. The startup limit
 --- applies to such a job unless it has its own.
 function Call:spawn(argv, job_opts, how)
   local limit = how.timeout_ms or how.keep_on_cancel and self.startup_ms or nil
-  local id, clock, exited, timed_out
+  local id, clock, exited, clock_code
   -- The clock starts first, so a job never runs without its limit. It is
   -- not one of the call's processes, so the call need not wait for the
   -- clock that the job's exit stops.
   if limit then
     local clock_err
-    clock, clock_err = maki.fn.jobstart({ "sleep", string.format("%.3f", limit / M.MS_PER_SEC) }, {
+    clock, clock_err = maki.fn.jobstart(M.clock(limit / M.MS_PER_SEC), {
       scope = "plugin",
       env = job_opts.env,
       clear_env = true,
-      on_exit = function()
+      on_exit = function(_, code)
         if id and not exited then
-          timed_out = true
+          clock_code = code
           maki.fn.jobstop(id)
         end
       end,
@@ -107,7 +126,7 @@ function Call:spawn(argv, job_opts, how)
       maki.fn.jobstop(clock)
     end
     if how.on_exit then
-      how.on_exit(job, code, timed_out)
+      how.on_exit(job, code, clock_code)
     end
   end)
   if not ok then
@@ -182,39 +201,44 @@ function Call:remove_dir_now(dir, env)
   end)
 end
 
---- Returns the exit code (nil after a timeout) and the stdout lines. It
---- waits for `on_exit`, because `jobwait` runs in a coroutine that a cancel
---- stops. {how} has `started(id)`, `on_line(id, line)`, `keep_on_cancel`,
+--- Returns the exit code, stdout lines, and any input or clock error.
+--- The code is nil if the clock exits first. Waits for `on_exit`, because a cancel can stop a coroutine that calls `jobwait`.
+--- {how} has `started(id)` returning `(ok, err)`, `on_line(id, line)`, `keep_on_cancel`,
 --- and `leftover(lines)`, which names a directory to remove first.
 function Call:run_to_end(argv, job_opts, how, timeout_ms)
   local lines = {}
+  local input_error
   job_opts.on_stdout = function(id, line)
     lines[#lines + 1] = line
     if how.on_line then
       how.on_line(id, line)
     end
   end
-  local code = maki.async.await(1, function(done)
+  local code, clock_code = maki.async.await(1, function(done)
     local id = self:spawn(argv, job_opts, {
       keep_on_cancel = how.keep_on_cancel,
       timeout_ms = timeout_ms,
-      on_exit = function(_, exit_code, timed_out)
-        local result = not timed_out and exit_code or nil
+      on_exit = function(_, exit_code, clock_exit)
+        local result = clock_exit == nil and exit_code or nil
         local leftover = how.leftover and how.leftover(lines)
         if leftover then
           self:remove_dir(leftover, job_opts.env, function()
-            done(result)
+            done(result, clock_exit)
           end)
         else
-          done(result)
+          done(result, clock_exit)
         end
       end,
     })
     if how.started then
-      how.started(id)
+      local _, err = how.started(id)
+      if err then
+        input_error = err
+        maki.fn.jobstop(id)
+      end
     end
   end)
-  return code, lines
+  return code, lines, input_error or (clock_code and M.clock_problem(clock_code))
 end
 
 --- The `inherit_env` option merges `env` into maki's environment without provider keys.
@@ -234,13 +258,17 @@ function Call:run_quick(argv, spec)
   local how = { keep_on_cancel = spec.keep_on_cancel }
   if spec.stdin then
     how.started = function(id)
-      maki.fn.chansend(id, spec.stdin)
-      maki.fn.chanclose(id, "stdin")
+      local sent, err = maki.fn.chansend(id, spec.stdin)
+      if not sent then
+        return nil, err
+      end
+      return maki.fn.chanclose(id, "stdin")
     end
   end
-  local ok, code, lines = pcall(self.run_to_end, self, argv, job_opts, how, spec.timeout_ms or self.startup_ms)
-  if not ok then
-    return nil, "maki cannot run " .. shown .. ": " .. tostring(code)
+  local ok, code, lines, run_error =
+    pcall(self.run_to_end, self, argv, job_opts, how, spec.timeout_ms or self.startup_ms)
+  if not ok or run_error then
+    return nil, "maki cannot run " .. shown .. ": " .. tostring(run_error or code)
   end
   if not code then
     return nil, shown .. " did not complete in time", true

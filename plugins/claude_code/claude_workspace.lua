@@ -551,7 +551,7 @@ function M.import_script(changes, project, git_dir, artifact, stage)
     'keep() { folders "$1"; mkdir -p -- "$originals/${1%/*}" "$displaced/${1%/*}"; '
       .. '[ "$1" -ef "$originals/$1" ] || ln -T -- "$1" "$originals/$1" || { printf "%s\\n" '
       .. M.bash_quote(IMPORT_NOTE .. IMPORT_NO_LINK)
-      .. ' >&2; exit 1; }; }',
+      .. " >&2; exit 1; }; }",
     'put() { folders "$1"; ln -T -- "${temp_of[$1]}" "$1"; }',
     'drop() { folders "$1"; mv -fT -- "$1" "$displaced/$1"; }',
   }

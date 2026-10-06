@@ -56,8 +56,7 @@ Claude cannot see this conversation. Put all necessary task data in `prompt`. Gi
 - `profile = "code"`: Claude edits files and runs commands in a private project snapshot. It returns changes as an artifact. Review them before claude_code_import changes the checkout. List necessary untracked files in `include`.
 - The user must open the tool view to see the reply. Relay the parts necessary for the main task.]]
 
-local import_description =
-  [[Apply a claude_code artifact's changes to the checkout with one approved bash command.
+local import_description = [[Apply a claude_code artifact's changes to the checkout with one approved bash command.
 
 If a target changed since the snapshot, the import stops before any checkout change. A later conflict can stop import partway. The error lists applied changes. A retry preserves earlier backups and applies changes that remain safe. Use `paths` to select files.]]
 
@@ -293,7 +292,7 @@ local function probe(call, spec, argv, env, confine)
   end
   local stream = Stream.new({ cwd = dir, worker = spec.worker, cli = spec.cli })
   local answers, problem, stderr_tail = {}, nil, {}
-  local ok, code = pcall(call.run_to_end, call, argv, claude_job_opts(dir, env, stderr_tail), {
+  local ok, code, _, run_error = pcall(call.run_to_end, call, argv, claude_job_opts(dir, env, stderr_tail), {
     leftover = function()
       return dir
     end,
@@ -315,14 +314,20 @@ local function probe(call, spec, argv, env, confine)
     end,
     started = function(id)
       for _, request in ipairs(launch.HANDSHAKE) do
-        maki.fn.chansend(id, launch.control_request(request))
+        local sent, err = maki.fn.chansend(id, launch.control_request(request))
+        if not sent then
+          return nil, err
+        end
       end
-      maki.fn.chanclose(id, "stdin")
+      return maki.fn.chanclose(id, "stdin")
     end,
   }, STARTUP_MS)
   if not ok then
     call:remove_dir_now(dir, env)
     return "maki cannot start Claude Code: " .. tostring(code)
+  end
+  if run_error then
+    return "maki cannot run Claude Code checks: " .. run_error
   end
   if problem then
     return problem
@@ -695,7 +700,10 @@ function Run:on_answer(control)
     self.prompted = true
     -- Keep the worker snapshot regardless of the result so the user can inspect its work.
     self.call.artifact = nil
-    maki.fn.chanclose(self.job_id, "stdin")
+    local closed, err = maki.fn.chanclose(self.job_id, "stdin")
+    if not closed then
+      self:stop("maki cannot close Claude Code stdin: " .. tostring(err))
+    end
   end
 end
 
@@ -783,11 +791,11 @@ function Run:start(argv, cwd, env, task)
     self:on_cancel(reason)
   end)
   -- A clock job, for the reason claude_jobs.lua gives.
-  local startup = { "sleep", tostring(STARTUP_TIMEOUT_SECS) }
+  local startup = jobs.clock(STARTUP_TIMEOUT_SECS)
   self.clock = self.call:spawn(startup, { env = self.spec.env, clear_env = true }, {
-    on_exit = function()
+    on_exit = function(_, code)
       if not self.stream.accepted then
-        self:stop("no init event in " .. STARTUP_TIMEOUT_SECS .. " s")
+        self:stop(jobs.clock_problem(code) or "no init event in " .. STARTUP_TIMEOUT_SECS .. " s")
       end
     end,
   })
@@ -919,6 +927,7 @@ local function handler(input, ctx)
   discard_unkept(call)
   if ok and #call.left_behind > 0 then
     reply.llm_output = reply.llm_output .. "\n" .. jobs.LEFT_BEHIND .. table.concat(call.left_behind, ", ")
+    call.left_behind = {}
   end
   call:answer()
   if not ok then

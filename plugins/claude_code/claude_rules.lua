@@ -1,7 +1,7 @@
 -- The route rules that this plugin and the claude-code provider share. The
 -- provider embeds this file and reads the JSON between the long brackets, so
 -- the file holds one JSON document and nothing else.
-return maki.json.decode([==[
+local rules, err = maki.json.decode([==[
 {
   "minimum_version": [2, 1, 284],
   "systems": ["linux"],
@@ -52,3 +52,7 @@ return maki.json.decode([==[
   "builtin_plugin_marker": "builtin"
 }
 ]==])
+if not rules then
+  error(err, 0)
+end
+return rules
