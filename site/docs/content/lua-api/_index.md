@@ -1433,6 +1433,7 @@ and tool set.
     `(string)` or `(nil, err)`. Optional `audiences` (string[]) gates who may
     call it, the same way `maki.api.register_tool` does. The default is the
     model alone, so a script cannot reach it through `code_execution`.
+    Config allow lists do not restrict local tools. Explicit denials still apply.
   - `name` (`string?`) display name for logs and UI.
   - `audience` (`string?`) tool audience for capability gating. Default: `"general_sub"`.
   - `mcp` (`boolean?`) give the session access to MCP tools. Their
@@ -2063,19 +2064,14 @@ local id = maki.fn.jobstart("git status", {
 maki.fn.jobstart({cmd}, {opts?})
 ```
 
-Run a command in the background. A string runs through `bash -c` on Unix
-or `cmd /C` on Windows; a table is spawned as argv, with no shell in
-between (nothing in it can be read as a redirect, a pipe, or `$(...)`).
-You get back a job id that you can pass to `jobstop` or `jobwait` to
-control the process.
+Run a command in the background. A string uses `bash -c` on Unix or
+`cmd /C` on Windows. An argv table starts the process directly without
+shell interpretation. Use the returned job id with `jobstop` or `jobwait`.
 
-`stdout` and `stderr` route a stream to a file instead of into maki. A
-path is opened for append and handed to the child, so nothing is buffered
-here: no callback, no tail, no events for that stream, and it counts as
-truncated everywhere a tail is reported. That makes the two mutually
-exclusive with `on_stdout` / `on_stderr` for the same stream, and a path
-additionally needs the `fs_write` permission. To both persist and react,
-run one job writing the file and a second one tailing it.
+`stdout` and `stderr` can append directly to files. Redirected streams
+have no callbacks, tails or events and count as truncated in job reports.
+A redirect conflicts with the corresponding output callback and needs
+`fs_write`. Use separate writer and reader jobs to store and process output.
 
 Requires the `run` [plugin permission](#plugin-permissions).
 
@@ -2089,8 +2085,8 @@ Requires the `run` [plugin permission](#plugin-permissions).
   - `cwd` (`string?`) working directory (tilde is expanded).
   - `env` (`table?`) environment variables, `{ VAR = "value" }`, added to
     maki's environment.
-  - `clear_env` (`boolean?`) make `env` the whole environment, inheriting
-    nothing from maki (default false).
+  - `clear_env` (`boolean?`) use only `env` for the child
+    environment (default false).
   - `stdin` (`string?`) `"pipe"` to write to the job with `chansend`. Defaults
     to `"null"`, no input. Neovim defaults to `"pipe"`, but a job that
     reads an open pipe with no data hangs.
@@ -2114,7 +2110,7 @@ Requires the `run` [plugin permission](#plugin-permissions).
   - `tail` (`integer?`) trailing lines per stream kept for `jobinfo`
     (default 20, 0 disables, max 1024).
   - `name` (`string?`) handle for `jobfind`, unique among the live jobs this
-    plugin can see. Starting a second job under a live name is an error.
+    plugin can see. A second job with the same live name fails.
 
 **Returns:** (`integer?`, `string?`) Job id, or nil plus an error message when the
   process could not start (binary not found, bad `cwd`, redirect file not
@@ -2355,13 +2351,13 @@ end
 maki.fn.chansend({id}, {data})
 ```
 
-Write {data} to job {id}'s stdin. The job must be started with
-`stdin = "pipe"`. Like `vim.fn.chansend`, except an error returns nil and
-a message instead of 0. List items are joined with newlines, a newline
-inside an item becomes NUL, and no trailing newline is added. Unread data
-stays in memory, and a child that keeps the job's stdin open without
-reading holds it even after the job exits. Use `kill_group_on_exit` to
-stop such a child.
+Write {data} to job {id}'s stdin. Start the job with `stdin = "pipe"`.
+Unlike `vim.fn.chansend`, an error returns nil and a message instead of 0.
+List items use newline separators. A newline inside an item becomes NUL.
+The final item has no newline suffix.
+
+Unread data stays in memory. A descendant can retain stdin after the job
+exits. Use `kill_group_on_exit` to stop that descendant and release the data.
 
 Requires the `run` [plugin permission](#plugin-permissions).
 
@@ -2444,11 +2440,12 @@ end
 maki.fn.exepath({name})
 ```
 
-The absolute path of the program {name} runs, or `""` if there is none,
-like Neovim's `vim.fn.exepath`. A name with a path separator resolves from
-the working directory. Other names are searched on `$PATH`, skipping files
-this process cannot run. Resolve a program once before running it from
-other directories, because a relative name can point elsewhere there.
+Resolve {name} to an absolute executable path, or return `""` if no
+executable exists, as in Neovim's `vim.fn.exepath`.
+Names with a path separator resolve from the working directory. Other
+names resolve through `$PATH`, with files this process cannot execute
+excluded. Resolve the program before a directory change so a relative
+name cannot select a different executable.
 
 Requires the `fs_read` [plugin permission](#plugin-permissions).
 
@@ -2543,7 +2540,7 @@ maki.fs.read({path})
 ```
 
 Read the entire file at {path} as a UTF-8 string.
-Files over 512 MiB or not valid UTF-8 return nil plus an error message.
+Files over 512 MiB or invalid UTF-8 return nil and an error message.
 Use `read_bytes` for binary files.
 
 Requires the `fs_read` [plugin permission](#plugin-permissions).

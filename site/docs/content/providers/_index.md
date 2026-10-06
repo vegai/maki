@@ -262,6 +262,15 @@ Aperture discovers models from your gateway. Set `APERTURE_HOST` to your Tailsca
 
 No hardcoded model catalog. Use any model ID supported by this provider. An API key is required.
 
+### Claude Code (experimental)
+
+- **Env var**: None. The provider is on only while the `claude_code` plugin is enabled in `init.lua`, and it shares some of the plugin's options. Log in with `claude auth login` on a claude.ai subscription.
+- **Features**: Experimental. Runs maki's agent loop on the Claude models of a Claude subscription, through the [`claude` CLI](https://code.claude.com/docs/en/cli-reference). maki runs every tool call itself.
+
+The models Claude Code offers your account, each with the context window Claude Code opens for it. Tiers and list prices come from the anthropic provider, or from models.dev for a release not yet in its table.
+
+The [Claude Code guide](/docs/claude-code/#experimental-provider) covers setup, limits and billing.
+
 ### DeepSeek
 
 - **Env var**: `DEEPSEEK_API_KEY`

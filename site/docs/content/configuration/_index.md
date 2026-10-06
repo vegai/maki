@@ -257,13 +257,13 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `artifact_dir` | string | `""` | - | Absolute path of the directory for coding snapshots and their changes. Defaults to `claude_code/changes` in the maki state directory. On the project's filesystem, maki can clone the dependencies instead of copying them. Expiry removes only the artifacts maki made there. |
+| `artifact_dir` | string | `""` | - | Absolute path of the directory for coding snapshots and their changes. Defaults to `claude_code/changes` in the maki state directory. On the project's filesystem, maki can clone the dependencies with copy-on-write. Imports of replacements or deletions need hard links on the checkout filesystem. Expiry removes only artifacts that maki created there. |
 | `artifact_ttl_hours` | integer | `24` | 1 | Remove a coding artifact after this many hours without a write. |
 | `config_dir` | string | `""` | - | Absolute path of a Claude Code config directory for maki, in place of `$CLAUDE_CONFIG_DIR` or `~/.claude`. Use it to give maki a different Claude login. |
 | `deny_read` | string | `""` | - | Extra paths Claude cannot read, relative to the session's directory and comma-separated, for example `config/prod.yml,certs/**`. As in `.gitignore`, a pattern without a `/` matches at any depth. They add to the default `.env*` and `secrets/` rules, and coding snapshots never contain them. |
 | `dependencies` | string | `""` | - | Untracked directories a coding snapshot copies from the project, comma-separated, for example `node_modules`. The copy is a copy-on-write clone when the filesystem supports it. |
 | `executable` | string | `"claude"` | - | The Claude Code executable. |
-| `max_concurrent` | integer | `2` | 1 | The maximum number of Claude Code processes that run at the same time. |
+| `max_concurrent` | integer | `2` | 1 | The maximum number of plugin calls that run Claude Code at the same time. The claude-code provider has its own limit with the same value, so up to twice this many can run together. |
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
 | `model` | string | `"sonnet"` | - | Model alias for calls that do not pick one. |
