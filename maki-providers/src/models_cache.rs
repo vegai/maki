@@ -257,6 +257,7 @@ fn store_discovery(path: &Path, listing: &Listing, fingerprint: String, now_ms: 
 pub async fn fetch_all_models_cached(
     policy: &ModelPolicy,
     mut on_update: impl FnMut(ModelList, Vec<String>),
+    fresh: bool,
 ) {
     let path = cache_path();
     let fingerprint = fingerprint();
@@ -276,6 +277,7 @@ pub async fn fetch_all_models_cached(
             on_update(listing.snapshot(), batch.warnings);
         },
         None,
+        fresh,
     )
     .await;
 

@@ -118,6 +118,7 @@ case $scenario in
   overloaded) init none; line '{"type":"assistant","error":"unknown","is_api_error_message":true,"message":{"model":"<synthetic>","content":[{"type":"text","text":"Overloaded"}]}}'; line '{"type":"result","subtype":"success","is_error":true,"api_error_status":529,"result":"Overloaded"}'; sleep 30 ;;
   cli_retry) init none; event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-haiku-4-5-20251001\"$start_usage}}"; line '{"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"retry_delay_ms":500,"error_status":529,"error":"overloaded"}'; sleep 30 ;;
   truncated) init none; generation max_tokens; line '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Output token limit hit. Resume directly."}]},"isSynthetic":true}'; sleep 30 ;;
+  truncated_line) init none; printf '%s' '{"type":"assistant","message":' ;;
   text_then_garbage) text_reply; line 'Update available: run claude update' ;;
   no_final_usage) init none; connect; generation tool_use; dispatch a; sleep 30 ;;
   api_key) init ANTHROPIC_API_KEY; sleep 30 ;;

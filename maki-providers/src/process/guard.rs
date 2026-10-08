@@ -1,20 +1,20 @@
 use std::ffi::c_long;
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
+use std::ptr;
 
 use libc::{
-    _SC_OPEN_MAX, _exit, STDIN_FILENO, STDOUT_FILENO, SYS_close_range, close, dup2, fork, syscall,
-    sysconf,
+    _SC_OPEN_MAX, _exit, STDIN_FILENO, STDOUT_FILENO, SYS_close_range, close, dup2, execve, fork,
+    syscall, sysconf,
 };
-use rustix::io::{Errno, read};
 use rustix::process::{Signal, getpid, kill_process_group};
 
 /// The guard shares the worker's group and reserves its id after the leader exits. Only
 /// maki holds the lifetime socket's other endpoint.
-pub(super) fn bind(command: &mut Command) -> io::Result<UnixStream> {
+pub fn bind(command: &mut Command) -> io::Result<UnixStream> {
     let (reader, lifetime) = UnixStream::pair()?;
     // SAFETY: sysconf has no pointer arguments.
     let max_fd = unsafe { sysconf(_SC_OPEN_MAX) };
@@ -37,15 +37,14 @@ pub(super) fn bind(command: &mut Command) -> io::Result<UnixStream> {
                                 close(fd as i32);
                             }
                         }
-                        let input = BorrowedFd::borrow_raw(STDIN_FILENO);
-                        let mut byte = [0u8];
-                        loop {
-                            match read(input, &mut byte) {
-                                Ok(0) => break,
-                                Ok(_) | Err(Errno::INTR) => {}
-                                Err(_) => break,
-                            }
-                        }
+                        let argv = [
+                            c"sh".as_ptr(),
+                            c"-c".as_ptr(),
+                            c"while IFS= read -r line; do :; done; kill -KILL 0".as_ptr(),
+                            ptr::null(),
+                        ];
+                        let environ = [ptr::null()];
+                        execve(c"/bin/sh".as_ptr(), argv.as_ptr(), environ.as_ptr());
                     }
                     let _ = kill_process_group(group, Signal::KILL);
                     _exit(0);

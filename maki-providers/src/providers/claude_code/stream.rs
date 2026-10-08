@@ -10,7 +10,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::checks::{self, InitExpect, RULES};
-use super::error::{Error, TOO_MANY_REQUESTS};
+use super::error::{Error, TOO_MANY_REQUESTS, shown};
 use super::mcp::Handoff;
 use super::transcript::Catalog;
 use crate::model::is_same_model;
@@ -68,7 +68,7 @@ const NO_SUCH_TOOL: &str = "<tool_use_error>Error: No such tool available:";
 /// How Claude Code rejects a call it never hands to maki.
 const REJECTIONS: [&str; 2] = [INPUT_REJECTED, NO_SUCH_TOOL];
 const SHOWN_LINE_CHARS: usize = 80;
-/// How many event kinds the trace keeps for a failed request's debug log.
+/// How many event kinds the trace keeps for a failed request's log.
 const TRACE_LEN: usize = 32;
 const UNNAMED_HOOK: &str = "startup";
 const NO_MESSAGE: &str = "no message";
@@ -107,6 +107,14 @@ struct Parked {
     arguments: Value,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum Phase {
+    Checking,
+    PromptSent,
+    Streaming,
+    Complete,
+}
+
 pub(crate) struct Turn<'a> {
     catalog: &'a Catalog,
     expect: InitExpect<'a>,
@@ -114,8 +122,7 @@ pub(crate) struct Turn<'a> {
     /// leaves its usage behind.
     plan_usage: &'a Mutex<Option<ProviderUsage>>,
     answers: HashMap<String, Value>,
-    prompted: bool,
-    accepted: bool,
+    phase: Phase,
     message_id: Option<String>,
     /// Each block arrives once, between its start and its stop, so a block
     /// without a start is either a repeat or came from nowhere. A text block
@@ -124,7 +131,6 @@ pub(crate) struct Turn<'a> {
     blocks: Vec<ContentBlock>,
     usage: Usage,
     stop_reason: Option<String>,
-    complete: bool,
     result: bool,
     parked: Vec<Parked>,
     /// Claude Code answered a call itself because the call broke its schema.
@@ -210,14 +216,12 @@ impl<'a> Turn<'a> {
             expect,
             plan_usage,
             answers: HashMap::new(),
-            prompted: false,
-            accepted: false,
+            phase: Phase::Checking,
             message_id: None,
             started: Vec::new(),
             blocks: Vec::new(),
             usage: Usage::default(),
             stop_reason: None,
-            complete: false,
             result: false,
             parked: Vec::new(),
             rejected: false,
@@ -229,7 +233,7 @@ impl<'a> Turn<'a> {
     }
 
     pub fn prompted(&mut self) {
-        self.prompted = true;
+        self.phase = Phase::PromptSent;
     }
 
     pub fn offered(&self) -> Vec<Offered> {
@@ -249,7 +253,7 @@ impl<'a> Turn<'a> {
 
     /// Only a held call is missing.
     pub fn awaits_handoff(&self) -> bool {
-        self.complete && self.calls_tools() && self.parked.is_empty() && !self.rejected
+        self.is_complete() && self.calls_tools() && self.parked.is_empty() && !self.rejected
     }
 
     pub fn calls_tools(&self) -> bool {
@@ -258,7 +262,7 @@ impl<'a> Turn<'a> {
 
     /// Only the result is missing.
     pub fn awaits_result(&self) -> bool {
-        self.complete && !self.result && !self.calls_tools()
+        self.is_complete() && !self.result && !self.calls_tools()
     }
 
     /// The stream has given every usage count, the final output count
@@ -276,15 +280,19 @@ impl<'a> Turn<'a> {
     /// Claude Code then hands maki no call and tells the model to continue.
     /// A reply that filled the context window counts as cut too.
     pub fn truncated(&self) -> bool {
-        self.complete
+        self.is_complete()
             && self
                 .stop_reason
                 .as_deref()
                 .is_some_and(|reason| CUT_STOPS.contains(&reason))
     }
 
+    fn is_complete(&self) -> bool {
+        self.phase == Phase::Complete
+    }
+
     pub fn accepted(&self) -> bool {
-        self.accepted
+        matches!(self.phase, Phase::Streaming | Phase::Complete)
     }
 
     /// Kinds of the latest events, oldest first, as `type/subtype` or the API
@@ -316,11 +324,12 @@ impl<'a> Turn<'a> {
     /// can add API events to `stream_event`, so an unknown API event is
     /// ignored until the reply is complete.
     pub fn feed(&mut self, line: &str) -> Result<Step, Error> {
-        let Ok(event) = serde_json::from_str::<Value>(line) else {
-            return Err(Error::NotAnEvent(
-                line.chars().take(SHOWN_LINE_CHARS).collect(),
-            ));
-        };
+        let event = serde_json::from_str::<Value>(line).map_err(|source| Error::NotAnEvent {
+            preview: line.chars().take(SHOWN_LINE_CHARS).collect(),
+            category: source.classify(),
+            bytes: line.len(),
+            source,
+        })?;
         self.record(&event);
         match (event["type"].as_str(), event["subtype"].as_str()) {
             (Some(CONTROL_RESPONSE), _) => self.answer(&event["response"]),
@@ -352,7 +361,16 @@ impl<'a> Turn<'a> {
             (Some("system"), Some("compact_boundary")) => Err(Error::Compacted),
             (Some("tool_progress"), _) => Ok(Step::Alive),
             (Some("system"), _) => Ok(Step::Nothing),
-            (Some("stream_event" | "assistant" | "user" | "result"), _) if !self.accepted => {
+            (Some("result"), _)
+                if !self.accepted()
+                    && (event["is_error"] == true
+                        || event["subtype"]
+                            .as_str()
+                            .is_some_and(|subtype| subtype.starts_with("error_"))) =>
+            {
+                Err(Error::Failed(shown(&event["errors"])))
+            }
+            (Some("stream_event" | "assistant" | "user" | "result"), _) if !self.accepted() => {
                 Err(Error::UncheckedStart)
             }
             (Some("assistant"), _) if event[API_ERROR_MARK] == true => {
@@ -405,19 +423,21 @@ impl<'a> Turn<'a> {
     }
 
     fn init(&mut self, event: &Value) -> Result<Step, Error> {
-        if !self.prompted {
+        if self.phase == Phase::Checking {
             return Err(Error::UncheckedStart);
         }
         if let Some(problem) = checks::init_problem(event, &self.expect) {
             return Err(Error::Check(problem));
         }
-        self.accepted = true;
+        if self.phase == Phase::PromptSent {
+            self.phase = Phase::Streaming;
+        }
         Ok(Step::Nothing)
     }
 
     fn stream_event(&mut self, event: &Value) -> Result<Step, Error> {
         let kind = event["type"].as_str();
-        if self.complete && kind != Some(MESSAGE_START) {
+        if self.is_complete() && kind != Some(MESSAGE_START) {
             return Err(Error::LateContent);
         }
         // Ignore the whole generation, and show the user nothing, until its
@@ -491,7 +511,7 @@ impl<'a> Turn<'a> {
                 Ok(Step::Nothing)
             }
             Some(MESSAGE_STOP) => {
-                self.complete = true;
+                self.phase = Phase::Complete;
                 self.settle()
             }
             _ => Ok(Step::Nothing),
@@ -532,7 +552,7 @@ impl<'a> Turn<'a> {
     /// completed reply is frozen, because a later block could add a call that
     /// Claude Code never hands to maki.
     fn assistant(&mut self, message: &Value) -> Result<Step, Error> {
-        if self.complete {
+        if self.is_complete() {
             return Err(Error::LateContent);
         }
         if self
@@ -661,7 +681,7 @@ impl<'a> Turn<'a> {
     }
 
     fn settle(&mut self) -> Result<Step, Error> {
-        if !self.complete {
+        if !self.is_complete() {
             return Ok(Step::Nothing);
         }
         // Claude Code sends blocks before `message_stop`, except those its output filter
@@ -741,6 +761,9 @@ impl<'a> Turn<'a> {
     /// An absent usage count must fail the request. Zero would conceal incomplete protocol
     /// data.
     pub fn response(self) -> Result<StreamResponse, Error> {
+        if self.stop_reason.as_deref() == Some(WINDOW_FULL_STOP) {
+            return Err(Error::ContextOverflow);
+        }
         let stop_reason = if self.truncated() {
             StopReason::MaxTokens
         } else if self.calls_tools() {
@@ -1115,7 +1138,7 @@ mod tests {
     #[test_case(assistant(json!({ "type": "tool_use", "id": "toolu_x", "name": "", "input": {} })) => matches Err(Error::NotOffered(_)) ; "a_call_without_a_name")]
     #[test_case(json!({ "type": "result", "subtype": "error_during_execution", "is_error": true, "result": "usage limit reached" }).to_string() => matches Err(Error::Failed(_)) ; "an_error_result")]
     #[test_case(json!({ "type": "surprise" }).to_string() => matches Err(Error::UnknownEvent(_)) ; "an_unknown_event")]
-    #[test_case("Update available".to_owned() => matches Err(Error::NotAnEvent(_)) ; "no_event")]
+    #[test_case("Update available".to_owned() => matches Err(Error::NotAnEvent { .. }) ; "no_event")]
     fn a_line_maki_cannot_accept_stops_the_generation(line: String) -> Result<Step, Error> {
         run(&[start(), line], Vec::new(), false).0
     }
@@ -1496,6 +1519,15 @@ mod tests {
         run(&batch(), vec![handoff], false).0
     }
 
+    #[test]
+    fn an_error_before_init_preserves_the_startup_cause() {
+        let event = json!({ "type": "result", "subtype": "error_during_execution", "errors": ["socat not installed"] }).to_string();
+        let step = with_turn(|mut turn| turn.feed(&event));
+        assert!(
+            matches!(step, Err(Error::Failed(ref message)) if message.contains("socat not installed"))
+        );
+    }
+
     /// A text reply that ends at its result.
     fn finished(mut lines: Vec<String>) -> Vec<String> {
         lines.push(
@@ -1505,10 +1537,7 @@ mod tests {
         lines
     }
 
-    /// A reply that filled the context window is cut, as one at the output
-    /// cap is.
     #[test_case(MAX_TOKENS_STOP ; "at_the_output_cap")]
-    #[test_case(WINDOW_FULL_STOP ; "at_a_full_window")]
     fn a_cut_reply_comes_back_as_cut(reason: &str) {
         let lines = reply(&[json!({ "type": "text", "text": "Half" })], reason);
         let (step, response) = run(&lines, Vec::new(), false);
@@ -1517,6 +1546,16 @@ mod tests {
             response.unwrap().unwrap().stop_reason,
             Some(StopReason::MaxTokens)
         );
+    }
+
+    #[test]
+    fn a_full_window_requests_compaction() {
+        let lines = reply(
+            &[json!({ "type": "text", "text": "Half" })],
+            WINDOW_FULL_STOP,
+        );
+        let (_, response) = run(&lines, Vec::new(), false);
+        assert!(matches!(response, Some(Err(Error::ContextOverflow))));
     }
 
     /// Claude Code sends each block before `message_stop`, and the last

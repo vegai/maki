@@ -8,14 +8,13 @@ mod checks;
 mod error;
 #[cfg(all(test, target_os = "linux"))]
 mod fake;
-#[cfg(target_os = "linux")]
-mod guard;
 #[cfg(all(test, target_os = "linux"))]
 mod live;
 mod mcp;
 mod run;
 mod stream;
 mod transcript;
+pub mod validation;
 
 use std::collections::{BTreeMap, HashMap};
 use std::env;
@@ -23,7 +22,6 @@ use std::ffi::OsString;
 use std::fmt::Display;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -83,6 +81,7 @@ const ERROR_PREFIX: &str = "claude-code: ";
 /// shows the list price only as a reference.
 const SUBSIDY: &str = "Claude subscription";
 const BAD_REQUEST: u16 = 400;
+const CONTEXT_OVERFLOW_STATUS: u16 = 413;
 const FEATURES: &str = "Experimental. Runs maki's agent loop on the Claude models of a Claude \
     subscription, through the [`claude` CLI](https://code.claude.com/docs/en/cli-reference). maki runs \
     every tool call itself.";
@@ -136,8 +135,6 @@ static PLUGIN_OPTIONS: Mutex<Option<PluginOptions>> = Mutex::new(None);
 /// first one found.
 static FAILED_LISTINGS: AsyncMutex<BTreeMap<(PathBuf, PathBuf), (Instant, String)>> =
     AsyncMutex::new(BTreeMap::new());
-/// Set by a refresh in the TUI, and taken by the next listing.
-static REFRESH_LISTING: AtomicBool = AtomicBool::new(false);
 
 struct Exchange<'a> {
     system: &'a str,
@@ -214,9 +211,18 @@ fn config_error(message: impl Display) -> AgentError {
 /// Temporary API errors and stalled replies enter maki's retry loop. Oversized
 /// conversations remain overflow errors so maki can compact them.
 ///
-/// Other failures are configuration errors. A retry can repeat a startup or handoff
-/// failure, or send a request twice.
+/// Login, policy and invariant failures stop the request. Held calls do not run when a
+/// generation fails, so an interrupted reply can use the normal retry limit.
 fn agent_error(error: Error) -> AgentError {
+    if matches!(&error, Error::ContextOverflow)
+        || matches!(&error, Error::WithStderr { error, .. } if matches!(error.as_ref(), Error::ContextOverflow))
+    {
+        return AgentError::Api {
+            status: CONTEXT_OVERFLOW_STATUS,
+            message: error.to_string(),
+            retry_after: None,
+        };
+    }
     if let Some(secs) = error.stalled() {
         warn!(%error, "claude-code: the reply stalled");
         return AgentError::Timeout { secs };
@@ -254,25 +260,6 @@ fn models_cache_path() -> Option<PathBuf> {
     maki_storage::paths::cache_dir()
         .ok()
         .map(|dir| dir.join(MODELS_CACHE_FILE))
-}
-
-/// For `maki models --refresh`. After an error, a saved list stays in use
-/// until it is a day old.
-/// This function blocks, so call it only out of the executor.
-pub fn refresh_models(timeouts: Timeouts) -> Option<Result<usize, AgentError>> {
-    let options = plugin_options()?;
-    Some(smol::block_on(async {
-        let provider = ClaudeCode::new(&options, timeouts)?;
-        let cwd = working_dir()?;
-        let models = provider.list(&cwd, true).await.map_err(config_error)?;
-        Ok(models.len())
-    }))
-}
-
-/// For a refresh in the TUI: the next listing asks Claude Code even if the
-/// saved list is fresh or a listing just failed.
-pub fn refresh_on_next_listing() {
-    REFRESH_LISTING.store(true, Ordering::Relaxed);
 }
 
 /// maki's working directory, as `getcwd` gives it. A model listing has no
@@ -373,11 +360,12 @@ struct Prepared {
     config_dir: PathBuf,
 }
 
+#[derive(Clone)]
 struct ClaudeCode {
     executable: PathBuf,
     limits: Limits,
     /// maki's environment, read afresh for each request.
-    environment: Box<dyn Fn() -> Vec<(String, String)> + Send + Sync>,
+    environment: Arc<dyn Fn() -> Vec<(String, String)> + Send + Sync>,
     models_cache: Option<PathBuf>,
     /// Takes precedence over `$CLAUDE_CONFIG_DIR`.
     config_dir: Option<PathBuf>,
@@ -395,7 +383,7 @@ impl ClaudeCode {
         Ok(Self {
             executable,
             limits: Limits::new(timeouts.stream),
-            environment: Box::new(|| utf8_vars(env::vars_os())),
+            environment: Arc::new(|| utf8_vars(env::vars_os())),
             models_cache: models_cache_path(),
             config_dir: options.config_dir.clone(),
         })
@@ -449,9 +437,14 @@ impl ClaudeCode {
         })
     }
 
+    async fn prepare_async(&self, cwd: &Path) -> Result<Prepared, Error> {
+        let provider = self.clone();
+        let cwd = cwd.to_owned();
+        smol::unblock(move || provider.prepare(&cwd)).await
+    }
+
     async fn models(&self, cwd: &Path) -> Result<Vec<Listed>, Error> {
-        self.list(cwd, REFRESH_LISTING.swap(false, Ordering::Relaxed))
-            .await
+        self.list(cwd, false).await
     }
 
     /// Model discovery starts up to six processes. Cache successful lists for 24 hours
@@ -461,19 +454,23 @@ impl ClaudeCode {
             self.executable.clone(),
             self.login_dir(&(self.environment)())?,
         );
-        let saved = || {
-            self.models_cache
-                .as_deref()
-                .and_then(|path| saved_models(path, MODELS_CACHE_TTL, &key.0, &key.1))
+        let saved = async || {
+            let path = self.models_cache.clone();
+            let (executable, config_dir) = key.clone();
+            smol::unblock(move || {
+                path.as_deref()
+                    .and_then(|path| saved_models(path, MODELS_CACHE_TTL, &executable, &config_dir))
+            })
+            .await
         };
         // The lock waits for any listing in progress, which can wait for a
         // slot, so a saved list answers without it.
-        if !fresh && let Some(models) = saved() {
+        if !fresh && let Some(models) = saved().await {
             return Ok(models);
         }
         let mut failures = FAILED_LISTINGS.lock().await;
         if !fresh {
-            if let Some(models) = saved() {
+            if let Some(models) = saved().await {
                 return Ok(models);
             }
             if let Some((at, message)) = failures.get(&key)
@@ -508,7 +505,7 @@ impl ClaudeCode {
     async fn ask_models(&self, cwd: &Path) -> Result<Vec<Listed>, Error> {
         let slots = slots();
         let _slot = slots.acquire().await;
-        let prepared = self.prepare(cwd)?;
+        let prepared = self.prepare_async(cwd).await?;
         let models = run::models(
             &self.executable,
             &prepared.env,
@@ -524,8 +521,12 @@ impl ClaudeCode {
                 config_dir: prepared.config_dir,
                 models,
             };
-            save_models(path, &saved);
-            return Ok(saved.models);
+            let path = path.to_owned();
+            return Ok(smol::unblock(move || {
+                save_models(&path, &saved);
+                saved.models
+            })
+            .await);
         }
         Ok(models)
     }
@@ -538,11 +539,13 @@ impl ClaudeCode {
         cwd: &Path,
     ) -> Result<StreamResponse, Error> {
         // Claude Code reports its directory as `getcwd` does.
-        let cwd = cwd.canonicalize().map_err(|source| Error::Path {
-            what: "resolve the directory of the session",
-            path: cwd.to_owned(),
-            source,
-        })?;
+        let cwd = smol::fs::canonicalize(cwd)
+            .await
+            .map_err(|source| Error::Path {
+                what: "resolve the directory of the session",
+                path: cwd.to_owned(),
+                source,
+            })?;
         let slots = slots();
         let waiting = Instant::now();
         let _slot = match slots.try_acquire() {
@@ -553,7 +556,7 @@ impl ClaudeCode {
             }
         };
         let slot_wait = waiting.elapsed();
-        let prepared = self.prepare(&cwd)?;
+        let prepared = self.prepare_async(&cwd).await?;
         run::request(run::Request {
             executable: &self.executable,
             env: &prepared.env,
@@ -571,6 +574,7 @@ impl ClaudeCode {
             slot_wait,
         })
         .await
+        .inspect_err(|_| run::invalidate_profile(&self.executable))
     }
 }
 
@@ -616,7 +620,16 @@ impl Provider for ClaudeCode {
     /// shows up without a maki update.
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
-            let models = self.models(&working_dir()?).await.map_err(config_error)?;
+            let cwd = smol::unblock(working_dir).await?;
+            let models = self.models(&cwd).await.map_err(config_error)?;
+            Ok(with_long_context(models, takes_a_million))
+        })
+    }
+
+    fn list_models_fresh(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async move {
+            let cwd = smol::unblock(working_dir).await?;
+            let models = self.list(&cwd, true).await.map_err(config_error)?;
             Ok(with_long_context(models, takes_a_million))
         })
     }
@@ -739,6 +752,7 @@ mod tests {
 
     /// Preserve overflow errors regardless of stderr. Retry temporary API errors and
     /// empty tool-call turns. Login errors must stop the request.
+    #[test_case(Error::ContextOverflow => (true, false) ; "an_exhausted_context_window")]
     #[test_case(refused(INVALID, None) => (true, false) ; "an_overflow")]
     #[test_case(Error::WithStderr { error: Box::new(refused(INVALID, None)), stderr: "noise".into() } => (true, false) ; "an_overflow_with_stderr")]
     #[test_case(refused(RATE_LIMITED, None) => (false, true) ; "a_rate_limit")]
@@ -747,6 +761,9 @@ mod tests {
     #[test_case(refused(LOGIN_FAILED, Some(401)) => (false, false) ; "a_login_error")]
     #[test_case(refused(UNKNOWN_KIND, None) => (false, false) ; "an_unknown_kind_without_a_status")]
     #[test_case(Error::CliRetry { kind: OVERLOADED_KIND.into(), status: None, delay: None } => (false, true) ; "a_retry_that_claude_code_wanted")]
+    #[test_case(Error::WentQuiet.after_start(true) => (false, true) ; "interrupted_after_init")]
+    #[test_case(Error::WentQuiet.after_start(false) => (false, false) ; "interrupted_before_init")]
+    #[test_case(Error::ApiRefused { kind: UNKNOWN_KIND.into(), text: "API Error: Stream idle timeout".into(), status: None } => (false, true) ; "a_reported_stream_idle_timeout")]
     #[test_case(Error::NoCallsToRun => (false, true) ; "a_tool_stop_without_calls")]
     fn a_refused_request_reads_as_the_anthropic_provider_reports_it(error: Error) -> (bool, bool) {
         let error = agent_error(error);
@@ -1002,6 +1019,7 @@ mod on_the_fake {
     use std::iter;
     use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
     use futures_lite::{FutureExt, future};
@@ -1097,7 +1115,7 @@ mod on_the_fake {
         ClaudeCode {
             executable: fake.executable(),
             limits: Limits::new(IDLE),
-            environment: Box::new(move || vars.clone()),
+            environment: Arc::new(move || vars.clone()),
             models_cache,
             config_dir: None,
         }
@@ -1131,7 +1149,7 @@ mod on_the_fake {
         let mut provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
         let mut vars = (provider.environment)();
         vars.push((CONFIG_DIR_VAR.to_owned(), String::new()));
-        provider.environment = Box::new(move || vars.clone());
+        provider.environment = Arc::new(move || vars.clone());
 
         let prepared = provider.prepare(&fake.project()).unwrap();
         assert!(

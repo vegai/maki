@@ -26,6 +26,7 @@ const MAX_HEAD_BYTES: usize = 16 * 1024;
 /// A `write` call carries a whole file, so the body limit is large.
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CONNECTIONS: usize = 32;
+const HEAD_TIMEOUT: Duration = Duration::from_secs(2);
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 /// Newest first.
 const PROTOCOL_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
@@ -170,7 +171,7 @@ async fn connection(stream: TcpStream, shared: Arc<Shared>) {
     let mut writer = stream;
     loop {
         // A rejected request's body is never read, so the connection ends.
-        let head = match within(shared.read_limit, read_head(&mut reader)).await {
+        let head = match within(shared.read_limit.min(HEAD_TIMEOUT), read_head(&mut reader)).await {
             Some(Ok(Some(head))) => head,
             Some(Ok(None)) | None => return,
             Some(Err(status)) => {

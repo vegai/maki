@@ -449,6 +449,9 @@ impl McpSession {
         // Without tool_search, deferred definitions would have no discovery path.
         let defer =
             filter.matches_external(TOOL_SEARCH_TOOL_NAME) && self.deferring(&idx, deferral);
+        if arrival == Arrival::Late && deferral == ToolDeferral::Native && !defer {
+            return;
+        }
         let loaded = self.lock_loaded();
         let mut cataloged: Vec<&ToolDescriptor> = Vec::new();
         for d in idx.descriptors.iter().filter(|d| {
@@ -1451,7 +1454,7 @@ fn spawn_persist_enabled(path: PathBuf, name: String, enabled: bool) {
 #[cfg(unix)]
 pub fn kill_process_groups(pids: &[u32]) {
     for &pid in pids {
-        unsafe { libc::killpg(pid as i32, libc::SIGKILL) };
+        maki_providers::process::kill_group(pid);
     }
 }
 
@@ -1737,6 +1740,27 @@ mod tests {
         assert!(found.loaded_tools.is_empty());
         assert!(found.text.starts_with(SEARCH_NO_MATCH));
         session.append_late_tools_filtered(&mut tools, deferral, &filter);
+        assert_eq!(tools, initial);
+    }
+
+    #[test]
+    fn native_late_tools_without_search_preserve_the_prefix() {
+        let filter = ToolFilter::Only {
+            allowed: vec![ALPHA_WIRE.into(), LATE_WIRE.into()],
+            excluded: Vec::new(),
+        };
+        let srv = entry_with_tools("srv", vec![tool_def("srv", "alpha", "", json!({}))]);
+        let (mut inner, session) = setup_with_defer(vec![srv], 0);
+        let mut tools = json!([]);
+        session.extend_tools_filtered(&mut tools, ToolDeferral::Native, &filter);
+        let initial = tools.clone();
+        assert_eq!(tool_names(&initial), vec![ALPHA_WIRE]);
+        inner.entries.push(entry_with_tools(
+            "late",
+            vec![tool_def("late", "beta", "", json!({}))],
+        ));
+        publish(&inner, &session.index, &session.snapshot);
+        session.append_late_tools_filtered(&mut tools, ToolDeferral::Native, &filter);
         assert_eq!(tools, initial);
     }
 

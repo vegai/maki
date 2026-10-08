@@ -1,122 +1,57 @@
-//! Each request owns a Claude Code process group. Stop the group before the handoff server so
-//! held calls retain their connection during cleanup.
+//! Each request owns its process group and holds tool calls until the reply is complete.
+mod launch;
+mod private_files;
+mod supervision;
 
-use std::collections::VecDeque;
-use std::env;
-#[cfg(target_os = "linux")]
-use std::fs;
-#[cfg(unix)]
-use std::fs::Permissions;
-use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
-#[cfg(target_os = "linux")]
-use std::os::unix::fs::MetadataExt;
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-#[cfg(target_os = "linux")]
-use std::os::unix::net::UnixStream;
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
-use std::process::{self, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
-
+pub(crate) use self::launch::models;
+use self::launch::{Launch, MCP_CONFIG_FLAG, base_args, checked_profile, command, probe};
+pub(super) use self::launch::{cache_profile, cached_profile, invalidate_profile};
+use self::private_files::{private_dir, private_file};
+use self::supervision::{
+    Group, Next, next, send, send_handshake, stdout_lines, supervised, unreadable, within,
+};
+use super::checks::InitExpect;
+use super::error::Error;
+use super::mcp::{self, Handoff};
+use super::stream::{Step, Turn, user_message};
+use super::transcript::{Catalog, SERVER, system_prompt, transcript};
+use crate::providers::anthropic::shared::{long_context_window, strip_long_context};
+use crate::{Message, ProviderEvent, ProviderUsage, StreamResponse};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use flume::{Receiver, Sender};
-use futures::future::join_all;
-use futures_lite::future;
-use futures_lite::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
-use futures_lite::{FutureExt, Stream, StreamExt};
-#[cfg(target_os = "linux")]
-use rustix::io::Errno;
-#[cfg(target_os = "linux")]
-use rustix::process::{Pid, getuid, test_kill_process};
+use futures_lite::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use smol::process::{Child, ChildStdin, ChildStdout, Command};
-use smol::{Task, Timer};
-use tempfile::TempDir;
+use std::io;
+use std::path::Path;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-use super::checks::{self, InitExpect, Profile, RULES};
-use super::error::Error;
-#[cfg(target_os = "linux")]
-use super::guard;
-use super::mcp::{self, Handoff};
-use super::stream::{
-    CONTROL_RESPONSE, INITIALIZE, Offered, SUCCESS, Step, Turn, control_request, user_message,
-};
-use super::transcript::{Catalog, SERVER, system_prompt, transcript};
-use crate::process::kill_group;
-#[cfg(unix)]
-use crate::process::wait_without_reaping;
-use crate::providers::anthropic::shared::{long_context_window, strip_long_context};
-use crate::{Message, ProviderEvent, ProviderUsage, StreamResponse};
-
-const DIR_PREFIX: &str = "maki-claude-code.";
-/// Between the pid namespace and the pid in a private directory's name.
-#[cfg(target_os = "linux")]
-const OWNER_SEPARATOR: char = '-';
-#[cfg(target_os = "linux")]
-const PID_NAMESPACE: &str = "/proc/self/ns/pid";
 const PROMPT_FILE: &str = "system-prompt.md";
 const MCP_FILE: &str = "mcp.json";
 const TOKEN_BYTES: usize = 32;
-/// How long a killed process's last stderr lines get to reach the error.
-const STDERR_DRAIN: Duration = Duration::from_secs(1);
-const STDERR_TAIL_LINES: usize = 10;
-#[cfg(unix)]
-const PRIVATE_FILE_MODE: u32 = 0o600;
-#[cfg(unix)]
-const PRIVATE_DIR_MODE: u32 = 0o700;
-const WINDOW_PROCESSES: usize = 4;
-const SET_MODEL: &str = "set_model";
-const CONTEXT_USAGE: &str = "get_context_usage";
-/// What Claude Code appends to a model name for its 1M window.
 const LONG_CONTEXT_NAME: &str = "[1m]";
-/// The probe sends no prompt, so its model never runs.
-const PROBE_MODEL: &str = "haiku";
-/// Generous, because Claude Code starts slowly.
-const STARTUP: Duration = Duration::from_secs(60);
-/// The held call arrives right after a completed reply, or not at all.
+pub(super) const STARTUP: Duration = Duration::from_secs(60);
 const HANDOFF: Duration = Duration::from_secs(30);
 const EXIT: Duration = Duration::from_secs(10);
 const MAX_OUTPUT_ENV: &str = "CLAUDE_CODE_MAX_OUTPUT_TOKENS";
 const EFFORT_FLAG: &str = "--effort";
-const MCP_CONFIG_FLAG: &str = "--mcp-config";
 const SYSTEM_PROMPT_FILE_FLAG: &str = "--system-prompt-file";
-const VERSION_FLAG: &str = "--version";
 const THINKING_BUDGET_ENV: &str = "MAX_THINKING_TOKENS";
 const NO_THINKING: (&str, &str) = ("CLAUDE_CODE_DISABLE_THINKING", "1");
-/// Otherwise the thinking of a reply reaches maki empty, and a long turn shows
-/// nothing until its text. A model that always thinks does so even with
-/// thinking off, so the flag goes on every run.
 const SHOWN_THINKING: (&str, &str) = ("--thinking-display", "summarized");
-/// maki owns the history and compacts it itself.
 const NO_AUTO_COMPACT: (&str, &str) = ("DISABLE_AUTO_COMPACT", "1");
-/// Otherwise Claude Code can resend a failed request without stream events.
 const NO_NONSTREAMING_FALLBACK: (&str, &str) = ("CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK", "1");
-/// maki retries a temporary API error itself. Claude Code's own retry would
-/// start a second generation inside one stream, which maki cannot tell from a
-/// broken stream.
+// A CLI retry starts a second generation inside one stream. maki retries the whole request.
 const NO_CLI_RETRIES: (&str, &str) = ("CLAUDE_CODE_MAX_RETRIES", "0");
-/// On Claude 5 models, Claude Code puts the cache mark on its final system message. Disable
-/// that message so later requests reuse transcript blocks.
 const NO_MID_CONVERSATION_SYSTEM: (&str, &str) =
     ("CLAUDE_CODE_MODEL_CAPABILITIES", "-mid_conv_system");
-/// Claude Code loads nothing on its own, and only maki's handoff server can
-/// receive tool calls.
-const SETTINGS: &str = r#"{"disableAllHooks":true,"autoMemoryEnabled":false,"autoCompactEnabled":false,"claudeMdExcludes":["**"],"disableClaudeAiConnectors":true,"permissions":{"allow":["mcp__maki"]}}"#;
-const EMPTY_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
-/// Claude Code starts tool calls before the reply ends. maki holds them until the complete
-/// reply arrives.
-///
-/// The HTTP MCP client has short call and server timeouts. Use the largest accepted server
-/// timeout so the client cannot answer held calls.
+// Held calls must outlive generation, so Claude Code cannot answer them before maki stops it.
 const HELD_CALL_TIMEOUT_MS: u64 = i32::MAX as u64;
 
+#[derive(Clone)]
 pub(crate) struct Limits {
     /// Time for Claude Code to start, answer the handshake and send its init
     /// event, and also for each write to its stdin.
@@ -137,39 +72,6 @@ impl Limits {
             exit: EXIT,
         }
     }
-}
-
-/// Turns off every Claude Code tool, sessions, settings files, and every MCP
-/// server except maki's.
-fn base_args(model: &str) -> Vec<String> {
-    [
-        "--print",
-        "--input-format",
-        "stream-json",
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--include-partial-messages",
-        "--no-session-persistence",
-        "--restricted",
-        "--tools",
-        "",
-        "--max-turns",
-        "1",
-        "--permission-mode",
-        "default",
-        "--permission-prompts",
-        "none",
-        "--setting-sources",
-        "",
-        "--settings",
-        SETTINGS,
-        "--strict-mcp-config",
-        "--model",
-        model,
-    ]
-    .map(str::to_owned)
-    .to_vec()
 }
 
 /// A model Claude Code offers, and the context window it opens for it.
@@ -207,381 +109,13 @@ pub(crate) enum Thinking {
     Budget(u32),
 }
 
-/// Kills the group on drop unless the leader is already reaped.
-struct Group {
-    child: Child,
-    reaped: bool,
-    #[cfg(target_os = "linux")]
-    _lifetime: UnixStream,
-}
-
-impl Group {
-    async fn spawn(command: process::Command) -> Result<Self, Error> {
-        smol::unblock(move || spawn_piped(command))
-            .await
-            .map_err(|source| Error::Io {
-                what: "start Claude Code",
-                source,
-            })
-    }
-
-    /// Only while the unreaped leader's pid still names the group.
-    fn kill(&self) {
-        if !self.reaped {
-            kill_group(self.child.id());
-        }
-    }
-
-    /// Kill remaining group members before the leader reap so the pid cannot identify another
-    /// group.
-    async fn wait(&mut self, deadline: Instant) -> Result<ExitStatus, Error> {
-        let exited = self.exited_by(deadline).await;
-        self.kill();
-        let status = self.child.status().await;
-        self.reaped = true;
-        if !exited {
-            return Err(Error::ExitLate);
-        }
-        status.map_err(|source| Error::Io {
-            what: "reap Claude Code",
-            source,
-        })
-    }
-
-    /// Does not reap the leader.
-    #[cfg(unix)]
-    async fn exited_by(&self, deadline: Instant) -> bool {
-        let pid = self.child.id();
-        smol::unblock(move || wait_without_reaping(pid))
-            .or(async {
-                Timer::at(deadline).await;
-                false
-            })
-            .await
-    }
-
-    /// The open process handle keeps the pid for this process.
-    #[cfg(not(unix))]
-    async fn exited_by(&mut self, deadline: Instant) -> bool {
-        async { self.child.status().await.is_ok() }
-            .or(async {
-                Timer::at(deadline).await;
-                false
-            })
-            .await
-    }
-}
-
-impl Drop for Group {
-    fn drop(&mut self) {
-        self.kill();
-    }
-}
-
-fn spawn_piped(command: process::Command) -> io::Result<Group> {
-    #[cfg(target_os = "linux")]
-    let mut command = command;
-    #[cfg(target_os = "linux")]
-    let lifetime = guard::bind(&mut command)?;
-    let child = Command::from(command)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    Ok(Group {
-        child,
-        reaped: false,
-        #[cfg(target_os = "linux")]
-        _lifetime: lifetime,
-    })
-}
-
-fn command(
-    executable: &Path,
-    env: &[(String, String)],
-    cwd: &Path,
-    args: &[String],
-) -> process::Command {
-    let mut command = process::Command::new(executable);
-    command
-        .args(args)
-        .current_dir(cwd)
-        .env_clear()
-        .envs(env.iter().map(|(name, value)| (name, value)));
-    #[cfg(unix)]
-    command.process_group(0);
-    command
-}
-
-/// Creates a file that only the user can read and write, from the moment it
-/// exists.
-fn private_file(path: &Path, content: &str) -> io::Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(PRIVATE_FILE_MODE);
-    let mut file: File = options.open(path)?;
-    file.write_all(content.as_bytes())
-}
-
-/// Private to the user from the moment it exists. Returns the resolved path,
-/// because a link on the way to `base` could make a directory inside
-/// `project` look like it is outside.
-fn private_dir(base: &Path, project: &Path) -> Result<(TempDir, PathBuf), Error> {
-    #[cfg(target_os = "linux")]
-    sweep_once(base);
-    let prefix = dir_prefix();
-    let mut builder = tempfile::Builder::new();
-    builder.prefix(&prefix);
-    #[cfg(unix)]
-    builder.permissions(Permissions::from_mode(PRIVATE_DIR_MODE));
-    let dir = builder.tempdir_in(base).map_err(|source| Error::Path {
-        what: "make a private directory in",
-        path: base.to_owned(),
-        source,
-    })?;
-    let path = dir.path().canonicalize().map_err(|source| Error::Path {
-        what: "resolve",
-        path: dir.path().to_owned(),
-        source,
-    })?;
-    if path.starts_with(project) {
-        return Err(Error::TempInProject(path));
-    }
-    Ok((dir, path))
-}
-
-/// Include the pid namespace in the directory name. A later maki process can then identify
-/// dead owners with pids scoped to their own namespace.
-fn dir_prefix() -> String {
-    #[cfg(target_os = "linux")]
-    if let Some(namespace) = pid_namespace() {
-        return format!("{DIR_PREFIX}{namespace}{OWNER_SEPARATOR}{}.", process::id());
-    }
-    DIR_PREFIX.to_owned()
-}
-
-#[cfg(target_os = "linux")]
-fn pid_namespace() -> Option<u64> {
-    fs::metadata(PID_NAMESPACE).ok().map(|meta| meta.ino())
-}
-
-/// Artifact cleanup can take a long time. Run it outside the async threads and scan each
-/// base once.
-#[cfg(target_os = "linux")]
-fn sweep_once(base: &Path) {
-    static SWEPT: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-    let mut swept = SWEPT.lock().unwrap_or_else(PoisonError::into_inner);
-    if swept.iter().any(|dir| dir == base) {
-        return;
-    }
-    swept.push(base.to_owned());
-    let base = base.to_owned();
-    smol::unblock(move || sweep_dead_owners(&base)).detach();
-}
-
-/// Removes the private directories in `base` whose maki is gone. A signal
-/// can kill maki before the directory's destructor runs. Only the user's own
-/// directories from this pid namespace go, and a link is never followed.
-#[cfg(target_os = "linux")]
-fn sweep_dead_owners(base: &Path) {
-    let (Ok(entries), Some(namespace)) = (fs::read_dir(base), pid_namespace()) else {
-        return;
-    };
-    let uid = getuid().as_raw();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(owner) = name
-            .to_str()
-            .and_then(|name| name.strip_prefix(DIR_PREFIX))
-            .and_then(|rest| rest.split_once('.'))
-            .and_then(|(owner, _)| owner.split_once(OWNER_SEPARATOR))
-            .filter(|(owner_namespace, _)| owner_namespace.parse() == Ok(namespace))
-            .and_then(|(_, pid)| pid.parse().ok())
-            .and_then(Pid::from_raw)
-        else {
-            continue;
-        };
-        let path = entry.path();
-        let owned =
-            fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir() && meta.uid() == uid);
-        if !owned || test_kill_process(owner) != Err(Errno::SRCH) {
-            continue;
-        }
-        match fs::remove_dir_all(&path) {
-            Ok(()) => debug!(
-                path = %path.display(),
-                owner = owner.as_raw_nonzero(),
-                "claude-code: removed a dead maki's private directory"
-            ),
-            Err(error) => warn!(
-                path = %path.display(),
-                %error,
-                "claude-code: could not remove a dead maki's private directory"
-            ),
-        }
-    }
-}
-
 fn token() -> Result<String, Error> {
     let mut bytes = [0u8; TOKEN_BYTES];
     getrandom::fill(&mut bytes).map_err(Error::Token)?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
-type StderrTail = Arc<Mutex<VecDeque<String>>>;
-
-struct Stderr {
-    tail: StderrTail,
-    reader: Option<Task<()>>,
-}
-
-impl Stderr {
-    /// Kills `group` first so its stderr ends, and every line gets read, even
-    /// from a process that exited before its reader started.
-    async fn explain(self, error: Error, group: &mut Group) -> Error {
-        group.kill();
-        if let Some(reader) = self.reader {
-            reader
-                .or(async {
-                    Timer::after(STDERR_DRAIN).await;
-                })
-                .await;
-        }
-        with_stderr(error, &self.tail)
-    }
-}
-
-/// Each error carries what Claude Code printed on stderr. After an error the
-/// group is reaped, so none of it still runs when the caller moves on.
-async fn supervised<T>(
-    command: process::Command,
-    work: impl AsyncFnOnce(&mut Group) -> Result<T, Error>,
-) -> Result<T, Error> {
-    let mut group = Group::spawn(command).await?;
-    debug!(pid = group.child.id(), "claude-code: process started");
-    let stderr = watch_stderr(&mut group.child);
-    match work(&mut group).await {
-        Ok(value) => Ok(value),
-        Err(error) => {
-            let error = stderr.explain(error, &mut group).await;
-            if !group.reaped {
-                let _ = group.wait(Instant::now() + EXIT).await;
-            }
-            Err(error)
-        }
-    }
-}
-
-fn watch_stderr(child: &mut Child) -> Stderr {
-    let tail: StderrTail = Arc::default();
-    let reader = child.stderr.take().map(|stderr| {
-        let lines = Arc::clone(&tail);
-        // A line that is not UTF-8 must not stop the reader, or Claude Code
-        // blocks once its stderr fills the pipe.
-        smol::spawn(async move {
-            let mut reader = BufReader::new(stderr).split(b'\n');
-            while let Some(Ok(line)) = reader.next().await {
-                let line =
-                    String::from_utf8_lossy(line.strip_suffix(b"\r").unwrap_or(&line)).into_owned();
-                let mut lines = lines.lock().unwrap_or_else(PoisonError::into_inner);
-                if lines.len() == STDERR_TAIL_LINES {
-                    lines.pop_front();
-                }
-                lines.push_back(line);
-            }
-        })
-    });
-    Stderr { tail, reader }
-}
-
-fn with_stderr(error: Error, tail: &StderrTail) -> Error {
-    let lines = tail.lock().unwrap_or_else(PoisonError::into_inner);
-    if lines.is_empty() {
-        return error;
-    }
-    let shown: Vec<&str> = lines.iter().map(String::as_str).collect();
-    Error::WithStderr {
-        error: Box::new(error),
-        stderr: shown.join("\n"),
-    }
-}
-
-fn unreadable(source: io::Error) -> Error {
-    Error::Io {
-        what: "read the output of Claude Code",
-        source,
-    }
-}
-
-enum Next {
-    Line(Option<io::Result<String>>),
-    Handoff(Handoff),
-    Late,
-}
-
-async fn next(
-    lines: &mut (impl Stream<Item = io::Result<String>> + Unpin),
-    handoffs: Option<&Receiver<Handoff>>,
-    deadline: Instant,
-) -> Next {
-    async { Next::Line(lines.next().await) }
-        .or(async {
-            match handoffs {
-                Some(handoffs) => match handoffs.recv_async().await {
-                    Ok(handoff) => Next::Handoff(handoff),
-                    Err(_) => future::pending().await,
-                },
-                None => future::pending().await,
-            }
-        })
-        .or(async {
-            Timer::at(deadline).await;
-            Next::Late
-        })
-        .await
-}
-
-fn stdout_lines(stdout: Option<ChildStdout>) -> Result<Lines<BufReader<ChildStdout>>, Error> {
-    stdout
-        .map(|out| BufReader::new(out).lines())
-        .ok_or(Error::NoStdout)
-}
-
-/// Sends the check requests, which Claude Code answers before it reads a
-/// prompt.
-async fn send_handshake(stdin: &mut Option<ChildStdin>, deadline: Instant) -> Result<(), Error> {
-    for step in &RULES.handshake {
-        let request = control_request(&step.id, &json!({ "subtype": step.subtype }));
-        send(stdin, &request, deadline).await?;
-    }
-    Ok(())
-}
-
-/// A process that ignores stdin can block a write larger than the pipe buffer. Bound the
-/// write with a deadline.
-async fn send(stdin: &mut Option<ChildStdin>, data: &str, deadline: Instant) -> Result<(), Error> {
-    let pipe = stdin.as_mut().ok_or(Error::NoStdin)?;
-    async {
-        pipe.write_all(data.as_bytes())
-            .await
-            .map_err(|source| Error::Io {
-                what: "write to Claude Code",
-                source,
-            })
-    }
-    .or(async {
-        Timer::at(deadline).await;
-        Err(Error::InputNotTaken)
-    })
-    .await
-}
-
-/// Versions and policy can change between requests. Validate both before a process starts in
-/// the project.
-///
-/// Retry only temporary API errors and stalled replies. Other failures can occur after Claude
-/// Code sends the request.
+/// Recheck current policy and the executable's identity before starting in the project.
 pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
     let started = Instant::now();
     let limits = req.limits;
@@ -589,24 +123,15 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
     // none.
     let catalog = Catalog::new(req.tools)?;
     let conversation = user_message(&transcript(req.messages)?);
-    let profile = checked_profile(
-        req.executable,
-        req.env,
-        req.cwd,
-        req.temp_dir,
-        limits.startup,
-    )
-    .await?;
-    let offered = probe(
-        req.executable,
-        &profile,
-        req.env,
-        req.cwd,
-        req.temp_dir,
-        req.plan_usage,
-        limits.startup,
-    )
-    .await?;
+    let launch = Launch {
+        executable: req.executable,
+        env: req.env,
+        project: req.cwd,
+        temp_dir: req.temp_dir,
+        startup: limits.startup,
+    };
+    let profile = checked_profile(&launch).await?;
+    let offered = probe(&launch, &profile, req.plan_usage).await?;
     // maki marks the 1M window with a `-1m` id and Claude Code with a `[1m]`
     // name. The generation reports the model without either.
     let asked = strip_long_context(req.model);
@@ -788,7 +313,9 @@ async fn converse(
                     Err(Error::ExitLate) => Error::WentQuiet,
                     Err(other) => other,
                 };
-                return Err(turn.take_broken().unwrap_or(ended));
+                let error = turn.take_broken().unwrap_or(ended);
+                warn!(%error, events = %turn.trace(), "claude-code: the request failed");
+                return Err(error.after_start(turn.accepted()));
             }
             Next::Handoff(handoff) => turn.park(handoff),
             // The reply and its usage are complete, so the result only
@@ -817,7 +344,7 @@ async fn converse(
             last_event = Instant::now();
         }
         if let Err(error) = &step {
-            debug!(%error, events = %turn.trace(), "claude-code: the request failed");
+            warn!(%error, events = %turn.trace(), "claude-code: the request failed");
         }
         if !generating && turn.accepted() {
             generating = true;
@@ -826,7 +353,7 @@ async fn converse(
                 "claude-code: init accepted, the reply streams"
             );
         }
-        match step? {
+        match step.map_err(|error| error.after_start(turn.accepted()))? {
             Step::Ready => {
                 debug!("claude-code: handshake accepted, sending the conversation");
                 // The conversation gets a full limit. Nothing reads stdout
@@ -853,14 +380,21 @@ async fn converse(
         group.kill();
     }
     let deadline = Instant::now() + limits.exit;
-    drain(&mut turn, &mut lines, &handoffs, deadline, stopped).await?;
-    let status = group.wait(deadline).await?;
+    drain(&mut turn, &mut lines, &handoffs, deadline, stopped)
+        .await
+        .map_err(|error| error.after_start(turn.accepted()))?;
+    let status = group
+        .wait(deadline)
+        .await
+        .map_err(|error| error.after_start(turn.accepted()))?;
     // After the reap, Claude Code cannot make calls. Stop the server to end the queue and
     // validate all remaining calls.
     drop(server.take());
-    queued_handoffs(&mut turn, handoffs, Instant::now() + limits.exit).await?;
+    queued_handoffs(&mut turn, handoffs, Instant::now() + limits.exit)
+        .await
+        .map_err(|error| error.after_start(turn.accepted()))?;
     if !stopped && !status.success() {
-        return Err(Error::ExitedAfterReply(status));
+        return Err(Error::ExitedAfterReply(status).after_start(turn.accepted()));
     }
     Ok((turn.response()?, prompted))
 }
@@ -871,13 +405,10 @@ async fn queued_handoffs(
     deadline: Instant,
 ) -> Result<(), Error> {
     loop {
-        let handoff = async { Some(handoffs.recv_async().await.ok()) }
-            .or(async {
-                Timer::at(deadline).await;
-                None
-            })
+        let handoff = within(deadline, handoffs.recv_async())
             .await
-            .ok_or(Error::ServerLate)?;
+            .ok_or(Error::ServerLate)?
+            .ok();
         match handoff {
             Some(handoff) => {
                 turn.park(handoff)?;
@@ -908,235 +439,10 @@ async fn drain(
             continue;
         };
         let cut = stopped
-            && matches!(error, Error::NotAnEvent(_) | Error::Io { .. })
+            && matches!(error, Error::NotAnEvent { .. } | Error::Io { .. })
             && matches!(next(lines, None, deadline).await, Next::Line(None));
         return if cut { Ok(()) } else { Err(error) };
     }
-}
-
-/// Runs `work` on a Claude Code with no prompt and no MCP server, in an empty
-/// directory checked to be outside the project.
-async fn unprompted<T>(
-    executable: &Path,
-    env: &[(String, String)],
-    project: &Path,
-    temp_dir: &Path,
-    work: impl AsyncFnOnce(&mut Group, &Path) -> Result<T, Error>,
-) -> Result<T, Error> {
-    let (_dir, dir_path) = private_dir(temp_dir, project)?;
-    let mut args = base_args(PROBE_MODEL);
-    args.extend([MCP_CONFIG_FLAG.to_owned(), EMPTY_MCP_CONFIG.to_owned()]);
-    supervised(command(executable, env, &dir_path, &args), async |group| {
-        work(group, &dir_path).await
-    })
-    .await
-}
-
-/// A hook that policy keeps on runs at startup, so the handshake first runs
-/// in an empty directory, without a prompt.
-async fn probe(
-    executable: &Path,
-    profile: &Profile,
-    env: &[(String, String)],
-    project: &Path,
-    temp_dir: &Path,
-    plan_usage: &Mutex<Option<ProviderUsage>>,
-    startup: Duration,
-) -> Result<Vec<Offered>, Error> {
-    let empty = Catalog::new(&json!([]))?;
-    unprompted(executable, env, project, temp_dir, async |group, dir| {
-        let mut stdin = group.child.stdin.take();
-        let mut lines = stdout_lines(group.child.stdout.take())?;
-        let tools = empty.exposed();
-        let expect = InitExpect {
-            profile,
-            model: PROBE_MODEL,
-            cwd: dir,
-            server: SERVER,
-            tools: &tools,
-        };
-        let mut turn = Turn::new(&empty, expect, plan_usage);
-        let deadline = Instant::now() + startup;
-        send_handshake(&mut stdin, deadline).await?;
-        drop(stdin);
-        let mut passed = false;
-        loop {
-            match next(&mut lines, None, deadline).await {
-                Next::Line(Some(Ok(line))) => match turn.feed(&line)? {
-                    Step::Ready => passed = true,
-                    Step::Nothing | Step::Alive => {}
-                    _ => return Err(Error::ProbeRan),
-                },
-                Next::Line(Some(Err(source))) => return Err(unreadable(source)),
-                Next::Line(None) => break,
-                Next::Handoff(_) | Next::Late => return Err(Error::ProbeLate(startup.as_secs())),
-            }
-        }
-        let status = group.wait(deadline).await?;
-        if !status.success() {
-            return Err(Error::ExitedInChecks(status));
-        }
-        if !passed {
-            return Err(Error::ChecksUnanswered);
-        }
-        Ok(turn.offered())
-    })
-    .await
-}
-
-/// A CLI upgrade between requests invalidates a cached version.
-async fn checked_profile(
-    executable: &Path,
-    env: &[(String, String)],
-    project: &Path,
-    temp_dir: &Path,
-    startup: Duration,
-) -> Result<Profile, Error> {
-    // Runs in a private directory outside the project, like the probe, so no
-    // Claude Code starts in the project before the checks.
-    let (_dir, dir_path) = private_dir(temp_dir, project)?;
-    let output = version(executable, env, &dir_path, startup).await?;
-    checks::profile(&output, env::consts::OS)
-}
-
-/// Returns the models by the ids they run, after the same checks a request
-/// must pass.
-pub(crate) async fn models(
-    executable: &Path,
-    env: &[(String, String)],
-    project: &Path,
-    temp_dir: &Path,
-    plan_usage: &Mutex<Option<ProviderUsage>>,
-    startup: Duration,
-) -> Result<Vec<Listed>, Error> {
-    let profile = checked_profile(executable, env, project, temp_dir, startup).await?;
-    let offered = probe(
-        executable, &profile, env, project, temp_dir, plan_usage, startup,
-    )
-    .await?;
-    let mut ids: Vec<String> = Vec::new();
-    for offer in offered {
-        if !ids.contains(&offer.model) {
-            ids.push(offer.model);
-        }
-    }
-    // Each model switch can take Claude Code 2 s, so several processes split
-    // the list. An unknown window falls back to the standard one, so the list
-    // stays correct without it.
-    let shares: Vec<&[String]> = ids
-        .chunks(ids.len().div_ceil(WINDOW_PROCESSES).max(1))
-        .collect();
-    let answers = join_all(
-        shares
-            .iter()
-            .map(|share| windows(executable, env, project, temp_dir, share, startup)),
-    )
-    .await;
-    let windows: Vec<Option<u32>> = shares
-        .iter()
-        .zip(answers)
-        .flat_map(|(share, answer)| {
-            answer.unwrap_or_else(|error| {
-                warn!(%error, "claude-code: maki cannot read the context windows");
-                vec![None; share.len()]
-            })
-        })
-        .collect();
-    Ok(ids
-        .into_iter()
-        .zip(windows)
-        .map(|(id, window)| Listed { id, window })
-        .collect())
-}
-
-/// Returns the context window Claude Code opens for each name in `models`,
-/// which is 1M for a new model even without `[1m]`. One process does it,
-/// without a prompt, in an empty directory like the probe. The result is
-/// `None` where the answer names a different model.
-async fn windows(
-    executable: &Path,
-    env: &[(String, String)],
-    project: &Path,
-    temp_dir: &Path,
-    models: &[String],
-    startup: Duration,
-) -> Result<Vec<Option<u32>>, Error> {
-    unprompted(executable, env, project, temp_dir, async |group, _| {
-        let mut stdin = group.child.stdin.take();
-        let mut lines = stdout_lines(group.child.stdout.take())?;
-        let deadline = Instant::now() + startup;
-        let initialize = json!({ "subtype": INITIALIZE });
-        ask(&mut stdin, &mut lines, &initialize, deadline).await?;
-        let mut windows = Vec::with_capacity(models.len());
-        for model in models {
-            let switch = json!({ "subtype": SET_MODEL, "model": model });
-            ask(&mut stdin, &mut lines, &switch, deadline).await?;
-            let usage = json!({ "subtype": CONTEXT_USAGE });
-            let usage = ask(&mut stdin, &mut lines, &usage, deadline).await?;
-            let window = usage["maxTokens"]
-                .as_u64()
-                .and_then(|n| u32::try_from(n).ok());
-            windows.push(window.filter(|_| usage["model"] == model.as_str()));
-        }
-        Ok(windows)
-    })
-    .await
-}
-
-/// Sends `request` and waits for its answer. Requests go one at a time,
-/// because Claude Code can answer a later request first. Other lines are
-/// ignored, because this process has no prompt and its events do not matter.
-async fn ask(
-    stdin: &mut Option<ChildStdin>,
-    lines: &mut (impl Stream<Item = io::Result<String>> + Unpin),
-    request: &Value,
-    deadline: Instant,
-) -> Result<Value, Error> {
-    let id = request["subtype"].as_str().unwrap_or_default();
-    send(stdin, &control_request(id, request), deadline).await?;
-    loop {
-        match next(lines, None, deadline).await {
-            Next::Line(Some(Ok(line))) => {
-                let event: Value = serde_json::from_str(&line).unwrap_or_default();
-                let answer = &event["response"];
-                if event["type"] == CONTROL_RESPONSE && answer["request_id"] == id {
-                    return match answer["subtype"] == SUCCESS {
-                        true => Ok(answer["response"].clone()),
-                        false => Err(Error::NotAnswered(id.to_owned())),
-                    };
-                }
-            }
-            Next::Line(Some(Err(source))) => return Err(unreadable(source)),
-            Next::Line(None) | Next::Handoff(_) | Next::Late => {
-                return Err(Error::NotAnswered(id.to_owned()));
-            }
-        }
-    }
-}
-
-async fn version(
-    executable: &Path,
-    env: &[(String, String)],
-    temp_dir: &Path,
-    startup: Duration,
-) -> Result<String, Error> {
-    let args = [VERSION_FLAG.to_owned()];
-    supervised(command(executable, env, temp_dir, &args), async |group| {
-        drop(group.child.stdin.take());
-        let mut lines = stdout_lines(group.child.stdout.take())?;
-        let deadline = Instant::now() + startup;
-        let first = match next(&mut lines, None, deadline).await {
-            Next::Line(Some(Ok(line))) => Some(line),
-            Next::Line(Some(Err(source))) => return Err(Error::UnreadableVersion(source)),
-            _ => None,
-        };
-        let status = group.wait(deadline).await?;
-        if !status.success() {
-            return Err(Error::VersionFailed(status));
-        }
-        first.ok_or(Error::NoVersion)
-    })
-    .await
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -1154,7 +460,7 @@ mod tests {
 
     use futures_lite::{FutureExt, StreamExt};
     use rustix::process::{Pid, Signal, kill_process, kill_process_group, test_kill_process_group};
-    use serde_json::{Value, json};
+    use serde_json::{Value, error::Category, json};
     use smol::Timer;
     use tempfile::tempdir;
     use test_case::test_case;
@@ -1168,14 +474,14 @@ mod tests {
     use super::super::mcp::Handoff;
     use super::super::stream::Turn;
     use super::super::transcript::{Catalog, SERVER};
-    use super::{
-        DIR_PREFIX, EFFORT_FLAG, Group, HANDOFF, HELD_CALL_TIMEOUT_MS, Limits, Listed,
-        NO_AUTO_COMPACT, NO_CLI_RETRIES, NO_MID_CONVERSATION_SYSTEM, NO_NONSTREAMING_FALLBACK,
-        NO_THINKING, SHOWN_THINKING, STARTUP, Thinking, command, models, probe, queued_handoffs,
-        spawn_piped, stdout_lines,
-    };
     #[cfg(target_os = "linux")]
-    use super::{OWNER_SEPARATOR, pid_namespace, sweep_dead_owners};
+    use super::private_files::{DIR_PREFIX, OWNER_SEPARATOR, pid_namespace, sweep_dead_owners};
+    use super::supervision::spawn_piped;
+    use super::{
+        EFFORT_FLAG, Group, HANDOFF, HELD_CALL_TIMEOUT_MS, Limits, Listed, NO_AUTO_COMPACT,
+        NO_CLI_RETRIES, NO_MID_CONVERSATION_SYSTEM, NO_NONSTREAMING_FALLBACK, NO_THINKING,
+        SHOWN_THINKING, STARTUP, Thinking, command, models, probe, queued_handoffs, stdout_lines,
+    };
     use crate::providers::anthropic::{LABEL_SESSION, LABEL_WEEK_ALL};
     use crate::{ContentBlock, ImageMediaType, ImageSource, Role, StopReason};
     use crate::{Message, ProviderEvent, StreamResponse};
@@ -1341,7 +647,7 @@ mod tests {
     #[test_case("no_final_usage" => matches Error::NoFinalOutput ; "a_reply_with_only_the_placeholder_output_count")]
     #[test_case("text_then_fail" => matches Error::ExitedAfterReply(_) ; "a_text_result_followed_by_a_failed_exit")]
     #[test_case("text_then_api_key" => matches Error::Check(_) ; "a_text_result_then_an_init_that_contradicts_it")]
-    #[test_case("text_then_garbage" => matches Error::NotAnEvent(_) ; "a_text_result_then_a_line_that_is_no_event")]
+    #[test_case("text_then_garbage" => matches Error::NotAnEvent { .. } ; "a_text_result_then_a_line_that_is_no_event")]
     fn a_run_maki_cannot_accept_stops_and_is_killed(scenario: &str) -> Error {
         let fake = Fake::new(scenario);
         let (result, _) = smol::block_on(fake.request());
@@ -1350,7 +656,34 @@ mod tests {
             fake.group_gone(),
             "a stopped run must not continue after its request"
         );
-        result.unwrap_err()
+        match result.unwrap_err() {
+            Error::Interrupted(error) => *error,
+            error => error,
+        }
+    }
+
+    #[test]
+    fn a_truncated_line_before_stop_is_diagnosed_and_retryable() {
+        let fake = Fake::new("truncated_line");
+        let (result, _) = smol::block_on(fake.request());
+        let error = result.unwrap_err();
+        assert!(error.temporary().is_some());
+        let Error::Interrupted(error) = error else {
+            panic!("{error:?}")
+        };
+        let Error::NotAnEvent {
+            category,
+            bytes,
+            source,
+            ..
+        } = *error
+        else {
+            panic!("{error:?}")
+        };
+        assert_eq!(category, Category::Eof);
+        assert_eq!(bytes, source.column());
+        assert!(fake.leader_reaped());
+        assert!(fake.group_gone());
     }
 
     /// An API error waits for the result that gives its status, but no
@@ -1424,7 +757,10 @@ mod tests {
             fake.group_gone(),
             "a stopped run must not continue after its request"
         );
-        assert!(matches!(result, Err(Error::ExitLate)), "{result:?}");
+        assert!(
+            matches!(result, Err(Error::Interrupted(ref error)) if matches!(**error, Error::ExitLate)),
+            "{result:?}"
+        );
     }
 
     /// A process that ignores stdin after its checks must not hold a request indefinitely.
@@ -1462,7 +798,11 @@ mod tests {
             fake.group_gone(),
             "a run that hangs must not continue after its request"
         );
-        result.unwrap_err()
+        let error = result.unwrap_err();
+        match error {
+            Error::Interrupted(error) => *error,
+            error => error,
+        }
     }
 
     /// maki continues a reply that hit its limit itself. Claude Code would
@@ -1576,7 +916,10 @@ mod tests {
             ALIAS,
             limits(STARTUP, IDLE, HANDOFF, SHORT_EXIT),
         ));
-        assert!(matches!(result, Err(Error::WentQuiet)), "{result:?}");
+        assert!(
+            matches!(result, Err(Error::Interrupted(ref error)) if matches!(**error, Error::WentQuiet)),
+            "{result:?}"
+        );
     }
 
     /// Every maki thinking setting reaches Claude Code: an effort level on the
@@ -1733,13 +1076,15 @@ mod tests {
         let fake = Fake::new("probe_runs");
         let profile = profile("2.1.284", "linux").unwrap();
         let result = smol::block_on(probe(
-            &fake.executable(),
+            &super::Launch {
+                executable: &fake.executable(),
+                env: &Fake::env(),
+                project: &fake.project(),
+                temp_dir: &env::temp_dir(),
+                startup: STARTUP,
+            },
             &profile,
-            &Fake::env(),
-            &fake.project(),
-            &env::temp_dir(),
             &fake.plan_usage,
-            STARTUP,
         ));
         assert!(
             fake.log("stdin_prompt").is_empty(),
@@ -1850,16 +1195,27 @@ mod tests {
             starts + 1,
             "only the probe can start"
         );
+        assert_eq!(fake.log("versions").lines().count(), 1);
     }
 
-    /// Each request reads the version again. A newer version runs, and one
-    /// below the minimum stops before it starts.
+    #[test]
+    fn an_unchanged_executable_reuses_its_checked_version() {
+        let fake = Fake::new("text");
+        for _ in 0..2 {
+            smol::block_on(fake.request()).0.unwrap();
+        }
+        assert_eq!(fake.log("versions").lines().count(), 1);
+        assert_eq!(fake.log("calls").lines().count(), 4);
+    }
+
     #[test_case(NEWER_VERSION, true ; "an_upgrade_runs")]
     #[test_case(OLDER_VERSION, false ; "a_downgrade_never_starts")]
     fn a_version_changed_between_requests(version: &str, runs: bool) {
         let fake = Fake::new("text");
         smol::block_on(fake.request()).0.unwrap();
         fs::write(fake.dir.path().join("version"), version).unwrap();
+        let script = fs::read(fake.executable()).unwrap();
+        fs::write(fake.executable(), script).unwrap();
         let starts = fake.log("calls").lines().count();
         let result = smol::block_on(fake.request()).0;
 

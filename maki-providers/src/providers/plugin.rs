@@ -18,7 +18,7 @@ use url::{Host, Url};
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelInfo};
 use crate::pricing::PricingSchedule;
-use crate::provider::{BoxFuture, Provider, RequestScope};
+use crate::provider::{BoxFuture, Provider};
 use crate::spec::{BASES, ProviderRegistry, ProviderSpec};
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
@@ -1064,13 +1064,14 @@ impl PluginProvider {
         })
     }
 
-    async fn models(&self) -> Result<Vec<ModelInfo>, AgentError> {
+    async fn models(&self, fresh: bool) -> Result<Vec<ModelInfo>, AgentError> {
         self.entry.ensure_auth().await?;
         // Rows describe models, they do not bound the catalogue, so without a
         // hook the listing is whatever the codec or base serves. Listing the
         // rows too, and falling back to them alone, is `fetch_all_models`'s job.
         match &self.entry.hooks.list_models {
             Some(hook) => hook.call(()).await,
+            None if fresh => self.inner.list_models_fresh().await,
             None => self.inner.list_models().await,
         }
     }
@@ -1084,7 +1085,6 @@ impl PluginProvider {
     }
 }
 
-#[warn(clippy::missing_trait_methods)]
 impl Provider for PluginProvider {
     fn stream_message<'a>(
         &'a self,
@@ -1156,32 +1156,16 @@ impl Provider for PluginProvider {
         })
     }
 
-    /// The inner provider is a codec or a native base from
-    /// [`BASES`](crate::spec::BASES), none of which uses the directory.
-    fn stream_message_in<'a>(
-        &'a self,
-        model: &'a Model,
-        messages: &'a [Message],
-        system: &'a str,
-        tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
-        opts: RequestOptions,
-        scope: RequestScope<'a>,
-    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-        self.stream_message(
-            model,
-            messages,
-            system,
-            tools,
-            event_tx,
-            opts,
-            scope.session_id,
-        )
-    }
-
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
-            let result = self.models().await;
+            let result = self.models(false).await;
+            self.mapped(result).await
+        })
+    }
+
+    fn list_models_fresh(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async move {
+            let result = self.models(true).await;
             self.mapped(result).await
         })
     }

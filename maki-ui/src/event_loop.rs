@@ -35,10 +35,10 @@ use maki_lua::{
     PackCommand, PackPreparation, PlanRequest, SessionEndReason, SessionRequest, TaskRequest,
     UiAction, UiAttachment, UiReply,
 };
+use maki_providers::Timeouts;
 use maki_providers::models_cache::{ModelList, fetch_all_models_cached};
 use maki_providers::provider::{Provider, from_model};
 use maki_providers::{Message, Model};
-use maki_providers::{Timeouts, claude_code};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::model::persist_model;
@@ -538,14 +538,19 @@ fn fetch_models(
     policy: Arc<ModelPolicy>,
     warn_tx: flume::Sender<String>,
     models_tx: flume::Sender<()>,
+    fresh: bool,
 ) -> smol::Task<()> {
     smol::spawn(async move {
-        fetch_all_models_cached(&policy, |list, warnings| {
-            for w in warnings {
-                let _ = warn_tx.try_send(w);
-            }
-            available.store(Some(Arc::new(list)));
-        })
+        fetch_all_models_cached(
+            &policy,
+            |list, warnings| {
+                for w in warnings {
+                    let _ = warn_tx.try_send(w);
+                }
+                available.store(Some(Arc::new(list)));
+            },
+            fresh,
+        )
         .await;
         let _ = models_tx.try_send(());
     })
@@ -560,6 +565,7 @@ fn spawn_model_fetch(policy: Arc<ModelPolicy>) -> BackgroundModels {
         policy,
         warn_tx.clone(),
         models_tx.clone(),
+        false,
     );
     BackgroundModels {
         available,
@@ -1823,12 +1829,12 @@ impl<'t> EventLoop<'t> {
     }
 
     fn refresh_models(&self) {
-        claude_code::refresh_on_next_listing();
         fetch_models(
             Arc::clone(&self.ctx.available_models),
             Arc::clone(&self.ctx.model_policy),
             self.warn_tx.clone(),
             self.models_tx.clone(),
+            true,
         )
         .detach();
     }

@@ -72,6 +72,10 @@ pub trait Provider: Send + Sync {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>>;
 
+    fn list_models_fresh(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        self.list_models()
+    }
+
     /// Fetch provider-side usage quota (remaining percentage / reset times).
     /// `Ok(None)` means the provider does not expose a programmatic usage endpoint.
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
@@ -268,6 +272,7 @@ pub async fn fetch_all_models(
     policy: &ModelPolicy,
     mut on_ready: impl FnMut(ModelBatch),
     on_done: Option<Box<dyn FnOnce() + Send>>,
+    fresh: bool,
 ) {
     let (tx, rx) = flume::unbounded();
     let timeouts = Timeouts::default();
@@ -280,7 +285,12 @@ pub async fn fetch_all_models(
         };
         let tx = tx.clone();
         smol::spawn(async move {
-            let batch = match provider.list_models().await {
+            let listed = if fresh {
+                provider.list_models_fresh().await
+            } else {
+                provider.list_models().await
+            };
+            let batch = match listed {
                 Ok(models) => {
                     let mut specs: Vec<String> =
                         models.iter().map(|m| format!("{slug}/{}", m.id)).collect();

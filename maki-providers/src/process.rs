@@ -1,6 +1,9 @@
 //! Finds a program the way `execvp` does, and signals a child's process
 //! group only while the child's pid still names that group.
 
+#[cfg(target_os = "linux")]
+pub mod guard;
+
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf, absolute};

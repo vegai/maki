@@ -192,6 +192,7 @@ fn discover_models(policy: Arc<ModelPolicy>, tx: WeakSender<Incoming>) {
                 }
             },
             None,
+            false,
         )
         .await;
     })

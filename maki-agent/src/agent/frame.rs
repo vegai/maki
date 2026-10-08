@@ -113,8 +113,10 @@ pub(crate) fn fingerprint(context: &RunContext, mcp: Option<&McpSession>, model:
     let mut hasher = Sha256::new();
     hasher.update(context.tools.definitions().to_string());
     hasher.update([0]);
-    hasher.update(format!("{:?}", context.tools.filter()));
-    hasher.update([0]);
+    if let Some(filter) = context.tools.filter().cache_key() {
+        hasher.update(filter.to_string());
+        hasher.update([0]);
+    }
     hasher.update(&context.authored);
     if mcp.is_some() {
         hasher.update([0]);
@@ -381,6 +383,15 @@ mod tests {
             fingerprint(&context("a", ""), Some(&mcp), &native),
             fingerprint(&context("a", ""), Some(&mcp), &model(CLIENT_MODEL)),
             "a model without tool search shapes the MCP entries another way"
+        );
+    }
+
+    #[test]
+    fn the_default_filter_keeps_the_stored_frame_fingerprint() {
+        const STORED: &str = "679dc2f4a48a473b9e5f948abcf928e3";
+        assert_eq!(
+            fingerprint(&context("a", ""), None, &model(NATIVE_MODEL)),
+            STORED
         );
     }
 

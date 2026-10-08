@@ -1,18 +1,19 @@
-//! Retry only temporary API errors for requests the API did not serve. Other errors can occur
-//! after Claude Code sends a request.
+//! Held tool calls cannot run before a complete reply, so interrupted generations can retry.
 
 use std::io;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{Value, error::Category};
 use thiserror::Error;
 
 const INVALID_REQUEST: &str = "invalid_request";
 pub(crate) const TOO_MANY_REQUESTS: u16 = 429;
 const SERVER_ERROR: u16 = 500;
 const OVERLOADED: u16 = 529;
+const UNKNOWN_ERROR: &str = "unknown";
+const STREAM_IDLE_TIMEOUT: &str = "Stream idle timeout";
 /// Kinds of Claude Code API error messages that a later attempt can fix,
 /// with the status assumed when the message carries none.
 const TEMPORARY_KINDS: &[(&str, u16)] = &[
@@ -24,7 +25,7 @@ const TEMPORARY_KINDS: &[(&str, u16)] = &[
 const SHOWN_JSON_CHARS: usize = 200;
 
 /// Limit JSON size so malformed CLI output cannot flood the error message.
-fn shown(value: &Value) -> String {
+pub(super) fn shown(value: &Value) -> String {
     let text = value.to_string();
     match text.char_indices().nth(SHOWN_JSON_CHARS) {
         Some((cut, _)) => format!("{}…", &text[..cut]),
@@ -125,8 +126,19 @@ pub(crate) enum Error {
     NoStdout,
     #[error("Claude Code closed its stdin")]
     NoStdin,
-    #[error("Claude Code printed a line that is not an event: {0}")]
-    NotAnEvent(String),
+    #[error(
+        "Claude Code printed a line that is not an event: {preview} ({category:?}, {bytes} bytes): {source}"
+    )]
+    NotAnEvent {
+        preview: String,
+        category: Category,
+        bytes: usize,
+        source: serde_json::Error,
+    },
+    #[error(transparent)]
+    Interrupted(Box<Error>),
+    #[error("Claude Code exhausted the context window")]
+    ContextOverflow,
     #[error("Claude Code sent an unknown event type: {}", shown(.0))]
     UnknownEvent(Value),
     #[error("Claude Code sent maki a {} request, which maki does not accept", shown(.0))]
@@ -225,9 +237,6 @@ impl Error {
         }
     }
 
-    /// The status and wait for an error a new attempt can fix: a rate limit,
-    /// an overload or a server error. Login, plan and protocol errors give
-    /// `None`.
     /// The idle limit of a reply that stopped streaming, which maki's retry
     /// loop treats as the anthropic provider's stalled stream.
     pub(crate) fn stalled(&self) -> Option<u64> {
@@ -238,11 +247,15 @@ impl Error {
         }
     }
 
+    /// Login, policy and protocol invariant failures stay terminal.
     pub(crate) fn temporary(&self) -> Option<(u16, Option<Duration>)> {
         match self {
-            Self::ApiRefused { kind, status, .. } => match status {
+            Self::ApiRefused { kind, status, text } => match status {
                 Some(status) if is_temporary_status(*status) => Some((*status, None)),
                 Some(_) => None,
+                None if kind == UNKNOWN_ERROR && text.contains(STREAM_IDLE_TIMEOUT) => {
+                    Some((SERVER_ERROR, None))
+                }
                 None => TEMPORARY_KINDS
                     .iter()
                     .find(|(name, _)| name == kind)
@@ -250,8 +263,29 @@ impl Error {
             },
             Self::CliRetry { status, delay, .. } => Some((status.unwrap_or(SERVER_ERROR), *delay)),
             Self::NoCallsToRun => Some((SERVER_ERROR, None)),
+            Self::Interrupted(_) => Some((SERVER_ERROR, None)),
             Self::WithStderr { error, .. } => error.temporary(),
             _ => None,
+        }
+    }
+
+    pub(crate) fn after_start(self, accepted: bool) -> Self {
+        let interrupted = matches!(
+            &self,
+            Self::WentQuiet
+                | Self::ExitedEarly(_)
+                | Self::ExitedAfterReply(_)
+                | Self::NotAnEvent { .. }
+                | Self::Io { .. }
+                | Self::ExitLate
+                | Self::HandoffLate(_)
+                | Self::ResultLate(_)
+                | Self::ServerLate
+        );
+        if accepted && interrupted {
+            Self::Interrupted(Box::new(self))
+        } else {
+            self
         }
     }
 }
@@ -324,11 +358,28 @@ pub(crate) enum Problem {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value, json};
+    use test_case::test_case;
 
     use super::{Error, SHOWN_JSON_CHARS};
 
+    const MALFORMED: &str = r#"{"type":"assistant","text":"\uD83D"}"#;
     const TOOL: &str = "read";
+
+    #[test_case(true ; "during_a_generation")]
+    #[test_case(false ; "before_init")]
+    fn malformed_output_retries_only_after_init(accepted: bool) {
+        let source = serde_json::from_str::<Value>(MALFORMED).unwrap_err();
+        let error = Error::NotAnEvent {
+            preview: MALFORMED.into(),
+            category: source.classify(),
+            bytes: MALFORMED.len(),
+            source,
+        }
+        .after_start(accepted);
+        assert_eq!(error.temporary().is_some(), accepted);
+        assert!(error.to_string().contains("column"));
+    }
 
     /// A huge value from Claude Code shows only its start, and a short one
     /// shows whole.

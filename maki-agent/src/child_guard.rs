@@ -57,9 +57,7 @@ impl ChildGuard {
     #[cfg(unix)]
     fn signal_kill(&self) {
         if self.child.is_some() {
-            unsafe {
-                libc::killpg(self.pid as i32, libc::SIGKILL);
-            }
+            maki_providers::process::kill_group(self.pid);
         }
     }
 

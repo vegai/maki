@@ -21,6 +21,9 @@ const ASSISTANT_ROLE: &str = "assistant";
 const TOOL_RESULT_ROLE: &str = "tool_result";
 const IS_ERROR: &str = "is_error";
 const TEXT: &str = "text";
+const BATCH_TOOL: &str = "batch";
+const BATCH_CALLS: &str = "tool_calls";
+const BATCH_CALL_TOOL: &str = "tool";
 const TRANSCRIPT_HEADER: &str =
     "maki transcript v1: the conversation so far, oldest first, one JSON value per line";
 
@@ -134,6 +137,21 @@ fn push_line(out: &mut String, value: &Value) {
 ///
 /// Use the tool names visible to the model. Omit thinking because its signature is valid only
 /// for its original request. Reject images after maki's image adaptation.
+fn exposed_input(name: &str, input: &Value) -> Value {
+    let mut input = input.clone();
+    if name == BATCH_TOOL
+        && let Some(calls) = input[BATCH_CALLS].as_array_mut()
+    {
+        for call in calls {
+            if let Some(name) = call[BATCH_CALL_TOOL].as_str() {
+                call[BATCH_CALL_TOOL] =
+                    Value::String(format!("{EXPOSED_PREFIX}{}", server_name(name)));
+            }
+        }
+    }
+    input
+}
+
 pub(crate) fn transcript(messages: &[Message]) -> Result<Vec<String>, Error> {
     let mut blocks = vec![TRANSCRIPT_HEADER.to_owned()];
     for message in messages {
@@ -149,7 +167,7 @@ pub(crate) fn transcript(messages: &[Message]) -> Result<Vec<String>, Error> {
                 } => calls.push(json!({
                     "id": id,
                     "name": format!("{EXPOSED_PREFIX}{}", server_name(name)),
-                    "input": input,
+                    "input": exposed_input(name, input),
                 })),
                 ContentBlock::ToolResult {
                     tool_use_id,
@@ -205,6 +223,7 @@ fn entry_of(message: &Message, text: &[&str], calls: Vec<Value>) -> Value {
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
+    use std::slice;
     use test_case::test_case;
 
     use super::super::error::Error;
@@ -320,6 +339,27 @@ mod tests {
             !text.contains("secret plan"),
             "the transcript must not contain thinking"
         );
+    }
+
+    #[test]
+    fn batch_arguments_use_the_exposed_names_without_changing_history() {
+        let input = json!({ "tool_calls": [{ "tool": "read", "args": { "path": "a.rs" } }, { "tool": LONG_NAME, "args": {} }] });
+        let message = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use("batch_1", "batch", input.clone())],
+            ..Default::default()
+        };
+        let text = transcript(slice::from_ref(&message)).unwrap().concat();
+        let entry: Value = serde_json::from_str(text.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(
+            entry["tool_calls"][0]["input"]["tool_calls"][0]["tool"],
+            "mcp__maki__read"
+        );
+        assert_eq!(
+            entry["tool_calls"][0]["input"]["tool_calls"][1]["tool"],
+            format!("{EXPOSED_PREFIX}{}", server_name(LONG_NAME))
+        );
+        assert_eq!(message.tool_uses().next().unwrap().2, &input);
     }
 
     /// Cache reuse needs identical earlier blocks. New history must append blocks without

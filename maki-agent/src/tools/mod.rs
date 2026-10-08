@@ -30,7 +30,7 @@ use std::time::{Duration, Instant, SystemTime};
 use humantime::format_duration;
 use ignore::WalkBuilder;
 use maki_config::ProjectConfig;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::agent::{CallInstructions, LoadedInstructions};
 use crate::cancel::{CancelMap, CancelToken};
@@ -97,6 +97,23 @@ pub enum ToolFilter {
 }
 
 impl ToolFilter {
+    pub(crate) fn cache_key(&self) -> Option<Value> {
+        fn sorted(names: &[String]) -> Vec<&str> {
+            let mut names: Vec<&str> = names.iter().map(String::as_str).collect();
+            names.sort_unstable();
+            names.dedup();
+            names
+        }
+        match self {
+            Self::All => None,
+            Self::Only { allowed, excluded } => {
+                Some(json!({ "only": sorted(allowed), "excluded": sorted(excluded) }))
+            }
+            Self::AllExcept(excluded) => Some(json!({ "excluded": sorted(excluded) })),
+            Self::Published { base, .. } => base.cache_key(),
+        }
+    }
+
     pub fn matches(&self, name: &str) -> bool {
         self.matches_names(&[name])
     }
@@ -720,7 +737,7 @@ pub mod test_support {
         mock_tool_with_schema(
             name,
             audience,
-            serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false}),
+            json!({"type": "object", "properties": {}, "additionalProperties": false}),
         )
     }
 
@@ -802,7 +819,7 @@ pub mod test_support {
             "guarded mock".into()
         }
         fn schema(&self) -> Value {
-            serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false})
+            json!({"type": "object", "properties": {}, "additionalProperties": false})
         }
         fn parse(
             &self,
@@ -910,10 +927,10 @@ mod tests {
     /// The array a host hands in is the whole answer, but only where names can
     /// be read out of it. Something unreadable must not quietly come out as
     /// "no tools at all".
-    #[test_case(serde_json::json!([{ TOOL_NAME_FIELD: READ_TOOL_NAME }]), true,  false ; "published_names_bind_the_filter")]
-    #[test_case(serde_json::json!([]),                                    false, false ; "empty_array_publishes_nothing")]
-    #[test_case(serde_json::json!([{ "description": "nameless" }]),       true,  true  ; "unreadable_array_falls_back_to_config")]
-    #[test_case(serde_json::json!({}),                                    true,  true  ; "non_array_falls_back_to_config")]
+    #[test_case(json!([{ TOOL_NAME_FIELD: READ_TOOL_NAME }]), true,  false ; "published_names_bind_the_filter")]
+    #[test_case(json!([]),                                    false, false ; "empty_array_publishes_nothing")]
+    #[test_case(json!([{ "description": "nameless" }]),       true,  true  ; "unreadable_array_falls_back_to_config")]
+    #[test_case(json!({}),                                    true,  true  ; "non_array_falls_back_to_config")]
     fn assembled_reads_its_filter_off_the_published_array(
         definitions: Value,
         read_matches: bool,
@@ -966,7 +983,7 @@ mod tests {
             ..Default::default()
         };
         let tools = RequestTools::assembled(
-            serde_json::json!([{ TOOL_NAME_FIELD: WRITE_TOOL_NAME }]),
+            json!([{ TOOL_NAME_FIELD: WRITE_TOOL_NAME }]),
             &LocalTools::default(),
             &config,
             &model,

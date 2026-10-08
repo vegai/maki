@@ -14,7 +14,7 @@ use maki_config::providers::{
 };
 use maki_providers::provider::fetch_all_models;
 use maki_providers::spec::Owner;
-use maki_providers::{ProviderData, Timeouts, catalog_providers, claude_code, refresh_catalog};
+use maki_providers::{ProviderData, catalog_providers, refresh_catalog};
 use maki_providers::{copilot_auth, openai_auth, plugin, xai_auth};
 use maki_storage::StateDir;
 use maki_storage::auth::ProviderCredentials;
@@ -610,15 +610,6 @@ pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMo
                 "catalog refresh failed, keeping existing cache: {e}"
             )),
         }
-        match claude_code::refresh_models(Timeouts::from(&config.provider)) {
-            Some(Ok(count)) => {
-                eprintln!("maki refreshed the claude-code model list ({count} models)")
-            }
-            Some(Err(e)) => refresh_failures.push(format!(
-                "maki cannot refresh the claude-code model list. A saved list remains valid for one day: {e}"
-            )),
-            None => {}
-        }
     }
 
     smol::block_on(fetch_all_models(
@@ -628,10 +619,14 @@ pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMo
                 println!("{model}");
             }
             for warning in batch.warnings {
+                if refresh {
+                    refresh_failures.push(warning.clone());
+                }
                 eprintln!("warning: {warning}");
             }
         },
         None,
+        refresh,
     ));
 
     if !refresh_failures.is_empty() {

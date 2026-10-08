@@ -124,7 +124,7 @@ fn listed(list: &[String], name: &str) -> bool {
     list.iter().any(|entry| entry == name)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Profile {
     pub version: String,
 }
@@ -351,6 +351,10 @@ pub(crate) fn file_conflicts(paths: &[PathBuf]) -> Vec<String> {
 /// `None` only for a claude.ai subscription login without an API key, in the
 /// default permission mode.
 pub(crate) fn account_problem(init: &Value) -> Option<Problem> {
+    account_problem_in(init, &[DEFAULT_MODE.to_owned()])
+}
+
+pub(super) fn account_problem_in(init: &Value, modes: &[String]) -> Option<Problem> {
     let Some(account) = init.get(ACCOUNT).filter(|a| a.is_object()) else {
         return Some(Problem::NoLogin);
     };
@@ -369,7 +373,7 @@ pub(crate) fn account_problem(init: &Value) -> Option<Problem> {
     {
         return Some(Problem::NoSubscription);
     }
-    if init[START_MODE] != DEFAULT_MODE {
+    if !modes.iter().any(|mode| init[START_MODE] == mode.as_str()) {
         return Some(Problem::StartMode(init[START_MODE].clone()));
     }
     None
@@ -405,6 +409,14 @@ fn policy_key_problem(entries: &Map<String, Value>) -> Option<String> {
 /// `None` only when just maki's flags and safe managed keys apply, every
 /// setting is valid, and compaction and every hook are off.
 pub(crate) fn policy_problem(settings: &Value, hooks: &Value) -> Option<Problem> {
+    policy_problem_in(settings, hooks, true)
+}
+
+pub(super) fn policy_problem_in(
+    settings: &Value,
+    hooks: &Value,
+    owns_history: bool,
+) -> Option<Problem> {
     let Some(sources) = settings[SOURCES].as_array() else {
         return Some(Problem::NoSettings);
     };
@@ -431,7 +443,7 @@ pub(crate) fn policy_problem(settings: &Value, hooks: &Value) -> Option<Problem>
             return Some(Problem::Policy(key));
         }
     }
-    if settings[EFFECTIVE][AUTO_COMPACT] != false {
+    if owns_history && settings[EFFECTIVE][AUTO_COMPACT] != false {
         return Some(Problem::OwnCompaction);
     }
     let (Some(listed), Some(policy)) = (hooks[HOOKS].as_array(), hooks[POLICY].as_object()) else {
@@ -458,7 +470,7 @@ pub(crate) struct InitExpect<'a> {
 /// Claude Code ships its own plugins, and a version or a feature gate can add
 /// one. The other checks cover what such a plugin could change: the tools, the
 /// MCP servers, the hooks and the settings.
-fn plugins_problem(plugins: &Value) -> Option<Problem> {
+pub(super) fn plugins_problem(plugins: &Value) -> Option<Problem> {
     let Some(plugins) = plugins.as_array() else {
         return Some(Problem::NoPlugins);
     };
@@ -477,13 +489,31 @@ fn plugins_problem(plugins: &Value) -> Option<Problem> {
 
 /// The API key, mode, tool catalog and handoff connection must all satisfy the route checks.
 pub(crate) fn init_problem(event: &Value, expect: &InitExpect<'_>) -> Option<Problem> {
+    init_problem_in(
+        event,
+        &expect.profile.version,
+        expect.cwd,
+        expect.tools,
+        &[DEFAULT_MODE.to_owned()],
+        Some(expect.server),
+    )
+}
+
+pub(super) fn init_problem_in(
+    event: &Value,
+    version: &str,
+    cwd: &Path,
+    expected_tools: &HashSet<String>,
+    modes: &[String],
+    handoff: Option<&str>,
+) -> Option<Problem> {
     if event[API_KEY_SOURCE] != RULES.no_key_source.as_str() {
         return Some(Problem::StartedWithKey(event[API_KEY_SOURCE].clone()));
     }
-    if event[VERSION] != expect.profile.version {
+    if event[VERSION] != version {
         return Some(Problem::OtherVersion(event[VERSION].clone()));
     }
-    if event[RUN_MODE] != DEFAULT_MODE {
+    if !modes.iter().any(|mode| event[RUN_MODE] == mode.as_str()) {
         return Some(Problem::RunMode(event[RUN_MODE].clone()));
     }
     let Some(tools) = event[TOOLS].as_array() else {
@@ -491,29 +521,31 @@ pub(crate) fn init_problem(event: &Value, expect: &InitExpect<'_>) -> Option<Pro
     };
     if let Some(tool) = tools.iter().find(|tool| {
         tool.as_str()
-            .is_none_or(|name| !expect.tools.contains(name))
+            .is_none_or(|name| !expected_tools.contains(name))
     }) {
         return Some(Problem::ExtraTool(tool.clone()));
     }
-    if let Some(missing) = expect
-        .tools
+    if let Some(missing) = expected_tools
         .iter()
         .find(|name| !tools.iter().any(|tool| tool == name.as_str()))
     {
         return Some(Problem::MissingTool(missing.clone()));
     }
-    let servers = event[MCP_SERVERS]
-        .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    match servers {
-        [server] if server[NAME] == expect.server && server[STATUS] == CONNECTED => {}
-        _ => return Some(Problem::HandoffServer(event[MCP_SERVERS].clone())),
+    let Some(servers) = event[MCP_SERVERS].as_array() else {
+        return Some(Problem::HandoffServer(event[MCP_SERVERS].clone()));
+    };
+    let connected = match (handoff, servers.as_slice()) {
+        (Some(name), [server]) => server[NAME] == name && server[STATUS] == CONNECTED,
+        (None, []) => true,
+        _ => false,
+    };
+    if !connected {
+        return Some(Problem::HandoffServer(event[MCP_SERVERS].clone()));
     }
     if let Some(problem) = plugins_problem(&event[PLUGINS]) {
         return Some(problem);
     }
-    if event[CWD].as_str().map(Path::new) != Some(expect.cwd) {
+    if event[CWD].as_str().map(Path::new) != Some(cwd) {
         return Some(Problem::OtherDir(event[CWD].clone()));
     }
     None
