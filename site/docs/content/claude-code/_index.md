@@ -51,7 +51,9 @@ Before maki sends a prompt, it validates the Claude Code version and your settin
 - No hook is active.
 - The checks accept the [policy](#what-claude-sees).
 
-If the run's answers fail the same checks, maki stops it at once.
+If the run's answers fail the same checks, maki stops it at once. The provider and plugin share the Rust launch checks. maki also checks that the reply names the model your account resolved.
+
+maki reuses a validated version while the executable is unchanged. Every process checks its init version, and each request validates the current login and policy.
 
 The tool view of a finished call shows the login and the token usage. It also shows your usage against the plan's 5-hour and 7-day limits. It lists each tool call that Claude Code did not allow. "maki found no route conflict" means that the checks passed. [Limits](#limits) says what maki cannot see about billing.
 
@@ -78,7 +80,7 @@ claude_code = { enabled = true, config_dir = "/home/me/.claude-maki" },
 checkout --snapshot--> artifact --claude -p--> changes --claude_code_import--> checkout
 ```
 
-1. maki takes a snapshot of the session's directory in a new artifact directory. It copies tracked files from disk, including uncommitted edits. The call can list additional untracked paths in `include`. The snapshot excludes `.env*`, `secrets/`, `deny_read` paths, `.claude`, submodules and external links. The reply names skipped submodules.
+1. maki takes a snapshot of the session's directory in a new artifact directory. It copies tracked files from disk, including uncommitted edits. The call can list additional untracked paths in `include`. The snapshot excludes `.env*`, `secrets/`, `deny_read` paths, `.claude`, `.maki`, sparse-checkout omissions, submodules and external links. Protected agent directory names are checked without regard to case. The reply names skipped submodules.
 
    A secret under another name, such as a tracked `.npmrc`, enters the snapshot. Add it to `deny_read`. The snapshot gets a fresh git repository. If a file changes during the copy, the call stops.
 
@@ -86,15 +88,17 @@ checkout --snapshot--> artifact --claude -p--> changes --claude_code_import--> c
 
    Untracked dependency files stay outside the import, including files that `prepare` creates. Preparation changes form the worker baseline even if the command fails or times out. The worker starts only after maki records that baseline.
 
-3. Claude works in the snapshot. Its shell commands run in the Claude Code sandbox, with bubblewrap on Linux and no network access. The shell can write only to the snapshot and a temporary directory beside it. It cannot read the checkout, maki state and config, other artifacts, logins or common credentials such as `~/.ssh`.
+3. Claude works in the snapshot. Its shell commands run in the Claude Code sandbox, with bubblewrap on Linux and no network access. The shell can write only to the snapshot and a temporary directory beside it. It cannot read the checkout, maki state and config, other artifacts, logins or common credentials such as `~/.ssh`, git credentials and keyrings. Add home-relative paths with `deny_read_home`. Other home files remain readable.
 
 4. Claude Code passes its environment to the shell. The `code` profile refuses to start when `CLAUDE_CODE_OAUTH_TOKEN` is set. It also refuses `HTTP_PROXY` or `HTTPS_PROXY` URLs that contain a login. Use `claude auth login` for authentication.
 
-5. maki lists the changes. `claude_code_import` applies them with one `bash` command that you approve. It validates all target files before any change. A conflict at that point stops the import.
+5. After the worker exits, maki moves root and nested Git metadata into the artifact's `git-metadata` directory. Ordinary files stay in the snapshot and remain eligible for import. Empty nested repositories do not prevent collection. The change report gives a hardened diff command.
 
-   The artifact's `originals` folder keeps hard links to the validated files. Its `displaced` folder keeps removed files separately for each import attempt. These backups preserve writes through open descriptors and later atomic editor saves. A save after removal can stop the import partway. The reply lists applied changes.
+6. maki lists the changes. `claude_code_import` applies them with one `bash` command that you approve. It validates all target files before any change. A conflict at that point stops the import.
 
-   A retry preserves earlier backups. It stops if an existing backup no longer refers to the checkout file. Apply symlink, submodule, file-type and non-UTF-8 path changes manually from the artifact.
+   The artifact's `originals` folder keeps hard links to the validated files. Its `displaced` folder keeps removed files. Both folders separate backups by import attempt. These backups preserve writes through open descriptors and later atomic editor saves. A save after removal can stop the import partway. The reply lists applied changes.
+
+   A retry preserves earlier backups. Each retry uses a new backup directory. Approval, import and manifest updates hold an artifact lock. Concurrent imports refuse to start, and expiry skips the artifact while that lock is held. Apply symlink, submodule, file-type and non-UTF-8 path changes manually from the artifact.
 
 Artifacts live in the maki state directory, or in `artifact_dir`, which must be an absolute path outside the checkout. To import replacements or deletions, choose an artifact directory on the checkout's filesystem. If maki cannot make hard links, the import stops before any checkout change. The next coding call removes every artifact that has not been written for `artifact_ttl_hours`.
 
@@ -112,7 +116,7 @@ Each model gets the context window Claude Code opens for it. maki reads the wind
 
 Claude Code's own tools are off. When the model calls a tool, maki stops Claude Code and runs the call with its own tools and your permission rules. It sends the results with the next request. Claude Code's own retries are off too.
 
-maki retries rate limits, overloads and server errors as it does for the anthropic provider. It also retries a reply that stopped to call tools but called none. No output for `stream_timeout_secs` causes a stream timeout and a retry. Each turn starts three `claude` processes, so this provider is slower than the anthropic one.
+maki retries rate limits, overloads and server errors as it does for the anthropic provider. It also retries interrupted generations and a reply that stopped to call tools but called none. Held tool calls run only after the whole request succeeds. Login, policy, refusal and invariant errors stop the turn. No output for `stream_timeout_secs` causes a stream timeout and a retry. Each turn starts a policy probe and a worker. A changed executable also gets a version check, so this provider is slower than the anthropic one.
 
 Each turn runs on your subscription login, and maki counts it as $0. It shows the API list price of the same tokens beside it, such as `$0.000 (~$0.123 Claude subscription)`.
 
@@ -122,7 +126,7 @@ All options live under `plugins.claude_code` in [configuration](/docs/configurat
 
 ## Limits
 
-- The plugin and provider run only on Linux. They need Claude Code 2.1.284 or newer. Each call validates the installed Claude Code version.
+- The plugin and provider run only on Linux. They need Claude Code 2.1.284 or newer. Each call validates the current CLI contract. An unchanged executable reuses its version check.
 - maki cannot see how Anthropic bills a call or a turn. Past your plan's limits, Anthropic can bill it as extra usage, which `/usage` shows. The USD value maki shows is the API list price of the tokens.
 - A plugin call has 30 seconds to start Claude Code. Then the call's `timeout` applies, 600 seconds by default. Claude Code tools can run for a long time without output.
 - If your organization policy keeps a hook on, the hook runs once in the empty directory before maki stops the call. The hook's output remains there. The reply names the directory.
@@ -131,4 +135,4 @@ All options live under `plugins.claude_code` in [configuration](/docs/configurat
 - When Anthropic's safety classifier stops a provider reply, the turn stops with its explanation. maki does not retry it.
 - In a plugin call Claude uses Claude Code's own tools, so maki's [token economy](/docs/token-economy/) does not apply. Each call starts a fresh `claude`. The prompt must contain all data necessary for the task.
 - A coding worker's shell has no network access. Fetch what it needs in `prepare`, which runs as you, outside the sandbox.
-- The changes exclude new files that match your `.gitignore` and anything the worker writes to a path named `.claude`.
+- The changes exclude new files that match your `.gitignore` and anything the worker writes to a path named `.claude` or `.maki`, including case variants.

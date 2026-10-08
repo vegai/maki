@@ -261,6 +261,7 @@ maki.setup({
 | `artifact_ttl_hours` | integer | `24` | 1 | Remove a coding artifact after this many hours without a write. |
 | `config_dir` | string | `""` | - | Absolute path of a Claude Code config directory for maki, in place of `$CLAUDE_CONFIG_DIR` or `~/.claude`. Use it to give maki a different Claude login. |
 | `deny_read` | string | `""` | - | Extra paths Claude cannot read, relative to the session's directory and comma-separated, for example `config/prod.yml,certs/**`. As in `.gitignore`, a pattern without a `/` matches at any depth. They add to the default `.env*` and `secrets/` rules, and coding snapshots never contain them. |
+| `deny_read_home` | string | `""` | - | Extra home-relative files or directories the coding shell cannot read, comma-separated. Common credential stores are denied by default. Other home files remain readable. |
 | `dependencies` | string | `""` | - | Untracked directories a coding snapshot copies from the project, comma-separated, for example `node_modules`. The copy is a copy-on-write clone when the filesystem supports it. |
 | `executable` | string | `"claude"` | - | The Claude Code executable. |
 | `max_concurrent` | integer | `2` | 1 | The maximum number of plugin calls that run Claude Code at the same time. The claude-code provider has its own limit with the same value, so up to twice this many can run together. |
