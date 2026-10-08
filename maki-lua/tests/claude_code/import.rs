@@ -31,7 +31,7 @@ esac
 /// Runs the installed tool, but fails when its arguments contain @FAIL_ON@.
 const FAILS: &str = r#"#!/bin/sh
 case " $* " in
-*"@FAIL_ON@"*) exit 1 ;;
+*"@FAIL_ON@"*) echo "@CAUSE@" >&2; exit 1 ;;
 *) exec "@REAL@" "$@" ;;
 esac
 "#;
@@ -80,6 +80,9 @@ const ADDED: &str = "src/new/added.rs";
 /// Names that survive only with proper shell quoting: a quote, a command
 /// substitution, a space, a newline and a glob.
 const HOSTILE_EDITED: &str = "src/it's $(touch pwned) *\nlib.rs";
+const BIDI_EDITED: &str = "src/a\u{202e}b\u{200b}.rs";
+const BIDI_ADDED: &str = "src/c\u{2066}d\u{e0061}.rs";
+const LINK_FAILURE: &str = "ln: fixture preservation failure";
 const HOSTILE_ADDED: &str = "src/a 'b' $(touch pwned)/*\nadded.rs";
 /// A temporary file from another import of the same artifact, beside the
 /// target.
@@ -211,6 +214,7 @@ impl Import {
     fn failing(&self, tool: &str, fail_on: &Path) {
         let script = FAILS
             .replace("@FAIL_ON@", &fail_on.to_string_lossy())
+            .replace("@CAUSE@", LINK_FAILURE)
             .replace("@REAL@", &on_path(tool).to_string_lossy());
         executable(&self.tools, tool, &script);
     }
@@ -380,7 +384,7 @@ fn a_link_that_fails_partway_keeps_what_landed_and_every_original() {
     assert!(!out.status.success());
     assert_eq!(fs::read_to_string(import.target()).unwrap(), RECORDED);
     assert!(!added.exists());
-    let kept = import.artifact.join(ORIGINALS).join(TARGET);
+    let kept = import.artifact.join(ORIGINALS).join(STAGE).join(TARGET);
     assert_eq!(fs::read_to_string(kept).unwrap(), ORIGINAL);
 }
 
@@ -423,7 +427,7 @@ fn a_write_through_a_descriptor_opened_before_is_kept_in_the_artifact(hold: Hold
     assert!(output.status.success(), "{stderr}");
     assert_eq!(fs::read_to_string(import.target()).unwrap(), RECORDED);
     assert_eq!(
-        fs::read_to_string(import.artifact.join(ORIGINALS).join(TARGET)).unwrap(),
+        fs::read_to_string(import.artifact.join(ORIGINALS).join(STAGE).join(TARGET)).unwrap(),
         NEWER
     );
 }
@@ -446,7 +450,7 @@ fn an_atomic_editor_save_survives_import(hold: Hold, succeeds: bool) {
     };
     assert_eq!(fs::read_to_string(saved).unwrap(), NEWER);
     assert_eq!(
-        fs::read_to_string(import.artifact.join(ORIGINALS).join(TARGET)).unwrap(),
+        fs::read_to_string(import.artifact.join(ORIGINALS).join(STAGE).join(TARGET)).unwrap(),
         ORIGINAL
     );
 }
@@ -463,6 +467,7 @@ fn a_failed_hard_link_stops_before_any_checkout_write() {
 
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains(CANNOT_PRESERVE));
+    assert!(String::from_utf8_lossy(&output.stderr).contains(LINK_FAILURE));
     writer.write_all(NEWER.as_bytes()).unwrap();
     writer.set_len(NEWER.len() as u64).unwrap();
     assert_eq!(fs::read_to_string(import.target()).unwrap(), NEWER);
@@ -485,11 +490,74 @@ fn a_retry_cannot_overwrite_a_preserved_save() {
     assert!(!output.status.success());
     assert_eq!(fs::read_to_string(import.target()).unwrap(), ORIGINAL);
     for saved in [
-        import.artifact.join(ORIGINALS).join(TARGET),
+        import.artifact.join(ORIGINALS).join(STAGE).join(TARGET),
         import.artifact.join(DISPLACED).join(STAGE).join(TARGET),
     ] {
         assert_eq!(fs::read_to_string(saved).unwrap(), NEWER);
     }
+}
+
+const RETRY_STAGE: &str = "stage.d4e5f6";
+
+#[test]
+fn a_new_attempt_can_import_without_overwriting_earlier_backups() {
+    let import = Import::new(LAST_CHECK);
+    import.failing("ln", Path::new(NEW_FILE_PREFIX));
+    let child = import.start_held();
+    fs::write(import.target(), NEWER).unwrap();
+    assert!(!import.release(child).status.success());
+    fs::write(import.target(), ORIGINAL).unwrap();
+    fs::remove_file(import.tools.join("ln")).unwrap();
+    fs::create_dir(import.artifact.join(RETRY_STAGE)).unwrap();
+    let output = import.run(&import.script.replace(STAGE, RETRY_STAGE));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read_to_string(import.target()).unwrap(), RECORDED);
+    assert_eq!(
+        fs::read_to_string(import.artifact.join(ORIGINALS).join(STAGE).join(TARGET)).unwrap(),
+        NEWER
+    );
+    assert_eq!(
+        fs::read_to_string(
+            import
+                .artifact
+                .join(ORIGINALS)
+                .join(RETRY_STAGE)
+                .join(TARGET)
+        )
+        .unwrap(),
+        ORIGINAL
+    );
+}
+
+#[test]
+fn invisible_names_are_visible_in_approval_and_keep_their_bytes_in_a_c_locale() {
+    let import = Import::named(STAGING, BIDI_EDITED, BIDI_ADDED);
+    for hidden in ['\u{202e}', '\u{200b}', '\u{2066}', '\u{e0061}'] {
+        assert!(!import.script.contains(hidden));
+    }
+    fs::File::create(import.marker("release")).unwrap();
+    let output = import
+        .command(&import.script)
+        .env("LC_ALL", "C")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(import.project.join(BIDI_EDITED)).unwrap(),
+        RECORDED
+    );
+    assert_eq!(
+        fs::read_to_string(import.project.join(BIDI_ADDED)).unwrap(),
+        RECORDED
+    );
 }
 
 /// A kill skips the command's cleanup while its new files wait beside their

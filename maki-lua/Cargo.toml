@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+tempfile = { workspace = true }
 arc-swap = { workspace = true }
 base64 = { workspace = true }
 image = { workspace = true, features = ["jpeg", "gif", "webp"] }
@@ -93,7 +94,6 @@ image = { workspace = true }
 jiff = { workspace = true }
 maki-agent = { workspace = true }
 maki-providers = { workspace = true, features = ["test-support"] }
-tempfile = { workspace = true }
 test-case = { workspace = true }
 
 [[bench]]

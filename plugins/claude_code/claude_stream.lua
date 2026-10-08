@@ -57,52 +57,12 @@ local function line_start(line)
   return cut and line:sub(1, cut - 1) or line
 end
 
-local function init_problem(ev, expect)
-  -- `none` also covers a bearer token or a cloud provider, which the child
-  -- environment and the `initialize` response have already ruled out.
-  if ev.apiKeySource ~= RULES.no_key_source then
-    return "Claude Code started with API key source "
-      .. tostring(ev.apiKeySource)
-      .. " instead of the subscription login"
+local function init_problem(line, expect)
+  local modes = {}
+  for mode in pairs(expect.permission_modes) do
+    modes[#modes + 1] = mode
   end
-  if ev.claude_code_version ~= expect.cli.version then
-    return "Claude Code reported version "
-      .. tostring(ev.claude_code_version)
-      .. ", but maki checked version "
-      .. expect.cli.version
-      .. " before the start"
-  end
-  if not expect.permission_modes[ev.permissionMode] then
-    return "Claude Code runs in permission mode " .. tostring(ev.permissionMode)
-  end
-  if not launch.is_list(ev.tools) then
-    return "the init event has no tool list"
-  end
-  local expected, offered = launch.set_of(expect.tools), launch.set_of(ev.tools)
-  for _, tool in ipairs(ev.tools) do
-    if not expected[tool] then
-      return "Claude Code has the tool " .. tostring(tool)
-    end
-  end
-  for _, tool in ipairs(expect.tools) do
-    if not offered[tool] then
-      return "Claude Code does not have the tool " .. tool
-    end
-  end
-  if not launch.is_list(ev.mcp_servers) then
-    return "the init event has no MCP server list"
-  end
-  if #ev.mcp_servers > 0 then
-    return "Claude Code loaded MCP servers"
-  end
-  local plugin_problem = launch.plugins_problem(ev.plugins)
-  if plugin_problem then
-    return plugin_problem
-  end
-  if ev.cwd ~= expect.cwd then
-    return "Claude Code runs in " .. tostring(ev.cwd) .. ", and not in " .. expect.cwd
-  end
-  return nil
+  return maki.claude_code.init_problem(line, expect.cli.version, expect.cwd, expect.tools, modes)
 end
 
 local function count(n)
@@ -173,7 +133,9 @@ function Stream:feed(line)
   end
   if ev.type == CONTROL_RESPONSE and type(ev.response) == "table" then
     local r = ev.response
-    return { control = { id = r.request_id, ok = r.subtype == SUCCESS, response = r.response, error = r.error } }
+    return {
+      control = { id = r.request_id, ok = r.subtype == SUCCESS, response = r.response, error = r.error, json = line },
+    }
   end
   if ev.type == RATE_LIMIT_EVENT and type(ev.rate_limit_info) == "table" then
     self.rate_limit = ev.rate_limit_info
@@ -184,7 +146,7 @@ function Stream:feed(line)
     return { stop = "Claude Code started a " .. tostring(ev.hook_event) .. " hook" }
   end
   if ev.type == SYSTEM and ev.subtype == INIT then
-    local problem = init_problem(ev, self.expect)
+    local problem = init_problem(line, self.expect)
     if problem then
       self.accepted = false
       return { stop = problem }
@@ -195,10 +157,28 @@ function Stream:feed(line)
   if not MODEL_OUTPUT[ev.type] then
     return nil
   end
+  if
+    not self.accepted
+    and ev.type == RESULT
+    and (ev.is_error or type(ev.subtype) == "string" and ev.subtype:match("^error_"))
+  then
+    self.result = ev
+    return { stop = self:outcome() }
+  end
   if not self.accepted then
     return { stop = "Claude Code sent " .. ev.type .. " output before its init event" }
   end
+  local message = ev.type == STREAM_EVENT and ev.event and ev.event.message or ev.message
+  if self.expect.model and type(message) == "table" and message.model then
+    if not maki.claude_code.same_model(message.model, self.expect.model) then
+      return { stop = "Claude Code ran " .. tostring(message.model) .. " for " .. self.expect.model }
+    end
+    self.model_checked = true
+  end
   if ev.type == RESULT then
+    if self.expect.model and not self.model_checked and not ev.is_error then
+      return { stop = "Claude Code did not report the model that ran" }
+    end
     self.result = ev
     return nil
   end

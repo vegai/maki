@@ -14,7 +14,7 @@ local Stream = require("claude_stream")
 local workspace = require("claude_workspace")
 
 local MODELS = { "sonnet", "opus", "haiku", "fable" }
-local PROBE_DIR_TEMPLATE = "maki-claude-code.XXXXXXXX"
+local PROBE_DIR_TEMPLATE = "maki-claude-code.XXXXXX"
 local DEFAULT_TMP_DIR = "/tmp"
 local MS_PER_SEC = jobs.MS_PER_SEC
 -- A stalled startup must not occupy a request slot indefinitely. Apply this limit to helpers
@@ -87,6 +87,11 @@ local opts = maki.api.register_options(output_limits.extend({
     desc = "Extra paths Claude cannot read, relative to the session's directory and comma-separated, for "
       .. "example `config/prod.yml,certs/**`. As in `.gitignore`, a pattern without a `/` matches at any "
       .. "depth. They add to the default `.env*` and `secrets/` rules, and coding snapshots never contain them.",
+  },
+  deny_read_home = {
+    default = "",
+    desc = "Extra home-relative files or directories the coding shell cannot read, comma-separated. "
+      .. "Common credential stores are denied by default. Other home files remain readable.",
   },
   dependencies = {
     default = "",
@@ -222,7 +227,7 @@ local function take_answer(answers, control, worker, confine)
   if not control.ok then
     return "Claude Code rejected the " .. tostring(control.id) .. " request: " .. tostring(control.error), false
   end
-  answers[control.id] = control.response or false
+  answers[control.id] = control.json or control.response or false
   for _, request in ipairs(launch.HANDSHAKE) do
     if answers[request.id] == nil then
       return nil, false
@@ -231,38 +236,21 @@ local function take_answer(answers, control, worker, confine)
   return launch.handshake_problem(answers, opts.deny_read, worker, confine), true
 end
 
--- `TMPDIR` is the user's, so its target is checked first. A cancel never
--- stops `mktemp`, which could leave a directory behind with no known name.
-local function probe_dir(env, spec, call)
-  local base_out, base_err = call:run_quick({ "pwd", "-P" }, { env = env, cwd = env.TMPDIR or DEFAULT_TMP_DIR })
-  local base = trimmed(base_out)
+-- A resolved TMPDIR must stay outside the project.
+local function probe_dir(env, spec)
+  local base, base_err = maki.uv.fs_realpath(env.TMPDIR or DEFAULT_TMP_DIR)
   if not base then
-    return nil, base_err or "maki cannot resolve the temporary directory"
+    return nil, base_err
   end
   if launch.in_checkout(base, spec) then
     return nil, "the temporary directory " .. base .. " is in the project. Set TMPDIR to a different directory."
   end
-  local created
-  local unnamed = "`mktemp -d` gave no directory name, and it can have left a directory in " .. base
-  local argv = { "mktemp", "-d", maki.fs.joinpath(base, PROBE_DIR_TEMPLATE) }
-  local ok, code = pcall(call.run_to_end, call, argv, { env = env, clear_env = true }, {
-    keep_on_cancel = true,
-    leftover = function(lines)
-      created = trimmed(lines[1])
-      if call.answered and not created then
-        maki.notify(ERROR_PREFIX .. unnamed, "warn")
-      end
-      return call.answered and created or nil
-    end,
-  })
-  if not ok then
-    return nil, "maki cannot run `mktemp`: " .. tostring(code)
-  end
-  if code ~= 0 or not created then
-    return nil, unnamed
+  local created, err = maki.uv.fs_mkdtemp(maki.fs.joinpath(base, PROBE_DIR_TEMPLATE))
+  if not created then
+    return nil, err
   end
   if launch.in_checkout(created, spec) or launch.within(spec.cwd, created) then
-    call:remove_dir_now(created, env)
+    maki.uv.fs_rmdir(created)
     return nil, "the probe directory " .. created .. " is in the project, or contains it"
   end
   return created
@@ -274,6 +262,7 @@ local function claude_job_opts(cwd, env, stderr_tail)
     env = env,
     clear_env = true,
     stdin = "pipe",
+    guard = true,
     on_stderr = function(_, line)
       jobs.keep_tail(stderr_tail, line)
     end,
@@ -286,7 +275,7 @@ end
 -- Keep the probe outside a coding artifact. Refusal removes that artifact, but a managed
 -- hook's output must remain available.
 local function probe(call, spec, argv, env, confine)
-  local dir, dir_err = probe_dir(spec.env, spec, call)
+  local dir, dir_err = probe_dir(spec.env, spec)
   if not dir then
     return dir_err
   end
@@ -323,14 +312,14 @@ local function probe(call, spec, argv, env, confine)
     end,
   }, STARTUP_MS)
   if not ok then
-    call:remove_dir_now(dir, env)
+    call:remove_dir(dir)
     return "maki cannot start Claude Code: " .. tostring(code)
   end
   if run_error then
     return "maki cannot run Claude Code checks: " .. run_error
   end
   if problem then
-    return problem
+    return jobs.with_stderr(problem, stderr_tail)
   end
   if not code then
     return "Claude Code did not send the responses to its checks in " .. STARTUP_TIMEOUT_SECS .. " s"
@@ -461,11 +450,8 @@ local function change_report(call, artifact, project)
     if more > 0 then
       lines[#lines + 1] = "and " .. more .. " more"
     end
-    lines[#lines + 1] = "Examine them in "
-      .. artifact.snapshot
-      .. ", then apply them with claude_code_import, id "
-      .. artifact.id
-      .. "."
+    lines[#lines + 1] = "Review the recorded changes with: " .. workspace.diff_command(artifact)
+    lines[#lines + 1] = "Apply them with claude_code_import, id " .. artifact.id .. "."
   end
   if artifact.prepare_err then
     lines[#lines + 1] = "the prepare command stopped with an error: " .. artifact.prepare_err
@@ -489,7 +475,7 @@ local function preflight(input, ctx, call)
   local home = maki.uv.os_homedir()
   local plan, plan_err, home_credentials
   if worker == launch.WORKERS[CODE_PROFILE] then
-    home_credentials, plan_err = launch.home_credentials(home)
+    home_credentials, plan_err = launch.home_credentials(home, opts.deny_read_home)
     if not home_credentials then
       return nil, plan_err
     end
@@ -540,11 +526,23 @@ local function preflight(input, ctx, call)
       "maki ignores these Claude Code settings, and it cannot ignore them safely:\n" .. table.concat(conflicts, "\n")
   end
 
-  local version, version_err = call:run_quick({ executable, "--version" }, { env = env })
-  local cli, cli_err = launch.checked_cli(version, maki.uv.os_uname().sysname)
-  if not cli then
-    return nil, version_err or cli_err
+  local version, version_err = maki.claude_code.cached_version(executable)
+  if not version and not version_err then
+    local dir, dir_err = probe_dir(env, { cwd = cwd, checkout_dirs = local_dirs, git_dir = git_dir })
+    if not dir then
+      return nil, dir_err
+    end
+    local output, output_err = call:run_quick({ executable, "--version" }, { cwd = dir, env = env })
+    call:remove_dir(dir)
+    if not output then
+      return nil, output_err
+    end
+    version, version_err = maki.claude_code.cache_version(executable, output, maki.uv.os_uname().sysname)
   end
+  if not version then
+    return nil, version_err
+  end
+  local cli = { version = version }
   return {
     model = model,
     worker = worker,
@@ -564,12 +562,12 @@ local function preflight(input, ctx, call)
 end
 
 local function open_artifact(call, spec)
-  local root, root_err = snapshot.resolve_root(call, spec.plan.root, spec)
+  local root, root_err = snapshot.resolve_root(spec.plan.root, spec)
   if not root then
     return nil, "maki cannot make a coding artifact: " .. root_err
   end
   snapshot.sweep(root, opts.artifact_ttl_hours)
-  local artifact, allocate_err = snapshot.allocate(call, root, spec.env, SNAPSHOT_TIMEOUT_MS)
+  local artifact, allocate_err = snapshot.allocate(root, spec.env, SNAPSHOT_TIMEOUT_MS)
   if not artifact then
     return nil, "maki cannot make a coding artifact: " .. allocate_err
   end
@@ -660,7 +658,7 @@ function Run:finish(outcome)
   end
   self.finished = true
   if self.clock then
-    maki.fn.jobstop(self.clock)
+    self.clock:stop()
   end
   self.resolve(outcome)
 end
@@ -675,6 +673,7 @@ function Run:stop(reason)
   if self.finished or self.stopped then
     return
   end
+  maki.claude_code.invalidate_version(self.spec.executable)
   self.stopped = reason
   self.route = ROUTE_UNCONFIRMED:format(self.spec.cli.version)
   maki.fn.jobstop(self.job_id)
@@ -694,6 +693,11 @@ function Run:on_answer(control)
     self:stop(problem)
     return
   elseif not complete then
+    return
+  end
+  self.stream.expect.model = launch.resolved_model(self.answers.account, self.spec.model)
+  if not self.stream.expect.model then
+    self:stop("Claude Code did not resolve the requested model " .. self.spec.model)
     return
   end
   if self:send(launch.user_message(self.task, self.spec.instructions)) then
@@ -722,8 +726,8 @@ function Run:on_line(line)
   elseif step.init and not self.prompted then
     self:stop(UNCHECKED_START)
   elseif step.init then
-    maki.fn.jobstop(self.clock)
-    local subscription = " (" .. self.answers.account.account.subscriptionType .. ")"
+    self.clock:stop()
+    local subscription = " (" .. launch.response(self.answers.account).account.subscriptionType .. ")"
     self.route = ROUTE_OK:format(subscription, self.spec.cli.version)
     self.view:set_header(dim_lines(self:header_lines()))
   elseif step.lines then
@@ -739,6 +743,12 @@ end
 
 function Run:on_exit(code)
   if self.finished then
+    if self.artifact and self.prompted then
+      local problem = snapshot.sanitize(self.artifact)
+      if problem then
+        maki.notify(ERROR_PREFIX .. "maki could not secure the retained snapshot: " .. problem, "error")
+      end
+    end
     return
   end
   if self.stopped then
@@ -790,15 +800,11 @@ function Run:start(argv, cwd, env, task)
   maki.async.on_cancel(function(reason)
     self:on_cancel(reason)
   end)
-  -- A clock job, for the reason claude_jobs.lua gives.
-  local startup = jobs.clock(STARTUP_TIMEOUT_SECS)
-  self.clock = self.call:spawn(startup, { env = self.spec.env, clear_env = true }, {
-    on_exit = function(_, code)
-      if not self.stream.accepted then
-        self:stop(jobs.clock_problem(code) or "no init event in " .. STARTUP_TIMEOUT_SECS .. " s")
-      end
-    end,
-  })
+  self.clock = maki.defer_fn(function()
+    if not self.stream.accepted then
+      self:stop("no init event in " .. STARTUP_TIMEOUT_SECS .. " s")
+    end
+  end, STARTUP_MS)
   -- A send error would finish the call before the wait starts, so the
   -- handshake is sent from inside the wait.
   return maki.async.await(1, function(done)

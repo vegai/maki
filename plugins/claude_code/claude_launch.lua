@@ -40,6 +40,9 @@ function M.is_list(value)
   if type(value) ~= "table" then
     return false
   end
+  if next(value) == nil and getmetatable(value) == nil then
+    return false
+  end
   local count = 0
   for _ in pairs(value) do
     count = count + 1
@@ -63,28 +66,14 @@ end
 -- Limits for a call's `timeout` and for the option.
 M.MIN_TIMEOUT_SECS = 30
 M.MAX_TIMEOUT_SECS = 1800
--- The minimum version supplies the necessary protocol. Each call must validate every login,
--- setting, hook, tool and plugin input.
---
--- Run the live tests in `maki-lua/tests/claude_code/qualify.rs` to qualify a new CLI version.
-local MINIMUM_VERSION = table.concat(RULES.minimum_version, ".")
--- `uname` names in lower case. Path rules, symlinks and process cleanup
--- differ per OS.
-local SYSTEMS = M.set_of(RULES.systems)
 -- The process that runs the task answers these requests, so the answers
 -- cover every settings source it merged, managed policy included.
 M.HANDSHAKE = RULES.handshake
 
 local STREAM_JSON = "stream-json"
--- How much of a JSON value a message shows, as in the provider.
-local SHOWN_JSON_CHARS = 200
 local EMPTY_MCP_CONFIG = '{"mcpServers":{}}'
 local INSTRUCTIONS_HEADING = "The instructions maki loaded for this task, from the project and the user:"
 
--- Only these variables reach the child, so an exported ANTHROPIC_API_KEY
--- cannot move it off the subscription. Names compare in upper case, so
--- `https_proxy` passes too.
-local PASSED_ENV = M.set_of(RULES.passed_env)
 -- Claude Code passes its environment to Bash, in the sandbox too (tested on
 -- 2.1.284), and the sandbox cannot drop a variable.
 local SHELL_TOOL = "Bash"
@@ -92,16 +81,6 @@ local SHELL_VISIBLE_LOGIN = "CLAUDE_CODE_OAUTH_TOKEN"
 -- A proxy URL can carry a user and a password that Claude Code needs to
 -- reach the API, so maki cannot strip them.
 local PROXY_ENV = { HTTP_PROXY = true, HTTPS_PROXY = true }
-
--- Variables that select a route. Every name with a prefix in
--- `route_env_prefixes` is one too, unless `harmless_env` lists it, so a new
--- cloud switch fails closed.
-local ROUTE_ENV = M.set_of(RULES.route_env)
-local HARMLESS_ENV = M.set_of(RULES.harmless_env)
--- Managed keys that only restrict or inform. Any other managed key can
--- reopen what the flags closed, and then maki cannot vouch for the profile.
-local HARMLESS_POLICY = M.set_of(RULES.harmless_policy)
-local HARMLESS_POLICY_PERMISSIONS = M.set_of(RULES.harmless_policy_permissions)
 
 local DEFAULT_DENY = { ".env*", "**/.env*", "secrets/**", "**/secrets/**" }
 -- Logins and keys under the home directory that the sandboxed shell cannot
@@ -119,6 +98,14 @@ local HOME_CREDENTIALS = {
   ".gnupg",
   ".netrc",
   ".git-credentials",
+  ".config/git/credentials",
+  ".local/share/keyrings",
+  ".password-store",
+  ".config/containers/auth.json",
+  ".m2/settings.xml",
+  ".gradle/gradle.properties",
+  ".terraform.d",
+  ".azure",
   ".config/gh",
   ".config/gcloud",
   ".docker",
@@ -140,76 +127,13 @@ local function sorted_keys(t)
   return keys
 end
 
-local function version_parts(version)
-  local major, minor, patch = (version or ""):match("^(%d+)%.(%d+)%.(%d+)$")
-  return major and { tonumber(major), tonumber(minor), tonumber(patch) }
+function M.checked_cli(output, system)
+  local version, err = maki.claude_code.version(output or "", system or "")
+  return version and { version = version } or nil, err
 end
 
-local function older(a, b)
-  for i = 1, #a do
-    if a[i] ~= b[i] then
-      return a[i] < b[i]
-    end
-  end
-  return false
-end
-
---- Returns `{ version }` for `claude --version` output on {sysname}, or nil
---- and the reason. A first word other than `major.minor.patch` is refused.
-function M.checked_cli(version_output, sysname)
-  local version = (version_output or ""):match("^%s*(%S+)")
-  local parts = version_parts(version)
-  if not parts then
-    return nil, "maki cannot read a Claude Code version from " .. string.format("%q", version_output or "")
-  end
-  if older(parts, RULES.minimum_version) then
-    return nil, "Claude Code " .. version .. " is older than " .. MINIMUM_VERSION .. ", the oldest version maki runs"
-  end
-  if not SYSTEMS[(sysname or ""):lower()] then
-    local systems = table.concat(RULES.systems, ", ")
-    return nil, "maki runs Claude Code only on " .. systems .. ", not on " .. tostring(sysname)
-  end
-  return { version = version }
-end
-
-local function passed(name)
-  local upper = name:upper()
-  if PASSED_ENV[upper] then
-    return true
-  end
-  for _, prefix in ipairs(RULES.passed_env_prefixes) do
-    if upper:sub(1, #prefix) == prefix then
-      return true
-    end
-  end
-  return false
-end
-
-local function routes_login(name)
-  if ROUTE_ENV[name] then
-    return true
-  end
-  for _, prefix in ipairs(RULES.route_env_prefixes) do
-    if name:sub(1, #prefix) == prefix then
-      return not HARMLESS_ENV[name]
-    end
-  end
-  return false
-end
-
---- Returns the child's environment from {environ}, and the sorted names
---- held back because they can change the login.
 function M.child_env(environ)
-  local env, withheld = {}, {}
-  for name, value in pairs(environ) do
-    if passed(name) then
-      env[name] = value
-    elseif routes_login(name) then
-      withheld[#withheld + 1] = name
-    end
-  end
-  table.sort(withheld)
-  return env, withheld
+  return maki.claude_code.environment(environ)
 end
 
 --- Returns why {worker} cannot run with {env}: its shell could read the
@@ -239,13 +163,22 @@ end
 
 --- Returns the logins and keys under {home} that a coding worker's shell
 --- cannot read, or nil and the reason when there is no home directory.
-function M.home_credentials(home)
+function M.home_credentials(home, extra)
   if not home or home == "" then
     return nil, NO_HOME
   end
   local paths = {}
   for i, path in ipairs(HOME_CREDENTIALS) do
     paths[i] = maki.fs.joinpath(home, path)
+  end
+  for path in (extra or ""):gmatch("[^,]+") do
+    path = M.trim(path)
+    if path:sub(1, 1) == "/" or ("/" .. path .. "/"):find("/../", 1, true) then
+      return nil, "a deny_read_home path must stay inside the home directory"
+    end
+    if path ~= "" then
+      paths[#paths + 1] = maki.fs.joinpath(home, path)
+    end
   end
   return paths
 end
@@ -254,31 +187,9 @@ end
 --- in {home}. The checks and each child resolve it from different
 --- directories, so it must be absolute.
 function M.config_dir(configured, home)
-  -- Claude Code treats an empty CLAUDE_CONFIG_DIR as unset.
-  local dir = configured ~= "" and configured or nil
-  if not dir then
-    if not home or home == "" then
-      return nil,
-        "maki cannot find the Claude Code config directory. Set the claude_code plugin's `config_dir` option, "
-          .. "CLAUDE_CONFIG_DIR or HOME."
-    end
-    dir = maki.fs.joinpath(home, RULES.claude_dir)
-  end
-  if dir:sub(1, 1) ~= "/" then
-    return nil,
-      "the Claude Code config directory "
-        .. dir
-        .. " is not an absolute path. Set the claude_code plugin's `config_dir` option, CLAUDE_CONFIG_DIR or HOME "
-        .. "to an absolute path."
-  end
-  return dir
+  return maki.claude_code.config_dir(configured, home)
 end
 
--- A worktree's `.git` file identifies its git directory. `commondir` leads to the primary
--- checkout. A submodule has its own git directory.
---
--- Unreadable git paths must stop validation because the primary checkout can contain local
--- settings. Resolve paths lexically, as Claude Code does.
 local function main_checkout(git_file)
   local text, err = maki.fs.read(git_file)
   if not text then
@@ -356,11 +267,6 @@ end
 
 -- As the provider shows a value from Claude Code: as JSON, cut so a huge
 -- value cannot flood the reply.
-local function shown(value)
-  local text = maki.json.encode(value)
-  local cut = utf8.offset(text, SHOWN_JSON_CHARS + 1)
-  return cut and cut <= #text and text:sub(1, cut - 1) .. "…" or text
-end
 
 function M.trim(text)
   return text:match("^%s*(.-)%s*$")
@@ -395,108 +301,32 @@ function M.skipped_settings(config_dir, cwd, local_dirs)
   return paths
 end
 
---- Returns the keys in an ignored file that are unsafe to ignore. Only the
---- names, because `env` can hold secrets.
+local function json(value)
+  return type(value) == "string" and value or maki.json.encode(value)
+end
+
+function M.response(value)
+  if type(value) ~= "string" then
+    return value
+  end
+  local event = maki.json.decode(value)
+  return event.type == "control_response" and event.response.response or event
+end
+
 function M.settings_conflicts(settings)
-  local keys = {}
-  for _, key in ipairs(RULES.route_settings) do
-    if settings[key] ~= nil then
-      keys[#keys + 1] = key
-    end
-  end
-  local method = settings[RULES.login_method_key]
-  if method ~= nil and method ~= RULES.subscription_login_method then
-    keys[#keys + 1] = RULES.login_method_key
-  end
-  local env = settings[RULES.env_key]
-  if type(env) == "table" then
-    for _, name in ipairs(sorted_keys(env)) do
-      if routes_login(name) then
-        keys[#keys + 1] = RULES.env_key .. "." .. name
-      end
-    end
-  end
-  return keys
+  return maki.claude_code.settings_conflicts(json(settings))
 end
 
---- Returns nil only if {plugins} is a list of Claude Code's own plugins.
---- Claude Code ships its own plugins, and a version or a feature gate can add
---- one. The other checks cover what such a plugin could change: the tools,
---- the MCP servers, the hooks and the settings.
 function M.plugins_problem(plugins)
-  if not M.is_list(plugins) then
-    return "Claude Code did not list its plugins"
-  end
-  local marker = RULES.builtin_plugin_marker
-  for _, plugin in ipairs(plugins) do
-    local source = type(plugin) == "table" and plugin.source or nil
-    if type(source) ~= "string" or plugin.path ~= marker or source:sub(-#marker - 1) ~= "@" .. marker then
-      return "Claude Code loaded the plugin "
-        .. shown(source)
-        .. ". maki does not run Claude Code with a plugin other than its built-in ones, "
-        .. "because a plugin can change what the model sees and does. Turn the plugin off in Claude Code."
-    end
-  end
-  return nil
+  return maki.claude_code.plugins_problem(maki.json.encode(plugins))
 end
 
---- Returns nil only for a claude.ai subscription login to Anthropic, with no
---- API key, in the mode {worker} needs.
+function M.resolved_model(account, requested)
+  return maki.claude_code.resolved_model(json(account), requested)
+end
+
 function M.account_problem(init, worker)
-  local account = type(init) == "table" and init.account
-  if type(account) ~= "table" then
-    return "Claude Code did not report its login"
-  end
-  if account.apiKeySource ~= nil and account.apiKeySource ~= RULES.no_key_source then
-    return "Claude Code would use an API key from " .. shown(account.apiKeySource) .. " instead of the subscription"
-  end
-  if account.apiProvider ~= RULES.first_party then
-    return "Claude Code sends requests to " .. shown(account.apiProvider) .. " instead of Anthropic"
-  end
-  if type(account.subscriptionType) ~= "string" or account.subscriptionType == "" then
-    return "Claude Code is not logged in with a claude.ai subscription. Run `claude auth login` with your "
-      .. "Claude subscription. For API billing, use maki's anthropic provider."
-  end
-  if not worker.reported_modes[init.current_permission_mode] then
-    return "Claude Code starts in permission mode " .. shown(init.current_permission_mode)
-  end
-  return nil
-end
-
-local function policy_key_problem(policy)
-  for _, key in ipairs(sorted_keys(policy)) do
-    local value = policy[key]
-    if key == RULES.login_method_key then
-      if value ~= RULES.subscription_login_method then
-        return key
-      end
-    elseif not HARMLESS_POLICY[key] then
-      return key
-    elseif key == RULES.permissions_key and type(value) == "table" then
-      for _, sub in ipairs(sorted_keys(value)) do
-        if not HARMLESS_POLICY_PERMISSIONS[sub] then
-          return RULES.permissions_key .. "." .. sub
-        end
-      end
-    end
-  end
-  return nil
-end
-
---- Returns `file: key` for each setting Claude Code rejected as invalid. A
---- missing list and an empty one both mean no errors. The messages are left
---- out, because a message can quote a value.
-local function invalid_settings(errors)
-  if errors == nil or M.is_list(errors) and #errors == 0 then
-    return nil
-  end
-  local found = {}
-  for _, err in ipairs(type(errors) == "table" and errors or {}) do
-    local entry = type(err) == "table" and err or {}
-    local key = type(entry.path) == "string" and entry.path ~= "" and ": " .. entry.path or ""
-    found[#found + 1] = tostring(entry.file or "a file without a name") .. key
-  end
-  return #found > 0 and table.concat(found, ", ") or "an error list that maki cannot read"
+  return maki.claude_code.account_problem(json(init), sorted_keys(worker.reported_modes))
 end
 
 local function empty(list)
@@ -568,27 +398,11 @@ local function deny_rules(extra)
 end
 
 function M.policy_problem(settings, hooks, deny_read, worker, confine)
-  if type(settings) ~= "table" or not M.is_list(settings.sources) or type(settings.effective) ~= "table" then
-    return "Claude Code did not give its settings"
+  local problem = maki.claude_code.policy_problem(json(settings), json(hooks))
+  if problem then
+    return problem
   end
-  local invalid = invalid_settings(settings.errors)
-  if invalid then
-    return "Claude Code rejected some settings as invalid, so maki cannot tell which settings apply: " .. invalid
-  end
-  for _, source in ipairs(settings.sources) do
-    local name = type(source) == "table" and source.source
-    if name == RULES.policy_source then
-      if type(source.settings) ~= "table" then
-        return "your organization's Claude Code policy is not a settings object that maki can check"
-      end
-      local key = policy_key_problem(source.settings)
-      if key then
-        return "your organization's Claude Code policy sets " .. key .. ", which maki cannot confirm is safe"
-      end
-    elseif name ~= RULES.flag_source then
-      return "Claude Code loaded " .. tostring(name) .. " settings, which it must ignore"
-    end
-  end
+  settings = M.response(settings)
   local effective = settings.effective
   local permissions = type(effective.permissions) == "table" and effective.permissions or {}
   if permissions.blockReadsOutsideWorkingDirectories ~= true then
@@ -614,18 +428,7 @@ function M.policy_problem(settings, hooks, deny_read, worker, confine)
       return problem
     end
   end
-  if type(hooks) ~= "table" or not M.is_list(hooks.hooks) or type(hooks.policy) ~= "table" then
-    return "Claude Code did not list its hooks"
-  end
-  if hooks.policy.allDisabled ~= true then
-    return "Claude Code cannot turn its hooks off"
-  end
-  for _, hook in ipairs(hooks.hooks) do
-    if type(hook) ~= "table" or hook.disabled ~= true then
-      local source = type(hook) == "table" and hook.source or nil
-      return "Claude Code would run a hook from " .. shown(source) .. ", which can change the checkout"
-    end
-  end
+
   return nil
 end
 

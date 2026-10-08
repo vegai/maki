@@ -13,6 +13,8 @@ local SNAPSHOT_DIR = "snapshot"
 local TMP_DIR = "tmp"
 local GIT_DIR = "git"
 local DOT_GIT = ".git"
+local QUARANTINE_DIR = "git-metadata"
+
 local MANIFEST = "manifest.json"
 local CHECK_INDEX = "consistency-index"
 local COPY_STARTED = "copy-started"
@@ -31,7 +33,6 @@ local CLONE_UNSUPPORTED = {
   ["Invalid argument"] = true,
 }
 local SECS_PER_HOUR = 3600
-local CURRENT_DIR = "./"
 -- Stands in for the script in a denied import's error.
 local IMPORT_COMMAND = "the import command"
 local LEFTOVERS_REMAIN = "maki could not remove its temporary files, so files starting with %s may remain "
@@ -75,12 +76,15 @@ local function from_hex(line)
   end))
 end
 
-local function checkout_git(call, spec, args, stdin)
-  return call:run_quick(workspace.git(args), { env = spec.env, cwd = spec.cwd, stdin = stdin })
+local function checkout_git(call, spec, args)
+  return call:run_quick(workspace.git(args), { env = spec.env, cwd = spec.cwd })
 end
 
 local function list_files(call, spec, mode, pathspecs)
   local args = { "ls-files", mode, "--" }
+  if mode == "-s" then
+    table.insert(args, 2, "-t")
+  end
   for _, pathspec in ipairs(pathspecs) do
     args[#args + 1] = pathspec
   end
@@ -391,7 +395,7 @@ local function unsettled_dependencies(call, artifact, spec, dependencies, marker
       return nil, "maki cannot examine the dependency " .. dir .. ": " .. err
     end
     for path in out:gmatch("[^\n]+") do
-      changed[#changed + 1] = path:sub(#CURRENT_DIR + 1)
+      changed[#changed + 1] = path:gsub("^%./", "")
     end
   end
   return changed
@@ -453,21 +457,31 @@ function M.sweep(root, ttl_hours)
     local marker = kind == "directory" and maki.fs.metadata(maki.fs.joinpath(dir, OWNER_MARKER))
     local meta = marker and (maki.fs.metadata(maki.fs.joinpath(dir, MANIFEST)) or marker)
     if meta and meta.mtime and meta.mtime < cutoff then
-      -- In the background, because a large tree takes long and the call
-      -- does not need it gone. The next sweep finishes a stopped one.
-      maki.fn.jobstart({ "rm", "-rf", "--", dir }, { scope = "plugin" })
+      local lock = maki.claude_code.lock_artifact(dir)
+      if lock then
+        local current = maki.fs.metadata(maki.fs.joinpath(dir, MANIFEST)) or marker
+        if current.mtime and current.mtime < cutoff then
+          local id = maki.fn.jobstart({ "rm", "-rf", "--", dir }, {
+            scope = "plugin",
+            on_exit = function()
+              lock:close()
+            end,
+          })
+          if not id then
+            lock:close()
+          end
+        else
+          lock:close()
+        end
+      end
     end
   end
-end
-
-local function resolved_path(call, path, env)
-  return call:run_quick({ "pwd", "-P" }, { env = env, cwd = path })
 end
 
 --- Returns {root} resolved on disk, even when it is missing. It must lie
 --- outside the checkout, so maki creates or removes nothing there until this
 --- function accepts it.
-function M.resolve_root(call, root, spec)
+function M.resolve_root(root, spec)
   local existing, missing = root, {}
   while true do
     local meta, meta_err = maki.fs.metadata(existing)
@@ -487,7 +501,7 @@ function M.resolve_root(call, root, spec)
     table.insert(missing, 1, name)
     existing = parent
   end
-  local resolved, err = resolved_path(call, existing, spec.env)
+  local resolved, err = maki.uv.fs_realpath(existing)
   if not resolved then
     return nil, err
   end
@@ -499,12 +513,12 @@ function M.resolve_root(call, root, spec)
 end
 
 --- `tmp` is the only other place the worker's shell can write.
-function M.allocate(call, root, env, timeout_ms)
+function M.allocate(root, env, timeout_ms)
   local _, root_err = maki.fs.mkdir(root, { parents = true })
   if root_err then
     return nil, "maki cannot make " .. root .. ": " .. root_err
   end
-  local dir, dir_err = call:run_quick({ "mktemp", "-d", maki.fs.joinpath(root, ARTIFACT_TEMPLATE) }, { env = env })
+  local dir, dir_err = maki.uv.fs_mkdtemp(maki.fs.joinpath(root, ARTIFACT_TEMPLATE))
   if not dir then
     return nil, dir_err
   end
@@ -539,11 +553,32 @@ function M.discard(artifact)
   maki.fs.rm(artifact.dir, { recursive = true, force = true })
 end
 
+-- Git traverses nested repositories during ordinary status commands. Keep their metadata
+-- outside the work tree, without discarding the worker's files or repository objects.
+function M.sanitize(artifact)
+  local quarantine = maki.fs.joinpath(artifact.dir, QUARANTINE_DIR)
+  local nested, err = maki.claude_code.sanitize_git(artifact.snapshot, quarantine, artifact.git)
+  if not nested then
+    return err
+  end
+  if #nested > 0 then
+    artifact.notes[#artifact.notes + 1] = "maki preserved the Git metadata for "
+      .. shown(nested)
+      .. " in "
+      .. quarantine
+      .. ". Their ordinary files remain in the snapshot."
+  end
+end
+
 -- What `prepare` wrote becomes the base for the worker's changes, so it is
 -- never offered for import, and a note lists it. A file that the worker
 -- also changed cannot be imported, because the checkout lacks the `prepare`
 -- changes underneath.
 local function commit_prepared(call, artifact)
+  local metadata_err = M.sanitize(artifact)
+  if metadata_err then
+    return metadata_err
+  end
   local _, add_err = snapshot_git(call, artifact, { "add", "-A" })
   if add_err then
     return add_err
@@ -584,9 +619,13 @@ function M.prepare(call, artifact, command, env, timeout_ms)
   return err, commit_prepared(call, artifact)
 end
 
---- Writes nothing inside the snapshot, because the worker controls it and a
---- link there could redirect the write.
+-- Sanitation moves metadata before restoring the trusted root pointer, so a worker link
+-- cannot redirect the write.
 function M.collect(call, artifact, project)
+  local metadata_err = M.sanitize(artifact)
+  if metadata_err then
+    return nil, metadata_err
+  end
   local _, add_err = snapshot_git(call, artifact, { "add", "-A" })
   if add_err then
     return nil, add_err
@@ -595,6 +634,7 @@ function M.collect(call, artifact, project)
   if not tree then
     return nil, tree_err
   end
+  artifact.tree = tree
   local raw, raw_err = snapshot_git(call, artifact, { "diff-tree", "-r", "--raw", "--no-renames", artifact.base, tree })
   if not raw then
     return nil, raw_err
@@ -810,10 +850,7 @@ end
 local function apply_import(ctx, call, env, artifact, todo)
   local project = artifact.manifest.project
   local made = missing_folders(project, todo)
-  local stage, stage_err = call:run_quick(
-    { "mktemp", "-d", maki.fs.joinpath(artifact.dir, workspace.STAGE_TEMPLATE) },
-    { env = env }
-  )
+  local stage, stage_err = maki.uv.fs_mkdtemp(maki.fs.joinpath(artifact.dir, workspace.STAGE_TEMPLATE))
   if not stage then
     return nil, "maki cannot make a stage folder in the artifact: " .. stage_err
   end
@@ -859,7 +896,7 @@ end
 --- approval can take long. If a file it changes also changed in the checkout
 --- since the snapshot, or in the artifact since the collect step, nothing
 --- applies.
-function M.import(ctx, call, spec)
+local function import_locked(ctx, call, spec)
   local artifact, open_err = open_import(spec)
   if not artifact then
     return nil, open_err
@@ -909,6 +946,24 @@ function M.import(ctx, call, spec)
   end
   local kept = originals and " The preserved versions are in " .. originals .. " and " .. displaced .. "." or ""
   return nil, M.stopped_partway(applied, missed, kept .. (unrecorded and " " .. unrecorded or ""), failure)
+end
+
+function M.import(ctx, call, spec)
+  if type(spec.id) ~= "string" or not spec.id:match(workspace.ARTIFACT_ID) then
+    return nil, "an artifact id contains only the characters A to Z, a to z and 0 to 9"
+  end
+  local lock, lock_err = maki.claude_code.lock_artifact(maki.fs.joinpath(spec.root, spec.id))
+  if not lock then
+    return nil, "maki cannot lock artifact " .. spec.id .. ": " .. lock_err
+  end
+  local ok, result, err = pcall(import_locked, ctx, call, spec)
+  call:when_idle(function()
+    lock:close()
+  end)
+  if not ok then
+    error(result, 0)
+  end
+  return result, err
 end
 
 --- Reports an import that stopped partway: the paths it {applied} and

@@ -3,7 +3,7 @@ use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::mem;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
@@ -152,6 +152,7 @@ pub(crate) struct JobSpec {
     /// Kill remaining group members before the exit callback so descendants cannot outlive
     /// the job.
     pub kill_group_on_exit: bool,
+    pub guard: bool,
     pub stdout: Redirect,
     pub stderr: Redirect,
     pub on_stdout: Option<RegistryKey>,
@@ -170,6 +171,7 @@ impl JobSpec {
             clear_env: false,
             pipe_stdin: false,
             kill_group_on_exit: false,
+            guard: false,
             stdout: Redirect::Capture,
             stderr: Redirect::Capture,
             on_stdout: None,
@@ -313,6 +315,7 @@ impl JobStore {
             clear_env,
             pipe_stdin,
             kill_group_on_exit,
+            guard,
             stdout,
             stderr,
             on_stdout,
@@ -360,6 +363,16 @@ impl JobStore {
             }
         }
 
+        #[cfg(target_os = "linux")]
+        let lifetime = if guard {
+            Some(process::guard::bind(&mut command).map_err(|error| error.to_string())?)
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        if guard {
+            return Err("jobstart: guard requires Linux".into());
+        }
         let mut child = command.spawn().map_err(|e| e.to_string())?;
         let pid = child.id();
         let (stdin_pipe, stdout_pipe, stderr_pipe) =
@@ -404,6 +417,8 @@ impl JobStore {
         thread::Builder::new()
             .name("job-wait".into())
             .spawn(move || {
+                #[cfg(target_os = "linux")]
+                let _lifetime = lifetime;
                 // The child arrives only after this thread starts, so after a
                 // spawn error `unwatched` stops it.
                 let Ok(child) = child_rx.recv() else {
@@ -985,10 +1000,20 @@ impl Drop for Unwatched {
 /// A reaped pid can identify another process. Hold the lock until the signal completes so
 /// [`reap`] cannot release the pid first.
 fn kill_job(job: &JobMeta) {
-    let state = ReapState::lock(&job.reap_state);
-    if !state.reaped {
-        process::kill_group(job.pid);
+    let pid = job.pid;
+    let state = Arc::clone(&job.reap_state);
+    let kill = move || {
+        let state = ReapState::lock(&state);
+        if !state.reaped {
+            process::kill_group(pid);
+        }
+    };
+    #[cfg(windows)]
+    if let Err(error) = thread::Builder::new().name("job-kill".into()).spawn(kill) {
+        tracing::warn!(pid, %error, "could not start the job termination thread");
     }
+    #[cfg(not(windows))]
+    kill();
 }
 
 /// Run a command in the background. A string uses `bash -c` on Unix or
@@ -1011,6 +1036,7 @@ fn kill_job(job: &JobMeta) {
 ///   `stdin` (string?) `"pipe"` to write to the job with `chansend`. Defaults
 ///     to `"null"`, no input. Neovim defaults to `"pipe"`, but a job that
 ///     reads an open pipe with no data hangs.
+///   `guard` (boolean?) on Linux, stop the group if maki dies, even from SIGKILL.
 ///   `kill_group_on_exit` (boolean?) after the process exits, kill the
 ///     processes that remain in its process group before `on_exit` runs, such
 ///     as a background child that closed its output (default false, Unix
@@ -1069,6 +1095,7 @@ fn jobstart(
         spec.kill_group_on_exit = opts
             .get::<Option<bool>>("kill_group_on_exit")?
             .unwrap_or(false);
+        spec.guard = opts.get::<Option<bool>>("guard")?.unwrap_or(false);
         spec.pipe_stdin = match opts.get::<Option<String>>("stdin")?.as_deref() {
             None | Some(STDIN_NULL) => false,
             Some(STDIN_PIPE) => true,
@@ -1602,11 +1629,7 @@ async fn call_back(lua: &Lua, callback: Function, job_id: u32, event: &JobEvent)
 // environment holds, so `fs_read` covers it.
 #[lua_fn(guard = FsRead)]
 fn executable(_lua: &Lua, name: String) -> LuaResult<i32> {
-    let found = env::var_os("PATH")
-        .map(|paths| env::split_paths(&paths).any(|dir| dir.join(&name).is_file()))
-        .unwrap_or(false)
-        || Path::new(&name).is_file();
-    Ok(if found { 1 } else { 0 })
+    Ok(i32::from(find_program_here(&name).is_some()))
 }
 
 /// Resolve {name} to an absolute executable path, or return `""` if no

@@ -24,6 +24,10 @@ local GIT_CONFIG = {
   "-c",
   "core.fsmonitor=false",
   "-c",
+  "diff.ignoreSubmodules=all",
+  "-c",
+  "status.submoduleSummary=false",
+  "-c",
   "core.quotePath=true",
   "-c",
   "commit.gpgSign=false",
@@ -43,7 +47,7 @@ local EXECUTABLE_MODE = "100755"
 local REGULAR_MODE = "100644"
 local ADDED = "A"
 local DELETED = "D"
-M.ADDED, M.DELETED = ADDED, DELETED
+M.ADDED = ADDED
 local TYPE_CHANGED = "T"
 local TYPE_KIND = "type"
 M.TYPE_KIND = TYPE_KIND
@@ -61,7 +65,7 @@ local KNOWN_MODES = {
   [GITLINK_MODE] = true,
 }
 -- The snapshot copies neither, and Claude Code config can add hooks.
-local NEVER_COLLECTED = { [".git"] = true, [".claude"] = true }
+local NEVER_COLLECTED = { [".git"] = true, [".claude"] = true, [".maki"] = true }
 local OBJECT_ID_LENGTHS = { [40] = true, [64] = true }
 -- Every check runs before the first write, and a failed check exits with
 -- this code.
@@ -73,8 +77,8 @@ local IMPORT_NOTE = "claude_code_import: "
 local NOTHING_IMPORTED = "so maki imported no changes"
 local IMPORT_CHANGED = "changed in the checkout after the snapshot, " .. NOTHING_IMPORTED
 local ARTIFACT_GONE = "is no longer in the artifact, " .. NOTHING_IMPORTED
-local IMPORT_NO_LINK = "cannot preserve open-file writes. Inspect the backup or put artifact_dir "
-  .. "on the checkout filesystem."
+local IMPORT_NO_LINK = "cannot preserve open-file writes. Check the ln error above. "
+  .. "For a cross-filesystem error, put artifact_dir on the checkout filesystem."
 M.IMPORT_ORIGINALS = "originals"
 M.IMPORT_DISPLACED = "displaced"
 M.STAGE_TEMPLATE = "stage.XXXXXX"
@@ -85,10 +89,8 @@ local TEMP_RANDOM = "XXXXXX"
 
 -- Claude Code project config can hold hooks or MCP servers. A file named
 -- `.claude` is left out too, because the manifest check refuses that name.
-local ALSO_EXCLUDED = { ".claude", "**/.claude", ".claude/**", "**/.claude/**" }
--- Also keeps `.claude` out of the changes, as a folder or a file. `.git`
--- needs no rule, because git shows a nested repository as a gitlink.
-M.UNCOLLECTED_RULE = ".claude\n"
+local ALSO_EXCLUDED = { ".claude", "**/.claude", ".maki", "**/.maki" }
+M.UNCOLLECTED_RULE = ".[cC][lL][aA][uU][dD][eE]\n.[mM][aA][kK][iI]\n"
 -- The owner's execute bit in `stat -c %A`: `x`, or `s` with setuid.
 local OWNER_EXECUTE_BITS = "[xs]"
 -- As a shell `case` pattern.
@@ -132,9 +134,11 @@ function M.excluded_pathspecs(deny_read)
   local specs = {}
   for _, pattern in ipairs(assert(launch.denied_paths(deny_read))) do
     specs[#specs + 1] = ":(exclude,glob)" .. pattern
+    specs[#specs + 1] = ":(exclude,glob)" .. pattern .. "/**"
   end
   for _, pattern in ipairs(ALSO_EXCLUDED) do
-    specs[#specs + 1] = ":(exclude,glob)" .. pattern
+    specs[#specs + 1] = ":(exclude,icase,glob)" .. pattern
+    specs[#specs + 1] = ":(exclude,icase,glob)" .. pattern .. "/**"
   end
   return specs
 end
@@ -195,6 +199,34 @@ function M.shell_quote(text)
   return "'" .. text:gsub("'", "'\\''") .. "'"
 end
 
+function M.diff_command(artifact)
+  local words = {
+    "env",
+    "-u",
+    "GIT_CONFIG_PARAMETERS",
+    "-u",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL=/dev/null",
+    "GIT_CONFIG_NOSYSTEM=1",
+    "GIT_DIR=" .. M.bash_quote(artifact.git),
+    "GIT_WORK_TREE=" .. M.bash_quote(artifact.snapshot),
+  }
+  for _, word in
+    ipairs(M.git({
+      "diff",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--ignore-submodules=all",
+      artifact.base,
+      artifact.tree,
+      "--",
+    }))
+  do
+    words[#words + 1] = M.bash_quote(word)
+  end
+  return table.concat(words, " ")
+end
+
 --- Normalizes each directory, so one directory always has one spelling.
 function M.dependency_dirs(option)
   local dirs = {}
@@ -242,18 +274,56 @@ end
 --- Quotes {text} for bash, with each control byte as a `$'\ooo'` escape, so
 --- the command that the user approves shows no control bytes.
 function M.bash_quote(text)
-  return (M.shell_quote(text):gsub("%c", function(char)
+  local quoted = M.shell_quote(text):gsub("%c", function(char)
     return string.format("'$'\\%03o''", char:byte())
-  end))
+  end)
+  return M.escape_invisible(quoted, true)
+end
+
+function M.escape_invisible(text, shell)
+  if not utf8.len(text) then
+    return text
+  end
+  local parts, previous = {}, 1
+  for offset, code in utf8.codes(text) do
+    if
+      code == 0x061c
+      or code == 0x034f
+      or code == 0x180e
+      or code == 0xfeff
+      or code >= 0x200b and code <= 0x200f
+      or code >= 0x202a and code <= 0x202e
+      or code >= 0x2060 and code <= 0x206f
+      or code >= 0xfe00 and code <= 0xfe0f
+      or code >= 0xe0000 and code <= 0xe007f
+    then
+      parts[#parts + 1] = text:sub(previous, offset - 1)
+      local following = utf8.offset(text, 2, offset) or #text + 1
+      if shell then
+        local escaped = text:sub(offset, following - 1):gsub(".", function(byte)
+          return string.format("\\%03o", byte:byte())
+        end)
+        parts[#parts + 1] = "'$'" .. escaped .. "''"
+      else
+        parts[#parts + 1] = string.format(code <= 0xffff and "\\u%04x" or "\\U%08x", code)
+      end
+      previous = following
+    end
+  end
+  parts[#parts + 1] = text:sub(previous)
+  return table.concat(parts)
 end
 
 --- Terminal control bytes can execute commands. Escape them and non-UTF-8 path bytes before
 --- display.
 function M.printable(path)
   return (
-    path:gsub(utf8.len(path) and "%c" or "[%c\128-\255]", function(char)
-      return string.format("\\%03o", char:byte())
-    end)
+    M.escape_invisible(
+      path:gsub(utf8.len(path) and "%c" or "[%c\128-\255]", function(char)
+        return string.format("\\%03o", char:byte())
+      end),
+      false
+    )
   )
 end
 
@@ -291,8 +361,8 @@ end
 local function staged_entries(output)
   local entries = {}
   for line in (output or ""):gmatch("[^\n]+") do
-    local mode, sha, path = line:match("^(%d+) (%x+) %d+\t(.*)$")
-    if mode then
+    local tag, mode, sha, path = line:match("^([%a%?]?) ?(%d+) (%x+) %d+\t(.*)$")
+    if mode and tag ~= "S" then
       entries[#entries + 1] = { mode = mode, sha = sha, path = M.unquote(path) }
     end
   end
@@ -394,7 +464,7 @@ function M.change_problem(change)
     return path_problem
   end
   for part in change.path:gmatch("[^/]+") do
-    if NEVER_COLLECTED[part] then
+    if NEVER_COLLECTED[part:lower()] then
       return change.path .. " is in " .. part .. ", which a snapshot does not copy"
     end
   end
@@ -535,7 +605,7 @@ function M.import_script(changes, project, git_dir, artifact, stage)
     'same() { [ -f "$1" ] && [ ! -L "$1" ] && [ "$(hash "$1" 2>/dev/null)" = "$2" ] '
       .. '&& [ "$(mode "$1")" = "$3" ] || changed "$1"; }',
     'absent() { [ ! -e "$1" ] && [ ! -L "$1" ] || changed "$1"; }',
-    "originals=" .. M.bash_quote(artifact .. "/" .. M.IMPORT_ORIGINALS),
+    "originals=" .. M.bash_quote(artifact .. "/" .. M.IMPORT_ORIGINALS .. "/" .. stage:match("[^/]+$")),
     "displaced=" .. M.bash_quote(artifact .. "/" .. M.IMPORT_DISPLACED .. "/" .. stage:match("[^/]+$")),
     "stage=" .. M.bash_quote(stage),
     "declare -A temp_of=()",

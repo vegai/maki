@@ -32,7 +32,7 @@ const ANSWER: &str = "The parser lives in src/parse.rs:10.";
 const OLDER_VERSION: &str = "2.1.283";
 const NEWER_VERSION: &str = "2.1.290";
 
-const ACCOUNT_SUBSCRIPTION: &str = r#"{"current_permission_mode":"default","account":{"apiProvider":"firstParty","subscriptionType":"Claude Pro"}}"#;
+const ACCOUNT_SUBSCRIPTION: &str = r#"{"current_permission_mode":"default","account":{"apiProvider":"firstParty","subscriptionType":"Claude Pro"},"models":[{"value":"sonnet","resolvedModel":"claude-sonnet-5"},{"value":"opus","resolvedModel":"claude-opus-5-5"},{"value":"haiku","resolvedModel":"claude-haiku-4-5"}]}"#;
 const ACCOUNT_LOGGED_OUT: &str =
     r#"{"current_permission_mode":"default","account":{"apiProvider":"firstParty"}}"#;
 const HOOKS_OFF: &str =
@@ -121,7 +121,7 @@ const NOT_AN_OBJECT: &str = "settings.json: is not a JSON object";
 /// Where serde reports the end of the broken settings file.
 const SYNTAX_ERROR_AT: &str = "settings.json: EOF while parsing a value at line 2 column 17";
 const BROKEN_SETTINGS: &str = "{\n  \"apiKeyHelper\":";
-const API_KEY_STOP: &str = "API key source ANTHROPIC_API_KEY";
+const API_KEY_STOP: &str = "API key source \"ANTHROPIC_API_KEY\"";
 const NO_INIT_STOP: &str = "no init event in 30 s";
 const NO_ANSWER_IN_TIME: &str = "did not complete in time";
 /// The fake's exit code, when it came, and its stderr, whatever text
@@ -159,6 +159,7 @@ const CODE_LONG: &str = "code_long";
 const MAX_TIMEOUT_SECS: u64 = 1800;
 const TIMEOUT_TOO_LONG: &str = "the maximum value of the `timeout_secs` option is 1800";
 const FULL_MODEL_ID: &str = "claude-sonnet-5";
+const WRONG_MODEL: &str = "Claude Code ran claude-opus-5-5 for claude-haiku-4-5";
 const BAD_MODEL_OPTION: &str = "the `model` option must be one of";
 /// Starts the worker's edits and never finishes them.
 const CODE_HANG: &str = "code_hang";
@@ -202,21 +203,23 @@ printf '%s\n' "$@" > "$dir/argv"
 env > "$dir/env"
 printf '%s\n' "${TMPDIR-}" >> "$dir/tmpdirs"
 cwd=$(pwd -P)
-flags=; mode=; tools=; prev=
+flags=; mode=; tools=; model=; prev=
 for arg; do
   [ "$prev" = --settings ] && flags=$arg
   [ "$prev" = --permission-mode ] && mode=$arg
   [ "$prev" = --tools ] && tools=$arg
+  [ "$prev" = --model ] && model=$arg
   prev=$arg
 done
 [ "$mode" = manual ] && mode=default
+case "$model" in sonnet) model=claude-sonnet-5 ;; opus) model=claude-opus-5-5 ;; haiku) model=claude-haiku-4-5 ;; esac
 line() { printf '%s\n' "$1"; }
 reply() { printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":%s}}\n' "$1" "$2"; }
 settings() {
   policy=; [ -e "$dir/policy.json" ] && policy=",{\"source\":\"policySettings\",\"settings\":$(cat "$dir/policy.json")}"
   printf '{"effective":%s,"sources":[{"source":"flagSettings","settings":%s}%s]}' "$flags" "$flags" "$policy"
 }
-init() { printf '{"type":"system","subtype":"init","apiKeySource":"%s","claude_code_version":"%s","permissionMode":"%s","tools":["%s"],"mcp_servers":[],"plugins":[{"name":"agents-md","path":"builtin","source":"agents-md@builtin"}],"cwd":"%s"}\n' "$1" "$(cut -d' ' -f1 "$dir/version")" "$mode" "$(printf '%s' "$tools" | sed 's/,/","/g')" "$cwd"; }
+init() { printf '{"type":"system","subtype":"init","apiKeySource":"%s","claude_code_version":"%s","permissionMode":"%s","tools":["%s"],"mcp_servers":[],"plugins":[{"name":"agents-md","path":"builtin","source":"agents-md@builtin"}],"cwd":"%s"}\n' "$1" "$(cut -d' ' -f1 "$dir/version")" "$mode" "$(printf '%s' "$tools" | sed 's/,/","/g')" "$cwd"; printf '{"type":"stream_event","event":{"type":"message_start","message":{"id":"m1","model":"%s"}}}\n' "$model"; }
 answer() { line '{"type":"result","subtype":"success","is_error":false,"result":"@ANSWER@"}'; }
 stray() { sleep @HANG_SECS@ </dev/null >/dev/null 2>&1 & echo $! > "$dir/stray"; }
 usage() { printf '{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","name":"Read","input":{"file_path":"%s/src/usage.rs"}}],"usage":{"input_tokens":7,"cache_read_input_tokens":2000,"cache_creation_input_tokens":300,"output_tokens":1}}}\n' "$cwd"; }
@@ -289,12 +292,29 @@ case "$scenario" in
     answer ;;
   code_claude_config*)
     init none
-    mkdir -p .claude src/.claude
+    mkdir -p .claude src/.claude .maki src/.MaKi .Claude
     printf '{}\n' > .claude/settings.local.json
     printf '{}\n' > src/.claude/settings.json
+    printf 'return {}\n' > .maki/init.lua
+    printf 'allow = []\n' > src/.MaKi/permissions.toml
+    printf '{}\n' > .Claude/settings.json
     mkdir tools; printf '{}\n' > tools/.claude
     printf 'worker\n' >> src/lib.rs
     answer ;;
+  code_nested_*)
+    init none
+    git init -q nested
+    printf 'nested work\n' > nested/file.txt
+    git -C nested config core.fsmonitor "touch '$dir/metadata_ran'"
+    if [ "$scenario" != code_nested_empty ]; then
+      git -C nested -c core.fsmonitor=false add file.txt
+      git -C nested -c core.fsmonitor=false -c user.name=test -c user.email=test@localhost commit -qm nested
+    fi
+    if [ "$scenario" = code_nested_pointer ]; then printf 'gitdir: nested/.git\n' > .git; fi
+    if [ "$scenario" = code_nested_casefold ]; then mv nested/.git nested/.GiT; fi
+    printf 'worker\n' >> src/lib.rs
+    if [ "$scenario" = code_nested_cancel ]; then touch "$dir/@WORKING@"; sleep @HANG_SECS@; else answer; fi ;;
+  wrong_model) model=claude-opus-5-5; init none; answer ;;
   code_redirect*)
     init none
     project=$(cat "$dir/project")
@@ -370,6 +390,8 @@ impl FakeClaude {
 
     fn answer_version(&self, version: &str) {
         self.write("version", &format!("{version} (Claude Code)\n"));
+        let script = fs::read(self.path("claude")).unwrap();
+        fs::write(self.path("claude"), script).unwrap();
     }
 
     fn write(&self, name: &str, content: &str) {
@@ -794,6 +816,46 @@ fn the_instructions_travel_with_the_task() {
     );
 }
 
+#[test]
+fn a_worker_cannot_return_a_reply_from_another_model() {
+    let err = FakeClaude::new().ask("wrong_model").unwrap_err();
+    assert!(err.contains(WRONG_MODEL), "{err}");
+}
+
+#[test]
+fn cached_versions_do_not_skip_current_policy_checks() {
+    let fake = FakeClaude::new();
+    let (reg, _host) = fake.host(ONE_SLOT);
+    let ctx = fake.ctx(None, None);
+    let ask = || smol::block_on(within_deadline(call(&reg, &ctx, ANSWERS)));
+    assert_eq!(ask().unwrap(), ANSWER);
+    assert_eq!(ask().unwrap(), ANSWER);
+    assert_eq!(
+        fake.log("calls")
+            .lines()
+            .filter(|line| *line == "version")
+            .count(),
+        1
+    );
+    add_a_managed_hook(&fake);
+    let err = ask().unwrap_err();
+    assert!(err.contains(HOOK_STOP), "{err}");
+    assert_eq!(
+        fake.log("calls")
+            .lines()
+            .filter(|line| *line == "start")
+            .count(),
+        5
+    );
+    assert_eq!(
+        fake.log("calls")
+            .lines()
+            .filter(|line| *line == "version")
+            .count(),
+        1
+    );
+}
+
 /// A conflict at init stops the run, but the usage the run printed right
 /// after the conflict still counts and survives the process.
 #[test]
@@ -803,9 +865,7 @@ fn a_stopped_run_keeps_what_it_spent() {
     assert_mentions(&err, SPENT_BEFORE_CANCEL);
 }
 
-/// Queued calls can hold every Lua slot, and a Lua timer needs one. The
-/// startup limit must still stop a run that never sends its init, long
-/// before the fake would stop, and leave no process behind.
+/// Timer callbacks must stop a worker even when tool calls fill every tool slot.
 #[test]
 fn the_startup_limit_holds_with_every_slot_taken() {
     let fake = FakeClaude::new();

@@ -1,6 +1,11 @@
 use std::env;
 #[cfg(windows)]
 use std::env::consts::ARCH;
+#[cfg(unix)]
+use std::fs::Permissions;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table};
@@ -8,7 +13,61 @@ use mlua::{Lua, Result as LuaResult, Table};
 #[cfg(unix)]
 use rustix::system::uname;
 
+use crate::api::fs::expand_tilde;
+use crate::api::util::pair::{Pair, pair, try_pair};
 use crate::plugin_permissions::PluginPermissions;
+
+const TEMP_SUFFIX: &str = "XXXXXX";
+#[cfg(unix)]
+const PRIVATE_DIR_MODE: u32 = 0o700;
+
+/// Resolve symlinks before comparing sandbox paths.
+/// @param path string Existing path.
+/// @return (string?, string?) Physical path, or nil and the error.
+#[lua_fn(guard = FsRead)]
+async fn fs_realpath(_lua: Lua, path: String) -> LuaResult<Pair<String>> {
+    Ok(pair(
+        smol::fs::canonicalize(expand_tilde(&path))
+            .await
+            .map(|path| path.to_string_lossy().into_owned()),
+    ))
+}
+
+/// Create a private temporary directory. The caller owns its cleanup.
+/// @param template string Path ending in XXXXXX.
+/// @return (string?, string?) Created directory, or nil and the error.
+#[lua_fn(guard = FsWrite)]
+async fn fs_mkdtemp(_lua: Lua, template: String) -> LuaResult<Pair<String>> {
+    let path = PathBuf::from(try_pair!(
+        template
+            .strip_suffix(TEMP_SUFFIX)
+            .ok_or("temporary directory template must end in XXXXXX")
+    ));
+    let dir = try_pair!(
+        smol::unblock(move || {
+            let prefix = path.file_name().unwrap_or_default().to_string_lossy();
+            let mut builder = tempfile::Builder::new();
+            builder.prefix(prefix.as_ref());
+            #[cfg(unix)]
+            builder.permissions(Permissions::from_mode(PRIVATE_DIR_MODE));
+            builder.tempdir_in(path.parent().unwrap_or_else(|| Path::new(".")))
+        })
+        .await
+    );
+    Ok((Some(dir.keep().to_string_lossy().into_owned()), None))
+}
+
+/// Remove an empty directory without following a symlink or deleting hook output.
+/// @param path string Directory to remove.
+/// @return (boolean?, string?) True on success, or nil and the error.
+#[lua_fn(guard = FsWrite)]
+async fn fs_rmdir(_lua: Lua, path: String) -> LuaResult<Pair<bool>> {
+    Ok(pair(
+        smol::fs::remove_dir(expand_tilde(&path))
+            .await
+            .map(|_| true),
+    ))
+}
 
 #[cfg(windows)]
 const WINDOWS_SYSNAME: &str = "Windows_NT";
@@ -107,5 +166,6 @@ lua_table! {
     /// ```
     "maki.uv" => pub(crate) fn create_uv_table(perms: &PluginPermissions), DOCS [
         cwd(perms), os_homedir(perms), os_getenv(perms), os_environ(perms), os_uname,
+        fs_realpath(perms), fs_mkdtemp(perms), fs_rmdir(perms),
     ]
 }

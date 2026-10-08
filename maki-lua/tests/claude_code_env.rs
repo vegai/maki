@@ -11,10 +11,8 @@ use std::fs::{self, File};
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::thread;
 use std::time::{Duration, SystemTime};
 
-use maki_agent::cancel::CancelToken;
 use maki_agent::tools::test_support::stub_ctx_in;
 use maki_agent::tools::{ToolContext, ToolRegistry};
 use maki_lua::PluginHost;
@@ -29,19 +27,13 @@ use test_case::test_case;
 mod support;
 
 use support::{
-    DEADLINE, LEFT_BEHIND, MINIMUM_VERSION, TOOL, WorkingDir, executable, git, listing, load,
-    on_path, tool_reply, use_fixture_user, wait_for_release, wait_until, within, write,
+    DEADLINE, MINIMUM_VERSION, TOOL, WorkingDir, executable, git, listing, load, on_path,
+    tool_reply, use_fixture_user, wait_for_release, within, write,
 };
 
-const VERSION_ONLY: &str = "#!/bin/sh\necho '@VERSION@ (Claude Code)'\n";
-/// Withhold the directory name until cancellation ends the handler. This exposes a directory
-/// that arrives after its owner stops.
-const HELD_MKTEMP: &str = "#!/bin/sh\ndir=$(\"@REAL@\" \"$@\") || exit 1\nprintf '%s\\n' \"$dir\" > \"@MARKER@\"\n@WAIT_FOR_RELEASE@\nprintf '%s\\n' \"$dir\"\n";
-/// Removes the directory and then fails, like the second of two removals.
-const LOSES_TO_ANOTHER_REMOVAL: &str = "#!/bin/sh\n\"@REAL@\" \"$@\"\nexit 1\n";
-/// Hold `rmdir` so a premature reply reaches the test before cleanup completes.
 const HELD_REMOVAL: &str =
     "#!/bin/sh\ntouch \"@MARKER@\"\n@WAIT_FOR_RELEASE@\nexec \"@REAL@\" \"$@\"\n";
+const VERSION_ONLY: &str = "#!/bin/sh\necho '@VERSION@ (Claude Code)'\n";
 /// Answers the handshake like a clean subscription login, in the mode it was
 /// started in, and runs no task. It saves its settings, the prompt it gets
 /// and each start's environment next to itself.
@@ -61,7 +53,7 @@ while IFS= read -r msg; do
   id=$(printf '%s' "$msg" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
   case "$msg" in
     *'"type":"user"'*) printf '%s\n' "$msg" > "$(dirname "$0")/prompt" ;;
-    *'"initialize"'*) reply "$id" "{\"current_permission_mode\":\"$mode\",\"account\":{\"apiProvider\":\"firstParty\",\"subscriptionType\":\"Claude Pro\"}}" ;;
+    *'"initialize"'*) reply "$id" "{\"current_permission_mode\":\"$mode\",\"account\":{\"apiProvider\":\"firstParty\",\"subscriptionType\":\"Claude Pro\"},\"models\":[{\"value\":\"sonnet\",\"resolvedModel\":\"claude-sonnet-5\"}]}" ;;
     *'"get_settings"'*) reply "$id" "{\"effective\":$flags,\"sources\":[{\"source\":\"flagSettings\",\"settings\":$flags}]}" ;;
     *'"get_hooks_listing"'*) reply "$id" '{"hooks":[],"events":[],"policy":{"allDisabled":true,"policyHookCount":0}}' ;;
   esac
@@ -100,7 +92,6 @@ const DEFAULT_ARTIFACT_ROOT: &str = "claude_code/changes";
 const PATH: &str = "PATH";
 /// A probe's error when the fake answers it with its version line.
 const NO_EVENT_STOP: &str = "printed a line that is not an event";
-const CANNOT_RUN: &str = "maki cannot run ";
 /// The plugin's names for an artifact's files.
 const ARTIFACT_MARKER: &str = ".maki-claude-code-artifact";
 const MANIFEST: &str = "manifest.json";
@@ -308,163 +299,18 @@ fn a_temp_dir_elsewhere_in_the_checkout_is_refused() {
     );
 }
 
-/// The cancel lands after `mktemp` made the directory but before it printed
-/// the name. The call must still remove that directory once `mktemp` exits.
 #[test]
-fn a_cancel_while_mktemp_runs_leaves_no_dir() {
+fn probe_cleanup_needs_no_external_helpers() {
     let _scenario = Scenario::enter();
     let tools = tempdir().unwrap();
     let base = tempdir().unwrap();
-    let marker = tools.path().join("made");
-    let release = tools.path().join("release");
-    let _path = hold(tools.path(), "mktemp", HELD_MKTEMP, &marker, &release);
     let claude = fake_claude(tools.path(), VERSION_ONLY);
+    let _path = EnvVar::set(PATH, tools.path());
     let _tmpdir = EnvVar::set(TMPDIR, base.path());
-
-    let mut ctx = session_ctx();
-    let (trigger, token) = CancelToken::new();
-    ctx.cancel = token;
-    let made = marker.clone();
-    let canceller = thread::spawn(move || {
-        assert!(wait_until(DEADLINE, || made.exists()), "mktemp did not run");
-        trigger.cancel();
-    });
-    let (reg, _host) = fake_host(&claude, tools.path());
-    // When the cancel lands decides the text: the runtime's cancel note, or
-    // the error of a process it stopped.
-    assert!(ask(&reg, &ctx).is_err(), "the call was cancelled");
-    canceller.join().unwrap();
-    fs::write(&release, "").unwrap();
-
-    let created = PathBuf::from(fs::read_to_string(&marker).unwrap().trim());
-    assert!(created.starts_with(base.path()), "made {created:?}");
-    assert!(
-        wait_until(DEADLINE, || !created.exists()),
-        "the directory from mktemp stayed"
-    );
-}
-
-/// maki can exit immediately after a refusal and kill incomplete cleanup. The reply must wait
-/// until the probe directory is gone.
-#[test]
-fn a_refusal_comes_after_the_probe_dir_is_gone() {
-    let _scenario = Scenario::enter();
-    let tools = tempdir().unwrap();
-    let base = tempdir().unwrap();
-    let marker = tools.path().join("removing");
-    let release = tools.path().join("release");
-    let _path = hold(tools.path(), "rmdir", HELD_REMOVAL, &marker, &release);
-    let claude = fake_claude(tools.path(), VERSION_ONLY);
-    let _tmpdir = EnvVar::set(TMPDIR, base.path());
-
-    let releaser = thread::spawn(move || {
-        if wait_until(DEADLINE, || marker.exists()) {
-            fs::write(release, "").unwrap();
-        }
-    });
-    let (reg, host) = fake_host(&claude, tools.path());
-    let refused = ask(&reg, &session_ctx()).unwrap_err();
-    assert!(refused.contains(NO_EVENT_STOP), "got: {refused}");
-    drop(host);
-    releaser.join().unwrap();
-    assert_eq!(
-        listing(base.path()),
-        Vec::<PathBuf>::new(),
-        "the probe directory stayed after the call"
-    );
-}
-
-/// A hanging `rmdir` must not hold the call or its slot forever. The job
-/// system kills it at the startup deadline, which holds after a cancel too,
-/// and the reply names the directory left behind.
-#[test]
-fn a_hung_rmdir_is_stopped_and_its_dir_named() {
-    let _scenario = Scenario::enter();
-    let tools = tempdir().unwrap();
-    let base = tempdir().unwrap();
-    let base_dir = base.path().canonicalize().unwrap();
-    let marker = tools.path().join("removing");
-    let never = tools.path().join("never");
-    let _path = hold(tools.path(), "rmdir", HELD_REMOVAL, &marker, &never);
-    let claude = fake_claude(tools.path(), VERSION_ONLY);
-    let _tmpdir = EnvVar::set(TMPDIR, base.path());
-
-    let (reg, _host) = fake_host(&claude, tools.path());
-    let err = ask(&reg, &session_ctx()).unwrap_err();
-    let left = listing(&base_dir);
-    assert_eq!(left.len(), 1, "the killed rmdir left the probe directory");
-    assert!(
-        err.contains(&format!("{LEFT_BEHIND}{}", left[0].display())),
-        "got: {err}"
-    );
-    fs::remove_dir(&left[0]).unwrap();
-}
-
-/// A removed directory is never reported as left behind, whichever part
-/// removed it. A cleanup that raises after the probe started removes the
-/// probe directory twice, and the second `rmdir` fails.
-#[test]
-fn a_dir_already_removed_is_not_named_left_behind() {
-    let _scenario = Scenario::enter();
-    let tools = tempdir().unwrap();
-    let base = tempdir().unwrap();
-    let unused = tools.path().join("unused");
-    let _path = hold(
-        tools.path(),
-        "rmdir",
-        LOSES_TO_ANOTHER_REMOVAL,
-        &unused,
-        &unused,
-    );
-    let claude = fake_claude(tools.path(), VERSION_ONLY);
-    let _tmpdir = EnvVar::set(TMPDIR, base.path());
-
     let (reg, _host) = fake_host(&claude, tools.path());
     let err = ask(&reg, &session_ctx()).unwrap_err();
     assert!(err.contains(NO_EVENT_STOP), "got: {err}");
     assert!(listing(base.path()).is_empty());
-    assert!(!err.contains(LEFT_BEHIND), "got: {err}");
-}
-
-/// A cleanup process can fail to start inside an exit callback. The caller must still receive
-/// a reply before its timeout.
-#[test]
-fn a_cleanup_that_cannot_start_still_ends_the_call() {
-    let _scenario = Scenario::enter();
-    let tools = tempdir().unwrap();
-    let base = tempdir().unwrap();
-    let base_dir = base.path().canonicalize().unwrap();
-    for name in ["pwd", "mktemp", "sleep"] {
-        symlink(on_path(name), tools.path().join(name)).unwrap();
-    }
-    let claude = fake_claude(tools.path(), VERSION_ONLY);
-    let _path = EnvVar::set(PATH, tools.path());
-    let _tmpdir = EnvVar::set(TMPDIR, base.path());
-
-    let (reg, _host) = fake_host(&claude, tools.path());
-    let err = ask(&reg, &session_ctx()).unwrap_err();
-    let left = listing(&base_dir);
-    assert_eq!(left.len(), 1, "without rmdir, the probe directory stays");
-    assert!(
-        err.contains(&format!("{LEFT_BEHIND}{}", left[0].display())),
-        "got: {err}"
-    );
-    fs::remove_dir(&left[0]).unwrap();
-}
-
-/// The clock starts before its job, so a job never runs without its time
-/// limit. Without `sleep`, the version check does not start.
-#[test]
-fn a_clock_that_cannot_start_stops_the_call() {
-    let _scenario = Scenario::enter();
-    let tools = tempdir().unwrap();
-    let claude = fake_claude(tools.path(), VERSION_ONLY);
-    let _path = EnvVar::set(PATH, tools.path());
-
-    let (reg, _host) = fake_host(&claude, tools.path());
-    let err = ask(&reg, &session_ctx()).unwrap_err();
-    let want = format!("{CANNOT_RUN}`{} --version`", claude.display());
-    assert!(err.contains(&want), "got: {err}");
 }
 
 /// Concurrent file changes can produce a snapshot state that never existed. Refuse that

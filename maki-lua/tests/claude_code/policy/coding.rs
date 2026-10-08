@@ -399,6 +399,97 @@ fn artifact_id(reply: &str) -> String {
     after.split(',').next().unwrap().to_owned()
 }
 
+const NESTED_FILE: &str = "nested/file.txt";
+const NESTED_WORK: &str = "nested work\n";
+const METADATA_MARKER: &str = "metadata_ran";
+const QUARANTINE: &str = "git-metadata";
+const SPARSE_MISSING: &str = "omitted/file.rs";
+const DENIED_CONTENT: &str = "secret\n";
+
+#[test_case("code_nested_empty" ; "without_a_commit")]
+#[test_case("code_nested_commit" ; "with_a_commit")]
+#[test_case("code_nested_pointer" ; "with_a_rewritten_root_pointer")]
+#[test_case("code_nested_casefold" ; "with_casefolded_metadata")]
+fn worker_git_metadata_is_quarantined_and_ordinary_files_import(scenario: &str) {
+    let (coding, reg, _host, id) = Coding::coded(scenario);
+    let artifact = coding.artifacts.path().join(&id);
+    let snapshot = artifact.join(SNAPSHOT_DIR);
+    assert!(!snapshot.join("nested/.git").exists());
+    assert!(!snapshot.join("nested/.GiT").exists());
+    assert!(!listing(&artifact.join(QUARANTINE)).is_empty());
+    git(&snapshot, &["status", "--porcelain"]);
+    git(&snapshot, &["diff"]);
+    assert!(!coding.fake.path(METADATA_MARKER).exists());
+    coding
+        .import(&reg, json!({ "id": id, "paths": [NESTED_FILE] }))
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(coding.project().join(NESTED_FILE)).unwrap(),
+        NESTED_WORK
+    );
+}
+
+#[test]
+fn sparse_checkout_omissions_stay_out_of_the_snapshot() {
+    let coding = Coding::new();
+    let project = coding.project();
+    write(&project.join(SPARSE_MISSING), BASE_LIB);
+    git(&project, &["add", SPARSE_MISSING]);
+    git(&project, &["commit", "-qm", "omitted"]);
+    git(
+        &project,
+        &["update-index", "--skip-worktree", SPARSE_MISSING],
+    );
+    fs::remove_file(project.join(SPARSE_MISSING)).unwrap();
+    let (reg, _host) = coding.host(&[]);
+    let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
+    let id = artifact_id(&reply);
+    assert!(
+        !coding
+            .artifacts
+            .path()
+            .join(&id)
+            .join(SNAPSHOT_DIR)
+            .join(SPARSE_MISSING)
+            .exists()
+    );
+    coding
+        .import(&reg, json!({ "id": id, "paths": [IMPORTED_LIB] }))
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(project.join(IMPORTED_LIB)).unwrap(),
+        WORKER_LIB
+    );
+}
+
+#[test_case(".env/prod" ; "an_env_directory")]
+#[test_case("deep/.env/prod" ; "a_nested_env_directory")]
+#[test_case(".maki/init.lua" ; "maki_configuration")]
+#[test_case("deep/.MaKi/permissions.toml" ; "casefolded_maki_configuration")]
+#[test_case(".Claude/settings.json" ; "casefolded_claude_configuration")]
+fn protected_directory_contents_never_enter_the_snapshot(path: &str) {
+    let coding = Coding::new();
+    let project = coding.project();
+    if project.join(".env").is_file() && path.starts_with(".env/") {
+        fs::remove_file(project.join(".env")).unwrap();
+    }
+    write(&project.join(path), DENIED_CONTENT);
+    git(&project, &["add", "-f", path]);
+    git(&project, &["commit", "-qm", "protected"]);
+    let (reg, _host) = coding.host(&[]);
+    let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
+    let id = artifact_id(&reply);
+    assert!(
+        !coding
+            .artifacts
+            .path()
+            .join(id)
+            .join(SNAPSHOT_DIR)
+            .join(path)
+            .exists()
+    );
+}
+
 #[test]
 fn a_coding_run_changes_a_snapshot_and_never_the_checkout() {
     let include = &[UNTRACKED_INPUT];
@@ -551,7 +642,9 @@ fn an_import_lands_what_the_artifact_recorded(object_format: &str) {
         fs::read_to_string(project.join(IMPORTED_LIB)).unwrap(),
         WORKER_LIB
     );
-    let originals = coding.artifacts.path().join(&id).join(ORIGINALS);
+    let originals = listing(&coding.artifacts.path().join(&id).join(ORIGINALS))
+        .pop()
+        .unwrap();
     assert_eq!(
         fs::read_to_string(originals.join(IMPORTED_LIB)).unwrap(),
         DIRTY_LIB
@@ -718,13 +811,8 @@ fn an_original_that_cannot_be_kept_changes_no_file() {
     let (coding, reg, _host, id) = Coding::coded(CODE_EDIT);
     let project = coding.project();
     let before = contents(&project);
-    let blocker = coding
-        .artifacts
-        .path()
-        .join(&id)
-        .join(ORIGINALS)
-        .join(DELETED_FILE);
-    fs::create_dir_all(blocker.join("old.rs")).unwrap();
+    let blocker = coding.artifacts.path().join(&id).join(ORIGINALS);
+    fs::write(&blocker, BLOCKER).unwrap();
 
     let input = json!({ "id": id, "paths": CHANGED_PATHS });
     let err = coding.import(&reg, input.clone()).unwrap_err();
@@ -732,13 +820,66 @@ fn an_original_that_cannot_be_kept_changes_no_file() {
     assert_eq!(contents(&project), before);
     assert_eq!(temp_files(&project), Vec::<PathBuf>::new());
 
-    fs::remove_dir_all(&blocker).unwrap();
+    fs::remove_file(&blocker).unwrap();
     coding.import(&reg, input).unwrap();
     assert_eq!(
         fs::read_to_string(project.join(IMPORTED_LIB)).unwrap(),
         WORKER_LIB
     );
     assert!(!project.join(DELETED_FILE).exists());
+}
+
+#[test]
+fn pending_approval_blocks_another_import_and_expiry() {
+    let (coding, reg, _host, id) = Coding::coded(CODE_EDIT);
+    let artifact = coding.artifacts.path().join(&id);
+    let control = old_folder(
+        coding.artifacts.path(),
+        SWEPT_FOLDER,
+        &[ARTIFACT_MARKER, MANIFEST],
+    );
+    let queued_id = id.clone();
+    let queued_reg = Arc::clone(&reg);
+    let queued_ctx = coding.ctx(&reg);
+    coding
+        .import_approved_after(&reg, &id, &[IMPORTED_LIB], move || {
+            let second = run_tool(
+                &queued_reg,
+                &queued_ctx,
+                IMPORT_TOOL,
+                json!({ "id": queued_id, "paths": [DELETED_FILE] }),
+            )
+            .unwrap_err();
+            assert!(second.contains("cannot lock artifact"), "{second}");
+            for name in [ARTIFACT_MARKER, MANIFEST] {
+                backdate(&artifact.join(name));
+            }
+            run_tool(
+                &queued_reg,
+                &queued_ctx,
+                TOOL,
+                json!({ "prompt": CODE_EDIT, "profile": CODE_PROFILE }),
+            )
+            .unwrap();
+            assert!(
+                wait_until(DEADLINE, || !control.exists()),
+                "the sweep did not complete"
+            );
+            assert!(
+                artifact.exists(),
+                "expiry deleted an artifact awaiting approval"
+            );
+        })
+        .unwrap();
+    coding
+        .import(&reg, json!({ "id": id, "paths": [DELETED_FILE] }))
+        .unwrap();
+    let manifest: Value = serde_json::from_str(
+        &fs::read_to_string(coding.artifacts.path().join(id).join(MANIFEST)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["imported"][IMPORTED_LIB], true);
+    assert_eq!(manifest["imported"][DELETED_FILE], true);
 }
 
 /// Manifest fields enter an approved shell command. Reject manifests that collection cannot
@@ -962,8 +1103,9 @@ fn the_change_report_fits_within_the_output_limits() {
 /// A cancel after the worker started keeps its snapshot, work included, as
 /// the reply says. With one slot, the next call starts only after the
 /// cancelled call's cleanup, which proves the snapshot survived it.
-#[test]
-fn a_cancel_during_the_run_keeps_the_workers_snapshot() {
+#[test_case(CODE_HANG ; "ordinary_changes")]
+#[test_case("code_nested_cancel" ; "nested_repository_metadata")]
+fn a_cancel_during_the_run_keeps_the_workers_snapshot(prompt: &str) {
     let coding = Coding::new();
     let (reg, _host) = coding.host(&[]);
     let mut ctx = coding.ctx(&reg);
@@ -976,7 +1118,7 @@ fn a_cancel_during_the_run_keeps_the_workers_snapshot() {
         started
     });
 
-    let input = json!({ "prompt": CODE_HANG, "model": MODEL_ALIAS, "profile": CODE_PROFILE });
+    let input = json!({ "prompt": prompt, "model": MODEL_ALIAS, "profile": CODE_PROFILE });
     let err = run_tool(&reg, &ctx, TOOL, input).unwrap_err();
     assert!(canceller.join().unwrap(), "the worker did not start");
     assert!(err.contains(SNAPSHOT_STAYS), "got: {err}");
@@ -988,6 +1130,16 @@ fn a_cancel_during_the_run_keeps_the_workers_snapshot() {
     };
     let lib = artifact.join(SNAPSHOT_DIR).join("src/lib.rs");
     assert!(fs::read_to_string(lib).unwrap().ends_with(WORKER_EDIT));
+    if prompt == "code_nested_cancel" {
+        let snapshot = artifact.join(SNAPSHOT_DIR);
+        assert!(!snapshot.join("nested/.git").exists());
+        assert_eq!(
+            fs::read_to_string(snapshot.join(NESTED_FILE)).unwrap(),
+            NESTED_WORK
+        );
+        git(&snapshot, &["status", "--porcelain"]);
+        assert!(!coding.fake.path(METADATA_MARKER).exists());
+    }
 }
 
 /// Every change can land and the command still fail. The reply says so,
@@ -1500,12 +1652,8 @@ fn a_session_in_a_linked_project_imports() {
     );
 }
 
-/// Claude Code config the worker writes stays in its snapshot at any depth,
-/// as a folder or a file.
-/// Among the changes the manifest check would refuse it, and then no other
-/// change of the artifact could apply.
 #[test]
-fn claude_code_config_the_worker_writes_stays_out_of_the_changes() {
+fn agent_config_the_worker_writes_stays_out_of_the_changes() {
     let (coding, reg, _host, id) = Coding::coded(CODE_CLAUDE_CONFIG);
     coding.import(&reg, json!({ "id": id })).unwrap();
 
@@ -1517,6 +1665,9 @@ fn claude_code_config_the_worker_writes_stays_out_of_the_changes() {
     assert!(!project.join(".claude/settings.local.json").exists());
     assert!(!project.join("src/.claude").exists());
     assert!(!project.join("tools/.claude").exists());
+    assert!(!project.join(".maki/init.lua").exists());
+    assert!(!project.join("src/.MaKi").exists());
+    assert!(!project.join(".Claude").exists());
 }
 
 /// A file that became a folder, and a name that the manifest cannot hold, are

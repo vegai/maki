@@ -8,14 +8,25 @@ local OUTPUT = "complete"
 local CALLBACK_ERROR = "exit callback failed"
 local SEND_ERROR = "stdin send failed"
 local CLOSE_ERROR = "stdin close failed"
-local CLOCK_ERROR = "the timeout clock exited with code 137"
 local DIRECTORY = "/probe/hook-output"
 local SUCCESS_CODE = 0
 local STOPPED_CODE = 137
 
 local function with_jobs(run)
-  local state = { started = {}, stopped = {}, notices = {}, cancel = {}, closes = 0 }
+  local state = { started = {}, stopped = {}, notices = {}, cancel = {}, timers = {}, closes = 0 }
   local overrides = {
+    {
+      maki,
+      "defer_fn",
+      function(callback, _ms)
+        local timer = { callback = callback, stopped = false }
+        function timer:stop()
+          self.stopped = true
+        end
+        state.timers[#state.timers + 1] = timer
+        return timer
+      end,
+    },
     {
       maki.fn,
       "jobstart",
@@ -116,35 +127,28 @@ for _, answered in ipairs({ false, true }) do
   end)
 end
 
-for _, code in ipairs({ SUCCESS_CODE, STOPPED_CODE }) do
-  case("a_clock_exit_stops_the_job_and_reports_code_" .. code, function()
-    with_jobs(function(state)
-      local call = jobs.new(STARTUP_MS, function() end)
-      state.finish = function()
-        state.started[1].opts.on_exit(1, code)
-        eq(state.stopped[2], true)
-        state.started[2].opts.on_exit(2, STOPPED_CODE)
-      end
-      local output, err, timed_out = call:run_quick(COMMAND, {})
-      eq(output, nil)
-      if code == SUCCESS_CODE then
-        has(err, "did not complete in time")
-        eq(timed_out, true)
-      else
-        has(err, CLOCK_ERROR)
-        eq(timed_out, nil)
-      end
-    end)
+case("a_timer_stops_the_job_and_reports_a_timeout", function()
+  with_jobs(function(state)
+    local call = jobs.new(STARTUP_MS, function() end)
+    state.finish = function()
+      state.timers[1].callback()
+      eq(state.stopped[1], true)
+      state.started[1].opts.on_exit(1, STOPPED_CODE)
+    end
+    local output, err, timed_out = call:run_quick(COMMAND, {})
+    eq(output, nil)
+    has(err, "did not complete in time")
+    eq(timed_out, true)
   end)
-end
+end)
 
 case("a_stopped_clock_cannot_change_a_completed_job", function()
   with_jobs(function(state)
     local call = jobs.new(STARTUP_MS, function() end)
     state.finish = function()
-      state.started[2].opts.on_stdout(2, OUTPUT)
-      state.started[2].opts.on_exit(2, SUCCESS_CODE)
-      state.started[1].opts.on_exit(1, STOPPED_CODE)
+      state.started[1].opts.on_stdout(1, OUTPUT)
+      state.started[1].opts.on_exit(1, SUCCESS_CODE)
+      state.timers[1].callback()
     end
     local output, err = call:run_quick(COMMAND, {})
     eq(output, OUTPUT)
@@ -161,8 +165,8 @@ for _, failure in ipairs({ "send", "close" }) do
       end
       local call = jobs.new(STARTUP_MS, function() end)
       state.finish = function()
-        eq(state.stopped[2], true)
-        state.started[2].opts.on_exit(2, SUCCESS_CODE)
+        eq(state.stopped[1], true)
+        state.started[1].opts.on_exit(1, SUCCESS_CODE)
       end
       local output, err = call:run_quick(COMMAND, { stdin = OUTPUT })
       eq(output, nil)

@@ -30,7 +30,7 @@ local function init_event(overrides)
     claude_code_version = OK_VERSION,
     permissionMode = "default",
     tools = { "Glob", "Grep", "Read" },
-    mcp_servers = {},
+    mcp_servers = maki.json.decode("[]"),
     plugins = BUILTIN_PLUGINS,
     cwd = CWD,
   }
@@ -163,6 +163,30 @@ case("home_credentials_include_the_default_claude_login", function()
   local paths = assert(launch.home_credentials("/home/u"))
   assert(contains(paths, "/home/u/.claude"), "~/.claude must be denied")
   assert(contains(paths, "/home/u/.ssh"), "~/.ssh must be denied")
+end)
+
+case("home_credentials_cover_standard_stores_and_user_paths", function()
+  local home = "/home/u"
+  local paths = assert(launch.home_credentials(home, "custom/login.json,tool/credentials"))
+  for _, path in ipairs({
+    ".config/git/credentials",
+    ".local/share/keyrings",
+    ".password-store",
+    ".config/containers/auth.json",
+    ".m2/settings.xml",
+    ".gradle/gradle.properties",
+    ".terraform.d",
+    ".azure",
+    "custom/login.json",
+    "tool/credentials",
+  }) do
+    assert(contains(paths, home .. "/" .. path), path)
+  end
+  for _, path in ipairs({ "/etc/passwd", "../outside", "nested/../../outside" }) do
+    local denied, problem = launch.home_credentials(home, path)
+    eq(denied, nil)
+    has(problem, "must stay inside")
+  end
 end)
 
 for _, home in ipairs({ "", false }) do
@@ -354,7 +378,7 @@ case("a_coding_handshake_checks_the_sandbox_and_a_read_one_does_not", function()
     sources = { { source = "flagSettings", settings = {} } },
     effective = launch.settings("", READ),
   }
-  local hooks = { hooks = {}, policy = { allDisabled = true } }
+  local hooks = { hooks = maki.json.decode("[]"), policy = { allDisabled = true } }
   eq(launch.policy_problem(settings, hooks, "", READ), nil)
   has(launch.policy_problem(settings, hooks, "", launch.WORKERS.code, CONFINE) or "", "outside its sandbox")
   settings.effective = launch.settings("", launch.WORKERS.code, CONFINE)
@@ -424,7 +448,7 @@ local function settings_answer(policy, edit)
   return { effective = effective, sources = sources }
 end
 
-local HOOKS_OFF = { hooks = {}, policy = { allDisabled = true, policyHookCount = 0 } }
+local HOOKS_OFF = { hooks = maki.json.decode("[]"), policy = { allDisabled = true, policyHookCount = 0 } }
 
 -- `checks.rs` runs the same cases against the provider's checks, so the two
 -- sides cannot drift apart. Each section's check returns the problem it
@@ -557,9 +581,9 @@ for _, c in ipairs({
     errors = {
       { file = "/etc/claude-code/managed-settings.json", path = "permissions.defaultMode", message = "bad TOKEN_42" },
     },
-    want = "/etc/claude-code/managed-settings.json: permissions.defaultMode",
+    want = "rejected some settings as invalid",
   },
-  { name = "an_unreadable_error_list", errors = "TOKEN_42", want = "an error list that maki cannot read" },
+  { name = "an_unreadable_error_list", errors = "TOKEN_42", want = "rejected some settings as invalid" },
 }) do
   case("settings_with_" .. c.name .. "_are_refused", function()
     local answer = settings_answer()
@@ -577,7 +601,7 @@ for _, c in ipairs({
     reshape = function(answer)
       answer.sources = { flags = answer.sources[1] }
     end,
-    want = "did not give its settings",
+    want = "did not report its settings",
   },
   {
     name = "extra_roots_as_an_object",
@@ -596,7 +620,7 @@ end
 
 for _, c in ipairs({
   { name = "an_array", value = { "Read", "Grep" }, want = true },
-  { name = "an_empty_table", value = {}, want = true },
+  { name = "an_empty_table", value = {}, want = false },
   { name = "an_object", value = { tool = "Bash" }, want = false },
   { name = "a_decoded_array_with_a_null", value = maki.json.decode('["Read", null, "Bash"]'), want = false },
   { name = "a_string", value = "Read", want = false },
@@ -803,9 +827,9 @@ for _, c in ipairs({
   { name = "missing_key_source", init = { apiKeySource = MISSING }, want = "API key source" },
   { name = "other_version", init = { claude_code_version = "2.1.285" }, want = "2.1.285" },
   { name = "bypass_mode", init = { permissionMode = "bypassPermissions" }, want = "bypassPermissions" },
-  { name = "extra_tool", init = { tools = { "Glob", "Grep", "Read", "Bash" } }, want = "has the tool Bash" },
+  { name = "extra_tool", init = { tools = { "Glob", "Grep", "Read", "Bash" } }, want = 'has the tool "Bash"' },
   { name = "missing_tool", init = { tools = { "Grep", "Read" } }, want = "does not have the tool Glob" },
-  { name = "no_tools", init = { tools = {} }, want = "does not have the tool Read" },
+  { name = "no_tools", init = { tools = {} }, want = "did not list its tools" },
   { name = "mcp_server", init = { mcp_servers = { { name = "x", status = "connected" } } }, want = "MCP" },
   {
     name = "installed_plugin",
@@ -814,8 +838,12 @@ for _, c in ipairs({
   },
   { name = "no_plugin_list", init = { plugins = MISSING }, want = "did not list its plugins" },
   -- A table check would pass an object, and `ipairs` would skip its entries.
-  { name = "tools_as_an_object", init = { tools = { tool = "Bash" } }, want = "no tool list" },
-  { name = "mcp_servers_as_an_object", init = { mcp_servers = { x = { name = "x" } } }, want = "no MCP server list" },
+  { name = "tools_as_an_object", init = { tools = { tool = "Bash" } }, want = "did not list its tools" },
+  {
+    name = "mcp_servers_as_an_object",
+    init = { mcp_servers = { x = { name = "x" } } },
+    want = "MCP servers are not just",
+  },
   {
     name = "plugins_as_an_object",
     init = { plugins = { p = { source = "p@market" } } },
@@ -827,7 +855,7 @@ for _, c in ipairs({
     name = "a_code_worker_in_default_mode",
     worker = launch.WORKERS.code,
     init = { tools = launch.WORKERS.code.tools },
-    want = "permission mode default",
+    want = 'permission mode "default"',
   },
   {
     name = "a_code_worker_without_bash",
@@ -1066,9 +1094,11 @@ end
 
 case("a_snapshot_leaves_out_credentials_and_claude_config", function()
   local specs = table.concat(workspace.excluded_pathspecs("config/prod.yml"), "|")
-  for _, excluded in ipairs({ ".env*", "**/.env*", "secrets/**", "config/prod.yml", ".claude/**" }) do
+  for _, excluded in ipairs({ ".env*", "**/.env*", "secrets/**", "config/prod.yml" }) do
     has(specs, ":(exclude,glob)" .. excluded)
   end
+  has(specs, ":(exclude,icase,glob).claude/**")
+  has(specs, ":(exclude,icase,glob).maki/**")
 end)
 
 -- Whatever the caller exports, git reads the artifact's repository and no
@@ -1488,5 +1518,22 @@ case("retyped_paths_finds_both_sides_of_a_file_that_became_a_folder", function()
   table.sort(found)
   eq(table.concat(found, " "), "a a/b c c/d/e")
 end)
+
+case("settings_env_arrays_are_checked_without_raising", function()
+  eq(#launch.settings_conflicts({ env = { "not a variable" } }), 0)
+end)
+
+case("startup_error_results_preserve_the_dependency_error", function()
+  local step = fresh():feed(
+    maki.json.encode({ type = "result", subtype = "error_during_execution", errors = { "socat not installed" } })
+  )
+  has(step.stop, "socat not installed")
+end)
+
+for _, path in ipairs({ ".maki/init.lua", "nested/.MaKi/permissions.toml", ".Claude/settings.json" }) do
+  case("protected_configuration_is_not_importable_" .. path, function()
+    has(workspace.change_problem({ path = path }), "which a snapshot does not copy")
+  end)
+end
 
 t.report()
