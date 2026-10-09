@@ -88,7 +88,7 @@ checkout --snapshot--> artifact --claude -p--> changes --claude_code_import--> c
 
    Untracked dependency files stay outside the import, including files that `prepare` creates. Preparation changes form the worker baseline even if the command fails or times out. The worker starts only after maki records that baseline.
 
-3. Claude works in the snapshot. Its shell commands run in the Claude Code sandbox, with bubblewrap on Linux and no network access. The shell can write only to the snapshot and a temporary directory beside it. It cannot read the checkout, maki state and config, other artifacts, logins or common credentials such as `~/.ssh`, git credentials and keyrings. Add home-relative paths with `deny_read_home`. Other home files remain readable.
+3. Claude works in the snapshot. Its shell commands run in the Claude Code sandbox, with bubblewrap on Linux and no network access. The shell can write only to the snapshot and a temporary directory beside it. It cannot read the checkout, maki state, config and logs, other artifacts, shell histories, browser profiles or common credentials such as `~/.ssh`, git credentials and keyrings. Add home-relative paths with `deny_read_home`. Other home files remain readable.
 
 4. Claude Code passes its environment to the shell. The `code` profile refuses to start when `CLAUDE_CODE_OAUTH_TOKEN` is set. It also refuses `HTTP_PROXY` or `HTTPS_PROXY` URLs that contain a login. Use `claude auth login` for authentication.
 
@@ -106,7 +106,7 @@ Artifacts live in the maki state directory, or in `artifact_dir`, which must be 
 
 The `claude-code` provider runs maki's agent loop on Claude Code models. The `claude_code` plugin enables the provider. Both use the plugin's `executable` and `config_dir`. It limits its requests to `max_concurrent` separately from the plugin's calls, so up to twice that many can run at once.
 
-Claude Code lists the models available to your account. The provider uses Anthropic model ids, such as `claude-code/claude-sonnet-5`. A listing uses one request slot and starts up to six short `claude` processes. maki keeps the list for a day. `maki models --refresh` or a model refresh in the TUI reads it again. A failed listing waits five minutes before a retry unless you refresh. Tiers and list prices are the anthropic provider's, as the [providers page](/docs/providers/) lists them.
+Claude Code lists the models available to your account. The provider uses Anthropic model ids, such as `claude-code/claude-sonnet-5`. A listing uses one request slot and starts up to six short `claude` processes. maki keeps the list for a day. Opening the model picker uses the cached list. `maki models --refresh` or Ctrl+r in the picker reads it again. A failed listing waits five minutes before a retry unless you refresh. Tiers and list prices are the anthropic provider's, as the [providers page](/docs/providers/) lists them.
 
 Organization policy can make Claude Code run a different model. A reply from a different model stops the turn.
 
@@ -116,7 +116,7 @@ Each model gets the context window Claude Code opens for it. maki reads the wind
 
 Claude Code's own tools are off. When the model calls a tool, maki stops Claude Code and runs the call with its own tools and your permission rules. It sends the results with the next request. Claude Code's own retries are off too.
 
-maki retries rate limits, overloads and server errors as it does for the anthropic provider. It also retries interrupted generations and a reply that stopped to call tools but called none. Held tool calls run only after the whole request succeeds. Login, policy, refusal and invariant errors stop the turn. No output for `stream_timeout_secs` causes a stream timeout and a retry. Each turn starts a policy probe and a worker. A changed executable also gets a version check, so this provider is slower than the anthropic one.
+maki retries rate limits, overloads and server errors as it does for the anthropic provider. It also retries interrupted generations and a reply that stopped to call tools but called none. Held tool calls run only after the whole request succeeds. Login, policy, refusal and invariant errors stop the turn. No output for `stream_timeout_secs` causes a stream timeout and a retry. Each turn starts a policy probe and a worker. Account and managed policy can change without changes to local files, so each turn checks them again. A changed executable also gets a version check, so this provider is slower than the anthropic one.
 
 Each turn runs on your subscription login, and maki counts it as $0. It shows the API list price of the same tokens beside it, such as `$0.000 (~$0.123 Claude subscription)`.
 

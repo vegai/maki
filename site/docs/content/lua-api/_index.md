@@ -114,7 +114,6 @@ The rules:
 | [`maki.async.Permit`](#maki-async-Permit) | One slot in a semaphore, obtained from `Semaphore:acquire()`. |
 | [`maki.async.Task`](#maki-async-Task) | Handle returned by `maki.async.spawn`. |
 | [`maki.base64`](#maki-base64) | Base64 encoding and decoding, modelled after `vim.base64`. |
-| [`maki.claude_code`](#maki-claude_code) | Claude Code launch checks shared with the subscription provider. |
 | [`maki.env`](#maki-env) | Paths to maki's own directories (config, state, logs, legacy). |
 | [`maki.fn`](#maki-fn) | Process and environment helpers, modeled after Neovim's `vim.fn` job |
 | [`maki.fs`](#maki-fs) | File-system utilities, modelled after `vim.fs` and `vim.uv`. |
@@ -1951,274 +1950,6 @@ maki.base64.decode("aGVsbG8=") -- "hello"
 ```
 
 
-## maki.claude_code {#maki-claude_code}
-
-Claude Code launch checks shared with the subscription provider. JSON inputs retain
-the distinction between null, objects and arrays.
-
----
-
-### `maki.claude_code.version()` {#maki-claude_code-version}
-
-```lua
-maki.claude_code.version({output}, {system})
-```
-
-Reject CLI versions and platforms that cannot enforce the launch contract.
-
-**Parameters:**
-
-- `{output}` (`string`) Version output.
-- `{system}` (`string`) Operating system name.
-
-**Returns:** (`string?`, `string?`) Accepted version, or nil and the reason.
-
----
-
-### `maki.claude_code.environment()` {#maki-claude_code-environment}
-
-```lua
-maki.claude_code.environment({environ})
-```
-
-Keep only variables that cannot redirect the subscription login.
-
-**Parameters:**
-
-- `{environ}` (`table`) Environment variables.
-
-**Returns:** (`table`, `table`) Child environment and withheld variable names.
-
----
-
-### `maki.claude_code.config_dir()` {#maki-claude_code-config_dir}
-
-```lua
-maki.claude_code.config_dir({configured?}, {home?})
-```
-
-Require an absolute login directory so probes and workers use the same account.
-
-**Parameters:**
-
-- `{configured?}` (`string?`) Explicit config directory.
-- `{home?}` (`string?`) Home directory.
-
-**Returns:** (`string?`, `string?`) Config directory, or nil and the reason.
-
----
-
-### `maki.claude_code.settings_conflicts()` {#maki-claude_code-settings_conflicts}
-
-```lua
-maki.claude_code.settings_conflicts({settings})
-```
-
-Return conflicting setting names without revealing their secret values.
-
-**Parameters:**
-
-- `{settings}` (`string`) JSON settings.
-
-**Returns:** (`table`) Conflicting names.
-
----
-
-### `maki.claude_code.account_problem()` {#maki-claude_code-account_problem}
-
-```lua
-maki.claude_code.account_problem({init}, {modes})
-```
-
-Check a subscription login before a prompt is sent.
-
-**Parameters:**
-
-- `{init}` (`string`) JSON account response or control event.
-- `{modes}` (`table`) Allowed permission modes.
-
-**Returns:** (`string?`) Reason the login is unsafe, or nil.
-
----
-
-### `maki.claude_code.policy_problem()` {#maki-claude_code-policy_problem}
-
-```lua
-maki.claude_code.policy_problem({settings}, {hooks})
-```
-
-Reject policy that can restore hooks or override the restricted launch.
-
-**Parameters:**
-
-- `{settings}` (`string`) JSON settings response or control event.
-- `{hooks}` (`string`) JSON hooks response or control event.
-
-**Returns:** (`string?`) Reason the policy is unsafe, or nil.
-
----
-
-### `maki.claude_code.init_problem()` {#maki-claude_code-init_problem}
-
-```lua
-maki.claude_code.init_problem({event}, {version}, {cwd}, {tools}, {modes})
-```
-
-Check the worker catalog, login route and directory before accepting output.
-
-**Parameters:**
-
-- `{event}` (`string`) JSON init event.
-- `{version}` (`string`) Validated version.
-- `{cwd}` (`string`) Expected directory.
-- `{tools}` (`table`) Allowed tool names.
-- `{modes}` (`table`) Allowed permission modes.
-
-**Returns:** (`string?`) Reason the init is unsafe, or nil.
-
----
-
-### `maki.claude_code.same_model()` {#maki-claude_code-same_model}
-
-```lua
-maki.claude_code.same_model({ran}, {expected})
-```
-
-Accept a dated snapshot of the requested Claude model.
-
-**Parameters:**
-
-- `{ran}` (`string`) Reported model.
-- `{expected}` (`string`) Requested model.
-
-**Returns:** (`boolean`) Whether the names identify the same model.
-
----
-
-### `maki.claude_code.lock_artifact()` {#maki-claude_code-lock_artifact}
-
-```lua
-maki.claude_code.lock_artifact({dir})
-```
-
-Hold an artifact across approval, import and manifest updates. Closing or dropping the
-handle releases the lock, including after a host crash.
-
-Requires the `fs_write` [plugin permission](#plugin-permissions).
-
-**Parameters:**
-
-- `{dir}` (`string`) Artifact directory.
-
-**Returns:** (`userdata?`, `string?`) Lock with close(), or nil if the artifact is busy.
-
----
-
-### `maki.claude_code.resolved_model()` {#maki-claude_code-resolved_model}
-
-```lua
-maki.claude_code.resolved_model({account}, {requested})
-```
-
-Resolve an alias from the checked account rather than from a local model table.
-
-**Parameters:**
-
-- `{account}` (`string`) JSON account response or control event.
-- `{requested}` (`string`) Model alias.
-
-**Returns:** (`string?`) Resolved model, or nil if the account did not report it.
-
----
-
-### `maki.claude_code.plugins_problem()` {#maki-claude_code-plugins_problem}
-
-```lua
-maki.claude_code.plugins_problem({plugins})
-```
-
-Reject plugins that can change the worker's tools or instructions.
-
-**Parameters:**
-
-- `{plugins}` (`string`) JSON plugin list.
-
-**Returns:** (`string?`) Reason the list is unsafe, or nil.
-
----
-
-### `maki.claude_code.cached_version()` {#maki-claude_code-cached_version}
-
-```lua
-maki.claude_code.cached_version({executable})
-```
-
-Reuse a validated version only while the executable's identity is unchanged.
-
-Requires the `fs_read` [plugin permission](#plugin-permissions).
-
-**Parameters:**
-
-- `{executable}` (`string`) Absolute CLI path.
-
-**Returns:** (`string?`, `string?`) Cached version, or nil and an optional error.
-
----
-
-### `maki.claude_code.cache_version()` {#maki-claude_code-cache_version}
-
-```lua
-maki.claude_code.cache_version({executable}, {output}, {system})
-```
-
-Validate and remember version output. Every worker also checks its init version.
-
-Requires the `fs_read` [plugin permission](#plugin-permissions).
-
-**Parameters:**
-
-- `{executable}` (`string`) Absolute CLI path.
-- `{output}` (`string`) Version output.
-- `{system}` (`string`) Operating system name.
-
-**Returns:** (`string?`, `string?`) Accepted version, or nil and the reason.
-
----
-
-### `maki.claude_code.invalidate_version()` {#maki-claude_code-invalidate_version}
-
-```lua
-maki.claude_code.invalidate_version({executable})
-```
-
-Recheck the installed version after a worker reports a launch failure.
-
-**Parameters:**
-
-- `{executable}` (`string`) Absolute CLI path.
-
----
-
-### `maki.claude_code.sanitize_git()` {#maki-claude_code-sanitize_git}
-
-```lua
-maki.claude_code.sanitize_git({snapshot}, {quarantine}, {git})
-```
-
-Move Git metadata out of a stopped worker's snapshot and restore its trusted root pointer.
-Directory symlinks are not followed, and nested files remain ordinary import candidates.
-
-Requires the `fs_write` [plugin permission](#plugin-permissions).
-
-**Parameters:**
-
-- `{snapshot}` (`string`) Snapshot directory.
-- `{quarantine}` (`string`) Private directory for preserved metadata.
-- `{git}` (`string`) Trusted artifact repository.
-
-**Returns:** (`table?`, `string?`) Relocated nested metadata paths, or nil and the error.
-
-
 ## maki.env {#maki-env}
 
 Paths to maki's own directories (config, state, logs, legacy).
@@ -2359,7 +2090,8 @@ Requires the `run` [plugin permission](#plugin-permissions).
   - `stdin` (`string?`) `"pipe"` to write to the job with `chansend`. Defaults
     to `"null"`, no input. Neovim defaults to `"pipe"`, but a job that
     reads an open pipe with no data hangs.
-  - `guard` (`boolean?`) on Linux, stop the group if maki dies, even from SIGKILL.
+  - `guard` (`boolean?`) on Linux, stop remaining group members when the job exits
+    or maki dies, even from SIGKILL.
   - `kill_group_on_exit` (`boolean?`) after the process exits, kill the
     processes that remain in its process group before `on_exit` runs, such
     as a background child that closed its output (default false, Unix
@@ -3130,6 +2862,24 @@ for _, e in ipairs(entries) do
   print(e[1], e[2]) -- "main.rs"  "file"
 end
 ```
+
+---
+
+### `maki.fs.try_lock()` {#maki-fs-try_lock}
+
+```lua
+maki.fs.try_lock({path})
+```
+
+Try to hold an exclusive file lock. Closing or dropping the handle releases it.
+
+Requires the `fs_write` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{path}` (`string`) Lock file, created if absent.
+
+**Returns:** (`userdata?`, `string?`) Lock with close(), or nil and the error if locking fails.
 
 ---
 
@@ -7507,6 +7257,25 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 - `{template}` (`string`) Path ending in XXXXXX.
 
 **Returns:** (`string?`, `string?`) Created directory, or nil and the error.
+
+---
+
+### `maki.uv.fs_rename()` {#maki-uv-fs_rename}
+
+```lua
+maki.uv.fs_rename({path}, {new_path})
+```
+
+Rename a file or directory. Like `vim.uv.fs_rename`.
+
+Requires the `fs_write` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{path}` (`string`) Existing path.
+- `{new_path}` (`string`) Destination path.
+
+**Returns:** (`boolean?`, `string?`) True on success, or nil and the error.
 
 ---
 
