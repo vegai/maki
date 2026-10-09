@@ -31,7 +31,7 @@ use maki_agent::{
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults, TrustConfig};
 use maki_providers::model::Model;
-use maki_providers::provider::{available_model_specs, fetch_all_models};
+use maki_providers::provider::{ModelListing, available_model_specs, fetch_all_models};
 use maki_providers::{add_cost, settle_session};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
@@ -192,7 +192,7 @@ fn discover_models(policy: Arc<ModelPolicy>, tx: WeakSender<Incoming>) {
                 }
             },
             None,
-            false,
+            ModelListing::Cached,
         )
         .await;
     })

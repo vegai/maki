@@ -1,9 +1,8 @@
+local native = require("maki.claude_code.internal")
+
 -- Claude Code's `stream-json` output. maki ignores all model output until an
 -- init event matches the run's settings, and checks any later init event
 -- again.
-
-local launch = require("claude_launch")
-local RULES = require("claude_rules")
 
 local Stream = {}
 Stream.__index = Stream
@@ -62,7 +61,7 @@ local function init_problem(line, expect)
   for mode in pairs(expect.permission_modes) do
     modes[#modes + 1] = mode
   end
-  return maki.claude_code.init_problem(line, expect.cli.version, expect.cwd, expect.tools, modes)
+  return native.init_problem(line, expect.cli.version, expect.cwd, expect.tools, modes)
 end
 
 local function count(n)
@@ -149,7 +148,7 @@ function Stream:feed(line)
     local problem = init_problem(line, self.expect)
     if problem then
       self.accepted = false
-      return { stop = problem }
+      return { stop = problem, init = ev }
     end
     self.accepted = true
     return { init = ev }
@@ -169,14 +168,14 @@ function Stream:feed(line)
     return { stop = "Claude Code sent " .. ev.type .. " output before its init event" }
   end
   local message = ev.type == STREAM_EVENT and ev.event and ev.event.message or ev.message
-  if self.expect.model and type(message) == "table" and message.model then
-    if not maki.claude_code.same_model(message.model, self.expect.model) then
+  if self.expect.model and ev.is_api_error_message ~= true and type(message) == "table" and message.model then
+    if not native.same_model(message.model, self.expect.model) then
       return { stop = "Claude Code ran " .. tostring(message.model) .. " for " .. self.expect.model }
     end
     self.model_checked = true
   end
   if ev.type == RESULT then
-    if self.expect.model and not self.model_checked and not ev.is_error then
+    if self.expect.model and not self.model_checked and ev.subtype == SUCCESS and not ev.is_error then
       return { stop = "Claude Code did not report the model that ran" }
     end
     self.result = ev

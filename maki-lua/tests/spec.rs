@@ -24,6 +24,11 @@ use test_case::test_case;
 fn plugin_spec(name: &str, spec: &str) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_source(&format!("{name}_spec"), spec)
+    let owner = if name == "claude_code" {
+        name.to_owned()
+    } else {
+        format!("{name}_spec")
+    };
+    host.load_source(&owner, spec)
         .unwrap_or_else(|e| panic!("{name} spec failed:\n{e}"));
 }

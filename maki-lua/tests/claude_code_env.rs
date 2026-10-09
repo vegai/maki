@@ -95,6 +95,7 @@ const NO_EVENT_STOP: &str = "printed a line that is not an event";
 /// The plugin's names for an artifact's files.
 const ARTIFACT_MARKER: &str = ".maki-claude-code-artifact";
 const MANIFEST: &str = "manifest.json";
+const SWEEP_TRASH: &str = ".trash-old";
 /// Older than the default artifact time limit of a day.
 const STALE_AGE: Duration = Duration::from_secs(48 * 60 * 60);
 
@@ -272,7 +273,14 @@ fn a_call_does_not_wait_for_the_sweep() {
     let input = json!({ "prompt": "anything", "profile": "code" });
     let _ = ask_with(&reg, &stub_ctx_in(&project, None, None), input);
     assert!(removing.exists(), "the sweep did not start");
-    assert!(old.exists(), "the call waited for the sweep");
+    assert!(
+        !old.exists(),
+        "expiry must first remove the artifact from the import namespace"
+    );
+    assert!(
+        artifacts.path().join(SWEEP_TRASH).exists(),
+        "the call waited for the sweep"
+    );
 }
 
 /// From a subdirectory, the project is still the whole checkout, so a
@@ -408,12 +416,12 @@ fn an_api_key_and_address_never_reach_claude_code() {
     let claude = fake_claude(tools.path(), HANDSHAKE_ONLY);
 
     let (reg, _host) = fake_host(&claude, tools.path());
-    let _ = ask(&reg, &session_ctx());
+    let result = ask(&reg, &session_ctx());
 
     let child_env = fs::read_to_string(tools.path().join("env")).unwrap();
     assert!(
         fs::exists(tools.path().join("prompt")).unwrap(),
-        "the task must reach Claude Code"
+        "the task must reach Claude Code: {result:?}"
     );
     for name in [API_KEY, BASE_URL] {
         assert!(

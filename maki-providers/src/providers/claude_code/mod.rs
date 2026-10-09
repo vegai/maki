@@ -33,7 +33,7 @@ use tracing::{info, warn};
 
 use crate::model::{Model, ModelFamily, ModelInfo, is_same_model};
 use crate::process::find_program;
-use crate::provider::{BoxFuture, Provider, RequestScope};
+use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use crate::providers::anthropic::shared::{
     LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, long_context_window,
 };
@@ -48,7 +48,6 @@ use crate::{
 };
 use error::Error;
 use maki_storage::atomic_write;
-use maki_storage::id::SessionRef;
 use run::{Limits, Listed, Thinking};
 
 pub(crate) const SLUG: &str = "claude-code";
@@ -424,7 +423,7 @@ impl ClaudeCode {
                 "claude-code: maki did not give the route variables to Claude Code"
             );
         }
-        let local_dirs = checks::local_settings_dirs(cwd)?;
+        let (local_dirs, _) = checks::local_settings_dirs(cwd)?;
         let conflicts =
             checks::file_conflicts(&checks::skipped_settings(&config_dir, cwd, &local_dirs));
         if !conflicts.is_empty() {
@@ -443,13 +442,9 @@ impl ClaudeCode {
         smol::unblock(move || provider.prepare(&cwd)).await
     }
 
-    async fn models(&self, cwd: &Path) -> Result<Vec<Listed>, Error> {
-        self.list(cwd, false).await
-    }
-
     /// Model discovery starts up to six processes. Cache successful lists for 24 hours
-    /// and failures for five minutes. `fresh` bypasses both caches.
-    async fn list(&self, cwd: &Path, fresh: bool) -> Result<Vec<Listed>, Error> {
+    /// and failures for five minutes. An explicit refresh bypasses both caches.
+    async fn list(&self, cwd: &Path, listing: ModelListing) -> Result<Vec<Listed>, Error> {
         let key = (
             self.executable.clone(),
             self.login_dir(&(self.environment)())?,
@@ -465,11 +460,13 @@ impl ClaudeCode {
         };
         // The lock waits for any listing in progress, which can wait for a
         // slot, so a saved list answers without it.
-        if !fresh && let Some(models) = saved().await {
+        if listing == ModelListing::Cached
+            && let Some(models) = saved().await
+        {
             return Ok(models);
         }
         let mut failures = FAILED_LISTINGS.lock().await;
-        if !fresh {
+        if listing == ModelListing::Cached {
             if let Some(models) = saved().await {
                 return Ok(models);
             }
@@ -574,25 +571,16 @@ impl ClaudeCode {
             slot_wait,
         })
         .await
-        .inspect_err(|_| run::invalidate_profile(&self.executable))
+        .inspect_err(|error| {
+            if error.invalidates_version() {
+                run::invalidate_profile(&self.executable);
+            }
+        })
     }
 }
 
 impl Provider for ClaudeCode {
     fn stream_message<'a>(
-        &'a self,
-        _model: &'a Model,
-        _messages: &'a [Message],
-        _system: &'a str,
-        _tools: &'a Value,
-        _event_tx: &'a Sender<ProviderEvent>,
-        _opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
-    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-        Box::pin(async { Err(config_error(Error::NoWorkingDir)) })
-    }
-
-    fn stream_message_in<'a>(
         &'a self,
         model: &'a Model,
         messages: &'a [Message],
@@ -618,18 +606,13 @@ impl Provider for ClaudeCode {
 
     /// Asks Claude Code which models the account can use, so a new model
     /// shows up without a maki update.
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
             let cwd = smol::unblock(working_dir).await?;
-            let models = self.models(&cwd).await.map_err(config_error)?;
-            Ok(with_long_context(models, takes_a_million))
-        })
-    }
-
-    fn list_models_fresh(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async move {
-            let cwd = smol::unblock(working_dir).await?;
-            let models = self.list(&cwd, true).await.map_err(config_error)?;
+            let models = self.list(&cwd, listing).await.map_err(config_error)?;
             Ok(with_long_context(models, takes_a_million))
         })
     }
@@ -682,12 +665,12 @@ mod tests {
         PluginOptions, SLOTS, SLUG, SUBSIDY, SavedModels, agent_error, create_with, follow_plugins,
         save_models, slots, thinking_for, with_long_context,
     };
+    use crate::ThinkingConfig;
     use crate::provider::Provider;
     use crate::providers::Timeouts;
     use crate::retry::RetryKind;
     use crate::types::Effort::{High, Max, Minimal};
     use crate::{Model, TokenUsage};
-    use crate::{RequestOptions, ThinkingConfig};
 
     const ANTHROPIC: &str = "anthropic";
     /// A row with vision in the anthropic table.
@@ -843,32 +826,6 @@ mod tests {
             id: id.to_owned(),
             window,
         }
-    }
-
-    /// Claude Code runs in the session's directory, so a request without one
-    /// stops before any process starts.
-    #[test]
-    fn a_request_without_a_working_dir_is_refused() {
-        let dir = tempdir().unwrap();
-        let provider = provider_in(dir.path(), Vec::new());
-        let model = Model::from_spec(&format!("{SLUG}/{DEFAULT_ROW}")).unwrap();
-        let (events, _received) = flume::unbounded();
-        let opts = RequestOptions {
-            thinking: ThinkingConfig::Off,
-            fast: false,
-        };
-        let error = smol::block_on(provider.stream_message(
-            &model,
-            &[],
-            "",
-            &json!([]),
-            &events,
-            opts,
-            None,
-        ))
-        .unwrap_err();
-        let expected = Error::NoWorkingDir.to_string();
-        assert!(error.to_string().contains(&expected), "{error}");
     }
 
     /// maki counts a turn on the subscription login as `$0`, and the list
@@ -1032,6 +989,7 @@ mod on_the_fake {
     use super::fake::{Fake, HAIKU, IDLE, MARKER, OPUS, SYSTEM, VERSION_ERROR, WAIT, tools};
     use super::run::{Limits, Listed, Thinking};
     use super::{ClaudeCode, Exchange, slots};
+    use crate::provider::ModelListing;
     use crate::{Message, Model, StreamResponse};
 
     const HAIKU_SPEC: &str = "claude-code/claude-haiku-4-5";
@@ -1184,7 +1142,7 @@ mod on_the_fake {
             .unwrap();
         let provider = provider_for(&fake, home.path(), &env::temp_dir(), Some(cache.clone()));
 
-        let listed = smol::block_on(provider.models(&fake.project())).unwrap();
+        let listed = smol::block_on(provider.list(&fake.project(), ModelListing::Cached)).unwrap();
         let want = if asks {
             vec![OPUS, HAIKU]
         } else {
@@ -1224,10 +1182,10 @@ mod on_the_fake {
 
         let listed = smol::block_on(
             async {
-                let _ = provider.list(&cwd, true).await;
+                let _ = provider.list(&cwd, ModelListing::Refresh).await;
                 None
             }
-            .or(async { Some(provider.list(&cwd, false).await) })
+            .or(async { Some(provider.list(&cwd, ModelListing::Cached).await) })
             .or(async {
                 Timer::after(WAIT).await;
                 None
@@ -1252,8 +1210,10 @@ mod on_the_fake {
         let provider = provider_for(&fake, home.path(), &env::temp_dir(), cache);
         let cwd = fake.project();
 
-        let (first, second) =
-            smol::block_on(future::zip(provider.models(&cwd), provider.models(&cwd)));
+        let (first, second) = smol::block_on(future::zip(
+            provider.list(&cwd, ModelListing::Cached),
+            provider.list(&cwd, ModelListing::Cached),
+        ));
         let ids = |listed: Vec<Listed>| -> Vec<String> {
             listed.into_iter().map(|model| model.id).collect()
         };
@@ -1273,14 +1233,42 @@ mod on_the_fake {
         let provider = provider_for(&fake, home.path(), &env::temp_dir(), cache);
         let cwd = fake.project();
 
-        let first = smol::block_on(provider.models(&cwd)).unwrap_err();
-        let again = smol::block_on(provider.models(&cwd)).unwrap_err();
+        let first = smol::block_on(provider.list(&cwd, ModelListing::Cached)).unwrap_err();
+        let again = smol::block_on(provider.list(&cwd, ModelListing::Cached)).unwrap_err();
         assert!(!matches!(first, Error::ListedRecently { .. }), "{first}");
         assert!(matches!(again, Error::ListedRecently { .. }), "{again}");
         assert_eq!(fake.log("versions").lines().count(), 1);
 
-        let _ = smol::block_on(provider.list(&cwd, true));
+        let _ = smol::block_on(provider.list(&cwd, ModelListing::Refresh));
         assert_eq!(fake.log("versions").lines().count(), 2);
+    }
+
+    #[test]
+    fn transient_errors_keep_the_validated_executable_version() {
+        let fake = Fake::new("overloaded");
+        let home = tempdir().unwrap();
+        let provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
+        let model = Model::from_spec(HAIKU_SPEC).unwrap();
+        let tools = tools();
+        let (events, _received) = flume::unbounded();
+        for _ in 0..2 {
+            let exchange = Exchange {
+                system: SYSTEM,
+                messages: &[],
+                tools: &tools,
+                events: &events,
+            };
+            let error = smol::block_on(provider.request(
+                &model,
+                Thinking::Default,
+                exchange,
+                &fake.project(),
+            ))
+            .unwrap_err();
+            assert!(error.temporary().is_some(), "{error}");
+        }
+        assert_eq!(fake.log("versions").lines().count(), 1);
+        assert_eq!(fake.log("calls").lines().count(), 4);
     }
 
     /// Sends one request through the provider as maki calls it, from `cwd`,

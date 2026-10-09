@@ -10,7 +10,7 @@ local GIT_UNCONFIGURED = { GIT_CONFIG_GLOBAL = "/dev/null", GIT_CONFIG_NOSYSTEM 
 
 -- With these attributes a blob id is the hash of the bytes on disk, the same
 -- id `git hash-object --no-filters` gives for the checkout.
-M.RAW_ATTRIBUTES = "* -text -filter -ident -working-tree-encoding\n"
+M.RAW_ATTRIBUTES = "* -text -filter -ident -working-tree-encoding !diff\n"
 -- Override anything the worker writes into the snapshot's git config.
 -- Quoted paths keep each listing in ASCII, which the job reader never splits
 -- mid-character.
@@ -199,18 +199,23 @@ function M.shell_quote(text)
   return "'" .. text:gsub("'", "'\\''") .. "'"
 end
 
+local function git_environment()
+  local words = { "env", "-u", "GIT_CONFIG_PARAMETERS", "-u", "GIT_CONFIG_COUNT" }
+  local assignments = {}
+  for name, value in pairs(GIT_UNCONFIGURED) do
+    assignments[#assignments + 1] = name .. "=" .. M.shell_quote(value)
+  end
+  table.sort(assignments)
+  for _, assignment in ipairs(assignments) do
+    words[#words + 1] = assignment
+  end
+  return words
+end
+
 function M.diff_command(artifact)
-  local words = {
-    "env",
-    "-u",
-    "GIT_CONFIG_PARAMETERS",
-    "-u",
-    "GIT_CONFIG_COUNT",
-    "GIT_CONFIG_GLOBAL=/dev/null",
-    "GIT_CONFIG_NOSYSTEM=1",
-    "GIT_DIR=" .. M.bash_quote(artifact.git),
-    "GIT_WORK_TREE=" .. M.bash_quote(artifact.snapshot),
-  }
+  local words = git_environment()
+  words[#words + 1] = "GIT_DIR=" .. M.bash_quote(artifact.git)
+  words[#words + 1] = "GIT_WORK_TREE=" .. M.bash_quote(artifact.snapshot)
   for _, word in
     ipairs(M.git({
       "diff",
@@ -563,11 +568,7 @@ end
 --- use links that cannot overwrite a save made after the original moved.
 --- A failed import runs `leftovers_script` to remove its temporary files.
 function M.import_script(changes, project, git_dir, artifact, stage)
-  local words = {}
-  for name, value in pairs(GIT_UNCONFIGURED) do
-    words[#words + 1] = name .. "=" .. M.shell_quote(value)
-  end
-  table.sort(words)
+  local words = git_environment()
   for _, word in ipairs(M.git({ "--git-dir=" .. git_dir })) do
     words[#words + 1] = M.bash_quote(word)
   end

@@ -1,4 +1,5 @@
-use std::ffi::c_long;
+use std::ffi::{c_int, c_long};
+use std::fs;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -7,14 +8,24 @@ use std::process::Command;
 use std::ptr;
 
 use libc::{
-    _SC_OPEN_MAX, _exit, STDIN_FILENO, STDOUT_FILENO, SYS_close_range, close, dup2, execve, fork,
-    syscall, sysconf,
+    _SC_OPEN_MAX, _exit, STDIN_FILENO, STDOUT_FILENO, SYS_close_range, close, dup2, execve,
+    setpgid, syscall, sysconf,
 };
-use rustix::process::{Signal, getpid, kill_process_group};
+use rustix::process::{Signal, getpgrp, getpid, kill_process_group};
+
+unsafe extern "C" {
+    fn _Fork() -> c_int;
+}
 
 /// The guard shares the worker's group and reserves its id after the leader exits. Only
 /// maki holds the lifetime socket's other endpoint.
 pub fn bind(command: &mut Command) -> io::Result<UnixStream> {
+    fs::metadata("/bin/sh").map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("process guard needs /bin/sh: {error}"),
+        )
+    })?;
     let (reader, lifetime) = UnixStream::pair()?;
     // SAFETY: sysconf has no pointer arguments.
     let max_fd = unsafe { sysconf(_SC_OPEN_MAX) };
@@ -25,8 +36,11 @@ pub fn bind(command: &mut Command) -> io::Result<UnixStream> {
     // It never allocates, unwinds or runs inherited destructors.
     unsafe {
         command.pre_exec(move || {
+            if getpgrp() != getpid() && setpgid(0, 0) < 0 {
+                return Err(io::Error::last_os_error());
+            }
             let group = getpid();
-            match fork() {
+            match _Fork() {
                 -1 => return Err(io::Error::last_os_error()),
                 0 => {
                     if dup2(reader.as_raw_fd(), STDIN_FILENO) >= 0 {
@@ -55,4 +69,33 @@ pub fn bind(command: &mut Command) -> io::Result<UnixStream> {
         });
     }
     Ok(lifetime)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bind;
+    use rustix::process::getpgrp;
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command, Stdio};
+
+    const CHILD: &str = "echo ready; exec sleep 30";
+    const READY: &str = "ready\n";
+
+    #[test]
+    fn guard_establishes_its_own_group_without_caller_setup() {
+        let parent_group = getpgrp();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", CHILD]).stdout(Stdio::piped());
+        let lifetime = bind(&mut command).unwrap();
+        let mut child = command.spawn().unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line, READY);
+        drop(lifetime);
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
+        assert_eq!(getpgrp(), parent_group);
+    }
 }

@@ -31,6 +31,13 @@ pub struct RequestScope<'a> {
     pub cwd: &'a Path,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ModelListing {
+    #[default]
+    Cached,
+    Refresh,
+}
+
 pub trait Provider: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn stream_message<'a>(
@@ -41,40 +48,13 @@ pub trait Provider: Send + Sync {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>>;
 
-    /// [`Provider::stream_message`] for a request that tells where it runs.
-    /// Only a provider that needs more than the session id overrides it. A
-    /// wrapper must also forward this function, or the provider it holds
-    /// loses the directory.
-    #[allow(clippy::too_many_arguments)]
-    fn stream_message_in<'a>(
-        &'a self,
-        model: &'a Model,
-        messages: &'a [Message],
-        system: &'a str,
-        tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
-        opts: RequestOptions,
-        scope: RequestScope<'a>,
-    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-        self.stream_message(
-            model,
-            messages,
-            system,
-            tools,
-            event_tx,
-            opts,
-            scope.session_id,
-        )
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>>;
-
-    fn list_models_fresh(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        self.list_models()
-    }
+    fn list_models(
+        &self,
+        listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>>;
 
     /// Fetch provider-side usage quota (remaining percentage / reset times).
     /// `Ok(None)` means the provider does not expose a programmatic usage endpoint.
@@ -190,7 +170,7 @@ impl Provider for UnconfiguredProvider {
         _tools: &'a Value,
         _event_tx: &'a Sender<ProviderEvent>,
         _opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async {
             Err(AgentError::Config {
@@ -199,7 +179,10 @@ impl Provider for UnconfiguredProvider {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async {
             Err(AgentError::Config {
                 message: NOT_CONFIGURED.to_string(),
@@ -272,7 +255,7 @@ pub async fn fetch_all_models(
     policy: &ModelPolicy,
     mut on_ready: impl FnMut(ModelBatch),
     on_done: Option<Box<dyn FnOnce() + Send>>,
-    fresh: bool,
+    listing: ModelListing,
 ) {
     let (tx, rx) = flume::unbounded();
     let timeouts = Timeouts::default();
@@ -284,12 +267,9 @@ pub async fn fetch_all_models(
             continue;
         };
         let tx = tx.clone();
+        let listing = listing.clone();
         smol::spawn(async move {
-            let listed = if fresh {
-                provider.list_models_fresh().await
-            } else {
-                provider.list_models().await
-            };
+            let listed = provider.list_models(listing).await;
             let batch = match listed {
                 Ok(models) => {
                     let mut specs: Vec<String> =

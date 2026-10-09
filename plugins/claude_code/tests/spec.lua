@@ -1,3 +1,4 @@
+local native = require("maki.claude_code.internal")
 local t = require("maki.test_helpers")
 local launch = require("claude_launch")
 local Stream = require("claude_stream")
@@ -12,7 +13,7 @@ local PROMPT = "--explain the parser"
 local ANSWER = "The parser lives in src/parse.rs:10."
 local OK_VERSION = "2.1.284"
 local LINUX = "Linux"
-local CLI = assert(launch.checked_cli(OK_VERSION .. " (Claude Code)", LINUX))
+local CLI = { version = assert(native.version(OK_VERSION .. " (Claude Code)", LINUX)) }
 local OUTSIDE = "/home/u/.ssh/config"
 -- What 2.1.280 sends with every setting source off.
 local BUILTIN_PLUGINS = {
@@ -456,7 +457,8 @@ local HOOKS_OFF = { hooks = maki.json.decode("[]"), policy = { allDisabled = tru
 local RULE_CASES = require("tests.rule_cases")
 local SHARED_CHECKS = {
   versions = function(c, shown)
-    local cli, problem = launch.checked_cli(c.output, c.system)
+    local version, problem = native.version(c.output, c.system)
+    local cli = version and { version = version }
     eq(cli and cli.version, c.version, shown)
     return problem
   end,
@@ -738,7 +740,7 @@ for _, c in ipairs({
     local dirs, err = launch.local_settings_dirs(maki.fs.joinpath(root, "wt"))
     t.rmtree(root)
     eq(dirs, nil)
-    has(err or "", "maki cannot examine it")
+    has(err or "", "maki cannot examine")
   end)
 end
 
@@ -754,20 +756,6 @@ for _, c in ipairs({
     eq(launch.within(c.path, c.root), c.want)
   end)
 end
-
-case("skipped_settings_cover_every_local_file", function()
-  local paths = launch.skipped_settings("/home/u/.claude", "/r/sub", { "/r/sub", "/r", "/main" })
-  eq(
-    table.concat(paths, "|"),
-    table.concat({
-      "/home/u/.claude/settings.json",
-      "/r/sub/.claude/settings.json",
-      "/r/sub/.claude/settings.local.json",
-      "/r/.claude/settings.local.json",
-      "/main/.claude/settings.local.json",
-    }, "|")
-  )
-end)
 
 -- Configured paths follow the defaults, with spaces and empty entries
 -- dropped and no second ./ added.
@@ -1535,5 +1523,23 @@ for _, path in ipairs({ ".maki/init.lua", "nested/.MaKi/permissions.toml", ".Cla
     has(workspace.change_problem({ path = path }), "which a snapshot does not copy")
   end)
 end
+
+case("synthetic_api_errors_preserve_the_result_cause", function()
+  local stream = Stream.new({ cwd = CWD, worker = READ, cli = CLI, model = "claude-haiku-4-5" })
+  stream:feed(init_event())
+  stream.expect.model = "claude-haiku-4-5"
+  local step = stream:feed(maki.json.encode({
+    type = "assistant",
+    is_api_error_message = true,
+    message = { model = "<synthetic>", content = {} },
+  }))
+  eq(step and step.stop, nil)
+  stream:feed(
+    maki.json.encode({ type = "result", subtype = "error_during_execution", is_error = true, errors = { "overloaded" } })
+  )
+  local text, is_error = stream:outcome()
+  has(text, "overloaded")
+  eq(is_error, true)
+end)
 
 t.report()

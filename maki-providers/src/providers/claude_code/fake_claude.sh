@@ -103,6 +103,14 @@ if [ -z "$got" ]; then [ "$scenario" = probe_runs ] && init none; exit 0; fi
 case $scenario in
   batch) init none; connect; generation tool_use; dispatch a; sleep 30 ;;
   cut_line) init none; connect; generation tool_use; printf '{"type":"keep_al'; dispatch a; sleep 30 ;;
+  missing_block_eof | missing_block_late)
+    init none
+    event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-haiku-4-5-20251001\"$start_usage}}"
+    event '{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"missing"}}'
+    event "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}$final_usage}"
+    event '{"type":"message_stop"}'
+    [ "$scenario" = missing_block_late ] && sleep 30 ;;
+  status_only_error) init none; line '{"type":"result","subtype":"error_during_execution","is_error":true,"api_error_status":529,"errors":["overloaded"]}' ;;
   text) text_reply ;;
   noisy_stderr) printf 'bad \377 byte\n' >&2; head -c 200000 /dev/zero | tr '\0' 'x' >&2; printf '\n' >&2; text_reply ;;
   text_then_fail) text_reply; exit 23 ;;

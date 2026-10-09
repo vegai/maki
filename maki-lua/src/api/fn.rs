@@ -1036,7 +1036,8 @@ fn kill_job(job: &JobMeta) {
 ///   `stdin` (string?) `"pipe"` to write to the job with `chansend`. Defaults
 ///     to `"null"`, no input. Neovim defaults to `"pipe"`, but a job that
 ///     reads an open pipe with no data hangs.
-///   `guard` (boolean?) on Linux, stop the group if maki dies, even from SIGKILL.
+///   `guard` (boolean?) on Linux, stop remaining group members when the job exits
+///     or maki dies, even from SIGKILL.
 ///   `kill_group_on_exit` (boolean?) after the process exits, kill the
 ///     processes that remain in its process group before `on_exit` runs, such
 ///     as a background child that closed its output (default false, Unix
@@ -1748,6 +1749,7 @@ fn text_line(mut bytes: Vec<u8>) -> String {
 mod tests {
     #[cfg(unix)]
     use std::fs;
+    use test_case::test_case;
 
     use super::*;
     use crate::api::util::command::{NO_UI_ERR, WinView};
@@ -2639,12 +2641,14 @@ mod tests {
     /// The `sleep` holds none of the job's pipes, so without the group kill
     /// nothing waits for it or stops it after the shell exits.
     #[cfg(target_os = "linux")]
-    #[test]
-    fn a_child_that_left_its_output_dies_with_the_leader() {
+    #[test_case(false ; "kill_group_on_exit")]
+    #[test_case(true ; "lifetime_guard")]
+    fn a_child_that_left_its_output_dies_with_the_leader(guard: bool) {
         let mut store = make_store();
         let id = store
             .start(JobSpec {
-                kill_group_on_exit: true,
+                kill_group_on_exit: !guard,
+                guard,
                 ..JobSpec::new(
                     task_owner(1),
                     JobCommand::Argv(vec!["sh".into(), "-c".into(), LEFT_ITS_OUTPUT.into()]),

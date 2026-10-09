@@ -169,9 +169,10 @@ enum Reply {
 async fn connection(stream: TcpStream, shared: Arc<Shared>) {
     let mut reader = BufReader::new(stream.clone());
     let mut writer = stream;
+    let mut head_limit = shared.read_limit.min(HEAD_TIMEOUT);
     loop {
         // A rejected request's body is never read, so the connection ends.
-        let head = match within(shared.read_limit.min(HEAD_TIMEOUT), read_head(&mut reader)).await {
+        let head = match within(head_limit, read_head(&mut reader)).await {
             Some(Ok(Some(head))) => head,
             Some(Ok(None)) | None => return,
             Some(Err(status)) => {
@@ -186,6 +187,7 @@ async fn connection(stream: TcpStream, shared: Arc<Shared>) {
             },
             Err(status) => Err(status),
         };
+        head_limit = shared.read_limit;
         let reply = match body {
             Ok(body) => answer(&shared, &body),
             Err(status) => {

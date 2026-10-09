@@ -21,9 +21,9 @@ const ASSISTANT_ROLE: &str = "assistant";
 const TOOL_RESULT_ROLE: &str = "tool_result";
 const IS_ERROR: &str = "is_error";
 const TEXT: &str = "text";
-const BATCH_TOOL: &str = "batch";
-const BATCH_CALLS: &str = "tool_calls";
-const BATCH_CALL_TOOL: &str = "tool";
+pub(super) const BATCH_TOOL: &str = "batch";
+pub(super) const BATCH_CALLS: &str = "tool_calls";
+pub(super) const BATCH_CALL_TOOL: &str = "tool";
 const TRANSCRIPT_HEADER: &str =
     "maki transcript v1: the conversation so far, oldest first, one JSON value per line";
 
@@ -132,13 +132,7 @@ fn push_line(out: &mut String, value: &Value) {
     let _ = write!(out, "\n{value}");
 }
 
-/// Anthropic caches prefixes at block boundaries. Keep each transcript message in a separate
-/// block so later requests reuse earlier messages.
-///
-/// Use the tool names visible to the model. Omit thinking because its signature is valid only
-/// for its original request. Reject images after maki's image adaptation.
-fn exposed_input(name: &str, input: &Value) -> Value {
-    let mut input = input.clone();
+fn expose_input(name: &str, input: &mut Value) {
     if name == BATCH_TOOL
         && let Some(calls) = input[BATCH_CALLS].as_array_mut()
     {
@@ -149,9 +143,13 @@ fn exposed_input(name: &str, input: &Value) -> Value {
             }
         }
     }
-    input
 }
 
+/// Anthropic caches prefixes at block boundaries. Keep each transcript message in a separate
+/// block so later requests reuse earlier messages.
+///
+/// Use the tool names visible to the model. Omit thinking because its signature is valid only
+/// for its original request. Reject images after maki's image adaptation.
 pub(crate) fn transcript(messages: &[Message]) -> Result<Vec<String>, Error> {
     let mut blocks = vec![TRANSCRIPT_HEADER.to_owned()];
     for message in messages {
@@ -164,11 +162,11 @@ pub(crate) fn transcript(messages: &[Message]) -> Result<Vec<String>, Error> {
                 ContentBlock::Text { text: t } => text.push(t.as_str()),
                 ContentBlock::ToolUse {
                     id, name, input, ..
-                } => calls.push(json!({
-                    "id": id,
-                    "name": format!("{EXPOSED_PREFIX}{}", server_name(name)),
-                    "input": exposed_input(name, input),
-                })),
+                } => {
+                    let mut call = json!({ "id": id, "name": format!("{EXPOSED_PREFIX}{}", server_name(name)), "input": input });
+                    expose_input(name, &mut call["input"]);
+                    calls.push(call);
+                }
                 ContentBlock::ToolResult {
                     tool_use_id,
                     content,

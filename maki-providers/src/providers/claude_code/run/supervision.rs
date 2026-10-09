@@ -66,10 +66,14 @@ impl Group {
     /// group.
     pub(super) async fn wait(&mut self, deadline: Instant) -> Result<ExitStatus, Error> {
         let exited = self.exited_by(deadline).await;
-        self.kill();
+        if exited == Some(false) {
+            self.reaped = true;
+        } else {
+            self.kill();
+        }
         let status = self.child.status().await;
         self.reaped = true;
-        if !exited {
+        if exited.is_none() {
             return Err(Error::ExitLate);
         }
         status.map_err(|source| Error::Io {
@@ -80,19 +84,17 @@ impl Group {
 
     /// Does not reap the leader.
     #[cfg(unix)]
-    async fn exited_by(&self, deadline: Instant) -> bool {
+    async fn exited_by(&self, deadline: Instant) -> Option<bool> {
         let pid = self.child.id();
-        within(deadline, smol::unblock(move || wait_without_reaping(pid)))
-            .await
-            .unwrap_or(false)
+        within(deadline, smol::unblock(move || wait_without_reaping(pid))).await
     }
 
     /// The open process handle keeps the pid for this process.
     #[cfg(not(unix))]
-    async fn exited_by(&mut self, deadline: Instant) -> bool {
+    async fn exited_by(&mut self, deadline: Instant) -> Option<bool> {
         within(deadline, self.child.status())
             .await
-            .is_some_and(|status| status.is_ok())
+            .map(|status| status.is_ok())
     }
 }
 

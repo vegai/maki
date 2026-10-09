@@ -182,7 +182,7 @@ impl Import {
             .replace("@GIT@", &git_dir.to_string_lossy())
             .replace("@ARTIFACT@", &artifact.to_string_lossy());
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-        host.load_source("import_script", &source).unwrap();
+        host.load_source("claude_code", &source).unwrap();
         let script = fs::read_to_string(&out).unwrap();
         let leftovers = fs::read_to_string(&leftovers).unwrap();
         let held = HELD

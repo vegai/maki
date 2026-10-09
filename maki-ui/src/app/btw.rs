@@ -82,7 +82,7 @@ async fn run_btw(
     // The request must own the sender so its completion closes the event channel.
     let stream_fut = async move {
         provider
-            .stream_message_in(
+            .stream_message(
                 &model,
                 &messages,
                 &system,
@@ -131,12 +131,11 @@ mod tests {
     use flume::Sender;
     use futures_lite::FutureExt;
     use maki_agent::AgentError;
-    use maki_providers::provider::{BoxFuture, Provider, RequestScope};
+    use maki_providers::provider::{BoxFuture, ModelListing, Provider, RequestScope};
     use maki_providers::{
         ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
         TokenUsage,
     };
-    use maki_storage::id::SessionRef;
     use serde_json::Value;
     use smol::Timer;
 
@@ -144,7 +143,6 @@ mod tests {
 
     const Q: &str = "why sqlite?";
     const SESSION_DIR: &str = "/session/dir";
-    const NO_DIR: &str = "the side question came without the directory of the session";
     const NEVER_ENDED: &str = "the side question did not stop";
     const END_LIMIT: Duration = Duration::from_secs(10);
 
@@ -155,23 +153,6 @@ mod tests {
 
     impl Provider for DirOnlyProvider {
         fn stream_message<'a>(
-            &'a self,
-            _model: &'a Model,
-            _messages: &'a [Message],
-            _system: &'a str,
-            _tools: &'a Value,
-            _event_tx: &'a Sender<ProviderEvent>,
-            _opts: RequestOptions,
-            _session_id: Option<&'a SessionRef>,
-        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-            Box::pin(async {
-                Err(AgentError::Config {
-                    message: NO_DIR.into(),
-                })
-            })
-        }
-
-        fn stream_message_in<'a>(
             &'a self,
             _model: &'a Model,
             _messages: &'a [Message],
@@ -192,7 +173,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
     }

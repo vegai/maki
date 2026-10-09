@@ -239,7 +239,7 @@ pub(crate) async fn stream_with_retry(
         // retry slept on a server `Retry-After` never pays for the attempt it
         // woke up to make.
         let result = cancel
-            .race(provider.stream_message_in(
+            .race(provider.stream_message(
                 model,
                 messages,
                 system,
@@ -385,13 +385,13 @@ fn error_description(error: &AgentError) -> String {
 
 #[cfg(test)]
 mod tests {
+    use maki_providers::provider::ModelListing;
     use std::path::Path;
     use std::sync::Mutex;
 
     use maki_providers::{
         Effort, KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Role, ThinkingConfig, TokenUsage,
     };
-    use maki_storage::id::SessionRef;
     use serde_json::json;
     use test_case::test_case;
 
@@ -604,7 +604,7 @@ mod tests {
             tools: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: RequestScope<'a>,
         ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 let prompt = (estimate_prompt_tokens(messages, system, tools) as f32
@@ -635,6 +635,7 @@ mod tests {
 
         fn list_models(
             &self,
+            _listing: ModelListing,
         ) -> maki_providers::provider::BoxFuture<
             '_,
             Result<Vec<maki_providers::ModelInfo>, AgentError>,
@@ -882,7 +883,7 @@ mod tests {
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: RequestScope<'a>,
         ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 let key = self.pool.current().to_owned();
@@ -902,6 +903,7 @@ mod tests {
 
         fn list_models(
             &self,
+            _listing: ModelListing,
         ) -> maki_providers::provider::BoxFuture<
             '_,
             Result<Vec<maki_providers::ModelInfo>, AgentError>,

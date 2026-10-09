@@ -203,28 +203,32 @@ pub(crate) fn child_env(
 /// A submodule has no `commondir` and returns `None`. Unreadable git paths must fail
 /// because the primary checkout can contain local settings. Resolve paths lexically, as
 /// Claude Code and the plugin do.
-fn main_checkout(git_file: &Path) -> io::Result<Option<PathBuf>> {
+fn main_checkout(git_file: &Path) -> io::Result<(Option<PathBuf>, Option<PathBuf>)> {
     let text = fs::read_to_string(git_file)?;
     let Some(gitdir) = text.trim().strip_prefix(GITDIR_PREFIX) else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let gitdir = git_file.parent().unwrap_or(git_file).join(gitdir.trim());
     let common = match fs::read_to_string(gitdir.join(COMMONDIR_FILE)) {
         Ok(common) => common,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return Ok((None, Some(normalize_path(&gitdir))));
+        }
         Err(e) => return Err(e),
     };
     let common = normalize_path(&gitdir.join(common.trim()));
     fs::metadata(&common)?;
-    Ok((common.file_name() == Some(GIT_ENTRY.as_ref()))
+    let main = (common.file_name() == Some(GIT_ENTRY.as_ref()))
         .then(|| common.parent().map(Path::to_path_buf))
-        .flatten())
+        .flatten();
+    Ok((main, Some(common)))
 }
 
 /// Returns the directories whose `.claude/settings.local.json` Claude Code
 /// can read from `cwd`: `cwd`, the repository root, and a worktree's primary
 /// checkout.
-pub(crate) fn local_settings_dirs(cwd: &Path) -> Result<Vec<PathBuf>, Error> {
+pub(crate) fn local_settings_dirs(cwd: &Path) -> Result<(Vec<PathBuf>, Option<PathBuf>), Error> {
+    let mut git_dir = None;
     let mut dirs = vec![cwd.to_path_buf()];
     for dir in cwd.ancestors() {
         let git = dir.join(GIT_ENTRY);
@@ -233,15 +237,19 @@ pub(crate) fn local_settings_dirs(cwd: &Path) -> Result<Vec<PathBuf>, Error> {
                 if !dirs.iter().any(|d| d == dir) {
                     dirs.push(dir.to_path_buf());
                 }
-                if meta.is_file()
-                    && let Some(main) = main_checkout(&git).map_err(|source| Error::Path {
-                        what: "examine the worktree of",
-                        path: git.clone(),
-                        source,
-                    })?
-                    && !dirs.contains(&main)
-                {
-                    dirs.push(main);
+                if meta.is_file() {
+                    let (main, external_git) =
+                        main_checkout(&git).map_err(|source| Error::Path {
+                            what: "examine the worktree of",
+                            path: git.clone(),
+                            source,
+                        })?;
+                    git_dir = external_git;
+                    if let Some(main) = main
+                        && !dirs.contains(&main)
+                    {
+                        dirs.push(main);
+                    }
                 }
                 break;
             }
@@ -255,7 +263,7 @@ pub(crate) fn local_settings_dirs(cwd: &Path) -> Result<Vec<PathBuf>, Error> {
             }
         }
     }
-    Ok(dirs)
+    Ok((dirs, git_dir))
 }
 
 /// Use `configured`, or `.claude` in `home`. Treat an empty value as unset. The checks and
@@ -720,7 +728,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            local_settings_dirs(&sub).unwrap(),
+            local_settings_dirs(&sub).unwrap().0,
             [sub.clone(), tree, main]
         );
     }
@@ -753,14 +761,14 @@ mod tests {
         fs::create_dir(&linked).unwrap();
         symlink(tree.join(GIT_ENTRY), linked.join(GIT_ENTRY)).unwrap();
         let main = tree.with_file_name("main");
-        assert_eq!(local_settings_dirs(&linked).unwrap(), [linked, main]);
+        assert_eq!(local_settings_dirs(&linked).unwrap().0, [linked, main]);
     }
 
     /// A submodule does not use its superproject's local settings.
     #[test]
     fn a_submodule_adds_no_other_checkout() {
         let (_dir, tree) = worktree(b"gitdir: ../super/.git/modules/sub\n", None);
-        assert_eq!(local_settings_dirs(&tree).unwrap(), [tree]);
+        assert_eq!(local_settings_dirs(&tree).unwrap().0, [tree]);
     }
 
     /// An unreadable worktree file, or a missing primary checkout, leaves

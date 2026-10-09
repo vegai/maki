@@ -12,7 +12,7 @@ use maki_config::providers::{
     ProviderDef, ProvidersConfig, all_builtins, builtin_provider, resolve_api_key_env,
     resolve_base_url, resolve_default_model, resolve_display_name, resolve_login_url, slugify,
 };
-use maki_providers::provider::fetch_all_models;
+use maki_providers::provider::{ModelListing, fetch_all_models};
 use maki_providers::spec::Owner;
 use maki_providers::{ProviderData, catalog_providers, refresh_catalog};
 use maki_providers::{copilot_auth, openai_auth, plugin, xai_auth};
@@ -602,13 +602,10 @@ pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMo
     // Model listing calls plugin hooks, so the host outlives the fetch.
     let (_host, config) = super::cli_stack(no_plugins, no_jit, trust_mode)?;
 
-    let mut refresh_failures = Vec::new();
     if refresh {
         match refresh_catalog() {
             Ok(()) => eprintln!("models.dev catalog has been refreshed"),
-            Err(e) => refresh_failures.push(format!(
-                "catalog refresh failed, keeping existing cache: {e}"
-            )),
+            Err(e) => eprintln!("warning: catalog refresh failed, keeping existing cache: {e}"),
         }
     }
 
@@ -619,19 +616,17 @@ pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMo
                 println!("{model}");
             }
             for warning in batch.warnings {
-                if refresh {
-                    refresh_failures.push(warning.clone());
-                }
                 eprintln!("warning: {warning}");
             }
         },
         None,
-        refresh,
+        if refresh {
+            ModelListing::Refresh
+        } else {
+            ModelListing::Cached
+        },
     ));
 
-    if !refresh_failures.is_empty() {
-        bail!("{}", refresh_failures.join("\n"));
-    }
     Ok(())
 }
 

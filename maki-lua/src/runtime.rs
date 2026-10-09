@@ -2897,12 +2897,13 @@ impl LuaRuntime {
         &self,
         maki: mlua::Table,
         require_root: Option<RequireRoot>,
+        private: Option<Table>,
     ) -> Result<mlua::Table, mlua::Error> {
         let env = self.lua.create_table()?;
         env.set("maki", maki)?;
 
         if require_root.is_some() || !self.bundled.dirs.is_empty() {
-            let require_fn = self.create_require_fn(&env, require_root)?;
+            let require_fn = self.create_require_fn(&env, require_root, private)?;
             env.set("require", require_fn)?;
         }
 
@@ -2918,6 +2919,7 @@ impl LuaRuntime {
         &self,
         env: &mlua::Table,
         require_root: Option<RequireRoot>,
+        private: Option<Table>,
     ) -> Result<Function, mlua::Error> {
         let loader = ModuleLoader {
             bundled: self.bundled.clone(),
@@ -2928,6 +2930,11 @@ impl LuaRuntime {
             loading: self.lua.create_table()?,
         };
 
+        if let Some(private) = private {
+            loader
+                .loaded
+                .set(crate::api::claude_code::MODULE, private)?;
+        }
         self.lua
             .create_function(move |lua, modname: String| loader.require(lua, &modname))
     }
@@ -3014,7 +3021,20 @@ impl LuaRuntime {
             .map_err(map_err)?;
             maki.set("pack", pack).map_err(map_err)?;
         }
-        let env = self.build_env(maki, require_root).map_err(map_err)?;
+        let private = if name.as_ref() == crate::api::claude_code::PLUGIN
+            && crate::loader::is_bundled(&name)
+            && !package
+        {
+            Some(
+                crate::api::claude_code::create_claude_code_table(&self.lua, &permissions)
+                    .map_err(map_err)?,
+            )
+        } else {
+            None
+        };
+        let env = self
+            .build_env(maki, require_root, private)
+            .map_err(map_err)?;
         if let Some(mut envs) = self.lua.app_data_mut::<PluginEnvs>() {
             envs.0.insert(Arc::clone(&name), env.to_pointer() as usize);
         }

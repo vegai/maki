@@ -11,6 +11,7 @@
 //! why each test here boots its own host and leans on `cargo nextest` giving
 //! every test its own process.
 
+use maki_providers::provider::{ModelListing, RequestScope};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -284,7 +285,10 @@ fn stream(
             thinking,
             fast: false,
         },
-        None,
+        RequestScope {
+            session_id: None,
+            cwd: Path::new("."),
+        },
     ));
     drop(tx);
     (rx.drain().collect(), result)
@@ -385,7 +389,8 @@ fn a_refresh_hook_persists_the_token_it_minted() {
 fn list_models_and_fetch_usage_answer_from_their_hooks() {
     let fixture = Fixture::start(MODELS_SCRIPT);
 
-    let models = smol::block_on(fixture.provider.list_models()).expect(HOOK_FAILED);
+    let models =
+        smol::block_on(fixture.provider.list_models(ModelListing::Cached)).expect(HOOK_FAILED);
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].id, MODEL);
     assert_eq!(models[0].context_window, Some(LISTED_WINDOW));
@@ -439,7 +444,7 @@ fn map_error_restates_the_status_and_keeps_retry_after(
 fn a_refused_side_request_is_the_native_error() {
     let fixture = Fixture::start(OVERLOADED_SCRIPT);
 
-    let error = smol::block_on(fixture.provider.list_models()).unwrap_err();
+    let error = smol::block_on(fixture.provider.list_models(ModelListing::Cached)).unwrap_err();
 
     assert!(
         matches!(error, AgentError::Api { status: 503, .. }),
@@ -458,7 +463,7 @@ fn a_side_request_that_cannot_connect_is_a_transport_error() {
     drop(closed);
     let fixture = Fixture::at(&base_url, Requests::default());
 
-    let error = smol::block_on(fixture.provider.list_models()).unwrap_err();
+    let error = smol::block_on(fixture.provider.list_models(ModelListing::Cached)).unwrap_err();
 
     assert!(matches!(error, AgentError::Http(_)), "{error:?}");
 }

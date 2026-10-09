@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
-use crate::provider::{ModelBatch, fetch_all_models, provider_available};
+use crate::provider::{ModelBatch, ModelListing, fetch_all_models, provider_available};
 use crate::providers::custom;
 use crate::spec::ProviderRegistry;
 
@@ -257,7 +257,7 @@ fn store_discovery(path: &Path, listing: &Listing, fingerprint: String, now_ms: 
 pub async fn fetch_all_models_cached(
     policy: &ModelPolicy,
     mut on_update: impl FnMut(ModelList, Vec<String>),
-    fresh: bool,
+    listing_policy: ModelListing,
 ) {
     let path = cache_path();
     let fingerprint = fingerprint();
@@ -277,7 +277,7 @@ pub async fn fetch_all_models_cached(
             on_update(listing.snapshot(), batch.warnings);
         },
         None,
-        fresh,
+        listing_policy,
     )
     .await;
 

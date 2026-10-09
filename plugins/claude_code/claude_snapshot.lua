@@ -1,3 +1,5 @@
+local native = require("maki.claude_code.internal")
+
 -- The private snapshot a coding worker runs in, and the import of its
 -- changes. Each step runs as a job of the call, so a cancel or a time limit
 -- stops it.
@@ -7,7 +9,9 @@ local workspace = require("claude_workspace")
 
 local M = {}
 
-local ARTIFACT_TEMPLATE = "XXXXXXXX"
+local IMPORT_LOCK = "import.lock"
+local TRASH_PREFIX = ".trash-"
+local ARTIFACT_TEMPLATE = "XXXXXX"
 local LINK_TO_NOWHERE = " is a link to a missing target"
 local SNAPSHOT_DIR = "snapshot"
 local TMP_DIR = "tmp"
@@ -326,7 +330,8 @@ local function commit_base(call, artifact, paths, dependencies)
   local _, mkdir_err = maki.fs.mkdir(info)
   local _, attributes_err = maki.fs.write(maki.fs.joinpath(info, "attributes"), workspace.RAW_ATTRIBUTES)
   local _, exclude_err = maki.fs.write(maki.fs.joinpath(info, "exclude"), table.concat(exclude))
-  local _, link_err = maki.fs.write(maki.fs.joinpath(artifact.snapshot, DOT_GIT), "gitdir: " .. artifact.git .. "\n")
+  local _, link_err =
+    native.sanitize_git(artifact.snapshot, maki.fs.joinpath(artifact.dir, QUARANTINE_DIR), artifact.git)
   local setup_err = mkdir_err or attributes_err or exclude_err or link_err
   if setup_err then
     return "maki cannot make the repository of the snapshot: " .. setup_err
@@ -457,16 +462,22 @@ function M.sweep(root, ttl_hours)
     local marker = kind == "directory" and maki.fs.metadata(maki.fs.joinpath(dir, OWNER_MARKER))
     local meta = marker and (maki.fs.metadata(maki.fs.joinpath(dir, MANIFEST)) or marker)
     if meta and meta.mtime and meta.mtime < cutoff then
-      local lock = maki.claude_code.lock_artifact(dir)
+      local lock = maki.fs.try_lock(maki.fs.joinpath(dir, IMPORT_LOCK))
       if lock then
         local current = maki.fs.metadata(maki.fs.joinpath(dir, MANIFEST)) or marker
         if current.mtime and current.mtime < cutoff then
-          local id = maki.fn.jobstart({ "rm", "-rf", "--", dir }, {
-            scope = "plugin",
-            on_exit = function()
-              lock:close()
-            end,
-          })
+          local trash = maki.fs.joinpath(root, TRASH_PREFIX .. name)
+          local renamed = name:sub(1, #TRASH_PREFIX) == TRASH_PREFIX or maki.uv.fs_rename(dir, trash)
+          if name:sub(1, #TRASH_PREFIX) == TRASH_PREFIX then
+            trash = dir
+          end
+          local id = renamed
+            and maki.fn.jobstart({ "rm", "-rf", "--", trash }, {
+              scope = "plugin",
+              on_exit = function()
+                lock:close()
+              end,
+            })
           if not id then
             lock:close()
           end
@@ -557,7 +568,7 @@ end
 -- outside the work tree, without discarding the worker's files or repository objects.
 function M.sanitize(artifact)
   local quarantine = maki.fs.joinpath(artifact.dir, QUARANTINE_DIR)
-  local nested, err = maki.claude_code.sanitize_git(artifact.snapshot, quarantine, artifact.git)
+  local nested, err = native.sanitize_git(artifact.snapshot, quarantine, artifact.git)
   if not nested then
     return err
   end
@@ -733,9 +744,6 @@ end
 --- because the sweep goes by its date and the approval can outlast the
 --- artifact's time limit.
 local function open_import(spec)
-  if type(spec.id) ~= "string" or not spec.id:match(workspace.ARTIFACT_ID) then
-    return nil, "an artifact id contains only the characters A to Z, a to z and 0 to 9"
-  end
   local dir = maki.fs.joinpath(spec.root, spec.id)
   local manifest_path = maki.fs.joinpath(dir, MANIFEST)
   local text = maki.fs.read(manifest_path)
@@ -952,10 +960,23 @@ function M.import(ctx, call, spec)
   if type(spec.id) ~= "string" or not spec.id:match(workspace.ARTIFACT_ID) then
     return nil, "an artifact id contains only the characters A to Z, a to z and 0 to 9"
   end
-  local lock, lock_err = maki.claude_code.lock_artifact(maki.fs.joinpath(spec.root, spec.id))
+  local dir = maki.fs.joinpath(spec.root, spec.id)
+  local missing = "there is no change artifact " .. spec.id .. ". If it was there before, the sweep removed it."
+  if not maki.fs.metadata(dir) then
+    return nil, missing
+  end
+  local lock, lock_err = maki.fs.try_lock(maki.fs.joinpath(dir, IMPORT_LOCK))
   if not lock then
+    if not maki.fs.metadata(dir) then
+      return nil, missing
+    end
     return nil, "maki cannot lock artifact " .. spec.id .. ": " .. lock_err
   end
+  maki.async.on_cancel(function()
+    call:when_idle(function()
+      lock:close()
+    end)
+  end)
   local ok, result, err = pcall(import_locked, ctx, call, spec)
   call:when_idle(function()
     lock:close()

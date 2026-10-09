@@ -87,10 +87,6 @@ pub(crate) fn create_maki_global(
     maki.set("base64", base64::create_base64_table(lua)?)?;
     maki.set("image", image::create_image_table(lua)?)?;
     maki.set("json", json::create_json_table(lua)?)?;
-    maki.set(
-        "claude_code",
-        claude_code::create_claude_code_table(lua, permissions)?,
-    )?;
     maki.set("yaml", yaml::create_yaml_table(lua)?)?;
     let net_hosts = permissions.net_hosts();
     warn_invalid_net_hosts(&plugin, &net_hosts);

@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, FileType};
+use std::fs::{File, FileType, TryLockError};
 use std::io::{Error as IoError, ErrorKind, Read, Result as IoResult};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use std::time::UNIX_EPOCH;
 
 use maki_agent::{FileQuery, FileReader, Ranked};
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{Buffer, Lua, Result as LuaResult, Table, Value};
+use mlua::{Buffer, Lua, Result as LuaResult, Table, UserData, UserDataMethods, Value};
 
 use crate::api::util::convert::opt_bool;
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
@@ -21,7 +21,43 @@ use crate::runtime::LUA_MEMORY_LIMIT;
 // Luau allows strings and buffers up to 1 GiB, but the VM budget is the binding
 // limit: a read the VM cannot hold dies with a Lua memory error instead.
 const MAX_READ_BYTES: u64 = LUA_MEMORY_LIMIT as u64;
+const LOCK_BUSY: &str = "lock is held";
 const NON_UTF8_CONTENT_ERR: &str = "non-utf8 content; use read_bytes";
+
+struct FileLock(Option<File>);
+
+impl UserData for FileLock {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method_mut("close", |_, this, ()| {
+            this.0.take();
+            Ok(())
+        });
+    }
+}
+
+/// Try to hold an exclusive file lock. Closing or dropping the handle releases it.
+/// @param path string Lock file, created if absent.
+/// @return (userdata?, string?) Lock with close(), or nil and the error if locking fails.
+#[lua_fn(guard = FsWrite)]
+async fn try_lock(_lua: Lua, path: String) -> LuaResult<Pair<FileLock>> {
+    let file = try_pair!(
+        smol::unblock(move || {
+            let file = File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(expand_tilde(&path))?;
+            file.try_lock().map_err(|error| match error {
+                TryLockError::WouldBlock => IoError::new(ErrorKind::WouldBlock, LOCK_BUSY),
+                TryLockError::Error(error) => error,
+            })?;
+            Ok::<_, IoError>(file)
+        })
+        .await
+    );
+    Ok((Some(FileLock(Some(file))), None))
+}
 
 pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     maki_storage::paths::expand_tilde(Path::new(path))
@@ -1101,7 +1137,7 @@ lua_table! {
     "maki.fs" => pub(crate) fn create_fs_table(perms: &PluginPermissions, plugin: Arc<str>), DOCS [
         read(perms), read_bytes(perms), metadata(perms), dirname, basename,
         joinpath, normalize, abspath, parents, root(perms), relpath, ext,
-        dir(perms), write(perms), append(perms), atomic_write(perms), rm(perms), mkdir(perms),
+        dir(perms), try_lock(perms), write(perms), append(perms), atomic_write(perms), rm(perms), mkdir(perms),
         glob(perms), grep(perms), fuzzy_files(perms, plugin),
     ]
 }
@@ -1113,7 +1149,7 @@ mod tests {
 
     use super::*;
     use crate::plugin_permissions::PluginPermissions;
-    use mlua::Lua;
+    use mlua::{AnyUserData, Function, Lua, ObjectLike};
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -2800,5 +2836,32 @@ mod tests {
                 .any(|p| p == NEW_FILE),
             "the plugin's own call finds it too"
         );
+    }
+    #[test]
+    fn file_lock_reports_contention_and_releases_on_close() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("import.lock");
+        let lua = Lua::new();
+        let table =
+            create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
+        let lock: Function = table.get("try_lock").unwrap();
+        let (first, error): (Option<AnyUserData>, Option<String>) =
+            smol::block_on(lock.call_async(path.to_str().unwrap())).unwrap();
+        assert_eq!(error, None);
+        let (second, error): (Option<AnyUserData>, Option<String>) =
+            smol::block_on(lock.call_async(path.to_str().unwrap())).unwrap();
+        assert!(second.is_none());
+        assert_eq!(error.as_deref(), Some(LOCK_BUSY));
+        let first = first.unwrap();
+        first.call_method::<()>("close", ()).unwrap();
+        let (third, error): (Option<AnyUserData>, Option<String>) =
+            smol::block_on(lock.call_async(path.to_str().unwrap())).unwrap();
+        assert!(third.is_some());
+        assert_eq!(error, None);
+        let missing = dir.path().join("absent/import.lock");
+        let (lock, error): (Option<AnyUserData>, Option<String>) =
+            smol::block_on(lock.call_async(missing.to_str().unwrap())).unwrap();
+        assert!(lock.is_none());
+        assert!(error.is_some_and(|error| error != LOCK_BUSY));
     }
 }

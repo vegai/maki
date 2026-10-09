@@ -356,6 +356,12 @@ pub enum AuthAction {
 }
 
 pub fn normalize_tool_name(name: &str) -> String {
+    if let Some((local, _)) = crate::sdk_mode::TOOL_NAME_MAP
+        .iter()
+        .find(|(_, wire)| *wire == name)
+    {
+        return (*local).to_owned();
+    }
     if name.contains(['_', '.', '-']) {
         return name.to_owned();
     }
@@ -389,7 +395,9 @@ mod tests {
     #[test_case("srv__GetDocs", "srv__GetDocs"; "mcp_wire_case_is_preserved")]
     #[test_case("srv.GetDocs", "srv.GetDocs"; "mcp_qualified_case_is_preserved")]
     #[test_case("NonExistentTool", "non_existent_tool"; "a_tool_can_register_later")]
-    #[test_case("MultiEdit", "multi_edit"; "normalization_does_not_resolve_aliases")]
+    #[test_case("MultiEdit", "multiedit"; "sdk_alias")]
+    #[test_case("WebFetch", "webfetch")]
+    #[test_case("WebSearch", "websearch")]
     fn normalize_tool_name_valid_inputs(input: &str, expected: &str) {
         assert_eq!(normalize_tool_name(input), expected);
     }

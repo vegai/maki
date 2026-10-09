@@ -416,7 +416,12 @@ fn worker_git_metadata_is_quarantined_and_ordinary_files_import(scenario: &str) 
     let snapshot = artifact.join(SNAPSHOT_DIR);
     assert!(!snapshot.join("nested/.git").exists());
     assert!(!snapshot.join("nested/.GiT").exists());
-    assert!(!listing(&artifact.join(QUARANTINE)).is_empty());
+    let expected = if scenario == "code_nested_pointer" {
+        2
+    } else {
+        1
+    };
+    assert_eq!(listing(&artifact.join(QUARANTINE)).len(), expected);
     git(&snapshot, &["status", "--porcelain"]);
     git(&snapshot, &["diff"]);
     assert!(!coding.fake.path(METADATA_MARKER).exists());
@@ -1720,4 +1725,32 @@ fn a_hostile_file_name_lands_through_the_whole_import() {
             .all(|path| path.file_name().is_none_or(|name| name != PWNED)),
         "a name ran a command"
     );
+}
+
+#[test]
+fn worker_attributes_cannot_hide_text_changes_from_review() {
+    let (coding, _reg, _host, id) = Coding::coded("code_attributes");
+    let artifact = coding.artifacts.path().join(id);
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(artifact.join(MANIFEST)).unwrap()).unwrap();
+    let change = manifest["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["path"] == IMPORTED_LIB)
+        .unwrap();
+    assert_eq!(change["kind"], "text");
+    let diff = git(
+        &artifact.join(SNAPSHOT_DIR),
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-submodules=all",
+            "HEAD",
+            "--",
+            IMPORTED_LIB,
+        ],
+    );
+    assert!(diff.contains("+worker"), "{diff}");
 }

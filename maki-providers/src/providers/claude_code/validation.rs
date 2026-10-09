@@ -40,9 +40,13 @@ pub fn account_problem(init: &Value, modes: &[String]) -> Option<String> {
     checks::account_problem_in(response(init), modes).map(|problem| problem.to_string())
 }
 
-pub fn policy_problem(settings: &Value, hooks: &Value) -> Option<String> {
-    checks::policy_problem_in(response(settings), response(hooks), false)
-        .map(|problem| problem.to_string())
+pub fn policy_problem<'a>(settings: &'a Value, hooks: &Value) -> (Option<String>, &'a Value) {
+    let settings = response(settings);
+    (
+        checks::policy_problem_in(settings, response(hooks), false)
+            .map(|problem| problem.to_string()),
+        &settings["effective"],
+    )
 }
 
 pub fn init_problem(
@@ -96,4 +100,18 @@ pub async fn cache_version(
 
 pub fn invalidate_version(executable: &Path) {
     super::run::invalidate_profile(executable);
+}
+
+pub fn local_settings_dirs(cwd: &Path) -> Result<(Vec<PathBuf>, Option<PathBuf>), String> {
+    checks::local_settings_dirs(cwd).map_err(|error| error.to_string())
+}
+
+pub fn file_conflicts(config_dir: &Path, cwd: &Path, local_dirs: &[PathBuf]) -> Vec<String> {
+    checks::file_conflicts(&checks::skipped_settings(config_dir, cwd, local_dirs))
+}
+
+pub fn subscription_type(account: &Value) -> Option<String> {
+    response(account)["account"]["subscriptionType"]
+        .as_str()
+        .map(str::to_owned)
 }

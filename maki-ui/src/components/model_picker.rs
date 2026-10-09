@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
@@ -28,6 +28,8 @@ const LOADING_NOTICE: &str = "loading models...";
 fn footer_line() -> Line<'static> {
     let t = theme::current();
     Line::from(vec![
+        Span::styled("  Ctrl+r", t.keybind_key),
+        Span::styled(" refresh", t.tool_dim),
         Span::styled("  Enter", t.keybind_key),
         Span::styled(" select", t.tool_dim),
         Span::styled("  !", t.keybind_key),
@@ -62,6 +64,7 @@ fn tier_for_shortcut(key: KeyEvent) -> Option<ModelTier> {
 
 pub enum ModelPickerAction {
     Consumed,
+    Refresh,
     Select(String),
     AssignTier(String, ModelTier),
     UnassignTier(String, ModelTier),
@@ -242,6 +245,9 @@ impl ModelPicker {
     }
 
     fn handle_key_inner(&mut self, key: KeyEvent) -> ModelPickerAction {
+        if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return ModelPickerAction::Refresh;
+        }
         if let Some(tier) = tier_for_shortcut(key)
             && let Some(entry) = self.picker.selected_item()
         {

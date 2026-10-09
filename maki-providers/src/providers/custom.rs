@@ -13,7 +13,7 @@ use super::catalog;
 use super::codec::{CodecOptions, protocol_spec};
 use crate::AgentError;
 use crate::model::{FastPricing, Model, ModelEntry, ModelInfo, ModelPricing, ModelTier};
-use crate::provider::Provider;
+use crate::provider::{ModelListing, Provider};
 use crate::providers::Timeouts;
 use crate::spec::{ProviderRegistry, ProviderSpec};
 
@@ -307,7 +307,7 @@ pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
         match create(slug, timeouts) {
             Ok(provider) => {
                 let slug_c = slug.clone();
-                let result = smol::block_on(provider.list_models());
+                let result = smol::block_on(provider.list_models(ModelListing::Cached));
                 match result {
                     Ok(mut models) => {
                         overlay_declared_tiers(def, &mut models);

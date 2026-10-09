@@ -220,6 +220,11 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
     Ok(response)
 }
 
+fn failed(error: Error, turn: &Turn<'_>) -> Error {
+    warn!(%error, events = %turn.trace(), "claude-code: the request failed");
+    error.after_start(turn.accepted())
+}
+
 fn millis(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
@@ -313,14 +318,14 @@ async fn converse(
                     Err(Error::ExitLate) => Error::WentQuiet,
                     Err(other) => other,
                 };
-                let error = turn.take_broken().unwrap_or(ended);
+                let error = turn.take_refusal().unwrap_or(ended);
                 warn!(%error, events = %turn.trace(), "claude-code: the request failed");
                 return Err(error.after_start(turn.accepted()));
             }
             Next::Handoff(handoff) => turn.park(handoff),
             // The reply and its usage are complete, so the result only
             // repeats them. Its delay is Claude Code's own business.
-            Next::Late if turn.is_broken() => Err(turn.take_broken().unwrap_or(Error::WentQuiet)),
+            Next::Late if turn.is_broken() => Err(turn.take_refusal().unwrap_or(Error::WentQuiet)),
             Next::Late if turn.awaits_result() && turn.has_stream_usage() => {
                 warn!(
                     secs = limits.exit.as_secs(),
@@ -343,9 +348,6 @@ async fn converse(
         if !matches!(step, Ok(Step::Alive)) {
             last_event = Instant::now();
         }
-        if let Err(error) = &step {
-            warn!(%error, events = %turn.trace(), "claude-code: the request failed");
-        }
         if !generating && turn.accepted() {
             generating = true;
             debug!(
@@ -353,7 +355,7 @@ async fn converse(
                 "claude-code: init accepted, the reply streams"
             );
         }
-        match step.map_err(|error| error.after_start(turn.accepted()))? {
+        match step.map_err(|error| failed(error, &turn))? {
             Step::Ready => {
                 debug!("claude-code: handshake accepted, sending the conversation");
                 // The conversation gets a full limit. Nothing reads stdout
@@ -382,21 +384,27 @@ async fn converse(
     let deadline = Instant::now() + limits.exit;
     drain(&mut turn, &mut lines, &handoffs, deadline, stopped)
         .await
-        .map_err(|error| error.after_start(turn.accepted()))?;
+        .map_err(|error| failed(error, &turn))?;
     let status = group
         .wait(deadline)
         .await
-        .map_err(|error| error.after_start(turn.accepted()))?;
+        .map_err(|error| failed(error, &turn))?;
     // After the reap, Claude Code cannot make calls. Stop the server to end the queue and
     // validate all remaining calls.
     drop(server.take());
     queued_handoffs(&mut turn, handoffs, Instant::now() + limits.exit)
         .await
-        .map_err(|error| error.after_start(turn.accepted()))?;
+        .map_err(|error| failed(error, &turn))?;
+    let accepted = turn.accepted();
+    let trace = turn.trace();
+    let response = turn.response().map_err(|error| {
+        warn!(%error, events = %trace, "claude-code: the request failed");
+        error.after_start(accepted)
+    })?;
     if !stopped && !status.success() {
-        return Err(Error::ExitedAfterReply(status).after_start(turn.accepted()));
+        warn!(%status, "claude-code: the CLI exited with an error after a validated reply");
     }
-    Ok((turn.response()?, prompted))
+    Ok((response, prompted))
 }
 
 async fn queued_handoffs(
@@ -630,9 +638,10 @@ mod tests {
 
     /// Events without content can follow the result, like the keep-alive
     /// Claude Code prints on long runs.
-    #[test]
-    fn a_reply_without_calls_ends_at_its_result() {
-        let fake = Fake::new("text_then_keep_alive");
+    #[test_case("text_then_keep_alive")]
+    #[test_case("text_then_fail")]
+    fn a_reply_without_calls_ends_at_its_result(scenario: &str) {
+        let fake = Fake::new(scenario);
         let (result, _) = smol::block_on(fake.request());
         let response = result.unwrap();
         assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
@@ -645,7 +654,6 @@ mod tests {
     #[test_case("overloaded" => matches Error::ApiRefused { status: Some(529), .. } ; "an_overloaded_api")]
     #[test_case("cli_retry" => matches Error::CliRetry { status: Some(529), .. } ; "a_retry_claude_code_wanted")]
     #[test_case("no_final_usage" => matches Error::NoFinalOutput ; "a_reply_with_only_the_placeholder_output_count")]
-    #[test_case("text_then_fail" => matches Error::ExitedAfterReply(_) ; "a_text_result_followed_by_a_failed_exit")]
     #[test_case("text_then_api_key" => matches Error::Check(_) ; "a_text_result_then_an_init_that_contradicts_it")]
     #[test_case("text_then_garbage" => matches Error::NotAnEvent { .. } ; "a_text_result_then_a_line_that_is_no_event")]
     fn a_run_maki_cannot_accept_stops_and_is_killed(scenario: &str) -> Error {
@@ -660,6 +668,22 @@ mod tests {
             Error::Interrupted(error) => *error,
             error => error,
         }
+    }
+
+    #[test_case("missing_block_eof")]
+    #[test_case("missing_block_late")]
+    #[test_case("status_only_error")]
+    fn incomplete_generations_and_status_only_api_errors_are_retryable(scenario: &str) {
+        let fake = Fake::new(scenario);
+        let (result, _) = smol::block_on(fake.request_with(
+            MARKER,
+            ALIAS,
+            limits(STARTUP, IDLE, SHORT_HANDOFF, SHORT_EXIT),
+        ));
+        let error = result.unwrap_err();
+        assert!(error.temporary().is_some(), "{error:?}");
+        assert!(fake.group_gone());
+        assert!(fake.leader_reaped());
     }
 
     #[test]

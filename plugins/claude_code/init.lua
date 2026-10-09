@@ -1,3 +1,5 @@
+local native = require("maki.claude_code.internal")
+
 -- Send the task only after the probe and worker pass the handshake.
 --
 -- Managed hooks can run at startup. Run the probe in an empty directory so a rejected hook
@@ -173,42 +175,6 @@ local callers = 0
 
 local function refuse(msg)
   return { llm_output = ERROR_PREFIX .. msg, is_error = true }
-end
-
--- An unreadable file could hold an API key helper, so it stops the call.
-local function settings_conflicts(paths)
-  local found = {}
-  for _, path in ipairs(paths) do
-    local meta, meta_err = maki.fs.metadata(path)
-    if meta_err then
-      found[#found + 1] = path .. ": maki cannot examine it (" .. meta_err .. ")"
-    elseif meta then
-      local text, read_err = maki.fs.read(path)
-      local settings, decode_err
-      if text then
-        settings, decode_err = maki.json.decode(text)
-      end
-      if not text then
-        found[#found + 1] = path .. ": maki cannot read it (" .. read_err .. ")"
-      elseif decode_err then
-        found[#found + 1] = path .. ": " .. decode_err
-      -- maki.json.decode marks a JSON array with a metatable, an object with
-      -- none, so an empty array and an empty object stay apart.
-      elseif type(settings) ~= "table" or getmetatable(settings) ~= nil then
-        found[#found + 1] = path .. ": is not a JSON object"
-      else
-        for _, key in ipairs(launch.settings_conflicts(settings)) do
-          found[#found + 1] = path .. ": " .. key
-        end
-      end
-    end
-  end
-  return found
-end
-
-local function trimmed(text)
-  local line = text and launch.trim(text)
-  return line ~= "" and line or nil
 end
 
 -- Returns why the responses stop the run, or nil, and whether all responses
@@ -403,6 +369,11 @@ local function coding_confine(spec, artifact)
   deny[#deny + 1] = spec.git_dir
   deny[#deny + 1] = maki.env.state_dir()
   deny[#deny + 1] = maki.env.config_dir()
+  deny[#deny + 1] = maki.env.logs_dir()
+  local runtime = maki.uv.os_getenv("XDG_RUNTIME_DIR")
+  if runtime and runtime:sub(1, 1) == "/" then
+    deny[#deny + 1] = maki.fs.joinpath(runtime, "containers/auth.json")
+  end
   deny[#deny + 1] = spec.own_config_dir
   table.move(spec.home_credentials, 1, #spec.home_credentials, #deny + 1, deny)
   return { deny_read = deny, allow_read = { artifact.git }, allow_write = { artifact.tmp } }
@@ -520,13 +491,14 @@ local function preflight(input, ctx, call)
   if not local_dirs then
     return nil, dirs_err
   end
-  local conflicts = settings_conflicts(launch.skipped_settings(config_dir, cwd, local_dirs))
+  local conflicts = native.file_conflicts(config_dir, cwd, local_dirs)
   if #conflicts > 0 then
     return nil,
       "maki ignores these Claude Code settings, and it cannot ignore them safely:\n" .. table.concat(conflicts, "\n")
   end
 
-  local version, version_err = maki.claude_code.cached_version(executable)
+  -- Keep the version job in Call so cancellation reaps it before the slot is released.
+  local version, version_err = native.cached_version(executable)
   if not version and not version_err then
     local dir, dir_err = probe_dir(env, { cwd = cwd, checkout_dirs = local_dirs, git_dir = git_dir })
     if not dir then
@@ -537,7 +509,7 @@ local function preflight(input, ctx, call)
     if not output then
       return nil, output_err
     end
-    version, version_err = maki.claude_code.cache_version(executable, output, maki.uv.os_uname().sysname)
+    version, version_err = native.cache_version(executable, output, maki.uv.os_uname().sysname)
   end
   if not version then
     return nil, version_err
@@ -673,7 +645,6 @@ function Run:stop(reason)
   if self.finished or self.stopped then
     return
   end
-  maki.claude_code.invalidate_version(self.spec.executable)
   self.stopped = reason
   self.route = ROUTE_UNCONFIRMED:format(self.spec.cli.version)
   maki.fn.jobstop(self.job_id)
@@ -722,12 +693,15 @@ function Run:on_line(line)
   if step.control then
     self:on_answer(step.control)
   elseif step.stop then
+    if step.init then
+      native.invalidate_version(self.spec.executable)
+    end
     self:stop(step.stop)
   elseif step.init and not self.prompted then
     self:stop(UNCHECKED_START)
   elseif step.init then
     self.clock:stop()
-    local subscription = " (" .. launch.response(self.answers.account).account.subscriptionType .. ")"
+    local subscription = " (" .. native.subscription_type(self.answers.account) .. ")"
     self.route = ROUTE_OK:format(subscription, self.spec.cli.version)
     self.view:set_header(dim_lines(self:header_lines()))
   elseif step.lines then

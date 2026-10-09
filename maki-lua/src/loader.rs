@@ -1340,6 +1340,19 @@ mod tests {
     const GLOBAL_TRUST_PATH: &str = "~/src/me/*";
     const PROJECT_TRUST_PATH: &str = "**";
 
+    #[test]
+    fn private_claude_helpers_are_not_available_to_other_plugins() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "ordinary",
+            r#"
+            assert(maki.claude_code == nil)
+            assert(not pcall(require, "maki.claude_code.internal"))
+        "#,
+        )
+        .unwrap();
+    }
+
     /// Closing the queue and reading it are one message. A Lua task can record
     /// an activation between a separate read and close, and a close that threw
     /// the queue away would strand exactly the request that was about to be

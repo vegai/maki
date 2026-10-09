@@ -37,6 +37,7 @@ use maki_lua::{
 };
 use maki_providers::Timeouts;
 use maki_providers::models_cache::{ModelList, fetch_all_models_cached};
+use maki_providers::provider::ModelListing;
 use maki_providers::provider::{Provider, from_model};
 use maki_providers::{Message, Model};
 use maki_storage::StateDir;
@@ -538,7 +539,7 @@ fn fetch_models(
     policy: Arc<ModelPolicy>,
     warn_tx: flume::Sender<String>,
     models_tx: flume::Sender<()>,
-    fresh: bool,
+    listing: ModelListing,
 ) -> smol::Task<()> {
     smol::spawn(async move {
         fetch_all_models_cached(
@@ -549,7 +550,7 @@ fn fetch_models(
                 }
                 available.store(Some(Arc::new(list)));
             },
-            fresh,
+            listing,
         )
         .await;
         let _ = models_tx.try_send(());
@@ -565,7 +566,7 @@ fn spawn_model_fetch(policy: Arc<ModelPolicy>) -> BackgroundModels {
         policy,
         warn_tx.clone(),
         models_tx.clone(),
-        false,
+        ModelListing::Cached,
     );
     BackgroundModels {
         available,
@@ -1834,7 +1835,7 @@ impl<'t> EventLoop<'t> {
             Arc::clone(&self.ctx.model_policy),
             self.warn_tx.clone(),
             self.models_tx.clone(),
-            true,
+            ModelListing::Refresh,
         )
         .detach();
     }

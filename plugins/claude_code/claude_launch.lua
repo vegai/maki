@@ -1,3 +1,5 @@
+local native = require("maki.claude_code.internal")
+
 -- Everything maki decides before Claude Code starts. The claude.ai
 -- subscription is the only route. Pay-per-token users have maki's anthropic
 -- provider.
@@ -113,6 +115,18 @@ local HOME_CREDENTIALS = {
   ".npmrc",
   ".pypirc",
   ".cargo/credentials.toml",
+  ".bash_history",
+  ".zsh_history",
+  ".local/share/fish/fish_history",
+  ".vault-token",
+  ".pgpass",
+  ".config/rclone",
+  ".mozilla",
+  ".config/google-chrome",
+  ".config/chromium",
+  ".config/BraveSoftware",
+  ".config/microsoft-edge",
+  ".var/app/org.mozilla.firefox",
 }
 
 local NO_HOME = "maki cannot find your home directory, so it cannot keep the coding worker's shell away from "
@@ -127,13 +141,8 @@ local function sorted_keys(t)
   return keys
 end
 
-function M.checked_cli(output, system)
-  local version, err = maki.claude_code.version(output or "", system or "")
-  return version and { version = version } or nil, err
-end
-
 function M.child_env(environ)
-  return maki.claude_code.environment(environ)
+  return native.environment(environ)
 end
 
 --- Returns why {worker} cannot run with {env}: its shell could read the
@@ -187,74 +196,15 @@ end
 --- in {home}. The checks and each child resolve it from different
 --- directories, so it must be absolute.
 function M.config_dir(configured, home)
-  return maki.claude_code.config_dir(configured, home)
+  return native.config_dir(configured, home)
 end
 
-local function main_checkout(git_file)
-  local text, err = maki.fs.read(git_file)
-  if not text then
+function M.local_settings_dirs(cwd)
+  local paths, err = native.local_settings_dirs(cwd)
+  if not paths then
     return nil, err
   end
-  local gitdir = text:match("^gitdir:%s*(.-)%s*$")
-  if not gitdir then
-    return nil
-  end
-  gitdir = maki.fs.normalize(maki.fs.joinpath(maki.fs.dirname(git_file), gitdir))
-  local commondir = maki.fs.joinpath(gitdir, "commondir")
-  local meta, meta_err = maki.fs.metadata(commondir)
-  if meta_err then
-    return nil, meta_err
-  end
-  if not meta then
-    return nil, nil, gitdir
-  end
-  local common, common_err = maki.fs.read(commondir)
-  if not common then
-    return nil, common_err
-  end
-  common = maki.fs.normalize(maki.fs.joinpath(gitdir, (common:gsub("%s+$", ""))))
-  local found, found_err = maki.fs.metadata(common)
-  if not found then
-    return nil, found_err or (common .. " does not exist")
-  end
-  return maki.fs.basename(common) == ".git" and maki.fs.dirname(common) or nil, nil, common
-end
-
---- Local settings can exist in the session directory, repository root and primary checkout.
---- Git objects can also reside outside the session directory.
-function M.local_settings_dirs(cwd)
-  local dirs, seen = {}, {}
-  local function add(dir)
-    if dir and not seen[dir] then
-      seen[dir] = true
-      dirs[#dirs + 1] = dir
-    end
-  end
-  add(cwd)
-  local candidates = { cwd }
-  for _, parent in ipairs(maki.fs.parents(cwd)) do
-    candidates[#candidates + 1] = parent
-  end
-  for _, dir in ipairs(candidates) do
-    local git = maki.fs.joinpath(dir, ".git")
-    local meta, err = maki.fs.metadata(git)
-    if err then
-      return nil, git .. ": maki cannot examine it (" .. err .. ")"
-    end
-    if meta then
-      add(dir)
-      if meta.is_file then
-        local main, main_err, git_dir = main_checkout(git)
-        if main_err then
-          return nil, git .. ": maki cannot examine it (" .. main_err .. ")"
-        end
-        add(main)
-        return dirs, nil, git_dir
-      end
-      break
-    end
-  end
-  return dirs
+  return paths.dirs, nil, paths.git_dir
 end
 
 local function joined(list)
@@ -264,9 +214,6 @@ local function joined(list)
   end
   return table.concat(names, ", ")
 end
-
--- As the provider shows a value from Claude Code: as JSON, cut so a huge
--- value cannot flood the reply.
 
 function M.trim(text)
   return text:match("^%s*(.-)%s*$")
@@ -288,45 +235,24 @@ function M.in_checkout(path, spec)
   return spec.git_dir ~= nil and M.within(path, spec.git_dir)
 end
 
---- Managed settings still apply and need handshake validation. Claude Code reads project
---- settings in its working directory and local settings in each `local_dirs` entry.
-function M.skipped_settings(config_dir, cwd, local_dirs)
-  local paths = {
-    maki.fs.joinpath(config_dir, RULES.settings_file),
-    maki.fs.joinpath(cwd, RULES.claude_dir, RULES.settings_file),
-  }
-  for _, dir in ipairs(local_dirs) do
-    paths[#paths + 1] = maki.fs.joinpath(dir, RULES.claude_dir, RULES.local_settings_file)
-  end
-  return paths
-end
-
 local function json(value)
   return type(value) == "string" and value or maki.json.encode(value)
 end
 
-function M.response(value)
-  if type(value) ~= "string" then
-    return value
-  end
-  local event = maki.json.decode(value)
-  return event.type == "control_response" and event.response.response or event
-end
-
 function M.settings_conflicts(settings)
-  return maki.claude_code.settings_conflicts(json(settings))
+  return native.settings_conflicts(json(settings))
 end
 
 function M.plugins_problem(plugins)
-  return maki.claude_code.plugins_problem(maki.json.encode(plugins))
+  return native.plugins_problem(maki.json.encode(plugins))
 end
 
 function M.resolved_model(account, requested)
-  return maki.claude_code.resolved_model(json(account), requested)
+  return native.resolved_model(json(account), requested)
 end
 
 function M.account_problem(init, worker)
-  return maki.claude_code.account_problem(json(init), sorted_keys(worker.reported_modes))
+  return native.account_problem(json(init), sorted_keys(worker.reported_modes))
 end
 
 local function empty(list)
@@ -398,12 +324,10 @@ local function deny_rules(extra)
 end
 
 function M.policy_problem(settings, hooks, deny_read, worker, confine)
-  local problem = maki.claude_code.policy_problem(json(settings), json(hooks))
+  local problem, effective = native.policy_problem(json(settings), json(hooks))
   if problem then
     return problem
   end
-  settings = M.response(settings)
-  local effective = settings.effective
   local permissions = type(effective.permissions) == "table" and effective.permissions or {}
   if permissions.blockReadsOutsideWorkingDirectories ~= true then
     return "Claude Code does not block reads outside the project"

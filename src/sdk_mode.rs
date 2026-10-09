@@ -40,7 +40,7 @@ use tracing::warn;
 
 use crate::cli::Cli;
 
-const TOOL_NAME_MAP: &[(&str, &str)] = &[
+pub(crate) const TOOL_NAME_MAP: &[(&str, &str)] = &[
     ("bash", "Bash"),
     ("read", "Read"),
     ("edit", "Edit"),

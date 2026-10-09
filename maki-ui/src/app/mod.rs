@@ -1097,6 +1097,7 @@ impl App {
         if self.model_picker.is_open() {
             return Some(match self.model_picker.handle_key(key) {
                 ModelPickerAction::Consumed => vec![],
+                ModelPickerAction::Refresh => vec![Action::RefreshModels],
                 ModelPickerAction::Select(spec) => {
                     vec![Action::ChangeModel(spec)]
                 }
@@ -1213,7 +1214,7 @@ impl App {
             }
             BuiltinAction::ModelPicker => {
                 self.model_picker.open(&self.state.model.spec());
-                return vec![Action::RefreshModels];
+                return vec![];
             }
         }
         vec![]
@@ -1854,7 +1855,7 @@ impl App {
             }
             "/model" => {
                 self.model_picker.open(&self.state.model.spec());
-                vec![Action::RefreshModels]
+                vec![]
             }
             "/theme" => {
                 self.theme_picker.open();

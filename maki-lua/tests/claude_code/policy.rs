@@ -115,7 +115,6 @@ const LOCAL_HELPER_CONFLICT: &str = "settings.local.json: apiKeyHelper";
 /// itself.
 const NO_AMBIENT_INSTRUCTIONS: &str = r#""claudeMdExcludes":["**"]"#;
 const MANAGED_ROOTS_STOP: &str = "Claude Code policy sets permissions.additionalDirectories";
-const CANNOT_CHECK: &str = "settings.json: maki cannot examine it";
 const CANNOT_READ: &str = "settings.json: maki cannot read it";
 const NOT_AN_OBJECT: &str = "settings.json: is not a JSON object";
 /// Where serde reports the end of the broken settings file.
@@ -264,6 +263,7 @@ case "$scenario" in
   api_key_then_usage) init ANTHROPIC_API_KEY; usage; sleep @HANG_SECS@ ;;
   stray_then_answer) stray; init none; answer ;;
   stray_then_api_key) stray; init ANTHROPIC_API_KEY ;;
+  code_attributes) init none; printf '* -diff\n' > .gitattributes; printf 'worker\n' >> src/lib.rs; answer ;;
   code_edit*)
     init none
     find . -path ./.git -prune -o -print | sort > "$dir/snapshot_listing"
@@ -573,6 +573,10 @@ fn move_to_an_older_version(fake: &FakeClaude) {
     fake.answer_version(OLDER_VERSION);
 }
 
+fn skip_a_null_api_key_helper(fake: &FakeClaude) {
+    fs::write(fake.settings_path(), r#"{"apiKeyHelper":null}"#).unwrap();
+}
+
 fn skip_an_api_key_helper(fake: &FakeClaude) {
     fs::write(fake.settings_path(), HELPER_SETTINGS).unwrap();
 }
@@ -635,6 +639,7 @@ fn answer_without_the_checks(fake: &FakeClaude) {
 /// rejected, because maki can exit right after.
 #[test_case(log_out, LOGIN_HINT, PROBED ; "logged_out")]
 #[test_case(move_to_an_older_version, TOO_OLD, "version\n" ; "an_older_version")]
+#[test_case(skip_a_null_api_key_helper, HELPER_CONFLICT, "" ; "skipped_null_api_key_helper")]
 #[test_case(skip_an_api_key_helper, HELPER_CONFLICT, "" ; "skipped_api_key_helper")]
 #[test_case(add_managed_extra_roots, MANAGED_ROOTS_STOP, PROBED ; "managed_extra_roots")]
 #[test_case(crash_the_probe, PROBE_CRASH, PROBED ; "probe_crashing_after_clean_answers")]
@@ -719,7 +724,7 @@ fn an_unusable_option_is_refused_at_load(name: &str, value: Value, want: &str) {
 
 /// Unreadable settings can hide an API key helper. Use invalid file types because root can
 /// bypass file mode restrictions.
-#[test_case(true, CANNOT_CHECK ; "config_dir_cannot_be_searched")]
+#[test_case(true, CANNOT_READ ; "config_dir_cannot_be_searched")]
 #[test_case(false, CANNOT_READ ; "settings_file_cannot_be_read")]
 fn settings_that_cannot_be_inspected_are_refused(config_is_a_file: bool, want: &str) {
     let fake = FakeClaude::new();

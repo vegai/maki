@@ -1,17 +1,19 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::claude_code::validation;
-use mlua::{Lua, Result as LuaResult, Table, UserData, UserDataMethods};
+use mlua::{Lua, Result as LuaResult, Table, Value as LuaValue};
 use serde_json::Value;
 
-use crate::api::util::pair::{Pair, pair, try_pair};
+use crate::api::util::convert::json_to_lua;
+use crate::api::util::pair::{Pair, pair};
 use crate::plugin_permissions::PluginPermissions;
 
-const IMPORT_LOCK: &str = "import.lock";
+pub(crate) const MODULE: &str = "maki.claude_code.internal";
+pub(crate) const PLUGIN: &str = "claude_code";
 const DOT_GIT: &str = ".git";
 const QUARANTINE_PREFIX: &str = "repository.";
 const QUARANTINE_ENTRY: &str = "metadata";
@@ -49,6 +51,55 @@ fn config_dir(
     ))
 }
 
+/// Discover all checkout settings directories and external Git objects.
+/// @param cwd string Working directory.
+/// @return (table?, string?) Checkout paths or error.
+#[lua_fn(guard = FsRead)]
+async fn local_settings_dirs(lua: Lua, cwd: String) -> LuaResult<Pair<Table>> {
+    let (dirs, git_dir) =
+        match smol::unblock(move || validation::local_settings_dirs(Path::new(&cwd))).await {
+            Ok(paths) => paths,
+            Err(error) => return Ok((None, Some(error))),
+        };
+    let result = lua.create_table()?;
+    result.set(
+        "dirs",
+        dirs.into_iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+    )?;
+    result.set(
+        "git_dir",
+        git_dir.map(|path| path.to_string_lossy().into_owned()),
+    )?;
+    Ok((Some(result), None))
+}
+
+/// Check raw settings files before JSON-to-Lua conversion can discard null values.
+/// @param config_dir string Login directory.
+/// @param cwd string Working directory.
+/// @param local_dirs table Local settings directories.
+/// @return (table) Conflicts.
+#[lua_fn(guard = FsRead)]
+async fn file_conflicts(
+    _lua: Lua,
+    config_dir: String,
+    cwd: String,
+    local_dirs: Vec<String>,
+) -> LuaResult<Vec<String>> {
+    Ok(smol::unblock(move || {
+        validation::file_conflicts(
+            Path::new(&config_dir),
+            Path::new(&cwd),
+            &local_dirs
+                .into_iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>(),
+        )
+    })
+    .await)
+}
+
 fn json(text: &str) -> LuaResult<Value> {
     serde_json::from_str(text).map_err(mlua::Error::external)
 }
@@ -70,16 +121,25 @@ fn account_problem(_lua: &Lua, init: String, modes: Vec<String>) -> LuaResult<Op
     Ok(validation::account_problem(&json(&init)?, &modes))
 }
 
-/// Reject policy that can restore hooks or override the restricted launch.
+/// Reject unsafe policy and return its validated effective settings.
 /// @param settings string JSON settings response or control event.
 /// @param hooks string JSON hooks response or control event.
-/// @return (string?) Reason the policy is unsafe, or nil.
+/// @return (string?, table?) Reason the policy is unsafe, or its effective settings.
 #[lua_fn]
-fn policy_problem(_lua: &Lua, settings: String, hooks: String) -> LuaResult<Option<String>> {
-    Ok(validation::policy_problem(
-        &json(&settings)?,
-        &json(&hooks)?,
-    ))
+fn policy_problem(
+    lua: &Lua,
+    settings: String,
+    hooks: String,
+) -> LuaResult<(Option<String>, Option<LuaValue>)> {
+    let settings = json(&settings)?;
+    let hooks = json(&hooks)?;
+    let (problem, effective) = validation::policy_problem(&settings, &hooks);
+    let effective = if problem.is_none() {
+        Some(json_to_lua(lua, effective)?)
+    } else {
+        None
+    };
+    Ok((problem, effective))
 }
 
 /// Check the worker catalog, login route and directory before accepting output.
@@ -164,14 +224,19 @@ fn quarantine_entry(path: &Path, quarantine: &Path) -> io::Result<()> {
 fn sanitize_snapshot(snapshot: &Path, quarantine: &Path, git: &Path) -> io::Result<Vec<String>> {
     fs::create_dir_all(quarantine)?;
     let root_git = snapshot.join(DOT_GIT);
-    if fs::symlink_metadata(&root_git).is_ok() {
-        quarantine_entry(&root_git, quarantine)?;
+    let expected = format!("gitdir: {}\n", git.display());
+    let trusted = fs::symlink_metadata(&root_git).is_ok_and(|meta| meta.is_file())
+        && fs::read(&root_git)? == expected.as_bytes();
+    if !trusted {
+        if fs::symlink_metadata(&root_git).is_ok() {
+            quarantine_entry(&root_git, quarantine)?;
+        }
+        let mut pointer = File::options()
+            .write(true)
+            .create_new(true)
+            .open(&root_git)?;
+        pointer.write_all(expected.as_bytes())?;
     }
-    let mut pointer = File::options()
-        .write(true)
-        .create_new(true)
-        .open(&root_git)?;
-    writeln!(pointer, "gitdir: {}", git.display())?;
     let mut pending = vec![snapshot.to_owned()];
     let mut relocated = Vec::new();
     while let Some(dir) = pending.pop() {
@@ -226,15 +291,12 @@ async fn sanitize_git(
     ))
 }
 
-struct ArtifactLock(Option<File>);
-
-impl UserData for ArtifactLock {
-    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method_mut("close", |_, this, ()| {
-            this.0.take();
-            Ok(())
-        });
-    }
+/// Extract an account's billing label from a control response.
+/// @param account string JSON account response or control event.
+/// @return (string?) Subscription label.
+#[lua_fn]
+fn subscription_type(_lua: &Lua, account: String) -> LuaResult<Option<String>> {
+    Ok(validation::subscription_type(&json(&account)?))
 }
 
 /// Resolve an alias from the checked account rather than from a local model table.
@@ -254,34 +316,77 @@ fn plugins_problem(_lua: &Lua, plugins: String) -> LuaResult<Option<String>> {
     Ok(validation::plugins_problem(&json(&plugins)?))
 }
 
-/// Hold an artifact across approval, import and manifest updates. Closing or dropping the
-/// handle releases the lock, including after a host crash.
-/// @param dir string Artifact directory.
-/// @return (userdata?, string?) Lock with close(), or nil if the artifact is busy.
-#[lua_fn(guard = FsWrite)]
-async fn lock_artifact(_lua: Lua, dir: String) -> LuaResult<Pair<ArtifactLock>> {
-    let file = try_pair!(
-        smol::unblock(move || {
-            let file = File::options()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(Path::new(&dir).join(IMPORT_LOCK))?;
-            file.try_lock().map_err(io::Error::other)?;
-            Ok::<_, io::Error>(file)
-        })
-        .await
-    );
-    Ok((Some(ArtifactLock(Some(file))), None))
-}
-
 lua_table! {
     /// Claude Code launch checks shared with the subscription provider. JSON inputs retain
     /// the distinction between null, objects and arrays.
     "maki.claude_code" => pub(crate) fn create_claude_code_table(perms: &PluginPermissions), DOCS [
-        version, environment, config_dir, settings_conflicts,
-        account_problem, policy_problem, init_problem, same_model, lock_artifact(perms),
-        resolved_model, plugins_problem, cached_version(perms), cache_version(perms), invalidate_version, sanitize_git(perms),
+        version, environment, config_dir, settings_conflicts, local_settings_dirs(perms), file_conflicts(perms),
+        account_problem, policy_problem, init_problem, same_model,
+        resolved_model, subscription_type, plugins_problem, cached_version(perms), cache_version(perms), invalidate_version, sanitize_git(perms),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DOT_GIT, sanitize_snapshot};
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    use tempfile::tempdir;
+    use test_case::test_case;
+
+    #[test_case(".git")]
+    #[test_case(".GiT")]
+    fn sanitize_keeps_the_trusted_pointer_and_moves_nested_metadata(name: &str) {
+        let dir = tempdir().unwrap();
+        let snapshot = dir.path().join("snapshot");
+        let quarantine = dir.path().join("quarantine");
+        let git = dir.path().join("repository");
+        fs::create_dir_all(snapshot.join("nested")).unwrap();
+        let pointer = format!("gitdir: {}\n", git.display());
+        fs::write(snapshot.join(DOT_GIT), &pointer).unwrap();
+        fs::write(snapshot.join("nested").join(name), "untrusted metadata").unwrap();
+        assert_eq!(
+            sanitize_snapshot(&snapshot, &quarantine, &git).unwrap(),
+            [format!("nested/{name}")]
+        );
+        assert_eq!(fs::read_to_string(snapshot.join(DOT_GIT)).unwrap(), pointer);
+        assert_eq!(fs::read_dir(&quarantine).unwrap().count(), 1);
+        assert!(
+            sanitize_snapshot(&snapshot, &quarantine, &git)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fs::read_dir(&quarantine).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sanitize_moves_metadata_links_without_following_directory_links() {
+        let dir = tempdir().unwrap();
+        let snapshot = dir.path().join("snapshot");
+        let quarantine = dir.path().join("quarantine");
+        let git = dir.path().join("repository");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let target = outside.join(DOT_GIT);
+        let pointer = format!("gitdir: {}\n", git.display());
+        fs::write(&target, &pointer).unwrap();
+        symlink(&target, snapshot.join(DOT_GIT)).unwrap();
+        symlink(&outside, snapshot.join("linked")).unwrap();
+        assert!(
+            sanitize_snapshot(&snapshot, &quarantine, &git)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), pointer);
+        assert!(
+            fs::symlink_metadata(snapshot.join(DOT_GIT))
+                .unwrap()
+                .is_file()
+        );
+        assert_eq!(fs::read_dir(&quarantine).unwrap().count(), 1);
+        assert!(snapshot.join("linked/.git").exists());
+    }
 }

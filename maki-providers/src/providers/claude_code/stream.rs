@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use super::checks::{self, InitExpect, RULES};
 use super::error::{Error, TOO_MANY_REQUESTS, shown};
 use super::mcp::Handoff;
-use super::transcript::Catalog;
+use super::transcript::{BATCH_CALL_TOOL, BATCH_CALLS, BATCH_TOOL, Catalog};
 use crate::model::is_same_model;
 use crate::providers::anthropic::{LABEL_SESSION, LABEL_WEEK_ALL};
 use crate::{
@@ -54,11 +54,9 @@ const WINDOW_FULL_STOP: &str = "model_context_window_exceeded";
 /// Stop reasons of an incomplete reply.
 const CUT_STOPS: [&str; 2] = [MAX_TOKENS_STOP, WINDOW_FULL_STOP];
 const TOOL_RESULT: &str = "tool_result";
-const BATCH_TOOL: &str = "batch";
-const BATCH_CALLS: &str = "tool_calls";
-const BATCH_CALL_TOOL: &str = "tool";
 const API_ERROR_MARK: &str = "is_api_error_message";
 const RATE_LIMITED: &str = "rate_limit";
+const UNKNOWN_ERROR: &str = "unknown";
 /// The plan status of a `rate_limit_event` once the plan's limit is used up.
 const PLAN_REJECTED: &str = "rejected";
 /// As 2.1.280 words it.
@@ -610,6 +608,18 @@ impl<'a> Turn<'a> {
             return Err(self.refused(refusal, status_of(&event["api_error_status"])));
         }
         if event["subtype"] != SUCCESS || event["is_error"] == true {
+            if let Some(status) = status_of(&event["api_error_status"]) {
+                return Err(self.refused(
+                    Refusal {
+                        kind: UNKNOWN_ERROR.into(),
+                        text: event["result"]
+                            .as_str()
+                            .map_or_else(|| shown(&event["errors"]), str::to_owned),
+                        status: Some(status),
+                    },
+                    None,
+                ));
+            }
             return Err(Error::Failed(
                 event["result"].as_str().unwrap_or(NO_MESSAGE).to_owned(),
             ));
@@ -633,13 +643,10 @@ impl<'a> Turn<'a> {
         }
     }
 
-    /// The error a reply broke off with, for a request whose output ended
-    /// before its result.
-    pub fn take_broken(&mut self) -> Option<Error> {
-        match self.refusal.take() {
-            Some(refusal) => Some(self.refused(refusal, None)),
-            None => self.lost.take(),
-        }
+    pub fn take_refusal(&mut self) -> Option<Error> {
+        self.refusal
+            .take()
+            .map(|refusal| self.refused(refusal, None))
     }
 
     pub fn is_broken(&self) -> bool {
@@ -818,11 +825,8 @@ fn unexpose_batch(catalog: &Catalog, input: &mut Value) {
         return;
     };
     for call in calls {
-        if let Some(name) = call[BATCH_CALL_TOOL]
-            .as_str()
-            .and_then(|exposed| catalog.maki_name(exposed))
-        {
-            call[BATCH_CALL_TOOL] = Value::from(name);
+        if let Some(exposed) = call[BATCH_CALL_TOOL].as_str() {
+            call[BATCH_CALL_TOOL] = Value::from(catalog.maki_name_or_made_up(exposed));
         }
     }
 }
@@ -1477,7 +1481,8 @@ mod tests {
     /// The model names a batch's calls as it sees the tools. The held call
     /// still matches the reply, and maki gets its own names back.
     #[test_case(EXPOSED, TOOL ; "an_offered_tool_gets_its_maki_name")]
-    #[test_case(UNKNOWN_TOOL, UNKNOWN_TOOL ; "an_unknown_tool_keeps_its_name")]
+    #[test_case(UNKNOWN_TOOL, "unknown" ; "an_unknown_exposed_tool_gets_its_local_name")]
+    #[test_case("mcp__maki__made_up", "made_up" ; "an_unknown_exposed_name_loses_its_prefix")]
     fn a_batch_names_its_calls_by_maki_names(inner: &str, expected: &str) {
         let input =
             json!({ BATCH_CALLS: [{ BATCH_CALL_TOOL: inner, "parameters": { "path": "a" } }] });

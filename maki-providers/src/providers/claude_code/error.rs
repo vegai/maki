@@ -35,10 +35,6 @@ pub(super) fn shown(value: &Value) -> String {
 
 #[derive(Debug, Error)]
 pub(crate) enum Error {
-    #[error(
-        "the provider needs the session's working directory, and this request did not pass one"
-    )]
-    NoWorkingDir,
     #[error(transparent)]
     Check(#[from] Problem),
     #[error("Claude Code ran {ran:?} for {asked}, which organization policy can cause")]
@@ -111,8 +107,6 @@ pub(crate) enum Error {
 
     #[error("Claude Code exited ({0}) before its reply was complete")]
     ExitedEarly(ExitStatus),
-    #[error("Claude Code exited ({0}) after its reply")]
-    ExitedAfterReply(ExitStatus),
     #[error("Claude Code exited ({0}) during its checks")]
     ExitedInChecks(ExitStatus),
     #[error("`claude --version` exited ({0})")]
@@ -227,6 +221,18 @@ pub(crate) enum Error {
 }
 
 impl Error {
+    pub(crate) fn invalidates_version(&self) -> bool {
+        match self {
+            Self::UnknownVersion(_)
+            | Self::TooOld { .. }
+            | Self::NoVersion
+            | Self::VersionFailed(_)
+            | Self::UnreadableVersion(_)
+            | Self::Check(_) => true,
+            Self::WithStderr { error, .. } => error.invalidates_version(),
+            _ => false,
+        }
+    }
     /// Returns the text when the API rejects a conversation that is larger
     /// than the window, whatever stderr says.
     pub(crate) fn invalid_request(&self) -> Option<&str> {
@@ -274,7 +280,6 @@ impl Error {
             &self,
             Self::WentQuiet
                 | Self::ExitedEarly(_)
-                | Self::ExitedAfterReply(_)
                 | Self::NotAnEvent { .. }
                 | Self::Io { .. }
                 | Self::ExitLate
