@@ -1,9 +1,9 @@
 -- The process-free half of the snapshot and the import: what a snapshot
 -- holds, how maki parses git output, and the scripts the import runs.
 
-local launch = require("claude_launch")
-
 local M = {}
+
+M.REPOSITORY_KIND = "repository"
 
 -- Keeps hashes and listings independent of the user's git config.
 local GIT_UNCONFIGURED = { GIT_CONFIG_GLOBAL = "/dev/null", GIT_CONFIG_NOSYSTEM = "1" }
@@ -131,6 +131,7 @@ function M.snapshot_git_env(env, git_dir, snapshot)
 end
 
 function M.excluded_pathspecs(deny_read)
+  local launch = require("claude_launch")
   local specs = {}
   for _, pattern in ipairs(assert(launch.denied_paths(deny_read))) do
     specs[#specs + 1] = ":(exclude,glob)" .. pattern
@@ -236,7 +237,7 @@ end
 function M.dependency_dirs(option)
   local dirs = {}
   for dir in (option or ""):gmatch("[^,]+") do
-    dir = launch.trim(dir)
+    dir = dir:match("^%s*(.-)%s*$")
     if dir ~= "" then
       local spelled, problem = M.relative_path(dir)
       if not spelled then
@@ -440,6 +441,15 @@ function M.retyped_paths(changes)
   return found
 end
 
+function M.repository_path(path, repositories)
+  for repository in pairs(repositories or {}) do
+    if repository == "." or path == repository or path:sub(1, #repository + 1) == repository .. "/" then
+      return true
+    end
+  end
+  return false
+end
+
 function M.kind(change, binary)
   if change.old_mode == SYMLINK_MODE or change.new_mode == SYMLINK_MODE then
     return "symlink"
@@ -502,7 +512,7 @@ function M.change_problem(change)
   -- `retyped_paths` can make any change a type change, which is never
   -- imported.
   local kind = M.kind(change, { [change.path] = change.kind == "binary" })
-  if change.kind ~= kind and change.kind ~= TYPE_KIND then
+  if change.kind ~= kind and change.kind ~= TYPE_KIND and change.kind ~= M.REPOSITORY_KIND then
     return change.path .. " is a " .. kind .. " change, and not " .. tostring(change.kind)
   end
   return nil

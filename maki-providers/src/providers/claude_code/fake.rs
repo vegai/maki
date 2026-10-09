@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
 
 use super::error::Error;
-use super::run::{Limits, Request, Thinking, request};
+use super::run::{Launch, Limits, Request, Thinking, request};
 use crate::{Message, ProviderEvent, ProviderUsage, StreamResponse};
 
 const OWNER_ONLY_MODE: &str = "700";
@@ -136,16 +136,19 @@ impl Fake {
         let (events, received) = flume::unbounded();
         let project = self.project();
         let result = request(Request {
-            executable: &self.executable(),
-            env: &Self::env(),
+            launch: Launch {
+                executable: &self.executable(),
+                env: &Self::env(),
+                project: &project,
+                temp_dir: &self.temp_base(),
+                startup: limits.startup,
+            },
             model,
-            cwd: &project,
             system: SYSTEM,
             messages,
             tools: &tools,
             events: &events,
             plan_usage: &self.plan_usage,
-            temp_dir: &self.temp_base(),
             max_output: None,
             thinking,
             limits: &limits,

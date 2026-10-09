@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::checks::{self, InitExpect, RULES};
+use super::checks::{self, HANDSHAKE, InitExpect};
 use super::error::{Error, TOO_MANY_REQUESTS, shown};
 use super::mcp::Handoff;
 use super::transcript::{BATCH_CALL_TOOL, BATCH_CALLS, BATCH_TOOL, Catalog};
@@ -23,8 +23,6 @@ use crate::{
 pub(crate) const INITIALIZE: &str = "initialize";
 pub(crate) const CONTROL_RESPONSE: &str = "control_response";
 pub(crate) const SUCCESS: &str = "success";
-/// The handshake ids in the shared rules. A test checks the rules name
-/// exactly these.
 pub(crate) const ACCOUNT_ANSWER: &str = "account";
 pub(crate) const SETTINGS_ANSWER: &str = "settings";
 pub(crate) const HOOKS_ANSWER: &str = "hooks";
@@ -394,7 +392,7 @@ impl<'a> Turn<'a> {
 
     fn answer(&mut self, response: &Value) -> Result<Step, Error> {
         let id = response["request_id"].as_str().unwrap_or_default();
-        if !RULES.handshake.iter().any(|step| step.id == id) || self.answers.contains_key(id) {
+        if !HANDSHAKE.iter().any(|step| step.id == id) || self.answers.contains_key(id) {
             return Err(Error::StrayAnswer(id.to_owned()));
         }
         if response["subtype"] != SUCCESS {
@@ -405,10 +403,9 @@ impl<'a> Turn<'a> {
         }
         self.answers
             .insert(id.to_owned(), response["response"].clone());
-        if RULES
-            .handshake
+        if HANDSHAKE
             .iter()
-            .any(|step| !self.answers.contains_key(&step.id))
+            .any(|step| !self.answers.contains_key(step.id))
         {
             return Ok(Step::Nothing);
         }
@@ -570,7 +567,7 @@ impl<'a> Turn<'a> {
                 Some(TEXT_BLOCK) => ContentBlock::Text { text: text("text") },
                 Some("thinking") => ContentBlock::Thinking {
                     thinking: text("thinking"),
-                    signature: block["signature"].as_str().map(str::to_owned),
+                    signature: None,
                 },
                 Some("redacted_thinking") => ContentBlock::RedactedThinking { data: text("data") },
                 Some(TOOL_USE_BLOCK) => {
@@ -789,9 +786,11 @@ impl<'a> Turn<'a> {
         };
         let output = output.ok_or(Error::NoFinalOutput)?;
         let mut blocks = self.blocks;
-        if stop_reason == StopReason::MaxTokens {
-            blocks.retain(|block| !matches!(block, ContentBlock::ToolUse { .. }));
-        }
+        blocks.retain(|block| {
+            !matches!(block, ContentBlock::RedactedThinking { .. })
+                && !(stop_reason == StopReason::MaxTokens
+                    && matches!(block, ContentBlock::ToolUse { .. }))
+        });
         for block in &mut blocks {
             if let ContentBlock::ToolUse { name, input, .. } = block
                 && name == BATCH_TOOL
@@ -905,7 +904,9 @@ mod tests {
 
     use serde_json::{Value, json};
 
-    use super::super::checks::{CONNECTED, DEFAULT_MODE, InitExpect, RULES, profile};
+    use super::super::checks::{
+        CONNECTED, DEFAULT_MODE, FIRST_PARTY, FLAG_SOURCE, InitExpect, NO_KEY_SOURCE, profile,
+    };
     use super::super::error::Error;
     use super::super::mcp::Handoff;
     use super::super::transcript::Catalog;
@@ -916,7 +917,7 @@ mod tests {
         Step, TOOL_RESULT, TOOL_USE_STOP, Turn, WINDOW_FULL_STOP, dropped_by_claude_code, usage_of,
         user_message,
     };
-    use crate::{StopReason, StreamResponse};
+    use crate::{ContentBlock, StopReason, StreamResponse};
 
     const CWD: &str = "/work";
     const VERSION: &str = "2.1.284";
@@ -973,7 +974,7 @@ mod tests {
                 ACCOUNT_ANSWER,
                 json!({
                     "current_permission_mode": DEFAULT_MODE,
-                    "account": { "apiProvider": RULES.first_party, "subscriptionType": "Claude Pro" },
+                    "account": { "apiProvider": FIRST_PARTY, "subscriptionType": "Claude Pro" },
                     "models": [
                         { "value": "default", "resolvedModel": OPUS },
                         { "value": "opus", "resolvedModel": OPUS },
@@ -983,7 +984,7 @@ mod tests {
             ),
             control(
                 SETTINGS_ANSWER,
-                json!({ "effective": { "autoCompactEnabled": false }, "sources": [{ "source": RULES.flag_source, "settings": {} }] }),
+                json!({ "effective": { "autoCompactEnabled": false }, "sources": [{ "source": FLAG_SOURCE, "settings": {} }] }),
             ),
             control(
                 HOOKS_ANSWER,
@@ -994,7 +995,7 @@ mod tests {
 
     fn init() -> String {
         json!({
-            "type": "system", "subtype": "init", "apiKeySource": RULES.no_key_source, "claude_code_version": VERSION,
+            "type": "system", "subtype": "init", "apiKeySource": NO_KEY_SOURCE, "claude_code_version": VERSION,
             "permissionMode": DEFAULT_MODE, "tools": [EXPOSED, EXPOSED_BATCH], "mcp_servers": [{ "name": SERVER, "status": CONNECTED }],
             "plugins": [], "cwd": CWD,
         })
@@ -1130,6 +1131,26 @@ mod tests {
             ],
             TOOL_USE_STOP,
         )
+    }
+
+    #[test]
+    fn cli_thinking_cannot_be_replayed_to_another_provider() {
+        let mut lines = reply(
+            &[
+                json!({ "type": "thinking", "thinking": "checking", "signature": "cli-prefix" }),
+                json!({ "type": "redacted_thinking", "data": "cli-encrypted" }),
+                json!({ "type": "text", "text": "done" }),
+            ],
+            END_TURN,
+        );
+        lines.push(json!({"type": "result", "subtype": "success", "is_error": false}).to_string());
+        let (step, response) = run(&lines, Vec::new(), false);
+        assert!(matches!(step, Ok(Step::Done)), "{step:?}");
+        let response = response.unwrap().unwrap();
+        assert!(matches!(response.message.content.as_slice(), [
+            ContentBlock::Thinking { thinking, signature: None },
+            ContentBlock::Text { text }
+        ] if thinking == "checking" && text == "done"));
     }
 
     /// Unexpected protocol data must stop the request before an unvalidated reply reaches the

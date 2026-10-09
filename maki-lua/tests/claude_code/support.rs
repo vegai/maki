@@ -1,6 +1,6 @@
 //! Items shared by the claude_code test binaries.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
 use std::future::Future;
@@ -13,13 +13,13 @@ use std::time::{Duration, Instant};
 
 use maki_agent::ToolOutput;
 use maki_agent::tools::{ToolContext, ToolRegistry};
+use maki_config::PluginsConfig;
 use maki_lua::PluginHost;
 use rustix::process::{Pid, geteuid, test_kill_process_group};
 use serde_json::{Map, Value};
 use smol::Timer;
 use smol::future::or;
 
-pub const PLUGIN_SRC: &str = include_str!("../../../plugins/claude_code/init.lua");
 pub const TOOL: &str = "claude_code";
 /// The Claude Code version the fakes report: the oldest maki runs.
 pub const MINIMUM_VERSION: &str = "2.1.284";
@@ -282,9 +282,13 @@ pub fn load(opts: Map<String, Value>) -> (Arc<ToolRegistry>, PluginHost) {
 pub fn try_load(opts: Map<String, Value>) -> Result<(Arc<ToolRegistry>, PluginHost), String> {
     use_fixture_user();
     let reg = Arc::new(ToolRegistry::new());
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_source_with_opts(TOOL, PLUGIN_SRC, opts)
-        .map_err(|e| e.to_string())?;
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_builtins(&PluginsConfig {
+        names: vec![TOOL.to_owned()],
+        opts: HashMap::from([(TOOL.to_owned(), opts)]),
+        ..Default::default()
+    })
+    .map_err(|e| e.to_string())?;
     Ok((reg, host))
 }
 

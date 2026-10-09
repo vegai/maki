@@ -37,7 +37,7 @@ pub(super) const MCP_CONFIG_FLAG: &str = "--mcp-config";
 const SETTINGS: &str = r#"{"disableAllHooks":true,"autoMemoryEnabled":false,"autoCompactEnabled":false,"claudeMdExcludes":["**"],"disableClaudeAiConnectors":true,"permissions":{"allow":["mcp__maki"]}}"#;
 const EMPTY_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
 
-pub(super) struct Launch<'a> {
+pub(crate) struct Launch<'a> {
     pub executable: &'a Path,
     pub env: &'a [(String, String)],
     pub project: &'a Path,

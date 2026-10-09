@@ -1775,7 +1775,7 @@ impl<'t> EventLoop<'t> {
                 terminal::suspend(self.terminal);
                 self.focus.on_resume();
             }
-            Action::RefreshModels => self.refresh_models(),
+            Action::RefreshModels(listing) => self.refresh_models(listing),
             Action::RefreshUsage => self.refresh_usage(),
             Action::ManualExit => self.sessions[idx].notifications.on_manual_exit(),
         }
@@ -1829,13 +1829,13 @@ impl<'t> EventLoop<'t> {
         self.dispatch(self.focused, actions);
     }
 
-    fn refresh_models(&self) {
+    fn refresh_models(&self, listing: ModelListing) {
         fetch_models(
             Arc::clone(&self.ctx.available_models),
             Arc::clone(&self.ctx.model_policy),
             self.warn_tx.clone(),
             self.models_tx.clone(),
-            ModelListing::Refresh,
+            listing,
         )
         .detach();
     }

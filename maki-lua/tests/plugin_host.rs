@@ -275,7 +275,7 @@ fn dangerous_globals_blocked() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
-    for global in &["io", "package"] {
+    for global in &["io", "package", "getfenv", "setfenv"] {
         let source =
             format!(r#"if {global} ~= nil then error("sandbox leak: {global} is not nil") end"#);
         host.load_source(&format!("sandbox_check_{global}"), &source)

@@ -14,7 +14,7 @@ use test_case::test_case;
 
 use super::checks::child_env;
 use super::error::Error;
-use super::run::{Limits, Request, Thinking, models, request};
+use super::run::{Launch, Limits, Request, Thinking, models, request};
 use super::{SLUG, agent_error, utf8_vars};
 use crate::model::Model;
 use crate::process::find_program;
@@ -107,16 +107,19 @@ impl Live {
         events: &Sender<ProviderEvent>,
     ) -> Result<StreamResponse, Error> {
         smol::block_on(request(Request {
-            executable: &self.claude,
-            env: &self.env,
+            launch: Launch {
+                executable: &self.claude,
+                env: &self.env,
+                project: &self.cwd,
+                temp_dir: &env::temp_dir(),
+                startup: Limits::new(IDLE).startup,
+            },
             model,
-            cwd: &self.cwd,
             system: SYSTEM,
             messages,
             tools,
             events,
             plan_usage: &Mutex::default(),
-            temp_dir: &env::temp_dir(),
             max_output,
             thinking,
             limits: &Limits::new(IDLE),

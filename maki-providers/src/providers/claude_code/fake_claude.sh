@@ -115,6 +115,7 @@ case $scenario in
   noisy_stderr) printf 'bad \377 byte\n' >&2; head -c 200000 /dev/zero | tr '\0' 'x' >&2; printf '\n' >&2; text_reply ;;
   text_then_fail) text_reply; exit 23 ;;
   text_then_linger) text_reply; exec >&-; sleep 30 ;;
+  text_then_slow_stdout) text_reply; sleep 30 ;;
   text_then_api_key) text_reply; init ANTHROPIC_API_KEY ;;
   text_then_keep_alive) text_reply; line '{"type":"keep_alive"}' ;;
   text_then_limits) text_reply; limits ;;

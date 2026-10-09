@@ -22,8 +22,8 @@ use tempfile::{TempDir, tempdir};
 use test_case::test_case;
 
 use super::support::{
-    DEADLINE, FIXTURE_GLOBAL_RULE, LEFT_BEHIND, MINIMUM_VERSION, PLUGIN_SRC, PROJECT_RULE, TOOL,
-    WorkingDir, executable, group_gone, load, running, tool_reply, try_load, wait_until, within,
+    DEADLINE, FIXTURE_GLOBAL_RULE, LEFT_BEHIND, MINIMUM_VERSION, PROJECT_RULE, TOOL, WorkingDir,
+    executable, group_gone, load, running, tool_reply, try_load, wait_until, within,
 };
 
 mod coding;
@@ -299,6 +299,24 @@ case "$scenario" in
     printf 'allow = []\n' > src/.MaKi/permissions.toml
     printf '{}\n' > .Claude/settings.json
     mkdir tools; printf '{}\n' > tools/.claude
+    printf 'worker\n' >> src/lib.rs
+    answer ;;
+  code_bare_root*)
+    init none
+    mkdir -p objects refs
+    printf 'ref: refs/heads/main\n' > HEAD
+    git --git-dir=. config core.bare false
+    git --git-dir=. config core.worktree .
+    git --git-dir=. config core.fsmonitor "touch '$dir/metadata_ran'"
+    printf 'worker\n' >> src/lib.rs
+    answer ;;
+  code_bare*)
+    init none
+    mkdir -p fixtures
+    git init -q --bare fixtures/x.git
+    git -C fixtures/x.git config core.bare false
+    git -C fixtures/x.git config core.worktree .
+    git -C fixtures/x.git config core.fsmonitor "touch '$dir/metadata_ran'"
     printf 'worker\n' >> src/lib.rs
     answer ;;
   code_nested_*)
@@ -715,10 +733,7 @@ fn an_unusable_option_is_refused_at_load(name: &str, value: Value, want: &str) {
     let fake = FakeClaude::new();
     let mut opts = fake.opts(ONE_SLOT);
     opts.insert(name.into(), value);
-    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-    let err = host
-        .load_source_with_opts(TOOL, PLUGIN_SRC, opts)
-        .unwrap_err();
+    let err = try_load(opts).err().unwrap();
     assert!(err.to_string().contains(want), "got: {err}");
 }
 

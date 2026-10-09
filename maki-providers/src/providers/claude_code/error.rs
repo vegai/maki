@@ -221,24 +221,29 @@ pub(crate) enum Error {
 }
 
 impl Error {
-    pub(crate) fn invalidates_version(&self) -> bool {
+    pub(crate) fn cause(&self) -> &Self {
         match self {
-            Self::UnknownVersion(_)
-            | Self::TooOld { .. }
-            | Self::NoVersion
-            | Self::VersionFailed(_)
-            | Self::UnreadableVersion(_)
-            | Self::Check(_) => true,
-            Self::WithStderr { error, .. } => error.invalidates_version(),
-            _ => false,
+            Self::WithStderr { error, .. } => error.cause(),
+            _ => self,
         }
+    }
+
+    pub(crate) fn invalidates_version(&self) -> bool {
+        matches!(
+            self.cause(),
+            Self::UnknownVersion(_)
+                | Self::TooOld { .. }
+                | Self::NoVersion
+                | Self::VersionFailed(_)
+                | Self::UnreadableVersion(_)
+                | Self::Check(_)
+        )
     }
     /// Returns the text when the API rejects a conversation that is larger
     /// than the window, whatever stderr says.
     pub(crate) fn invalid_request(&self) -> Option<&str> {
-        match self {
+        match self.cause() {
             Self::ApiRefused { kind, text, .. } if kind == INVALID_REQUEST => Some(text),
-            Self::WithStderr { error, .. } => error.invalid_request(),
             _ => None,
         }
     }
@@ -246,16 +251,15 @@ impl Error {
     /// The idle limit of a reply that stopped streaming, which maki's retry
     /// loop treats as the anthropic provider's stalled stream.
     pub(crate) fn stalled(&self) -> Option<u64> {
-        match self {
+        match self.cause() {
             Self::Stalled(secs) => Some(*secs),
-            Self::WithStderr { error, .. } => error.stalled(),
             _ => None,
         }
     }
 
     /// Login, policy and protocol invariant failures stay terminal.
     pub(crate) fn temporary(&self) -> Option<(u16, Option<Duration>)> {
-        match self {
+        match self.cause() {
             Self::ApiRefused { kind, status, text } => match status {
                 Some(status) if is_temporary_status(*status) => Some((*status, None)),
                 Some(_) => None,
@@ -270,7 +274,6 @@ impl Error {
             Self::CliRetry { status, delay, .. } => Some((status.unwrap_or(SERVER_ERROR), *delay)),
             Self::NoCallsToRun => Some((SERVER_ERROR, None)),
             Self::Interrupted(_) => Some((SERVER_ERROR, None)),
-            Self::WithStderr { error, .. } => error.temporary(),
             _ => None,
         }
     }

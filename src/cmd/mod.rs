@@ -98,15 +98,9 @@ fn load_plugins(
     // Before any plugin can call `maki.net`, so the first request already sees
     // the hosts the user exempted from the private-address block.
     maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
-    // Runs before any model is resolved, so the claude-code provider is on
-    // only once its plugin has loaded and checked the options both share. A
-    // plugin registers its options when it loads, and a failed load removes
-    // them.
+    // Model resolution must wait until the plugin has checked the shared options.
     let builtins = host.load_builtins(&config.plugins);
-    let loaded: Vec<String> = host
-        .plugin_options()
-        .map(|specs| specs.into_keys().map(|name| name.to_string()).collect())
-        .unwrap_or_default();
+    let loaded = host.loaded_plugins()?;
     maki_providers::claude_code::follow_plugins(&loaded, &config.plugins.opts);
 
     if let Err(e) = builtins {

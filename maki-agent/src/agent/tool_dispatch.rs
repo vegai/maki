@@ -806,11 +806,10 @@ fn run_tool_search(
     let query = input["query"].as_str().unwrap_or_default();
     emit_raw_start(ctx, origin, &id, &tool_id, query.to_owned(), input);
     let deferral = ToolDeferral::for_model(&ctx.model);
-    let (output, is_error) =
-        match mcp.search_tools_filtered(query, origin, deferral, &ctx.tool_filter) {
-            Ok(found) => (found, false),
-            Err(e) => (e.into(), true),
-        };
+    let (output, is_error) = match mcp.search_tools(query, origin, deferral, &ctx.tool_filter) {
+        Ok(found) => (found, false),
+        Err(e) => (e.into(), true),
+    };
     ToolDoneEvent {
         call: None,
         id,
@@ -2241,7 +2240,7 @@ mod tests {
             assert!(done.output.as_text().contains(PROBE_WIRE));
 
             let mut tools = serde_json::json!([]);
-            mcp.extend_tools(&mut tools, ToolDeferral::Client);
+            mcp.extend_tools(&mut tools, ToolDeferral::Client, &ToolFilter::All);
             assert!(
                 tool_names(&tools).contains(&PROBE_WIRE),
                 "searched tool must join the next request"
@@ -2273,7 +2272,7 @@ mod tests {
             assert_eq!(done.output.loaded_tools(), [PROBE_WIRE]);
 
             let mut tools = serde_json::json!([]);
-            mcp.extend_tools(&mut tools, ToolDeferral::Client);
+            mcp.extend_tools(&mut tools, ToolDeferral::Client, &ToolFilter::All);
             assert_eq!(
                 tool_names(&tools),
                 vec![PROBE_WIRE],
@@ -2295,7 +2294,7 @@ mod tests {
             assert!(done.output.loaded_tools().is_empty());
 
             let mut tools = serde_json::json!([]);
-            mcp.extend_tools(&mut tools, ToolDeferral::Client);
+            mcp.extend_tools(&mut tools, ToolDeferral::Client, &ToolFilter::All);
             assert_eq!(
                 tool_names(&tools),
                 vec![TOOL_SEARCH_TOOL_NAME],
@@ -2318,7 +2317,7 @@ mod tests {
             );
 
             let mut tools = serde_json::json!([]);
-            mcp.extend_tools(&mut tools, ToolDeferral::Client);
+            mcp.extend_tools(&mut tools, ToolDeferral::Client, &ToolFilter::All);
             assert_eq!(
                 tool_names(&tools),
                 vec![TOOL_SEARCH_TOOL_NAME],
@@ -2778,10 +2777,11 @@ mod tests {
                 "plan mode must not block or deny the call, got: {text}"
             );
             let mut tools = serde_json::json!([]);
-            ctx.mcp
-                .as_ref()
-                .unwrap()
-                .extend_tools(&mut tools, ToolDeferral::Client);
+            ctx.mcp.as_ref().unwrap().extend_tools(
+                &mut tools,
+                ToolDeferral::Client,
+                &ToolFilter::All,
+            );
             assert!(
                 tool_names(&tools).contains(&&PROBE_WIRE.to_owned()[..]),
                 "a permitted plan-mode call must load the definition"
@@ -2803,10 +2803,11 @@ mod tests {
             assert!(text.starts_with(PERMISSION_DENIED_PREFIX), "got: {text}");
             assert!(done.output.loaded_tools().is_empty());
             let mut tools = serde_json::json!([]);
-            ctx.mcp
-                .as_ref()
-                .unwrap()
-                .extend_tools(&mut tools, ToolDeferral::Client);
+            ctx.mcp.as_ref().unwrap().extend_tools(
+                &mut tools,
+                ToolDeferral::Client,
+                &ToolFilter::All,
+            );
             assert!(
                 !tool_names(&tools).contains(&&PROBE_WIRE.to_owned()[..]),
                 "an unapproved call must not load the definition"

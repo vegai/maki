@@ -35,7 +35,6 @@ M.WORKERS = {
     contract = CODE_CONTRACT,
   },
 }
-local RULES = require("claude_rules")
 
 --- `ipairs` skips object entries. Require a JSON array so an object cannot bypass list validation.
 function M.is_list(value)
@@ -70,7 +69,7 @@ M.MIN_TIMEOUT_SECS = 30
 M.MAX_TIMEOUT_SECS = 1800
 -- The process that runs the task answers these requests, so the answers
 -- cover every settings source it merged, managed policy included.
-M.HANDSHAKE = RULES.handshake
+M.HANDSHAKE = native.handshake()
 
 local STREAM_JSON = "stream-json"
 local EMPTY_MCP_CONFIG = '{"mcpServers":{}}'
@@ -141,10 +140,6 @@ local function sorted_keys(t)
   return keys
 end
 
-function M.child_env(environ)
-  return native.environment(environ)
-end
-
 --- Returns why {worker} cannot run with {env}: its shell could read the
 --- login token, or a proxy URL with a user or password in it. Names compare
 --- in upper case, because `https_proxy` and the like reach the child too.
@@ -192,13 +187,6 @@ function M.home_credentials(home, extra)
   return paths
 end
 
---- Returns {configured} (`config_dir` or `$CLAUDE_CONFIG_DIR`), or `.claude`
---- in {home}. The checks and each child resolve it from different
---- directories, so it must be absolute.
-function M.config_dir(configured, home)
-  return native.config_dir(configured, home)
-end
-
 function M.local_settings_dirs(cwd)
   local paths, err = native.local_settings_dirs(cwd)
   if not paths then
@@ -237,10 +225,6 @@ end
 
 local function json(value)
   return type(value) == "string" and value or maki.json.encode(value)
-end
-
-function M.settings_conflicts(settings)
-  return native.settings_conflicts(json(settings))
 end
 
 function M.plugins_problem(plugins)

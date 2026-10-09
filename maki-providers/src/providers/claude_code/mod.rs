@@ -41,15 +41,25 @@ use crate::providers::{Timeouts, anthropic, catalog};
 use crate::spec::{
     AuthDoc, Build, CatalogDoc, GeneratedDocs, NO_CURATED_MODELS, Native, ProviderSpec,
 };
-use crate::types::dialect;
 use crate::{
-    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
-    ThinkingConfig,
+    AgentError, Effort, EffortDialect, Message, ProviderEvent, ProviderUsage, RequestOptions,
+    StreamResponse, ThinkingConfig,
 };
 use error::Error;
 use maki_storage::atomic_write;
-use run::{Limits, Listed, Thinking};
+use run::{Launch, Limits, Listed, Request, Thinking};
 
+const CLAUDE_CODE: EffortDialect = EffortDialect {
+    supported: &[
+        Effort::Low,
+        Effort::Medium,
+        Effort::High,
+        Effort::XHigh,
+        Effort::Max,
+    ],
+    adaptive: None,
+    off: None,
+};
 pub(crate) const SLUG: &str = "claude-code";
 const DISPLAY_NAME: &str = "Claude Code (experimental)";
 const PLUGIN: &str = "claude_code";
@@ -213,9 +223,7 @@ fn config_error(message: impl Display) -> AgentError {
 /// Login, policy and invariant failures stop the request. Held calls do not run when a
 /// generation fails, so an interrupted reply can use the normal retry limit.
 fn agent_error(error: Error) -> AgentError {
-    if matches!(&error, Error::ContextOverflow)
-        || matches!(&error, Error::WithStderr { error, .. } if matches!(error.as_ref(), Error::ContextOverflow))
-    {
+    if matches!(error.cause(), Error::ContextOverflow) {
         return AgentError::Api {
             status: CONTEXT_OVERFLOW_STATUS,
             message: error.to_string(),
@@ -338,7 +346,7 @@ fn thinking_for(thinking: ThinkingConfig, model: &Model) -> Thinking {
     match thinking {
         ThinkingConfig::Off => Thinking::Off,
         _ if ThinkingConfig::requires_adaptive(&model.id) => thinking
-            .effort_str(&dialect::CLAUDE_CODE, model)
+            .effort_str(&CLAUDE_CODE, model)
             .map_or(Thinking::Default, Thinking::Effort),
         _ => thinking
             .request_thinking(model)
@@ -554,17 +562,20 @@ impl ClaudeCode {
         };
         let slot_wait = waiting.elapsed();
         let prepared = self.prepare_async(&cwd).await?;
-        run::request(run::Request {
-            executable: &self.executable,
-            env: &prepared.env,
+        run::request(Request {
+            launch: Launch {
+                executable: &self.executable,
+                env: &prepared.env,
+                project: &cwd,
+                temp_dir: &prepared.temp_dir,
+                startup: self.limits.startup,
+            },
             model: &model.id,
-            cwd: &cwd,
             system: exchange.system,
             messages: exchange.messages,
             tools: exchange.tools,
             events: exchange.events,
             plan_usage: &PLAN_USAGE,
-            temp_dir: &prepared.temp_dir,
             max_output: model.output_tokens(),
             thinking,
             limits: &self.limits,

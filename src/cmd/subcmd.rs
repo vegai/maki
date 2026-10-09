@@ -605,7 +605,7 @@ pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMo
     if refresh {
         match refresh_catalog() {
             Ok(()) => eprintln!("models.dev catalog has been refreshed"),
-            Err(e) => eprintln!("warning: catalog refresh failed, keeping existing cache: {e}"),
+            Err(e) => bail!("models.dev catalog refresh failed: {e}"),
         }
     }
 

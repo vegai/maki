@@ -1,4 +1,4 @@
-use super::super::checks::RULES;
+use super::super::checks::HANDSHAKE;
 use super::super::error::Error;
 use super::super::mcp::Handoff;
 use super::super::stream::control_request;
@@ -10,7 +10,7 @@ use crate::process::kill_group;
 use crate::process::wait_without_reaping;
 use flume::Receiver;
 use futures_lite::future;
-use futures_lite::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use futures_lite::{FutureExt, Stream, StreamExt};
 use serde_json::json;
 use smol::process::{Child, ChildStdin, ChildStdout, Command};
@@ -27,8 +27,13 @@ use tracing::debug;
 
 const STDERR_DRAIN: Duration = Duration::from_secs(1);
 const STDERR_TAIL_LINES: usize = 10;
+const STDERR_LINE_BYTES: usize = 4096;
+const TRUNCATED_LINE: &str = "…";
 
-pub(super) async fn within<T>(deadline: Instant, work: impl Future<Output = T>) -> Option<T> {
+pub(in crate::providers::claude_code) async fn within<T>(
+    deadline: Instant,
+    work: impl Future<Output = T>,
+) -> Option<T> {
     async { Some(work.await) }
         .or(async {
             Timer::at(deadline).await;
@@ -173,10 +178,8 @@ fn watch_stderr(child: &mut Child) -> Stderr {
         // A line that is not UTF-8 must not stop the reader, or Claude Code
         // blocks once its stderr fills the pipe.
         smol::spawn(async move {
-            let mut reader = BufReader::new(stderr).split(b'\n');
-            while let Some(Ok(line)) = reader.next().await {
-                let line =
-                    String::from_utf8_lossy(line.strip_suffix(b"\r").unwrap_or(&line)).into_owned();
+            let mut reader = BufReader::new(stderr);
+            while let Ok(Some(line)) = stderr_line(&mut reader).await {
                 let mut lines = lines.lock().unwrap_or_else(PoisonError::into_inner);
                 if lines.len() == STDERR_TAIL_LINES {
                     lines.pop_front();
@@ -186,6 +189,34 @@ fn watch_stderr(child: &mut Child) -> Stderr {
         })
     });
     Stderr { tail, reader }
+}
+
+async fn stderr_line(reader: &mut (impl AsyncBufRead + Unpin)) -> io::Result<Option<String>> {
+    let mut line = Vec::new();
+    let mut truncated = false;
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            if line.is_empty() && !truncated {
+                return Ok(None);
+            }
+            break;
+        }
+        let end = chunk.iter().position(|byte| *byte == b'\n');
+        let length = end.unwrap_or(chunk.len());
+        let kept = length.min(STDERR_LINE_BYTES - line.len());
+        line.extend_from_slice(&chunk[..kept]);
+        truncated |= kept < length;
+        reader.consume(length + usize::from(end.is_some()));
+        if end.is_some() {
+            break;
+        }
+    }
+    let mut text = String::from_utf8_lossy(line.strip_suffix(b"\r").unwrap_or(&line)).into_owned();
+    if truncated {
+        text.push_str(TRUNCATED_LINE);
+    }
+    Ok(Some(text))
 }
 
 fn with_stderr(error: Error, tail: &StderrTail) -> Error {
@@ -248,8 +279,8 @@ pub(super) async fn send_handshake(
     stdin: &mut Option<ChildStdin>,
     deadline: Instant,
 ) -> Result<(), Error> {
-    for step in &RULES.handshake {
-        let request = control_request(&step.id, &json!({ "subtype": step.subtype }));
+    for step in HANDSHAKE {
+        let request = control_request(step.id, &json!({ "subtype": step.subtype }));
         send(stdin, &request, deadline).await?;
     }
     Ok(())
@@ -273,4 +304,29 @@ pub(super) async fn send(
     })
     .await
     .ok_or(Error::InputNotTaken)?
+}
+
+#[cfg(test)]
+mod tests {
+    use futures_lite::io::Cursor;
+
+    use super::{STDERR_LINE_BYTES, TRUNCATED_LINE, stderr_line};
+
+    const NEXT_LINE: &str = "next";
+
+    #[test]
+    fn capped_stderr_lines_are_drained_before_the_next_line() {
+        smol::block_on(async {
+            let input = format!("{}\n{NEXT_LINE}\n", "x".repeat(STDERR_LINE_BYTES * 2));
+            let mut reader = Cursor::new(input.as_bytes());
+            let line = stderr_line(&mut reader).await.unwrap().unwrap();
+            assert_eq!(line.len(), STDERR_LINE_BYTES + TRUNCATED_LINE.len());
+            assert!(line.ends_with(TRUNCATED_LINE));
+            assert_eq!(
+                stderr_line(&mut reader).await.unwrap().as_deref(),
+                Some(NEXT_LINE)
+            );
+            assert!(stderr_line(&mut reader).await.unwrap().is_none());
+        });
+    }
 }

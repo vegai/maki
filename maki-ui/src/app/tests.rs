@@ -7488,7 +7488,10 @@ fn run_builtin_model_picker_opens_cached_models() {
     let mut app = test_app();
     let actions = app.run_builtin(BuiltinAction::ModelPicker);
     assert!(app.model_picker.is_open());
-    assert!(actions.is_empty());
+    assert!(matches!(
+        &actions[..],
+        [Action::RefreshModels(ModelListing::Cached)]
+    ));
 }
 
 #[test]
@@ -7512,6 +7515,9 @@ fn model_picker_refresh_requires_an_explicit_key() {
         KeyCode::Char('r'),
         KeyModifiers::CONTROL,
     )));
-    assert!(matches!(&actions[..], [Action::RefreshModels]));
+    assert!(matches!(
+        &actions[..],
+        [Action::RefreshModels(ModelListing::Refresh)]
+    ));
     assert!(app.model_picker.is_open());
 }

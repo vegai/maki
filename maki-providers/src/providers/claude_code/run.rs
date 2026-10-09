@@ -3,12 +3,13 @@ mod launch;
 mod private_files;
 mod supervision;
 
-pub(crate) use self::launch::models;
-use self::launch::{Launch, MCP_CONFIG_FLAG, base_args, checked_profile, command, probe};
+pub(crate) use self::launch::{Launch, models};
+use self::launch::{MCP_CONFIG_FLAG, base_args, checked_profile, command, probe};
 pub(super) use self::launch::{cache_profile, cached_profile, invalidate_profile};
 use self::private_files::{private_dir, private_file};
+pub(super) use self::supervision::within;
 use self::supervision::{
-    Group, Next, next, send, send_handshake, stdout_lines, supervised, unreadable, within,
+    Group, Next, next, send, send_handshake, stdout_lines, supervised, unreadable,
 };
 use super::checks::InitExpect;
 use super::error::Error;
@@ -82,17 +83,13 @@ pub(crate) struct Listed {
 }
 
 pub(crate) struct Request<'a> {
-    pub executable: &'a Path,
-    pub env: &'a [(String, String)],
+    pub launch: Launch<'a>,
     pub model: &'a str,
-    pub cwd: &'a Path,
     pub system: &'a str,
     pub messages: &'a [Message],
     pub tools: &'a Value,
     pub events: &'a Sender<ProviderEvent>,
     pub plan_usage: &'a Mutex<Option<ProviderUsage>>,
-    /// `$TMPDIR` as maki sees it.
-    pub temp_dir: &'a Path,
     pub max_output: Option<u32>,
     pub thinking: Thinking,
     pub limits: &'a Limits,
@@ -123,15 +120,9 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
     // none.
     let catalog = Catalog::new(req.tools)?;
     let conversation = user_message(&transcript(req.messages)?);
-    let launch = Launch {
-        executable: req.executable,
-        env: req.env,
-        project: req.cwd,
-        temp_dir: req.temp_dir,
-        startup: limits.startup,
-    };
-    let profile = checked_profile(&launch).await?;
-    let offered = probe(&launch, &profile, req.plan_usage).await?;
+    let launch = &req.launch;
+    let profile = checked_profile(launch).await?;
+    let offered = probe(launch, &profile, req.plan_usage).await?;
     // maki marks the 1M window with a `-1m` id and Claude Code with a `[1m]`
     // name. The generation reports the model without either.
     let asked = strip_long_context(req.model);
@@ -151,7 +142,7 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
         checks_ms = millis(checked),
         "claude-code: checks passed"
     );
-    let (_dir, dir_path) = private_dir(req.temp_dir, req.cwd)?;
+    let (_dir, dir_path) = private_dir(req.launch.temp_dir, req.launch.project)?;
     let (handoff_tx, handoffs) = flume::unbounded();
     let server = mcp::serve(token()?, catalog.tools.clone(), handoff_tx, limits.startup)
         .await
@@ -184,7 +175,7 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
             InitExpect {
                 profile: &profile,
                 model: runs,
-                cwd: req.cwd,
+                cwd: req.launch.project,
                 server: SERVER,
                 tools: &tools,
             },
@@ -197,7 +188,7 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
     };
     let ran = Instant::now();
     let (response, prompted) = supervised(
-        command(req.executable, &env, req.cwd, &args),
+        command(req.launch.executable, &env, req.launch.project, &args),
         async |group| converse(group, run, &mut server).await,
     )
     .await?;
@@ -220,9 +211,9 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
     Ok(response)
 }
 
-fn failed(error: Error, turn: &Turn<'_>) -> Error {
-    warn!(%error, events = %turn.trace(), "claude-code: the request failed");
-    error.after_start(turn.accepted())
+fn failed(error: Error, accepted: bool, trace: &str) -> Error {
+    warn!(%error, events = trace, "claude-code: the request failed");
+    error.after_start(accepted)
 }
 
 fn millis(duration: Duration) -> u64 {
@@ -243,7 +234,7 @@ fn run_args(
         SYSTEM_PROMPT_FILE_FLAG.to_owned(),
         prompt_file.display().to_string(),
     ]);
-    let mut env = req.env.to_vec();
+    let mut env = req.launch.env.to_vec();
     for (name, value) in [
         NO_AUTO_COMPACT,
         NO_NONSTREAMING_FALLBACK,
@@ -319,8 +310,7 @@ async fn converse(
                     Err(other) => other,
                 };
                 let error = turn.take_refusal().unwrap_or(ended);
-                warn!(%error, events = %turn.trace(), "claude-code: the request failed");
-                return Err(error.after_start(turn.accepted()));
+                return Err(failed(error, turn.accepted(), &turn.trace()));
             }
             Next::Handoff(handoff) => turn.park(handoff),
             // The reply and its usage are complete, so the result only
@@ -355,7 +345,7 @@ async fn converse(
                 "claude-code: init accepted, the reply streams"
             );
         }
-        match step.map_err(|error| failed(error, &turn))? {
+        match step.map_err(|error| failed(error, turn.accepted(), &turn.trace()))? {
             Step::Ready => {
                 debug!("claude-code: handshake accepted, sending the conversation");
                 // The conversation gets a full limit. Nothing reads stdout
@@ -382,26 +372,42 @@ async fn converse(
         group.kill();
     }
     let deadline = Instant::now() + limits.exit;
-    drain(&mut turn, &mut lines, &handoffs, deadline, stopped)
-        .await
-        .map_err(|error| failed(error, &turn))?;
-    let status = group
-        .wait(deadline)
-        .await
-        .map_err(|error| failed(error, &turn))?;
+    match drain(&mut turn, &mut lines, &handoffs, deadline, stopped).await {
+        Err(Error::ExitLate) => {
+            group.kill();
+            warn!("claude-code: output stayed open after a complete reply; stopping the CLI");
+            drain(
+                &mut turn,
+                &mut lines,
+                &handoffs,
+                Instant::now() + limits.exit,
+                true,
+            )
+            .await
+            .map_err(|error| failed(error, turn.accepted(), &turn.trace()))?;
+        }
+        result => result.map_err(|error| failed(error, turn.accepted(), &turn.trace()))?,
+    }
+    let status = match group.wait(deadline).await {
+        Ok(status) => Some(status),
+        Err(Error::ExitLate) => {
+            warn!("claude-code: the CLI did not exit after a complete reply; keeping the reply");
+            None
+        }
+        Err(error) => return Err(failed(error, turn.accepted(), &turn.trace())),
+    };
     // After the reap, Claude Code cannot make calls. Stop the server to end the queue and
     // validate all remaining calls.
     drop(server.take());
     queued_handoffs(&mut turn, handoffs, Instant::now() + limits.exit)
         .await
-        .map_err(|error| failed(error, &turn))?;
+        .map_err(|error| failed(error, turn.accepted(), &turn.trace()))?;
     let accepted = turn.accepted();
     let trace = turn.trace();
-    let response = turn.response().map_err(|error| {
-        warn!(%error, events = %trace, "claude-code: the request failed");
-        error.after_start(accepted)
-    })?;
-    if !stopped && !status.success() {
+    let response = turn
+        .response()
+        .map_err(|error| failed(error, accepted, &trace))?;
+    if !stopped && let Some(status) = status.filter(|status| !status.success()) {
         warn!(%status, "claude-code: the CLI exited with an error after a validated reply");
     }
     Ok((response, prompted))
@@ -769,9 +775,10 @@ mod tests {
 
     /// A reply whose output closed but whose process never exits stops at
     /// the exit limit, and so does the process.
-    #[test]
-    fn a_run_that_never_exits_is_killed_at_the_exit_limit() {
-        let fake = Fake::new("text_then_linger");
+    #[test_case("text_then_linger" ; "closed_stdout")]
+    #[test_case("text_then_slow_stdout" ; "open_stdout")]
+    fn a_complete_reply_survives_a_cli_that_does_not_exit(scenario: &str) {
+        let fake = Fake::new(scenario);
         let (result, _) = smol::block_on(fake.request_with(
             &format!("find {MARKER}"),
             ALIAS,
@@ -781,10 +788,11 @@ mod tests {
             fake.group_gone(),
             "a stopped run must not continue after its request"
         );
+        let response = result.unwrap();
         assert!(
-            matches!(result, Err(Error::Interrupted(ref error)) if matches!(**error, Error::ExitLate)),
-            "{result:?}"
+            matches!(response.message.content.as_slice(), [ContentBlock::Text { text }] if text == "Reading.")
         );
+        assert_eq!(fake.log("calls").lines().count(), 2);
     }
 
     /// A process that ignores stdin after its checks must not hold a request indefinitely.

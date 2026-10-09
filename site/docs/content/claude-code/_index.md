@@ -88,19 +88,27 @@ checkout --snapshot--> artifact --claude -p--> changes --claude_code_import--> c
 
    Untracked dependency files stay outside the import, including files that `prepare` creates. Preparation changes form the worker baseline even if the command fails or times out. The worker starts only after maki records that baseline.
 
-3. Claude works in the snapshot. Its shell commands run in the Claude Code sandbox, with bubblewrap on Linux and no network access. The shell can write only to the snapshot and a temporary directory beside it. It cannot read the checkout, maki state, config and logs, other artifacts, shell histories, browser profiles or common credentials such as `~/.ssh`, git credentials and keyrings. Add home-relative paths with `deny_read_home`. Other home files remain readable.
+3. Claude works in the snapshot. Its shell commands run in the Claude Code sandbox, with bubblewrap on Linux and no network access. The shell can write only to the snapshot and a temporary directory beside it. It cannot read the checkout, maki state, config and logs, other artifacts, shell histories, browser profiles or common credentials such as `~/.ssh`, git credentials and keyrings. Add home-relative paths with `deny_read_home`. The shell also cannot read `$XDG_RUNTIME_DIR` or the socket at `$SSH_AUTH_SOCK`. Other home files remain readable.
 
 4. Claude Code passes its environment to the shell. The `code` profile refuses to start when `CLAUDE_CODE_OAUTH_TOKEN` is set. It also refuses `HTTP_PROXY` or `HTTPS_PROXY` URLs that contain a login. Use `claude auth login` for authentication.
 
-5. After the worker exits, maki moves root and nested Git metadata into the artifact's `git-metadata` directory. Ordinary files stay in the snapshot and remain eligible for import. Empty nested repositories do not prevent collection. The change report gives a hardened diff command.
+5. After the worker exits, maki moves root and nested Git metadata into the artifact's `git-metadata` directory. Ordinary files stay in the snapshot and remain eligible for import. Empty nested repositories do not prevent collection. Embedded bare repositories are kept in quarantine and require manual changes. Bare metadata at the snapshot root makes every change manual. Quarantined Git configs are stored separately so Git cannot load them. The change report gives a hardened diff command.
 
 6. maki lists the changes. `claude_code_import` applies them with one `bash` command that you approve. It validates all target files before any change. A conflict at that point stops the import.
 
    The artifact's `originals` folder keeps hard links to the validated files. Its `displaced` folder keeps removed files. Both folders separate backups by import attempt. These backups preserve writes through open descriptors and later atomic editor saves. A save after removal can stop the import partway. The reply lists applied changes.
 
-   A retry preserves earlier backups. Each retry uses a new backup directory. Approval, import and manifest updates hold an artifact lock. Concurrent imports refuse to start, and expiry skips the artifact while that lock is held. Apply symlink, submodule, file-type and non-UTF-8 path changes manually from the artifact.
+   A retry preserves earlier backups. Each retry uses a new backup directory. Approval, import and manifest updates hold an artifact lock. Concurrent imports refuse to start, and expiry skips the artifact while that lock is held. Apply embedded-repository, symlink, submodule, file-type and non-UTF-8 path changes manually from the artifact.
 
 Artifacts live in the maki state directory, or in `artifact_dir`, which must be an absolute path outside the checkout. To import replacements or deletions, choose an artifact directory on the checkout's filesystem. If maki cannot make hard links, the import stops before any checkout change. The next coding call removes every artifact that has not been written for `artifact_ttl_hours`.
+
+To prevent Git from opening embedded bare repositories implicitly, set this global option:
+
+```bash
+git config --global safe.bareRepository explicit
+```
+
+Use `git --git-dir=<path>` when you intend to open a bare repository.
 
 ## Experimental provider
 

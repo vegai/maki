@@ -136,7 +136,7 @@ pub fn request_tools<'t>(
     match mcp {
         Some(mcp) => {
             let mut definitions = tools.definitions().clone();
-            mcp.extend_tools_filtered(&mut definitions, deferral, tools.filter());
+            mcp.extend_tools(&mut definitions, deferral, tools.filter());
             Cow::Owned(definitions)
         }
         None => Cow::Borrowed(tools.definitions()),
@@ -184,7 +184,7 @@ impl LiveFrame {
         deferral: ToolDeferral,
     ) -> &[Value] {
         let before = self.wire.as_array().map_or(0, Vec::len);
-        mcp.append_late_tools_filtered(&mut self.wire, deferral, self.tools.filter());
+        mcp.append_late_tools(&mut self.wire, deferral, self.tools.filter());
         self.wire.as_array().map_or(&[], |wire| &wire[before..])
     }
 }

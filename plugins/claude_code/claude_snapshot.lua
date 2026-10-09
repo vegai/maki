@@ -330,11 +330,19 @@ local function commit_base(call, artifact, paths, dependencies)
   local _, mkdir_err = maki.fs.mkdir(info)
   local _, attributes_err = maki.fs.write(maki.fs.joinpath(info, "attributes"), workspace.RAW_ATTRIBUTES)
   local _, exclude_err = maki.fs.write(maki.fs.joinpath(info, "exclude"), table.concat(exclude))
-  local _, link_err =
-    native.sanitize_git(artifact.snapshot, maki.fs.joinpath(artifact.dir, QUARANTINE_DIR), artifact.git)
+  local link_err = M.sanitize(artifact)
   local setup_err = mkdir_err or attributes_err or exclude_err or link_err
   if setup_err then
     return "maki cannot make the repository of the snapshot: " .. setup_err
+  end
+  if artifact.repositories then
+    local kept = {}
+    for _, path in ipairs(paths) do
+      if not workspace.repository_path(path, artifact.repositories) then
+        kept[#kept + 1] = path
+      end
+    end
+    paths = kept
   end
   if #paths > 0 then
     local _, add_err = call:run_quick(
@@ -568,16 +576,27 @@ end
 -- outside the work tree, without discarding the worker's files or repository objects.
 function M.sanitize(artifact)
   local quarantine = maki.fs.joinpath(artifact.dir, QUARANTINE_DIR)
-  local nested, err = native.sanitize_git(artifact.snapshot, quarantine, artifact.git)
-  if not nested then
+  local paths, err = native.sanitize_git(artifact.snapshot, quarantine, artifact.git)
+  if not paths then
     return err
   end
-  if #nested > 0 then
+  if #paths.metadata > 0 then
     artifact.notes[#artifact.notes + 1] = "maki preserved the Git metadata for "
-      .. shown(nested)
+      .. shown(paths.metadata)
       .. " in "
       .. quarantine
       .. ". Their ordinary files remain in the snapshot."
+  end
+  if #paths.repositories > 0 then
+    artifact.repositories = artifact.repositories or {}
+    for _, path in ipairs(paths.repositories) do
+      artifact.repositories[path] = true
+    end
+    artifact.notes[#artifact.notes + 1] = "maki quarantined the embedded repository metadata for "
+      .. shown(paths.repositories)
+      .. " in "
+      .. quarantine
+      .. ". Apply these changes manually."
   end
 end
 
@@ -667,7 +686,9 @@ function M.collect(call, artifact, project)
   local binary = workspace.binary_paths(numstat)
   local retyped = workspace.retyped_paths(changes)
   for _, change in ipairs(changes) do
-    change.kind = retyped[change.path] and workspace.TYPE_KIND or workspace.kind(change, binary)
+    change.kind = workspace.repository_path(change.path, artifact.repositories) and workspace.REPOSITORY_KIND
+      or retyped[change.path] and workspace.TYPE_KIND
+      or workspace.kind(change, binary)
   end
   if #unnamed > 0 then
     artifact.notes[#artifact.notes + 1] = NOT_UTF8_CHANGES:format(shown(unnamed), artifact.snapshot)
@@ -972,11 +993,6 @@ function M.import(ctx, call, spec)
     end
     return nil, "maki cannot lock artifact " .. spec.id .. ": " .. lock_err
   end
-  maki.async.on_cancel(function()
-    call:when_idle(function()
-      lock:close()
-    end)
-  end)
   local ok, result, err = pcall(import_locked, ctx, call, spec)
   call:when_idle(function()
     lock:close()

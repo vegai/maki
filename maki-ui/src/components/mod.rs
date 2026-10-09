@@ -36,6 +36,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_agent::AgentInput;
 use maki_agent::{BufferSnapshot, ToolInput, ToolOutput};
 use maki_lua::{PackCommand, PackPlan};
+use maki_providers::provider::ModelListing;
 use maki_providers::{ImageSource, Message, ModelTier};
 use ratatui::text::{Line, Span};
 
@@ -205,7 +206,7 @@ pub enum Action {
     },
     AssignTier(String, ModelTier),
     UnassignTier(String, ModelTier),
-    RefreshModels,
+    RefreshModels(ModelListing),
     RefreshUsage,
     Compact(Option<String>),
     ToggleMcp(String, bool),

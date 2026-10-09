@@ -450,6 +450,10 @@ fn the_default_artifact_root_hides_all_of_makis_state_but_the_workers_artifact()
     git(&project, &["commit", "-q", "-m", "base"]);
     let _home = EnvVar::set(HOME, home.path());
     let _state_home = EnvVar::set(XDG_STATE_HOME, state_home.path());
+    let runtime = tempdir().unwrap();
+    let agent = home.path().join("agent.sock");
+    let _runtime = EnvVar::set("XDG_RUNTIME_DIR", runtime.path());
+    let _agent = EnvVar::set("SSH_AUTH_SOCK", &agent);
     let state_dir = maki_storage::paths::state_dir().unwrap();
     assert!(
         state_dir.starts_with(state_home.path()),
@@ -472,7 +476,7 @@ fn the_default_artifact_root_hides_all_of_makis_state_but_the_workers_artifact()
         .join(DEFAULT_ARTIFACT_ROOT)
         .canonicalize()
         .unwrap();
-    for hidden in [&state_dir, &root] {
+    for hidden in [&state_dir, &root, runtime.path(), &agent] {
         assert!(
             filesystem["denyRead"]
                 .as_array()

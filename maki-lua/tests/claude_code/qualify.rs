@@ -6,23 +6,28 @@
 //! filter excludes slow fixture tests.
 
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::os::unix::fs::symlink;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use maki_agent::tools::test_support::stub_ctx_in;
 use serde_json::{Map, Value, json};
-use tempfile::tempdir;
+use tempfile::{tempdir, tempdir_in};
 
 use super::support::{
     ARTIFACT_LINE, BASH_SRC, CLAUDE_CONFIG_ENV, IMPORT_TOOL, SNAPSHOT_DIR, TOOL, WRITE_SRC,
     contents, developer_login, executable, git, load, on_path, tool_reply, write,
 };
 
+const RUNTIME_ENV: &str = "XDG_RUNTIME_DIR";
+const ENDPOINTS: &[&str] = &["bus", "systemd/private"];
+const CONNECT_PROMPT: &str = "These Unix sockets are test fixtures with no services attached. Run each listed Bash command once and report its result:\n";
 const CLAUDE: &str = "claude";
 const OUTSIDE_DIR: &str = "outside";
 const PROJECT_DIR: &str = "proj";
@@ -861,4 +866,79 @@ fn live_a_startup_hook_runs_in_the_process_working_dir() {
         workdir.join("hook-was-here").exists(),
         "the relative write of the hook went to a different location"
     );
+}
+
+#[test]
+#[ignore = "runs the installed claude CLI on the subscription of the caller"]
+fn live_coding_worker_cannot_connect_to_runtime_sockets() {
+    let _socat = on_path("socat");
+    let runtime = env::var_os(RUNTIME_ENV).expect("the qualification needs XDG_RUNTIME_DIR");
+    let sockets = tempdir_in(runtime).unwrap();
+    let mut listeners = Vec::new();
+    let mut commands = Vec::new();
+    for endpoint in ENDPOINTS {
+        let path = sockets.path().join(endpoint);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = UnixStream::connect(&path).unwrap();
+        let (connected, _) = listener.accept().unwrap();
+        drop((client, connected));
+        listener.set_nonblocking(true).unwrap();
+        commands.push(format!(
+            "socat -T1 - UNIX-CONNECT:{} </dev/null",
+            path.display()
+        ));
+        listeners.push(listener);
+    }
+    let fixture = tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let project = root.join(PROJECT_DIR);
+    write(&project.join(NOTES), NOTES_BEFORE);
+    git(&project, &["init", "-q"]);
+    git(&project, &["add", "-A"]);
+    git(&project, &["commit", "-qm", "fixture"]);
+    let opts = Map::from_iter([
+        ("executable".into(), json!(recording_claude(&root))),
+        ("config_dir".into(), json!(developer_login())),
+        ("artifact_dir".into(), json!(root.join(ARTIFACTS_DIR))),
+    ]);
+    let (reg, _host) = load(opts);
+    let ctx = stub_ctx_in(&project, None, None);
+    let prompt = format!("{CONNECT_PROMPT}{}", commands.join("\n"));
+    let reply = smol::block_on(tool_reply(
+        &reg,
+        &ctx,
+        TOOL,
+        json!({
+            "prompt": prompt, "profile": "code", "model": LIVE_MODEL,
+        }),
+    ))
+    .unwrap();
+    let raw = fs::read_to_string(root.join(RAW_OUTPUT)).unwrap();
+    let attempted = attempts(&raw);
+    for command in commands {
+        let calls: Vec<_> = attempted
+            .iter()
+            .filter(|attempt| {
+                attempt.name == "Bash"
+                    && attempt.input["command"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(&command))
+            })
+            .collect();
+        assert!(
+            !calls.is_empty(),
+            "the worker did not try {command}: {reply}"
+        );
+        assert!(
+            calls.iter().all(|attempt| attempt.is_error == Some(true)),
+            "the sandbox accepted {command}"
+        );
+    }
+    for listener in listeners {
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == ErrorKind::WouldBlock),
+            "a worker connected to the fixture socket"
+        );
+    }
 }

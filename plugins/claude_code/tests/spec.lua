@@ -72,7 +72,7 @@ end
 -- ── claude_launch ──
 
 case("child_env_passes_only_known_names_and_reports_route_ones", function()
-  local env, withheld = launch.child_env({
+  local env, withheld = native.environment({
     PATH = "/bin",
     HOME = "/home/u",
     LC_ALL = "C",
@@ -450,57 +450,6 @@ local function settings_answer(policy, edit)
 end
 
 local HOOKS_OFF = { hooks = maki.json.decode("[]"), policy = { allDisabled = true, policyHookCount = 0 } }
-
--- `checks.rs` runs the same cases against the provider's checks, so the two
--- sides cannot drift apart. Each section's check returns the problem it
--- finds in one case, and compares any other result itself.
-local RULE_CASES = require("tests.rule_cases")
-local SHARED_CHECKS = {
-  versions = function(c, shown)
-    local version, problem = native.version(c.output, c.system)
-    local cli = version and { version = version }
-    eq(cli and cli.version, c.version, shown)
-    return problem
-  end,
-  env = function(c, shown)
-    local env, withheld = launch.child_env({ [c.name] = "" })
-    eq(env[c.name] and "passed" or withheld[1] == c.name and "withheld" or "dropped", c.verdict, shown)
-  end,
-  config_dirs = function(c, shown)
-    local dir, problem = launch.config_dir(c.configured, c.home)
-    eq(dir, c.dir, shown)
-    return problem
-  end,
-  settings = function(c, shown)
-    eq(table.concat(launch.settings_conflicts(c.settings), ","), table.concat(c.conflicts, ","), shown)
-  end,
-  policies = function(c)
-    return launch.policy_problem(settings_answer(c.policy), HOOKS_OFF, "", READ)
-  end,
-  accounts = function(c)
-    return launch.account_problem(c.init, READ)
-  end,
-  plugin_lists = function(c)
-    return launch.plugins_problem(c.plugins)
-  end,
-  hooks = function(c)
-    return launch.policy_problem(settings_answer(), c.hooks, "", READ)
-  end,
-}
-for section, cases in pairs(RULE_CASES) do
-  local check = assert(SHARED_CHECKS[section], "no check for the shared section " .. section)
-  for i, c in ipairs(cases) do
-    local shown = maki.json.encode(c)
-    case("shared_" .. section .. "_" .. i, function()
-      local problem = check(c, shown)
-      if c.problem then
-        has(problem or "", c.problem, shown)
-      else
-        eq(problem, nil, shown)
-      end
-    end)
-  end
-end
 
 case("our_settings_alone_pass", function()
   eq(launch.policy_problem(settings_answer(), HOOKS_OFF, "", READ), nil)
@@ -1508,7 +1457,7 @@ case("retyped_paths_finds_both_sides_of_a_file_that_became_a_folder", function()
 end)
 
 case("settings_env_arrays_are_checked_without_raising", function()
-  eq(#launch.settings_conflicts({ env = { "not a variable" } }), 0)
+  eq(#native.settings_conflicts(maki.json.encode({ env = { "not a variable" } })), 0)
 end)
 
 case("startup_error_results_preserve_the_dependency_error", function()

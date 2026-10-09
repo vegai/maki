@@ -1,4 +1,4 @@
-use std::ffi::{c_int, c_long};
+use std::ffi::c_long;
 use std::fs;
 use std::io;
 use std::os::fd::AsRawFd;
@@ -8,14 +8,10 @@ use std::process::Command;
 use std::ptr;
 
 use libc::{
-    _SC_OPEN_MAX, _exit, STDIN_FILENO, STDOUT_FILENO, SYS_close_range, close, dup2, execve,
-    setpgid, syscall, sysconf,
+    _SC_OPEN_MAX, _exit, SIGCHLD, STDIN_FILENO, STDOUT_FILENO, SYS_clone, SYS_close_range, close,
+    dup2, execve, setpgid, syscall, sysconf,
 };
 use rustix::process::{Signal, getpgrp, getpid, kill_process_group};
-
-unsafe extern "C" {
-    fn _Fork() -> c_int;
-}
 
 /// The guard shares the worker's group and reserves its id after the leader exits. Only
 /// maki holds the lifetime socket's other endpoint.
@@ -40,7 +36,12 @@ pub fn bind(command: &mut Command) -> io::Result<UnixStream> {
                 return Err(io::Error::last_os_error());
             }
             let group = getpid();
-            match _Fork() {
+            // Inherited atfork handlers can deadlock inside pre_exec.
+            #[cfg(not(target_arch = "s390x"))]
+            let pid = syscall(SYS_clone, SIGCHLD, 0usize, 0usize, 0usize, 0usize);
+            #[cfg(target_arch = "s390x")]
+            let pid = syscall(SYS_clone, 0usize, SIGCHLD, 0usize, 0usize, 0usize);
+            match pid {
                 -1 => return Err(io::Error::last_os_error()),
                 0 => {
                     if dup2(reader.as_raw_fd(), STDIN_FILENO) >= 0 {

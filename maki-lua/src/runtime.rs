@@ -454,6 +454,9 @@ pub enum Request {
     CollectPluginOptions {
         reply: flume::Sender<PluginOptionSpecs>,
     },
+    CollectLoadedPlugins {
+        reply: flume::Sender<Vec<String>>,
+    },
     /// Packages `init.lua` declared. Read after the init files have run, since
     /// that is when the declared set is complete.
     CollectPackages {
@@ -2596,7 +2599,7 @@ impl LuaRuntime {
         let watchdog = Watchdog::spawn(&lua, Arc::clone(&shutdown));
 
         let globals = lua.globals();
-        for name in &["require", "io", "package"] {
+        for name in &["require", "io", "package", "getfenv", "setfenv"] {
             globals
                 .set(*name, LuaValue::Nil)
                 .map_err(|e| PluginError::Lua {
@@ -3022,7 +3025,7 @@ impl LuaRuntime {
             maki.set("pack", pack).map_err(map_err)?;
         }
         let private = if name.as_ref() == crate::api::claude_code::PLUGIN
-            && crate::loader::is_bundled(&name)
+            && authority == DeclAuthority::Bundled
             && !package
         {
             Some(
@@ -4676,6 +4679,11 @@ pub fn spawn(
                         }
                         Request::CollectPluginOptions { reply } => {
                             let _ = reply.send(collect_plugin_options(&rt.lua));
+                        }
+                        Request::CollectLoadedPlugins { reply } => {
+                            let mut names: Vec<String> = rt.plugins.borrow().keys().map(ToString::to_string).collect();
+                            names.sort_unstable();
+                            let _ = reply.send(names);
                         }
                         Request::CollectPackages { reply } => {
                             let declared = with_packs(&rt.lua, |packs| packs.specs.clone());

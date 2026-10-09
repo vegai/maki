@@ -4,8 +4,6 @@ use maki_agent::tools::ToolRegistry;
 use maki_lua::PluginHost;
 use test_case::test_case;
 
-#[test_case("claude_code", include_str!("../../plugins/claude_code/tests/spec.lua") ; "claude_code_plugin_spec")]
-#[test_case("claude_code", include_str!("../../plugins/claude_code/tests/jobs.lua") ; "claude_code_job_spec")]
 #[test_case("completion", include_str!("../../plugins/completion/tests/spec.lua") ; "completion_plugin_spec")]
 #[test_case("edit", include_str!("../../plugins/edit/tests/spec.lua") ; "edit_plugin_spec")]
 #[test_case("index", include_str!("../../plugins/index/tests/spec.lua") ; "index_plugin_spec")]
@@ -24,11 +22,7 @@ use test_case::test_case;
 fn plugin_spec(name: &str, spec: &str) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let owner = if name == "claude_code" {
-        name.to_owned()
-    } else {
-        format!("{name}_spec")
-    };
+    let owner = format!("{name}_spec");
     host.load_source(&owner, spec)
         .unwrap_or_else(|e| panic!("{name} spec failed:\n{e}"));
 }

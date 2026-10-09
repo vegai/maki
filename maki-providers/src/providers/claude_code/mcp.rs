@@ -3,15 +3,14 @@
 //!
 //! Only clients on 127.0.0.1 with the request's bearer token can connect.
 
-use std::future::Future;
 use std::io;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flume::Sender;
 use futures_lite::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use futures_lite::{FutureExt, Stream, StreamExt, future};
+use futures_lite::{Stream, StreamExt, future};
 use serde::Serialize;
 use serde_json::{Value, json};
 use smol::lock::Semaphore;
@@ -20,6 +19,7 @@ use smol::{Task, Timer};
 use tracing::warn;
 
 use super::error::Error;
+use super::run::within;
 
 const ENDPOINT: &str = "/mcp";
 const MAX_HEAD_BYTES: usize = 16 * 1024;
@@ -172,7 +172,7 @@ async fn connection(stream: TcpStream, shared: Arc<Shared>) {
     let mut head_limit = shared.read_limit.min(HEAD_TIMEOUT);
     loop {
         // A rejected request's body is never read, so the connection ends.
-        let head = match within(head_limit, read_head(&mut reader)).await {
+        let head = match within(Instant::now() + head_limit, read_head(&mut reader)).await {
             Some(Ok(Some(head))) => head,
             Some(Ok(None)) | None => return,
             Some(Err(status)) => {
@@ -181,7 +181,12 @@ async fn connection(stream: TcpStream, shared: Arc<Shared>) {
             }
         };
         let body = match admit(&shared, &head) {
-            Ok(()) => match within(shared.read_limit, read_body(&mut reader, head.length)).await {
+            Ok(()) => match within(
+                Instant::now() + shared.read_limit,
+                read_body(&mut reader, head.length),
+            )
+            .await
+            {
                 Some(body) => body,
                 None => return,
             },
@@ -204,15 +209,6 @@ async fn connection(stream: TcpStream, shared: Arc<Shared>) {
             Reply::Park => future::pending::<()>().await,
         }
     }
-}
-
-async fn within<T>(limit: Duration, read: impl Future<Output = T>) -> Option<T> {
-    async { Some(read.await) }
-        .or(async {
-            Timer::after(limit).await;
-            None
-        })
-        .await
 }
 
 /// `None` after the peer closes the connection.
@@ -441,7 +437,6 @@ fn response(status: &str, body: &str) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use std::future::Future;
     use std::io;
     use std::net::{Ipv4Addr, Shutdown};
     use std::sync::Arc;

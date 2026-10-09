@@ -34,6 +34,18 @@ use super::{
     WORKING, add_a_managed_hook, ctx_in, within_deadline,
 };
 
+const NESTED_FILE: &str = "nested/file.txt";
+const NESTED_WORK: &str = "nested work\n";
+const METADATA_MARKER: &str = "metadata_ran";
+const QUARANTINE: &str = "git-metadata";
+const SPARSE_MISSING: &str = "omitted/file.rs";
+const DENIED_CONTENT: &str = "secret\n";
+
+const BARE_REPOSITORY: &str = "fixtures/x.git";
+const EXISTING_BARE_FILE: &str = "fixtures/x.git/work.txt";
+const EMBEDDED_REPOSITORIES_NOTE: &str = "embedded repository metadata";
+const REPOSITORY_CHANGE: &str = "repository, apply manually";
+
 /// What a test writes over a file the artifact recorded.
 const TAMPERED: &str = "tampered\n";
 /// Untracked in the test repository, so a coding call copies it only on
@@ -192,6 +204,8 @@ const IMPORT_HELD: &str = "import-held";
 const IMPORT_RELEASE: &str = "import-release";
 const USER_ONLY_VARIABLE: &str = "CARGO_MANIFEST_DIR";
 const PREPARED_ENV: &str = "prepared_env.txt";
+const PREPARED_TMP: &str = "prepared_tmp.txt";
+const APPLY_MANUALLY: &str = "Apply it manually";
 
 fn coding_repo(project: &Path, object_format: &str) {
     fs::remove_dir(project.join(".git")).unwrap();
@@ -399,13 +413,6 @@ fn artifact_id(reply: &str) -> String {
     after.split(',').next().unwrap().to_owned()
 }
 
-const NESTED_FILE: &str = "nested/file.txt";
-const NESTED_WORK: &str = "nested work\n";
-const METADATA_MARKER: &str = "metadata_ran";
-const QUARANTINE: &str = "git-metadata";
-const SPARSE_MISSING: &str = "omitted/file.rs";
-const DENIED_CONTENT: &str = "secret\n";
-
 #[test_case("code_nested_empty" ; "without_a_commit")]
 #[test_case("code_nested_commit" ; "with_a_commit")]
 #[test_case("code_nested_pointer" ; "with_a_rewritten_root_pointer")]
@@ -417,9 +424,9 @@ fn worker_git_metadata_is_quarantined_and_ordinary_files_import(scenario: &str) 
     assert!(!snapshot.join("nested/.git").exists());
     assert!(!snapshot.join("nested/.GiT").exists());
     let expected = if scenario == "code_nested_pointer" {
-        2
+        3
     } else {
-        1
+        2
     };
     assert_eq!(listing(&artifact.join(QUARANTINE)).len(), expected);
     git(&snapshot, &["status", "--porcelain"]);
@@ -432,6 +439,73 @@ fn worker_git_metadata_is_quarantined_and_ordinary_files_import(scenario: &str) 
         fs::read_to_string(coding.project().join(NESTED_FILE)).unwrap(),
         NESTED_WORK
     );
+}
+
+#[test_case(false ; "new_repository")]
+#[test_case(true ; "existing_files_become_a_repository")]
+fn embedded_bare_repositories_cannot_be_imported(overwrite: bool) {
+    let coding = Coding::new();
+    if overwrite {
+        write(&coding.project().join(EXISTING_BARE_FILE), BASE_LIB);
+        git(&coding.project(), &["add", EXISTING_BARE_FILE]);
+        git(&coding.project(), &["commit", "-qm", "fixture"]);
+    }
+    let (reg, _host) = coding.host(&[]);
+    let reply = coding.code(&reg, "code_bare", &[]).unwrap();
+    let id = artifact_id(&reply);
+    assert!(
+        reply.contains(EMBEDDED_REPOSITORIES_NOTE) && reply.contains(BARE_REPOSITORY),
+        "{reply}"
+    );
+    let artifact = coding.artifacts.path().join(&id);
+    assert!(!artifact.join(SNAPSHOT_DIR).join(BARE_REPOSITORY).exists());
+    if overwrite {
+        assert!(reply.contains(REPOSITORY_CHANGE), "{reply}");
+        let result = coding
+            .import(&reg, json!({"id": id, "paths": [EXISTING_BARE_FILE]}))
+            .unwrap();
+        assert!(result.contains(APPLY_MANUALLY), "{result}");
+        assert_eq!(
+            fs::read_to_string(coding.project().join(EXISTING_BARE_FILE)).unwrap(),
+            BASE_LIB
+        );
+    } else {
+        assert!(
+            coding
+                .import(
+                    &reg,
+                    json!({"id": id, "paths": [format!("{BARE_REPOSITORY}/config")]})
+                )
+                .is_err()
+        );
+        assert!(!coding.project().join(BARE_REPOSITORY).exists());
+    }
+    coding
+        .import(&reg, json!({"id": id, "paths": [IMPORTED_LIB]}))
+        .unwrap();
+    assert!(!coding.fake.path(METADATA_MARKER).exists());
+}
+
+#[test]
+fn root_bare_metadata_requires_manual_import() {
+    let coding = Coding::new();
+    let (reg, _host) = coding.host(&[]);
+    let reply = coding.code(&reg, "code_bare_root", &[]).unwrap();
+    assert!(reply.contains(REPOSITORY_CHANGE), "{reply}");
+    let id = artifact_id(&reply);
+    let snapshot = coding.artifacts.path().join(&id).join(SNAPSHOT_DIR);
+    for metadata in ["HEAD", "config"] {
+        assert!(!snapshot.join(metadata).exists());
+    }
+    let result = coding
+        .import(&reg, json!({"id": id, "paths": [IMPORTED_LIB]}))
+        .unwrap();
+    assert!(result.contains(APPLY_MANUALLY), "{result}");
+    assert_eq!(
+        fs::read_to_string(coding.project().join(IMPORTED_LIB)).unwrap(),
+        DIRTY_LIB
+    );
+    assert!(!coding.fake.path(METADATA_MARKER).exists());
 }
 
 #[test]
@@ -1283,10 +1357,17 @@ fn a_link_prepare_makes_out_of_the_snapshot_is_dropped() {
 #[test]
 fn prepare_runs_with_the_users_environment() {
     let coding = Coding::new();
-    let prepare = format!("printf %s \"${USER_ONLY_VARIABLE}\" > {PREPARED_ENV}");
+    let prepare = format!(
+        "printf %s \"${USER_ONLY_VARIABLE}\" > {PREPARED_ENV}; printf %s \"$TMPDIR\" > {PREPARED_TMP}"
+    );
     let (reg, _host) = coding.host(&[("prepare", json!(prepare))]);
     let id = artifact_id(&coding.code(&reg, CODE_EDIT, &[]).unwrap());
-    let snapshot = coding.artifacts.path().join(id).join(SNAPSHOT_DIR);
+    let artifact = coding.artifacts.path().join(id);
+    let snapshot = artifact.join(SNAPSHOT_DIR);
+    assert_eq!(
+        fs::read_to_string(snapshot.join(PREPARED_TMP)).unwrap(),
+        artifact.join("tmp").to_string_lossy()
+    );
 
     let seen = fs::read_to_string(snapshot.join(PREPARED_ENV)).unwrap();
     assert_eq!(seen, env::var(USER_ONLY_VARIABLE).unwrap());

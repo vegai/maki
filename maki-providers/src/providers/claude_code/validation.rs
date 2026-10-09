@@ -4,9 +4,13 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::checks;
+
+pub fn handshake() -> Value {
+    json!(checks::HANDSHAKE)
+}
 
 pub fn version(output: &str, system: &str) -> Result<String, String> {
     checks::profile(output, system)

@@ -370,9 +370,15 @@ local function coding_confine(spec, artifact)
   deny[#deny + 1] = maki.env.state_dir()
   deny[#deny + 1] = maki.env.config_dir()
   deny[#deny + 1] = maki.env.logs_dir()
-  local runtime = maki.uv.os_getenv("XDG_RUNTIME_DIR")
-  if runtime and runtime:sub(1, 1) == "/" then
-    deny[#deny + 1] = maki.fs.joinpath(runtime, "containers/auth.json")
+  for _, name in ipairs({ "XDG_RUNTIME_DIR", "SSH_AUTH_SOCK" }) do
+    local path = maki.uv.os_getenv(name)
+    if path and path:sub(1, 1) == "/" then
+      deny[#deny + 1] = path
+      local resolved = maki.uv.fs_realpath(path)
+      if resolved and resolved ~= path then
+        deny[#deny + 1] = resolved
+      end
+    end
   end
   deny[#deny + 1] = spec.own_config_dir
   table.move(spec.home_credentials, 1, #spec.home_credentials, #deny + 1, deny)
@@ -472,7 +478,7 @@ local function preflight(input, ctx, call)
   if not instructions then
     return nil, "maki cannot load the instructions of the session: " .. tostring(instructions_err)
   end
-  local env, withheld = launch.child_env(maki.uv.os_environ())
+  local env, withheld = native.environment(maki.uv.os_environ())
   local secret_err = launch.shell_secret_problem(worker, env)
   if secret_err then
     return nil, secret_err
@@ -483,7 +489,7 @@ local function preflight(input, ctx, call)
   if opts.config_dir ~= "" then
     env.CLAUDE_CONFIG_DIR = opts.config_dir
   end
-  local config_dir, config_dir_err = launch.config_dir(env.CLAUDE_CONFIG_DIR, home)
+  local config_dir, config_dir_err = native.config_dir(env.CLAUDE_CONFIG_DIR, home)
   if not config_dir then
     return nil, config_dir_err
   end
@@ -830,7 +836,7 @@ local function run(input, ctx, call, timeout_secs)
     return claude:build(claude:start(argv, spec.cwd, env, input.prompt))
   end
   claude.artifact = artifact
-  local fill_err = fill_snapshot(call, claude.view, spec.plan, artifact, spec.cwd, spec.env)
+  local fill_err = fill_snapshot(call, claude.view, spec.plan, artifact, spec.cwd, env)
   if fill_err then
     return refuse(fill_err)
   end
@@ -982,7 +988,7 @@ local function import_handler(input, ctx)
     paths = input.paths,
     project = project,
     root = artifacts,
-    env = (launch.child_env(maki.uv.os_environ())),
+    env = (native.environment(maki.uv.os_environ())),
   })
   if not result then
     return refuse(err)

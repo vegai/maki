@@ -574,8 +574,7 @@ impl PluginHost {
     }
 
     /// Option specs declared by loaded plugins via `maki.api.register_options`,
-    /// keyed by plugin name. Docgen documents them, and the claude-code
-    /// provider is on while its plugin is in the result.
+    /// keyed by plugin name.
     pub fn plugin_options(&self) -> Result<PluginOptionSpecs, PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.inner
@@ -583,6 +582,15 @@ impl PluginHost {
             .send(Request::CollectPluginOptions { reply: reply_tx })
             .map_err(|_| PluginError::HostDead)?;
         reply_rx.recv().map_err(|_| PluginError::HostDead)
+    }
+
+    pub fn loaded_plugins(&self) -> Result<Vec<String>, PluginError> {
+        let (reply, receiver) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::CollectLoadedPlugins { reply })
+            .map_err(|_| PluginError::HostDead)?;
+        receiver.recv().map_err(|_| PluginError::HostDead)
     }
 
     /// Runs a source as the global `init.lua`.
@@ -1340,17 +1348,44 @@ mod tests {
     const GLOBAL_TRUST_PATH: &str = "~/src/me/*";
     const PROJECT_TRUST_PATH: &str = "**";
 
-    #[test]
-    fn private_claude_helpers_are_not_available_to_other_plugins() {
+    #[test_case("ordinary")]
+    #[test_case("claude_code")]
+    fn private_claude_helpers_require_bundled_authority(name: &str) {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(
-            "ordinary",
+            name,
             r#"
             assert(maki.claude_code == nil)
             assert(not pcall(require, "maki.claude_code.internal"))
         "#,
         )
         .unwrap();
+    }
+
+    #[test_case(include_str!("../../plugins/claude_code/tests/spec.lua") ; "plugin_spec")]
+    #[test_case(include_str!("../../plugins/claude_code/tests/jobs.lua") ; "job_spec")]
+    fn claude_code_bundled_spec(source: &str) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.send_load(
+            Arc::from(crate::api::claude_code::PLUGIN),
+            vec![LoadChunk::bundled(crate::api::claude_code::PLUGIN, source)],
+            LoadContext {
+                authority: DeclAuthority::Bundled,
+                ..LoadContext::plain(None, PluginPermissions::trusted())
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn loaded_plugins_include_plugins_without_options() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("empty", "return {}").unwrap();
+        assert_eq!(host.loaded_plugins().unwrap(), ["empty"]);
+        assert!(host.load_source("broken", "error('broken')").is_err());
+        assert_eq!(host.loaded_plugins().unwrap(), ["empty"]);
+        host.unload("empty").unwrap();
+        assert!(host.loaded_plugins().unwrap().is_empty());
     }
 
     /// Closing the queue and reading it are one message. A Lua task can record

@@ -1,5 +1,5 @@
 //! The rules that decide whether a Claude Code process may serve a request.
-//! The `claude_code` plugin applies the same rules in `claude_launch.lua`.
+//! Native Lua helpers apply these checks to plugin workers.
 //! Here the process hands tool calls to maki and runs no tools itself.
 
 use std::collections::HashSet;
@@ -7,19 +7,114 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
 
 use maki_storage::paths::normalize_path;
-use serde::Deserialize;
+use serde::Serialize;
 use serde_json::{Map, Value};
 
 use super::error::{Error, Problem};
 
-/// The rules shared with the plugin, from its `claude_rules.lua`, which holds
-/// one JSON document in a long string.
-const RULES_SOURCE: &str = include_str!("../../../../plugins/claude_code/claude_rules.lua");
-const RULES_OPEN: &str = "[==[";
-const RULES_CLOSE: &str = "]==]";
+pub(crate) const MINIMUM_VERSION: [u64; 3] = [2, 1, 284];
+pub(crate) const SYSTEMS: &[&str] = &["linux"];
+pub(crate) const HANDSHAKE: &[HandshakeStep] = &[
+    HandshakeStep {
+        id: "account",
+        subtype: "initialize",
+    },
+    HandshakeStep {
+        id: "settings",
+        subtype: "get_settings",
+    },
+    HandshakeStep {
+        id: "hooks",
+        subtype: "get_hooks_listing",
+    },
+];
+pub(crate) const PASSED_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "TERM",
+    "TMPDIR",
+    "TZ",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+];
+pub(crate) const PASSED_ENV_PREFIXES: &[&str] = &["LC_", "XDG_"];
+pub(crate) const ROUTE_ENV: &[&str] = &[
+    "CLAUDE_CODE_API_BASE_URL",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CONFIG_DIR",
+];
+pub(crate) const ROUTE_ENV_PREFIXES: &[&str] = &["CLAUDE_CODE_USE_", "ANTHROPIC_"];
+pub(crate) const HARMLESS_ENV: &[&str] = &[
+    "CLAUDE_CODE_USE_COWORK_PLUGINS",
+    "CLAUDE_CODE_USE_NATIVE_FILE_SEARCH",
+    "CLAUDE_CODE_USE_POWERSHELL_TOOL",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES",
+];
+pub(crate) const ROUTE_SETTINGS: &[&str] = &[
+    "apiKeyHelper",
+    "awsAuthRefresh",
+    "awsCredentialExport",
+    "gcpAuthRefresh",
+    "forceLoginOrgUUID",
+];
+pub(crate) const LOGIN_METHOD_KEY: &str = "forceLoginMethod";
+pub(crate) const SUBSCRIPTION_LOGIN_METHOD: &str = "claudeai";
+pub(crate) const HARMLESS_POLICY: &[&str] = &[
+    "availableModels",
+    "cleanupPeriodDays",
+    "companyAnnouncements",
+    "disableAllHooks",
+    "disableClaudeAiConnectors",
+    "forceLoginOrgUUID",
+    "includeCoAuthoredBy",
+    "model",
+    "permissions",
+];
+pub(crate) const PERMISSIONS_KEY: &str = "permissions";
+pub(crate) const HARMLESS_POLICY_PERMISSIONS: &[&str] = &["deny", "disableBypassPermissionsMode"];
+pub(crate) const ENV_KEY: &str = "env";
+pub(crate) const FIRST_PARTY: &str = "firstParty";
+pub(crate) const NO_KEY_SOURCE: &str = "none";
+pub(crate) const FLAG_SOURCE: &str = "flagSettings";
+pub(crate) const POLICY_SOURCE: &str = "policySettings";
+pub(crate) const CLAUDE_DIR: &str = ".claude";
+pub(crate) const SETTINGS_FILE: &str = "settings.json";
+pub(crate) const LOCAL_SETTINGS_FILE: &str = "settings.local.json";
+pub(crate) const BUILTIN_PLUGIN_MARKER: &str = "builtin";
 const UNREADABLE_FILE: &str = "maki cannot read it";
 const NOT_AN_OBJECT: &str = "is not a JSON object";
 
@@ -56,72 +151,14 @@ const POLICY: &str = "policy";
 const ALL_DISABLED: &str = "allDisabled";
 const DISABLED: &str = "disabled";
 
-/// The minimum version supplies the necessary flags and control requests. Each request must
-/// validate all login, setting, hook, tool and plugin inputs.
-#[derive(Debug, Deserialize)]
-pub(crate) struct Rules {
-    pub minimum_version: [u64; 3],
-    /// Path rules, symlinks and process cleanup differ per OS.
-    pub systems: Vec<String>,
-    pub handshake: Vec<HandshakeStep>,
-    /// Only these variables reach the child, so an exported
-    /// `ANTHROPIC_API_KEY` cannot move it off the subscription. Names compare
-    /// in upper case, so `https_proxy` passes too.
-    pub passed_env: Vec<String>,
-    pub passed_env_prefixes: Vec<String>,
-    /// Variables that select a route, each one a conflict in an ignored
-    /// settings file. Every name with a prefix in `route_env_prefixes` counts
-    /// too, unless `harmless_env` lists it.
-    pub route_env: Vec<String>,
-    pub route_env_prefixes: Vec<String>,
-    pub harmless_env: Vec<String>,
-    /// These keys can change the login even in settings that maki ignores.
-    pub route_settings: Vec<String>,
-    pub login_method_key: String,
-    pub subscription_login_method: String,
-    /// Managed keys that only restrict or inform. Any other managed key can
-    /// reopen what the flags closed.
-    pub harmless_policy: Vec<String>,
-    pub permissions_key: String,
-    pub harmless_policy_permissions: Vec<String>,
-    pub env_key: String,
-    pub first_party: String,
-    /// A subscription login sends no key source, or "none".
-    pub no_key_source: String,
-    pub flag_source: String,
-    pub policy_source: String,
-    pub claude_dir: String,
-    pub settings_file: String,
-    pub local_settings_file: String,
-    /// Where Claude Code says a plugin of its own lives, and the marketplace
-    /// in its source.
-    pub builtin_plugin_marker: String,
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize)]
 pub(crate) struct HandshakeStep {
-    pub id: String,
-    pub subtype: String,
+    pub id: &'static str,
+    pub subtype: &'static str,
 }
 
-/// A malformed file is a panic here rather than a compile error, so a test
-/// forces it in CI.
-pub(crate) static RULES: LazyLock<Rules> = LazyLock::new(|| {
-    serde_json::from_str(long_string(RULES_SOURCE)).expect("claude_rules.lua holds valid rules")
-});
-
-/// The JSON document that a Lua file shared with the plugin holds in a long
-/// string.
-fn long_string(source: &str) -> &str {
-    source
-        .split_once(RULES_OPEN)
-        .and_then(|(_, rest)| rest.split_once(RULES_CLOSE))
-        .map(|(json, _)| json)
-        .expect("the shared Lua file holds its JSON in a long string")
-}
-
-fn listed(list: &[String], name: &str) -> bool {
-    list.iter().any(|entry| entry == name)
+fn listed(list: &[&str], name: &str) -> bool {
+    list.contains(&name)
 }
 
 #[derive(Debug, Clone)]
@@ -144,17 +181,17 @@ fn version_parts(version: &str) -> Option<[u64; 3]> {
 pub(crate) fn profile(output: &str, os: &str) -> Result<Profile, Error> {
     let version = output.split_whitespace().next().unwrap_or_default();
     let parts = version_parts(version).ok_or_else(|| Error::UnknownVersion(output.to_owned()))?;
-    let minimum = RULES.minimum_version;
+    let minimum = MINIMUM_VERSION;
     if parts < minimum {
         return Err(Error::TooOld {
             version: version.to_owned(),
             oldest: minimum.map(|part| part.to_string()).join("."),
         });
     }
-    if !listed(&RULES.systems, &os.to_ascii_lowercase()) {
+    if !listed(SYSTEMS, &os.to_ascii_lowercase()) {
         return Err(Error::UnsupportedSystem {
             os: os.to_owned(),
-            systems: RULES.systems.join(", "),
+            systems: SYSTEMS.join(", "),
         });
     }
     Ok(Profile {
@@ -164,22 +201,20 @@ pub(crate) fn profile(output: &str, os: &str) -> Result<Profile, Error> {
 
 fn passed(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
-    listed(&RULES.passed_env, &upper)
-        || RULES
-            .passed_env_prefixes
+    listed(PASSED_ENV, &upper)
+        || PASSED_ENV_PREFIXES
             .iter()
-            .any(|prefix| upper.starts_with(prefix.as_str()))
+            .any(|prefix| upper.starts_with(prefix))
 }
 
 /// A new `CLAUDE_CODE_USE_*` cloud switch fails closed, and only the model
 /// variables that Claude Code knows pass as `ANTHROPIC_*`.
 pub(crate) fn routes_login(name: &str) -> bool {
-    listed(&RULES.route_env, name)
-        || (RULES
-            .route_env_prefixes
+    listed(ROUTE_ENV, name)
+        || (ROUTE_ENV_PREFIXES
             .iter()
-            .any(|prefix| name.starts_with(prefix.as_str()))
-            && !listed(&RULES.harmless_env, name))
+            .any(|prefix| name.starts_with(prefix))
+            && !listed(HARMLESS_ENV, name))
 }
 
 /// Also returns the sorted names held back because they can change the
@@ -276,7 +311,7 @@ pub(crate) fn config_dir(
     let home = home.filter(|home| !home.is_empty());
     let dir = match (configured, home) {
         (Some(dir), _) => PathBuf::from(dir),
-        (None, Some(home)) => PathBuf::from(home).join(&RULES.claude_dir),
+        (None, Some(home)) => PathBuf::from(home).join(CLAUDE_DIR),
         (None, None) => return Err(Error::NoConfigDir),
     };
     if dir.is_absolute() {
@@ -295,35 +330,34 @@ pub(crate) fn skipped_settings(
     local_dirs: &[PathBuf],
 ) -> Vec<PathBuf> {
     let mut paths = vec![
-        config_dir.join(&RULES.settings_file),
-        cwd.join(&RULES.claude_dir).join(&RULES.settings_file),
+        config_dir.join(SETTINGS_FILE),
+        cwd.join(CLAUDE_DIR).join(SETTINGS_FILE),
     ];
     paths.extend(
         local_dirs
             .iter()
-            .map(|dir| dir.join(&RULES.claude_dir).join(&RULES.local_settings_file)),
+            .map(|dir| dir.join(CLAUDE_DIR).join(LOCAL_SETTINGS_FILE)),
     );
     paths
 }
 
 /// Returns only the names, because `env` can hold secrets.
 pub(crate) fn settings_conflicts(settings: &Value) -> Vec<String> {
-    let mut keys: Vec<String> = RULES
-        .route_settings
+    let mut keys: Vec<String> = ROUTE_SETTINGS
         .iter()
-        .filter(|key| settings.get(key.as_str()).is_some())
-        .cloned()
+        .filter(|key| settings.get(**key).is_some())
+        .map(|key| (*key).to_owned())
         .collect();
     if settings
-        .get(&RULES.login_method_key)
-        .is_some_and(|method| method != RULES.subscription_login_method.as_str())
+        .get(LOGIN_METHOD_KEY)
+        .is_some_and(|method| method != SUBSCRIPTION_LOGIN_METHOD)
     {
-        keys.push(RULES.login_method_key.clone());
+        keys.push(LOGIN_METHOD_KEY.to_owned());
     }
-    if let Some(env) = settings.get(&RULES.env_key).and_then(Value::as_object) {
+    if let Some(env) = settings.get(ENV_KEY).and_then(Value::as_object) {
         let mut names: Vec<&String> = env.keys().filter(|name| routes_login(name)).collect();
         names.sort();
-        let env_key = &RULES.env_key;
+        let env_key = ENV_KEY;
         keys.extend(names.into_iter().map(|name| format!("{env_key}.{name}")));
     }
     keys
@@ -368,11 +402,11 @@ pub(super) fn account_problem_in(init: &Value, modes: &[String]) -> Option<Probl
     };
     if let Some(source) = account
         .get(API_KEY_SOURCE)
-        .filter(|source| *source != RULES.no_key_source.as_str())
+        .filter(|source| *source != NO_KEY_SOURCE)
     {
         return Some(Problem::ApiKey(source.clone()));
     }
-    if account[API_PROVIDER] != RULES.first_party.as_str() {
+    if account[API_PROVIDER] != FIRST_PARTY {
         return Some(Problem::OtherProvider(account[API_PROVIDER].clone()));
     }
     if account[SUBSCRIPTION_TYPE]
@@ -392,22 +426,20 @@ fn policy_key_problem(entries: &Map<String, Value>) -> Option<String> {
     keys.sort();
     for key in keys {
         let value = &entries[key];
-        if *key == RULES.login_method_key {
-            if value != RULES.subscription_login_method.as_str() {
+        if *key == LOGIN_METHOD_KEY {
+            if value != SUBSCRIPTION_LOGIN_METHOD {
                 return Some(key.clone());
             }
-        } else if !listed(&RULES.harmless_policy, key) {
+        } else if !listed(HARMLESS_POLICY, key) {
             return Some(key.clone());
-        } else if let Some(permissions) =
-            value.as_object().filter(|_| *key == RULES.permissions_key)
-        {
+        } else if let Some(permissions) = value.as_object().filter(|_| *key == PERMISSIONS_KEY) {
             let mut subs: Vec<&String> = permissions.keys().collect();
             subs.sort();
             if let Some(sub) = subs
                 .into_iter()
-                .find(|sub| !listed(&RULES.harmless_policy_permissions, sub))
+                .find(|sub| !listed(HARMLESS_POLICY_PERMISSIONS, sub))
             {
-                return Some(format!("{}.{sub}", RULES.permissions_key));
+                return Some(format!("{}.{sub}", PERMISSIONS_KEY));
             }
         }
     }
@@ -436,10 +468,10 @@ pub(super) fn policy_problem_in(
     }
     for source in sources {
         let name = source[SOURCE].as_str();
-        if name == Some(RULES.flag_source.as_str()) {
+        if name == Some(FLAG_SOURCE) {
             continue;
         }
-        if name != Some(RULES.policy_source.as_str()) {
+        if name != Some(POLICY_SOURCE) {
             return Some(Problem::LoadedSettings(
                 name.unwrap_or(UNNAMED_SOURCE).to_owned(),
             ));
@@ -482,7 +514,7 @@ pub(super) fn plugins_problem(plugins: &Value) -> Option<Problem> {
     let Some(plugins) = plugins.as_array() else {
         return Some(Problem::NoPlugins);
     };
-    let marker = RULES.builtin_plugin_marker.as_str();
+    let marker = BUILTIN_PLUGIN_MARKER;
     plugins
         .iter()
         .find(|plugin| {
@@ -515,7 +547,7 @@ pub(super) fn init_problem_in(
     modes: &[String],
     handoff: Option<&str>,
 ) -> Option<Problem> {
-    if event[API_KEY_SOURCE] != RULES.no_key_source.as_str() {
+    if event[API_KEY_SOURCE] != NO_KEY_SOURCE {
         return Some(Problem::StartedWithKey(event[API_KEY_SOURCE].clone()));
     }
     if event[VERSION] != version {
@@ -575,17 +607,11 @@ mod tests {
     use super::super::error::{Error, Problem};
     use super::super::stream::{ACCOUNT_ANSWER, HOOKS_ANSWER, SETTINGS_ANSWER};
     use super::{
-        COMMONDIR_FILE, CONNECTED, DEFAULT_MODE, GIT_ENTRY, InitExpect, NOT_AN_OBJECT, RULES,
-        UNREADABLE_FILE, account_problem, child_env, config_dir, file_conflicts, init_problem,
-        local_settings_dirs, long_string, plugins_problem, policy_problem, profile,
-        settings_conflicts,
+        COMMONDIR_FILE, CONNECTED, DEFAULT_MODE, FLAG_SOURCE, GIT_ENTRY, HANDSHAKE, InitExpect,
+        NO_KEY_SOURCE, NOT_AN_OBJECT, POLICY_SOURCE, UNREADABLE_FILE, account_problem, child_env,
+        config_dir, file_conflicts, init_problem, local_settings_dirs, plugins_problem,
+        policy_problem, profile, settings_conflicts,
     };
-
-    /// `spec.lua` runs the same cases against the plugin's checks.
-    const RULE_CASES: &str = include_str!("../../../../plugins/claude_code/tests/rule_cases.lua");
-    const PASSED: &str = "passed";
-    const WITHHELD: &str = "withheld";
-    const DROPPED: &str = "dropped";
 
     const VERSION: &str = "2.1.284";
     const LINUX: &str = "linux";
@@ -627,72 +653,113 @@ mod tests {
         assert_eq!(withheld, [API_KEY_ENV, BEDROCK_ENV]);
     }
 
-    /// Both implementations must reach the same verdict and report the same refusal text for
-    /// each shared case.
-    #[test_case("versions" ; "versions")]
-    #[test_case("env" ; "env")]
-    #[test_case("config_dirs" ; "config_dirs")]
-    #[test_case("settings" ; "settings")]
-    #[test_case("policies" ; "policies")]
-    #[test_case("accounts" ; "accounts")]
-    #[test_case("plugin_lists" ; "plugin_lists")]
-    #[test_case("hooks" ; "hooks")]
-    fn the_shared_rule_cases_hold(section: &str) {
-        let cases: Value = serde_json::from_str(long_string(RULE_CASES)).unwrap();
-        for case in cases[section].as_array().unwrap() {
-            let text = |key: &str| case[key].as_str();
-            let problem = match section {
-                "versions" => {
-                    let checked = profile(text("output").unwrap(), text("system").unwrap());
-                    let version = checked.as_ref().ok().map(|p| p.version.as_str());
-                    assert_eq!(version, text("version"), "{case}");
-                    checked.err().map(|error| error.to_string())
-                }
-                "env" => {
-                    let (env, withheld) =
-                        child_env([(text("name").unwrap().to_owned(), String::new())]);
-                    let verdict = match (env.is_empty(), withheld.is_empty()) {
-                        (false, _) => PASSED,
-                        (true, false) => WITHHELD,
-                        (true, true) => DROPPED,
-                    };
-                    assert_eq!(Some(verdict), text("verdict"), "{case}");
-                    None
-                }
-                "config_dirs" => {
-                    let dir = config_dir(
-                        text("configured").map(OsString::from),
-                        text("home").map(OsString::from),
-                    );
-                    let found = dir.as_deref().ok().and_then(Path::to_str);
-                    assert_eq!(found, text("dir"), "{case}");
-                    dir.err().map(|error| error.to_string())
-                }
-                "settings" => {
-                    let conflicts = json!(settings_conflicts(&case["settings"]));
-                    assert_eq!(conflicts, case["conflicts"], "{case}");
-                    None
-                }
-                "policies" => {
-                    let settings = settings_with(Some(case["policy"].clone()), None);
-                    policy_problem(&settings, &hooks_off()).map(|problem| problem.to_string())
-                }
-                "accounts" => account_problem(&case["init"]).map(|problem| problem.to_string()),
-                "plugin_lists" => {
-                    plugins_problem(&case["plugins"]).map(|problem| problem.to_string())
-                }
-                "hooks" => policy_problem(&settings_with(None, None), &case["hooks"])
-                    .map(|problem| problem.to_string()),
-                _ => unreachable!("an unknown section {section}"),
-            };
-            match text("problem") {
-                Some(want) => assert!(
-                    problem.as_deref().is_some_and(|found| found.contains(want)),
-                    "{case}: got {problem:?}"
-                ),
-                None => assert_eq!(problem, None, "{case}"),
-            }
-        }
+    #[test_case("2.1.284 (Claude Code)", "linux" => matches Ok(version) if version == "2.1.284" ; "version_1")]
+    #[test_case("2.1.285 (Claude Code)", "Linux" => matches Ok(version) if version == "2.1.285" ; "version_2")]
+    #[test_case("  2.1.1000", "linux" => matches Ok(version) if version == "2.1.1000" ; "version_3")]
+    #[test_case("3.0.0", "linux" => matches Ok(version) if version == "3.0.0" ; "version_4")]
+    #[test_case("2.1.283 (Claude Code)", "linux" => matches Err(Error::TooOld { .. }) ; "version_5")]
+    #[test_case("1.9.999", "linux" => matches Err(Error::TooOld { .. }) ; "version_6")]
+    #[test_case("2.1.284-beta (Claude Code)", "linux" => matches Err(Error::UnknownVersion(_)) ; "version_7")]
+    #[test_case("2.1.284.1", "linux" => matches Err(Error::UnknownVersion(_)) ; "version_8")]
+    #[test_case("Update available", "linux" => matches Err(Error::UnknownVersion(_)) ; "version_9")]
+    #[test_case("claude: not found", "linux" => matches Err(Error::UnknownVersion(_)) ; "version_10")]
+    #[test_case("", "linux" => matches Err(Error::UnknownVersion(_)) ; "version_11")]
+    #[test_case("2.1.284", "darwin" => matches Err(Error::UnsupportedSystem { .. }) ; "version_12")]
+    #[test_case("2.1.284", "Windows_NT" => matches Err(Error::UnsupportedSystem { .. }) ; "version_13")]
+    fn versions_meet_the_launch_requirements(output: &str, system: &str) -> Result<String, Error> {
+        profile(output, system).map(|profile| profile.version)
+    }
+
+    #[test_case("PATH" => (true, false) ; "passed_path")]
+    #[test_case("https_proxy" => (true, false) ; "passed_https_proxy")]
+    #[test_case("LC_ALL" => (true, false) ; "passed_lc_all")]
+    #[test_case("XDG_RUNTIME_DIR" => (true, false) ; "passed_xdg_runtime_dir")]
+    #[test_case("CLAUDE_CONFIG_DIR" => (true, false) ; "passed_claude_config_dir")]
+    #[test_case("ANTHROPIC_API_KEY" => (false, true) ; "withheld_anthropic_api_key")]
+    #[test_case("ANTHROPIC_BASE_URL" => (false, true) ; "withheld_anthropic_base_url")]
+    #[test_case("ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION" => (false, true) ; "withheld_anthropic_small_fast_model_aws_region")]
+    #[test_case("CLAUDE_CODE_API_BASE_URL" => (false, true) ; "withheld_claude_code_api_base_url")]
+    #[test_case("CLAUDE_CODE_USE_BEDROCK" => (false, true) ; "withheld_claude_code_use_bedrock")]
+    #[test_case("CLAUDE_CODE_USE_NEWCLOUD" => (false, true) ; "withheld_claude_code_use_newcloud")]
+    #[test_case("CLAUDE_CODE_USE_POWERSHELL_TOOL" => (false, false) ; "dropped_claude_code_use_powershell_tool")]
+    #[test_case("ANTHROPIC_MODEL" => (false, false) ; "dropped_anthropic_model")]
+    #[test_case("CARGO_HOME" => (false, false) ; "dropped_cargo_home")]
+    fn environment_names_are_passed_withheld_or_dropped(name: &str) -> (bool, bool) {
+        let (env, withheld) = child_env([(name.to_owned(), String::new())]);
+        (!env.is_empty(), !withheld.is_empty())
+    }
+
+    #[test_case(Some("/cfg"), Some("/home/u") => matches Ok(path) if path == Path::new("/cfg") ; "config_directory_1")]
+    #[test_case(None, Some("/home/u") => matches Ok(path) if path == Path::new("/home/u/.claude") ; "config_directory_2")]
+    #[test_case(Some(""), Some("/home/u") => matches Ok(path) if path == Path::new("/home/u/.claude") ; "config_directory_3")]
+    #[test_case(Some("cfg"), Some("/home/u") => matches Err(Error::RelativeConfigDir(_)) ; "config_directory_4")]
+    #[test_case(None, Some("home") => matches Err(Error::RelativeConfigDir(_)) ; "config_directory_5")]
+    #[test_case(None, Some("") => matches Err(Error::NoConfigDir) ; "config_directory_6")]
+    #[test_case(None, None => matches Err(Error::NoConfigDir) ; "config_directory_7")]
+    fn login_directory_is_absolute(
+        configured: Option<&str>,
+        home: Option<&str>,
+    ) -> Result<PathBuf, Error> {
+        config_dir(configured.map(OsString::from), home.map(OsString::from))
+    }
+
+    #[test_case(json!({"apiKeyHelper":"/bin/helper","forceLoginMethod":"console","env":{"ANTHROPIC_API_KEY":"sk-ant-secret","ANTHROPIC_MODEL":"opus","FOO":"bar"}}) => json!(["apiKeyHelper", "forceLoginMethod", "env.ANTHROPIC_API_KEY"]) ; "settings_1")]
+    #[test_case(json!({"gcpAuthRefresh":"g","awsAuthRefresh":"a"}) => json!(["awsAuthRefresh", "gcpAuthRefresh"]) ; "settings_2")]
+    #[test_case(json!({"env":{"CLAUDE_CODE_USE_VERTEX":"1","ANTHROPIC_BASE_URL":"u"}}) => json!(["env.ANTHROPIC_BASE_URL", "env.CLAUDE_CODE_USE_VERTEX"]) ; "settings_3")]
+    #[test_case(json!({"forceLoginMethod":"claudeai"}) => json!([]) ; "settings_4")]
+    #[test_case(json!({"model":"opus"}) => json!([]) ; "settings_5")]
+    fn ignored_settings_cannot_select_a_different_route(settings: Value) -> Value {
+        json!(settings_conflicts(&settings))
+    }
+
+    #[test_case(json!({"companyAnnouncements":["hi"],"permissions":{"deny":["Bash"]}}) => matches None ; "policies_1")]
+    #[test_case(json!({"model":"opus","availableModels":["opus"],"forceLoginMethod":"claudeai"}) => matches None ; "policies_2")]
+    #[test_case(json!({"permissions":{"allow":["Bash"]}}) => matches Some(Problem::Policy(_)) ; "policies_3")]
+    #[test_case(json!({"permissions":{"disableBypassPermissionsMode":"disable","defaultMode":"plan"}}) => matches Some(Problem::Policy(_)) ; "policies_4")]
+    #[test_case(json!({"apiKeyHelper":"x"}) => matches Some(Problem::Policy(_)) ; "policies_5")]
+    #[test_case(json!({"forceLoginMethod":"console"}) => matches Some(Problem::Policy(_)) ; "policies_6")]
+    #[test_case(json!({"env":{"EDITOR":"vi"}}) => matches Some(Problem::Policy(_)) ; "policies_7")]
+    fn managed_policy_cannot_restore_tools_or_routes(value: Value) -> Option<Problem> {
+        policy_problem(&settings_with(Some(value), None), &hooks_off())
+    }
+
+    #[test_case(json!({"current_permission_mode":"default","account":{"apiProvider":"firstParty","subscriptionType":"Claude Pro"}}) => matches None ; "accounts_1")]
+    #[test_case(json!({"current_permission_mode":"default","account":{"apiProvider":"firstParty","subscriptionType":"Claude Pro","apiKeySource":"none"}}) => matches None ; "accounts_2")]
+    #[test_case(json!({}) => matches Some(Problem::NoLogin) ; "accounts_3")]
+    #[test_case(json!({"current_permission_mode":"default","account":{"apiProvider":"firstParty"}}) => matches Some(Problem::NoSubscription) ; "accounts_4")]
+    #[test_case(json!({"current_permission_mode":"default","account":{"apiProvider":"firstParty","subscriptionType":"Claude Pro","apiKeySource":"ANTHROPIC_API_KEY"}}) => matches Some(Problem::ApiKey(_)) ; "accounts_5")]
+    #[test_case(json!({"current_permission_mode":"default","account":{"apiProvider":"firstParty","apiKeySource":"/login managed key"}}) => matches Some(Problem::ApiKey(_)) ; "accounts_6")]
+    #[test_case(json!({"current_permission_mode":"default","account":{"apiProvider":"bedrock","subscriptionType":"Claude Pro"}}) => matches Some(Problem::OtherProvider(_)) ; "accounts_7")]
+    #[test_case(json!({"current_permission_mode":"bypassPermissions","account":{"apiProvider":"firstParty","subscriptionType":"Claude Pro"}}) => matches Some(Problem::StartMode(_)) ; "accounts_8")]
+    fn accounts_use_a_subscription_route(value: Value) -> Option<Problem> {
+        account_problem(&value)
+    }
+
+    #[test_case(json!([]) => matches None ; "plugin_lists_1")]
+    #[test_case(json!([{"name":"agents-md","path":"builtin","source":"agents-md@builtin"}]) => matches None ; "plugin_lists_2")]
+    #[test_case(json!([{"name":"cc-plugin-new","path":"builtin","source":"cc-plugin-new@builtin"}]) => matches None ; "plugin_lists_3")]
+    #[test_case(json!([{"name":"new","path":"/home/u/.claude/plugins/new","source":"new@builtin"}]) => matches Some(Problem::Plugin(_)) ; "plugin_lists_4")]
+    #[test_case(json!([{"name":"evil","path":"builtin","source":"evil@market"}]) => matches Some(Problem::Plugin(_)) ; "plugin_lists_5")]
+    #[test_case(json!([{"name":"agents-md","source":"agents-md@builtin"}]) => matches Some(Problem::Plugin(_)) ; "plugin_lists_6")]
+    #[test_case(json!(["agents-md@builtin"]) => matches Some(Problem::Plugin(_)) ; "plugin_lists_7")]
+    #[test_case(json!("agents-md@builtin") => matches Some(Problem::NoPlugins) ; "plugin_lists_8")]
+    #[test_case(json!(null) => matches Some(Problem::NoPlugins) ; "plugin_lists_9")]
+    fn only_builtin_cli_plugins_are_accepted(value: Value) -> Option<Problem> {
+        plugins_problem(&value)
+    }
+
+    #[test_case(json!({"hooks":[],"policy":{"allDisabled":true}}) => matches None ; "hooks_1")]
+    #[test_case(json!({"hooks":[{"source":"userSettings","disabled":true}],"policy":{"allDisabled":true}}) => matches None ; "hooks_2")]
+    #[test_case(json!({"hooks":[{"event":"PreToolUse","source":"policySettings","disabled":false}],"policy":{"allDisabled":true,"policyHookCount":1}}) => matches Some(Problem::Hook(_)) ; "hooks_3")]
+    #[test_case(json!({"hooks":[{"source":"userSettings"}],"policy":{"allDisabled":true}}) => matches Some(Problem::Hook(_)) ; "hooks_4")]
+    #[test_case(json!({"hooks":{"h":{"source":"policySettings"}},"policy":{"allDisabled":true}}) => matches Some(Problem::NoHooks) ; "hooks_5")]
+    #[test_case(json!({"hooks":[],"policy":{"allDisabled":false}}) => matches Some(Problem::HooksStayOn) ; "hooks_6")]
+    #[test_case(json!({"hooks":[],"policy":{}}) => matches Some(Problem::HooksStayOn) ; "hooks_7")]
+    #[test_case(json!({"hooks":[]}) => matches Some(Problem::NoHooks) ; "hooks_8")]
+    #[test_case(json!({"policy":{"allDisabled":true}}) => matches Some(Problem::NoHooks) ; "hooks_9")]
+    #[test_case(json!(null) => matches Some(Problem::NoHooks) ; "hooks_10")]
+    fn hooks_are_disabled(value: Value) -> Option<Problem> {
+        policy_problem(&settings_with(None, None), &value)
     }
 
     #[test]
@@ -787,9 +854,9 @@ mod tests {
     }
 
     fn settings_with(policy: Option<Value>, extra_source: Option<&str>) -> Value {
-        let mut sources = vec![json!({ "source": RULES.flag_source.as_str(), "settings": {} })];
+        let mut sources = vec![json!({ "source": FLAG_SOURCE, "settings": {} })];
         if let Some(policy) = policy {
-            sources.push(json!({ "source": RULES.policy_source.as_str(), "settings": policy }));
+            sources.push(json!({ "source": POLICY_SOURCE, "settings": policy }));
         }
         if let Some(name) = extra_source {
             sources.push(json!({ "source": name, "settings": {} }));
@@ -819,7 +886,7 @@ mod tests {
         let mut event = json!({
             "type": "system",
             "subtype": "init",
-            "apiKeySource": RULES.no_key_source.as_str(),
+            "apiKeySource": NO_KEY_SOURCE,
             "claude_code_version": VERSION,
             "permissionMode": DEFAULT_MODE,
             "tools": [TOOL, OTHER_TOOL],
@@ -860,12 +927,8 @@ mod tests {
     /// The decoder keys the answers on these ids, in the order the requests go
     /// out.
     #[test]
-    fn the_shared_rules_parse_with_the_handshake_roles() {
-        let ids: Vec<&str> = RULES
-            .handshake
-            .iter()
-            .map(|step| step.id.as_str())
-            .collect();
+    fn handshake_requests_match_the_decoder_roles() {
+        let ids: Vec<&str> = HANDSHAKE.iter().map(|step| step.id).collect();
         assert_eq!(ids, [ACCOUNT_ANSWER, SETTINGS_ANSWER, HOOKS_ANSWER]);
     }
 }
