@@ -20,6 +20,7 @@ use crate::{
 };
 
 const STREAM_DONE: &str = "[DONE]";
+const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 /// `tool_calls[].index` comes straight off the wire; a bogus huge value must
 /// not size the accumulator vec.
 const MAX_TOOL_CALLS_PER_MESSAGE: usize = 512;
@@ -198,12 +199,12 @@ impl OpenAiCompatProvider {
     /// wins, then the construction-time env / `providers.toml` override, then
     /// the static compat default.
     pub(crate) fn base_url(&self, auth: &ResolvedAuth) -> String {
-        if let Some(explicit) = auth.base_url.as_deref() {
-            return explicit.to_string();
-        }
-        self.resolved_base_url
-            .clone()
-            .unwrap_or_else(|| self.config.base_url.to_string())
+        auth.base_url
+            .as_deref()
+            .or(self.resolved_base_url.as_deref())
+            .unwrap_or(&self.config.base_url)
+            .trim_end_matches('/')
+            .to_owned()
     }
 
     fn build_request(
@@ -235,7 +236,7 @@ impl OpenAiCompatProvider {
     ) -> Result<StreamResponse, AgentError> {
         let json_body = serde_json::to_vec(body)?;
         let mut request = self
-            .build_request("POST", "/chat/completions", auth)
+            .build_request("POST", CHAT_COMPLETIONS_PATH, auth)
             .header("content-type", "application/json");
         for &(key, value) in extra_headers {
             if request
@@ -829,8 +830,22 @@ mod tests {
     use test_case::test_case;
 
     use crate::model::{Model, ModelPricing, ModelTier};
+    use crate::test_support::{Canned, serve};
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+    const TEST_BASE_URL: &str = "https://example.test/v1";
+    const FIREWORKS_BASE_URL: &str = "https://api.fireworks.ai/inference/v1";
+    const FIREWORKS_BASE_URL_TRAILING_SLASH: &str = "https://api.fireworks.ai/inference/v1/";
+    const TEST_MODEL_ID: &str = "test-model";
+    const MODELS_ROUTE: &str = "/v1/models";
+    const CHAT_COMPLETIONS_ROUTE: &str = "/v1/chat/completions";
+    const URL_JOIN_RESPONSES: &[Canned] = &[
+        Canned::at(
+            MODELS_ROUTE,
+            Canned::json(200, r#"{"data":[{"id":"test-model"}]}"#),
+        ),
+        Canned::at(CHAT_COMPLETIONS_ROUTE, Canned::sse("data: [DONE]\n\n")),
+    ];
     const COUNTS_SURVIVE_A_BAD_COST: &str =
         "a price we cannot read must not take the token counts down with it";
     const TOOL_NAME: &str = "word_count";
@@ -1450,7 +1465,7 @@ data: [DONE]\n";
     static TEST_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
         slug: Cow::Borrowed("top-p-test"),
         api_key_env: Cow::Borrowed(""),
-        base_url: Cow::Borrowed("https://example.test/v1"),
+        base_url: Cow::Borrowed(TEST_BASE_URL),
         max_tokens_field: Cow::Borrowed(DEFAULT_MAX_TOKENS_FIELD),
         include_stream_usage: true,
         provider_name: Cow::Borrowed("test"),
@@ -1458,7 +1473,7 @@ data: [DONE]\n";
 
     fn test_model(family: ModelFamily) -> Model {
         Model {
-            id: "test-model".into(),
+            id: TEST_MODEL_ID.into(),
             provider: Arc::<str>::from("test"),
             tier: ModelTier::Medium,
             family,
@@ -1483,6 +1498,61 @@ data: [DONE]\n";
             stream_timeout: TEST_STREAM_TIMEOUT,
             resolved_base_url: None,
         }
+    }
+
+    #[test_case(FIREWORKS_BASE_URL, None, None ; "without_trailing_slash")]
+    #[test_case(FIREWORKS_BASE_URL_TRAILING_SLASH, None, None ; "declared_trailing_slash")]
+    #[test_case(TEST_BASE_URL, Some(FIREWORKS_BASE_URL_TRAILING_SLASH), None ; "configured_trailing_slash")]
+    #[test_case(TEST_BASE_URL, Some(TEST_BASE_URL), Some(FIREWORKS_BASE_URL_TRAILING_SLASH) ; "auth_trailing_slash")]
+    fn request_urls_join_base_url(
+        declared: &str,
+        configured: Option<&str>,
+        explicit: Option<&str>,
+    ) {
+        let mut provider = test_provider();
+        provider.config.to_mut().base_url = Cow::Owned(declared.to_owned());
+        provider.resolved_base_url = configured.map(str::to_owned);
+        let auth = ResolvedAuth::withheld().with_base_url(explicit.map(str::to_owned));
+
+        for path in [CHAT_COMPLETIONS_PATH, MODELS_PATH] {
+            let request = provider
+                .build_request("POST", path, &auth)
+                .body(())
+                .unwrap();
+            assert_eq!(
+                request.uri().to_string(),
+                format!("{FIREWORKS_BASE_URL}{path}")
+            );
+        }
+    }
+
+    #[test_case("" ; "without_trailing_slash")]
+    #[test_case("/" ; "with_trailing_slash")]
+    fn stream_and_model_listing_join_base_url(suffix: &str) {
+        smol::block_on(async {
+            let (base_url, requests) = serve(URL_JOIN_RESPONSES);
+            let auth = ResolvedAuth::withheld().with_base_url(Some(format!("{base_url}{suffix}")));
+            let provider = test_provider();
+
+            let models = provider.do_list_models(&auth).await.unwrap();
+            assert_eq!(models.len(), 1);
+            assert_eq!(models[0].id, TEST_MODEL_ID);
+
+            let (event_tx, _) = flume::unbounded();
+            provider
+                .do_stream(
+                    &test_model(ModelFamily::Generic),
+                    &[],
+                    &json!({}),
+                    &event_tx,
+                    &auth,
+                )
+                .await
+                .unwrap();
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests[0].path, MODELS_ROUTE);
+            assert_eq!(requests[1].path, CHAT_COMPLETIONS_ROUTE);
+        });
     }
 
     #[test_case("test-model", ModelFamily::Gpt, ThinkingConfig::Off, true ; "gpt_off_sends")]
