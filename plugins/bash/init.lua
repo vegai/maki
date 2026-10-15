@@ -118,6 +118,11 @@ local function rtk_rewrite(command, ctx)
   if config and not config.rtk then
     return nil
   end
+  local cmd = command:match("^%s*(.-)%s*$")
+  -- RTK does not rewrite multiline scripts.
+  if cmd:find("\n", 1, true) then
+    return nil
+  end
 
   if rtk_available == nil then
     local result = run_rtk({ "rtk", "--version" })
@@ -128,7 +133,6 @@ local function rtk_rewrite(command, ctx)
     return nil
   end
 
-  local cmd = command:match("^%s*(.-)%s*$")
   if cmd:match("^cargo ") and cmd:find(" -- ", 1, true) then
     return nil
   end
@@ -143,7 +147,7 @@ local function rtk_rewrite(command, ctx)
   end
 
   local rewritten = (result.stdout or ""):match("^%s*(.-)%s*$")
-  if rewritten == "" or rewritten == command:match("^%s*(.-)%s*$") then
+  if rewritten == "" or rewritten == cmd then
     return nil
   end
   if rtk_find_unsupported(rewritten) then
