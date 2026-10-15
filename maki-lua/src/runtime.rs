@@ -240,6 +240,8 @@ fn load_user_source<'a>(lua: &'a Lua, name: &str, source: &'a str) -> Chunk<'a> 
     lua.load(source).set_name(name)
 }
 
+pub(crate) type PrivateApi = fn(&Lua, &PluginPermissions) -> mlua::Result<(&'static str, Table)>;
+
 /// Everything a load needs besides the code itself.
 ///
 /// One value rather than a row of positional arguments: it travels unchanged
@@ -263,6 +265,7 @@ pub struct LoadContext {
     /// [`PluginHost::load_builtins`] leaves this at the answer that grants
     /// nothing.
     pub authority: DeclAuthority,
+    pub(crate) private_api: Option<PrivateApi>,
 }
 
 impl LoadContext {
@@ -276,6 +279,7 @@ impl LoadContext {
             revision_guard: None,
             package: false,
             authority: DeclAuthority::ThirdParty,
+            private_api: None,
         }
     }
 }
@@ -2914,12 +2918,13 @@ impl LuaRuntime {
         &self,
         maki: mlua::Table,
         require_root: Option<RequireRoot>,
+        private: Option<(&'static str, Table)>,
     ) -> Result<mlua::Table, mlua::Error> {
         let env = self.lua.create_table()?;
         env.set("maki", maki)?;
 
         if require_root.is_some() || !self.bundled.dirs.is_empty() {
-            let require_fn = self.create_require_fn(&env, require_root)?;
+            let require_fn = self.create_require_fn(&env, require_root, private)?;
             env.set("require", require_fn)?;
         }
 
@@ -2936,6 +2941,7 @@ impl LuaRuntime {
         &self,
         env: &mlua::Table,
         require_root: Option<RequireRoot>,
+        private: Option<(&'static str, Table)>,
     ) -> Result<Function, mlua::Error> {
         let loader = ModuleLoader {
             bundled: self.bundled.clone(),
@@ -2946,6 +2952,9 @@ impl LuaRuntime {
             loading: self.lua.create_table()?,
         };
 
+        if let Some((module, private)) = private {
+            loader.loaded.set(module, private)?;
+        }
         self.lua
             .create_function(move |lua, modname: String| loader.require(lua, &modname))
     }
@@ -2983,6 +2992,7 @@ impl LuaRuntime {
             revision_guard,
             package,
             authority,
+            private_api,
         } = context;
         let map_err = |e: mlua::Error| PluginError::Lua {
             plugin: name.to_string(),
@@ -3032,7 +3042,17 @@ impl LuaRuntime {
             .map_err(map_err)?;
             maki.set("pack", pack).map_err(map_err)?;
         }
-        let env = self.build_env(maki, require_root).map_err(map_err)?;
+        let private = if authority == DeclAuthority::Bundled && !package {
+            private_api
+                .map(|create| create(&self.lua, &permissions))
+                .transpose()
+                .map_err(map_err)?
+        } else {
+            None
+        };
+        let env = self
+            .build_env(maki, require_root, private)
+            .map_err(map_err)?;
         if let Some(mut envs) = self.lua.app_data_mut::<PluginEnvs>() {
             envs.0.insert(Arc::clone(&name), env.to_pointer() as usize);
         }
