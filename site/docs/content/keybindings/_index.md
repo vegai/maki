@@ -85,6 +85,7 @@ Some pickers add extra bindings on top of the defaults:
 | Rewind Picker | `Ctrl+F` | Fork up to the selected prompt and switch to it |
 | Queue | `Enter` | Remove item |
 | Commands | `Tab` | Complete command |
+| Model Picker | `Ctrl+R` | Refresh available models |
 | Model Picker | `!/@/#/$` | Set tier (strong/medium/weak/compaction) |
 | Model Picker | `%` | Fold or unfold provider |
 | Session Picker | `Ctrl+N` | New session |
