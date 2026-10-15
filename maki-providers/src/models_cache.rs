@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
-use crate::provider::{ModelBatch, fetch_all_models, provider_available};
+use crate::provider::{ModelBatch, ModelListing, fetch_all_models, provider_available};
 use crate::providers::custom;
 use crate::spec::ProviderRegistry;
 
@@ -253,37 +253,39 @@ fn store_discovery(path: &Path, listing: &Listing, fingerprint: String, now_ms: 
 pub async fn fetch_all_models_cached(
     policy: &ModelPolicy,
     mut on_update: impl FnMut(ModelList, Vec<String>),
+    listing: ModelListing,
 ) {
     let path = cache_path();
     let fingerprint = fingerprint();
-    let mut listing = Listing {
+    let mut discovered = Listing {
         replayed: path
             .as_deref()
             .map(|p| replay(p, policy, &fingerprint, maki_storage::auth::now_millis()))
             .unwrap_or_default(),
         ..Listing::default()
     };
-    on_update(listing.snapshot(), Vec::new());
+    on_update(discovered.snapshot(), Vec::new());
 
     fetch_all_models(
         policy,
         |batch| {
-            listing.add_live(&batch);
-            on_update(listing.snapshot(), batch.warnings);
+            discovered.add_live(&batch);
+            on_update(discovered.snapshot(), batch.warnings);
         },
         None,
+        listing,
     )
     .await;
 
     if let Some(path) = &path {
         store_discovery(
             path,
-            &listing,
+            &discovered,
             fingerprint,
             maki_storage::auth::now_millis(),
         );
     }
-    on_update(listing.finish(), Vec::new());
+    on_update(discovered.finish(), Vec::new());
 }
 
 #[cfg(test)]

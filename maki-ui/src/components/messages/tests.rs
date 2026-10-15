@@ -21,6 +21,22 @@ use test_case::test_case;
 const UNDECODABLE_IMAGE: &str = "invalid image";
 const VIEW_WIDTH: u16 = 80;
 const VIEW_HEIGHT: u16 = 24;
+const QUEUE_MESSAGE: &str = "waiting for a Claude Code request slot";
+
+#[test_case(false ; "acquired")]
+#[test_case(true ; "cancelled")]
+fn provider_queue_status_is_visible_and_clears_without_entering_history(cancelled: bool) {
+    let mut panel = panel_with_tools(&[]);
+    panel.set_provider_wait(Some(QUEUE_MESSAGE.into()));
+    assert!(buffer_text(&render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT)).contains(QUEUE_MESSAGE));
+    assert!(panel.messages.is_empty());
+    if cancelled {
+        panel.stream_reset();
+    } else {
+        panel.set_provider_wait(None);
+    }
+    assert!(!buffer_text(&render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT)).contains(QUEUE_MESSAGE));
+}
 
 #[test_case(false ; "live")]
 #[test_case(true ; "loaded")]

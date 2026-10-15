@@ -8434,11 +8434,14 @@ fn run_builtin_file_picker_opens_modal() {
 }
 
 #[test]
-fn run_builtin_model_picker_opens_and_refreshes() {
+fn run_builtin_model_picker_opens_cached_models() {
     let mut app = test_app();
     let actions = app.run_builtin(BuiltinAction::ModelPicker);
     assert!(app.model_picker.is_open());
-    assert!(matches!(&actions[..], [Action::RefreshModels]));
+    assert!(matches!(
+        &actions[..],
+        [Action::RefreshModels(ModelListing::Cached)]
+    ));
 }
 
 #[test]
@@ -8451,5 +8454,20 @@ fn ctrl_l_opens_model_picker() {
         state: crossterm::event::KeyEventState::NONE,
     };
     app.update(Msg::Key(key));
+    assert!(app.model_picker.is_open());
+}
+
+#[test]
+fn model_picker_refresh_requires_an_explicit_key() {
+    let mut app = test_app();
+    app.run_builtin(BuiltinAction::ModelPicker);
+    let actions = app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Char('r'),
+        KeyModifiers::CONTROL,
+    )));
+    assert!(matches!(
+        &actions[..],
+        [Action::RefreshModels(ModelListing::Refresh)]
+    ));
     assert!(app.model_picker.is_open());
 }

@@ -5,7 +5,6 @@ use std::time::Duration;
 use flume::Sender;
 use futures_lite::io::BufReader;
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
-use maki_storage::id::SessionRef;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
@@ -15,7 +14,7 @@ use super::openai::responses;
 use super::openai_compat;
 use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing, ModelTier, lookup_entry};
 use crate::model_registry;
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, Provider, RequestScope};
 use crate::providers::{ResolvedAuth, Timeouts};
 use crate::spec::{AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec};
 use crate::{
@@ -41,8 +40,6 @@ const AUTH_NOTE: &str = "(or run `maki auth login copilot` to import a token fro
 /// No Aperture route: Copilot's auth is GraphQL-discovered, not a clean proxy
 /// target.
 pub(crate) const SPEC: ProviderSpec = ProviderSpec {
-    slug: SLUG,
-    display_name: DISPLAY_NAME,
     api_key_env: ENV_VAR,
     family: ModelFamily::Generic,
     supports_thinking: false,
@@ -51,12 +48,11 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(100_000),
-    fallback_context_window: 200_000,
     models_toml: include_str!("../../../models/copilot.toml"),
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
-        with_auth: create_with_auth,
+        with_auth: Some(create_with_auth),
     }),
     aperture: None,
     login: Some(LoginConfig {
@@ -74,6 +70,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
         catalog: CatalogDoc::Table,
         trailing_notes: &[],
     },
+    ..ProviderSpec::new(SLUG, DISPLAY_NAME, 200_000)
 };
 
 fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
@@ -802,7 +799,7 @@ impl Provider for Copilot {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let mut prefixed_system = String::new();

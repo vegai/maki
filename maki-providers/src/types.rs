@@ -702,6 +702,9 @@ impl TitleSource for Message {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum ProviderEvent {
+    Waiting {
+        message: Option<String>,
+    },
     TextDelta {
         text: String,
     },
@@ -1247,6 +1250,10 @@ impl ThinkingConfig {
                 body["thinking"] = json!({"type": "enabled", "budget_tokens": n});
             }
         }
+    }
+
+    pub(crate) fn requires_adaptive(model_id: &str) -> bool {
+        requires_adaptive(model_id)
     }
 
     pub fn apply_reasoning_effort(self, body: &mut Value, dialect: &EffortDialect, model: &Model) {

@@ -30,6 +30,7 @@ toml = { workspace = true }
 arc-swap = { workspace = true }
 getrandom = { workspace = true }
 futures-lite = { workspace = true }
+futures = { workspace = true }
 wait-timeout = { workspace = true }
 image = { workspace = true, features = ["jpeg", "gif", "webp"] }
 base64 = { workspace = true }

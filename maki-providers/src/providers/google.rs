@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use flume::Sender;
 use futures_lite::io::{AsyncBufReadExt, BufReader};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
-use maki_storage::id::{MakiId, SessionRef};
+use maki_storage::id::MakiId;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
@@ -12,7 +12,7 @@ use tracing::warn;
 use maki_config::providers::Protocol;
 
 use crate::model::{Model, ModelFamily};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, Provider, RequestScope};
 use crate::providers::Timeouts;
 use crate::providers::aperture::GEMINI_PATH_PREFIX;
 use crate::spec::{
@@ -49,8 +49,6 @@ fn max_thinking(model: &Model) -> u32 {
 }
 
 pub(crate) const SPEC: ProviderSpec = ProviderSpec {
-    slug: SLUG,
-    display_name: DISPLAY_NAME,
     api_key_env: ENV_VAR,
     family: ModelFamily::Gemini,
     supports_thinking: true,
@@ -59,12 +57,11 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(65_536),
-    fallback_context_window: 1_000_000,
     models_toml: include_str!("../../models/google.toml"),
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
-        with_auth: create_with_auth,
+        with_auth: Some(create_with_auth),
     }),
     aperture: Some(ApertureRoute {
         path_prefix: GEMINI_PATH_PREFIX,
@@ -84,6 +81,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
         catalog: CatalogDoc::Table,
         trailing_notes: &[],
     },
+    ..ProviderSpec::new(SLUG, DISPLAY_NAME, 1_000_000)
 };
 
 fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
@@ -277,7 +275,7 @@ impl Provider for Google {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(self.do_stream(model, messages, system, tools, event_tx, opts.thinking))
     }

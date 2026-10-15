@@ -31,8 +31,6 @@ If `~/.grok/auth.json` already exists, login offers to reuse it without writing 
 
 /// No Aperture route: the OAuth CLI proxy is not a clean gateway target.
 pub(crate) const SPEC: ProviderSpec = ProviderSpec {
-    slug: SLUG,
-    display_name: DISPLAY_NAME,
     api_key_env: auth::API_KEY_ENV,
     family: ModelFamily::Generic,
     supports_thinking: true,
@@ -41,12 +39,11 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(GROK_MAX_OUTPUT_TOKENS),
-    fallback_context_window: 500_000,
     models_toml: include_str!("../../../models/xai.toml"),
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
-        with_auth: create_with_auth,
+        with_auth: Some(create_with_auth),
     }),
     aperture: None,
     login: Some(LoginConfig {
@@ -64,6 +61,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
         catalog: CatalogDoc::Table,
         trailing_notes: &[OAUTH_NOTE],
     },
+    ..ProviderSpec::new(SLUG, DISPLAY_NAME, 500_000)
 };
 
 fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {

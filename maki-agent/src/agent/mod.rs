@@ -11,7 +11,7 @@ mod transcript;
 
 pub use compaction::compact;
 pub use display_order::{DisplayItem, display_order, observation_line};
-pub use frame::{RunContext, RunContextBuilder, plan_mode_update};
+pub use frame::{RunContext, RunContextBuilder, plan_mode_update, request_tools};
 pub use history::{
     History, HistorySnapshot, SharedHeader, SharedMessages, UNAVAILABLE_RESULT,
     close_dangling_tool_calls, live_header, live_history, live_snapshot, publish_live_history,

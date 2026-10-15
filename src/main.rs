@@ -1,11 +1,13 @@
 mod cli;
 mod cmd;
+mod notice;
 mod print;
 mod project_trust;
 mod provider_scripts;
 mod resume;
 mod sdk_mode;
 mod setup;
+mod tool_names;
 mod update;
 
 use std::time::Duration;

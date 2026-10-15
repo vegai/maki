@@ -19,6 +19,10 @@ use maki_providers::{Model, ResolvedAuth, ThinkingSupport, Timeouts};
 use tempfile::TempDir;
 use test_case::test_case;
 
+#[path = "../common/environment.rs"]
+#[allow(dead_code)]
+mod environment;
+
 mod golden;
 
 const MISTRAL: &str = "mistral";
@@ -52,7 +56,7 @@ const NOT_BUILT: &str = "mistral did not build from its declaration";
 fn isolated_state() -> TempDir {
     let dir = TempDir::new().expect(TEMPDIR_FAILED);
     for var in HOME_VARS {
-        unsafe { std::env::set_var(var, dir.path()) };
+        environment::set(var, dir.path());
     }
     dir
 }
@@ -145,7 +149,7 @@ fn routed(model_id: &str) -> Model {
 #[test_case(routed, MEDIUM, true ; "routed_medium")]
 fn only_ministral_is_denied_thinking(adjusted: fn(&str) -> Model, model_id: &str, thinks: bool) {
     let _state = isolated_state();
-    unsafe { std::env::set_var(MISTRAL_KEY_ENV, MISTRAL_KEY) };
+    environment::set(MISTRAL_KEY_ENV, MISTRAL_KEY);
     let _host = load_bundled(MISTRAL);
 
     let model = adjusted(model_id);

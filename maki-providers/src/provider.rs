@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -15,10 +16,25 @@ use crate::providers::catalog::{
     available_if_warm, catalog_providers, catalog_providers_if_available, try_create,
 };
 use crate::providers::{KeyRotation, Timeouts, custom, plugin};
-use crate::spec::{Owner, ProviderRegistry};
+use crate::spec::{Owner, ProviderRegistry, ProviderSpec};
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Where a request runs: its session, if any, and that session's working
+/// directory. A provider shared by all sessions cannot know this, and one that
+/// starts a process per request needs the directory.
+#[derive(Clone, Debug)]
+pub struct RequestScope<'a> {
+    pub session_id: Option<&'a SessionRef>,
+    pub cwd: &'a Path,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelListing {
+    Cached,
+    Refresh,
+}
 
 pub trait Provider: Send + Sync {
     #[allow(clippy::too_many_arguments)]
@@ -30,10 +46,14 @@ pub trait Provider: Send + Sync {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>>;
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>>;
+
+    fn list_models_fresh(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        self.list_models()
+    }
 
     /// Fetch provider-side usage quota (remaining percentage / reset times).
     /// `Ok(None)` means the provider does not expose a programmatic usage endpoint.
@@ -115,6 +135,29 @@ pub fn from_model_fallback(model: &mut Model, timeouts: Timeouts) -> Box<dyn Pro
 
 struct UnconfiguredProvider;
 
+const STATIC_FALLBACK: &str = "using static fallback";
+const NO_FALLBACK: &str = "there is no model list";
+
+/// A provider that uses another provider's model table has no curated rows of its own.
+fn failed_listing(spec: &ProviderSpec, error: &AgentError) -> ModelBatch {
+    let models: Vec<String> = spec
+        .listed_rows()
+        .iter()
+        .flat_map(|entry| entry.prefixes.iter())
+        .map(|prefix| format!("{}/{prefix}", spec.slug))
+        .collect();
+    let fallback = if models.is_empty() {
+        NO_FALLBACK
+    } else {
+        STATIC_FALLBACK
+    };
+    warn!(provider = spec.slug, %error, "maki cannot get the model list, {fallback}");
+    ModelBatch {
+        models,
+        warnings: vec![format!("{}: {error} ({fallback})", spec.display_name)],
+    }
+}
+
 const NOT_CONFIGURED: &str = "no provider configured — run /login or `maki auth login`";
 
 impl Provider for UnconfiguredProvider {
@@ -126,7 +169,7 @@ impl Provider for UnconfiguredProvider {
         _tools: &'a Value,
         _event_tx: &'a Sender<ProviderEvent>,
         _opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async {
             Err(AgentError::Config {
@@ -169,7 +212,7 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
         .into_iter()
         .filter(|m| provider_available_offline(m.slug))
         .flat_map(|m| {
-            m.models()
+            m.listed_rows()
                 .iter()
                 .flat_map(|entry| entry.prefixes.iter())
                 .map(move |p| format!("{}/{}", m.slug, p))
@@ -208,6 +251,7 @@ pub async fn fetch_all_models(
     policy: &ModelPolicy,
     mut on_ready: impl FnMut(ModelBatch),
     on_done: Option<Box<dyn FnOnce() + Send>>,
+    listing: ModelListing,
 ) {
     let (tx, rx) = flume::unbounded();
     let timeouts = Timeouts::default();
@@ -218,15 +262,19 @@ pub async fn fetch_all_models(
             warn!(provider = slug, "failed to create provider, skipping");
             continue;
         };
-        let display_name = spec.display_name;
         let tx = tx.clone();
         smol::spawn(async move {
-            let batch = match provider.list_models().await {
+            let listed = match listing {
+                ModelListing::Cached => provider.list_models(),
+                ModelListing::Refresh => provider.list_models_fresh(),
+            }
+            .await;
+            let batch = match listed {
                 Ok(models) => {
                     let mut specs: Vec<String> =
                         models.iter().map(|m| format!("{slug}/{}", m.id)).collect();
                     set_known_models(slug, models);
-                    for entry in spec.models() {
+                    for entry in spec.listed_rows() {
                         for prefix in &entry.prefixes {
                             let spec = format!("{slug}/{prefix}");
                             if !specs.contains(&spec) {
@@ -239,21 +287,7 @@ pub async fn fetch_all_models(
                         warnings: Vec::new(),
                     }
                 }
-                Err(e) => {
-                    warn!(provider = slug, error = %e, "failed to list models, using static fallback");
-                    let fallback: Vec<String> = spec
-                        .models()
-                        .iter()
-                        .flat_map(|entry| entry.prefixes.iter())
-                        .map(|p| format!("{slug}/{p}"))
-                        .collect();
-                    ModelBatch {
-                        models: fallback,
-                        warnings: vec![format!(
-                            "{display_name}: {e} (using static fallback)"
-                        )],
-                    }
-                }
+                Err(e) => failed_listing(spec, &e),
             };
             let _ = tx.send_async(batch).await;
         })
@@ -323,6 +357,27 @@ pub async fn fetch_all_models(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::{anthropic, claude_code};
+
+    /// Only a provider with its own rows falls back to them after an error.
+    #[test_case::test_case(&anthropic::SPEC => (false, STATIC_FALLBACK) ; "a_provider_with_its_own_rows")]
+    #[test_case::test_case(&claude_code::SPEC => (true, NO_FALLBACK) ; "one_that_runs_anothers_models")]
+    fn a_failed_listing_says_whether_it_fell_back(spec: &ProviderSpec) -> (bool, &'static str) {
+        let batch = failed_listing(
+            spec,
+            &AgentError::Config {
+                message: "down".into(),
+            },
+        );
+        let [warning] = batch.warnings.as_slice() else {
+            panic!("{:?}", batch.warnings);
+        };
+        let said = [STATIC_FALLBACK, NO_FALLBACK]
+            .into_iter()
+            .find(|fallback| warning.contains(fallback))
+            .unwrap();
+        (batch.models.is_empty(), said)
+    }
 
     fn policy(allowed: &[&str], excluded: &[&str]) -> ModelPolicy {
         ModelPolicy::new(

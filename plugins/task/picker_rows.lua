@@ -12,7 +12,7 @@ local M = {}
 
 -- An idle plugin task is waiting for its next prompt, not finished.
 local function alive(status)
-  return status == "working" or status == "idle"
+  return status == "working" or status == "idle" or status == "queued"
 end
 
 -- The main chat comes first and has no status. The subagents follow, live

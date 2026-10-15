@@ -3,7 +3,6 @@ use std::sync::{Arc, Mutex};
 
 use flume::Sender;
 use futures::future::join_all;
-use maki_storage::id::SessionRef;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
@@ -11,7 +10,7 @@ use tracing::warn;
 use maki_config::providers::{Protocol, ProvidersConfig};
 
 use crate::model::Model;
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, Provider, RequestScope};
 use crate::types::ThinkingFallback;
 use crate::{AgentError, Effort, Message, ProviderEvent, RequestOptions, StreamResponse};
 
@@ -149,7 +148,7 @@ impl Provider for LocalEndpoint {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();

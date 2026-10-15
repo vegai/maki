@@ -99,8 +99,10 @@ fn load_plugins(
     // the hosts the user exempted from the private-address block.
     maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
     maki_lua::set_shell_preference(config.agent.shell.clone());
+    // Model resolution must wait until the plugin has checked the shared options.
+    let builtins = host.load_builtins(&config.plugins);
 
-    if let Err(e) = host.load_builtins(&config.plugins) {
+    if let Err(e) = builtins {
         let e = color_eyre::eyre::Report::from(e).wrap_err("load builtin plugins");
         match on_builtin_failure {
             BuiltinFailure::Fatal => return Err(e),
@@ -127,7 +129,9 @@ fn load_plugins(
     // Publishes this load's providers in one step. Until here every reader
     // still sees the generation that was serving, so a `/reload` never opens a
     // window in which a registered provider answers "unknown".
+    let loaded = host.loaded_plugins()?;
     maki_providers::plugin::commit_load();
+    maki_providers::claude_code::follow_plugins(&loaded, &config.plugins.opts);
 
     Ok((config, sanitize_warnings(&warnings)))
 }
@@ -297,4 +301,69 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::env;
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    use maki_agent::tools::ToolRegistry;
+    use maki_config::RawConfig;
+    use maki_lua::{Interaction, PluginHost};
+    use maki_providers::{Model, Timeouts, provider};
+    use serde_json::{Value, json};
+    use test_case::test_case;
+
+    use super::{BuiltinFailure, load_plugins};
+
+    const PLUGIN: &str = "claude_code";
+    /// A builtin whose `max_file_size_mb` has a minimum.
+    const OTHER_PLUGIN: &str = "index";
+    const MODEL: &str = "claude-code/claude-haiku-4-5";
+    const EXECUTABLE: &str = "executable";
+
+    /// The provider reads the plugin's options from process-wide state, so
+    /// the cases take turns under a threaded harness.
+    static PLUGIN_OPTIONS: Mutex<()> = Mutex::new(());
+
+    /// A failed builtin load stops later builtins. Enable the provider only if its own plugin
+    /// completed its load.
+    #[test_case(json!({}), None => true ; "a_plugin_that_loaded")]
+    #[test_case(json!({ "max_concurrent": 0 }), None => false ; "a_plugin_that_failed_to_load")]
+    #[test_case(json!({}), Some((OTHER_PLUGIN, json!({ "max_file_size_mb": 0 }))) => false ; "a_plugin_behind_one_that_failed")]
+    fn the_provider_follows_the_plugin_that_loaded(
+        options: Value,
+        other: Option<(&str, Value)>,
+    ) -> bool {
+        let _turn = PLUGIN_OPTIONS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        load_plugins(
+            &mut host,
+            true,
+            BuiltinFailure::Warn,
+            Interaction::None,
+            |_, _, _| {
+                let mut config = RawConfig::default().into_config(&[])?;
+                config.plugins.names = vec![PLUGIN.to_owned()];
+                let mut options = options.as_object().unwrap().clone();
+                // The provider only needs a runnable file here, because no
+                // test runs it and CI has no `claude`.
+                options.insert(EXECUTABLE.to_owned(), json!(env::current_exe()?));
+                config.plugins.opts.insert(PLUGIN.to_owned(), options);
+                if let Some((name, options)) = &other {
+                    config.plugins.names.push((*name).to_owned());
+                    let options = options.as_object().unwrap().clone();
+                    config.plugins.opts.insert((*name).to_owned(), options);
+                }
+                Ok(config)
+            },
+        )
+        .unwrap();
+
+        let mut model = Model::from_spec(MODEL).unwrap();
+        provider::from_model(&mut model, Timeouts::default()).is_ok()
+    }
 }

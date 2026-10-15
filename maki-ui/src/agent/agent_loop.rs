@@ -9,7 +9,7 @@ use maki_agent::prompt::ResolvedPrompts;
 use maki_agent::session::Resumed;
 use maki_agent::template;
 use maki_agent::template::Vars;
-use maki_agent::tools::{RequestTools, ToolAudience, ToolRegistry};
+use maki_agent::tools::{LocalTools, RequestTools, ToolAudience, ToolRegistry};
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, AgentSeed, CancelMap,
     CancelToken, DoneReason, Envelope, EventSender, History, Instructions, McpCommand, PromptRole,
@@ -33,6 +33,7 @@ fn base_tools(
 ) -> RequestTools {
     RequestTools::build(
         ToolRegistry::global(),
+        &LocalTools::default(),
         vars,
         model,
         config,
@@ -250,6 +251,7 @@ impl AgentLoop {
             model: &slot.model,
             cancel,
             context_size: self.gauge.size(),
+            cwd: self.seed.permissions.cwd(),
         };
         agent::compact(
             &*provider,

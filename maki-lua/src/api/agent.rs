@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use flume::{Receiver, Sender};
 use futures::future::{Either, select};
+use futures_lite::future::poll_once;
 use maki_agent::agent::{LoadedInstructions, tool_dispatch};
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
 use maki_agent::tools::interpreter_bridge;
@@ -277,8 +279,8 @@ impl Upstream {
 
 /// Forwards subagent events upstream, stamped with the subagent identity.
 /// Usage goes live on the tool header while the run goes on (last turn's tokens
-/// plus the run's summed cost). `Done` pings `done_tx`, which tells `prompt`
-/// that every turn of the run has passed through. A parent agent hears neither
+/// plus the run's summed cost). A flush acknowledges all queued events, including
+/// turns from an interrupted run. A parent agent hears neither
 /// `Done` nor `Error`: it learns both from the tool result. A chat tab hears
 /// both, since nothing else would tell its task the run ended, and hears
 /// `StreamClosed` once the session is gone. The registry adds up every turn
@@ -289,12 +291,12 @@ async fn relay_session_events(
     mut sub_events: SessionEvents,
     upstream: Upstream,
     subagent_info: Arc<OnceLock<SubagentInfo>>,
-    done_tx: flume::Sender<()>,
-    live_sink: Option<flume::Sender<ToolLive>>,
+    flush_rx: Receiver<Sender<()>>,
+    live_sink: Option<Sender<ToolLive>>,
 ) {
     let to_chat = matches!(upstream, Upstream::Chat { .. });
     let mut cost = None;
-    while let Some(mut envelope) = sub_events.next().await {
+    let mut forward = |mut envelope: Envelope| {
         match &envelope.event {
             AgentEvent::TurnComplete(turn) => {
                 add_cost(&mut cost, turn.cost);
@@ -308,19 +310,44 @@ async fn relay_session_events(
                 }
             }
             AgentEvent::Done { .. } => {
-                let _ = done_tx.send(());
                 if !to_chat {
-                    continue;
+                    return;
                 }
             }
-            AgentEvent::Error { .. } if !to_chat => continue,
+            AgentEvent::Error { .. } if !to_chat => return,
             AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolPending { .. }
-            | AgentEvent::SubagentHistory { .. } => continue,
+            | AgentEvent::SubagentHistory { .. } => return,
             _ => {}
         }
         envelope.subagent = subagent_info.get().cloned();
         upstream.send(envelope);
+    };
+    loop {
+        let next = {
+            let event = pin!(sub_events.next());
+            let flush = pin!(flush_rx.recv_async());
+            match select(event, flush).await {
+                Either::Left((event, _)) => Ok(event),
+                Either::Right((flush, _)) => Err(flush),
+            }
+        };
+        match next {
+            Ok(Some(event)) => forward(event),
+            Ok(None) => break,
+            Err(Ok(done)) => {
+                while let Some(Some(event)) = poll_once(sub_events.next()).await {
+                    forward(event);
+                }
+                let _ = done.send(());
+            }
+            Err(Err(_)) => {
+                while let Some(event) = sub_events.next().await {
+                    forward(event);
+                }
+                break;
+            }
+        }
     }
     if to_chat {
         upstream.send_event(AgentEvent::StreamClosed, subagent_info.get().cloned());
@@ -477,23 +504,16 @@ async fn tools(
         .and_then(|spec| Model::from_spec_with_policy(spec, &agent.model_policy).ok());
     let model = parsed.as_ref().unwrap_or(&agent.model);
 
-    let base = match (only, except) {
-        (Some(o), _) => ToolFilter::Only(o),
-        (_, Some(e)) => ToolFilter::AllExcept(e),
-        _ => ToolFilter::All,
+    let base = ToolFilter::from_config(&agent.config, model, &[]);
+    let filter = match (only, except) {
+        (Some(names), _) => base.publishing(names),
+        (_, Some(names)) => base.excluding(&names.iter().map(String::as_str).collect::<Vec<_>>()),
+        _ => base,
     };
-    let disabled: Vec<&str> = agent
-        .config
-        .disabled_tools
-        .iter()
-        .map(String::as_str)
-        .collect();
-    let filter = base
-        .excluding(&disabled)
-        .excluding(maki_agent::tools::capability_exclusions(model));
 
     let vars = maki_agent::template::env_vars();
     let ctx_desc = DescriptionContext {
+        local_tools: None,
         filter: &filter,
         audience,
         workflow,
@@ -714,6 +734,7 @@ async fn call_tool(
 ///     `(string)` or `(nil, err)`. Optional `audiences` (string[]) gates who may
 ///     call it, the same way `maki.api.register_tool` does. The default is the
 ///     model alone, so a script cannot reach it through `code_execution`.
+///     Config allow lists do not restrict local tools. Explicit denials still apply.
 ///   `name` (string?) - display name for logs and UI.
 ///   `audience` (string?) - tool audience for capability gating. Default: `"general_sub"`.
 ///   `mcp` (boolean?) - give the session MCP tools. Their definitions are
@@ -884,7 +905,7 @@ async fn session(
         .unzip();
 
     let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
-    let (done_tx, done_rx) = flume::unbounded();
+    let (flush_tx, flush_rx) = flume::unbounded();
     // Doubles as the task id tools see. The fallback gets its own id: it keys
     // `subagent_cancels`, where two subagents sharing the session id would
     // collide.
@@ -907,7 +928,7 @@ async fn session(
         sub_events,
         upstream.clone(),
         Arc::clone(&subagent_info),
-        done_tx,
+        flush_rx,
         agent_ctx.live_sink.clone(),
     ))
     .detach();
@@ -966,7 +987,14 @@ async fn session(
     // The array is the caller's, and the filter comes out of it, so whatever
     // the caller left out is also a name this session cannot dispatch or bind
     // inside its sandbox.
-    let tools = RequestTools::assembled(JsonValue::Array(tools_json), &agent_ctx.config, &model);
+    let local_tools = Arc::new(local_map);
+    let tools = RequestTools::assembled(
+        JsonValue::Array(tools_json),
+        &local_tools,
+        &agent_ctx.config,
+        &model,
+        audience,
+    );
     let system = system.unwrap_or_default();
     let context: RunContextBuilder =
         Arc::new(move |_, _| RunContext::fixed(system.clone(), tools.clone()));
@@ -1015,9 +1043,9 @@ async fn session(
         cancellation: Arc::clone(&cancellation),
         upstream,
         subagent_info,
-        local_tools: Arc::new(local_map),
+        local_tools,
         name,
-        dones: RunDones::new(done_rx),
+        flush_tx,
         start: Instant::now(),
         closed: false,
         background,
@@ -1268,40 +1296,10 @@ struct SessionState {
     subagent_info: Arc<OnceLock<SubagentInfo>>,
     local_tools: LocalTools,
     name: String,
-    dones: RunDones,
+    flush_tx: Sender<Sender<()>>,
     start: Instant,
     closed: bool,
     background: Option<Background>,
-}
-
-/// Every run that ends `Ok` leaves exactly one `Done` on the relay's channel,
-/// and one that errs or is dropped mid-flight leaves none. A prompt cut short
-/// does not wait for its `Done`, and neither does one dropped while waiting.
-/// Events carry no prompt tag, so the next prompt can't tell a leftover from
-/// its own. It counts how many it is owed instead and reads past the old ones.
-struct RunDones {
-    rx: flume::Receiver<()>,
-    unread: usize,
-}
-
-impl RunDones {
-    fn new(rx: flume::Receiver<()>) -> Self {
-        Self { rx, unread: 0 }
-    }
-
-    fn expect_one(&mut self) {
-        self.unread += 1;
-    }
-
-    /// Safe to drop mid-wait, because a `Done` only stops being owed once it
-    /// has been read.
-    async fn caught_up(&mut self) -> Result<(), flume::RecvError> {
-        while self.unread > 0 {
-            self.rx.recv_async().await?;
-            self.unread -= 1;
-        }
-        Ok(())
-    }
 }
 
 struct Background {
@@ -1579,10 +1577,11 @@ async fn prompt(
         settle.outcome = result.as_ref().err().map(AgentEvent::error);
     }
     drop(watch);
-    if let Some(Ok(_)) = finished {
-        s.dones.expect_one();
-    }
     let result = finished.unwrap_or(Ok(DoneReason::Cancelled));
+    let (done, drained) = flume::bounded(1);
+    if s.flush_tx.send(done).is_ok() {
+        let _ = drained.recv_async().await;
+    }
     // Before the run is judged, so a prompt Esc or an error cut short still
     // leaves what it streamed in the tab's transcript. A monitor nobody closes
     // would otherwise keep it in memory until the plugin unloads.
@@ -1631,12 +1630,6 @@ async fn prompt(
             Some(tbl)
         };
         return Ok((tbl, Some(err)));
-    }
-    // The relay reaches `Done` only after every `TurnComplete`, so once it has,
-    // all our `ToolLive::Usage` messages sit in the live channel before
-    // `dispatch_racing_live` drains it for the last time.
-    if s.dones.caught_up().await.is_err() {
-        tracing::warn!(name = %s.name, "subagent event relay stopped, live usage may lag");
     }
     let usage = s.params.ledger.totals().usage;
 
@@ -1717,8 +1710,6 @@ fn call_local_tool(
 
 #[cfg(test)]
 mod tests {
-    use flume::Sender;
-    use futures_lite::future::poll_once;
     use maki_agent::prompt::{PromptId, ResolvedPrompts};
     use maki_agent::tools::test_support::stub_ctx_with;
     use maki_agent::{DoneReason, TurnCompleteEvent};
@@ -2069,23 +2060,6 @@ mod tests {
         );
     }
 
-    /// A prompt cut short leaves its run's `Done` unread. The next prompt must
-    /// read past it and keep waiting for its own, even when it gets dropped
-    /// halfway and asked again.
-    #[test]
-    fn next_prompt_waits_past_a_leftover_done() {
-        let (tx, rx) = flume::unbounded();
-        let mut dones = RunDones::new(rx);
-        dones.expect_one();
-        tx.send(()).unwrap();
-        dones.expect_one();
-        assert!(smol::block_on(poll_once(dones.caught_up())).is_none());
-
-        tx.send(()).unwrap();
-        assert_eq!(smol::block_on(dones.caught_up()), Ok(()));
-        assert!(tx.is_empty());
-    }
-
     const RUN_ID: u64 = 7;
     const PARENT_ID: &str = "task-1";
     const IGNORED_ERROR: &str = "handled by the session caller";
@@ -2128,6 +2102,38 @@ mod tests {
         })
         .unwrap();
         info
+    }
+
+    #[test]
+    fn an_abandoned_flush_cannot_acknowledge_the_next_prompt() {
+        smol::block_on(async {
+            let (guard, sub_events) = event_stream();
+            let sub_tx = guard.sender(RUN_ID);
+            let (parent_tx, _parent_rx) = flume::unbounded();
+            let (flush_tx, flush_rx) = flume::unbounded();
+            let (live_tx, live_rx) = flume::unbounded();
+            let mut relay = pin!(relay_session_events(
+                sub_events,
+                Upstream::Parent(EventSender::new(parent_tx, RUN_ID)),
+                subagent_info(),
+                flush_rx,
+                Some(live_tx),
+            ));
+            let (done, abandoned) = flume::bounded(1);
+            flush_tx.send(done).unwrap();
+            assert!(poll_once(relay.as_mut()).await.is_none());
+            drop(abandoned);
+
+            sub_tx.send(turn(SESSION_MODEL, DONE_USAGE, 0.25)).unwrap();
+            let (done, drained) = flume::bounded(1);
+            flush_tx.send(done).unwrap();
+            assert_eq!(drained.try_recv(), Err(flume::TryRecvError::Empty));
+            assert!(poll_once(relay.as_mut()).await.is_none());
+            assert_eq!(drained.try_recv(), Ok(()));
+            assert!(matches!(live_rx.try_recv(), Ok(ToolLive::Usage(_))));
+            drop(guard);
+            relay.await;
+        });
     }
 
     /// Two turns, an error and the run's `Done`, then the guard drops. The
@@ -2206,14 +2212,14 @@ mod tests {
     #[test]
     fn relay_to_parent_reports_each_turn_and_keeps_run_ends_behind() {
         let (upstream, parent_rx) = parent_upstream();
-        let (done_tx, done_rx) = flume::unbounded();
+        let (_flush_tx, flush_rx) = flume::unbounded();
         let (live_tx, live_rx) = flume::unbounded();
 
         smol::block_on(relay_session_events(
             relayed_run(),
             upstream,
             subagent_info(),
-            done_tx,
+            flush_rx,
             Some(live_tx),
         ));
 
@@ -2222,7 +2228,6 @@ mod tests {
             tokens(50, 10).format_sum_cost(Some(0.75)),
         ];
         assert_eq!(live_usages(&live_rx), expected_live);
-        assert_eq!(done_rx.try_recv(), Ok(()));
 
         let forwarded = parent_rx.drain().collect::<Vec<_>>();
         assert_eq!(forwarded.len(), expected_live.len());
@@ -2256,18 +2261,17 @@ mod tests {
     #[test]
     fn relay_to_chat_forwards_run_ends_and_closes_the_task() {
         let session = MakiId::generate();
-        let (done_tx, done_rx) = flume::unbounded();
+        let (_flush_tx, flush_rx) = flume::unbounded();
         let (ui_tx, ui_rx) = flume::unbounded();
 
         smol::block_on(relay_session_events(
             relayed_run(),
             chat_upstream(session, ui_tx),
             subagent_info(),
-            done_tx,
+            flush_rx,
             None,
         ));
 
-        assert_eq!(done_rx.try_recv(), Ok(()));
         let forwarded = ui_rx
             .drain()
             .map(|action| match action {
@@ -2316,18 +2320,17 @@ mod tests {
         };
         drop(background.start_prompt(PARENT_ID, guard.sender(RUN_ID)));
         drop(guard);
-        let (done_tx, done_rx) = flume::unbounded();
+        let (_flush_tx, flush_rx) = flume::unbounded();
         let (ui_tx, ui_rx) = flume::unbounded();
 
         smol::block_on(relay_session_events(
             sub_events,
             chat_upstream(MakiId::generate(), ui_tx),
             subagent_info(),
-            done_tx,
+            flush_rx,
             None,
         ));
 
-        assert!(done_rx.is_empty());
         let events = ui_rx
             .drain()
             .map(|action| match action {

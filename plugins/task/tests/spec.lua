@@ -12,6 +12,7 @@ local DEPLOY = { id = "toolu_04", name = "deploy", status = "working", focused =
 local AUDIT = { id = "toolu_05", name = "audit", status = "working", focused = false }
 local MONITOR = { id = "session-01", name = "ci-monitor", status = "idle", plugin = "ci", focused = false }
 local RESEARCH_DONE = { id = RESEARCH.id, name = RESEARCH.name, status = "done", focused = false }
+local QUEUED = { id = "toolu_06", name = "queued", status = "queued", focused = false }
 
 case("maki_agent_has_expected_functions", function()
   assert(type(maki.agent) == "table", "maki.agent must be a table")
@@ -65,6 +66,12 @@ case("main_is_pinned_first_and_running_beats_finished", function()
   eq(sections(built.rows), "2:Running,4:Finished", "main has no header and each section opens once")
   eq(built.sections.running, 2)
   eq(built.sections.finished, 2)
+end)
+
+case("queued_tasks_stay_in_the_running_section", function()
+  local built = Rows.build({ MAIN, BUILD, QUEUED }, "")
+  eq(ids(built.rows), "main,toolu_06,toolu_02")
+  eq(sections(built.rows), "2:Running,3:Finished")
 end)
 
 -- The worst case for a cursor kept as a position: the first running task

@@ -5,7 +5,7 @@ use maki_storage::id::SessionRef;
 use serde_json::Value;
 
 use crate::model::{Model, ModelFamily, ModelInfo};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, Provider, RequestScope};
 use crate::providers::catalog::{
     CatalogMeta, CatalogTransport, EndpointType, FreeTier, ProviderQuirks,
     adaptive_effort_if_available, init_shared_catalog_if_needed,
@@ -44,8 +44,6 @@ The default is `false`."#;
 /// Neither Opencode slug is a `maki auth login` target, so neither carries a
 /// `login` row.
 pub(crate) const ZEN_SPEC: ProviderSpec = ProviderSpec {
-    slug: ZEN_SLUG,
-    display_name: ZEN_DISPLAY_NAME,
     api_key_env: ENV_VAR,
     family: ModelFamily::Generic,
     supports_thinking: true,
@@ -54,12 +52,11 @@ pub(crate) const ZEN_SPEC: ProviderSpec = ProviderSpec {
     thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(128_000),
-    fallback_context_window: 256_000,
     models_toml: NO_CURATED_MODELS,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
-        with_auth: create_with_auth,
+        with_auth: Some(create_with_auth),
     }),
     aperture: None,
     login: None,
@@ -70,11 +67,10 @@ pub(crate) const ZEN_SPEC: ProviderSpec = ProviderSpec {
         catalog: CatalogDoc::Discovered(GENERIC_DISCOVERY_NOTE),
         trailing_notes: &[FREE_MODELS_NOTE],
     },
+    ..ProviderSpec::new(ZEN_SLUG, ZEN_DISPLAY_NAME, 256_000)
 };
 
 pub(crate) const GO_SPEC: ProviderSpec = ProviderSpec {
-    slug: GO_SLUG,
-    display_name: GO_DISPLAY_NAME,
     api_key_env: ENV_VAR,
     family: ModelFamily::Generic,
     supports_thinking: false,
@@ -83,7 +79,6 @@ pub(crate) const GO_SPEC: ProviderSpec = ProviderSpec {
     thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(64_000),
-    fallback_context_window: 128_000,
     models_toml: NO_CURATED_MODELS,
     pricing_schedule: None,
     build: Build::Catalog,
@@ -96,6 +91,7 @@ pub(crate) const GO_SPEC: ProviderSpec = ProviderSpec {
         catalog: CatalogDoc::Discovered(GO_DISCOVERY_NOTE),
         trailing_notes: &[],
     },
+    ..ProviderSpec::new(GO_SLUG, GO_DISPLAY_NAME, 128_000)
 };
 
 /// Zen ids name the sub-provider that serves them, as
@@ -236,8 +232,9 @@ impl Provider for Opencode {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        let session_id = scope.session_id;
         Box::pin(async move {
             let (sub_provider, actual_id) =
                 model.id.split_once('/').unwrap_or((ZEN_SLUG, &model.id));

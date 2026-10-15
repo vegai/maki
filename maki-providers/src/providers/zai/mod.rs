@@ -3,13 +3,12 @@ use std::sync::{Arc, Mutex};
 
 use flume::Sender;
 use maki_config::providers::{Protocol, ProviderPlan};
-use maki_storage::id::SessionRef;
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::warn;
 
 use crate::model::{Model, ModelFamily, ThinkingSupport};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, Provider, RequestScope};
 use crate::providers::aperture::NO_PATH_PREFIX;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::spec::{
@@ -67,8 +66,6 @@ const PLANS: &[(&str, ProviderPlan)] = &[
 /// (`/api/paas/v4/chat/completions`), so the upstream base url must carry the
 /// whole path and any prefix would double it up.
 pub(crate) const SPEC: ProviderSpec = ProviderSpec {
-    slug: SLUG,
-    display_name: DISPLAY_NAME,
     api_key_env: ENV_VAR,
     family: ModelFamily::Glm,
     supports_thinking: false,
@@ -77,12 +74,11 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: false,
     fallback_max_output: Some(16_000),
-    fallback_context_window: 128_000,
     models_toml: include_str!("../../../models/zai.toml"),
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
-        with_auth: create_with_auth,
+        with_auth: Some(create_with_auth),
     }),
     aperture: Some(ApertureRoute {
         path_prefix: NO_PATH_PREFIX,
@@ -102,6 +98,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
         catalog: CatalogDoc::Table,
         trailing_notes: &[],
     },
+    ..ProviderSpec::new(SLUG, DISPLAY_NAME, 128_000)
 };
 
 fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
@@ -225,7 +222,7 @@ impl Provider for Zai {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();

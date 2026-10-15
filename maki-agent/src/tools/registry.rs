@@ -504,10 +504,12 @@ impl ToolRegistry {
         let snapshot = self.tools.load();
         let mut out = Vec::with_capacity(snapshot.len());
         for entry in snapshot.iter() {
-            if !entry.tool.audience().contains(ctx.audience) {
-                continue;
-            }
-            if !ctx.filter.matches(entry.name()) {
+            if !ctx.filter.admits(
+                entry.name(),
+                entry.tool.audience(),
+                ctx.audience,
+                ctx.local_tools,
+            ) {
                 continue;
             }
             let description = vars.apply(&entry.tool.description(ctx)).into_owned();
@@ -606,8 +608,9 @@ mod tests {
         )
         .unwrap();
 
-        let filter = crate::tools::ToolFilter::All;
+        let filter = crate::tools::ToolFilter::default();
         let ctx = DescriptionContext {
+            local_tools: None,
             filter: &filter,
             audience: ToolAudience::MAIN,
             workflow: false,
@@ -634,8 +637,9 @@ mod tests {
         )
         .unwrap();
 
-        let filter = crate::tools::ToolFilter::All;
+        let filter = crate::tools::ToolFilter::default();
         let ctx = DescriptionContext {
+            local_tools: None,
             filter: &filter,
             audience: ToolAudience::MAIN,
             workflow: false,
@@ -798,9 +802,10 @@ mod tests {
         reg.register(mock("everywhere"), lua_source("p")).unwrap();
 
         let vars = Vars::new();
-        let filter = crate::tools::ToolFilter::All;
+        let filter = crate::tools::ToolFilter::default();
         let names_for = |audience: ToolAudience| -> Vec<String> {
             let ctx = DescriptionContext {
+                local_tools: None,
                 filter: &filter,
                 audience,
                 workflow: false,

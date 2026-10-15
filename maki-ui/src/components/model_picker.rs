@@ -13,6 +13,7 @@ use maki_providers::models_cache::ModelList;
 use maki_providers::spec::{Build, ProviderRegistry};
 
 use crate::components::Overlay;
+use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::{Cadence, Dirty, Watch};
 
@@ -24,6 +25,7 @@ const PRICE_SEPARATOR: &str = " · ";
 const PRICE_WIDTH: usize = 7;
 const LOADING_NOTICE: &str = "loading models...";
 const FOOTER: &[(&str, &str)] = &[
+    ("Ctrl+r", "refresh"),
     ("Enter", "select"),
     ("!", "strong"),
     ("@", "medium"),
@@ -72,6 +74,7 @@ fn provider_entry(model: &ModelEntry, count: usize) -> ModelEntry {
 
 pub enum ModelPickerAction {
     Consumed,
+    Refresh,
     Select(String),
     AssignTier(String, ModelTier),
     UnassignTier(String, ModelTier),
@@ -311,6 +314,9 @@ impl ModelPicker {
     }
 
     fn handle_key_inner(&mut self, key: KeyEvent) -> ModelPickerAction {
+        if key::REFRESH.matches(key) {
+            return ModelPickerAction::Refresh;
+        }
         let on_provider_row = self.picker.selected_item().is_some_and(|e| e.is_provider);
         // Enter on a provider row would hand back a bare slug as the model.
         if key.code == FOLD_KEY || (on_provider_row && key.code == KeyCode::Enter) {

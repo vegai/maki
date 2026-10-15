@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 use flume::Sender;
 use futures_lite::io::{AsyncBufReadExt, BufReader};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
-use maki_storage::id::SessionRef;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::debug;
@@ -19,7 +18,7 @@ use url::Url;
 use maki_config::providers::Protocol;
 
 use crate::model::{Model, ModelFamily};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, Provider, RequestScope};
 use crate::providers::aperture::NO_PATH_PREFIX;
 use crate::spec::{
     ApertureRoute, AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
@@ -41,8 +40,8 @@ const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
 const OAUTH_BETA: &str = "oauth-2025-04-20";
 const BLOCK_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 const MONEY_EXPONENT: u32 = 2;
-const LABEL_SESSION: &str = "Current session";
-const LABEL_WEEK_ALL: &str = "Current week (all models)";
+pub(crate) const LABEL_SESSION: &str = "Current session";
+pub(crate) const LABEL_WEEK_ALL: &str = "Current week (all models)";
 
 pub(crate) const SLUG: &str = "anthropic";
 pub(crate) const DISPLAY_NAME: &str = "Anthropic";
@@ -73,8 +72,6 @@ You will need `AWS_REGION` and one of the following for auth:
 You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROPIC_BEDROCK_BASE_URL`. These env var names match Claude Code, so if you were already using Bedrock there, the same setup works here."#;
 
 pub(crate) const SPEC: ProviderSpec = ProviderSpec {
-    slug: SLUG,
-    display_name: DISPLAY_NAME,
     api_key_env: ENV_VAR,
     family: ModelFamily::Claude,
     supports_thinking: true,
@@ -83,12 +80,11 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: false,
     fallback_max_output: Some(128_000),
-    fallback_context_window: 200_000,
     models_toml: include_str!("../../../models/anthropic.toml"),
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
-        with_auth: create_with_auth,
+        with_auth: Some(create_with_auth),
     }),
     aperture: Some(ApertureRoute {
         path_prefix: NO_PATH_PREFIX,
@@ -108,6 +104,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
         catalog: CatalogDoc::Table,
         trailing_notes: &[LONG_CONTEXT_NOTE, BEDROCK_NOTE],
     },
+    ..ProviderSpec::new(SLUG, DISPLAY_NAME, 200_000)
 };
 
 inventory::submit!(SPEC.config_row());
@@ -503,7 +500,7 @@ impl Provider for Anthropic {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let system_blocks = if let Some(prefix) = &self.system_prefix {

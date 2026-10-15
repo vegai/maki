@@ -2,9 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use agent_client_protocol_schema::v1::{
-    Content, ContentBlock, ContentChunk, Cost, Diff, ImageContent, SessionUpdate, StopReason,
-    TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
+    Content, ContentBlock, ContentChunk, Cost, Diff, ImageContent, Notice, NoticeSeverity,
+    SessionUpdate, StopReason, TextContent, ToolCall, ToolCallContent, ToolCallId,
+    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use maki_agent::tools::ToolRegistry;
 use maki_agent::types::{ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent};
@@ -97,6 +97,14 @@ pub fn thinking_delta(text: &str) -> SessionUpdate {
     SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
         text.to_string(),
     ))))
+}
+
+pub fn provider_waiting(message: String, notices: bool) -> SessionUpdate {
+    if notices {
+        SessionUpdate::Notice(Notice::new(NoticeSeverity::Info, message))
+    } else {
+        thinking_delta(&format!("{message}\n\n"))
+    }
 }
 
 pub fn tool_pending(id: &str, name: &str) -> SessionUpdate {

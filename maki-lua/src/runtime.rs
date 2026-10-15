@@ -480,6 +480,9 @@ pub enum Request {
     CollectPluginOptions {
         reply: flume::Sender<PluginOptionSpecs>,
     },
+    CollectLoadedPlugins {
+        reply: flume::Sender<Vec<String>>,
+    },
     /// Packages `init.lua` declared. Read after the init files have run, since
     /// that is when the declared set is complete.
     CollectPackages {
@@ -4300,6 +4303,7 @@ async fn run_tool_call(
         let Some(tool_keys) = owner.tools.get(&*tool) else {
             return ToolCallReply::err(format!("tool not found: {tool}"));
         };
+        ctx.permissions = owner.permissions.clone();
         match lua.registry_value(&tool_keys.handler) {
             Ok(f) => f,
             Err(e) => return ToolCallReply::err(strip_traceback(&e)),
@@ -4914,6 +4918,11 @@ pub fn spawn(
                         }
                         Request::CollectPluginOptions { reply } => {
                             let _ = reply.send(collect_plugin_options(&rt.lua));
+                        }
+                        Request::CollectLoadedPlugins { reply } => {
+                            let mut names: Vec<String> = rt.plugins.borrow().keys().map(ToString::to_string).collect();
+                            names.sort_unstable();
+                            let _ = reply.send(names);
                         }
                         Request::CollectPackages { reply } => {
                             let declared = with_packs(&rt.lua, |packs| packs.specs.clone());
