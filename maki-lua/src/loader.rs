@@ -28,8 +28,8 @@ use crate::plugin_permissions::{
     load_plugin_permissions,
 };
 use crate::runtime::{
-    self, ClickFallback, ConfigScope, EndSession, LoadChunk, LoadContext, LuaThread, Request,
-    RestoreItem,
+    self, ClickFallback, ConfigScope, EndSession, LoadChunk, LoadContext, LuaThread, PrivateApi,
+    Request, RestoreItem,
 };
 use maki_agent::prompt::ResolvedPrompts;
 use maki_storage::id::MakiId;
@@ -72,6 +72,7 @@ impl InitFiles {
 struct BundledPlugin {
     name: &'static str,
     dir: Dir<'static>,
+    private_api: Option<PrivateApi>,
 }
 
 /// `lib` is not a default builtin; it exists so plugins can
@@ -79,92 +80,119 @@ struct BundledPlugin {
 static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     BundledPlugin {
         name: "sessions",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/sessions"),
     },
     BundledPlugin {
         name: "thinking",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/thinking"),
     },
     BundledPlugin {
         name: "index",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/index"),
     },
     BundledPlugin {
         name: "webfetch",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/webfetch"),
     },
     BundledPlugin {
         name: "websearch",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/websearch"),
     },
     BundledPlugin {
         name: "bash",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/bash"),
     },
     BundledPlugin {
         name: "batch",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/batch"),
     },
     BundledPlugin {
         name: "grep",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/grep"),
     },
     BundledPlugin {
         name: "glob",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/glob"),
     },
     BundledPlugin {
         name: "skill",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/skill"),
     },
     BundledPlugin {
         name: "question",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/question"),
     },
     BundledPlugin {
         name: "todo_write",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/todo_write"),
     },
     BundledPlugin {
         name: "read",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/read"),
     },
     BundledPlugin {
         name: "write",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/write"),
     },
     BundledPlugin {
         name: "edit",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/edit"),
     },
     // Below the tools it pre-approves: `memory` allows writes into its own
     // state dir, and a rule can only name a registered tool.
     BundledPlugin {
         name: "memory",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/memory"),
     },
     BundledPlugin {
         name: "task",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/task"),
     },
     BundledPlugin {
         name: "code_execution",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/code_execution"),
     },
     BundledPlugin {
         name: "completion",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/completion"),
     },
     BundledPlugin {
+        name: "claude_code",
+        private_api: Some(crate::api::claude_code::create_private_module),
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/claude_code"),
+    },
+    BundledPlugin {
         name: "view_image",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/view_image"),
     },
     BundledPlugin {
         name: "lib",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/lib"),
     },
     BundledPlugin {
         name: "list",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/list"),
     },
     // The rest register no tool. They declare a provider maki ships, on
@@ -172,30 +200,37 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     // keeps that surface honest.
     BundledPlugin {
         name: "synthetic",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/synthetic"),
     },
     BundledPlugin {
         name: "deepseek",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/deepseek"),
     },
     BundledPlugin {
         name: "mistral",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/mistral"),
     },
     BundledPlugin {
         name: "tensorx",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/tensorx"),
     },
     BundledPlugin {
         name: "regolo",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/regolo"),
     },
     BundledPlugin {
         name: "requesty",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/requesty"),
     },
     BundledPlugin {
         name: "openrouter",
+        private_api: None,
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/openrouter"),
     },
 ];
@@ -546,6 +581,7 @@ impl PluginHost {
                     // The one load that ships inside the binary, and so the
                     // one that may declare a provider under a built-in slug.
                     authority: DeclAuthority::Bundled,
+                    private_api: bundled.private_api,
                     ..LoadContext::plain(None, permissions)
                 },
             )?;
@@ -573,7 +609,7 @@ impl PluginHost {
     }
 
     /// Option specs declared by loaded plugins via `maki.api.register_options`,
-    /// keyed by plugin name. Used by docgen.
+    /// keyed by plugin name.
     pub fn plugin_options(&self) -> Result<PluginOptionSpecs, PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.inner
@@ -737,6 +773,7 @@ impl PluginHost {
                     revision_guard: package.revision_guard.clone(),
                     package: true,
                     authority: DeclAuthority::ThirdParty,
+                    private_api: None,
                 },
                 reply: reply_tx,
             })
@@ -814,6 +851,7 @@ impl PluginHost {
                 revision_guard,
                 package: true,
                 authority: DeclAuthority::ThirdParty,
+                private_api: None,
             },
         )
     }
@@ -1373,6 +1411,47 @@ mod tests {
 
     const GLOBAL_TRUST_PATH: &str = "~/src/me/*";
     const PROJECT_TRUST_PATH: &str = "**";
+
+    #[test_case("ordinary")]
+    #[test_case("claude_code")]
+    fn private_claude_helpers_require_bundled_authority(name: &str) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            name,
+            r#"
+            assert(maki.claude_code == nil)
+            assert(not pcall(require, "maki.claude_code.internal"))
+        "#,
+        )
+        .unwrap();
+    }
+
+    #[test_case(include_str!("../../plugins/claude_code/tests/spec.lua") ; "plugin_spec")]
+    #[test_case(include_str!("../../plugins/claude_code/tests/jobs.lua") ; "job_spec")]
+    fn claude_code_bundled_spec(source: &str) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.send_load(
+            Arc::from(crate::api::claude_code::PLUGIN),
+            vec![LoadChunk::bundled(crate::api::claude_code::PLUGIN, source)],
+            LoadContext {
+                authority: DeclAuthority::Bundled,
+                private_api: Some(crate::api::claude_code::create_private_module),
+                ..LoadContext::plain(None, PluginPermissions::trusted())
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn loaded_plugins_include_plugins_without_options() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("empty", "return {}").unwrap();
+        assert_eq!(host.loaded_plugins().unwrap(), ["empty"]);
+        assert!(host.load_source("broken", "error('broken')").is_err());
+        assert_eq!(host.loaded_plugins().unwrap(), ["empty"]);
+        host.unload("empty").unwrap();
+        assert!(host.loaded_plugins().unwrap().is_empty());
+    }
 
     /// Closing the queue and reading it are one message. A Lua task can record
     /// an activation between a separate read and close, and a close that threw

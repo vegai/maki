@@ -2,6 +2,7 @@ pub(crate) mod agent;
 pub(crate) mod r#async;
 pub(crate) mod autocmd;
 pub(crate) mod base64;
+pub(crate) mod claude_code;
 pub(crate) mod env;
 pub(crate) mod r#fn;
 pub(crate) mod fs;
