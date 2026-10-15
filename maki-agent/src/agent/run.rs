@@ -6,7 +6,7 @@ use arc_swap::ArcSwap;
 use serde_json::{Value, json};
 use tracing::{debug, error, info, warn};
 
-use maki_providers::provider::Provider;
+use maki_providers::provider::{Provider, RequestScope};
 use maki_providers::{
     ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, ImageSource, InputTransformation, Message,
     Model, RequestOptions, Role, StopReason, StreamResponse,
@@ -542,7 +542,10 @@ impl<'h> Agent<'h> {
                 tools,
                 opts: self.opts,
                 output_budget: self.config.max_turn_output,
-                session_id: self.session_id.as_ref(),
+                scope: RequestScope {
+                    session_id: self.session_id.as_ref(),
+                    cwd: self.permissions.cwd(),
+                },
                 retry: self.timeouts.retry,
             },
             Some(self.gauge),
@@ -668,6 +671,7 @@ impl<'h> Agent<'h> {
             model: &self.model,
             cancel: &self.cancel,
             context_size: self.gauge.size(),
+            cwd: self.permissions.cwd(),
         }
     }
 
@@ -1028,6 +1032,7 @@ impl<'h> Agent<'h> {
             model: &self.model,
             cancel: &self.cancel,
             context_size: context_size_before,
+            cwd: self.permissions.cwd(),
         };
         let Compacted {
             usage: compaction_usage,
@@ -1151,7 +1156,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use maki_config::ProjectConfig;
-    use maki_providers::provider::{BoxFuture, Provider};
+    use maki_providers::provider::{BoxFuture, Provider, RequestScope};
     use maki_providers::{
         ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
         StreamResponse, ThinkingSupport, TokenUsage,
@@ -1240,7 +1245,7 @@ mod tests {
             tools: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _scope: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
                 self.requests.lock().unwrap().push(CapturedRequest {
@@ -1281,7 +1286,7 @@ mod tests {
             _: &'a Value,
             ptx: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _scope: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 if let Some(text) = self.delta {
@@ -1856,8 +1861,10 @@ mod tests {
                     system: "system".into(),
                     tools: RequestTools::assembled(
                         serde_json::json!([{ "name": tool }]),
+                        &LocalTools::default(),
                         &AgentConfig::default(),
                         model,
+                        ToolAudience::MAIN,
                     ),
                     facts: Some(PromptFacts {
                         model: model.spec(),
@@ -1922,8 +1929,10 @@ mod tests {
                     system: format!("system {facts:?}"),
                     tools: RequestTools::assembled(
                         serde_json::json!([{ "name": *world.tool.lock().unwrap() }]),
+                        &LocalTools::default(),
                         &AgentConfig::default(),
                         model,
+                        ToolAudience::MAIN,
                     ),
                     facts: (!*world.host_written.lock().unwrap()).then_some(facts),
                     authored: world.authored.lock().unwrap().to_string(),
@@ -2602,7 +2611,7 @@ mod tests {
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _scope: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
                 let mut remaining = self.0.lock().unwrap();
@@ -2667,7 +2676,7 @@ mod tests {
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _scope: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             let thinking = messages
                 .iter()

@@ -11,6 +11,7 @@
 //! why each test here boots its own host and leans on `cargo nextest` giving
 //! every test its own process.
 
+use maki_providers::provider::RequestScope;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -32,6 +33,10 @@ use maki_storage::auth::{load_plugin_auth, lock_plugin_store};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use test_case::test_case;
+
+#[path = "common/environment.rs"]
+#[allow(dead_code)]
+mod environment;
 
 const SLUG: &str = "acmelua";
 const DISPLAY_NAME: &str = "Acme (Lua)";
@@ -179,7 +184,7 @@ fn isolated_state() -> TempDir {
         "XDG_DATA_HOME",
         "XDG_CACHE_HOME",
     ] {
-        unsafe { std::env::set_var(var, dir.path()) };
+        environment::set(var, dir.path());
     }
     dir
 }
@@ -273,7 +278,7 @@ impl Fixture {
 
     fn at(base_url: &str, server: Requests) -> Self {
         let state = isolated_state();
-        unsafe { std::env::set_var(BASE_URL_ENV, base_url) };
+        environment::set(BASE_URL_ENV, base_url);
 
         let host = plugin_host();
         host.load_plugin_file(&fixture_path()).expect(LOAD_FAILED);
@@ -334,7 +339,10 @@ fn stream(
             thinking,
             fast: false,
         },
-        None,
+        RequestScope {
+            session_id: None,
+            cwd: Path::new("."),
+        },
     ));
     drop(tx);
     (rx.drain().collect(), result)

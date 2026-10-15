@@ -21,6 +21,8 @@
 //! slug), so [`every_golden_replays`] runs each file in a child process of
 //! this binary. Nothing one case leaves behind can reach the next.
 
+use super::environment;
+use maki_providers::provider::RequestScope;
 use std::collections::BTreeMap;
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
@@ -325,10 +327,10 @@ impl Replay {
     fn open(slug: &str, script: &'static [Canned]) -> Self {
         let home = isolated_state();
         let (base_url, requests) = serve(script);
-        unsafe { env::set_var(base_url_env_var(slug), base_url) };
+        environment::set(&base_url_env_var(slug), base_url);
         let host = load_bundled(slug);
         let key_env = plugin::spec(slug).expect(NOT_DECLARED).api_key_env;
-        unsafe { env::set_var(key_env, API_KEY) };
+        environment::set(key_env, API_KEY);
         let provider = plugin::create(slug, Timeouts::default()).expect(CREATE_FAILED);
         Self {
             provider,
@@ -410,7 +412,10 @@ impl Replay {
                 thinking: turn.thinking.into(),
                 fast: false,
             },
-            turn.session.as_ref(),
+            RequestScope {
+                session_id: turn.session.as_ref(),
+                cwd: Path::new("."),
+            },
         ));
         drop(tx);
         (rx.drain().collect(), result)

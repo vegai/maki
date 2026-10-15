@@ -49,6 +49,7 @@ impl TaskOutcome {
 #[serde(rename_all = "lowercase")]
 pub(crate) enum TaskStatus {
     Working,
+    Queued,
     Done,
     Error,
 }
@@ -182,7 +183,7 @@ pub(crate) fn diff_task_states<'a>(
     for task in current {
         let announce = match previous.iter().find(|(id, _)| id == task.id) {
             Some((_, status)) => *status != task.status,
-            None => task.status == TaskStatus::Working,
+            None => matches!(task.status, TaskStatus::Working | TaskStatus::Queued),
         };
         if announce {
             emit(task);

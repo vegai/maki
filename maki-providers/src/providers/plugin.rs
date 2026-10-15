@@ -10,7 +10,6 @@ use maki_config::host_allowed;
 use maki_config::providers::{Protocol, ProvidersConfig, base_url_override, plan_base_url};
 use maki_storage::StateDir;
 use maki_storage::auth::{lock_credentials, plugin_auth_stamp};
-use maki_storage::id::SessionRef;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, warn};
@@ -18,7 +17,7 @@ use url::{Host, Url};
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelInfo};
 use crate::pricing::PricingSchedule;
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use crate::spec::{BASES, ProviderRegistry, ProviderSpec};
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
@@ -1177,14 +1176,17 @@ impl PluginProvider {
         })
     }
 
-    async fn models(&self) -> Result<Vec<ModelInfo>, AgentError> {
+    async fn models(&self, listing: ModelListing) -> Result<Vec<ModelInfo>, AgentError> {
         self.entry.ensure_auth().await?;
         // Rows describe models, they do not bound the catalogue, so without a
         // hook the listing is whatever the codec or base serves. Listing the
         // rows too, and falling back to them alone, is `fetch_all_models`'s job.
         match &self.entry.hooks.list_models {
             Some(hook) => hook.call(()).await,
-            None => self.inner.list_models().await,
+            None => match listing {
+                ModelListing::Cached => self.inner.list_models().await,
+                ModelListing::Refresh => self.inner.list_models_fresh().await,
+            },
         }
     }
 
@@ -1194,6 +1196,18 @@ impl PluginProvider {
             Some(hook) => hook.call(()).await,
             None => self.inner.fetch_usage().await,
         }
+    }
+}
+
+impl PluginProvider {
+    fn list_models_with(
+        &self,
+        listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async move {
+            let result = self.models(listing).await;
+            self.mapped(result).await
+        })
     }
 }
 
@@ -1207,7 +1221,7 @@ impl Provider for PluginProvider {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let result = async {
@@ -1225,7 +1239,7 @@ impl Provider for PluginProvider {
                     let attempt = async {
                         let result = self
                             .inner
-                            .stream_message(model, messages, system, tools, &tx, opts, session_id)
+                            .stream_message(model, messages, system, tools, &tx, opts, scope.clone())
                             .await;
                         drop(tx);
                         result
@@ -1279,10 +1293,11 @@ impl Provider for PluginProvider {
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async move {
-            let result = self.models().await;
-            self.mapped(result).await
-        })
+        self.list_models_with(ModelListing::Cached)
+    }
+
+    fn list_models_fresh(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        self.list_models_with(ModelListing::Refresh)
     }
 
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
@@ -1345,10 +1360,13 @@ pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, Agent
 
     let inner = match entry.target {
         Target::Base(spec) => {
-            let native = spec.native().ok_or_else(|| AgentError::Config {
-                message: format!("base provider '{}' has no constructor", spec.slug),
-            })?;
-            (native.with_auth)(shared, timeouts, prefix)
+            let with_auth = spec
+                .native()
+                .and_then(|native| native.with_auth)
+                .ok_or_else(|| AgentError::Config {
+                    message: format!("base provider '{}' has no constructor", spec.slug),
+                })?;
+            with_auth(shared, timeouts, prefix)
         }
         Target::Codec(protocol) => codec::build(codec_options(&entry, protocol), shared, timeouts),
     };
@@ -1556,6 +1574,7 @@ pub fn logout(slug: &str) -> Result<bool, AgentError> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
@@ -1775,7 +1794,7 @@ mod tests {
             _tools: &'a Value,
             _event_tx: &'a Sender<ProviderEvent>,
             _opts: RequestOptions,
-            _session_id: Option<&'a SessionRef>,
+            _scope: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
                 Err(AgentError::Config {
@@ -2342,7 +2361,10 @@ mod tests {
             &serde_json::json!([]),
             &tx,
             RequestOptions::default(),
-            None,
+            RequestScope {
+                session_id: None,
+                cwd: Path::new("."),
+            },
         ));
 
         assert!(
@@ -2387,7 +2409,10 @@ mod tests {
             &serde_json::json!([]),
             &tx,
             RequestOptions::default(),
-            None,
+            RequestScope {
+                session_id: None,
+                cwd: Path::new("."),
+            },
         ));
 
         assert_eq!(requests.lock().unwrap().len(), 1, "{MISSED_ORIGIN}");

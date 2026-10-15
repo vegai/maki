@@ -89,6 +89,7 @@ struct ContextSpec {
     instructions: String,
     slots: Arc<ResolvedSlots>,
     config: AgentConfig,
+    local_tools: LocalTools,
     excluded_tools: Vec<&'static str>,
     mcp: bool,
     system_override: Option<String>,
@@ -105,12 +106,14 @@ impl ContextSpec {
         config: AgentConfig,
         excluded_tools: Vec<&'static str>,
         mcp: Option<&McpHandle>,
+        local_tools: LocalTools,
     ) -> Self {
         Self {
             vars,
             instructions: instructions.text.clone(),
             slots,
             config,
+            local_tools,
             excluded_tools,
             mcp: mcp.is_some(),
             system_override: None,
@@ -121,6 +124,7 @@ impl ContextSpec {
     fn render(&self, model: &Model, workflow: bool) -> RunContext {
         let tools = RequestTools::build(
             ToolRegistry::global(),
+            &self.local_tools,
             &self.vars,
             model,
             &self.config,
@@ -150,12 +154,8 @@ impl ContextSpec {
 /// would put in the model's context from MCP (always-load definitions and
 /// `tool_search`). Probed as [`ToolDeferral::Client`] because the native
 /// array lists every deferred definition too.
-fn advertised_tool_names(tools: &Value, mcp: Option<&McpSession>) -> Vec<String> {
-    let mut probe = tools.clone();
-    if let Some(mcp) = mcp {
-        mcp.extend_tools(&mut probe, ToolDeferral::Client);
-    }
-    extract_tool_names(&probe)
+fn advertised_tool_names(tools: &RequestTools, mcp: Option<&McpSession>) -> Vec<String> {
+    extract_tool_names(&agent::request_tools(tools, mcp, ToolDeferral::Client))
 }
 
 pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
@@ -171,6 +171,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
         params.config.clone(),
         params.excluded_tools,
         params.mcp_handle.as_ref(),
+        LocalTools::default(),
     );
     let initial = spec.render(&params.model, params.defaults.workflow);
     let context = spec.builder();
@@ -179,7 +180,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
         .mcp_handle
         .clone()
         .map(|h| McpSession::new(h, &params.resumed.history));
-    let tool_names = advertised_tool_names(initial.tools.definitions(), mcp.as_ref());
+    let tool_names = advertised_tool_names(&initial.tools, mcp.as_ref());
 
     let (guard, events) = event_stream();
     let event_tx = guard.sender(0);
@@ -315,6 +316,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             params.config.clone(),
             params.excluded_tools,
             params.mcp_handle.as_ref(),
+            params.local_tools.clone(),
         )
     };
     let initial = spec.render(&params.model, params.defaults.workflow);
@@ -324,7 +326,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
         .mcp_handle
         .clone()
         .map(|h| McpSession::new(h, &params.resumed.history));
-    let tool_names = advertised_tool_names(initial.tools.definitions(), mcp.as_ref());
+    let tool_names = advertised_tool_names(&initial.tools, mcp.as_ref());
 
     let (guard, events) = event_stream();
     let base_tx = guard.sender(0);
@@ -512,6 +514,7 @@ mod tests {
     const BODY_EVENT: &str = "the body's event must be delivered before the close";
     const STILL_WORKING: &str = "await_shutdown must not return while the task still works";
     const TASK_DROPPED: &str = "await_shutdown dropped a task that had work left";
+    const MODEL_SPEC: &str = "anthropic/claude-sonnet-4-5";
 
     /// A host-written prompt never had maki's facts in it. If the frame
     /// claimed it did, a later edit would be announced to a model that never
@@ -541,6 +544,7 @@ mod tests {
                 AgentConfig::default(),
                 Vec::new(),
                 None,
+                LocalTools::default(),
             )
         };
         let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
@@ -560,9 +564,16 @@ mod tests {
     #[test]
     fn advertised_names_show_tool_search_not_deferred_tools() {
         let base = serde_json::json!([{"name": "read"}]);
+        let tools = RequestTools::assembled(
+            base.clone(),
+            &LocalTools::default(),
+            &AgentConfig::default(),
+            &Model::from_spec(MODEL_SPEC).unwrap(),
+            ToolAudience::MAIN,
+        );
         let mcp =
             crate::mcp::test_support::stub_session(&[("srv.fetch_issue", "Fetch a GitHub issue")]);
-        let names = advertised_tool_names(&base, Some(&mcp));
+        let names = advertised_tool_names(&tools, Some(&mcp));
         assert_eq!(
             names,
             vec!["read", crate::mcp::TOOL_SEARCH_TOOL_NAME],
@@ -573,7 +584,7 @@ mod tests {
             serde_json::json!([{"name": "read"}]),
             "probing must not bake MCP entries into the base tools"
         );
-        assert_eq!(advertised_tool_names(&base, None), vec!["read"]);
+        assert_eq!(advertised_tool_names(&tools, None), vec!["read"]);
     }
 
     /// The ordering the SDK exit rests on: the stream ends when the run ends,

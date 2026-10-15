@@ -580,6 +580,15 @@ impl PluginHost {
         reply_rx.recv().map_err(|_| PluginError::HostDead)
     }
 
+    pub fn loaded_plugins(&self) -> Result<Vec<String>, PluginError> {
+        let (reply, receiver) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::CollectLoadedPlugins { reply })
+            .map_err(|_| PluginError::HostDead)?;
+        receiver.recv().map_err(|_| PluginError::HostDead)
+    }
+
     /// Runs a source as the global `init.lua`.
     ///
     /// The one scope where `maki.pack.add` may declare packages, so it is its

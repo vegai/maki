@@ -263,7 +263,8 @@ pub fn generate() -> String {
     let defs = registry.definitions(
         &vars,
         &DescriptionContext {
-            filter: &ToolFilter::All,
+            local_tools: None,
+            filter: &ToolFilter::default(),
             audience: ToolAudience::MAIN,
             workflow: false,
             mcp: false,

@@ -747,6 +747,9 @@ pub enum AgentEvent {
         total: u32,
         cache: u32,
     },
+    ProviderWaiting {
+        message: Option<String>,
+    },
     /// End of a session's event stream. Emitted only by
     /// [`EventStreamGuard::drop`] and swallowed by [`SessionEvents::next`], so
     /// a consumer sees `None` and never this variant.

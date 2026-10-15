@@ -1,0 +1,489 @@
+//! Shared launch validation for the provider and the Lua worker.
+
+use std::collections::{HashMap, HashSet};
+use std::env;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
+use serde_json::{Value, json};
+
+use super::checks;
+use super::error::Error;
+use super::stream::{self, API_ERROR_MARK, EventKind, StreamMode, count};
+
+pub const EMPTY_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
+pub(super) const CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
+pub(super) const HOME_ENV: &str = "HOME";
+const TMPDIR_ENV: &str = "TMPDIR";
+
+pub use super::checks::{GIT_ENTRY, git_directory};
+pub use super::run::{VersionCheck, invalidate_profile as invalidate_version};
+pub use super::stream::usage_of as plan_usage;
+
+const BASE_ARGS: &[&str] = &[
+    "--print",
+    "--input-format",
+    "stream-json",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--no-session-persistence",
+    "--restricted",
+    "--permission-prompts",
+    "none",
+    "--setting-sources",
+    "",
+    "--strict-mcp-config",
+];
+
+pub fn base_args(model: &str, tools: &str, mode: &str, settings: &str) -> Vec<String> {
+    let mut args: Vec<_> = BASE_ARGS.iter().map(|arg| (*arg).to_owned()).collect();
+    args.extend(
+        [
+            "--model",
+            model,
+            "--tools",
+            tools,
+            "--permission-mode",
+            mode,
+            "--settings",
+            settings,
+        ]
+        .map(str::to_owned),
+    );
+    args
+}
+
+pub fn base_settings() -> Value {
+    json!({ "disableAllHooks": true, "autoMemoryEnabled": false, "claudeMdExcludes": ["**"], "disableClaudeAiConnectors": true })
+}
+
+pub fn handshake() -> Value {
+    json!(checks::HANDSHAKE)
+}
+
+pub fn environment(environ: HashMap<String, String>) -> (HashMap<String, String>, Vec<String>) {
+    let (env, withheld) = checks::child_env(environ);
+    (env.into_iter().collect(), withheld)
+}
+
+pub struct LaunchPreparation {
+    pub env: Vec<(String, String)>,
+    pub withheld: Vec<String>,
+    pub config_dir: PathBuf,
+    pub own_config_dir: Option<PathBuf>,
+    pub temp_dir: PathBuf,
+    pub local_dirs: Vec<PathBuf>,
+    pub git_dir: Option<PathBuf>,
+}
+
+pub(super) fn prepare_launch(
+    vars: Vec<(String, String)>,
+    configured: Option<PathBuf>,
+    cwd: &Path,
+) -> Result<LaunchPreparation, Error> {
+    let var = |name: &str| {
+        vars.iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| OsString::from(value))
+    };
+    let own_config_dir = var(CONFIG_DIR_ENV)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    let config_dir = login_dir(&vars, configured.as_deref())?;
+    let temp_dir = var(TMPDIR_ENV).map_or_else(env::temp_dir, PathBuf::from);
+    let (mut env, withheld) = checks::child_env(vars);
+    env.retain(|(name, value)| name != CONFIG_DIR_ENV || !value.is_empty());
+    if configured.is_some() {
+        env.retain(|(name, _)| name != CONFIG_DIR_ENV);
+        env.push((CONFIG_DIR_ENV.to_owned(), config_dir.display().to_string()));
+    }
+    let (local_dirs, git_dir) = checks::local_settings_dirs(cwd)?;
+    let conflicts = file_conflicts(&config_dir, cwd, &local_dirs);
+    if !conflicts.is_empty() {
+        return Err(Error::SkippedSettings(conflicts));
+    }
+    Ok(LaunchPreparation {
+        env,
+        withheld,
+        config_dir,
+        own_config_dir,
+        temp_dir,
+        local_dirs,
+        git_dir,
+    })
+}
+
+pub(super) fn login_dir(
+    vars: &[(String, String)],
+    configured: Option<&Path>,
+) -> Result<PathBuf, Error> {
+    let var = |name: &str| {
+        vars.iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| OsString::from(value))
+    };
+    checks::config_dir(
+        configured
+            .map(OsString::from)
+            .or_else(|| var(CONFIG_DIR_ENV)),
+        var(HOME_ENV),
+    )
+}
+
+pub fn prepared_launch(
+    vars: HashMap<String, String>,
+    configured: Option<String>,
+    cwd: &Path,
+) -> Result<LaunchPreparation, String> {
+    prepare_launch(
+        vars.into_iter().collect(),
+        configured.map(PathBuf::from),
+        cwd,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn response(value: &Value) -> &Value {
+    if value["type"] == "control_response" {
+        &value["response"]["response"]
+    } else {
+        value
+    }
+}
+
+pub fn account_problem(init: &Value, modes: &[String]) -> Option<String> {
+    checks::account_problem_in(response(init), modes).map(|problem| problem.to_string())
+}
+
+pub fn worker_policy(settings: &Value, hooks: &Value, expected: &Value) -> Result<(), String> {
+    if expected["permissions"]["blockReadsOutsideWorkingDirectories"] != true
+        || expected["permissions"]["deny"].as_array().is_none()
+        || expected
+            .get("sandbox")
+            .is_some_and(|sandbox| !sandbox.is_object())
+    {
+        return Err(
+            "expected worker settings must contain read restrictions and valid sandbox settings"
+                .to_owned(),
+        );
+    }
+    let settings = response(settings);
+    if let Some(problem) = checks::policy_problem_in(settings, response(hooks), false) {
+        return Err(problem.to_string());
+    }
+    let effective = &settings["effective"];
+    if !effective.is_object() {
+        return Err("Claude Code does not report effective settings".to_owned());
+    }
+    match worker_problem(effective, expected) {
+        Some(problem) => Err(problem),
+        None => Ok(()),
+    }
+}
+
+pub fn init_problem(
+    event: &Value,
+    version: &str,
+    cwd: &Path,
+    tools: HashSet<String>,
+    modes: &[String],
+) -> Option<String> {
+    checks::init_problem_in(event, version, cwd, &tools, modes, None)
+        .map(|problem| problem.to_string())
+}
+
+pub struct WorkerEvent {
+    pub event: Value,
+    pub model_checked: bool,
+    pub problem: Option<String>,
+}
+
+/// Workers may compact and retry within their own run. Provider turns must preserve maki's
+/// transcript and retry accounting, so their classifier rejects both events.
+pub fn classify(
+    line: &str,
+    accepted: bool,
+    expected_model: Option<&str>,
+    mut model_checked: bool,
+) -> Result<WorkerEvent, String> {
+    let event = stream::parse_event(line).map_err(|error| error.to_string())?;
+    let mut check = || -> Result<(), Error> {
+        let kind = stream::classify(&event, StreamMode::Worker, accepted)?;
+        if let Some(expected) = expected_model {
+            let message = if kind == EventKind::Stream {
+                &event["event"]["message"]
+            } else {
+                &event["message"]
+            };
+            if event[API_ERROR_MARK] != true
+                && let Some(ran) = message["model"].as_str()
+            {
+                stream::check_model(ran, expected)?;
+                model_checked = true;
+            }
+            if kind == EventKind::Result
+                && event["subtype"] == stream::SUCCESS
+                && event["is_error"] != true
+                && !model_checked
+            {
+                return Err(Error::NoModel);
+            }
+        }
+        Ok(())
+    };
+    let problem = check().err().map(|error| error.to_string());
+    Ok(WorkerEvent {
+        event,
+        model_checked,
+        problem,
+    })
+}
+
+pub fn usage_counts(usage: &Value) -> Value {
+    json!({
+        "input_tokens": count(usage, "input_tokens"),
+        "cache_read_input_tokens": count(usage, "cache_read_input_tokens"),
+        "cache_creation_input_tokens": count(usage, "cache_creation_input_tokens"),
+        "output_tokens": count(usage, "output_tokens"),
+    })
+}
+
+pub fn resolved_model(account: &Value, requested: &str) -> Option<String> {
+    response(account)["models"]
+        .as_array()?
+        .iter()
+        .find(|offer| offer["value"] == requested)?["resolvedModel"]
+        .as_str()
+        .filter(|model| !model.is_empty())
+        .map(str::to_owned)
+}
+
+pub async fn version_check(executable: &Path) -> Result<VersionCheck, String> {
+    super::run::version_check(executable)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub fn checkout_root(cwd: &Path) -> Result<PathBuf, String> {
+    let cwd = cwd.canonicalize().map_err(|error| error.to_string())?;
+    checks::checkout_root(&cwd).map_err(|error| error.to_string())
+}
+
+fn file_conflicts(config_dir: &Path, cwd: &Path, local_dirs: &[PathBuf]) -> Vec<String> {
+    checks::file_conflicts(&checks::skipped_settings(config_dir, cwd, local_dirs))
+}
+
+pub fn subscription_type(account: &Value) -> Option<String> {
+    response(account)["account"]["subscriptionType"]
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn empty_array(value: Option<&Value>) -> bool {
+    value.is_none_or(|value| value.as_array().is_some_and(Vec::is_empty))
+}
+
+fn foreign_path(value: Option<&Value>, ours: &Value) -> Option<String> {
+    let paths = value?;
+    let Some(paths) = paths.as_array() else {
+        return Some("paths given as a table".to_owned());
+    };
+    paths
+        .iter()
+        .find(|path| {
+            !ours
+                .as_array()
+                .is_some_and(|allowed| allowed.contains(path))
+        })
+        .map(|path| {
+            path.as_str()
+                .map_or_else(|| path.to_string(), str::to_owned)
+        })
+}
+
+fn sandbox_problem(sandbox: &Value, expected: &Value) -> Option<String> {
+    let outside = "Claude Code can run shell commands outside its sandbox";
+    let network_error = "Claude Code's sandbox lets shell commands use the network";
+    let read_error = "Claude Code's sandbox lets shell commands read paths that maki denies";
+    let sandbox = match sandbox.as_object() {
+        Some(sandbox) => sandbox,
+        None => return Some(outside.to_owned()),
+    };
+    let safe_keys = [
+        "enabled",
+        "failIfUnavailable",
+        "autoAllowBashIfSandboxed",
+        "allowUnsandboxedCommands",
+        "excludedCommands",
+        "enableWeakerNestedSandbox",
+        "network",
+        "filesystem",
+    ];
+    if sandbox.keys().any(|key| !safe_keys.contains(&key.as_str()))
+        || sandbox.get("enabled") != Some(&Value::Bool(true))
+        || sandbox.get("failIfUnavailable") != Some(&Value::Bool(true))
+        || sandbox.get("allowUnsandboxedCommands") != Some(&Value::Bool(false))
+        || !empty_array(sandbox.get("excludedCommands"))
+        || sandbox
+            .get("enableWeakerNestedSandbox")
+            .is_some_and(|value| value != false)
+    {
+        return Some(outside.to_owned());
+    }
+    let network = match sandbox.get("network").and_then(Value::as_object) {
+        Some(network) => network,
+        None => return Some(network_error.to_owned()),
+    };
+    let network_keys = [
+        "strictAllowlist",
+        "allowedDomains",
+        "allowAllUnixSockets",
+        "allowUnixSockets",
+        "allowLocalBinding",
+        "deniedDomains",
+    ];
+    if network
+        .keys()
+        .any(|key| !network_keys.contains(&key.as_str()))
+        || network.get("strictAllowlist") != Some(&Value::Bool(true))
+        || !empty_array(network.get("allowedDomains"))
+        || !empty_array(network.get("allowUnixSockets"))
+        || network
+            .get("allowAllUnixSockets")
+            .is_some_and(|value| value != false)
+        || network
+            .get("allowLocalBinding")
+            .is_some_and(|value| value != false)
+    {
+        return Some(network_error.to_owned());
+    }
+    let filesystem = match sandbox.get("filesystem").and_then(Value::as_object) {
+        Some(filesystem) => filesystem,
+        None => return Some(read_error.to_owned()),
+    };
+    let filesystem_keys = [
+        "disabled",
+        "allowRead",
+        "denyRead",
+        "allowWrite",
+        "denyWrite",
+    ];
+    if filesystem
+        .keys()
+        .any(|key| !filesystem_keys.contains(&key.as_str()))
+        || filesystem
+            .get("disabled")
+            .is_some_and(|value| value != false)
+    {
+        return Some(read_error.to_owned());
+    }
+    let expected = &expected["filesystem"];
+    if let Some(path) = foreign_path(filesystem.get("allowRead"), &expected["allowRead"]) {
+        return Some(format!(
+            "Claude Code's sandbox lets shell commands read {path}"
+        ));
+    }
+    for path in expected["denyRead"].as_array().into_iter().flatten() {
+        if !filesystem
+            .get("denyRead")
+            .and_then(Value::as_array)
+            .is_some_and(|denied| denied.contains(path))
+        {
+            return Some(format!(
+                "Claude Code's sandbox lets shell commands read {}",
+                path.as_str().unwrap_or_default()
+            ));
+        }
+    }
+    foreign_path(filesystem.get("allowWrite"), &expected["allowWrite"])
+        .map(|path| format!("Claude Code's sandbox lets shell commands write to {path}"))
+}
+
+fn worker_problem(effective: &Value, expected: &Value) -> Option<String> {
+    let permissions = &effective["permissions"];
+    if permissions["blockReadsOutsideWorkingDirectories"] != true {
+        return Some("Claude Code does not block reads outside the project".to_owned());
+    }
+    if !empty_array(permissions.get("additionalDirectories")) {
+        let directories = &permissions["additionalDirectories"];
+        let shown = directories.as_array().map_or_else(
+            || "directories given as a table".to_owned(),
+            |paths| {
+                paths
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+        );
+        return Some(format!("Claude Code can also read {shown}"));
+    }
+    for rule in expected["permissions"]["deny"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        if !permissions["deny"]
+            .as_array()
+            .is_some_and(|denied| denied.contains(rule))
+        {
+            return Some(format!(
+                "Claude Code does not apply the deny rule {}",
+                rule.as_str().unwrap_or_default()
+            ));
+        }
+    }
+    expected
+        .get("sandbox")
+        .and_then(|sandbox| sandbox_problem(&effective["sandbox"], sandbox))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sandbox_problem, worker_problem};
+    use serde_json::{Value, json};
+    use test_case::test_case;
+
+    const READ_RULE: &str = "Read(./secrets)";
+    const DENIED: &str = "/checkout";
+    const OUTSIDE: &str = "/outside";
+
+    fn expected() -> Value {
+        json!({
+            "permissions": { "blockReadsOutsideWorkingDirectories": true, "deny": [READ_RULE] },
+            "sandbox": {
+                "enabled": true, "failIfUnavailable": true, "allowUnsandboxedCommands": false,
+                "network": { "strictAllowlist": true, "allowedDomains": [] },
+                "filesystem": { "denyRead": [DENIED], "allowRead": [], "allowWrite": [] }
+            }
+        })
+    }
+
+    #[test_case("/excludedCommands", json!(null) ; "null_command_exclusions")]
+    #[test_case("/network/allowedDomains", json!([null]) ; "null_domain_entry")]
+    #[test_case("/network/allowAllUnixSockets", json!(null) ; "null_socket_policy")]
+    #[test_case("/filesystem/allowRead", json!([null]) ; "null_read_entry")]
+    #[test_case("/filesystem/allowWrite", json!([OUTSIDE]) ; "foreign_write_path")]
+    #[test_case("/unknownEscape", json!(true) ; "unknown_sandbox_setting")]
+    fn effective_sandbox_rejects_nulls_and_unknown_escape_settings(path: &str, value: Value) {
+        let expected = expected();
+        let mut sandbox = expected["sandbox"].clone();
+        let (parent, key) = path.rsplit_once('/').unwrap();
+        sandbox
+            .pointer_mut(parent)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(key.to_owned(), value);
+        assert!(sandbox_problem(&sandbox, &expected["sandbox"]).is_some());
+    }
+
+    #[test]
+    fn null_additional_directories_are_not_an_empty_list() {
+        let expected = expected();
+        let mut effective = expected.clone();
+        effective["permissions"]["additionalDirectories"] = json!([null]);
+        assert!(worker_problem(&effective, &expected).is_some());
+    }
+}

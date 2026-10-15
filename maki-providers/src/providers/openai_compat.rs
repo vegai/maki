@@ -1014,7 +1014,7 @@ data: [DONE]\n";
                     ProviderEvent::ThinkingDelta { text } => thinking.push(text),
                     ProviderEvent::TextDelta { text } => text_deltas.push(text),
                     ProviderEvent::ToolUseStart { .. } => {}
-                    ProviderEvent::PromptProgress { .. } => {}
+                    ProviderEvent::PromptProgress { .. } | ProviderEvent::Waiting { .. } => {}
                 }
             }
             assert_eq!(thinking, vec!["Let me think", "..."]);

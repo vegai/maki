@@ -26,7 +26,7 @@ function M.build(tasks, query)
     if ListPicker.matches(task.name, words) then
       if not task.status then
         main = task
-      elseif task.status == "working" then
+      elseif task.status == "working" or task.status == "queued" then
         running[#running + 1] = task
       else
         finished[#finished + 1] = task

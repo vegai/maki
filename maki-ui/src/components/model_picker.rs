@@ -13,6 +13,7 @@ use maki_providers::models_cache::ModelList;
 use maki_providers::spec::{Build, ProviderRegistry};
 
 use crate::components::Overlay;
+use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::theme;
@@ -28,6 +29,8 @@ const LOADING_NOTICE: &str = "loading models...";
 fn footer_line() -> Line<'static> {
     let t = theme::current();
     Line::from(vec![
+        Span::styled("  Ctrl+r", t.keybind_key),
+        Span::styled(" refresh", t.tool_dim),
         Span::styled("  Enter", t.keybind_key),
         Span::styled(" select", t.tool_dim),
         Span::styled("  !", t.keybind_key),
@@ -62,6 +65,7 @@ fn tier_for_shortcut(key: KeyEvent) -> Option<ModelTier> {
 
 pub enum ModelPickerAction {
     Consumed,
+    Refresh,
     Select(String),
     AssignTier(String, ModelTier),
     UnassignTier(String, ModelTier),
@@ -242,6 +246,9 @@ impl ModelPicker {
     }
 
     fn handle_key_inner(&mut self, key: KeyEvent) -> ModelPickerAction {
+        if key::REFRESH.matches(key) {
+            return ModelPickerAction::Refresh;
+        }
         if let Some(tier) = tier_for_shortcut(key)
             && let Some(entry) = self.picker.selected_item()
         {

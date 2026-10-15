@@ -27,7 +27,7 @@ use maki_storage::auth::load_provider_credentials;
 use maki_storage::id::SessionRef;
 
 use crate::model::{Model, ModelInfo, ModelPricing};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, Provider, RequestScope};
 use crate::providers::anthropic::shared;
 use crate::providers::openai_compat::{
     DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiCompatProvider,
@@ -901,11 +901,11 @@ impl Provider for CatalogProvider {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.unlocked(&self.data.slug)?.clone();
-            let auth = self.data.request_auth(auth, session_id);
+            let auth = self.data.request_auth(auth, scope.session_id);
             let meta = self
                 .data
                 .models
@@ -1003,18 +1003,22 @@ impl Provider for LazyCatalogProvider {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             self.resolve()
                 .await?
-                .stream_message(model, messages, system, tools, event_tx, opts, session_id)
+                .stream_message(model, messages, system, tools, event_tx, opts, scope)
                 .await
         })
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move { self.resolve().await?.list_models().await })
+    }
+
+    fn list_models_fresh(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async move { self.resolve().await?.list_models_fresh().await })
     }
 }
 
@@ -1081,10 +1085,11 @@ mod tests {
         SessionRef, StateDir, available_if_warm, determine_catalog_format, parse_model, quirks_for,
     };
     use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
-    use crate::provider::Provider;
-    use crate::providers::{ResolvedAuth, Timeouts, opencode};
+    use crate::provider::{Provider, RequestScope};
+    use crate::providers::{ResolvedAuth, Timeouts, anthropic, claude_code, opencode};
     use crate::spec::ProviderRegistry;
     use crate::{AgentError, ModelFamily, ModelTier, RequestOptions};
+    use std::path::Path;
     use test_case::test_case;
 
     const SESSION_HEADER: &str = "x-opencode-session";
@@ -1222,7 +1227,10 @@ mod tests {
             &serde_json::json!([]),
             &tx,
             RequestOptions::default(),
-            None,
+            RequestScope {
+                session_id: None,
+                cwd: Path::new("."),
+            },
         ));
         assert!(matches!(
             result,
@@ -2012,6 +2020,26 @@ mod tests {
             Some(BUILTIN_BASE_URL),
             models,
         )
+    }
+
+    /// Use the source provider's catalog so new model prices have one canonical entry.
+    #[test]
+    fn a_provider_running_anothers_models_reads_their_catalog_entry() {
+        let (_tmp, state_dir) = temp_state_dir();
+        let models = HashMap::from([(
+            UNLISTED_MODEL.into(),
+            priced_row(UNLISTED_INPUT_PRICE, UNLISTED_OUTPUT_PRICE),
+        )]);
+        super::seed_catalog_for_tests(
+            catalog_index(anthropic::SLUG, "@ai-sdk/anthropic", None, models),
+            state_dir,
+        );
+
+        let model = Model::from_spec(&format!("{}/{UNLISTED_MODEL}", claude_code::SLUG)).unwrap();
+        assert_eq!(
+            (model.pricing.input, model.pricing.output),
+            (UNLISTED_INPUT_PRICE, UNLISTED_OUTPUT_PRICE)
+        );
     }
 
     #[test]

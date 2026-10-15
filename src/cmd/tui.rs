@@ -17,15 +17,38 @@ use maki_providers::model::Model;
 use maki_storage::StateDir;
 use maki_ui::{OpenSession, RunOutcome};
 
-use crate::cli::{Cli, normalize_tool_name};
+use crate::cli::Cli;
 use crate::provider_scripts;
 use crate::resume::{self, Resolved};
 use crate::setup;
+use maki_agent::mcp::is_wire_name;
 
 const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
 const MODEL_FALLBACK_WARNING: &str = "model resolution failed, keeping previous model";
 const POLICY_GRANT_NOTICE: &str = "folder trusted by trust.paths pattern";
+
+fn tool_filter_warnings(cli: &Cli, registry: &ToolRegistry) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (flag, names) in [
+        ("--allowed-tools", &cli.allowed_tools),
+        ("--disallowed-tools", &cli.disallowed_tools),
+    ] {
+        for name in names {
+            if registry.get(name).is_some() || is_wire_name(name) {
+                continue;
+            }
+            let mut warning = format!("no loaded tool matches '{name}' in {flag}.");
+            let suggestion = name.replace('-', "_");
+            if suggestion != *name && registry.get(&suggestion).is_some() {
+                warning.push_str(&format!(" Did you mean '{suggestion}'?"));
+            }
+            warning.push_str(" The entry remains active for tools that load later.");
+            warnings.push(warning);
+        }
+    }
+    warnings
+}
 
 /// One generation of the app: everything torn down and rebuilt on `/reload`.
 /// Dropping it joins the Lua thread via `PluginHost::drop`.
@@ -101,18 +124,13 @@ fn load_config(
         config.permissions.yolo = true;
     }
     if !cli.allowed_tools.is_empty() {
-        config.agent.allowed_tools = cli
-            .allowed_tools
-            .iter()
-            .map(|t| normalize_tool_name(t))
-            .collect::<Result<Vec<_>>>()?;
+        config.agent.allowed_tools = cli.allowed_tools.clone();
     }
     if !cli.disallowed_tools.is_empty() {
-        config.agent.disabled_tools.extend(
-            cli.disallowed_tools
-                .iter()
-                .filter_map(|t| normalize_tool_name(t).ok()),
-        );
+        config
+            .agent
+            .disabled_tools
+            .extend(cli.disallowed_tools.iter().cloned());
     }
     config.validate()?;
     Ok(config)
@@ -180,6 +198,7 @@ fn build_stack(
         },
     )?;
 
+    warnings.extend(tool_filter_warnings(cli, ToolRegistry::global()));
     let commands = discover_commands(cli.no_commands, launch.cwd);
 
     setup::remember_thinking(&mut config.session_defaults, launch.storage);

@@ -39,32 +39,8 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::cli::Cli;
-
-const TOOL_NAME_MAP: &[(&str, &str)] = &[
-    ("bash", "Bash"),
-    ("read", "Read"),
-    ("edit", "Edit"),
-    ("write", "Write"),
-    ("grep", "Grep"),
-    ("glob", "Glob"),
-    ("todo_write", "TodoWrite"),
-    ("webfetch", "WebFetch"),
-    ("websearch", "WebSearch"),
-    ("task", "Task"),
-    ("multiedit", "MultiEdit"),
-    ("code_execution", "CodeExecution"),
-    ("index", "Index"),
-    ("memory", "Memory"),
-    ("question", "Question"),
-    ("skill", "Skill"),
-];
-
-/// Emits a hyphenated-hex UUIDv7 string for Claude Code SDK wire ids
-/// (message.id, assistant message.id).
-#[allow(clippy::disallowed_methods)]
-fn wire_uuid() -> String {
-    uuid::Uuid::now_v7().to_string()
-}
+use crate::notice::{NOTIFICATION, ProviderNotice, wire_uuid};
+use crate::tool_names::maki_to_claude_tool_name;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum PermissionMode {
@@ -393,14 +369,6 @@ impl StreamSynth {
             "index": self.block_index,
         })
     }
-}
-
-fn maki_to_claude_tool_name(name: &str) -> &str {
-    TOOL_NAME_MAP
-        .iter()
-        .find(|(m, _)| *m == name)
-        .map(|(_, c)| *c)
-        .unwrap_or(name)
 }
 
 #[derive(Clone)]
@@ -1072,6 +1040,15 @@ impl EventPump {
                 text,
             } if parent_tool_use_id.is_none() => self.result_text.clone_from(text),
             AgentEvent::Steered { .. } => {}
+            AgentEvent::ProviderWaiting { message } => {
+                self.writer.emit_system(
+                    NOTIFICATION,
+                    serde_json::to_value(ProviderNotice::new(
+                        message.as_deref(),
+                        parent_tool_use_id.as_deref(),
+                    ))?,
+                )?;
+            }
             AgentEvent::Retry {
                 attempt,
                 message,
@@ -1208,19 +1185,12 @@ fn map_tool_names_in_content(content: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use crate::tool_names::claude_to_maki_tool_name;
     use flume::Receiver;
     use maki_config::ToolKey;
     use test_case::test_case;
 
     use super::*;
-
-    fn claude_to_maki_tool_name(name: &str) -> &str {
-        TOOL_NAME_MAP
-            .iter()
-            .find(|(_, c)| *c == name)
-            .map(|(m, _)| *m)
-            .unwrap_or(name)
-    }
 
     #[test_case("bash", "Bash")]
     #[test_case("read", "Read")]
@@ -1803,6 +1773,32 @@ mod tests {
             subagent: None,
             run_id: 0,
         }
+    }
+
+    #[test]
+    fn provider_waiting_emits_keyed_notifications_and_clear() {
+        const WAITING: &str = "waiting for a provider request slot";
+        let (mut pump, out_rx) = test_pump(PermissionMode::Default, flume::unbounded().0);
+        for message in [Some(WAITING.to_owned()), None] {
+            pump.handle(top_level(AgentEvent::ProviderWaiting { message }))
+                .unwrap();
+        }
+        let notices: Vec<Value> = out_rx
+            .try_iter()
+            .map(|line| serde_json::from_str(&line).unwrap())
+            .collect();
+        assert_eq!(notices.len(), 2);
+        for notice in &notices {
+            assert_eq!(notice["type"], "system");
+            assert_eq!(notice["subtype"], NOTIFICATION);
+            assert_eq!(notice["priority"], "low");
+            assert!(notice["uuid"].as_str().is_some());
+            assert_eq!(notice["session_id"], pump.session_id);
+        }
+        assert_eq!(notices[0]["text"], WAITING);
+        assert_eq!(notices[1]["text"], "");
+        assert_eq!(notices[0]["key"], notices[1]["key"]);
+        assert_eq!(pump.result_text, "");
     }
 
     /// Nothing reached the model, so a client reading `is_error` must not take

@@ -33,6 +33,8 @@ use maki_storage::sessions::SessionClaim;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::notice::{NOTIFICATION, ProviderNotice, wire_uuid};
+
 const SESSION_LINE_PREFIX: &str = "session: ";
 
 // Fails fast: silently dropping an image the caller explicitly attached
@@ -124,6 +126,17 @@ struct RetryEvent<'a> {
     attempt: u32,
     retry_delay_ms: u64,
     error: &'a str,
+    session_id: &'a SessionRef,
+}
+
+#[derive(Serialize)]
+struct NoticeEvent<'a> {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    subtype: &'static str,
+    #[serde(flatten)]
+    notice: ProviderNotice<'a>,
+    uuid: String,
     session_id: &'a SessionRef,
 }
 
@@ -323,6 +336,22 @@ pub fn run(params: PrintParams) -> Result<()> {
                 if let Some(reason) = dropped_prompt(event, parent_tool_use_id) {
                     is_error = true;
                     result_text = reason.to_owned();
+                }
+            }
+            AgentEvent::ProviderWaiting { message } => {
+                if let Some(out) = &mut verbose_out {
+                    out.emit(&NoticeEvent {
+                        event_type: "system",
+                        subtype: NOTIFICATION,
+                        notice: ProviderNotice::new(message.as_deref(), parent_tool_use_id),
+                        uuid: wire_uuid(),
+                        session_id: &session_id,
+                    })?;
+                } else if let Some(message) = message {
+                    match &subagent {
+                        Some(info) => eprintln!("{}: {message}", info.name),
+                        None => eprintln!("{message}"),
+                    }
                 }
             }
             AgentEvent::Retry {

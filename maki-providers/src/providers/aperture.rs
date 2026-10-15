@@ -8,13 +8,12 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, Provider, RequestScope};
 use crate::spec::{
     AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, NO_CURATED_MODELS, Native,
     ProviderRegistry, ProviderSpec,
 };
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
-use maki_storage::id::SessionRef;
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{ResolvedAuth, Timeouts, google, plugin};
@@ -50,20 +49,17 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
 
 /// Aperture routes onto other providers; nothing routes onto Aperture.
 pub(crate) const SPEC: ProviderSpec = ProviderSpec {
-    slug: SLUG,
-    display_name: DISPLAY_NAME,
     api_key_env: NO_ENV_VAR,
     family: ModelFamily::Generic,
     supports_thinking: false,
     supports_deferred_tools: false,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(16_384),
-    fallback_context_window: 128_000,
     models_toml: NO_CURATED_MODELS,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
-        with_auth: create_with_auth,
+        with_auth: Some(create_with_auth),
     }),
     aperture: None,
     login: Some(LoginConfig {
@@ -81,6 +77,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
         catalog: CatalogDoc::Discovered(DISCOVERY_NOTE),
         trailing_notes: &[],
     },
+    ..ProviderSpec::new(SLUG, DISPLAY_NAME, 128_000)
 };
 
 fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
@@ -262,7 +259,8 @@ impl Aperture {
         )
         .or_else(|| {
             spec.native()
-                .map(|n| (n.with_auth)(auth, self.timeouts, self.system_prefix.clone()))
+                .and_then(|n| n.with_auth)
+                .map(|with_auth| with_auth(auth, self.timeouts, self.system_prefix.clone()))
         })
     }
 }
@@ -375,7 +373,7 @@ impl Provider for Aperture {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let (provider_id, model_id) = model.id.split_once('/').unwrap_or(("", &model.id));
@@ -394,7 +392,7 @@ impl Provider for Aperture {
                         tools,
                         event_tx,
                         opts,
-                        session_id,
+                        scope,
                     )
                     .await;
             }

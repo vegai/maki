@@ -9,8 +9,8 @@ use crate::model::{ModelEntry, ModelFamily, ModelTier};
 use crate::pricing::PricingSchedule;
 use crate::provider::Provider;
 use crate::providers::{
-    ResolvedAuth, Timeouts, anthropic, aperture, copilot, custom, google, llama_cpp, ollama,
-    openai, opencode, plugin, xai, zai,
+    ResolvedAuth, Timeouts, anthropic, aperture, claude_code, copilot, custom, google, llama_cpp,
+    ollama, openai, opencode, plugin, xai, zai,
 };
 
 /// The slugs a plugin may name as its `base`, in documentation order. A `base`
@@ -37,14 +37,10 @@ pub const GENERIC_DISCOVERY_NOTE: &str =
 
 /// Everything maki knows about one provider without asking the network.
 ///
-/// This struct is the checklist for adding a native provider. Every field is
-/// mandatory in the literal, and that is the point: there is deliberately no
-/// `Default`, no `#[non_exhaustive]`, and no row uses `..`, so adding a field
-/// here breaks every row until someone answers for each one.
-///
-/// The checklist is two files: this row, and `models/<slug>.toml` next to it
-/// carrying the provider's curated table. A Lua plugin provider gets one of
-/// these built from its declaration instead, see [`plugin::spec`].
+/// Each row supplies its identity and fallback context window, then overrides
+/// the shared defaults from [`Self::new`] with its transport, model metadata
+/// and documentation. Curated models live in `models/<slug>.toml`. A Lua
+/// plugin provider builds its row from its declaration, see [`plugin::spec`].
 #[derive(Debug)]
 pub struct ProviderSpec {
     pub slug: &'static str,
@@ -58,6 +54,8 @@ pub struct ProviderSpec {
     /// borrows this row's protocol does not inherit it; see
     /// [`crate::Model::supports_deferred_tools`].
     pub supports_deferred_tools: bool,
+    /// A transport can reject images even when its model metadata supports vision.
+    pub accepts_images: bool,
     pub accepts_arbitrary_models: bool,
     pub fallback_max_output: Option<u32>,
     pub fallback_context_window: u32,
@@ -67,6 +65,11 @@ pub struct ProviderSpec {
     /// catalog, and for a declaration, which carries its rows on
     /// [`Build::Declared`].
     pub models_toml: &'static str,
+    /// The builtin whose models this provider runs under another slug, as
+    /// claude-code runs the Anthropic models through the `claude` CLI. That
+    /// builtin's curated table and models.dev entries describe these models,
+    /// and `models_toml` is [`NO_CURATED_MODELS`].
+    pub models_of: Option<&'static str>,
     /// Set by the providers whose rates move with the wall clock, so the hours
     /// sit next to the prices they scale. Everyone else bills flat.
     pub pricing_schedule: Option<&'static PricingSchedule>,
@@ -108,8 +111,10 @@ pub struct Native {
     /// Built from config and env by maki itself.
     pub new: NewFn,
     /// Build against auth someone else resolved. Used by plugin providers
-    /// that extend a base slug and by Aperture's gateway routing.
-    pub with_auth: WithAuthFn,
+    /// that extend a base slug and by Aperture's gateway routing. `None` for a
+    /// provider that manages its own login, which no plugin or gateway can
+    /// replace.
+    pub with_auth: Option<WithAuthFn>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -165,11 +170,58 @@ pub enum CatalogDoc {
 }
 
 impl ProviderSpec {
+    pub(crate) const fn new(
+        slug: &'static str,
+        display_name: &'static str,
+        fallback_context_window: u32,
+    ) -> Self {
+        Self {
+            slug,
+            display_name,
+            api_key_env: "",
+            family: ModelFamily::Generic,
+            supports_thinking: false,
+            supports_deferred_tools: false,
+            accepts_images: true,
+            accepts_arbitrary_models: false,
+            fallback_max_output: None,
+            fallback_context_window,
+            models_toml: NO_CURATED_MODELS,
+            models_of: None,
+            pricing_schedule: None,
+            build: Build::Catalog,
+            aperture: None,
+            login: None,
+            docs: GeneratedDocs {
+                api_urls: &[],
+                features: None,
+                auth: AuthDoc::EnvVar,
+                catalog: CatalogDoc::Discovered(GENERIC_DISCOVERY_NOTE),
+                trailing_notes: &[],
+            },
+        }
+    }
+
     /// The one way to reach this provider's curated table.
     pub fn models(&self) -> &'static [ModelEntry] {
         match self.build {
             Build::Declared(models) => models,
-            Build::Native(_) | Build::Catalog => manifest::table(self.slug),
+            Build::Native(_) | Build::Catalog => manifest::table(self.models_slug()),
+        }
+    }
+
+    /// The slug whose curated table and models.dev entries describe this
+    /// provider's models.
+    pub fn models_slug(&self) -> &'static str {
+        self.models_of.unwrap_or(self.slug)
+    }
+
+    /// A source provider's table can contain models unavailable on this route. Leave
+    /// discovery to the route provider.
+    pub fn listed_rows(&self) -> &'static [ModelEntry] {
+        match self.models_of {
+            Some(_) => &[],
+            None => self.models(),
         }
     }
 
@@ -219,6 +271,7 @@ const BUILTINS: &[ProviderSpec] = &[
     xai::SPEC,
     aperture::SPEC,
     opencode::GO_SPEC,
+    claude_code::SPEC,
 ];
 
 pub struct ProviderRegistry;
@@ -339,11 +392,15 @@ mod tests {
 
     /// A `base` borrows a native constructor, so a slug on the list that lost
     /// its `impl Provider` would pass registration and fail every `create`.
+    /// A native row without `with_auth` fails the same way.
     #[test]
     fn every_base_is_a_native_builtin() {
         for base in BASES {
-            let spec = ProviderRegistry::get(base);
-            assert!(spec.and_then(ProviderSpec::native).is_some(), "{base}");
+            let native = ProviderRegistry::get(base).and_then(ProviderSpec::native);
+            assert!(
+                native.is_some_and(|native| native.with_auth.is_some()),
+                "{base}"
+            );
         }
     }
 
@@ -368,12 +425,42 @@ mod tests {
         }
     }
 
+    /// Aperture reaches a native provider through `with_auth`, with the
+    /// gateway's auth, so a native row with a route needs `with_auth`.
+    #[test]
+    fn an_aperture_route_on_a_native_row_comes_with_with_auth() {
+        for spec in BUILTINS.iter().filter(|spec| spec.aperture.is_some()) {
+            assert!(
+                spec.native()
+                    .is_none_or(|native| native.with_auth.is_some()),
+                "{} has an Aperture route but no with_auth",
+                spec.slug
+            );
+        }
+    }
+
     /// A malformed table is a runtime panic now, not a compile error, so this
     /// forces every one of them in CI. Never `#[ignore]` it.
     #[test]
     fn every_builtin_model_table_parses() {
         for spec in BUILTINS {
             spec.models();
+        }
+    }
+
+    /// A provider running another provider's models has no table of its own.
+    /// It borrows a builtin's table and lists only the models it offers.
+    #[test]
+    fn a_provider_running_anothers_models_borrows_a_real_table() {
+        for spec in BUILTINS {
+            let Some(of) = spec.models_of else { continue };
+            let slug = spec.slug;
+            assert!(
+                ProviderRegistry::get(of).is_some(),
+                "{slug} runs {of}, no builtin"
+            );
+            assert_eq!(spec.models_toml, NO_CURATED_MODELS, "{slug}");
+            assert!(!spec.models().is_empty(), "{slug} reads no rows of {of}");
         }
     }
 

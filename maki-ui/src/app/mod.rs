@@ -71,6 +71,7 @@ use maki_lua::{
     PackPreparation, PlanActionOutcome, PlanMenu, PlanRowAction, WinView, is_reserved,
 };
 use maki_providers::models_cache::ModelList;
+use maki_providers::provider::ModelListing;
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, TokenUsage, add_cost};
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
@@ -1117,6 +1118,7 @@ impl App {
         if self.model_picker.is_open() {
             return Some(match self.model_picker.handle_key(key) {
                 ModelPickerAction::Consumed => vec![],
+                ModelPickerAction::Refresh => vec![Action::RefreshModels(ModelListing::Refresh)],
                 ModelPickerAction::Select(spec) => {
                     vec![Action::ChangeModel(spec)]
                 }
@@ -1135,10 +1137,16 @@ impl App {
                 LoginPickerAction::Consumed => vec![],
                 LoginPickerAction::Close => vec![],
                 LoginPickerAction::Authenticated { model_spec } => {
-                    vec![Action::ChangeModel(model_spec), Action::RefreshModels]
+                    vec![
+                        Action::ChangeModel(model_spec),
+                        Action::RefreshModels(ModelListing::Cached),
+                    ]
                 }
                 LoginPickerAction::Configured { slug } => {
-                    vec![Action::RefreshProvider { slug }, Action::RefreshModels]
+                    vec![
+                        Action::RefreshProvider { slug },
+                        Action::RefreshModels(ModelListing::Cached),
+                    ]
                 }
             });
         }
@@ -1232,7 +1240,7 @@ impl App {
             }
             BuiltinAction::ModelPicker => {
                 self.model_picker.open(&self.state.model.spec());
-                return vec![Action::RefreshModels];
+                return vec![Action::RefreshModels(ModelListing::Cached)];
             }
         }
         vec![]
@@ -1906,7 +1914,7 @@ impl App {
             }
             "/model" => {
                 self.model_picker.open(&self.state.model.spec());
-                vec![Action::RefreshModels]
+                vec![Action::RefreshModels(ModelListing::Cached)]
             }
             "/theme" => {
                 self.theme_picker.open();

@@ -7,6 +7,7 @@
 //! waits on every event source at once and wakes the moment a plugin action,
 //! agent event, or keypress arrives instead of sleeping in `event::poll`.
 
+use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,6 +15,7 @@ use std::time::{Duration, Instant};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
+use futures::FutureExt;
 
 use crossterm::event::{
     Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
@@ -37,6 +39,7 @@ use maki_lua::{
 };
 use maki_providers::Timeouts;
 use maki_providers::models_cache::{ModelList, fetch_all_models_cached};
+use maki_providers::provider::ModelListing;
 use maki_providers::provider::{Provider, from_model};
 use maki_providers::{Message, Model};
 use maki_storage::StateDir;
@@ -46,6 +49,7 @@ use maki_storage::sessions::normalize_title;
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 use serde_json::json;
+use smol::Task;
 use tracing::{info, warn};
 
 use crate::agent::{
@@ -500,7 +504,7 @@ pub(crate) struct EventLoop<'t> {
     /// without this a second `/packupdate` would race the first over the same
     /// clones and locks.
     pack_running: bool,
-    _model_fetch_task: smol::Task<()>,
+    model_fetch: ModelFetch,
 }
 
 /// One item from any of the event loop's sources; `None` from `next_wake`
@@ -525,30 +529,67 @@ struct BackgroundModels {
     warn_tx: flume::Sender<String>,
     models_rx: flume::Receiver<()>,
     models_tx: flume::Sender<()>,
-    task: smol::Task<()>,
+    task: Task<()>,
 }
 
-/// The one way discovery starts, so startup and `/models refresh` cannot drift
-/// apart. It only reports that it finished and leaves rebuilding to the UI
-/// thread, over a channel so the loop wakes on it instead of noticing at the
-/// next tick. The channel holds one slot, which collapses overlapping fetches
-/// into a single rebuild.
+struct ModelFetch {
+    task: Option<Task<()>>,
+    pending: Option<ModelListing>,
+}
+
+impl ModelFetch {
+    fn request(&mut self, listing: ModelListing, start: impl FnOnce(ModelListing) -> Task<()>) {
+        if self.task.is_some() {
+            self.pending = Some(match (self.pending, listing) {
+                (Some(ModelListing::Refresh), _) | (_, ModelListing::Refresh) => {
+                    ModelListing::Refresh
+                }
+                _ => ModelListing::Cached,
+            });
+        } else {
+            self.task = Some(start(listing));
+        }
+    }
+
+    fn finished(&mut self) -> Option<ModelListing> {
+        self.task = None;
+        self.pending.take()
+    }
+}
+
+/// ModelFetch serializes discovery and coalesces queued refreshes. Completion wakes the UI
+/// thread to rebuild the model list, including when discovery panics.
 fn fetch_models(
     available: Arc<ArcSwapOption<ModelList>>,
     policy: Arc<ModelPolicy>,
     warn_tx: flume::Sender<String>,
     models_tx: flume::Sender<()>,
-) -> smol::Task<()> {
+    listing: ModelListing,
+) -> Task<()> {
     smol::spawn(async move {
-        fetch_all_models_cached(&policy, |list, warnings| {
-            for w in warnings {
-                let _ = warn_tx.try_send(w);
-            }
-            available.store(Some(Arc::new(list)));
-        })
-        .await;
-        let _ = models_tx.try_send(());
+        let fetch = fetch_all_models_cached(
+            &policy,
+            |list, warnings| {
+                for w in warnings {
+                    let _ = warn_tx.try_send(w);
+                }
+                available.store(Some(Arc::new(list)));
+            },
+            listing,
+        );
+        complete_model_fetch(fetch, &warn_tx, models_tx).await;
     })
+}
+
+async fn complete_model_fetch(
+    fetch: impl Future<Output = ()>,
+    warn_tx: &flume::Sender<String>,
+    models_tx: flume::Sender<()>,
+) {
+    if AssertUnwindSafe(fetch).catch_unwind().await.is_err() {
+        let _ = warn_tx.try_send("model discovery panicked; refresh to try again".to_owned());
+    }
+    let _ = models_tx.try_send(());
 }
 
 fn spawn_model_fetch(policy: Arc<ModelPolicy>) -> BackgroundModels {
@@ -560,6 +601,7 @@ fn spawn_model_fetch(policy: Arc<ModelPolicy>) -> BackgroundModels {
         policy,
         warn_tx.clone(),
         models_tx.clone(),
+        ModelListing::Cached,
     );
     BackgroundModels {
         available,
@@ -720,7 +762,10 @@ impl<'t> EventLoop<'t> {
             pack_tx,
             pack_rx,
             pack_running: false,
-            _model_fetch_task: bg.task,
+            model_fetch: ModelFetch {
+                task: Some(bg.task),
+                pending: None,
+            },
         })
     }
 
@@ -860,7 +905,12 @@ impl<'t> EventLoop<'t> {
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
             Wake::Warn(warning) => self.focused_app().flash(warning),
             Wake::Pack(preparation) => self.finish_pack(*preparation),
-            Wake::ModelsDiscovered => self.rebuild_models(),
+            Wake::ModelsDiscovered => {
+                self.rebuild_models();
+                if let Some(listing) = self.model_fetch.finished() {
+                    self.refresh_models(listing);
+                }
+            }
         }
         Ok(())
     }
@@ -1781,7 +1831,7 @@ impl<'t> EventLoop<'t> {
                 terminal::suspend(self.terminal);
                 self.focus.on_resume();
             }
-            Action::RefreshModels => self.refresh_models(),
+            Action::RefreshModels(listing) => self.refresh_models(listing),
             Action::RefreshUsage => self.refresh_usage(),
             Action::ManualExit => self.sessions[idx].notifications.on_manual_exit(),
         }
@@ -1835,14 +1885,16 @@ impl<'t> EventLoop<'t> {
         self.dispatch(self.focused, actions);
     }
 
-    fn refresh_models(&self) {
-        fetch_models(
-            Arc::clone(&self.ctx.available_models),
-            Arc::clone(&self.ctx.model_policy),
-            self.warn_tx.clone(),
-            self.models_tx.clone(),
-        )
-        .detach();
+    fn refresh_models(&mut self, listing: ModelListing) {
+        self.model_fetch.request(listing, |listing| {
+            fetch_models(
+                Arc::clone(&self.ctx.available_models),
+                Arc::clone(&self.ctx.model_policy),
+                self.warn_tx.clone(),
+                self.models_tx.clone(),
+                listing,
+            )
+        });
     }
 
     fn refresh_usage(&mut self) {
@@ -1973,10 +2025,63 @@ mod tests {
     use super::*;
     use maki_agent::DoneReason;
     use maki_providers::TokenUsage;
+    use std::future::pending;
     use test_case::test_case;
 
     const OBSERVATION: &str = "failed";
     const SHELL_RESULT: &str = "command finished";
+
+    #[test]
+    fn a_panicked_model_fetch_completes_and_allows_the_queued_refresh() {
+        let (models_tx, models_rx) = flume::bounded(1);
+        let (warn_tx, warn_rx) = flume::unbounded();
+        let mut fetch = ModelFetch {
+            task: None,
+            pending: None,
+        };
+        fetch.request(ModelListing::Cached, |_| {
+            smol::spawn(async move {
+                complete_model_fetch(async { panic!("discovery failed") }, &warn_tx, models_tx)
+                    .await;
+            })
+        });
+        fetch.request(ModelListing::Refresh, |_| unreachable!());
+        smol::block_on(models_rx.recv_async()).unwrap();
+        assert!(warn_rx.recv().unwrap().contains("model discovery panicked"));
+        let next = fetch.finished().unwrap();
+        assert_eq!(next, ModelListing::Refresh);
+        fetch.request(next, |_| smol::spawn(pending()));
+        assert!(fetch.task.is_some());
+    }
+
+    #[test]
+    fn model_refresh_waits_for_discovery_and_coalesces_with_priority() {
+        let mut fetch = ModelFetch {
+            task: None,
+            pending: None,
+        };
+        let mut started = Vec::new();
+        for listing in [
+            ModelListing::Cached,
+            ModelListing::Refresh,
+            ModelListing::Cached,
+            ModelListing::Refresh,
+        ] {
+            fetch.request(listing, |listing| {
+                started.push(listing);
+                smol::spawn(pending())
+            });
+        }
+        assert_eq!(started, [ModelListing::Cached]);
+        let next = fetch.finished().unwrap();
+        assert_eq!(next, ModelListing::Refresh);
+        fetch.request(next, |listing| {
+            started.push(listing);
+            smol::spawn(pending())
+        });
+        assert_eq!(started, [ModelListing::Cached, ModelListing::Refresh]);
+        assert_eq!(fetch.finished(), None);
+    }
 
     fn done_event() -> AgentEvent {
         AgentEvent::Done {

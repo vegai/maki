@@ -25,7 +25,7 @@ async fn roundtrip(
 /// the tool call that spawned them.
 ///
 /// @return (table|nil, string|nil) Array of `{id, name, focused, status?}` where
-///   `status` is `"working"`, `"done"`, or `"error"`, or nil and an error.
+///   `status` is `"working"`, `"queued"`, `"done"`, or `"error"`, or nil and an error.
 /// @example
 /// for _, t in ipairs(maki.task.list() or {}) do
 ///   print(t.name, t.status or "main")

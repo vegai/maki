@@ -547,6 +547,12 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Single(key::REFRESH.label),
+        description: "Refresh available models",
+        context: KeybindContext::ModelPicker,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Single("!/@/#/$"),
         description: "Set tier (strong/medium/weak/compaction)",
         context: KeybindContext::ModelPicker,

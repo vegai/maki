@@ -14,8 +14,8 @@ use maki_agent::tools::registry::{RegisteredTool, ToolRegistry};
 use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
 use maki_agent::tools::{
     BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
-    PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation,
-    is_tool_enabled, timeout_annotation,
+    PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolInvocation, is_tool_enabled,
+    timeout_annotation,
 };
 use maki_agent::{
     AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, SharedBuf, TextOutput, ToolOutput,
@@ -89,10 +89,20 @@ fn dctx_json(ctx: &DescriptionContext) -> Value {
         "workflow": ctx.workflow,
         "mcp": ctx.mcp,
     });
-    match ctx.filter {
-        ToolFilter::All => {}
-        ToolFilter::Only(names) => obj["only"] = json!(names),
-        ToolFilter::AllExcept(names) => obj["except"] = json!(names),
+    if let Some(names) = ctx
+        .filter
+        .published
+        .as_ref()
+        .or(ctx.filter.allowed.as_ref())
+    {
+        obj["only"] = json!(
+            names
+                .iter()
+                .filter(|name| ctx.filter.matches(name))
+                .collect::<Vec<_>>()
+        );
+    } else if !ctx.filter.excluded.is_empty() {
+        obj["except"] = json!(ctx.filter.excluded);
     }
     obj
 }
@@ -659,6 +669,12 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///   description     (string)   Required. Non-empty description shown to the model.
 ///   schema          (table)    Required. JSON Schema object describing the tool's input parameters.
 ///   handler         (function) Required. Called with `(input, ctx)` when the tool is invoked.
+///                              `ctx:cwd()` returns the directory the calling session started
+///                              in. `/cd` does not change it, and under ACP it can differ from
+///                              `maki.uv.cwd()`.
+///                              `ctx:instructions()` returns the instruction text maki's prompt
+///                              loads there. Both need `fs_read`. Outside a handler, they return
+///                              nil and an error.
 ///                              Must return a string or a table with any of these fields:
 ///                                llm_output  (string)  Result text for the model or the calling code.
 ///                                is_error    (boolean) When true, the result is treated as an error.
@@ -1910,7 +1926,8 @@ mod tests {
         let mut tool = make_lua_tool(None);
         tool.has_describe_fn = true;
         let ctx = DescriptionContext {
-            filter: &ToolFilter::All,
+            local_tools: None,
+            filter: &ToolFilter::default(),
             audience: ToolAudience::MAIN,
             workflow: false,
             mcp: false,
