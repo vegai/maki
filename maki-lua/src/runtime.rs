@@ -2288,21 +2288,22 @@ async fn run_work_fn(
 /// one that scheduled it, and pumps job events so a `maki.system` started in
 /// the callback still gets its `on_stdout` and `on_exit`.
 ///
-/// The gate guard comes after the sleep: pending timers should pile up
-/// cheaply, but the bodies compete for the `MAX_INFLIGHT_TOOLS` budget so
-/// `for i=1,10000 do maki.defer_fn(f, 0) end` can't run 10k coroutines at
-/// once. Errors are logged and dropped, nobody is awaiting a result.
+/// Timer callbacks have their own bounded budget so they can cancel jobs even when every
+/// tool slot is occupied. Running callbacks still hold the reload barrier.
 fn spawn_deferred_callback(
     lua: &Lua,
     ex: &Rc<smol::LocalExecutor<'_>>,
     gate: &Rc<InflightGate>,
+    timer_gate: &Rc<InflightGate>,
     cb: DeferredCallback,
 ) {
     let lua = lua.clone();
     let gate = Rc::clone(gate);
+    let timer_gate = Rc::clone(timer_gate);
     ex.spawn(async move {
         smol::Timer::after(cb.delay).await;
-        let _guard = gate.acquire().await;
+        let _hold = DrainHold::new(&gate);
+        let _guard = timer_gate.acquire().await;
         // Only now stop advertising the timer as pending: up to here a
         // `clear_plugin` can still flip the flag we read below, and from here
         // on the drain barrier waits for the guard instead.
@@ -2607,7 +2608,7 @@ impl LuaRuntime {
         let watchdog = Watchdog::spawn(&lua, Arc::clone(&shutdown));
 
         let globals = lua.globals();
-        for name in &["require", "io", "package"] {
+        for name in &["require", "io", "package", "getfenv", "setfenv"] {
             globals
                 .set(*name, LuaValue::Nil)
                 .map_err(|e| PluginError::Lua {
@@ -4290,6 +4291,7 @@ pub fn spawn(
                 .detach();
             }
             let gate = Rc::new(InflightGate::new(rt.lua.clone()));
+            let timer_gate = Rc::new(InflightGate::new(rt.lua.clone()));
             let restores = Rc::new(RestoreTracker::default());
             let (hook_tx, hook_rx) = flume::unbounded::<HostHook>();
             {
@@ -4326,7 +4328,7 @@ pub fn spawn(
                         spawn_async_task(&rt.lua, &ex, &gate, task);
                     }
                     while let Ok(cb) = defer_rx.try_recv() {
-                        spawn_deferred_callback(&rt.lua, &ex, &gate, cb);
+                        spawn_deferred_callback(&rt.lua, &ex, &gate, &timer_gate, cb);
                     }
                     // Nothing to serve, so spend the lull on native codegen.
                     // One chunk per pass with a yield in between, so no request
@@ -4357,7 +4359,7 @@ pub fn spawn(
                             smol::future::or(
                                 async {
                                     let cb = defer_rx.recv_async().await?;
-                                    spawn_deferred_callback(&rt.lua, &ex, &gate, cb);
+                                    spawn_deferred_callback(&rt.lua, &ex, &gate, &timer_gate, cb);
                                     Ok(None)
                                 },
                                 async { rx.recv_async().await.map(Some) },

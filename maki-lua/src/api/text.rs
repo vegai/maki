@@ -16,6 +16,20 @@ thread_local! {
     static MATCHER: RefCell<Matcher> = RefCell::new(Matcher::new(Config::DEFAULT));
 }
 
+/// Whether a code point has a visible, printable representation.
+/// @param code integer Unicode code point.
+/// @return (boolean) True for a visible character.
+#[lua_fn]
+fn is_printable(_lua: &Lua, code: u32) -> LuaResult<bool> {
+    Ok(char::from_u32(code).is_some_and(|character| {
+        if character.is_ascii() {
+            !character.is_control()
+        } else {
+            character.escape_debug().count() == 1
+        }
+    }))
+}
+
 /// Convert an HTML string to Markdown.
 /// Useful for cleaning up web content fetched with `maki.webfetch`.
 ///
@@ -209,7 +223,7 @@ lua_table! {
     /// local hits = maki.text.fuzzy_list("mrs", names, { limit = 10 })
     /// ```
     "maki.text" => pub(crate) fn create_text_table(), DOCS [
-        html_to_markdown, fuzzy, fuzzy_list,
+        is_printable, html_to_markdown, fuzzy, fuzzy_list,
     ]
 }
 

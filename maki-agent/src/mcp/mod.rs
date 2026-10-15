@@ -1414,9 +1414,9 @@ fn spawn_persist_enabled(path: PathBuf, name: String, enabled: bool) {
 
 #[cfg(unix)]
 pub fn kill_process_groups(pids: &[u32]) {
-    use crate::child_guard::sigkill_process_group;
+    use maki_providers::process::kill_group;
 
-    pids.iter().copied().for_each(sigkill_process_group);
+    pids.iter().copied().for_each(kill_group);
 }
 
 #[cfg(not(unix))]

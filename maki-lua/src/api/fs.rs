@@ -1,8 +1,10 @@
 use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, FileType};
+use std::fs::{File, FileType, TryLockError};
 use std::io::{Error as IoError, ErrorKind, Read, Result as IoResult};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,7 +12,9 @@ use std::time::UNIX_EPOCH;
 
 use maki_agent::{FileQuery, FileReader, Ranked};
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{Buffer, Lua, Result as LuaResult, Table, Value};
+use mlua::{Buffer, Lua, Result as LuaResult, Table, UserData, UserDataMethods, Value};
+#[cfg(unix)]
+use rustix::fs::OFlags;
 
 use crate::api::util::convert::opt_bool;
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
@@ -21,7 +25,52 @@ use crate::runtime::LUA_MEMORY_LIMIT;
 // Luau allows strings and buffers up to 1 GiB, but the VM budget is the binding
 // limit: a read the VM cannot hold dies with a Lua memory error instead.
 const MAX_READ_BYTES: u64 = LUA_MEMORY_LIMIT as u64;
+#[cfg(unix)]
+const PRIVATE_FILE_MODE: u32 = 0o600;
+pub(super) const LOCK_BUSY: &str = "lock is held";
 const NON_UTF8_CONTENT_ERR: &str = "non-utf8 content; use read_bytes";
+
+struct FileLock(Option<File>);
+
+impl FileLock {
+    fn try_lock(file: File) -> IoResult<Self> {
+        file.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => IoError::new(ErrorKind::WouldBlock, LOCK_BUSY),
+            TryLockError::Error(error) => error,
+        })?;
+        Ok(Self(Some(file)))
+    }
+}
+
+impl UserData for FileLock {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method_mut("close", |_, this, ()| {
+            this.0.take();
+            Ok(())
+        });
+    }
+}
+
+/// Try to hold an exclusive file lock. Closing or dropping the handle releases it.
+/// @param path string Lock file, created privately if absent. Symlinks are refused on Unix.
+/// @return (userdata?, string?) Lock with close(), or nil and the error if locking fails.
+#[lua_fn(guard = FsWrite)]
+async fn try_lock(_lua: Lua, path: String) -> LuaResult<Pair<FileLock>> {
+    let file = try_pair!(
+        smol::unblock(move || {
+            let mut options = File::options();
+            options.read(true).write(true).create(true).truncate(false);
+            #[cfg(unix)]
+            options
+                .mode(PRIVATE_FILE_MODE)
+                .custom_flags(OFlags::NOFOLLOW.bits() as i32);
+            let file = options.open(expand_tilde(&path))?;
+            FileLock::try_lock(file)
+        })
+        .await
+    );
+    Ok((Some(file), None))
+}
 
 pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     maki_storage::paths::expand_tilde(Path::new(path))
@@ -121,7 +170,7 @@ async fn read_file(path: PathBuf, max_bytes: u64) -> IoResult<Vec<u8>> {
 }
 
 /// Read the entire file at {path} as a UTF-8 string.
-/// Files over 512 MiB or not valid UTF-8 return nil plus an error message.
+/// Files over 512 MiB or invalid UTF-8 return nil and an error message.
 /// Use `read_bytes` for binary files.
 ///
 /// @param path string Absolute or relative file path. `~/` is expanded to the home directory.
@@ -161,10 +210,11 @@ async fn read_bytes(lua: Lua, path: String) -> LuaResult<Pair<Buffer>> {
 /// Get metadata for the file or directory at {path}.
 /// Returns a table with `size` (integer), `is_file` (boolean), `is_dir` (boolean),
 /// and `mtime` (number, fractional seconds since the Unix epoch; absent when the
-/// filesystem does not report a modification time).
+/// filesystem does not report a modification time). `is_symlink` is true for an unfollowed link.
 /// If {path} does not exist, returns nil with no error.
 ///
 /// @param path string Absolute or relative path.
+/// @param follow boolean? Follow symlinks (default true).
 /// @return (table?, string?) Metadata table, nil if missing, or nil plus an error message.
 /// @example
 /// local meta = maki.fs.metadata("src/main.rs")
@@ -172,14 +222,20 @@ async fn read_bytes(lua: Lua, path: String) -> LuaResult<Pair<Buffer>> {
 ///   print("size: " .. meta.size)
 /// end
 #[lua_fn(guard = FsRead)]
-async fn metadata(lua: Lua, path: String) -> LuaResult<Pair<Table>> {
+async fn metadata(lua: Lua, path: String, follow: Option<bool>) -> LuaResult<Pair<Table>> {
     let abs = try_pair!(make_absolute(&path));
-    match smol::fs::metadata(&abs).await {
+    let metadata = if follow.unwrap_or(true) {
+        smol::fs::metadata(&abs).await
+    } else {
+        smol::fs::symlink_metadata(&abs).await
+    };
+    match metadata {
         Ok(meta) => {
             let tbl = lua.create_table()?;
             tbl.set("size", meta.len())?;
             tbl.set("is_file", meta.is_file())?;
             tbl.set("is_dir", meta.is_dir())?;
+            tbl.set("is_symlink", meta.is_symlink())?;
             if let Ok(modified) = meta.modified()
                 && let Ok(dur) = modified.duration_since(UNIX_EPOCH)
             {
@@ -1101,7 +1157,7 @@ lua_table! {
     "maki.fs" => pub(crate) fn create_fs_table(perms: &PluginPermissions, plugin: Arc<str>), DOCS [
         read(perms), read_bytes(perms), metadata(perms), dirname, basename,
         joinpath, normalize, abspath, parents, root(perms), relpath, ext,
-        dir(perms), write(perms), append(perms), atomic_write(perms), rm(perms), mkdir(perms),
+        dir(perms), try_lock(perms), write(perms), append(perms), atomic_write(perms), rm(perms), mkdir(perms),
         glob(perms), grep(perms), fuzzy_files(perms, plugin),
     ]
 }
@@ -1113,7 +1169,7 @@ mod tests {
 
     use super::*;
     use crate::plugin_permissions::PluginPermissions;
-    use mlua::Lua;
+    use mlua::{AnyUserData, Function, Lua, ObjectLike};
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -1310,6 +1366,34 @@ mod tests {
             matches!(err, mlua::Value::String(_)),
             "dir should return error for nonexistent path"
         );
+    }
+
+    #[cfg(unix)]
+    #[test_case(true ; "followed_link")]
+    #[test_case(false ; "unfollowed_link")]
+    fn metadata_can_classify_a_link_without_following_it(follow: bool) {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        std::fs::write(&target, "content").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let lua = Lua::new();
+        let table =
+            create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
+        let metadata: Function = table.get("metadata").unwrap();
+        let (value, error): (Option<Table>, Option<String>) =
+            smol::block_on(metadata.call_async((link.to_str().unwrap(), follow))).unwrap();
+        assert_eq!(error, None);
+        let value = value.unwrap();
+        assert_eq!(value.get::<bool>("is_file").unwrap(), follow);
+        assert_eq!(value.get::<bool>("is_symlink").unwrap(), !follow);
+        if !follow {
+            std::fs::remove_file(target).unwrap();
+            let (value, error): (Option<Table>, Option<String>) =
+                smol::block_on(metadata.call_async((link.to_str().unwrap(), follow))).unwrap();
+            assert_eq!(error, None);
+            assert!(value.unwrap().get::<bool>("is_symlink").unwrap());
+        }
     }
 
     #[test]
@@ -2800,5 +2884,58 @@ mod tests {
                 .any(|p| p == NEW_FILE),
             "the plugin's own call finds it too"
         );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn file_lock_is_private_and_refuses_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("private.lock");
+        let link = dir.path().join("link.lock");
+        let lua = Lua::new();
+        let table =
+            create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
+        let lock: Function = table.get("try_lock").unwrap();
+        let (held, error): (Option<AnyUserData>, Option<String>) =
+            smol::block_on(lock.call_async(path.to_str().unwrap())).unwrap();
+        assert_eq!(error, None);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            PRIVATE_FILE_MODE
+        );
+        held.unwrap().call_method::<()>("close", ()).unwrap();
+        symlink(&path, &link).unwrap();
+        let (held, error): (Option<AnyUserData>, Option<String>) =
+            smol::block_on(lock.call_async(link.to_str().unwrap())).unwrap();
+        assert!(held.is_none());
+        assert!(error.is_some());
+    }
+
+    #[test]
+    fn file_lock_reports_contention_and_releases_on_close() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("import.lock");
+        let lua = Lua::new();
+        let table =
+            create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
+        let lock: Function = table.get("try_lock").unwrap();
+        let (first, error): (Option<AnyUserData>, Option<String>) =
+            smol::block_on(lock.call_async(path.to_str().unwrap())).unwrap();
+        assert_eq!(error, None);
+        let (second, error): (Option<AnyUserData>, Option<String>) =
+            smol::block_on(lock.call_async(path.to_str().unwrap())).unwrap();
+        assert!(second.is_none());
+        assert_eq!(error.as_deref(), Some(LOCK_BUSY));
+        let first = first.unwrap();
+        first.call_method::<()>("close", ()).unwrap();
+        let (third, error): (Option<AnyUserData>, Option<String>) =
+            smol::block_on(lock.call_async(path.to_str().unwrap())).unwrap();
+        assert!(third.is_some());
+        assert_eq!(error, None);
+        let missing = dir.path().join("absent/import.lock");
+        let (lock, error): (Option<AnyUserData>, Option<String>) =
+            smol::block_on(lock.call_async(missing.to_str().unwrap())).unwrap();
+        assert!(lock.is_none());
+        assert!(error.is_some_and(|error| error != LOCK_BUSY));
     }
 }
