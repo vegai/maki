@@ -365,7 +365,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         default: ConfigValue::Str("none"),
         min: None,
         env: None,
-        description: "Pin the thinking level of every new session: true/\"adaptive\", false/\"off\", \"minimal\" to \"max\", or a token budget. Unset, new sessions start at the last `/thinking` level",
+        description: "Set the thinking level of every new session: true/\"adaptive\", false/\"off\", \"minimal\" to \"max\", or a token budget. A launch thinking flag overrides this. Unset, new sessions start at the last `/thinking` level",
     },
 ];
 

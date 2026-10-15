@@ -1,7 +1,9 @@
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use clap::builder::{StringValueParser, TypedValueParser};
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
+use maki_storage::sessions::StoredThinking;
 
 use crate::print::OutputFormat;
 
@@ -41,6 +43,14 @@ pub struct Cli {
     /// Model spec (provider/model-id). Defaults to last used model, or claude-opus-4-6
     #[arg(short, long)]
     pub model: Option<String>,
+
+    /// Thinking setting for this launch: off, adaptive, minimal through max, or a positive token budget
+    #[arg(long, visible_alias = "effort", global = true, value_parser = StoredThinking::parse_setting, conflicts_with = "max_thinking_tokens")]
+    pub thinking: Option<StoredThinking>,
+
+    /// Positive thinking-token budget for this launch
+    #[arg(long, global = true)]
+    pub max_thinking_tokens: Option<NonZeroU32>,
 
     /// Include full turn-by-turn messages in --print output
     #[arg(long)]
@@ -157,15 +167,9 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub betas: Option<String>,
     #[arg(long, hide = true)]
-    pub max_thinking_tokens: Option<String>,
-    #[arg(long, hide = true)]
-    pub effort: Option<String>,
-    #[arg(long, hide = true)]
     pub json_schema: Option<String>,
     #[arg(long, hide = true)]
     pub max_budget_usd: Option<String>,
-    #[arg(long, hide = true)]
-    pub thinking: Option<String>,
     #[arg(long, hide = true)]
     pub thinking_display: Option<String>,
 
@@ -175,6 +179,15 @@ pub struct Cli {
 }
 
 impl Cli {
+    pub fn thinking_override(&self) -> Option<StoredThinking> {
+        self.thinking.or_else(|| {
+            self.max_thinking_tokens
+                .map(|tokens| StoredThinking::Budget {
+                    tokens: tokens.get(),
+                })
+        })
+    }
+
     pub fn warn_ignored_flags(&self) {
         let ignored = [
             ("fallback-model", self.fallback_model.is_some()),
@@ -186,11 +199,8 @@ impl Cli {
             ("mcp-config", self.mcp_config.is_some()),
             ("tools", self.tools.is_some()),
             ("betas", self.betas.is_some()),
-            ("max-thinking-tokens", self.max_thinking_tokens.is_some()),
-            ("effort", self.effort.is_some()),
             ("json-schema", self.json_schema.is_some()),
             ("max-budget-usd", self.max_budget_usd.is_some()),
-            ("thinking", self.thinking.is_some()),
             ("thinking-display", self.thinking_display.is_some()),
         ];
         for (flag, set) in &ignored {
@@ -381,9 +391,43 @@ pub fn normalize_tool_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::error::ErrorKind;
     use test_case::test_case;
 
     const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
+
+    #[test_case(&["--thinking", "xhigh"], "xhigh" ; "thinking_level")]
+    #[test_case(&["--thinking", "off"], "off" ; "explicit_off")]
+    #[test_case(&["--thinking", "adaptive"], "adaptive" ; "adaptive")]
+    #[test_case(&["--thinking", "8192"], "8192" ; "thinking_budget")]
+    #[test_case(&["--effort", "low"], "low" ; "effort_alias")]
+    #[test_case(&["--max-thinking-tokens", "2048"], "2048" ; "compatibility_budget")]
+    #[test_case(&["acp", "--thinking", "high"], "high" ; "acp_local_flag")]
+    #[test_case(&["--effort", "high", "acp"], "high" ; "acp_global_flag")]
+    #[test_case(&["acp", "--max-thinking-tokens", "4096"], "4096" ; "acp_budget")]
+    fn thinking_flags_use_the_shared_setting(args: &[&str], expected: &str) {
+        let cli = Cli::try_parse_from(std::iter::once("maki").chain(args.iter().copied())).unwrap();
+        assert_eq!(
+            cli.thinking_override(),
+            Some(StoredThinking::parse_setting(expected).unwrap())
+        );
+    }
+
+    #[test_case(&["--thinking", "turbo"], ErrorKind::ValueValidation ; "unknown_level")]
+    #[test_case(&["--thinking", "0"], ErrorKind::ValueValidation ; "zero_thinking_budget")]
+    #[test_case(&["-p", "--effort", "turbo"], ErrorKind::ValueValidation ; "invalid_print_effort")]
+    #[test_case(&["acp", "--thinking", "turbo"], ErrorKind::ValueValidation ; "invalid_acp_thinking")]
+    #[test_case(&["--max-thinking-tokens", "0"], ErrorKind::ValueValidation ; "zero_compatibility_budget")]
+    #[test_case(&["--max-thinking-tokens", "high"], ErrorKind::ValueValidation ; "non_numeric_compatibility_budget")]
+    #[test_case(&["--thinking", "high", "--effort", "low"], ErrorKind::ArgumentConflict ; "two_aliases")]
+    #[test_case(&["--thinking", "high", "--max-thinking-tokens", "2048"], ErrorKind::ArgumentConflict ; "level_and_budget")]
+    #[test_case(&["acp", "--effort", "high", "--max-thinking-tokens", "2048"], ErrorKind::ArgumentConflict ; "acp_level_and_budget")]
+    fn invalid_thinking_flags_fail_during_parsing(args: &[&str], expected: ErrorKind) {
+        let error = Cli::try_parse_from(std::iter::once("maki").chain(args.iter().copied()))
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), expected);
+    }
 
     #[test_case("Read", "read")]
     #[test_case("Bash", "bash")]

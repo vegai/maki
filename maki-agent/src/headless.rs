@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use flume::Receiver;
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_providers::Timeouts;
 use maki_providers::model::Model;
@@ -67,8 +68,8 @@ pub struct HeadlessParams {
     /// Where the transcript is written. The same dir the caller resolved the
     /// session from, so a run cannot read one session and write another.
     pub storage: StateDir,
-    /// The `always_*` knobs. A headless run has no toggle UI, so config is the
-    /// whole answer. The model gate stays in `RequestOptions::clamped`.
+    /// Launch defaults after CLI, config and saved-state precedence. The model
+    /// gate stays in `RequestOptions::clamped`.
     pub defaults: SessionDefaults,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
@@ -77,6 +78,8 @@ pub struct HeadlessParams {
 
 pub struct HeadlessHandle {
     pub tool_names: Vec<String>,
+    /// Provider-adjusted capabilities, so startup metadata matches the run.
+    pub initial_model: Receiver<Model>,
     pub session_id: SessionRef,
     pub cwd: String,
     pub task: smol::Task<()>,
@@ -191,11 +194,13 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
     let defaults = params.defaults;
     let working_dir_path = params.initial_wd.clone();
     let task_working_dir = working_dir.clone();
+    let (ready_tx, ready_rx) = flume::bounded(1);
     let task = smol::spawn(run_session(guard, params.mcp_handle.clone(), async move {
         let mut model = params.model;
         let Some(provider) = connect(&mut model, params.timeouts, &event_tx).await else {
             return;
         };
+        let _ = ready_tx.send(model.clone());
         let mut track = SessionTrack::open(
             params.resumed,
             params.claim,
@@ -256,6 +261,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
     (
         HeadlessHandle {
             tool_names,
+            initial_model: ready_rx,
             session_id: session_ref,
             cwd: working_dir,
             task,
@@ -281,7 +287,7 @@ pub struct InteractiveParams {
     pub yolo: bool,
     pub system_prompt_override: Option<String>,
     pub append_system_prompt: Option<String>,
-    /// The `always_*` knobs. `workflow` picks the tool catalog here; the rest
+    /// Resolved launch defaults. `workflow` picks the tool catalog here; the rest
     /// are what a host without toggles puts on every [`AgentInput`] it sends.
     pub defaults: SessionDefaults,
     pub model_policy: Arc<ModelPolicy>,
@@ -294,6 +300,7 @@ pub struct InteractiveParams {
 
 pub struct InteractiveHandle {
     pub tool_names: Vec<String>,
+    pub initial_model: Receiver<Model>,
     pub input_tx: flume::Sender<AgentInput>,
     pub answer_tx: flume::Sender<String>,
     pub cancel_tx: flume::Sender<()>,
@@ -353,11 +360,13 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 
     let session_ref_clone = session_ref.clone();
     let task_permissions = Arc::clone(&permissions);
+    let (ready_tx, ready_rx) = flume::bounded(1);
     let task = smol::spawn(run_session(guard, params.mcp_handle.clone(), async move {
         let mut model = params.model;
         let Some(mut provider) = connect(&mut model, params.timeouts, &base_tx).await else {
             return;
         };
+        let _ = ready_tx.send(model.clone());
         let mut track =
             SessionTrack::open(params.resumed, params.claim, params.storage, &working_dir);
         let mut run_id: u64 = 0;
@@ -447,6 +456,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     (
         InteractiveHandle {
             tool_names,
+            initial_model: ready_rx,
             input_tx,
             answer_tx,
             cancel_tx,

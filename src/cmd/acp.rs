@@ -9,12 +9,14 @@ use maki_config::load_env_files;
 use maki_config::project::{self, TrustMode};
 use maki_lua::{InitFiles, Interaction, PluginHost};
 use maki_storage::StateDir;
+use maki_storage::sessions::StoredThinking;
 
 use crate::provider_scripts;
 use crate::setup;
 
 pub fn run(
     model_arg: Option<String>,
+    thinking: Option<StoredThinking>,
     yolo: bool,
     no_plugins: bool,
     no_jit: bool,
@@ -61,7 +63,7 @@ pub fn run(
 
     let (model, warning) = setup::resolve_model(model_arg.as_deref(), &config.provider, &storage)?;
     super::report_warnings(Vec::from_iter(warning));
-    setup::remember_thinking(&mut config.session_defaults, &storage);
+    setup::resolve_thinking(&mut config.session_defaults, &storage, thinking);
 
     setup::init_logging(&config.storage);
     setup::init_telemetry(&config.telemetry);

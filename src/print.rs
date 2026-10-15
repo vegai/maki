@@ -4,8 +4,7 @@
 //! unchanged. Keep `PrintResult` fields a strict subset of theirs. `StreamJson`
 //! is JSONL with the same shape, `Text` prints the raw response only.
 //!
-//! We adopt new fields when Claude Code adds them but never invent our own.
-//! Check their docs before changing anything here.
+//! Init metadata also reports Maki's model-clamped thinking setting.
 
 use std::io::{self, Read};
 use std::path::PathBuf;
@@ -26,7 +25,7 @@ use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
 use maki_lua::{EventHandle, SessionEndReason};
 use maki_providers::model::Model;
-use maki_providers::{TokenUsage, add_cost};
+use maki_providers::{ThinkingConfig, TokenUsage, add_cost};
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
@@ -82,6 +81,7 @@ struct InitEvent<'a> {
     session_id: &'a SessionRef,
     tools: &'a [String],
     model: &'a str,
+    thinking: String,
 }
 
 #[derive(Serialize)]
@@ -242,11 +242,13 @@ pub fn run(params: PrintParams) -> Result<()> {
 
     let HeadlessHandle {
         tool_names,
+        initial_model,
         session_id,
         cwd,
         task,
     } = handle;
     let start = Instant::now();
+    let model = smol::block_on(initial_model.recv_async()).unwrap_or(model);
 
     let mut verbose_out = match format {
         OutputFormat::StreamJson => Some(VerboseOutput::StreamJson),
@@ -262,6 +264,9 @@ pub fn run(params: PrintParams) -> Result<()> {
             session_id: &session_id,
             tools: &tool_names,
             model: &model.id,
+            thinking: ThinkingConfig::from(defaults.thinking)
+                .clamped(&model)
+                .to_string(),
         })?,
         // Text mode never says which session it wrote, and a later `-r`
         // needs it. On stderr so a pipe reading the answer is unaffected.
@@ -508,7 +513,15 @@ mod tests {
         "usage",
         "duration_ms",
     ];
-    const INIT_EVENT_FIELDS: &[&str] = &["type", "subtype", "cwd", "session_id", "tools", "model"];
+    const INIT_EVENT_FIELDS: &[&str] = &[
+        "type",
+        "subtype",
+        "cwd",
+        "session_id",
+        "tools",
+        "model",
+        "thinking",
+    ];
     const RETRY_EVENT_FIELDS: &[&str] = &[
         "type",
         "subtype",
@@ -545,6 +558,7 @@ mod tests {
             session_id: &sid,
             tools: &["bash".into(), "read".into()],
             model: "test-model",
+            thinking: ThinkingConfig::Off.to_string(),
         };
         let json: Value = serde_json::to_value(&init).unwrap();
         for field in INIT_EVENT_FIELDS {

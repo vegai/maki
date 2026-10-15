@@ -202,6 +202,7 @@ fn cli_stack(
 }
 
 pub fn dispatch(cli: Cli) -> Result<()> {
+    let thinking = cli.thinking_override();
     // `--trust` is a grant for this process, so every entry point under it
     // reads the same shared project config the TUI would.
     let trust_mode = if cli.trust {
@@ -254,7 +255,14 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             update::rollback().map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
         }
         Some(Command::Acp { model, yolo }) => {
-            acp::run(model, yolo, cli.no_plugins, cli.no_jit, trust_mode)?;
+            acp::run(
+                model,
+                thinking,
+                yolo,
+                cli.no_plugins,
+                cli.no_jit,
+                trust_mode,
+            )?;
         }
         Some(Command::Migrate { action }) => match action {
             MigrateAction::Xdg => migrate::xdg()?,

@@ -30,7 +30,7 @@ use maki_agent::{
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
 use maki_providers::model::Model;
-use maki_providers::{ImageSource, StopReason, Timeouts, TokenUsage, add_cost};
+use maki_providers::{ImageSource, StopReason, ThinkingConfig, Timeouts, TokenUsage, add_cost};
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
@@ -538,7 +538,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         eprintln!("MCP config error: {mcp_config_errors}");
     }
 
-    let startup_model = model.clone();
+    let initial_model = model.clone();
     let (handle, events) = headless::spawn_interactive(InteractiveParams {
         model,
         config,
@@ -560,6 +560,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         project_config,
         local_tools: Default::default(),
     });
+    let startup_model = smol::block_on(handle.initial_model.recv_async()).unwrap_or(initial_model);
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
     let writer_thread = std::thread::spawn(move || {
@@ -586,6 +587,7 @@ pub fn run(params: SdkParams) -> Result<()> {
             "cwd": working_dir,
             "tools": tools,
             "model": startup_model.id,
+            "thinking": ThinkingConfig::from(defaults.thinking).clamped(&startup_model).to_string(),
             "permissionMode": permission_mode.as_str(),
             "apiKeySource": "none",
             "mcp_servers": [],
