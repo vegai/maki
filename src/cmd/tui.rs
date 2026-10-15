@@ -201,7 +201,11 @@ fn build_stack(
     warnings.extend(tool_filter_warnings(cli, ToolRegistry::global()));
     let commands = discover_commands(cli.no_commands, launch.cwd);
 
-    setup::remember_thinking(&mut config.session_defaults, launch.storage);
+    setup::resolve_thinking(
+        &mut config.session_defaults,
+        launch.storage,
+        cli.thinking_override(),
+    );
     let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, launch.storage);
     let (model, needs_login) = match (model_result, fallback_model) {
         (Ok((m, warning)), _) => {

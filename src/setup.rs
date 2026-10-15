@@ -14,6 +14,7 @@ use maki_providers::{AgentError, Timeouts, custom, plugin};
 use maki_storage::StateDir;
 use maki_storage::log::RotatingFileWriter;
 use maki_storage::model::{read_model, read_thinking};
+use maki_storage::sessions::StoredThinking;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
@@ -107,13 +108,16 @@ fn provider_ready(slug: &str) -> Result<(), AgentError> {
     provider_for_slug(slug, Timeouts::default()).map(drop)
 }
 
-/// `always_thinking` pins the level. Without it, a fresh session starts at
-/// whatever `/thinking` last set, the way the model comes back too; a model
-/// that cannot run that level clamps it when the session loads.
-pub fn remember_thinking(defaults: &mut SessionDefaults, storage: &StateDir) {
-    if defaults.thinking.is_none() {
-        defaults.thinking = read_thinking(storage);
-    }
+/// A launch flag overrides config, then the saved `/thinking` level supplies
+/// the fallback. The model reconciles the chosen setting before each request.
+pub fn resolve_thinking(
+    defaults: &mut SessionDefaults,
+    storage: &StateDir,
+    explicit: Option<StoredThinking>,
+) {
+    defaults.thinking = explicit
+        .or(defaults.thinking)
+        .or_else(|| read_thinking(storage));
 }
 
 /// An unknown slug may just mean the models.dev catalog has not been loaded
@@ -319,13 +323,50 @@ pub fn init_logging(storage_config: &maki_config::StorageConfig) {
 
 #[cfg(test)]
 mod tests {
+    use maki_config::SessionDefaults;
+    use maki_storage::StateDir;
+    use maki_storage::model::{persist_thinking, read_thinking};
+    use maki_storage::sessions::{Effort, StoredThinking};
+    use tempfile::tempdir;
     use test_case::test_case;
 
-    use super::{DEFAULT_LOG_LEVEL, build_log_filter};
+    use super::{DEFAULT_LOG_LEVEL, build_log_filter, resolve_thinking};
 
     const FOREIGN: &str = "other_crate=debug";
     const FOREIGN_EMPTY_PIECES: &str = ",other_crate=debug,,";
     const BROKEN: &str = "not a directive=!!";
+    const SAVED: StoredThinking = StoredThinking::Effort { level: Effort::Max };
+    const CONFIGURED: StoredThinking = StoredThinking::Effort {
+        level: Effort::High,
+    };
+    const EXPLICIT: StoredThinking = StoredThinking::Effort {
+        level: Effort::XHigh,
+    };
+
+    #[test_case(Some(EXPLICIT), Some(CONFIGURED), Some(SAVED), Some(EXPLICIT) ; "flag_overrides_config_and_state")]
+    #[test_case(Some(StoredThinking::Off), Some(CONFIGURED), Some(SAVED), Some(StoredThinking::Off) ; "explicit_off_overrides_enabled_defaults")]
+    #[test_case(None, Some(CONFIGURED), Some(SAVED), Some(CONFIGURED) ; "config_overrides_state")]
+    #[test_case(None, None, Some(SAVED), Some(SAVED) ; "state_is_the_fallback")]
+    #[test_case(None, None, None, None ; "no_saved_choice")]
+    fn launch_thinking_precedence_does_not_change_saved_state(
+        explicit: Option<StoredThinking>,
+        configured: Option<StoredThinking>,
+        saved: Option<StoredThinking>,
+        expected: Option<StoredThinking>,
+    ) {
+        let root = tempdir().unwrap();
+        let storage = StateDir::from_path(root.path().to_path_buf());
+        if let Some(saved) = saved {
+            persist_thinking(&storage, saved);
+        }
+        let mut defaults = SessionDefaults {
+            thinking: configured,
+            ..SessionDefaults::default()
+        };
+        resolve_thinking(&mut defaults, &storage, explicit);
+        assert_eq!(defaults.thinking, expected);
+        assert_eq!(read_thinking(&storage), saved);
+    }
 
     #[test_case(None, None, "info" ; "nothing_set_logs_at_info")]
     #[test_case(Some("warn"), None, "warn" ; "our_variable_wins")]
