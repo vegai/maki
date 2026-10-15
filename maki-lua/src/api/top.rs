@@ -12,6 +12,7 @@ use std::time::Duration;
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 
+use crate::api::util::callback::call_inline;
 use crate::api::util::command::{UiAction, ui_send};
 use crate::api::util::convert::TableExt;
 use crate::docs::FnDoc;
@@ -142,7 +143,7 @@ fn notify(
     });
     if let Some(func) = handler_fn {
         // A broken override must not swallow the message, so fall through.
-        match func.call::<()>((msg.clone(), level.clone(), opts)) {
+        match call_inline(lua, func, (msg.clone(), level.clone(), opts)) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 tracing::warn!(error = %e, "maki.notify handler failed; falling through to flash");
@@ -310,6 +311,8 @@ mod tests {
 
     const BY_FUNCTION: &str = "maki.set_notify_handler(function(msg) seen = msg end)";
     const BY_ASSIGNMENT: &str = "maki.notify = function(msg) seen = msg end";
+    const CALLER_SECRET: &str = "private-table";
+    const STACK_LEVELS: usize = 8;
 
     /// Builds one plugin's `maki` table under the global {plugin}, wired the
     /// way `create_maki_global` wires it: `notify` on the metatable's
@@ -348,6 +351,8 @@ mod tests {
 
     #[test_case("" ; "no handler installed")]
     #[test_case("maki.set_notify_handler(function() end) maki.set_notify_handler(nil)" ; "handler removed again")]
+    #[test_case("maki.set_notify_handler(function() error('broken handler') end)" ; "a_broken_handler")]
+    #[test_case("maki.set_notify_handler(function() coroutine.yield() end)" ; "a_yielding_handler")]
     fn notify_falls_back_to_flash(prelude: &str) {
         let lua = Lua::new();
         let (tx, rx) = flume::unbounded();
@@ -401,6 +406,45 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!(seen, "from the other plugin");
+    }
+
+    #[test]
+    fn notify_handlers_cannot_read_the_callers_environment() {
+        let lua = Lua::new();
+        lua.sandbox(true).unwrap();
+        install(&lua, None, "maki");
+        let observer = lua.create_table().unwrap();
+        let meta = lua.create_table().unwrap();
+        meta.set("__index", lua.globals()).unwrap();
+        observer.set_metatable(Some(meta.clone())).unwrap();
+        lua.load(format!(
+            r#"
+            maki.set_notify_handler(function()
+                for level = 1, {STACK_LEVELS} do
+                    local ok, env = pcall(getfenv, level)
+                    if ok and env.secret then stolen = env.secret end
+                end
+                notified = true
+            end)
+        "#
+        ))
+        .set_environment(observer.clone())
+        .exec()
+        .unwrap();
+        let caller = lua.create_table().unwrap();
+        caller.set_metatable(Some(meta)).unwrap();
+        caller.set("secret", CALLER_SECRET).unwrap();
+        let function = lua
+            .load(r#"maki.notify("hello")"#)
+            .set_environment(caller)
+            .into_function()
+            .unwrap();
+        lua.create_thread(function)
+            .unwrap()
+            .resume::<()>(())
+            .unwrap();
+        assert!(observer.get::<bool>("notified").unwrap());
+        assert!(observer.get::<Option<String>>("stolen").unwrap().is_none());
     }
 
     /// The handler closes over an env that dies with its plugin, so unloading

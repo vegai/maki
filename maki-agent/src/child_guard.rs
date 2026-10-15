@@ -3,9 +3,7 @@ use std::process::ExitStatus;
 use std::time::Duration;
 
 #[cfg(unix)]
-use rustix::io::Errno;
-#[cfg(unix)]
-use rustix::process::{Pid, Signal, WaitOptions, kill_process_group, waitpid};
+use rustix::process::{Pid, WaitOptions, waitpid};
 use smol::process::Child;
 
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -61,7 +59,7 @@ impl ChildGuard {
     #[cfg(unix)]
     fn signal_kill(&self) {
         if self.child.is_some() {
-            sigkill_process_group(self.pid);
+            maki_providers::process::kill_group(self.pid);
         }
     }
 
@@ -90,18 +88,6 @@ impl ChildGuard {
         if let Some(mut child) = self.child.take() {
             let _ = child.try_status();
         }
-    }
-}
-
-#[cfg(unix)]
-pub(crate) fn sigkill_process_group(pid: u32) {
-    let Some(group) = unix_pid(pid) else {
-        return;
-    };
-    if let Err(err) = kill_process_group(group, Signal::KILL)
-        && err != Errno::SRCH
-    {
-        tracing::warn!(pid, %err, "failed to kill process group");
     }
 }
 
