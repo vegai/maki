@@ -7,6 +7,12 @@ if [ "$1" = --version ]; then
   if [ -e "$dir/version_error" ]; then cat "$dir/version_error" >&2; exit 1; fi
   echo "$version"; exit 0
 fi
+if [ -e "$dir/track_sessions" ]; then
+  mkdir -p "$dir/sessions"
+  touch "$dir/sessions/$$.json"
+  trap 'rm -f "$dir/sessions/$$.json"; echo $$ >> "$dir/cleaned_sessions"' EXIT
+  trap 'exit 0' TERM
+fi
 echo start >> "$dir/calls"
 printf '%s' "$CLAUDE_CODE_DISABLE_ATTACHMENTS" > "$dir/attachments_disabled"
 hooks='[]'
@@ -102,6 +108,23 @@ while IFS= read -r msg; do
 done
 if [ -z "$got" ]; then [ "$scenario" = probe_runs ] && init none; exit 0; fi
 case $scenario in
+  graceful_batch | ignores_term_batch)
+    [ "$scenario" = ignores_term_batch ] && trap '' TERM
+    init none; connect; generation tool_use; dispatch a
+    if IFS= read -r reply <&3; then printf '%s' "$reply" > "$dir/answered_call"; fi
+    ;;
+  graceful_refusal)
+    mkfifo "$dir/hold"
+    exec 4<>"$dir/hold"
+    init ANTHROPIC_API_KEY
+    IFS= read -r held <&4
+    ;;
+  graceful_cut)
+    mkfifo "$dir/hold"
+    exec 4<>"$dir/hold"
+    init none; generation max_tokens
+    IFS= read -r held <&4
+    ;;
   batch) init none; connect; generation tool_use; dispatch a; sleep @WAIT_SECS@ ;;
   cut_line) init none; connect; generation tool_use; printf '{"type":"keep_al'; dispatch a; sleep @WAIT_SECS@ ;;
   missing_block_eof | missing_block_late)

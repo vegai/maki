@@ -2,7 +2,6 @@ use super::super::checks::HANDSHAKE;
 use super::super::error::Error;
 use super::super::mcp::Handoff;
 use super::super::stream::control_request;
-use super::EXIT;
 #[cfg(target_os = "linux")]
 use crate::process::guard;
 use crate::process::kill_group;
@@ -13,6 +12,10 @@ use futures_lite::future;
 use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use futures_lite::stream;
 use futures_lite::{FutureExt, Stream, StreamExt};
+#[cfg(unix)]
+use rustix::io::Errno;
+#[cfg(unix)]
+use rustix::process::{Pid, Signal, kill_process};
 use serde_json::json;
 use smol::process::{Child, ChildStdin, ChildStdout, Command};
 use smol::{Task, Timer};
@@ -26,7 +29,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use thiserror::Error as ThisError;
 use tracing::debug;
+#[cfg(unix)]
+use tracing::warn;
 
+pub(super) const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 const STDERR_DRAIN: Duration = Duration::from_secs(1);
 const STDERR_TAIL_LINES: usize = 10;
 const STDERR_LINE_BYTES: usize = 4096;
@@ -72,6 +78,21 @@ impl Group {
         if !self.reaped {
             kill_group(self.child.id());
         }
+    }
+
+    pub(super) fn terminate(&self) {
+        if self.reaped {
+            return;
+        }
+        #[cfg(unix)]
+        if let Some(pid) = i32::try_from(self.child.id()).ok().and_then(Pid::from_raw)
+            && let Err(error) = kill_process(pid, Signal::TERM)
+            && error != Errno::SRCH
+        {
+            warn!(pid = self.child.id(), %error, "could not request Claude Code shutdown");
+        }
+        #[cfg(not(unix))]
+        self.kill();
     }
 
     /// Kill remaining group members before the leader reap so the pid cannot identify another
@@ -143,10 +164,7 @@ struct Stderr {
 }
 
 impl Stderr {
-    /// Kills `group` first so its stderr ends, and every line gets read, even
-    /// from a process that exited before its reader started.
-    async fn explain(self, error: Error, group: &mut Group) -> Error {
-        group.kill();
+    async fn explain(self, error: Error) -> Error {
         if let Some(reader) = self.reader {
             reader
                 .or(async {
@@ -167,15 +185,15 @@ pub(super) async fn supervised<T>(
     let mut group = Group::spawn(command).await?;
     debug!(pid = group.child.id(), "claude-code: process started");
     let stderr = watch_stderr(&mut group.child);
-    match work(&mut group).await {
+    let result = work(&mut group).await;
+    if !group.reaped {
+        drop(group.child.stdin.take());
+        group.terminate();
+        let _ = group.wait(Instant::now() + SHUTDOWN_GRACE).await;
+    }
+    match result {
         Ok(value) => Ok(value),
-        Err(error) => {
-            let error = stderr.explain(error, &mut group).await;
-            if !group.reaped {
-                let _ = group.wait(Instant::now() + EXIT).await;
-            }
-            Err(error)
-        }
+        Err(error) => Err(stderr.explain(error).await),
     }
 }
 

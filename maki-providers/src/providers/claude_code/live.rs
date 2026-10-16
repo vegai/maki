@@ -2,13 +2,17 @@
 //! subscription. They run only on request: `cargo nextest run -p
 //! maki-providers --run-ignored only -E 'test(/claude_code::live::/)'`.
 
+use std::collections::HashSet;
 use std::env;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use flume::Sender;
 use serde_json::{Value, json};
+use smol::Timer;
 use tempfile::{TempDir, tempdir};
 use test_case::test_case;
 
@@ -62,6 +66,15 @@ const SLOW_MODEL: &str = "claude-sonnet-5";
 /// The limit that Claude Code's MCP client puts on a call without a server
 /// `timeout`.
 const CLIENT_CALL_LIMIT: Duration = Duration::from_secs(60);
+const SESSION_POLL: Duration = Duration::from_millis(10);
+const REAL_CLAUDE_ENV: &str = "MAKI_LIVE_CLAUDE";
+const SESSION_PIDS_ENV: &str = "MAKI_LIVE_SESSION_PIDS";
+const SESSION_DIRECTORY: &str = "sessions";
+const EXECUTABLE_MODE: u32 = 0o700;
+const REQUEST_PROCESSES: usize = 2;
+const NO_LIVE_SESSION: &str = "no worker session file was observed";
+const SESSION_LEFT: &str = "a session file was left behind";
+const TRACKED_CLAUDE: &str = "#!/bin/sh\nif [ \"$1\" != --version ]; then printf '%s\\n' \"$$\" >> \"$MAKI_LIVE_SESSION_PIDS\"; fi\nexec \"$MAKI_LIVE_CLAUDE\" \"$@\"\n";
 
 struct Live {
     claude: PathBuf,
@@ -331,6 +344,78 @@ fn live_tool_calls_round_trip_through_maki() {
         assert!(
             text.contains(meaning),
             "the reply must use the results of maki: {text}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "runs the claude CLI on the subscription of the caller"]
+fn live_stopping_a_tool_reply_removes_its_session() {
+    let mut live = Live::new();
+    let tracking = tempdir().unwrap();
+    let wrapper = tracking.path().join("claude");
+    let pids = tracking.path().join("pids");
+    let sessions = super::validation::login_dir(&live.env, None)
+        .unwrap()
+        .join(SESSION_DIRECTORY);
+    fs::write(&wrapper, TRACKED_CLAUDE).unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(EXECUTABLE_MODE)).unwrap();
+    live.env.extend([
+        (
+            REAL_CLAUDE_ENV.to_owned(),
+            live.claude.to_str().unwrap().to_owned(),
+        ),
+        (
+            SESSION_PIDS_ENV.to_owned(),
+            pids.to_str().unwrap().to_owned(),
+        ),
+    ]);
+    live.claude = wrapper;
+    let observed = Arc::new(Mutex::new(HashSet::new()));
+    let seen = Arc::clone(&observed);
+    let pid_log = pids.clone();
+    let session_dir = sessions.clone();
+    let observer = smol::spawn(async move {
+        loop {
+            if let Ok(pids) = smol::fs::read_to_string(&pid_log).await {
+                for pid in pids.lines() {
+                    if smol::fs::metadata(session_dir.join(format!("{pid}.json")))
+                        .await
+                        .is_ok()
+                    {
+                        seen.lock().unwrap().insert(pid.to_owned());
+                    }
+                }
+            }
+            Timer::after(SESSION_POLL).await;
+        }
+    });
+    let reply = live.ask(
+        MODEL,
+        &[Message::user(format!(
+            "Call {TOOL} exactly once with the word {WORD}. Wait for its result before replying."
+        ))],
+        &lookup_tool(),
+        None,
+        Thinking::Off,
+    );
+    smol::block_on(observer.cancel());
+    let reply = reply.unwrap();
+    let _ = lookup_round(&reply, WORD, MEANING);
+    assert_eq!(reply.message.tool_uses().count(), 1);
+    let pids = fs::read_to_string(pids).unwrap();
+    assert_eq!(pids.lines().count(), REQUEST_PROCESSES);
+    assert!(
+        observed
+            .lock()
+            .unwrap()
+            .contains(pids.lines().last().unwrap()),
+        "{NO_LIVE_SESSION}"
+    );
+    for pid in pids.lines() {
+        assert!(
+            !sessions.join(format!("{pid}.json")).exists(),
+            "{SESSION_LEFT}: {pid}"
         );
     }
 }

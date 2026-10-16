@@ -11,7 +11,7 @@ use self::private_files::private_file;
 pub(super) use self::private_files::{PrivateDir, private_dir};
 pub(super) use self::supervision::within;
 use self::supervision::{
-    Group, Next, next, send, send_handshake, stdout_lines, supervised, unreadable,
+    Group, Next, SHUTDOWN_GRACE, next, send, send_handshake, stdout_lines, supervised, unreadable,
 };
 use super::checks::{InitExpect, require_system};
 use super::error::Error;
@@ -414,10 +414,13 @@ async fn exchange_reply(
     // stopped here. Every event up to the end of the output is still checked,
     // so nothing after the reply can contradict it unnoticed.
     let stopped = turn.calls_tools() || turn.truncated() || result_late;
-    if stopped {
-        group.kill();
-    }
     let mut deadline = Instant::now() + limits.exit;
+    if turn.truncated() {
+        group.kill();
+    } else if stopped {
+        group.terminate();
+        deadline = deadline.min(Instant::now() + SHUTDOWN_GRACE);
+    }
     match drain(turn, &mut lines, handoffs, deadline, stopped).await {
         Err(Error::ExitLate) => {
             group.kill();
@@ -583,6 +586,10 @@ mod tests {
     const WEEK_RESET_MS: u64 = 1_790_521_200_000;
     const PRIVATE_MODES: &str = "600\n700\n";
     const MCP_OK: &str = "HTTP/1.1 200 OK";
+    const TRACK_SESSIONS: &str = "track_sessions";
+    const SESSIONS: &str = "sessions";
+    const CLEANED_SESSIONS: &str = "cleaned_sessions";
+    const ANSWERED_CALL: &str = "answered_call";
     /// Prints the pid of a `sleep` that closed all its standard streams.
     const LINGERING_MEMBER: &str = "sleep 30 </dev/null >/dev/null 2>&1 & echo $!";
 
@@ -649,6 +656,69 @@ mod tests {
             "the handoff token must not be on the command line"
         );
         assert!(fake.log("stdin_prompt").contains(MARKER));
+    }
+
+    #[test_case("graceful_batch", true ; "a_cooperative_leader")]
+    #[test_case("ignores_term_batch", false ; "a_leader_that_ignores_sigterm")]
+    fn stopping_a_tool_reply_keeps_calls_parked_during_cleanup(scenario: &str, cleans: bool) {
+        let fake = Fake::new(scenario);
+        fs::write(fake.dir.path().join(TRACK_SESSIONS), "").unwrap();
+        let reply = through_keep_alives(&fake, limits(STARTUP, IDLE, HANDOFF, SHORT_EXIT)).unwrap();
+        assert_eq!(reply.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(reply.message.tool_uses().count(), 2);
+        assert!(fake.log(ANSWERED_CALL).is_empty());
+        assert_eq!(
+            fs::read_dir(fake.dir.path().join(SESSIONS))
+                .unwrap()
+                .next()
+                .is_none(),
+            cleans
+        );
+        assert_eq!(
+            fake.log(CLEANED_SESSIONS)
+                .lines()
+                .any(|pid| pid == fake.log("pid").trim()),
+            cleans
+        );
+        assert!(fake.group_gone());
+        assert!(fake.leader_reaped());
+    }
+
+    #[test]
+    fn a_refused_request_allows_the_cli_to_clean_its_session() {
+        let fake = Fake::new("graceful_refusal");
+        fs::write(fake.dir.path().join(TRACK_SESSIONS), "").unwrap();
+        let (result, _) = smol::block_on(fake.request());
+        assert!(matches!(result.unwrap_err().cause(), Error::Check(_)));
+        assert!(
+            fs::read_dir(fake.dir.path().join(SESSIONS))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        assert!(
+            fake.log(CLEANED_SESSIONS)
+                .lines()
+                .any(|pid| pid == fake.log("pid").trim())
+        );
+        assert!(fake.group_gone());
+        assert!(fake.leader_reaped());
+    }
+
+    #[test]
+    fn a_capped_reply_stops_without_a_cleanup_grace() {
+        let fake = Fake::new("graceful_cut");
+        fs::write(fake.dir.path().join(TRACK_SESSIONS), "").unwrap();
+        let (reply, _) = smol::block_on(fake.request());
+        assert_eq!(reply.unwrap().stop_reason, Some(StopReason::MaxTokens));
+        assert!(
+            !fake
+                .log(CLEANED_SESSIONS)
+                .lines()
+                .any(|pid| pid == fake.log("pid").trim())
+        );
+        assert!(fake.group_gone());
+        assert!(fake.leader_reaped());
     }
 
     /// Runs a request on a fake that sends keep-alives until it is stopped,
@@ -1187,6 +1257,7 @@ mod tests {
     #[test_case(false ; "without_windows")]
     fn the_listed_models_are_what_the_account_offers(windows: bool) {
         let fake = Fake::new("text");
+        fs::write(fake.dir.path().join(TRACK_SESSIONS), "").unwrap();
         if !windows {
             fs::write(fake.dir.path().join(NO_WINDOWS), "").unwrap();
         }
@@ -1202,6 +1273,12 @@ mod tests {
         ))
         .unwrap();
 
+        assert!(
+            fs::read_dir(fake.dir.path().join(SESSIONS))
+                .unwrap()
+                .next()
+                .is_none()
+        );
         let window = |size| windows.then_some(size);
         assert_eq!(
             listed,
@@ -1373,22 +1450,25 @@ mod tests {
         );
     }
 
-    /// A stderr drain often kills after `wait` reaped the leader, when its
-    /// pid may name another group. Here the child is only marked reaped, so a
-    /// kill would show as SIGKILL rather than the test's SIGTERM.
-    #[test]
-    fn a_reaped_group_is_never_signalled() {
+    /// Marking the leader reaped must prevent signalling a pid that may identify another group.
+    #[test_case(false ; "sigkill")]
+    #[test_case(true ; "sigterm")]
+    fn a_reaped_group_is_never_signalled(graceful: bool) {
         let here = env::current_dir().unwrap();
         let args = [LONG_SLEEP_SECS.to_owned()];
         let sleep = command(Path::new(SLEEP), &Fake::env(), &here, &args);
         let mut group = smol::block_on(Group::spawn(sleep)).unwrap();
         group.reaped = true;
 
-        group.kill();
+        if graceful {
+            group.terminate();
+        } else {
+            group.kill();
+        }
 
         let pid = Pid::from_raw(group.child.id().try_into().unwrap()).unwrap();
-        kill_process(pid, Signal::TERM).unwrap();
+        kill_process(pid, Signal::USR1).unwrap();
         let status = smol::block_on(group.child.status()).unwrap();
-        assert_eq!(status.signal(), Some(Signal::TERM.as_raw()));
+        assert_eq!(status.signal(), Some(Signal::USR1.as_raw()));
     }
 }
