@@ -1137,8 +1137,12 @@ mod tests {
             fake.group_gone(),
             "a drop of the request must kill Claude Code"
         );
-        let left: Vec<_> = fs::read_dir(fake.temp_base()).unwrap().collect();
-        assert!(left.is_empty(), "{left:?}");
+        let base = fake.temp_base();
+        assert!(
+            wait_until(|| fs::read_dir(&base).unwrap().next().is_none()),
+            "{:?}",
+            fs::read_dir(&base).unwrap().collect::<Vec<_>>()
+        );
     }
 
     /// A signal can kill maki before any destructor runs, so Claude Code must
