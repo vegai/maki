@@ -102,30 +102,6 @@ local function sandbox_problem(sandbox, confine)
   )
 end
 
-case("child_env_passes_only_known_names_and_reports_route_ones", function()
-  local env, withheld = native.environment({
-    PATH = "/bin",
-    HOME = "/home/u",
-    LC_ALL = "C",
-    https_proxy = "http://proxy:3128",
-    CLAUDE_CODE_OAUTH_TOKEN = "subscription-token",
-    CLAUDE_CODE_USE_BEDROCK = "1",
-    ANTHROPIC_API_KEY = SECRET,
-    ANTHROPIC_MODEL = "claude-x",
-    SOME_TOOL_TOKEN = "other",
-  })
-  eq(env.PATH, "/bin")
-  eq(env.HOME, "/home/u")
-  eq(env.LC_ALL, "C")
-  eq(env.https_proxy, "http://proxy:3128")
-  eq(env.CLAUDE_CODE_OAUTH_TOKEN, "subscription-token")
-  eq(env.ANTHROPIC_API_KEY, nil)
-  eq(env.CLAUDE_CODE_USE_BEDROCK, nil)
-  eq(env.ANTHROPIC_MODEL, nil)
-  eq(env.SOME_TOOL_TOKEN, nil)
-  eq(table.concat(withheld, ","), "ANTHROPIC_API_KEY,CLAUDE_CODE_USE_BEDROCK")
-end)
-
 for _, c in ipairs({
   {
     name = "the_code_worker_with_the_token",

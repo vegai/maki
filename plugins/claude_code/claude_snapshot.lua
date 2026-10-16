@@ -139,6 +139,7 @@ function M.disk_blobs(call, env, cwd, paths, keep_on_cancel, timeout_ms)
   end
   local out, err = call:run_quick(workspace.git({ "hash-object", "--no-filters", "--stdin-paths" }), {
     env = env,
+    inherit_env = true,
     cwd = cwd,
     stdin = workspace.quoted_lines(paths),
     keep_on_cancel = keep_on_cancel,
