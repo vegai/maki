@@ -55,7 +55,7 @@ pub(in crate::providers::claude_code) async fn within<T>(
         .await
 }
 
-/// Kills the group on drop unless the leader is already reaped.
+/// Kills the group on drop until reaping starts.
 pub(super) struct Group {
     pub(super) child: Child,
     pub(super) reaped: bool,
@@ -99,14 +99,15 @@ impl Group {
     /// group.
     pub(super) async fn wait(&mut self, deadline: Instant) -> Result<ExitStatus, Error> {
         let exited = self.exited_by(deadline).await;
-        if exited == Some(false) {
-            // A failed wait cannot prove the pid still belongs to this group.
-            self.reaped = true;
-        } else {
+        if exited != Some(false) {
             self.kill();
         }
-        let status = self.child.status().await;
+        // The status future may reap even if its caller stops waiting. Disable further
+        // signals before it starts, while the leader's pid still belongs to the group.
         self.reaped = true;
+        let status = within(Instant::now() + SHUTDOWN_GRACE, self.child.status())
+            .await
+            .ok_or(Error::ReapLate)?;
         if exited.is_none() {
             return Err(Error::ExitLate);
         }
@@ -176,8 +177,7 @@ impl Stderr {
     }
 }
 
-/// Each error carries what Claude Code printed on stderr. After an error the
-/// group is reaped, so none of it still runs when the caller moves on.
+/// Stops the group and bounds cleanup before attaching stderr to an error.
 pub(super) async fn supervised<T>(
     command: process::Command,
     work: impl AsyncFnOnce(&mut Group) -> Result<T, Error>,
@@ -189,7 +189,12 @@ pub(super) async fn supervised<T>(
     if !group.reaped {
         drop(group.child.stdin.take());
         group.terminate();
-        let _ = group.wait(Instant::now() + SHUTDOWN_GRACE).await;
+        if matches!(
+            group.wait(Instant::now() + SHUTDOWN_GRACE).await,
+            Err(Error::ReapLate)
+        ) {
+            return Err(stderr.explain(Error::ReapLate).await);
+        }
     }
     match result {
         Ok(value) => Ok(value),
