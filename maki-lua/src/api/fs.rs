@@ -64,9 +64,9 @@ async fn mkdtemp(_lua: Lua, template: String) -> LuaResult<Pair<String>> {
     if !template.ends_with(TEMP_SUFFIX) {
         return Ok((None, Some(INVALID_TEMPLATE.into())));
     }
-    Ok(pair(
+    let path = try_pair!(make_absolute(&template));
+    let directory = try_pair!(
         smol::unblock(move || -> IoResult<String> {
-            let path = expand_tilde(&template);
             let name = path.file_name().unwrap_or_default().to_string_lossy();
             let prefix = name.strip_suffix(TEMP_SUFFIX).unwrap_or_default();
             let mut builder = tempfile::Builder::new();
@@ -78,7 +78,10 @@ async fn mkdtemp(_lua: Lua, template: String) -> LuaResult<Pair<String>> {
             let _ = dir.keep();
             Ok(name)
         })
-        .await,
+        .await
+    );
+    Ok(pair(
+        touched(PathBuf::from(&directory), Ok::<_, IoError>(directory)).await,
     ))
 }
 
@@ -87,9 +90,10 @@ async fn mkdtemp(_lua: Lua, template: String) -> LuaResult<Pair<String>> {
 /// @return (boolean?, string?) True on success, or nil and the error.
 #[lua_fn(guard = FsWrite)]
 async fn rmdir(_lua: Lua, path: String) -> LuaResult<Pair<bool>> {
-    Ok(pair(
-        smol::unblock(move || fs::remove_dir(expand_tilde(&path)).map(|_| true)).await,
-    ))
+    let path = try_pair!(make_absolute(&path));
+    let removed = path.clone();
+    let result = smol::unblock(move || fs::remove_dir(path)).await;
+    Ok(pair(touched(removed, result).await.map(|()| true)))
 }
 
 /// Rename a file or directory.
@@ -98,12 +102,13 @@ async fn rmdir(_lua: Lua, path: String) -> LuaResult<Pair<bool>> {
 /// @return (boolean?, string?) True on success, or nil and the error.
 #[lua_fn(guard = FsWrite)]
 async fn rename(_lua: Lua, path: String, new_path: String) -> LuaResult<Pair<bool>> {
-    Ok(pair(
-        smol::unblock(move || {
-            fs::rename(expand_tilde(&path), expand_tilde(&new_path)).map(|()| true)
-        })
-        .await,
-    ))
+    let path = try_pair!(make_absolute(&path));
+    let new_path = try_pair!(make_absolute(&new_path));
+    let moved_from = path.clone();
+    let moved_to = new_path.clone();
+    let result = smol::unblock(move || fs::rename(path, new_path)).await;
+    let result = touched(moved_from, result).await;
+    Ok(pair(touched(moved_to, result).await.map(|()| true)))
 }
 
 struct FileLock(Option<File>);
@@ -769,7 +774,7 @@ fn descend(mut base: PathBuf, component: &Component<'_>) -> PathBuf {
 /// Resolving the path is a realpath per ancestor and one more per `..` left
 /// in the tail, and this runs on the one executor every plugin shares, so it
 /// waits for a blocking thread the way the call it follows did.
-async fn touched<E>(path: PathBuf, result: Result<(), E>) -> Result<(), E> {
+async fn touched<T, E>(path: PathBuf, result: Result<T, E>) -> Result<T, E> {
     if result.is_ok() {
         smol::unblock(move || maki_agent::invalidate_for(&resolved(&path))).await;
     }
@@ -1240,7 +1245,11 @@ lua_table! {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::ffi::OsStr;
     use std::fs::OpenOptions;
+    #[cfg(unix)]
+    use std::os::unix::{ffi::OsStrExt, fs::symlink};
     use std::time::{Duration, Instant, SystemTime};
 
     use super::*;
@@ -1256,6 +1265,7 @@ mod tests {
     const READ_LIMIT_ERROR: &str = "file exceeds the 536870912-byte read limit";
     const TEST_READ_LIMIT: u64 = 4;
     const TEST_PLUGIN: &str = "test";
+    const MOVED_DIRECTORY: &str = "moved";
 
     #[test]
     fn read_file_ok() {
@@ -2922,6 +2932,95 @@ mod tests {
         );
     }
 
+    #[test_case(false ; "file")]
+    #[test_case(true ; "directory")]
+    fn a_rename_refreshes_both_indexed_trees(directory: bool) {
+        let root = TempDir::new().unwrap();
+        let source = TempDir::new_in(root.path()).unwrap();
+        let destination = TempDir::new_in(root.path()).unwrap();
+        let name = if directory { MOVED_DIRECTORY } else { NEW_FILE };
+        let from = source.path().join(name);
+        let to = destination.path().join(name);
+        let file = if directory {
+            fs::create_dir(&from).unwrap();
+            from.join(NEW_FILE)
+        } else {
+            from.clone()
+        };
+        fs::write(file, FIRST_CONTENT).unwrap();
+        walked(source.path());
+        walked(destination.path());
+        let source_index = maki_agent::file_index(source.path());
+        let destination_index = maki_agent::file_index(destination.path());
+        assert!(
+            source_index
+                .corpus()
+                .iter()
+                .any(|path| path.ends_with(NEW_FILE))
+        );
+        assert!(destination_index.corpus().is_empty());
+
+        let lua = Lua::new();
+        let rename: Function = fs_table(&lua).get("rename").unwrap();
+        let result: (Option<bool>, Option<String>) =
+            smol::block_on(rename.call_async((from.to_str().unwrap(), to.to_str().unwrap())))
+                .unwrap();
+        assert_eq!(result, (Some(true), None));
+        source_index.expire();
+        destination_index.expire();
+        let deadline = Instant::now() + WALK_TIMEOUT;
+        loop {
+            source_index.refresh();
+            destination_index.refresh();
+            let source = source_index.corpus();
+            let destination = destination_index.corpus();
+            if source.complete
+                && source.is_empty()
+                && destination.complete
+                && destination.iter().any(|path| path.ends_with(NEW_FILE))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{NEVER_WALKED}");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test_case(false ; "mkdtemp")]
+    #[test_case(true ; "rmdir")]
+    fn directory_mutations_refresh_the_index(remove: bool) {
+        let root = TempDir::new().unwrap();
+        let path = root
+            .path()
+            .join(if remove { MOVED_DIRECTORY } else { TEMP_SUFFIX });
+        if remove {
+            fs::create_dir(&path).unwrap();
+        }
+        walked(root.path());
+        let index = maki_agent::file_index(root.path());
+        assert_eq!(index.corpus().is_empty(), !remove);
+
+        let lua = Lua::new();
+        let operation: Function = fs_table(&lua)
+            .get(if remove { "rmdir" } else { "mkdtemp" })
+            .unwrap();
+        let (value, error): (Value, Option<String>) =
+            smol::block_on(operation.call_async(path.to_str().unwrap())).unwrap();
+        assert_eq!(error, None);
+        assert_ne!(value, Value::Nil);
+        index.expire();
+        let deadline = Instant::now() + WALK_TIMEOUT;
+        loop {
+            index.refresh();
+            let corpus = index.corpus();
+            if corpus.complete && corpus.is_empty() == remove {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{NEVER_WALKED}");
+            std::thread::yield_now();
+        }
+    }
+
     /// A file the agent has just written is a file the user is about to ask
     /// for, and the walk behind the answer can be twenty seconds old.
     #[test]
@@ -3014,39 +3113,19 @@ mod tests {
         assert!(lock.is_none());
         assert!(error.is_some_and(|error| error != LOCK_BUSY));
     }
-}
-
-#[cfg(test)]
-mod directory_tests {
-    use super::{INVALID_UTF8_PATH, TEMP_SUFFIX, create_fs_table};
-    use crate::plugin_permissions::PluginPermissions;
-    use mlua::{Function, Lua};
-    #[cfg(unix)]
-    use std::ffi::OsStr;
-    use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::ffi::OsStrExt;
-    #[cfg(unix)]
-    use std::os::unix::fs::symlink;
-    use std::path::Path;
-    use std::sync::Arc;
-    use tempfile::tempdir;
-    use test_case::test_case;
-
-    const TEST_PLUGIN: &str = "test";
 
     #[cfg(unix)]
     #[test]
     fn realpath_refuses_a_non_utf8_target() {
-        let root = tempdir().unwrap();
+        let root = TempDir::new().unwrap();
         let target = root.path().join(OsStr::from_bytes(b"invalid\xff"));
         fs::create_dir(&target).unwrap();
         let link = root.path().join("alias");
         symlink(target, &link).unwrap();
         let lua = Lua::new();
-        let uv =
+        let table =
             create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
-        let resolve: Function = uv.get("realpath").unwrap();
+        let resolve: Function = table.get("realpath").unwrap();
         let (path, error): (Option<String>, Option<String>) =
             smol::block_on(resolve.call_async(link.to_str().unwrap())).unwrap();
         assert_eq!(path, None);
@@ -3056,11 +3135,11 @@ mod directory_tests {
     #[test_case("" ; "unprefixed_template")]
     #[test_case("artifact." ; "prefixed_template")]
     fn mkdtemp_creates_inside_the_template_directory(prefix: &str) {
-        let root = tempdir().unwrap();
+        let root = TempDir::new().unwrap();
         let lua = Lua::new();
-        let uv =
+        let table =
             create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
-        let create: Function = uv.get("mkdtemp").unwrap();
+        let create: Function = table.get("mkdtemp").unwrap();
         let template = root.path().join(format!("{prefix}{TEMP_SUFFIX}"));
         let (path, error): (Option<String>, Option<String>) =
             smol::block_on(create.call_async(template.to_str().unwrap())).unwrap();

@@ -127,6 +127,8 @@ pub(crate) enum Error {
         bytes: usize,
         source: serde_json::Error,
     },
+    #[error("Claude Code printed an event exceeding the {limit}-byte limit")]
+    EventTooLarge { limit: usize },
     #[error("Claude Code printed a line that is not an event: {0}")]
     InvalidEvent(String),
     #[error("Claude Code did not report the model that ran")]
@@ -291,6 +293,7 @@ impl Error {
             Self::WentQuiet
                 | Self::ExitedEarly(_)
                 | Self::NotAnEvent { .. }
+                | Self::EventTooLarge { .. }
                 | Self::Io { .. }
                 | Self::ExitLate
                 | Self::MalformedArguments(_)
@@ -378,6 +381,8 @@ mod tests {
 
     const MALFORMED: &str = r#"{"type":"assistant","text":"\uD83D"}"#;
     const TOOL: &str = "read";
+    const EVENT_BYTES: usize = 1024;
+    const EVENT_LIMIT_ERROR: &str = "Claude Code printed an event exceeding the 1024-byte limit";
 
     #[test_case(true ; "during_a_generation")]
     #[test_case(false ; "before_init")]
@@ -392,6 +397,14 @@ mod tests {
         .after_start(accepted);
         assert_eq!(error.temporary().is_some(), accepted);
         assert!(error.to_string().contains("column"));
+    }
+
+    #[test_case(true ; "after_init")]
+    #[test_case(false ; "before_init")]
+    fn oversized_events_retain_the_limit_and_retry_only_after_init(accepted: bool) {
+        let error = Error::EventTooLarge { limit: EVENT_BYTES }.after_start(accepted);
+        assert_eq!(error.temporary().is_some(), accepted);
+        assert_eq!(error.to_string(), EVENT_LIMIT_ERROR);
     }
 
     #[test_case(true ; "after_init")]

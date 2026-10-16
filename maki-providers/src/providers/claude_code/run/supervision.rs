@@ -13,7 +13,6 @@ use futures_lite::future;
 use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use futures_lite::stream;
 use futures_lite::{FutureExt, Stream, StreamExt};
-use serde_json::error::Category;
 use serde_json::json;
 use smol::process::{Child, ChildStdin, ChildStdout, Command};
 use smol::{Task, Timer};
@@ -33,7 +32,6 @@ const STDERR_TAIL_LINES: usize = 10;
 const STDERR_LINE_BYTES: usize = 4096;
 const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 const TRUNCATED_LINE: &str = "…";
-const OVERSIZED_EVENT: &str = "[oversized event]";
 
 #[derive(Debug, ThisError)]
 #[error("event exceeds the {MAX_EVENT_BYTES}-byte limit")]
@@ -246,11 +244,8 @@ pub(super) fn unreadable(source: io::Error) -> Error {
         .get_ref()
         .is_some_and(|error| error.is::<EventTooLarge>())
     {
-        return Error::NotAnEvent {
-            preview: OVERSIZED_EVENT.to_owned(),
-            category: Category::Io,
-            bytes: MAX_EVENT_BYTES + 1,
-            source: serde_json::Error::io(source),
+        return Error::EventTooLarge {
+            limit: MAX_EVENT_BYTES,
         };
     }
     Error::Io {
@@ -377,7 +372,7 @@ mod tests {
         let error = smol::block_on(event_line(&mut reader)).unwrap_err();
         assert_eq!(reader.position(), (MAX_EVENT_BYTES + 1) as u64);
         assert!(
-            matches!(unreadable(error), Error::NotAnEvent { bytes, .. } if bytes == MAX_EVENT_BYTES + 1)
+            matches!(unreadable(error), Error::EventTooLarge { limit } if limit == MAX_EVENT_BYTES)
         );
     }
 
