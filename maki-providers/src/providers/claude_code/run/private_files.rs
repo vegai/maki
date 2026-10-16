@@ -12,6 +12,7 @@ use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
 use std::process;
 #[cfg(target_os = "linux")]
 use std::sync::{Mutex, PoisonError};
