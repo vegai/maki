@@ -111,6 +111,7 @@ const IMPORT_GUIDANCE: &str = "merge it manually";
 const STAGING_STEP: &str = "staged ";
 /// The prefix of every temporary file an import writes.
 const IMPORT_TEMP: &str = ".maki-import-";
+const IMPORT_LOCK: &str = "import.lock";
 /// An artifact's repository, next to its snapshot.
 const ARTIFACT_GIT: &str = "git";
 const SHA1: &str = "sha1";
@@ -1182,9 +1183,12 @@ fn a_cancelled_import_leaves_the_checkout_as_it_was() {
         "the import did not write its new files"
     );
     let cancelled = result.unwrap_err();
-    for part in [NOTHING_IMPORTED, CANCELLED] {
-        assert!(cancelled.contains(part), "{part} missing from: {cancelled}");
-    }
+    assert!(cancelled.contains(CANCELLED), "{cancelled}");
+    let lock = File::open(coding.artifact(&id).join(IMPORT_LOCK)).unwrap();
+    assert!(
+        wait_until(DEADLINE, || lock.try_lock().is_ok()),
+        "import cleanup did not release its lock"
+    );
     assert_eq!(contents(&project), before);
     assert!(temp_files(&project).is_empty());
 }
