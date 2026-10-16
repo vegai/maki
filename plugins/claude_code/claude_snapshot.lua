@@ -14,6 +14,7 @@ local SWEEP_CONTENTS = [[
 set -e
 cd -P -- "$1"
 [ "$(pwd -P)" = "$1" ]
+find -P . -type d ! -perm -u=rwx -exec chmod u+rwx -- {} \;
 find . -mindepth 1 -maxdepth 1 ! -name "$2" -exec rm -rf -- {} +
 rm -f -- "./$2"
 rmdir -- "$1"
@@ -459,10 +460,32 @@ function M.fill(call, artifact, spec)
   return commit_base(call, artifact, kept, spec.dependencies) or consistency_problem(call, artifact, spec)
 end
 
+local function remove_artifact(call, dir, released)
+  local function finished(_, code)
+    if code ~= 0 then
+      call:leave(dir)
+    end
+    if released then
+      released()
+    end
+  end
+  if not pcall(call.start, call, { "sh", "-c", SWEEP_CONTENTS, "sh", dir, OWNER_MARKER }, {}, finished) then
+    finished()
+  end
+end
+
+local function discard_failed_allocation(call, dir)
+  maki.async.await(1, function(done)
+    remove_artifact(call, dir, function()
+      done(true)
+    end)
+  end)
+end
+
 --- An import rewrites the manifest, so the sweep keeps the artifact of an
 --- unfinished import. An artifact that stopped before the collect step is
 --- dated by its marker.
-function M.sweep(root, ttl_hours)
+function M.sweep(call, root, ttl_hours)
   local entries = maki.fs.dir(root)
   local cutoff = os.time() - ttl_hours * SECS_PER_HOUR
   for _, entry in ipairs(entries or {}) do
@@ -481,14 +504,12 @@ function M.sweep(root, ttl_hours)
           if already_trash then
             trash = dir
           end
-          local id = renamed
-            and maki.fn.jobstart({ "sh", "-c", SWEEP_CONTENTS, "sh", trash, OWNER_MARKER }, {
-              scope = "plugin",
-              on_exit = function()
-                lock:close()
-              end,
-            })
-          if not id then
+          if renamed then
+            remove_artifact(call, trash, function()
+              lock:close()
+            end)
+          else
+            call:leave(dir)
             lock:close()
           end
         else
@@ -534,7 +555,7 @@ function M.resolve_root(root, spec)
 end
 
 --- `tmp` is the only other place the worker's shell can write.
-function M.allocate(root, env, timeout_ms)
+function M.allocate(call, root, env, timeout_ms)
   local _, root_err = maki.fs.mkdir(root, { parents = true })
   if root_err then
     return nil, "maki cannot make " .. root .. ": " .. root_err
@@ -545,7 +566,7 @@ function M.allocate(root, env, timeout_ms)
   end
   local _, mark_err = maki.fs.write(maki.fs.joinpath(dir, OWNER_MARKER), "")
   if mark_err then
-    maki.fs.rm(dir, { recursive = true, force = true })
+    discard_failed_allocation(call, dir)
     return nil, "maki cannot mark " .. dir .. " as an artifact: " .. mark_err
   end
   local snapshot = maki.fs.joinpath(dir, workspace.SNAPSHOT_DIR)
@@ -563,15 +584,15 @@ function M.allocate(root, env, timeout_ms)
   for _, sub in ipairs({ artifact.snapshot, artifact.tmp }) do
     local _, mkdir_err = maki.fs.mkdir(sub)
     if mkdir_err then
-      M.discard(artifact)
+      discard_failed_allocation(call, artifact.dir)
       return nil, "maki cannot make " .. sub .. ": " .. mkdir_err
     end
   end
   return artifact
 end
 
-function M.discard(artifact)
-  maki.fs.rm(artifact.dir, { recursive = true, force = true })
+function M.discard(call, artifact, removed)
+  remove_artifact(call, artifact.dir, removed)
 end
 
 -- Git traverses nested repositories during ordinary status commands. Keep their metadata

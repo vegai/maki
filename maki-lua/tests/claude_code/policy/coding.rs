@@ -127,6 +127,12 @@ const PREPARE_FAILED: &str = "the prepare command stopped with an error";
 /// Longer than `DEADLINE`, so a stop that fails makes the test fail while it
 /// waits.
 const PREPARE_NEVER_ENDS: &str = "sleep 240";
+const PREPARE_LOCKS_DIRECTORIES: &str =
+    "mkdir -p locked/nested; touch locked/nested/file; chmod a-rwx locked/nested locked;";
+const LOCKED_SNAPSHOT_FILE: &str = "locked/nested/file";
+const READ_ONLY_DIRECTORY_MODE: u32 = 0o555;
+const READ_ONLY_FILE_MODE: u32 = 0o400;
+const TRASH_PREFIX: &str = ".trash-";
 const SNAPSHOT_STAYS: &str = "The worker's snapshot stays in";
 const REPLY_LINES: usize = 8;
 /// The blank line and the note `maki.truncate` appends past the limit.
@@ -1194,12 +1200,18 @@ fn a_cancelled_import_leaves_the_checkout_as_it_was() {
 }
 
 /// Cancellation must remove the incomplete snapshot and its dependencies immediately.
-#[test]
-fn a_cancel_while_the_snapshot_is_made_discards_it() {
+#[test_case(false ; "ordinary_directories")]
+#[test_case(true ; "inaccessible_directories")]
+fn a_cancel_while_the_snapshot_is_made_discards_it(locked: bool) {
     let coding = Coding::new();
     let started = tempdir().unwrap();
     let marker = started.path().join(PREPARE_STARTED);
-    let prepare = format!("touch '{}'; {PREPARE_NEVER_ENDS}", marker.display());
+    let setup = if locked {
+        PREPARE_LOCKS_DIRECTORIES
+    } else {
+        ""
+    };
+    let prepare = format!("{setup} touch '{}'; {PREPARE_NEVER_ENDS}", marker.display());
     let (reg, _host) = coding.host(&[("prepare", json!(prepare))]);
     let mut ctx = coding.ctx(&reg);
     let (trigger, token) = CancelToken::new();
@@ -1817,6 +1829,62 @@ fn the_sweep_takes_only_stale_artifacts(files: &[&str], fresh_manifest: bool, sw
         if swept { 1 } else { 2 },
         "the artifact of the call must stay"
     );
+}
+
+#[test_case(READ_ONLY_DIRECTORY_MODE, false ; "read_only")]
+#[test_case(NO_ACCESS_MODE, false ; "inaccessible")]
+#[test_case(READ_ONLY_DIRECTORY_MODE, true ; "already_in_trash")]
+fn the_sweep_removes_protected_directories_without_changing_link_targets(mode: u32, trashed: bool) {
+    let coding = Coding::new();
+    let name = if trashed {
+        format!("{TRASH_PREFIX}{OLD_FOLDER}")
+    } else {
+        OLD_FOLDER.to_owned()
+    };
+    let old = old_folder(coding.artifacts.path(), &name, &[ARTIFACT_MARKER, MANIFEST]);
+    let locked = old.join(SNAPSHOT_DIR).join(LOCKED_SNAPSHOT_FILE);
+    write(&locked, BASE_LIB);
+    let outside = tempdir().unwrap();
+    let target = outside.path().join(IMPORTED_LIB);
+    write(&target, BASE_LIB);
+    let directory = target.parent().unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(READ_ONLY_FILE_MODE)).unwrap();
+    fs::set_permissions(
+        directory,
+        fs::Permissions::from_mode(READ_ONLY_DIRECTORY_MODE),
+    )
+    .unwrap();
+    let file_permissions = fs::metadata(&target).unwrap().permissions();
+    let directory_permissions = fs::metadata(directory).unwrap().permissions();
+    symlink(directory, old.join(SNAPSHOT_DIR).join(PREPARED_LINK)).unwrap();
+    fs::create_dir_all(old.join(ORIGINALS)).unwrap();
+    fs::hard_link(&target, old.join(ORIGINALS).join(PREPARED_FILE)).unwrap();
+    for path in [
+        locked.parent().unwrap(),
+        locked.parent().unwrap().parent().unwrap(),
+    ] {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let (reg, _host) = coding.host(&[]);
+    coding.code(&reg, CODE_EDIT, &[]).unwrap();
+    let removed = wait_until(DEADLINE, || {
+        fs::read_dir(coding.artifacts.path()).unwrap().count() == 1
+    });
+    let final_directory_permissions = fs::metadata(directory).unwrap().permissions();
+    fs::set_permissions(directory, fs::Permissions::from_mode(EXECUTABLE_MODE)).unwrap();
+
+    assert!(
+        removed,
+        "artifact stayed: {:?}",
+        listing(coding.artifacts.path())
+    );
+    assert!(!old.exists());
+    assert_eq!(fs::read_to_string(&target).unwrap(), BASE_LIB);
+    assert_eq!(
+        fs::metadata(&target).unwrap().permissions(),
+        file_permissions
+    );
+    assert_eq!(final_directory_permissions, directory_permissions);
 }
 
 /// An artifact directory inside the checkout can expose project files to cleanup.

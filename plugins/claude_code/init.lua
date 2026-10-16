@@ -277,8 +277,8 @@ local function open_artifact(call, spec)
   if not root then
     return nil, "maki cannot make a coding artifact: " .. root_err
   end
-  snapshot.sweep(root, opts.artifact_ttl_hours)
-  local artifact, allocate_err = snapshot.allocate(root, spec.env, SNAPSHOT_TIMEOUT_MS)
+  snapshot.sweep(call, root, opts.artifact_ttl_hours)
+  local artifact, allocate_err = snapshot.allocate(call, root, spec.env, SNAPSHOT_TIMEOUT_MS)
   if not artifact then
     return nil, "maki cannot make a coding artifact: " .. allocate_err
   end
@@ -361,14 +361,16 @@ end
 
 -- Wait for all processes before artifact removal. A stopped copy can still write until its
 -- process exits.
-local function discard_unkept(call)
+local function discard_unkept(call, removed)
   local artifact = call.artifact
   if artifact then
     call.artifact = nil
     call:stop()
     call:when_idle(function()
-      snapshot.discard(artifact)
+      snapshot.discard(call, artifact, removed)
     end)
+  elseif removed then
+    removed()
   end
 end
 
@@ -406,7 +408,11 @@ local function handler(input, ctx)
   if not ok then
     call:stop()
   end
-  discard_unkept(call)
+  maki.async.await(1, function(done)
+    discard_unkept(call, function()
+      done(true)
+    end)
+  end)
   if ok and #call.left_behind > 0 then
     reply.llm_output = reply.llm_output .. "\n" .. jobs.LEFT_BEHIND .. table.concat(call.left_behind, ", ")
     call.left_behind = {}
