@@ -10,8 +10,10 @@ use crate::process::kill_group;
 use crate::process::wait_without_reaping;
 use flume::Receiver;
 use futures_lite::future;
-use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use futures_lite::stream;
 use futures_lite::{FutureExt, Stream, StreamExt};
+use serde_json::error::Category;
 use serde_json::json;
 use smol::process::{Child, ChildStdin, ChildStdout, Command};
 use smol::{Task, Timer};
@@ -23,12 +25,19 @@ use std::os::unix::net::UnixStream;
 use std::process::{self, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
+use thiserror::Error as ThisError;
 use tracing::debug;
 
 const STDERR_DRAIN: Duration = Duration::from_secs(1);
 const STDERR_TAIL_LINES: usize = 10;
 const STDERR_LINE_BYTES: usize = 4096;
+const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 const TRUNCATED_LINE: &str = "…";
+const OVERSIZED_EVENT: &str = "[oversized event]";
+
+#[derive(Debug, ThisError)]
+#[error("event exceeds the {MAX_EVENT_BYTES}-byte limit")]
+struct EventTooLarge;
 
 pub(in crate::providers::claude_code) async fn within<T>(
     deadline: Instant,
@@ -233,6 +242,17 @@ fn with_stderr(error: Error, tail: &StderrTail) -> Error {
 }
 
 pub(super) fn unreadable(source: io::Error) -> Error {
+    if source
+        .get_ref()
+        .is_some_and(|error| error.is::<EventTooLarge>())
+    {
+        return Error::NotAnEvent {
+            preview: OVERSIZED_EVENT.to_owned(),
+            category: Category::Io,
+            bytes: MAX_EVENT_BYTES + 1,
+            source: serde_json::Error::io(source),
+        };
+    }
     Error::Io {
         what: "read the output of Claude Code",
         source,
@@ -266,12 +286,39 @@ pub(super) async fn next(
     .unwrap_or(Next::Late)
 }
 
+async fn event_line(reader: &mut (impl AsyncBufRead + Unpin)) -> io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    reader
+        .take((MAX_EVENT_BYTES + 1) as u64)
+        .read_until(b'\n', &mut bytes)
+        .await?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    if bytes.len() > MAX_EVENT_BYTES {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, EventTooLarge));
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
 pub(super) fn stdout_lines(
     stdout: Option<ChildStdout>,
-) -> Result<Lines<BufReader<ChildStdout>>, Error> {
-    stdout
-        .map(|out| BufReader::new(out).lines())
-        .ok_or(Error::NoStdout)
+) -> Result<impl Stream<Item = io::Result<String>> + Unpin, Error> {
+    let reader = BufReader::new(stdout.ok_or(Error::NoStdout)?);
+    Ok(Box::pin(stream::unfold(reader, |mut reader| async move {
+        event_line(&mut reader)
+            .await
+            .transpose()
+            .map(|line| (line, reader))
+    })))
 }
 
 /// Sends the check requests, which Claude Code answers before it reads a
@@ -309,11 +356,43 @@ pub(super) async fn send(
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::error::Error;
     use futures_lite::io::Cursor;
+    use test_case::test_case;
 
-    use super::{STDERR_LINE_BYTES, TRUNCATED_LINE, stderr_line};
+    use super::{
+        MAX_EVENT_BYTES, STDERR_LINE_BYTES, TRUNCATED_LINE, event_line, stderr_line, unreadable,
+    };
 
     const NEXT_LINE: &str = "next";
+
+    #[test_case(false ; "unterminated_event")]
+    #[test_case(true ; "terminated_event")]
+    fn oversized_events_stop_at_the_limit(terminated: bool) {
+        let mut input = vec![b'x'; MAX_EVENT_BYTES + 2];
+        if terminated {
+            input.push(b'\n');
+        }
+        let mut reader = Cursor::new(input);
+        let error = smol::block_on(event_line(&mut reader)).unwrap_err();
+        assert_eq!(reader.position(), (MAX_EVENT_BYTES + 1) as u64);
+        assert!(
+            matches!(unreadable(error), Error::NotAnEvent { bytes, .. } if bytes == MAX_EVENT_BYTES + 1)
+        );
+    }
+
+    #[test_case(false ; "unterminated_event")]
+    #[test_case(true ; "terminated_event")]
+    fn events_at_the_limit_remain_readable(terminated: bool) {
+        let mut input = vec![b'x'; MAX_EVENT_BYTES];
+        if terminated {
+            input.push(b'\n');
+        }
+        let mut reader = Cursor::new(input);
+        let line = smol::block_on(event_line(&mut reader)).unwrap().unwrap();
+        assert_eq!(line.len(), MAX_EVENT_BYTES);
+        assert!(smol::block_on(event_line(&mut reader)).unwrap().is_none());
+    }
 
     #[test]
     fn capped_stderr_lines_are_drained_before_the_next_line() {

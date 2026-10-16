@@ -3,9 +3,20 @@ use std::path::PathBuf;
 
 use clap::builder::{StringValueParser, TypedValueParser};
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
-use maki_storage::sessions::StoredThinking;
+use maki_storage::sessions::{Effort, StoredThinking, ThinkingParseError};
 
 use crate::print::OutputFormat;
+
+const SDK_THINKING_ENABLED: &str = "enabled";
+const SDK_THINKING_DISABLED: &str = "disabled";
+
+fn parse_thinking(input: &str) -> Result<StoredThinking, ThinkingParseError> {
+    match input.trim() {
+        SDK_THINKING_ENABLED => Ok(StoredThinking::Adaptive),
+        SDK_THINKING_DISABLED => Ok(StoredThinking::Off),
+        value => StoredThinking::parse_setting(value),
+    }
+}
 
 #[derive(Clone, ValueEnum, Default)]
 pub enum PromptVariant {
@@ -45,8 +56,12 @@ pub struct Cli {
     pub model: Option<String>,
 
     /// Thinking setting for this launch: off, adaptive, minimal through max, or a positive token budget
-    #[arg(long, visible_alias = "effort", global = true, value_parser = StoredThinking::parse_setting, conflicts_with = "max_thinking_tokens")]
+    #[arg(long, global = true, value_parser = parse_thinking)]
     pub thinking: Option<StoredThinking>,
+
+    /// Thinking effort for this launch: minimal through max
+    #[arg(long, global = true)]
+    pub effort: Option<Effort>,
 
     /// Positive thinking-token budget for this launch
     #[arg(long, global = true)]
@@ -180,12 +195,15 @@ pub struct Cli {
 
 impl Cli {
     pub fn thinking_override(&self) -> Option<StoredThinking> {
-        self.thinking.or_else(|| {
-            self.max_thinking_tokens
-                .map(|tokens| StoredThinking::Budget {
-                    tokens: tokens.get(),
-                })
-        })
+        if self.thinking == Some(StoredThinking::Off) {
+            return self.thinking;
+        }
+        self.max_thinking_tokens
+            .map(|tokens| StoredThinking::Budget {
+                tokens: tokens.get(),
+            })
+            .or_else(|| self.effort.map(|level| StoredThinking::Effort { level }))
+            .or(self.thinking)
     }
 
     pub fn warn_ignored_flags(&self) {
@@ -412,11 +430,20 @@ mod tests {
     #[test_case(&["--thinking", "off"], "off" ; "explicit_off")]
     #[test_case(&["--thinking", "adaptive"], "adaptive" ; "adaptive")]
     #[test_case(&["--thinking", "8192"], "8192" ; "thinking_budget")]
-    #[test_case(&["--effort", "low"], "low" ; "effort_alias")]
+    #[test_case(&["--effort", "low"], "low" ; "effort")]
     #[test_case(&["--max-thinking-tokens", "2048"], "2048" ; "compatibility_budget")]
     #[test_case(&["acp", "--thinking", "high"], "high" ; "acp_local_flag")]
     #[test_case(&["--effort", "high", "acp"], "high" ; "acp_global_flag")]
     #[test_case(&["acp", "--max-thinking-tokens", "4096"], "4096" ; "acp_budget")]
+    #[test_case(&["--thinking", "enabled"], "adaptive" ; "sdk_enabled")]
+    #[test_case(&["--thinking", "disabled"], "off" ; "sdk_disabled")]
+    #[test_case(&["--thinking=adaptive", "--effort", "high"], "high" ; "sdk_adaptive_and_effort")]
+    #[test_case(&["--thinking", "enabled", "--effort", "low"], "low" ; "sdk_enabled_and_effort")]
+    #[test_case(&["--max-thinking-tokens", "4096", "--effort", "high"], "4096" ; "sdk_budget_and_effort")]
+    #[test_case(&["--thinking", "disabled", "--max-thinking-tokens", "4096", "--effort", "high"], "off" ; "disabled_overrides_budget_and_effort")]
+    #[test_case(&["--thinking", "high", "--effort", "low"], "low" ; "effort_overrides_thinking")]
+    #[test_case(&["--thinking", "high", "--max-thinking-tokens", "2048"], "2048" ; "budget_overrides_thinking")]
+    #[test_case(&["acp", "--effort", "high", "--max-thinking-tokens", "2048"], "2048" ; "acp_budget_overrides_effort")]
     fn thinking_flags_use_the_shared_setting(args: &[&str], expected: &str) {
         let cli = Cli::try_parse_from(std::iter::once("maki").chain(args.iter().copied())).unwrap();
         assert_eq!(
@@ -431,9 +458,6 @@ mod tests {
     #[test_case(&["acp", "--thinking", "turbo"], ErrorKind::ValueValidation ; "invalid_acp_thinking")]
     #[test_case(&["--max-thinking-tokens", "0"], ErrorKind::ValueValidation ; "zero_compatibility_budget")]
     #[test_case(&["--max-thinking-tokens", "high"], ErrorKind::ValueValidation ; "non_numeric_compatibility_budget")]
-    #[test_case(&["--thinking", "high", "--effort", "low"], ErrorKind::ArgumentConflict ; "two_aliases")]
-    #[test_case(&["--thinking", "high", "--max-thinking-tokens", "2048"], ErrorKind::ArgumentConflict ; "level_and_budget")]
-    #[test_case(&["acp", "--effort", "high", "--max-thinking-tokens", "2048"], ErrorKind::ArgumentConflict ; "acp_level_and_budget")]
     fn invalid_thinking_flags_fail_during_parsing(args: &[&str], expected: ErrorKind) {
         let error = Cli::try_parse_from(std::iter::once("maki").chain(args.iter().copied()))
             .err()

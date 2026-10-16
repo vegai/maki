@@ -13,8 +13,6 @@ local M = {}
 M.MODELS = { "sonnet", "opus", "haiku", "fable" }
 M.STARTUP_TIMEOUT_SECS = 30
 M.STARTUP_MS = M.STARTUP_TIMEOUT_SECS * jobs.MS_PER_SEC
-local PROBE_DIR_TEMPLATE = "maki-claude-code.XXXXXX"
-local DEFAULT_TMP_DIR = "/tmp"
 M.READ_PROFILE = "read"
 M.CODE_PROFILE = "code"
 M.NO_SESSION_DIR = "maki cannot find the session's working directory: "
@@ -197,17 +195,12 @@ function M.shell_secret_problem(worker, env)
 end
 
 function M.denied_home_paths(extra)
-  local paths = {}
-  for path in (extra or ""):gmatch("[^,]+") do
-    path = workspace.trim(path)
+  return workspace.comma_list(extra, function(path)
     if path:sub(1, 1) == "/" or path:sub(1, 1) == "~" or ("/" .. path .. "/"):find("/../", 1, true) then
       return nil, "a deny_read_home path must stay inside the home directory"
     end
-    if path ~= "" then
-      paths[#paths + 1] = path
-    end
-  end
-  return paths
+    return path
+  end)
 end
 
 --- Returns the logins and keys under {home} that a coding worker's shell
@@ -221,7 +214,7 @@ function M.home_credentials(home, extra, environ)
     return nil, "maki cannot resolve relocated credential paths: " .. tostring(cwd_err)
   end
   local paths, seen = {}, {}
-  local resolved_home = maki.uv.fs_realpath(home) or home
+  local resolved_home = maki.fs.realpath(home) or home
   local function add(path)
     if not seen[path] then
       seen[path] = true
@@ -232,7 +225,7 @@ function M.home_credentials(home, extra, environ)
     add(maki.fs.joinpath(home, path))
     local absolute = maki.fs.joinpath(resolved_home, path)
     add(absolute)
-    local resolved = maki.uv.fs_realpath(absolute)
+    local resolved = maki.fs.realpath(absolute)
     if resolved then
       add(resolved)
     end
@@ -247,7 +240,7 @@ function M.home_credentials(home, extra, environ)
   add(maki.fs.joinpath(home, ".claude.json*"))
   add(maki.fs.joinpath(resolved_home, ".claude.json*"))
   for _, path in ipairs(state_files) do
-    local resolved = maki.uv.fs_realpath(maki.fs.joinpath(resolved_home, path))
+    local resolved = maki.fs.realpath(maki.fs.joinpath(resolved_home, path))
     if resolved and not workspace.within(resolved, resolved_home) then
       add(resolved)
     end
@@ -266,7 +259,7 @@ function M.home_credentials(home, extra, environ)
         path = maki.fs.joinpath(cwd, path)
       end
       add(path)
-      local resolved = maki.uv.fs_realpath(path)
+      local resolved = maki.fs.realpath(path)
       if resolved then
         add(resolved)
       end
@@ -452,24 +445,12 @@ function M.checked_step(stream, line, answers, spec, confine, deny_read)
   return step
 end
 
--- A resolved TMPDIR must stay outside the project.
 local function probe_dir(env, spec)
-  local base, base_err = maki.uv.fs_realpath(env.TMPDIR or DEFAULT_TMP_DIR)
-  if not base then
-    return nil, base_err
+  local denied = { unpack(spec.checkout_dirs) }
+  if spec.git_dir then
+    denied[#denied + 1] = spec.git_dir
   end
-  if M.in_checkout(base, spec) then
-    return nil, "the temporary directory " .. base .. " is in the project. Set TMPDIR to a different directory."
-  end
-  local created, err = maki.uv.fs_mkdtemp(maki.fs.joinpath(base, PROBE_DIR_TEMPLATE))
-  if not created then
-    return nil, err
-  end
-  if M.in_checkout(created, spec) or workspace.within(spec.cwd, created) then
-    maki.uv.fs_rmdir(created)
-    return nil, "the probe directory " .. created .. " is in the project, or contains it"
-  end
-  return created
+  return native.private_dir(env.TMPDIR, spec.cwd, denied)
 end
 
 function M.job_opts(cwd, env, stderr_tail)

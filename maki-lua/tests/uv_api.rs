@@ -103,14 +103,14 @@ fn a_neighbouring_permission_does_not_carry_over(held: Permission, call: &str, n
 }
 
 const NATIVE_DIRECTORIES: &str = r#"
-local dir = assert(maki.uv.fs_mkdtemp(@TEMPLATE@))
-assert(maki.uv.fs_realpath(dir) == dir)
+local dir = assert(maki.fs.mkdtemp(@TEMPLATE@))
+assert(maki.fs.realpath(dir) == dir)
 assert(maki.fs.write(maki.fs.joinpath(dir, "kept"), "data"))
-local removed, err = maki.uv.fs_rmdir(dir)
+local removed, err = maki.fs.rmdir(dir)
 assert(removed == nil and err ~= nil)
 assert(maki.fs.read(maki.fs.joinpath(dir, "kept")) == "data")
 assert(maki.fs.rm(maki.fs.joinpath(dir, "kept")))
-assert(maki.uv.fs_rmdir(dir))
+assert(maki.fs.rmdir(dir))
 "#;
 
 #[test]
@@ -134,9 +134,9 @@ fn native_temp_directories_are_private_and_realpath_follows_links() {
     symlink(base.path(), &link).unwrap();
     let source = format!(
         r#"
-local physical = assert(maki.uv.fs_realpath({link}))
+local physical = assert(maki.fs.realpath({link}))
 assert(physical == {base})
-local dir = assert(maki.uv.fs_mkdtemp(maki.fs.joinpath(physical, "private.XXXXXX")))
+local dir = assert(maki.fs.mkdtemp(maki.fs.joinpath(physical, "private.XXXXXX")))
 assert(maki.fs.write({output}, dir))
 "#,
         link = serde_json::to_string(&link).unwrap(),

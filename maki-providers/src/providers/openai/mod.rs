@@ -30,15 +30,21 @@ With ChatGPT OAuth the model list comes from the Codex backend's own `/models` e
 /// path for `gpt-*-codex` models and bypass the gateway, so Aperture has no
 /// route here.
 pub(crate) const SPEC: ProviderSpec = ProviderSpec {
+    slug: SLUG,
+    display_name: DISPLAY_NAME,
     api_key_env: ENV_VAR,
     family: ModelFamily::Gpt,
     supports_thinking: true,
     supports_deferred_tools: false,
     adaptive_effort: platform::adaptive_effort,
     thinking_fields_fallback: platform::thinking_fields_fallback,
+    accepts_images: true,
     accepts_arbitrary_models: false,
     fallback_max_output: Some(100_000),
+    fallback_context_window: 200_000,
     models_toml: include_str!("../../../models/openai.toml"),
+    models_of: None,
+    plugin: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
@@ -60,7 +66,6 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
         catalog: CatalogDoc::Table,
         trailing_notes: &[OAUTH_NOTE],
     },
-    ..ProviderSpec::new(SLUG, DISPLAY_NAME, 200_000)
 };
 
 fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {

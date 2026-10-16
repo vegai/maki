@@ -133,14 +133,17 @@ local function snapshot_git(call, artifact, args, stdin)
   )
 end
 
-function M.disk_blobs(call, env, cwd, paths, keep_on_cancel)
+function M.disk_blobs(call, env, cwd, paths, keep_on_cancel, timeout_ms)
   if #paths == 0 then
     return {}
   end
-  local out, err = call:run_quick(
-    workspace.git({ "hash-object", "--no-filters", "--stdin-paths" }),
-    { env = env, cwd = cwd, stdin = workspace.quoted_lines(paths), keep_on_cancel = keep_on_cancel }
-  )
+  local out, err = call:run_quick(workspace.git({ "hash-object", "--no-filters", "--stdin-paths" }), {
+    env = env,
+    cwd = cwd,
+    stdin = workspace.quoted_lines(paths),
+    keep_on_cancel = keep_on_cancel,
+    timeout_ms = timeout_ms,
+  })
   if not out then
     return nil, err
   end
@@ -473,7 +476,7 @@ function M.sweep(root, ttl_hours)
         if current.mtime and current.mtime < cutoff then
           local trash = maki.fs.joinpath(root, TRASH_PREFIX .. name)
           local already_trash = name:sub(1, #TRASH_PREFIX) == TRASH_PREFIX
-          local renamed = already_trash or maki.uv.fs_rename(dir, trash)
+          local renamed = already_trash or maki.fs.rename(dir, trash)
           if already_trash then
             trash = dir
           end
@@ -518,7 +521,7 @@ function M.resolve_root(root, spec)
     table.insert(missing, 1, name)
     existing = parent
   end
-  local resolved, err = maki.uv.fs_realpath(existing)
+  local resolved, err = maki.fs.realpath(existing)
   if not resolved then
     return nil, err
   end
@@ -535,7 +538,7 @@ function M.allocate(root, env, timeout_ms)
   if root_err then
     return nil, "maki cannot make " .. root .. ": " .. root_err
   end
-  local dir, dir_err = maki.uv.fs_mkdtemp(maki.fs.joinpath(root, ARTIFACT_TEMPLATE))
+  local dir, dir_err = maki.fs.mkdtemp(maki.fs.joinpath(root, ARTIFACT_TEMPLATE))
   if not dir then
     return nil, dir_err
   end

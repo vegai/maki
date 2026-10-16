@@ -51,15 +51,21 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
 
 /// Aperture routes onto other providers; nothing routes onto Aperture.
 pub(crate) const SPEC: ProviderSpec = ProviderSpec {
+    slug: SLUG,
+    display_name: DISPLAY_NAME,
     api_key_env: NO_ENV_VAR,
     family: ModelFamily::Generic,
     supports_thinking: false,
     supports_deferred_tools: false,
     adaptive_effort,
     thinking_fields_fallback,
+    accepts_images: true,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(16_384),
+    fallback_context_window: 128_000,
     models_toml: NO_CURATED_MODELS,
+    models_of: None,
+    plugin: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
@@ -81,7 +87,6 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
         catalog: CatalogDoc::Discovered(DISCOVERY_NOTE),
         trailing_notes: &[],
     },
-    ..ProviderSpec::new(SLUG, DISPLAY_NAME, 128_000)
 };
 
 fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {

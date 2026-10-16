@@ -1,13 +1,6 @@
 use std::env;
 #[cfg(windows)]
 use std::env::consts::ARCH;
-use std::fs;
-#[cfg(unix)]
-use std::fs::Permissions;
-use std::io;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
 
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table};
@@ -15,68 +8,10 @@ use mlua::{Lua, Result as LuaResult, Table};
 #[cfg(unix)]
 use rustix::system::uname;
 
-use crate::api::util::pair::{Pair, pair, try_pair};
 use crate::plugin_permissions::PluginPermissions;
 
-const INVALID_UTF8_PATH: &str = "path is not valid UTF-8";
-const INVALID_TEMPLATE: &str = "temporary directory template must end in XXXXXX";
-const TEMP_SUFFIX: &str = "XXXXXX";
-#[cfg(unix)]
-const PRIVATE_DIR_MODE: u32 = 0o700;
 #[cfg(windows)]
 const WINDOWS_SYSNAME: &str = "Windows_NT";
-
-fn path_text(path: PathBuf) -> io::Result<String> {
-    path.into_os_string()
-        .into_string()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, INVALID_UTF8_PATH))
-}
-
-/// Resolve a path to its canonical absolute name.
-/// @param path string Existing path.
-/// @return (string?, string?) Physical path, or nil and the error.
-#[lua_fn(guard = FsRead)]
-fn fs_realpath(_lua: &Lua, path: String) -> LuaResult<Pair<String>> {
-    Ok(pair(fs::canonicalize(path).and_then(path_text)))
-}
-
-/// Create a private temporary directory. The caller owns its cleanup.
-/// @param template string Path ending in XXXXXX.
-/// @return (string?, string?) Created directory, or nil and the error.
-#[lua_fn(guard = FsWrite)]
-fn fs_mkdtemp(_lua: &Lua, template: String) -> LuaResult<Pair<String>> {
-    if !template.ends_with(TEMP_SUFFIX) {
-        return Ok((None, Some(INVALID_TEMPLATE.into())));
-    }
-    let path = PathBuf::from(template);
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let prefix = name.strip_suffix(TEMP_SUFFIX).unwrap_or_default();
-    let mut builder = tempfile::Builder::new();
-    builder.prefix(prefix);
-    #[cfg(unix)]
-    builder.permissions(Permissions::from_mode(PRIVATE_DIR_MODE));
-    let dir = try_pair!(builder.tempdir_in(path.parent().unwrap_or_else(|| Path::new("."))));
-    let name = try_pair!(path_text(dir.path().to_owned()));
-    let _ = dir.keep();
-    Ok((Some(name), None))
-}
-
-/// Remove an empty directory.
-/// @param path string Directory to remove.
-/// @return (boolean?, string?) True on success, or nil and the error.
-#[lua_fn(guard = FsWrite)]
-fn fs_rmdir(_lua: &Lua, path: String) -> LuaResult<Pair<bool>> {
-    Ok(pair(fs::remove_dir(path).map(|_| true)))
-}
-
-/// Rename a file or directory. Like `vim.uv.fs_rename`.
-/// @param path string Existing path.
-/// @param new_path string Destination path.
-/// @return (boolean?, string?) True on success, or nil and the error.
-#[lua_fn(guard = FsWrite)]
-fn fs_rename(_lua: &Lua, path: String, new_path: String) -> LuaResult<Pair<bool>> {
-    Ok(pair(fs::rename(path, new_path).map(|()| true)))
-}
 
 /// Return the current working directory as an absolute path. Like `vim.uv.cwd`.
 ///
@@ -172,59 +107,5 @@ lua_table! {
     /// ```
     "maki.uv" => pub(crate) fn create_uv_table(perms: &PluginPermissions), DOCS [
         cwd(perms), os_homedir(perms), os_getenv(perms), os_environ(perms), os_uname,
-        fs_realpath(perms), fs_mkdtemp(perms), fs_rename(perms), fs_rmdir(perms),
     ]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{INVALID_UTF8_PATH, TEMP_SUFFIX, create_uv_table};
-    use crate::plugin_permissions::PluginPermissions;
-    use mlua::{Function, Lua};
-    #[cfg(unix)]
-    use std::ffi::OsStr;
-    use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::ffi::OsStrExt;
-    #[cfg(unix)]
-    use std::os::unix::fs::symlink;
-    use std::path::Path;
-    use tempfile::tempdir;
-    use test_case::test_case;
-
-    #[cfg(unix)]
-    #[test]
-    fn realpath_refuses_a_non_utf8_target() {
-        let root = tempdir().unwrap();
-        let target = root.path().join(OsStr::from_bytes(b"invalid\xff"));
-        fs::create_dir(&target).unwrap();
-        let link = root.path().join("alias");
-        symlink(target, &link).unwrap();
-        let lua = Lua::new();
-        let uv = create_uv_table(&lua, &PluginPermissions::trusted()).unwrap();
-        let resolve: Function = uv.get("fs_realpath").unwrap();
-        let (path, error): (Option<String>, Option<String>) =
-            resolve.call(link.to_str().unwrap()).unwrap();
-        assert_eq!(path, None);
-        assert_eq!(error.as_deref(), Some(INVALID_UTF8_PATH));
-    }
-
-    #[test_case("" ; "unprefixed_template")]
-    #[test_case("artifact." ; "prefixed_template")]
-    fn mkdtemp_creates_inside_the_template_directory(prefix: &str) {
-        let root = tempdir().unwrap();
-        let lua = Lua::new();
-        let uv = create_uv_table(&lua, &PluginPermissions::trusted()).unwrap();
-        let create: Function = uv.get("fs_mkdtemp").unwrap();
-        let template = root.path().join(format!("{prefix}{TEMP_SUFFIX}"));
-        let (path, error): (Option<String>, Option<String>) =
-            smol::block_on(create.call_async(template.to_str().unwrap())).unwrap();
-        assert_eq!(error, None);
-        let path = Path::new(path.as_ref().unwrap());
-        assert_eq!(path.parent(), Some(root.path()));
-        let name = path.file_name().unwrap().to_str().unwrap();
-        assert!(name.starts_with(prefix));
-        assert_eq!(name.len(), prefix.len() + TEMP_SUFFIX.len());
-        fs::remove_dir(path).unwrap();
-    }
 }

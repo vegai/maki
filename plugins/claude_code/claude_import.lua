@@ -15,14 +15,17 @@ local UNRECORDED = "maki could not record this in the artifact (%s), so a second
   .. "changed."
 
 -- git records the owner's execute bit, whoever runs maki.
-local function owner_executes(call, env, cwd, paths, keep_on_cancel)
+local function owner_executes(call, env, cwd, paths, keep_on_cancel, timeout_ms)
   if #paths == 0 then
     return {}
   end
-  local out, err = call:run_quick(
-    { "xargs", "-0", "stat", "-c", "%A", "--" },
-    { env = env, cwd = cwd, stdin = table.concat(paths, "\0"), keep_on_cancel = keep_on_cancel }
-  )
+  local out, err = call:run_quick({ "xargs", "-0", "stat", "-c", "%A", "--" }, {
+    env = env,
+    cwd = cwd,
+    stdin = table.concat(paths, "\0"),
+    keep_on_cancel = keep_on_cancel,
+    timeout_ms = timeout_ms,
+  })
   if not out then
     return nil, err
   end
@@ -38,6 +41,7 @@ end
 -- repository, which can differ from the checkout's.
 local function checkout_state(call, env, artifact, changes, keep_on_cancel)
   local project = artifact.manifest.project
+  local timeout_ms = workspace.import_timeout(changes) * jobs.MS_PER_SEC
   local git_env = workspace.snapshot_git_env(env, maki.fs.joinpath(artifact.dir, workspace.GIT_DIR), project)
   local state, files = {}, {}
   for _, change in ipairs(changes) do
@@ -52,11 +56,11 @@ local function checkout_state(call, env, artifact, changes, keep_on_cancel)
       state[change.path] = "not a file"
     end
   end
-  local blobs, err = snapshot.disk_blobs(call, git_env, project, files, keep_on_cancel)
+  local blobs, err = snapshot.disk_blobs(call, git_env, project, files, keep_on_cancel, timeout_ms)
   if not blobs then
     return nil, err
   end
-  local executable, executable_err = owner_executes(call, env, project, files, keep_on_cancel)
+  local executable, executable_err = owner_executes(call, env, project, files, keep_on_cancel, timeout_ms)
   if not executable then
     return nil, executable_err
   end
@@ -229,7 +233,7 @@ end
 local function apply_import(ctx, call, env, artifact, todo)
   local project = artifact.manifest.project
   local made = missing_folders(project, todo)
-  local stage, stage_err = maki.uv.fs_mkdtemp(maki.fs.joinpath(artifact.dir, workspace.STAGE_TEMPLATE))
+  local stage, stage_err = maki.fs.mkdtemp(maki.fs.joinpath(artifact.dir, workspace.STAGE_TEMPLATE))
   if not stage then
     return nil, "maki cannot make a stage folder in the artifact: " .. stage_err
   end

@@ -49,15 +49,21 @@ fn max_thinking(model: &Model) -> u32 {
 }
 
 pub(crate) const SPEC: ProviderSpec = ProviderSpec {
+    slug: SLUG,
+    display_name: DISPLAY_NAME,
     api_key_env: ENV_VAR,
     family: ModelFamily::Gemini,
     supports_thinking: true,
     supports_deferred_tools: false,
     adaptive_effort: api_decides,
     thinking_fields_fallback: |_| None,
+    accepts_images: true,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(65_536),
+    fallback_context_window: 1_000_000,
     models_toml: include_str!("../../models/google.toml"),
+    models_of: None,
+    plugin: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
@@ -81,7 +87,6 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
         catalog: CatalogDoc::Table,
         trailing_notes: &[],
     },
-    ..ProviderSpec::new(SLUG, DISPLAY_NAME, 1_000_000)
 };
 
 fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {

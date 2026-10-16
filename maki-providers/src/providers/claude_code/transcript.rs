@@ -1,6 +1,7 @@
 //! Use maki's system prompt and conversation transcript. The MCP catalog maps tool names to
 //! identifiers that Claude Code accepts.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
@@ -44,7 +45,7 @@ cannot call now is no longer available. Your reply ends at a tool call: maki run
 results in the next transcript.";
 
 pub(crate) struct Catalog {
-    pub tools: Vec<McpTool>,
+    to_exposed: HashMap<String, String>,
     to_maki: HashMap<String, String>,
 }
 
@@ -81,27 +82,36 @@ fn server_name(name: &str) -> String {
 }
 
 impl Catalog {
-    pub fn new(tools: &Value) -> Result<Self, Error> {
+    pub fn new(tools: &Value) -> Result<(Self, Vec<McpTool>), Error> {
         let mut catalog = Self {
-            tools: Vec::new(),
+            to_exposed: HashMap::new(),
             to_maki: HashMap::new(),
         };
+        let mut offered = Vec::new();
         for tool in tools.as_array().map(Vec::as_slice).unwrap_or_default() {
             let Some(name) = tool["name"].as_str() else {
                 return Err(Error::NamelessTool(tool.clone()));
             };
             let server = server_name(name);
             let exposed = format!("{EXPOSED_PREFIX}{server}");
+            catalog.to_exposed.insert(name.to_owned(), exposed.clone());
             if catalog.to_maki.insert(exposed, name.to_owned()).is_some() {
                 return Err(Error::SharedName(server));
             }
-            catalog.tools.push(McpTool {
+            offered.push(McpTool {
                 name: server,
                 description: tool["description"].as_str().unwrap_or_default().to_owned(),
                 input_schema: tool["input_schema"].clone(),
             });
         }
-        Ok(catalog)
+        Ok((catalog, offered))
+    }
+
+    pub fn exposed_name(&self, name: &str) -> Cow<'_, str> {
+        self.to_exposed.get(name).map_or_else(
+            || Cow::Owned(format!("{EXPOSED_PREFIX}{}", server_name(name))),
+            |exposed| Cow::Borrowed(exposed.as_str()),
+        )
     }
 
     pub fn exposed(&self) -> HashSet<String> {
@@ -132,14 +142,13 @@ fn push_line(out: &mut String, value: &Value) {
     let _ = write!(out, "\n{value}");
 }
 
-fn expose_input(name: &str, input: &mut Value) {
+fn expose_input(catalog: &Catalog, name: &str, input: &mut Value) {
     if name == BATCH_TOOL
         && let Some(calls) = input[BATCH_CALLS].as_array_mut()
     {
         for call in calls {
             if let Some(name) = call[BATCH_CALL_TOOL].as_str() {
-                call[BATCH_CALL_TOOL] =
-                    Value::String(format!("{EXPOSED_PREFIX}{}", server_name(name)));
+                call[BATCH_CALL_TOOL] = Value::String(catalog.exposed_name(name).into_owned());
             }
         }
     }
@@ -150,7 +159,7 @@ fn expose_input(name: &str, input: &mut Value) {
 ///
 /// Use the tool names visible to the model. Omit thinking because its signature is valid only
 /// for its original request. Reject images after maki's image adaptation.
-pub(crate) fn transcript(messages: &[Message]) -> Result<Vec<String>, Error> {
+pub(crate) fn transcript(messages: &[Message], catalog: &Catalog) -> Result<Vec<String>, Error> {
     let mut blocks = vec![TRANSCRIPT_HEADER.to_owned()];
     for message in messages {
         let mut out = String::new();
@@ -163,8 +172,9 @@ pub(crate) fn transcript(messages: &[Message]) -> Result<Vec<String>, Error> {
                 ContentBlock::ToolUse {
                     id, name, input, ..
                 } => {
-                    let mut call = json!({ "id": id, "name": format!("{EXPOSED_PREFIX}{}", server_name(name)), "input": input });
-                    expose_input(name, &mut call["input"]);
+                    let mut call =
+                        json!({ "id": id, "name": catalog.exposed_name(name), "input": input });
+                    expose_input(catalog, name, &mut call["input"]);
                     calls.push(call);
                 }
                 ContentBlock::ToolResult {
@@ -227,7 +237,7 @@ mod tests {
     use super::super::error::Error;
     use super::{
         Catalog, EXPOSED_PREFIX, IS_ERROR, MAX_EXPOSED_NAME, SERVER, TEXT, TRANSCRIPT_HEADER,
-        entry_of, fits, server_name, transcript,
+        entry_of, fits, server_name,
     };
     use crate::{ContentBlock, ImageMediaType, ImageSource, Message, Role};
 
@@ -242,6 +252,11 @@ mod tests {
         assert_eq!(entry["observation"], true);
     }
 
+    fn transcript(messages: &[Message]) -> Result<Vec<String>, Error> {
+        let (catalog, _) = Catalog::new(&tools(&[]))?;
+        super::transcript(messages, &catalog)
+    }
+
     fn tools(names: &[&str]) -> Value {
         Value::Array(
             names
@@ -254,19 +269,19 @@ mod tests {
     /// Claude Code gives each tool the name `mcp__<server>__<tool>`.
     #[test]
     fn a_short_name_is_exposed_as_it_is_and_maps_back() {
-        let catalog = Catalog::new(&tools(&["read", "bash"])).unwrap();
+        let (catalog, offered) = Catalog::new(&tools(&["read", "bash"])).unwrap();
         assert_eq!(
             catalog.maki_name(&format!("mcp__{SERVER}__read")),
             Some("read")
         );
         assert_eq!(catalog.maki_name_of_server("bash"), Some("bash"));
-        assert_eq!(catalog.tools[0].name, "read");
+        assert_eq!(offered[0].name, "read");
         assert_eq!(catalog.maki_name("read"), None);
     }
 
     #[test]
     fn a_long_name_is_shortened_to_fit_and_still_maps_back() {
-        let catalog = Catalog::new(&tools(&[LONG_NAME])).unwrap();
+        let (catalog, _) = Catalog::new(&tools(&[LONG_NAME])).unwrap();
         let exposed = catalog.exposed().into_iter().next().unwrap();
         assert!(exposed.len() <= MAX_EXPOSED_NAME, "{exposed}");
         assert_eq!(catalog.maki_name(&exposed), Some(LONG_NAME));
@@ -275,7 +290,7 @@ mod tests {
     #[test_case("a.b" ; "a_dot")]
     #[test_case("a b" ; "a_space")]
     fn a_name_with_a_character_mcp_refuses_is_rewritten(name: &str) {
-        let catalog = Catalog::new(&tools(&[name])).unwrap();
+        let (catalog, _) = Catalog::new(&tools(&[name])).unwrap();
         let exposed = catalog.exposed().into_iter().next().unwrap();
         assert!(
             fits(exposed.trim_start_matches(EXPOSED_PREFIX)),
@@ -381,11 +396,22 @@ mod tests {
         assert_eq!(transcript(&messages).unwrap(), whole);
     }
 
+    #[test]
+    fn transcript_prefixes_survive_tool_catalog_changes() {
+        let messages = history();
+        let (empty, _) = Catalog::new(&tools(&[])).unwrap();
+        let (current, _) = Catalog::new(&tools(&["read", "bash", LONG_NAME])).unwrap();
+        assert_eq!(
+            super::transcript(&messages, &current).unwrap(),
+            super::transcript(&messages, &empty).unwrap(),
+        );
+    }
+
     /// The next request must show the model the name it can call for the
     /// renamed tool.
     #[test]
     fn a_renamed_tool_keeps_its_exposed_name_in_the_history() {
-        let catalog = Catalog::new(&tools(&[LONG_NAME])).unwrap();
+        let (catalog, _) = Catalog::new(&tools(&[LONG_NAME])).unwrap();
         let exposed = catalog.exposed().into_iter().next().unwrap();
         let called = catalog.maki_name(&exposed).unwrap();
         let reply = Message {

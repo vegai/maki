@@ -35,6 +35,8 @@ const NEWER_VERSION: &str = "2.1.290";
 const ACCOUNT_SUBSCRIPTION: &str = r#"{"current_permission_mode":"default","account":{"apiProvider":"firstParty","subscriptionType":"Claude Pro"},"models":[{"value":"sonnet","resolvedModel":"claude-sonnet-5"},{"value":"opus","resolvedModel":"claude-opus-5-5"},{"value":"haiku","resolvedModel":"claude-haiku-4-5-20251001"}]}"#;
 const ACCOUNT_LOGGED_OUT: &str =
     r#"{"current_permission_mode":"default","account":{"apiProvider":"firstParty"}}"#;
+const HOOKS_FILE: &str = "hooks.json";
+const STOPPED_EXIT: &str = "exited with code -1";
 const HOOKS_OFF: &str =
     r#"{"hooks":[],"events":[],"policy":{"allDisabled":true,"policyHookCount":0}}"#;
 /// A managed hook stays on despite `disableAllHooks`, so the listing shows
@@ -403,7 +405,7 @@ impl FakeClaude {
         };
         fake.answer_version(MINIMUM_VERSION);
         fake.write("account.json", ACCOUNT_SUBSCRIPTION);
-        fake.write("hooks.json", HOOKS_OFF);
+        fake.write(HOOKS_FILE, HOOKS_OFF);
         fake
     }
 
@@ -605,7 +607,7 @@ fn skip_an_api_key_helper(fake: &FakeClaude) {
 }
 
 fn add_a_managed_hook(fake: &FakeClaude) {
-    fake.write("hooks.json", HOOKS_MANAGED);
+    fake.write(HOOKS_FILE, HOOKS_MANAGED);
 }
 
 fn add_managed_extra_roots(fake: &FakeClaude) {
@@ -1027,7 +1029,11 @@ fn a_cancelled_call_lets_go_only_once_its_processes_end(
     });
     // When the cancel lands decides the text: the runtime's cancel note, or
     // the error of a process the cancel stopped.
-    assert!(first.is_err(), "the call was cancelled");
+    let error = first.unwrap_err();
+    assert!(
+        error.contains(CANCEL_MARKER) || error.contains(STOPPED_EXIT),
+        "{error}"
+    );
     assert_eq!(second.unwrap(), ANSWER);
     assert_eq!(
         fake.log("overlaps"),

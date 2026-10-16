@@ -607,6 +607,7 @@ mod tests {
     fn advertised_names_show_tool_search_not_deferred_tools() {
         let base = serde_json::json!([{"name": "read"}]);
         let tools = RequestTools::assembled(
+            ToolRegistry::global(),
             base.clone(),
             &LocalTools::default(),
             &AgentConfig::default(),

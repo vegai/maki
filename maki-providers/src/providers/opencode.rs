@@ -44,15 +44,21 @@ The default is `false`."#;
 /// Neither Opencode slug is a `maki auth login` target, so neither carries a
 /// `login` row.
 pub(crate) const ZEN_SPEC: ProviderSpec = ProviderSpec {
+    slug: ZEN_SLUG,
+    display_name: ZEN_DISPLAY_NAME,
     api_key_env: ENV_VAR,
     family: ModelFamily::Generic,
     supports_thinking: true,
     supports_deferred_tools: false,
     adaptive_effort,
     thinking_fields_fallback: |_| None,
+    accepts_images: true,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(128_000),
+    fallback_context_window: 256_000,
     models_toml: NO_CURATED_MODELS,
+    models_of: None,
+    plugin: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
@@ -67,19 +73,24 @@ pub(crate) const ZEN_SPEC: ProviderSpec = ProviderSpec {
         catalog: CatalogDoc::Discovered(GENERIC_DISCOVERY_NOTE),
         trailing_notes: &[FREE_MODELS_NOTE],
     },
-    ..ProviderSpec::new(ZEN_SLUG, ZEN_DISPLAY_NAME, 256_000)
 };
 
 pub(crate) const GO_SPEC: ProviderSpec = ProviderSpec {
+    slug: GO_SLUG,
+    display_name: GO_DISPLAY_NAME,
     api_key_env: ENV_VAR,
     family: ModelFamily::Generic,
     supports_thinking: false,
     supports_deferred_tools: false,
     adaptive_effort: |_| adaptive_effort_if_available(GO_SLUG),
     thinking_fields_fallback: |_| None,
+    accepts_images: true,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(64_000),
+    fallback_context_window: 128_000,
     models_toml: NO_CURATED_MODELS,
+    models_of: None,
+    plugin: None,
     pricing_schedule: None,
     build: Build::Catalog,
     aperture: None,
@@ -91,7 +102,6 @@ pub(crate) const GO_SPEC: ProviderSpec = ProviderSpec {
         catalog: CatalogDoc::Discovered(GO_DISCOVERY_NOTE),
         trailing_notes: &[],
     },
-    ..ProviderSpec::new(GO_SLUG, GO_DISPLAY_NAME, 128_000)
 };
 
 /// Zen ids name the sub-provider that serves them, as

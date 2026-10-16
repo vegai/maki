@@ -21,7 +21,7 @@ use crate::cli::Cli;
 use crate::provider_scripts;
 use crate::resume::{self, Resolved};
 use crate::setup;
-use maki_agent::mcp::is_wire_name;
+use maki_agent::mcp::{is_qualified_name, is_wire_name};
 
 const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
@@ -35,7 +35,7 @@ fn tool_filter_warnings(cli: &Cli, registry: &ToolRegistry) -> Vec<String> {
         ("--disallowed-tools", &cli.disallowed_tools),
     ] {
         for name in names {
-            if registry.get(name).is_some() || is_wire_name(name) {
+            if registry.get(name).is_some() || is_wire_name(name) || is_qualified_name(name) {
                 continue;
             }
             let mut warning = format!("no loaded tool matches '{name}' in {flag}.");
@@ -616,6 +616,17 @@ mod tests {
     const STORED_SPEC: &str = "zai/glm-4.6";
     const CWD: &str = "/project";
     const STORED_MESSAGE: &str = "the turn the stored session already had";
+
+    #[test_case("srv.probe", true ; "qualified_mcp_tool")]
+    #[test_case("srv__probe", true ; "wire_mcp_tool")]
+    #[test_case("unloaded_tool", false ; "unknown_registry_tool")]
+    fn tool_filter_warnings_accept_mcp_names(name: &str, accepted: bool) {
+        let cli = Cli::parse_from(["maki", "--disallowed-tools", name]);
+        assert_eq!(
+            tool_filter_warnings(&cli, &ToolRegistry::new()).is_empty(),
+            accepted
+        );
+    }
 
     fn no_names(_: &PluginHost) -> Result<Vec<String>> {
         Ok(Vec::new())

@@ -4,7 +4,8 @@
 //! unchanged. Keep `PrintResult` fields a strict subset of theirs. `StreamJson`
 //! is JSONL with the same shape, `Text` prints the raw response only.
 //!
-//! Init metadata also reports Maki's model-clamped thinking setting.
+//! Keep Claude Code fields compatible with its wire format. Maki adds `thinking` to init
+//! metadata so scripted callers can inspect the effective, model-clamped setting.
 
 use std::io::{self, Read};
 use std::path::PathBuf;

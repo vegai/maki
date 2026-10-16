@@ -348,6 +348,7 @@ pub(crate) fn context_update(
 #[cfg(test)]
 mod tests {
     use crate::tools::ToolAudience;
+    use crate::tools::ToolRegistry;
     use std::path::PathBuf;
 
     use super::*;
@@ -413,6 +414,7 @@ mod tests {
         RunContext::fixed(
             authored.into(),
             RequestTools::assembled(
+                ToolRegistry::global(),
                 json!([{ "name": tools }]),
                 &LocalTools::default(),
                 &AgentConfig::default(),
@@ -473,6 +475,7 @@ mod tests {
         let restricted = RunContext::fixed(
             String::new(),
             RequestTools::assembled(
+                ToolRegistry::global(),
                 base_tools.clone(),
                 &LocalTools::default(),
                 &AgentConfig {

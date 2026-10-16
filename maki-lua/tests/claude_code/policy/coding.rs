@@ -30,14 +30,14 @@ use super::super::support::{
 };
 use super::{
     ANSWERS, CODE_CLAUDE_CONFIG, CODE_EDIT, CODE_HANG, CODE_HOSTILE, CODE_LONG, CODE_PROFILE,
-    CODE_RETYPE, FakeClaude, HOOK_SENTINEL, HOSTILE_NAME, MODEL_ALIAS, NO_ANSWER_IN_TIME, ONE_SLOT,
-    WORKING, add_a_managed_hook, ctx_in, within_deadline,
+    CODE_RETYPE, FakeClaude, HOOK_SENTINEL, HOOKS_FILE, HOOKS_OFF, HOSTILE_NAME, MODEL_ALIAS,
+    NO_ANSWER_IN_TIME, ONE_SLOT, STOPPED_EXIT, WORKING, add_a_managed_hook, ctx_in,
+    within_deadline,
 };
 
 const LARGE_IMPORT_CHANGES: usize = 1024;
 const IMPORT_TOO_LARGE: &str = "Use `paths` to import smaller groups";
 
-const IMPORT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const CANNOT_LOCK_ARTIFACT: &str = "cannot lock artifact";
 const PREPARE_TIMEOUT_SECS: u64 = 1;
 const NESTED_FILE: &str = "nested/file.txt";
@@ -1160,7 +1160,7 @@ fn a_cancelled_import_leaves_the_checkout_as_it_was() {
         .collect();
     expected_temporary.sort();
     let canceller = thread::spawn(move || {
-        let paused = wait_until(IMPORT_READY_TIMEOUT, || held.exists());
+        let paused = wait_until(DEADLINE, || held.exists());
         let mut temporary: Vec<_> = temp_files(&written)
             .into_iter()
             .flat_map(|dir| contents(&dir).into_values())
@@ -1211,7 +1211,11 @@ fn a_cancel_while_the_snapshot_is_made_discards_it() {
     assert!(canceller.join().unwrap(), "prepare did not start");
     // When the cancel lands decides the text: the runtime's cancel note, or
     // the error of a step whose process it stopped.
-    assert!(result.is_err(), "the call was cancelled");
+    let error = result.unwrap_err();
+    assert!(
+        error.contains(CANCELLED) || error.contains(STOPPED_EXIT),
+        "{error}"
+    );
     let artifacts = coding.artifacts.path().to_owned();
     let emptied = wait_until(DEADLINE, || {
         fs::read_dir(&artifacts).unwrap().next().is_none()
@@ -1236,7 +1240,8 @@ fn a_refused_coding_call_keeps_what_a_policy_hook_wrote() {
         .map(PathBuf::from)
         .collect();
     let next = json!({ "prompt": ANSWERS, "model": MODEL_ALIAS });
-    let _ = run_tool(&reg, &coding.ctx(&reg), TOOL, next);
+    coding.fake.write(HOOKS_FILE, HOOKS_OFF);
+    run_tool(&reg, &coding.ctx(&reg), TOOL, next).unwrap();
 
     let kept = ran_in.iter().all(|dir| dir.join(HOOK_SENTINEL).exists());
     for dir in coding.fake.log("hook_ran_in").lines().map(Path::new) {

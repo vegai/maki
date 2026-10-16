@@ -140,7 +140,7 @@ function Call:leave(dir)
 end
 
 function Call:remove_dir(dir, removed)
-  local ok = maki.uv.fs_rmdir(dir)
+  local ok = maki.fs.rmdir(dir)
   if not ok and maki.fs.metadata(dir) then
     self:leave(dir)
   end

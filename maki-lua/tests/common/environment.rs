@@ -1,6 +1,9 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
+use std::iter;
+use std::path::Path;
 
+const PATH: &str = "PATH";
 const NEXTEST: &str = "NEXTEST";
 
 pub fn require_nextest() {
@@ -28,6 +31,12 @@ pub struct EnvVar {
 }
 
 impl EnvVar {
+    pub fn prepend_path(dir: &Path) -> Self {
+        let current = env::var_os(PATH).unwrap_or_default();
+        let entries = iter::once(dir.to_path_buf()).chain(env::split_paths(&current));
+        Self::set(PATH, env::join_paths(entries).unwrap())
+    }
+
     pub fn set(name: &'static str, value: impl AsRef<OsStr>) -> Self {
         let before = env::var_os(name);
         set(name, value);

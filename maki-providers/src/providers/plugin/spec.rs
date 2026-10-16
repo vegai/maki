@@ -76,6 +76,8 @@ fn spec_row(decl: &ProviderDecl, target: Target, models: &'static [ModelEntry]) 
         ),
     };
     ProviderSpec {
+        slug: leak_str(&decl.slug),
+        display_name: leak_str(&decl.display_name),
         api_key_env: decl.api_key_env.as_deref().map_or("", leak_str),
         family: decl.family.unwrap_or(native.family),
         supports_thinking: native.supports_thinking,
@@ -93,7 +95,10 @@ fn spec_row(decl: &ProviderDecl, target: Target, models: &'static [ModelEntry]) 
             .accepts_arbitrary_models
             .unwrap_or(accepts_arbitrary_models),
         fallback_max_output: decl.max_output_tokens.unwrap_or(max_output),
+        fallback_context_window: decl.context_window.unwrap_or(context_window),
         models_toml: NO_CURATED_MODELS,
+        models_of: None,
+        plugin: None,
         pricing_schedule: decl.pricing_schedule.clone().map(leak),
         build: Build::Declared(models),
         aperture: decl.aperture.as_ref().map(|route| ApertureRoute {
@@ -116,11 +121,6 @@ fn spec_row(decl: &ProviderDecl, target: Target, models: &'static [ModelEntry]) 
             },
             trailing_notes: &[],
         },
-        ..ProviderSpec::new(
-            leak_str(&decl.slug),
-            leak_str(&decl.display_name),
-            decl.context_window.unwrap_or(context_window),
-        )
     }
 }
 

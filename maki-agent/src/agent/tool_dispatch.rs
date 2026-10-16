@@ -2741,6 +2741,7 @@ mod tests {
         }
         let tools = if assembled {
             RequestTools::assembled(
+                ToolRegistry::global(),
                 json!([
                     { TOOL_NAME_FIELD: CLIENT_NAME },
                     { TOOL_NAME_FIELD: PROBE_WIRE },
@@ -2931,6 +2932,7 @@ mod tests {
         let mut ctx = stub_ctx(&AgentMode::Build);
         ctx.registry = registry_with(&[PROBE_WIRE, OTHER_WIRE]);
         let tools = RequestTools::assembled(
+            ToolRegistry::global(),
             serde_json::json!([{ TOOL_NAME_FIELD: OTHER_WIRE }]),
             &ctx.local_tools,
             &ctx.config,

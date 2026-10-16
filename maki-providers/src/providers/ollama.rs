@@ -28,15 +28,21 @@ const DISCOVERY_NOTE: &str = "This provider talks the OpenAI-compatible `/v1` AP
      (e.g. `http://localhost:8080` for llama.cpp).";
 
 pub(crate) const SPEC: ProviderSpec = ProviderSpec {
+    slug: OLLAMA.slug,
+    display_name: OLLAMA.display_name,
     api_key_env: OLLAMA.api_key_env,
     family: ModelFamily::Generic,
     supports_thinking: false,
     supports_deferred_tools: false,
     adaptive_effort: |model| OLLAMA.adaptive_effort(model),
     thinking_fields_fallback: |_| OLLAMA.fields_fallback(),
+    accepts_images: true,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(16_384),
+    fallback_context_window: 128_000,
     models_toml: NO_CURATED_MODELS,
+    models_of: None,
+    plugin: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
@@ -62,7 +68,6 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
         catalog: CatalogDoc::Discovered(DISCOVERY_NOTE),
         trailing_notes: &[],
     },
-    ..ProviderSpec::new(OLLAMA.slug, OLLAMA.display_name, 128_000)
 };
 
 inventory::submit!(SPEC.config_row());

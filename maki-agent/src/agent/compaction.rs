@@ -653,6 +653,7 @@ mod tests {
         RunContext::fixed(
             NO_SYSTEM.into(),
             RequestTools::assembled(
+                ToolRegistry::global(),
                 Value::Array(Vec::new()),
                 &LocalTools::default(),
                 &AgentConfig::default(),
