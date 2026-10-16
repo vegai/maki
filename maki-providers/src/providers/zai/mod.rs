@@ -66,13 +66,19 @@ const PLANS: &[(&str, ProviderPlan)] = &[
 /// (`/api/paas/v4/chat/completions`), so the upstream base url must carry the
 /// whole path and any prefix would double it up.
 pub(crate) const SPEC: ProviderSpec = ProviderSpec {
+    slug: SLUG,
+    display_name: DISPLAY_NAME,
     api_key_env: ENV_VAR,
     family: ModelFamily::Glm,
     supports_thinking: false,
     supports_deferred_tools: false,
+    accepts_images: true,
     accepts_arbitrary_models: false,
     fallback_max_output: Some(16_000),
+    fallback_context_window: 128_000,
     models_toml: include_str!("../../../models/zai.toml"),
+    models_of: None,
+    plugin: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
@@ -96,7 +102,6 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
         catalog: CatalogDoc::Table,
         trailing_notes: &[],
     },
-    ..ProviderSpec::new(SLUG, DISPLAY_NAME, 128_000)
 };
 
 fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {

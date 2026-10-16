@@ -7,12 +7,13 @@ pub(super) use self::launch::version_check;
 pub(crate) use self::launch::{Launch, models};
 use self::launch::{MCP_CONFIG_FLAG, base_args, checked_profile, command, probe};
 pub use self::launch::{VersionCheck, invalidate_profile};
-use self::private_files::{PrivateDir, private_dir, private_file};
+use self::private_files::private_file;
+pub(super) use self::private_files::{PrivateDir, private_dir};
 pub(super) use self::supervision::within;
 use self::supervision::{
     Group, Next, next, send, send_handshake, stdout_lines, supervised, unreadable,
 };
-use super::checks::InitExpect;
+use super::checks::{InitExpect, require_system};
 use super::error::Error;
 use super::mcp::{self, Handoff, Server};
 use super::stream::{Step, Turn, Wait, user_message};
@@ -25,8 +26,8 @@ use flume::{Receiver, Sender};
 use futures_lite::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::env;
 use std::io;
-use std::mem::take;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -132,9 +133,9 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
     let limits = launch.limits;
     // Before any process starts, so a conversation maki cannot send costs
     // none.
-    let mut catalog = Catalog::new(req.exchange.tools)?;
-    let conversation = user_message(&transcript(req.exchange.messages)?);
-    let profile = checked_profile(launch).await?;
+    let (catalog, tools) = Catalog::new(req.exchange.tools)?;
+    let conversation = user_message(&transcript(req.exchange.messages, &catalog)?);
+    require_system(env::consts::OS)?;
     // maki marks the 1M window with a `-1m` id and Claude Code with a `[1m]`
     // name. The generation reports the model without either.
     let asked = strip_long_context(req.model);
@@ -144,7 +145,7 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
     };
     let setup = async {
         let (handoff_tx, handoffs) = flume::unbounded();
-        let server = mcp::serve(token()?, take(&mut catalog.tools), handoff_tx, MCP_READ)
+        let server = mcp::serve(token()?, tools, handoff_tx, MCP_READ)
             .await
             .map_err(|source| Error::Io {
                 what: "start the handoff server",
@@ -180,8 +181,13 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
             handoffs,
         })
     };
+    let checks = async {
+        let profile = checked_profile(launch).await?;
+        let offered = probe(launch, req.plan_usage).await?;
+        Ok::<_, Error>((profile, offered))
+    };
     let (
-        offered,
+        (profile, offered),
         PreparedRequest {
             dir,
             prompt_file,
@@ -189,7 +195,7 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
             server,
             handoffs,
         },
-    ) = futures::future::try_join(probe(launch, req.plan_usage), setup).await?;
+    ) = futures::future::try_join(checks, setup).await?;
     // An alias such as `sonnet` runs whatever model the account answer maps
     // it to.
     let runs = offered
@@ -917,7 +923,7 @@ mod tests {
     /// first, so the call is still queued then.
     #[test]
     fn a_call_still_queued_at_the_end_is_checked() {
-        let catalog =
+        let (catalog, _) =
             Catalog::new(&json!([{ "name": TOOL, "input_schema": { "type": "object" } }])).unwrap();
         let tools = catalog.exposed();
         let profile = profile("2.1.284", "linux").unwrap();

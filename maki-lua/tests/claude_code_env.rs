@@ -145,16 +145,7 @@ fn hold(dir: &Path, name: &str, template: &str, marker: &Path, release: &Path) -
         .replace("@WAIT_FOR_RELEASE@", &wait_for_release("\"@RELEASE@\""))
         .replace("@RELEASE@", &release.to_string_lossy());
     executable(dir, name, &script);
-    path_first(dir)
-}
-
-/// Puts `dir` first on the `PATH` until the guard drops.
-fn path_first(dir: &Path) -> EnvVar {
-    let path = env::var_os(PATH).unwrap();
-    let entries = [dir.to_path_buf()]
-        .into_iter()
-        .chain(env::split_paths(&path));
-    EnvVar::set(PATH, env::join_paths(entries).unwrap())
+    EnvVar::prepend_path(dir)
 }
 
 /// A fake `claude` in `dir` that runs `script` and reports the minimum

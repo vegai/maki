@@ -2774,6 +2774,79 @@ end
 
 ---
 
+### `maki.fs.realpath()` {#maki-fs-realpath}
+
+```lua
+maki.fs.realpath({path})
+```
+
+Resolve a path to its canonical absolute name.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{path}` (`string`) Existing path.
+
+**Returns:** (`string?`, `string?`) Physical path, or nil and the error.
+
+---
+
+### `maki.fs.mkdtemp()` {#maki-fs-mkdtemp}
+
+```lua
+maki.fs.mkdtemp({template})
+```
+
+Create a private temporary directory. The caller owns its cleanup.
+
+Requires the `fs_write` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{template}` (`string`) Path ending in XXXXXX.
+
+**Returns:** (`string?`, `string?`) Created directory, or nil and the error.
+
+---
+
+### `maki.fs.rmdir()` {#maki-fs-rmdir}
+
+```lua
+maki.fs.rmdir({path})
+```
+
+Remove an empty directory.
+
+Requires the `fs_write` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{path}` (`string`) Directory to remove.
+
+**Returns:** (`boolean?`, `string?`) True on success, or nil and the error.
+
+---
+
+### `maki.fs.rename()` {#maki-fs-rename}
+
+```lua
+maki.fs.rename({path}, {new_path})
+```
+
+Rename a file or directory.
+
+Requires the `fs_write` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{path}` (`string`) Existing path.
+- `{new_path}` (`string`) Destination path.
+
+**Returns:** (`boolean?`, `string?`) True on success, or nil and the error.
+
+---
+
 ### `maki.fs.dirname()` {#maki-fs-dirname}
 
 ```lua
@@ -7432,79 +7505,6 @@ Return the operating system's name and version, like `vim.uv.os_uname`.
 ```lua
 if maki.uv.os_uname().sysname == "Linux" then print("on Linux") end
 ```
-
----
-
-### `maki.uv.fs_realpath()` {#maki-uv-fs_realpath}
-
-```lua
-maki.uv.fs_realpath({path})
-```
-
-Resolve a path to its canonical absolute name.
-
-Requires the `fs_read` [plugin permission](#plugin-permissions).
-
-**Parameters:**
-
-- `{path}` (`string`) Existing path.
-
-**Returns:** (`string?`, `string?`) Physical path, or nil and the error.
-
----
-
-### `maki.uv.fs_mkdtemp()` {#maki-uv-fs_mkdtemp}
-
-```lua
-maki.uv.fs_mkdtemp({template})
-```
-
-Create a private temporary directory. The caller owns its cleanup.
-
-Requires the `fs_write` [plugin permission](#plugin-permissions).
-
-**Parameters:**
-
-- `{template}` (`string`) Path ending in XXXXXX.
-
-**Returns:** (`string?`, `string?`) Created directory, or nil and the error.
-
----
-
-### `maki.uv.fs_rename()` {#maki-uv-fs_rename}
-
-```lua
-maki.uv.fs_rename({path}, {new_path})
-```
-
-Rename a file or directory. Like `vim.uv.fs_rename`.
-
-Requires the `fs_write` [plugin permission](#plugin-permissions).
-
-**Parameters:**
-
-- `{path}` (`string`) Existing path.
-- `{new_path}` (`string`) Destination path.
-
-**Returns:** (`boolean?`, `string?`) True on success, or nil and the error.
-
----
-
-### `maki.uv.fs_rmdir()` {#maki-uv-fs_rmdir}
-
-```lua
-maki.uv.fs_rmdir({path})
-```
-
-Remove an empty directory.
-
-Requires the `fs_write` [plugin permission](#plugin-permissions).
-
-**Parameters:**
-
-- `{path}` (`string`) Directory to remove.
-
-**Returns:** (`boolean?`, `string?`) True on success, or nil and the error.
 
 
 ## maki.yaml {#maki-yaml}

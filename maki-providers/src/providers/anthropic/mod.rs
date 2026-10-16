@@ -71,13 +71,19 @@ You will need `AWS_REGION` and one of the following for auth:
 You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROPIC_BEDROCK_BASE_URL`. These env var names match Claude Code, so if you were already using Bedrock there, the same setup works here."#;
 
 pub(crate) const SPEC: ProviderSpec = ProviderSpec {
+    slug: SLUG,
+    display_name: DISPLAY_NAME,
     api_key_env: ENV_VAR,
     family: ModelFamily::Claude,
     supports_thinking: true,
     supports_deferred_tools: true,
+    accepts_images: true,
     accepts_arbitrary_models: false,
     fallback_max_output: Some(128_000),
+    fallback_context_window: 200_000,
     models_toml: include_str!("../../../models/anthropic.toml"),
+    models_of: None,
+    plugin: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
@@ -101,7 +107,6 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
         catalog: CatalogDoc::Table,
         trailing_notes: &[LONG_CONTEXT_NOTE, BEDROCK_NOTE],
     },
-    ..ProviderSpec::new(SLUG, DISPLAY_NAME, 200_000)
 };
 
 inventory::submit!(SPEC.config_row());

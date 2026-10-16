@@ -101,6 +101,10 @@ pub(crate) fn same_tool_name(name: &str, candidate: &str) -> bool {
 pub fn is_wire_name(name: &str) -> bool {
     name.contains(WIRE_SEPARATOR)
 }
+pub fn is_qualified_name(name: &str) -> bool {
+    name.contains(SEPARATOR)
+}
+
 const MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct McpToolDef {

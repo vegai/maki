@@ -29,9 +29,15 @@ const PRIVATE_FILE_MODE: u32 = 0o600;
 #[cfg(unix)]
 const PRIVATE_DIR_MODE: u32 = 0o700;
 
-pub(super) struct PrivateDir(Option<TempDir>);
+pub(in crate::providers::claude_code) struct PrivateDir(Option<TempDir>);
 
 impl PrivateDir {
+    pub(in crate::providers::claude_code) fn keep(mut self) {
+        if let Some(dir) = self.0.take() {
+            let _ = dir.keep();
+        }
+    }
+
     pub(super) async fn close(mut self) {
         if let Some(dir) = self.0.take() {
             smol::unblock(move || drop(dir)).await;
@@ -61,7 +67,10 @@ pub(super) fn private_file(path: &Path, content: &str) -> io::Result<()> {
 /// Private to the user from the moment it exists. Returns the resolved path,
 /// because a link on the way to `base` could make a directory inside
 /// `project` look like it is outside.
-pub(super) fn private_dir(base: &Path, project: &Path) -> Result<(PrivateDir, PathBuf), Error> {
+pub(in crate::providers::claude_code) fn private_dir(
+    base: &Path,
+    project: &Path,
+) -> Result<(PrivateDir, PathBuf), Error> {
     #[cfg(target_os = "linux")]
     sweep_once(base);
     let prefix = dir_prefix();

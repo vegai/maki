@@ -29,13 +29,13 @@ pub(crate) const ACCOUNT_ANSWER: &str = checks::ACCOUNT_ANSWER;
 pub(crate) const SETTINGS_ANSWER: &str = checks::SETTINGS_ANSWER;
 pub(crate) const HOOKS_ANSWER: &str = checks::HOOKS_ANSWER;
 const SYSTEM_EVENT: &str = "system";
-const ASSISTANT_EVENT: &str = "assistant";
+pub(super) const ASSISTANT_EVENT: &str = "assistant";
 const USER_EVENT: &str = "user";
 const RESULT_EVENT: &str = "result";
 const STREAM_EVENT: &str = "stream_event";
 const UNKNOWN_EVENT_KIND: &str = "?";
 const CONTROL_REQUEST: &str = "control_request";
-const RATE_LIMIT_EVENT: &str = "rate_limit_event";
+pub(super) const RATE_LIMIT_EVENT: &str = "rate_limit_event";
 const KEEP_ALIVE_EVENT: &str = "keep_alive";
 const TOOL_PROGRESS_EVENT: &str = "tool_progress";
 const INIT_EVENT: &str = "init";
@@ -1173,6 +1173,7 @@ mod tests {
             { "name": BATCH_TOOL, "description": "d", "input_schema": {} },
         ]))
         .unwrap()
+        .0
     }
 
     fn control(id: &str, response: Value) -> String {

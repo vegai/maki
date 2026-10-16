@@ -59,7 +59,7 @@ maki --no-jit acp
 ```
 
 `maki acp` takes `-m` / `--model` and `--yolo` as subcommand flags. Thinking
-flags work before or after `acp`: `--thinking`, its alias `--effort`, and
+flags work before or after `acp`: `--thinking`, `--effort`, and
 `--max-thinking-tokens`. They override config and the saved TUI level for
 this server process. See [Thinking](/docs/headless/#thinking) for values and
 precedence. Other global flags like `--no-jit` must come before the subcommand

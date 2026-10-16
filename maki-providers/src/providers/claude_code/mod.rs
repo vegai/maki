@@ -17,7 +17,7 @@ mod transcript;
 pub mod validation;
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fmt::Display;
@@ -43,7 +43,8 @@ use crate::providers::anthropic::shared::{
 };
 use crate::providers::{Timeouts, anthropic, catalog};
 use crate::spec::{
-    AuthDoc, Build, CatalogDoc, GeneratedDocs, NO_CURATED_MODELS, Native, ProviderSpec,
+    AuthDoc, Build, CatalogDoc, GeneratedDocs, NO_CURATED_MODELS, Native, PluginBinding,
+    ProviderSpec,
 };
 use crate::{
     AgentError, Effort, EffortDialect, Message, ProviderEvent, ProviderUsage, RequestOptions,
@@ -108,6 +109,8 @@ const MODELS_NOTE: &str = "The models Claude Code offers your account, each with
     for a release not yet in its table.";
 
 pub(crate) const SPEC: ProviderSpec = ProviderSpec {
+    slug: SLUG,
+    display_name: DISPLAY_NAME,
     api_key_env: NO_KEY_ENV,
     family: ModelFamily::Claude,
     supports_thinking: true,
@@ -115,8 +118,13 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     supports_deferred_tools: false,
     accepts_arbitrary_models: false,
     fallback_max_output: None,
+    fallback_context_window: 200_000,
     models_toml: NO_CURATED_MODELS,
     models_of: Some(anthropic::SLUG),
+    plugin: Some(PluginBinding {
+        name: PLUGIN,
+        configure: configure_plugin,
+    }),
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
@@ -131,7 +139,6 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
         catalog: CatalogDoc::Discovered(MODELS_NOTE),
         trailing_notes: &[NOTES],
     },
-    ..ProviderSpec::new(SLUG, DISPLAY_NAME, 200_000)
 };
 
 /// Shared by all sessions, because each request is a process. The plugin
@@ -174,20 +181,11 @@ impl PluginOptions {
     }
 }
 
-/// Load plugin options before provider construction so both use the same configuration.
-pub fn follow_plugins(enabled_plugins: &[String], options: &HashMap<String, Map<String, Value>>) {
-    let enabled = enabled_plugins.iter().any(|name| name == PLUGIN);
-    let options = enabled.then(|| PluginOptions::from_table(options.get(PLUGIN)));
-    if let Some(options) = &options
-        && let Ok(provider) = ClaudeCode::new(options, Timeouts::default())
-        && let Some(path) = &provider.models_cache
-        && let Ok(config_dir) = provider.login_dir()
-    {
-        saved_models(path, Duration::MAX, &provider.executable, &config_dir);
-    }
+fn configure_plugin(options: Option<&Map<String, Value>>) {
     *PLUGIN_OPTIONS
         .lock()
-        .unwrap_or_else(PoisonError::into_inner) = options;
+        .unwrap_or_else(PoisonError::into_inner) =
+        options.map(|options| PluginOptions::from_table(Some(options)));
 }
 
 /// New limits need new slots. Active and queued requests keep their old limit until completion.
@@ -313,19 +311,6 @@ struct SavedModels {
     models: Vec<Listed>,
 }
 
-static LISTED_WINDOWS: Mutex<BTreeMap<(PathBuf, PathBuf), Vec<Listed>>> =
-    Mutex::new(BTreeMap::new());
-
-fn remember_windows(saved: &SavedModels) {
-    LISTED_WINDOWS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(
-            (saved.executable.clone(), saved.config_dir.clone()),
-            saved.models.clone(),
-        );
-}
-
 fn keyed_models_path(path: &Path, executable: &Path, config_dir: &Path) -> PathBuf {
     let mut key = Sha256::new();
     key.update(executable.as_os_str().as_encoded_bytes());
@@ -349,7 +334,6 @@ fn saved_models(
     if saved.executable != executable || saved.config_dir != config_dir {
         return None;
     }
-    remember_windows(&saved);
     Some(saved.models)
 }
 
@@ -397,7 +381,6 @@ fn prune_model_caches(base: &Path, current: &Path) {
 }
 
 fn save_models(base: &Path, saved: &SavedModels) -> bool {
-    remember_windows(saved);
     let path = keyed_models_path(base, &saved.executable, &saved.config_dir);
     let result = serde_json::to_vec(saved)
         .map_err(|error| error.to_string())
@@ -475,6 +458,7 @@ struct ClaudeCode {
     /// maki's environment, read afresh for each request.
     environment: Arc<Environment>,
     models_cache: Option<PathBuf>,
+    windows: Arc<Mutex<Option<SavedModels>>>,
     /// Takes precedence over `$CLAUDE_CONFIG_DIR`.
     config_dir: Option<PathBuf>,
 }
@@ -499,6 +483,7 @@ impl ClaudeCode {
                     .collect(),
             }),
             models_cache: models_cache_path(),
+            windows: Arc::default(),
             config_dir: options.config_dir.clone(),
         })
     }
@@ -553,11 +538,17 @@ impl ClaudeCode {
         let saved = async || {
             let path = self.models_cache.clone();
             let (executable, config_dir) = key.clone();
-            smol::unblock(move || {
+            let models = smol::unblock(move || {
                 path.as_deref()
                     .and_then(|path| saved_models(path, MODELS_CACHE_TTL, &executable, &config_dir))
             })
-            .await
+            .await?;
+            self.remember_windows(&SavedModels {
+                executable: key.0.clone(),
+                config_dir: key.1.clone(),
+                models: models.clone(),
+            });
+            Some(models)
         };
         // The lock waits for any listing in progress, which can wait for a
         // slot, so a saved list answers without it.
@@ -588,15 +579,31 @@ impl ClaudeCode {
         listed
     }
 
-    /// Returns the window from the last list, however old it is. Windows
-    /// change far less often than the list.
+    fn remember_windows(&self, saved: &SavedModels) {
+        *self.windows.lock().unwrap_or_else(PoisonError::into_inner) = Some(saved.clone());
+    }
+
+    /// Load the last list lazily, retaining only this provider's current login and executable.
     fn window_of(&self, id: &str) -> Option<u32> {
         let config_dir = self.login_dir().ok()?;
-        let windows = LISTED_WINDOWS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut windows = self.windows.lock().unwrap_or_else(PoisonError::into_inner);
+        if windows.as_ref().is_none_or(|saved| {
+            saved.executable != self.executable || saved.config_dir != config_dir
+        }) {
+            let models = self
+                .models_cache
+                .as_deref()
+                .and_then(|path| saved_models(path, Duration::MAX, &self.executable, &config_dir))
+                .unwrap_or_default();
+            *windows = Some(SavedModels {
+                executable: self.executable.clone(),
+                config_dir,
+                models,
+            });
+        }
         windows
-            .get(&(self.executable.clone(), config_dir))?
+            .as_ref()?
+            .models
             .iter()
             .find(|listed| is_same_model(&listed.id, id))?
             .window
@@ -617,6 +624,7 @@ impl ClaudeCode {
             config_dir: prepared.config_dir,
             models,
         };
+        self.remember_windows(&saved);
         if let Some(path) = &self.models_cache {
             let path = path.to_owned();
             return Ok(smol::unblock(move || {
@@ -625,7 +633,6 @@ impl ClaudeCode {
             })
             .await);
         }
-        remember_windows(&saved);
         Ok(saved.models)
     }
 
@@ -747,7 +754,7 @@ mod tests {
     use std::env;
     #[cfg(unix)]
     use std::ffi::OsString;
-    use std::fs::File;
+    use std::fs::{self, File};
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
     use std::path::Path;
@@ -768,13 +775,14 @@ mod tests {
     use super::{
         ClaudeCode, LONG_CONTEXT_WINDOW, Listed, MAX_MODEL_CACHES, MODELS_CACHE_FILE,
         MODELS_CACHE_TTL, PLUGIN, PLUGIN_OFF, PluginOptions, SLOTS, SLUG, SUBSIDY, SavedModels,
-        WAITING_FOR_SLOT, agent_error, create_with, follow_plugins, keyed_models_path,
-        request_slot, save_models, saved_models, slots, thinking_for, with_long_context,
+        WAITING_FOR_SLOT, agent_error, create_with, keyed_models_path, request_slot, save_models,
+        saved_models, slots, thinking_for, with_long_context,
     };
     use crate::ThinkingConfig;
     use crate::provider::Provider;
     use crate::providers::Timeouts;
     use crate::retry::RetryKind;
+    use crate::spec::ProviderRegistry;
     use crate::types::Effort::{High, Max, Minimal};
     use crate::{Model, ProviderEvent, TokenUsage};
 
@@ -983,6 +991,31 @@ mod tests {
             id: id.to_owned(),
             window,
         }
+    }
+
+    #[test]
+    fn listed_windows_load_lazily_and_survive_disk_pruning() {
+        let root = tempdir().unwrap();
+        let provider = provider_in(
+            root.path(),
+            vec![listed(DEFAULT_ROW, Some(STANDARD_WINDOW))],
+        );
+        let saved = SavedModels {
+            executable: provider.executable.clone(),
+            config_dir: root.path().to_owned(),
+            models: vec![listed(DEFAULT_ROW, Some(LONG_CONTEXT_WINDOW))],
+        };
+        let cache = provider.models_cache.as_ref().unwrap();
+        assert!(save_models(cache, &saved));
+        assert_eq!(provider.window_of(DEFAULT_ROW), Some(LONG_CONTEXT_WINDOW));
+        let path = keyed_models_path(cache, &saved.executable, &saved.config_dir);
+        fs::remove_file(path).unwrap();
+        assert_eq!(provider.window_of(DEFAULT_ROW), Some(LONG_CONTEXT_WINDOW));
+        provider.remember_windows(&SavedModels {
+            models: vec![listed(DEFAULT_ROW, Some(STANDARD_WINDOW))],
+            ..saved
+        });
+        assert_eq!(provider.window_of(DEFAULT_ROW), Some(STANDARD_WINDOW));
     }
 
     #[test]
@@ -1198,7 +1231,7 @@ mod tests {
 
     impl Drop for ProviderOff {
         fn drop(&mut self) {
-            follow_plugins(&[], &HashMap::new());
+            ProviderRegistry::configure_plugins(&[], &HashMap::new());
             *SLOTS.lock().unwrap_or_else(PoisonError::into_inner) = None;
         }
     }
@@ -1211,10 +1244,10 @@ mod tests {
             let table = json!({ MAX_CONCURRENT: max }).as_object().unwrap().clone();
             HashMap::from([(PLUGIN.to_owned(), table)])
         };
-        follow_plugins(&enabled, &options(1));
+        ProviderRegistry::configure_plugins(&enabled, &options(1));
         let _running = slots().try_acquire_arc().expect("the one slot");
 
-        follow_plugins(&enabled, &options(2));
+        ProviderRegistry::configure_plugins(&enabled, &options(2));
         let wider = slots();
         let taken = [wider.try_acquire_arc(), wider.try_acquire_arc()];
         assert!(
@@ -1336,6 +1369,7 @@ mod on_the_fake {
                     .collect()
             }),
             models_cache,
+            windows: Arc::default(),
             config_dir: None,
         }
     }

@@ -28,6 +28,7 @@ const HIGH_BUDGET: u64 = 38_400;
 const XHIGH_BUDGET: u64 = 51_200;
 const MINIMAL_BUDGET: u64 = 6_400;
 const EXPLICIT_BUDGET: u64 = 2048;
+const SDK_BUDGET: u64 = 4096;
 const PROTOCOL_TIMEOUT: Duration = Duration::from_secs(30);
 const INITIALIZE_ID: u64 = 1;
 const NEW_SESSION_ID: u64 = 2;
@@ -188,7 +189,7 @@ impl Drop for Process {
 }
 
 #[test_case(false, Some("low"), &["--thinking", "xhigh"], Yes, "xhigh", Some(XHIGH_BUDGET) ; "print_thinking_overrides_config_and_state")]
-#[test_case(false, Some("low"), &["--effort", "high"], Yes, "high", Some(HIGH_BUDGET) ; "print_effort_alias")]
+#[test_case(false, Some("low"), &["--effort", "high"], Yes, "high", Some(HIGH_BUDGET) ; "print_effort")]
 #[test_case(false, Some("low"), &["--max-thinking-tokens", "2048"], Yes, "2048", Some(EXPLICIT_BUDGET) ; "print_budget")]
 #[test_case(false, Some("high"), &["--thinking", "off"], Yes, "off", None ; "explicit_off")]
 #[test_case(false, Some("xhigh"), &[], Yes, "xhigh", Some(XHIGH_BUDGET) ; "configured_fallback")]
@@ -196,9 +197,14 @@ impl Drop for Process {
 #[test_case(false, None, &["--thinking", "max"], No, "off", None ; "unsupported_model_is_reported_as_off")]
 #[test_case(false, None, &["--thinking", "off"], Required, "minimal", Some(MINIMAL_BUDGET) ; "required_thinking_is_reported_as_minimal")]
 #[test_case(true, Some("low"), &["--thinking", "xhigh"], Yes, "xhigh", Some(XHIGH_BUDGET) ; "sdk_thinking")]
-#[test_case(true, Some("low"), &["--effort", "xhigh"], Yes, "xhigh", Some(XHIGH_BUDGET) ; "sdk_effort_alias")]
+#[test_case(true, Some("low"), &["--effort", "xhigh"], Yes, "xhigh", Some(XHIGH_BUDGET) ; "sdk_effort")]
 #[test_case(true, Some("low"), &["--max-thinking-tokens", "2048"], Yes, "2048", Some(EXPLICIT_BUDGET) ; "sdk_budget")]
 #[test_case(true, None, &["--thinking", "max"], No, "off", None ; "sdk_model_clamping")]
+#[test_case(true, None, &["--thinking", "disabled"], Yes, "off", None ; "sdk_disabled")]
+#[test_case(true, None, &["--thinking", "enabled", "--effort", "high"], Yes, "high", Some(HIGH_BUDGET) ; "sdk_enabled_with_effort")]
+#[test_case(true, None, &["--thinking=adaptive", "--effort", "high"], Yes, "high", Some(HIGH_BUDGET) ; "sdk_adaptive_with_effort")]
+#[test_case(true, None, &["--max-thinking-tokens", "4096", "--effort", "high"], Yes, "4096", Some(SDK_BUDGET) ; "sdk_budget_with_effort")]
+#[test_case(false, None, &["--thinking", "disabled", "--max-thinking-tokens", "4096", "--effort", "high"], Yes, "off", None ; "disabled_overrides_other_flags")]
 fn headless_thinking_reaches_the_request_and_init(
     sdk: bool,
     configured: Option<&str>,

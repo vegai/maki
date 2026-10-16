@@ -110,6 +110,23 @@ function M.trim(text)
   return text:match("^%s*(.-)%s*$")
 end
 
+function M.comma_list(option, validate)
+  local values = {}
+  for value in (option or ""):gmatch("[^,]+") do
+    value = M.trim(value)
+    if value ~= "" then
+      local normalized, problem = validate(value)
+      if not normalized then
+        return nil, problem
+      end
+      if normalized ~= "" then
+        values[#values + 1] = normalized
+      end
+    end
+  end
+  return values
+end
+
 function M.within(path, root)
   return root == "/" or path == root or path:sub(1, #root + 1) == root .. "/"
 end
@@ -123,16 +140,20 @@ function M.denied_paths(extra)
   for _, pattern in ipairs(DEFAULT_DENY) do
     patterns[#patterns + 1] = pattern
   end
-  for pattern in (extra or ""):gmatch("[^,]+") do
-    pattern = M.trim(pattern):gsub("^%./", "")
+  local extra_patterns, problem = M.comma_list(extra, function(pattern)
+    pattern = pattern:gsub("^%./", "")
     if pattern:sub(1, 1) == "/" or (("/" .. pattern .. "/"):find("/../", 1, true)) or pattern:find(")", 1, true) then
       return nil, pattern .. " must be relative to the project, without `..` or `)`"
     end
-    if pattern ~= "" then
-      patterns[#patterns + 1] = pattern
-      if not pattern:find("/", 1, true) then
-        patterns[#patterns + 1] = "**/" .. pattern
-      end
+    return pattern
+  end)
+  if not extra_patterns then
+    return nil, problem
+  end
+  for _, pattern in ipairs(extra_patterns) do
+    patterns[#patterns + 1] = pattern
+    if not pattern:find("/", 1, true) then
+      patterns[#patterns + 1] = "**/" .. pattern
     end
   end
   return patterns
@@ -274,18 +295,7 @@ end
 
 --- Normalizes each directory, so one directory always has one spelling.
 function M.dependency_dirs(option)
-  local dirs = {}
-  for dir in (option or ""):gmatch("[^,]+") do
-    dir = dir:match("^%s*(.-)%s*$")
-    if dir ~= "" then
-      local spelled, problem = M.relative_path(dir)
-      if not spelled then
-        return nil, problem
-      end
-      dirs[#dirs + 1] = spelled
-    end
-  end
-  return dirs
+  return M.comma_list(option, M.relative_path)
 end
 
 --- Escapes only ASCII pattern characters, so non-ASCII names pass unchanged.

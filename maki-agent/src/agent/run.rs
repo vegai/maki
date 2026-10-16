@@ -1151,6 +1151,7 @@ fn interrupt_message(message: String, images: Vec<ImageSource>) -> Message {
 
 #[cfg(test)]
 mod tests {
+    use crate::tools::ToolRegistry;
     use std::collections::VecDeque;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
@@ -1860,6 +1861,7 @@ mod tests {
                 RunContext {
                     system: "system".into(),
                     tools: RequestTools::assembled(
+                        ToolRegistry::global(),
                         serde_json::json!([{ "name": tool }]),
                         &LocalTools::default(),
                         &AgentConfig::default(),
@@ -1928,6 +1930,7 @@ mod tests {
                 RunContext {
                     system: format!("system {facts:?}"),
                     tools: RequestTools::assembled(
+                        ToolRegistry::global(),
                         serde_json::json!([{ "name": *world.tool.lock().unwrap() }]),
                         &LocalTools::default(),
                         &AgentConfig::default(),

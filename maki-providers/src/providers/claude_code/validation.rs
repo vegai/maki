@@ -7,14 +7,19 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
+use crate::ProviderUsage;
+
 use super::checks;
 use super::error::Error;
-use super::stream::{self, API_ERROR_MARK, EventKind, StreamMode, count};
+use super::stream::{
+    self, API_ERROR_MARK, ASSISTANT_EVENT, EventKind, RATE_LIMIT_EVENT, StreamMode, count,
+};
 
 pub const EMPTY_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
 pub(super) const CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 pub(super) const HOME_ENV: &str = "HOME";
 const TMPDIR_ENV: &str = "TMPDIR";
+const PROBE_PATH_NOT_UTF8: &str = "probe path is not valid UTF-8";
 
 pub use super::checks::{GIT_ENTRY, git_directory};
 pub use super::run::{VersionCheck, invalidate_profile as invalidate_version};
@@ -144,6 +149,35 @@ pub fn prepared_launch(
     .map_err(|error| error.to_string())
 }
 
+/// Make a worker probe directory with the provider's ownership tag and checkout checks.
+pub async fn private_dir(
+    base: Option<PathBuf>,
+    project: PathBuf,
+    denied: Vec<PathBuf>,
+) -> Result<String, String> {
+    smol::unblock(move || {
+        let base = base
+            .unwrap_or_else(env::temp_dir)
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let inside_checkout = |path: &Path| {
+            path.starts_with(&project) || denied.iter().any(|dir| path.starts_with(dir))
+        };
+        if inside_checkout(&base) {
+            return Err(Error::TempInProject(base).to_string());
+        }
+        let (dir, path) =
+            super::run::private_dir(&base, &project).map_err(|error| error.to_string())?;
+        if inside_checkout(&path) || project.starts_with(&path) {
+            return Err(Error::TempInProject(path).to_string());
+        }
+        let name = path.to_str().ok_or(PROBE_PATH_NOT_UTF8)?.to_owned();
+        dir.keep();
+        Ok(name)
+    })
+    .await
+}
+
 fn response(value: &Value) -> &Value {
     if value["type"] == "control_response" {
         &value["response"]["response"]
@@ -195,6 +229,8 @@ pub fn init_problem(
 
 pub struct WorkerEvent {
     pub event: Value,
+    pub usage: Option<Value>,
+    pub rate_limit: Option<ProviderUsage>,
     pub model_checked: bool,
     pub problem: Option<String>,
 }
@@ -233,8 +269,18 @@ pub fn classify(
         Ok(())
     };
     let problem = check().err().map(|error| error.to_string());
+    let usage = if event["type"] == ASSISTANT_EVENT {
+        &event["message"]["usage"]
+    } else {
+        &event["usage"]
+    };
+    let usage = usage.is_object().then(|| usage_counts(usage));
+    let rate_limit = (event["type"] == RATE_LIMIT_EVENT && event["rate_limit_info"].is_object())
+        .then(|| plan_usage(&event["rate_limit_info"]));
     Ok(WorkerEvent {
         event,
+        usage,
+        rate_limit,
         model_checked,
         problem,
     })

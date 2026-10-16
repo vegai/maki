@@ -896,6 +896,7 @@ async fn session(
     // inside its sandbox.
     let local_tools = Arc::new(local_map);
     let tools = RequestTools::assembled(
+        &agent_ctx.registry,
         JsonValue::Array(tools_json),
         &local_tools,
         &agent_ctx.config,

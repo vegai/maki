@@ -183,6 +183,16 @@ fn version_parts(version: &str) -> Option<[u64; 3]> {
     parts.next().is_none().then_some(parsed)
 }
 
+pub(super) fn require_system(os: &str) -> Result<(), Error> {
+    if !SYSTEMS.contains(&os.to_ascii_lowercase().as_str()) {
+        return Err(Error::UnsupportedSystem {
+            os: os.to_owned(),
+            systems: SYSTEMS.join(", "),
+        });
+    }
+    Ok(())
+}
+
 /// A first word that is not `major.minor.patch` stops the request.
 pub(crate) fn profile(output: &str, os: &str) -> Result<Profile, Error> {
     let version = output.split_whitespace().next().unwrap_or_default();
@@ -194,12 +204,7 @@ pub(crate) fn profile(output: &str, os: &str) -> Result<Profile, Error> {
             oldest: minimum.map(|part| part.to_string()).join("."),
         });
     }
-    if !SYSTEMS.contains(&os.to_ascii_lowercase().as_str()) {
-        return Err(Error::UnsupportedSystem {
-            os: os.to_owned(),
-            systems: SYSTEMS.join(", "),
-        });
-    }
+    require_system(os)?;
     Ok(Profile {
         version: version.to_owned(),
     })

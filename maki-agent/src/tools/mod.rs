@@ -118,6 +118,12 @@ pub struct ToolFilter {
     pub excluded: Vec<String>,
 }
 
+enum ToolLocation {
+    Registry,
+    Local,
+    External,
+}
+
 impl ToolFilter {
     pub(crate) fn cache_key(&self) -> Option<Value> {
         fn sorted(names: &[String]) -> Vec<&str> {
@@ -138,18 +144,22 @@ impl ToolFilter {
         }
     }
 
-    fn matches_where(&self, matches: impl Fn(&str) -> bool, local: bool, external: bool) -> bool {
+    fn matches_where(&self, matches: impl Fn(&str) -> bool, location: ToolLocation) -> bool {
         let includes = |names: &Option<Vec<String>>| {
             names
                 .as_ref()
                 .is_none_or(|names| names.iter().any(|name| matches(name)))
         };
-        (local || includes(&self.allowed) && (external || includes(&self.published)))
-            && !self.excluded.iter().any(|name| matches(name))
+        let included = match location {
+            ToolLocation::Local => true,
+            ToolLocation::Registry => includes(&self.allowed) && includes(&self.published),
+            ToolLocation::External => includes(&self.allowed),
+        };
+        included && !self.excluded.iter().any(|name| matches(name))
     }
 
     pub fn matches(&self, name: &str) -> bool {
-        self.matches_where(|candidate| candidate == name, false, false)
+        self.matches_where(|candidate| candidate == name, ToolLocation::Registry)
     }
 
     pub fn admits(
@@ -163,14 +173,20 @@ impl ToolFilter {
         local
             .map_or(audience, |tool| tool.audience)
             .contains(caller)
-            && self.matches_where(|candidate| candidate == name, local.is_some(), false)
+            && self.matches_where(
+                |candidate| candidate == name,
+                if local.is_some() {
+                    ToolLocation::Local
+                } else {
+                    ToolLocation::Registry
+                },
+            )
     }
 
     pub fn matches_external(&self, name: &str) -> bool {
         self.matches_where(
             |candidate| crate::mcp::same_tool_name(name, candidate),
-            false,
-            true,
+            ToolLocation::External,
         )
     }
 
@@ -252,6 +268,7 @@ impl RequestTools {
     /// Session-local tools keep explicit denials but bypass registry allow lists.
     /// Missing names fall back to the config filter. An empty array offers no registry tools.
     pub fn assembled(
+        registry: &ToolRegistry,
         mut definitions: Value,
         local_tools: &LocalTools,
         config: &AgentConfig,
@@ -273,7 +290,10 @@ impl RequestTools {
         if let Some(defs) = definitions.as_array_mut() {
             defs.retain(|def| {
                 def[TOOL_NAME_FIELD].as_str().is_none_or(|name| {
-                    filter.admits(name, ToolAudience::all(), audience, Some(local_tools))
+                    let registered = registry
+                        .get(name)
+                        .map_or(ToolAudience::all(), |entry| entry.tool.audience());
+                    filter.admits(name, registered, audience, Some(local_tools))
                 })
             });
         }
@@ -900,6 +920,7 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use super::registry::ToolSource;
     use crate::template::Vars;
     use std::fs::{self, File};
 
@@ -925,6 +946,7 @@ mod tests {
     ) {
         let model = Model::from_spec(TEST_MODEL_SPEC).unwrap();
         let tools = RequestTools::assembled(
+            ToolRegistry::global(),
             definitions,
             &LocalTools::default(),
             &AgentConfig::default(),
@@ -933,6 +955,47 @@ mod tests {
         );
         assert_eq!(tools.filter().matches(READ_TOOL_NAME), read_matches);
         assert_eq!(tools.filter().matches(WRITE_TOOL_NAME), write_matches);
+    }
+
+    #[test_case(ToolAudience::MAIN, ToolAudience::RESEARCH_SUB, false ; "main_tool_hidden_from_research")]
+    #[test_case(ToolAudience::RESEARCH_SUB, ToolAudience::MAIN, false ; "research_tool_hidden_from_main")]
+    #[test_case(ToolAudience::RESEARCH_SUB, ToolAudience::RESEARCH_SUB, true ; "research_tool_offered")]
+    #[test_case(ToolAudience::INTERPRETER, ToolAudience::MAIN, false ; "script_tool_hidden_from_main")]
+    #[test_case(ToolAudience::INTERPRETER, ToolAudience::INTERPRETER, true ; "script_tool_offered")]
+    fn assembled_registry_tools_agree_with_dispatch(
+        tool_audience: ToolAudience,
+        caller: ToolAudience,
+        offered: bool,
+    ) {
+        let registry = Arc::new(ToolRegistry::new());
+        registry
+            .register(
+                test_support::mock_tool(READ_TOOL_NAME, tool_audience),
+                ToolSource::Lua {
+                    plugin: Arc::from(READ_TOOL_NAME),
+                },
+            )
+            .unwrap();
+        let model = Model::from_spec(TEST_MODEL_SPEC).unwrap();
+        let tools = RequestTools::assembled(
+            &registry,
+            json!([{ TOOL_NAME_FIELD: READ_TOOL_NAME }]),
+            &LocalTools::default(),
+            &AgentConfig::default(),
+            &model,
+            caller,
+        );
+        let mut ctx = test_support::stub_ctx(&AgentMode::Build);
+        ctx.registry = registry;
+        ctx.audience = caller;
+        ctx.tool_filter = Arc::clone(tools.filter());
+        assert_eq!(!tools.definitions().as_array().unwrap().is_empty(), offered);
+        assert_eq!(
+            crate::agent::tool_dispatch::callable(&ctx)
+                .iter()
+                .any(|tool| tool.name == READ_TOOL_NAME),
+            offered
+        );
     }
 
     #[test_case(true  ; "vision_model_keeps_view_image")]
@@ -993,6 +1056,7 @@ mod tests {
             false,
         );
         let assembled = RequestTools::assembled(
+            ToolRegistry::global(),
             json!([{ TOOL_NAME_FIELD: WRITE_TOOL_NAME }]),
             &local_tools,
             &config,
@@ -1041,6 +1105,7 @@ mod tests {
         )]));
         let definitions = json!([{ TOOL_NAME_FIELD: WRITE_TOOL_NAME }]);
         let tools = RequestTools::assembled(
+            ToolRegistry::global(),
             definitions.clone(),
             &local_tools,
             &AgentConfig::default(),
@@ -1070,6 +1135,7 @@ mod tests {
             ..Default::default()
         };
         let tools = RequestTools::assembled(
+            ToolRegistry::global(),
             json!([{ TOOL_NAME_FIELD: WRITE_TOOL_NAME }]),
             &LocalTools::default(),
             &config,

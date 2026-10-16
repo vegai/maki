@@ -1,10 +1,14 @@
 use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, FileType, TryLockError};
+#[cfg(unix)]
+use std::fs::Permissions;
+use std::fs::{self, File, FileType, TryLockError};
 use std::io::{Error as IoError, ErrorKind, Read, Result as IoResult};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,6 +33,78 @@ const MAX_READ_BYTES: u64 = LUA_MEMORY_LIMIT as u64;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 pub(super) const LOCK_BUSY: &str = "lock is held";
 const NON_UTF8_CONTENT_ERR: &str = "non-utf8 content; use read_bytes";
+
+const INVALID_UTF8_PATH: &str = "path is not valid UTF-8";
+const INVALID_TEMPLATE: &str = "temporary directory template must end in XXXXXX";
+const TEMP_SUFFIX: &str = "XXXXXX";
+#[cfg(unix)]
+const PRIVATE_DIR_MODE: u32 = 0o700;
+
+fn path_text(path: PathBuf) -> IoResult<String> {
+    path.into_os_string()
+        .into_string()
+        .map_err(|_| IoError::new(ErrorKind::InvalidData, INVALID_UTF8_PATH))
+}
+
+/// Resolve a path to its canonical absolute name.
+/// @param path string Existing path.
+/// @return (string?, string?) Physical path, or nil and the error.
+#[lua_fn(guard = FsRead)]
+async fn realpath(_lua: Lua, path: String) -> LuaResult<Pair<String>> {
+    Ok(pair(
+        smol::unblock(move || fs::canonicalize(expand_tilde(&path)).and_then(path_text)).await,
+    ))
+}
+
+/// Create a private temporary directory. The caller owns its cleanup.
+/// @param template string Path ending in XXXXXX.
+/// @return (string?, string?) Created directory, or nil and the error.
+#[lua_fn(guard = FsWrite)]
+async fn mkdtemp(_lua: Lua, template: String) -> LuaResult<Pair<String>> {
+    if !template.ends_with(TEMP_SUFFIX) {
+        return Ok((None, Some(INVALID_TEMPLATE.into())));
+    }
+    Ok(pair(
+        smol::unblock(move || -> IoResult<String> {
+            let path = expand_tilde(&template);
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let prefix = name.strip_suffix(TEMP_SUFFIX).unwrap_or_default();
+            let mut builder = tempfile::Builder::new();
+            builder.prefix(prefix);
+            #[cfg(unix)]
+            builder.permissions(Permissions::from_mode(PRIVATE_DIR_MODE));
+            let dir = builder.tempdir_in(path.parent().unwrap_or_else(|| Path::new(".")))?;
+            let name = path_text(dir.path().to_owned())?;
+            let _ = dir.keep();
+            Ok(name)
+        })
+        .await,
+    ))
+}
+
+/// Remove an empty directory.
+/// @param path string Directory to remove.
+/// @return (boolean?, string?) True on success, or nil and the error.
+#[lua_fn(guard = FsWrite)]
+async fn rmdir(_lua: Lua, path: String) -> LuaResult<Pair<bool>> {
+    Ok(pair(
+        smol::unblock(move || fs::remove_dir(expand_tilde(&path)).map(|_| true)).await,
+    ))
+}
+
+/// Rename a file or directory.
+/// @param path string Existing path.
+/// @param new_path string Destination path.
+/// @return (boolean?, string?) True on success, or nil and the error.
+#[lua_fn(guard = FsWrite)]
+async fn rename(_lua: Lua, path: String, new_path: String) -> LuaResult<Pair<bool>> {
+    Ok(pair(
+        smol::unblock(move || {
+            fs::rename(expand_tilde(&path), expand_tilde(&new_path)).map(|()| true)
+        })
+        .await,
+    ))
+}
 
 struct FileLock(Option<File>);
 
@@ -1155,7 +1231,7 @@ lua_table! {
     /// if err then return end
     /// ```
     "maki.fs" => pub(crate) fn create_fs_table(perms: &PluginPermissions, plugin: Arc<str>), DOCS [
-        read(perms), read_bytes(perms), metadata(perms), dirname, basename,
+        read(perms), read_bytes(perms), metadata(perms), realpath(perms), mkdtemp(perms), rmdir(perms), rename(perms), dirname, basename,
         joinpath, normalize, abspath, parents, root(perms), relpath, ext,
         dir(perms), try_lock(perms), write(perms), append(perms), atomic_write(perms), rm(perms), mkdir(perms),
         glob(perms), grep(perms), fuzzy_files(perms, plugin),
@@ -2937,5 +3013,63 @@ mod tests {
             smol::block_on(lock.call_async(missing.to_str().unwrap())).unwrap();
         assert!(lock.is_none());
         assert!(error.is_some_and(|error| error != LOCK_BUSY));
+    }
+}
+
+#[cfg(test)]
+mod directory_tests {
+    use super::{INVALID_UTF8_PATH, TEMP_SUFFIX, create_fs_table};
+    use crate::plugin_permissions::PluginPermissions;
+    use mlua::{Function, Lua};
+    #[cfg(unix)]
+    use std::ffi::OsStr;
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStrExt;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    use std::path::Path;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use test_case::test_case;
+
+    const TEST_PLUGIN: &str = "test";
+
+    #[cfg(unix)]
+    #[test]
+    fn realpath_refuses_a_non_utf8_target() {
+        let root = tempdir().unwrap();
+        let target = root.path().join(OsStr::from_bytes(b"invalid\xff"));
+        fs::create_dir(&target).unwrap();
+        let link = root.path().join("alias");
+        symlink(target, &link).unwrap();
+        let lua = Lua::new();
+        let uv =
+            create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
+        let resolve: Function = uv.get("realpath").unwrap();
+        let (path, error): (Option<String>, Option<String>) =
+            smol::block_on(resolve.call_async(link.to_str().unwrap())).unwrap();
+        assert_eq!(path, None);
+        assert_eq!(error.as_deref(), Some(INVALID_UTF8_PATH));
+    }
+
+    #[test_case("" ; "unprefixed_template")]
+    #[test_case("artifact." ; "prefixed_template")]
+    fn mkdtemp_creates_inside_the_template_directory(prefix: &str) {
+        let root = tempdir().unwrap();
+        let lua = Lua::new();
+        let uv =
+            create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
+        let create: Function = uv.get("mkdtemp").unwrap();
+        let template = root.path().join(format!("{prefix}{TEMP_SUFFIX}"));
+        let (path, error): (Option<String>, Option<String>) =
+            smol::block_on(create.call_async(template.to_str().unwrap())).unwrap();
+        assert_eq!(error, None);
+        let path = Path::new(path.as_ref().unwrap());
+        assert_eq!(path.parent(), Some(root.path()));
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with(prefix));
+        assert_eq!(name.len(), prefix.len() + TEMP_SUFFIX.len());
+        fs::remove_dir(path).unwrap();
     }
 }

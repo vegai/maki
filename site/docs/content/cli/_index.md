@@ -42,8 +42,9 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `-p`, `--print` | Non-interactive run. See [Headless Mode](/docs/headless/) |
 | `--image <PATH>` | Attach an image in `--print` mode (repeatable). Paths must be png, jpeg, gif, or webp |
 | `-m`, `--model <SPEC>` | Model as `provider/model-id`. Fallback: last used (skipped with a warning when its provider is gone or has no key) → `provider.default_model` in config → auto-detect from available providers |
-| `--thinking <SETTING>` | Thinking for this launch: `off`, `adaptive`, `minimal` through `max`, or a positive token budget. Alias: `--effort`. Overrides `always_thinking` and the saved `/thinking` level |
-| `--max-thinking-tokens <N>` | Positive thinking-token budget for this launch. Conflicts with `--thinking` / `--effort` |
+| `--thinking <SETTING>` | Thinking for this launch: `off`, `adaptive`, `minimal` through `max`, or a positive token budget. Accepts SDK spellings `disabled` and `enabled`. Overrides `always_thinking` and the saved `/thinking` level |
+| `--effort <LEVEL>` | Thinking effort for this launch: `minimal` through `max`. See [precedence](/docs/headless/#thinking) when combined with other thinking flags |
+| `--max-thinking-tokens <N>` | Positive thinking-token budget for this launch. Takes precedence over effort unless thinking is explicitly disabled |
 | `--verbose` | Full turn-by-turn messages in `--print` output |
 | `-c`, `--continue` | Resume the most recent session in this directory |
 | `-r`, `--resume <ID>` | Resume a specific session (aliases: `-s`, `--session`) |

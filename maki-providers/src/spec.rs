@@ -1,4 +1,7 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+use serde_json::{Map, Value};
 
 use maki_config::PROVIDER_BUILTINS;
 use maki_config::providers::{BuiltInProvider, Protocol, ProviderPlan};
@@ -37,10 +40,14 @@ pub const GENERIC_DISCOVERY_NOTE: &str =
 
 /// Everything maki knows about one provider without asking the network.
 ///
-/// Each row supplies its identity and fallback context window, then overrides
-/// the shared defaults from [`Self::new`] with its transport, model metadata
-/// and documentation. Curated models live in `models/<slug>.toml`. A Lua
-/// plugin provider builds its row from its declaration, see [`plugin::spec`].
+/// This struct is the checklist for adding a native provider. Every field is
+/// mandatory in the literal, and that is the point: there is deliberately no
+/// `Default`, no `#[non_exhaustive]`, and no row uses `..`, so adding a field
+/// here breaks every row until someone answers for each one.
+///
+/// The checklist is two files: this row, and `models/<slug>.toml` next to it
+/// carrying the provider's curated table. A Lua plugin provider gets one of
+/// these built from its declaration instead, see [`plugin::spec`].
 #[derive(Debug)]
 pub struct ProviderSpec {
     pub slug: &'static str,
@@ -74,6 +81,8 @@ pub struct ProviderSpec {
     /// sit next to the prices they scale. Everyone else bills flat.
     pub pricing_schedule: Option<&'static PricingSchedule>,
 
+    /// Plugin that enables and configures this native provider.
+    pub plugin: Option<PluginBinding>,
     pub build: Build,
     /// `Some` iff Aperture can proxy onto this provider. Lives on the spec, not
     /// on [`Native`], so the route survives a provider losing its bespoke impl.
@@ -83,6 +92,12 @@ pub struct ProviderSpec {
     /// see [`ProviderSpec::config_row`].
     pub login: Option<LoginConfig>,
     pub docs: GeneratedDocs,
+}
+
+#[derive(Debug)]
+pub struct PluginBinding {
+    pub name: &'static str,
+    pub configure: fn(Option<&Map<String, Value>>),
 }
 
 /// For a provider whose ids all come from a live catalog.
@@ -170,38 +185,6 @@ pub enum CatalogDoc {
 }
 
 impl ProviderSpec {
-    pub(crate) const fn new(
-        slug: &'static str,
-        display_name: &'static str,
-        fallback_context_window: u32,
-    ) -> Self {
-        Self {
-            slug,
-            display_name,
-            api_key_env: "",
-            family: ModelFamily::Generic,
-            supports_thinking: false,
-            supports_deferred_tools: false,
-            accepts_images: true,
-            accepts_arbitrary_models: false,
-            fallback_max_output: None,
-            fallback_context_window,
-            models_toml: NO_CURATED_MODELS,
-            models_of: None,
-            pricing_schedule: None,
-            build: Build::Catalog,
-            aperture: None,
-            login: None,
-            docs: GeneratedDocs {
-                api_urls: &[],
-                features: None,
-                auth: AuthDoc::EnvVar,
-                catalog: CatalogDoc::Discovered(GENERIC_DISCOVERY_NOTE),
-                trailing_notes: &[],
-            },
-        }
-    }
-
     /// The one way to reach this provider's curated table.
     pub fn models(&self) -> &'static [ModelEntry] {
         match self.build {
@@ -277,6 +260,17 @@ const BUILTINS: &[ProviderSpec] = &[
 pub struct ProviderRegistry;
 
 impl ProviderRegistry {
+    pub fn configure_plugins(loaded: &[String], options: &HashMap<String, Map<String, Value>>) {
+        let empty = Map::new();
+        for binding in BUILTINS.iter().filter_map(|spec| spec.plugin.as_ref()) {
+            let config = loaded
+                .iter()
+                .any(|name| name == binding.name)
+                .then(|| options.get(binding.name).unwrap_or(&empty));
+            (binding.configure)(config);
+        }
+    }
+
     /// The row that describes `slug` itself: compiled in, or built from a
     /// plugin's declaration. The one to reach for unless plugin providers
     /// must be left out on purpose, see [`Self::compiled`].

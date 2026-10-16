@@ -35,16 +35,19 @@ maki -p --max-thinking-tokens 8192 "explain this function"
 
 `--thinking` accepts the same values as `/thinking`: `off`, `adaptive`,
 `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or a positive token budget.
-`--effort` is an alias. `--max-thinking-tokens` accepts a positive integer.
-Pass one thinking flag per launch. Invalid values and conflicting flags fail
-before a provider starts.
+The CLI also accepts the SDK spellings `disabled` and `enabled` for `off`
+and `adaptive`. `--effort` accepts `minimal` through `max`, and
+`--max-thinking-tokens` accepts a positive integer. When flags are combined,
+`--thinking off` or `disabled` wins, followed by `--max-thinking-tokens`,
+`--effort`, then other `--thinking` settings. Invalid values fail before a
+provider starts.
 
 The launch flag overrides `always_thinking` in config, which overrides the
 last level saved by `/thinking` in the TUI. This saved-level fallback also
 applies to SDK and ACP runs. A launch override does not change that saved level.
 
 The `system/init` event in `stream-json` output, SDK output, and verbose JSON
-includes `thinking` as a string. It reports the setting after the selected
+includes Maki's `thinking` extension as a string. It reports the setting after the selected
 model's capability checks: an unsupported model reports `"off"`, and a model
 that requires thinking raises `"off"` to `"minimal"`. Providers translate
 effort levels and token budgets into their own API parameters.

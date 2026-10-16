@@ -72,164 +72,121 @@ struct BundledPlugin {
     private_api: Option<PrivateApi>,
 }
 
+impl BundledPlugin {
+    const fn new(name: &'static str, dir: Dir<'static>) -> Self {
+        Self {
+            name,
+            dir,
+            private_api: None,
+        }
+    }
+}
+
 /// `lib` is not a default builtin; it exists so plugins can
 /// `require()` shared modules across boundaries.
 static BUNDLED_PLUGINS: &[BundledPlugin] = &[
-    BundledPlugin {
-        name: "sessions",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/sessions"),
-    },
-    BundledPlugin {
-        name: "thinking",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/thinking"),
-    },
-    BundledPlugin {
-        name: "index",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/index"),
-    },
-    BundledPlugin {
-        name: "webfetch",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/webfetch"),
-    },
-    BundledPlugin {
-        name: "websearch",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/websearch"),
-    },
-    BundledPlugin {
-        name: "bash",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/bash"),
-    },
-    BundledPlugin {
-        name: "batch",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/batch"),
-    },
-    BundledPlugin {
-        name: "grep",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/grep"),
-    },
-    BundledPlugin {
-        name: "glob",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/glob"),
-    },
-    BundledPlugin {
-        name: "skill",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/skill"),
-    },
-    BundledPlugin {
-        name: "question",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/question"),
-    },
-    BundledPlugin {
-        name: "todo_write",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/todo_write"),
-    },
-    BundledPlugin {
-        name: "read",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/read"),
-    },
-    BundledPlugin {
-        name: "write",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/write"),
-    },
-    BundledPlugin {
-        name: "edit",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/edit"),
-    },
+    BundledPlugin::new(
+        "sessions",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/sessions"),
+    ),
+    BundledPlugin::new(
+        "thinking",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/thinking"),
+    ),
+    BundledPlugin::new(
+        "index",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/index"),
+    ),
+    BundledPlugin::new(
+        "webfetch",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/webfetch"),
+    ),
+    BundledPlugin::new(
+        "websearch",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/websearch"),
+    ),
+    BundledPlugin::new("bash", include_dir!("$CARGO_MANIFEST_DIR/../plugins/bash")),
+    BundledPlugin::new(
+        "batch",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/batch"),
+    ),
+    BundledPlugin::new("grep", include_dir!("$CARGO_MANIFEST_DIR/../plugins/grep")),
+    BundledPlugin::new("glob", include_dir!("$CARGO_MANIFEST_DIR/../plugins/glob")),
+    BundledPlugin::new(
+        "skill",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/skill"),
+    ),
+    BundledPlugin::new(
+        "question",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/question"),
+    ),
+    BundledPlugin::new(
+        "todo_write",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/todo_write"),
+    ),
+    BundledPlugin::new("read", include_dir!("$CARGO_MANIFEST_DIR/../plugins/read")),
+    BundledPlugin::new(
+        "write",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/write"),
+    ),
+    BundledPlugin::new("edit", include_dir!("$CARGO_MANIFEST_DIR/../plugins/edit")),
     // Below the tools it pre-approves: `memory` allows writes into its own
     // state dir, and a rule can only name a registered tool.
-    BundledPlugin {
-        name: "memory",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/memory"),
-    },
-    BundledPlugin {
-        name: "task",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/task"),
-    },
-    BundledPlugin {
-        name: "code_execution",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/code_execution"),
-    },
-    BundledPlugin {
-        name: "completion",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/completion"),
-    },
+    BundledPlugin::new(
+        "memory",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/memory"),
+    ),
+    BundledPlugin::new("task", include_dir!("$CARGO_MANIFEST_DIR/../plugins/task")),
+    BundledPlugin::new(
+        "code_execution",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/code_execution"),
+    ),
+    BundledPlugin::new(
+        "completion",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/completion"),
+    ),
     BundledPlugin {
         name: "claude_code",
         private_api: Some(crate::api::claude_code::create_private_module),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/claude_code"),
     },
-    BundledPlugin {
-        name: "view_image",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/view_image"),
-    },
-    BundledPlugin {
-        name: "lib",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/lib"),
-    },
-    BundledPlugin {
-        name: "list",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/list"),
-    },
+    BundledPlugin::new(
+        "view_image",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/view_image"),
+    ),
+    BundledPlugin::new("lib", include_dir!("$CARGO_MANIFEST_DIR/../plugins/lib")),
+    BundledPlugin::new("list", include_dir!("$CARGO_MANIFEST_DIR/../plugins/list")),
     // The rest register no tool. They declare a provider maki ships, on
     // the same surface a third-party plugin declares one with, which is what
     // keeps that surface honest.
-    BundledPlugin {
-        name: "synthetic",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/synthetic"),
-    },
-    BundledPlugin {
-        name: "deepseek",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/deepseek"),
-    },
-    BundledPlugin {
-        name: "mistral",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/mistral"),
-    },
-    BundledPlugin {
-        name: "tensorx",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/tensorx"),
-    },
-    BundledPlugin {
-        name: "regolo",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/regolo"),
-    },
-    BundledPlugin {
-        name: "requesty",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/requesty"),
-    },
-    BundledPlugin {
-        name: "openrouter",
-        private_api: None,
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/openrouter"),
-    },
+    BundledPlugin::new(
+        "synthetic",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/synthetic"),
+    ),
+    BundledPlugin::new(
+        "deepseek",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/deepseek"),
+    ),
+    BundledPlugin::new(
+        "mistral",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/mistral"),
+    ),
+    BundledPlugin::new(
+        "tensorx",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/tensorx"),
+    ),
+    BundledPlugin::new(
+        "regolo",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/regolo"),
+    ),
+    BundledPlugin::new(
+        "requesty",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/requesty"),
+    ),
+    BundledPlugin::new(
+        "openrouter",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/openrouter"),
+    ),
 ];
 
 /// Every bundled name, not just the default-enabled ones. An external package

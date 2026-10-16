@@ -208,7 +208,7 @@ local function coding_confine(spec, artifact)
     local path = maki.uv.os_getenv(name)
     if path and path:sub(1, 1) == "/" then
       deny[#deny + 1] = path
-      local resolved = maki.uv.fs_realpath(path)
+      local resolved = maki.fs.realpath(path)
       if resolved and resolved ~= path then
         deny[#deny + 1] = resolved
       end

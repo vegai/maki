@@ -44,6 +44,28 @@ async fn project_git_dir(_lua: Lua, project: String) -> LuaResult<Pair<String>> 
     ))
 }
 
+/// Create an owned probe directory outside every checkout alias and Git directory.
+/// @param base string? Temporary directory, or the process default.
+/// @param project string Session directory.
+/// @param denied table Checkout aliases and Git directories.
+/// @return (string?, string?) Created directory, or nil and the error. The caller owns cleanup.
+#[lua_fn(guard = FsWrite)]
+async fn private_dir(
+    _lua: Lua,
+    base: Option<String>,
+    project: String,
+    denied: Vec<String>,
+) -> LuaResult<Pair<String>> {
+    Ok(pair(
+        validation::private_dir(
+            base.map(PathBuf::from),
+            PathBuf::from(project),
+            denied.into_iter().map(PathBuf::from).collect(),
+        )
+        .await,
+    ))
+}
+
 /// Existing home state and temporary copies that must be hidden from workers.
 /// @param home string Home directory.
 /// @return (table?, string?) State filenames, or nil and the error.
@@ -340,21 +362,15 @@ fn classify(lua: &Lua, line: String, mode: Table) -> LuaResult<Pair<Table>> {
     result.set("event", json_to_lua(lua, event)?)?;
     result.set("model_checked", classified.model_checked)?;
     result.set("problem", classified.problem)?;
-    let usage = if event["type"] == "assistant" {
-        &event["message"]["usage"]
-    } else {
-        &event["usage"]
-    };
-    if usage.is_object() {
-        result.set("usage", json_to_lua(lua, &validation::usage_counts(usage))?)?;
+    if let Some(usage) = &classified.usage {
+        result.set("usage", json_to_lua(lua, usage)?)?;
     }
-    if event["type"] == "rate_limit_event" && event["rate_limit_info"].is_object() {
+    if let Some(rate_limit) = &classified.rate_limit {
         result.set(
             "rate_limit",
             json_to_lua(
                 lua,
-                &serde_json::to_value(validation::plan_usage(&event["rate_limit_info"]))
-                    .map_err(mlua::Error::external)?,
+                &serde_json::to_value(rate_limit).map_err(mlua::Error::external)?,
             )?,
         )?;
     }
@@ -382,7 +398,7 @@ lua_table! {
     /// Claude Code launch checks shared with the subscription provider. JSON inputs retain
     /// the distinction between null, objects and arrays.
     "maki.claude_code" => pub(crate) fn create_claude_code_table(perms: &PluginPermissions), DOCS [
-        handshake, base_args, base_settings, empty_mcp_config, environment, prepare_launch(perms), home_state_files(perms),
+        handshake, base_args, base_settings, empty_mcp_config, environment, prepare_launch(perms), private_dir(perms), home_state_files(perms),
         account_problem, policy_problem, init_problem,
         resolved_model, subscription_type, classify, version_check(perms), invalidate_version, sanitize_git(perms), project_git_dir(perms), unpack_blobs(perms),
     ]
@@ -403,6 +419,32 @@ mod tests {
 
     const LINKED: &str = "linked";
     const NESTED: &str = "src";
+
+    #[test_case(false ; "direct_denied_directory")]
+    #[test_case(true ; "symlinked_denied_directory")]
+    fn worker_probe_directories_reject_checkout_aliases(through_link: bool) {
+        const DENIED_TEMP: &str = "is in the project";
+        let root = tempdir().unwrap();
+        let project = root.path().join("project");
+        let denied = root.path().join("denied");
+        fs::create_dir(&project).unwrap();
+        fs::create_dir(&denied).unwrap();
+        let alias = root.path().join(LINKED);
+        symlink(&denied, &alias).unwrap();
+        let base = if through_link { &alias } else { &denied };
+        let lua = Lua::new();
+        let table = create_claude_code_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let create: Function = table.get("private_dir").unwrap();
+        let (path, error): (Option<String>, Option<String>) = smol::block_on(create.call_async((
+            base.to_str().unwrap(),
+            project.to_str().unwrap(),
+            vec![denied.to_str().unwrap()],
+        )))
+        .unwrap();
+        assert_eq!(path, None);
+        assert!(error.unwrap().contains(DENIED_TEMP));
+        assert!(fs::read_dir(&denied).unwrap().next().is_none());
+    }
 
     #[test]
     fn home_state_files_include_temporary_copies() {

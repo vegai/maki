@@ -39,13 +39,19 @@ const AUTH_NOTE: &str = "(or run `maki auth login copilot` to import a token fro
 /// No Aperture route: Copilot's auth is GraphQL-discovered, not a clean proxy
 /// target.
 pub(crate) const SPEC: ProviderSpec = ProviderSpec {
+    slug: SLUG,
+    display_name: DISPLAY_NAME,
     api_key_env: ENV_VAR,
     family: ModelFamily::Generic,
     supports_thinking: false,
     supports_deferred_tools: false,
+    accepts_images: true,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(100_000),
+    fallback_context_window: 200_000,
     models_toml: include_str!("../../../models/copilot.toml"),
+    models_of: None,
+    plugin: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
@@ -67,7 +73,6 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
         catalog: CatalogDoc::Table,
         trailing_notes: &[],
     },
-    ..ProviderSpec::new(SLUG, DISPLAY_NAME, 200_000)
 };
 
 fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
