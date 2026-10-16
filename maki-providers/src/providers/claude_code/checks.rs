@@ -37,6 +37,7 @@ pub(crate) const HANDSHAKE: &[HandshakeStep] = &[
 ];
 const NO_PROXY: &str = "NO_PROXY";
 const LOOPBACK: &str = "127.0.0.1";
+const ESSENTIAL_TRAFFIC_ONLY: (&str, &str) = ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
 const PASSED_ENV: &[&str] = &[
     "PATH",
     "HOME",
@@ -258,6 +259,10 @@ pub(crate) fn child_env(
     {
         env.push((NO_PROXY.to_owned(), LOOPBACK.to_owned()));
     }
+    env.push((
+        ESSENTIAL_TRAFFIC_ONLY.0.to_owned(),
+        ESSENTIAL_TRAFFIC_ONLY.1.to_owned(),
+    ));
     withheld.sort();
     (env, withheld)
 }
@@ -678,10 +683,11 @@ mod tests {
     #[cfg(unix)]
     use super::SETTINGS_NOT_A_FILE;
     use super::{
-        COMMONDIR_FILE, CONNECTED, DEFAULT_MODE, FLAG_SOURCE, GIT_ENTRY, HANDSHAKE, InitExpect,
-        MAX_SETTINGS_BYTES, NO_KEY_SOURCE, NOT_AN_OBJECT, POLICY_SOURCE, SETTINGS_TOO_LARGE,
-        UNREADABLE_FILE, account_problem, child_env, config_dir, file_conflicts, init_problem,
-        local_settings_dirs, plugins_problem, policy_problem, profile, settings_conflicts,
+        COMMONDIR_FILE, CONNECTED, DEFAULT_MODE, ESSENTIAL_TRAFFIC_ONLY, FLAG_SOURCE, GIT_ENTRY,
+        HANDSHAKE, InitExpect, MAX_SETTINGS_BYTES, NO_KEY_SOURCE, NOT_AN_OBJECT, POLICY_SOURCE,
+        SETTINGS_TOO_LARGE, UNREADABLE_FILE, account_problem, child_env, config_dir,
+        file_conflicts, init_problem, local_settings_dirs, plugins_problem, policy_problem,
+        profile, settings_conflicts,
     };
 
     const VERSION: &str = "2.1.284";
@@ -746,8 +752,31 @@ mod tests {
         .map(|(name, value)| (name.to_owned(), value.to_owned()));
         let (env, withheld) = child_env(environ);
         let names: Vec<&str> = env.iter().map(|(name, _)| name.as_str()).collect();
-        assert_eq!(names, [PATH_ENV, PROXY_ENV, LOCALE_ENV, "NO_PROXY"]);
+        assert_eq!(
+            names,
+            [
+                PATH_ENV,
+                PROXY_ENV,
+                LOCALE_ENV,
+                "NO_PROXY",
+                ESSENTIAL_TRAFFIC_ONLY.0
+            ]
+        );
         assert_eq!(withheld, [API_KEY_ENV, BEDROCK_ENV]);
+    }
+
+    #[test_case(None ; "unset")]
+    #[test_case(Some("") ; "empty")]
+    #[test_case(Some(ESSENTIAL_TRAFFIC_ONLY.1) ; "already_disabled")]
+    fn children_disable_nonessential_traffic(setting: Option<&str>) {
+        let environ = setting.map(|value| (ESSENTIAL_TRAFFIC_ONLY.0.to_owned(), value.to_owned()));
+        let (env, _) = child_env(environ);
+        let settings: Vec<_> = env
+            .iter()
+            .filter(|(name, _)| name == ESSENTIAL_TRAFFIC_ONLY.0)
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(settings, [ESSENTIAL_TRAFFIC_ONLY.1]);
     }
 
     #[test_case("2.1.284 (Claude Code)", "linux" => matches Ok(version) if version == "2.1.284" ; "minimum_version")]

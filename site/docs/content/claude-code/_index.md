@@ -55,6 +55,8 @@ If the run's answers fail the same checks, maki stops it at once. The provider a
 
 maki reuses a validated version while the executable is unchanged. Every process checks its init version, and each request validates the current login and policy.
 
+maki sets `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` for plugin workers, provider requests and their probes. This disables telemetry, error reports, automatic updates and fetching of feature flags. It reduces startup and shutdown delays while keeping session cleanup. Remote Control and other [features that need fetched flags](https://code.claude.com/docs/en/env-vars#features-that-need-feature-flag-fetching) are unavailable in these processes.
+
 The tool view of a finished call shows the login and the token usage. It also shows your usage against the plan's 5-hour and 7-day limits. It lists each tool call that Claude Code did not allow. "maki found no route conflict" means that the checks passed. [Limits](#limits) says what maki cannot see about billing.
 
 ## What Claude sees
