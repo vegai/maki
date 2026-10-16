@@ -4,15 +4,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use maki_agent::cancel::CancelToken;
-use maki_agent::tools::{Deadline, FileKey, MAIN_TASK_ID, ToolAudience, ToolContext, ToolLive};
+use maki_agent::tools::{
+    Deadline, FileKey, MAIN_TASK_ID, ToolAudience, ToolContext, ToolLive, ToolOutputMode,
+};
 use maki_config::{AgentConfig, ToolOutputLines};
 use maki_storage::id::SessionRef;
-use mlua::{LuaSerdeExt, MultiValue, UserData, UserDataMethods, Value as LuaValue};
+use mlua::{
+    LuaSerdeExt, MultiValue, Result as LuaResult, UserData, UserDataMethods, Value as LuaValue,
+};
 
 use crate::api::tool::ToolCallReply;
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::json_to_lua;
-use crate::api::util::pair::Pair;
+use crate::api::util::pair::{Pair, err_pair};
+use crate::plugin_permissions::{Permission, PluginPermissions, denied_error};
 use crate::runtime::{RestoreReason, active_task, lock_cell};
 
 const DEADLINE_ALREADY_SET_MSG: &str = "ctx:set_deadline() already called";
@@ -51,7 +56,7 @@ pub(crate) struct AgentContext(ToolContext);
 impl From<&ToolContext> for AgentContext {
     fn from(ctx: &ToolContext) -> Self {
         let mut c = ctx.clone();
-        c.deadline = Deadline::None;
+        c.deadline = Deadline::default();
         c.tool_output_lines = ToolOutputLines::default();
         Self(c)
     }
@@ -90,6 +95,9 @@ pub(crate) struct LuaCtx {
     session_id: Option<SessionRef>,
     task_id: Option<Arc<str>>,
     pub(crate) finish_tx: Option<flume::Sender<ToolCallReply>>,
+    /// The ctx starts outside the Lua thread, which owns the plugin permissions. Keep
+    /// permissions denied until `run_tool_call` assigns them.
+    pub(crate) permissions: PluginPermissions,
 }
 
 enum Caps {
@@ -102,6 +110,7 @@ enum Caps {
         config: AgentConfig,
         workflow: bool,
         audience: ToolAudience,
+        output_mode: ToolOutputMode,
     },
     Restore {
         state: Option<serde_json::Value>,
@@ -129,6 +138,7 @@ impl LuaCtx {
             session_id: ctx.session_id.clone(),
             task_id: ctx.task_id.clone(),
             finish_tx: None,
+            permissions: PluginPermissions::denied(),
         }
     }
 
@@ -148,6 +158,7 @@ impl LuaCtx {
                 config: ctx.config.clone(),
                 workflow: ctx.workflow,
                 audience: ctx.audience,
+                output_mode: ctx.output_mode,
             },
         )
     }
@@ -163,6 +174,7 @@ impl LuaCtx {
             session_id: ctx.session_id,
             task_id: ctx.task_id,
             finish_tx: None,
+            permissions: PluginPermissions::denied(),
         }
     }
 
@@ -205,6 +217,14 @@ impl LuaCtx {
         }
     }
 
+    fn output_mode(&self) -> ToolOutputMode {
+        match &self.caps {
+            Caps::Handler { agent } => agent.output_mode,
+            Caps::Start { output_mode, .. } => *output_mode,
+            Caps::Restore { .. } => ToolOutputMode::Compact,
+        }
+    }
+
     fn task_id(&self) -> &str {
         self.task_id.as_deref().unwrap_or(MAIN_TASK_ID)
     }
@@ -231,11 +251,23 @@ impl LuaCtx {
     fn cap_err_pair<T>(&self, method: &str) -> Pair<T> {
         (None, Some(self.cap_err(method)))
     }
+
+    /// Raises the same error a guarded `maki.*` function would, for a method
+    /// whose plugin lacks {permission}.
+    fn require(&self, permission: Permission) -> LuaResult<()> {
+        if self.permissions.is_allowed(permission) {
+            Ok(())
+        } else {
+            Err(denied_error(permission))
+        }
+    }
 }
 
 impl UserData for LuaCtx {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("cancelled", |_, this, ()| Ok(this.cancel.is_cancelled()));
+
+        methods.add_method("output_mode", |_, this, ()| Ok(this.output_mode().as_str()));
 
         methods.add_method("workflow", |_, this, ()| {
             let Some(workflow) = this.workflow() else {
@@ -260,6 +292,47 @@ impl UserData for LuaCtx {
         });
 
         methods.add_method("task_id", |_, this, ()| Ok(this.task_id().to_owned()));
+
+        // The calling session's working directory, with links resolved as
+        // `getcwd` resolves them, so it matches `maki.uv.cwd()` for a session
+        // in maki's own directory. Under ACP a session can work in another
+        // checkout, where `maki.uv.cwd()` names the wrong project. Needs
+        // `fs_read`, like `maki.uv.cwd()`.
+        methods.add_async_method("cwd", |_, this, ()| async move {
+            let Some(agent) = this.agent() else {
+                return Ok(this.cap_err_pair("cwd"));
+            };
+            this.require(Permission::FsRead)?;
+            let cwd = agent.permissions.cwd().to_owned();
+            drop(this);
+            Ok(match smol::fs::canonicalize(cwd).await {
+                Ok(dir) => match dir.into_os_string().into_string() {
+                    Ok(dir) => (Some(dir), None),
+                    Err(_) => err_pair("cwd: path is not UTF-8"),
+                },
+                Err(e) => err_pair(format!("cwd: {e}")),
+            })
+        });
+
+        // The instructions maki's prompt loads for the calling session's
+        // directory: the project's files and the user's global file. For a
+        // tool that hands a task to an agent that loads no instructions
+        // itself. Needs `fs_read`.
+        methods.add_async_method("instructions", |_, this, ()| async move {
+            let Some(agent) = this.agent() else {
+                return Ok(this.cap_err_pair("instructions"));
+            };
+            this.require(Permission::FsRead)?;
+            let Some(cwd) = agent.permissions.cwd().to_str().map(str::to_owned) else {
+                return Ok(err_pair("instructions: path is not UTF-8"));
+            };
+            // Nothing here may hold the ctx borrow across the wait, because a
+            // cancel hook running during the wait needs `ctx:finish`, which
+            // borrows the ctx mutably.
+            drop(this);
+            let text = smol::unblock(move || maki_agent::agent::load_instruction_text(&cwd)).await;
+            Ok((Some(text), None))
+        });
 
         methods.add_method("restore_reason", |_, this, ()| {
             let Some(reason) = this.restore_reason() else {
@@ -398,6 +471,7 @@ mod tests {
     use maki_agent::tools::test_support::stub_ctx_with;
     use maki_agent::tools::{LocalTool, ToolAudience};
     use maki_agent::{AgentMode, InstructionBlock};
+    use mlua::Lua;
     use test_case::test_case;
 
     use super::*;
@@ -408,6 +482,8 @@ mod tests {
     /// Arbitrary ids are rejected: `SessionRef` parses base58 or a uuid.
     const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
     const SUBAGENT_TASK_ID: &str = "toolu_task";
+    const CWD_IN_START_ERR: &str = "cwd not available in start ctx";
+    const INSTRUCTIONS_IN_START_ERR: &str = "instructions not available in start ctx";
 
     fn session_ref() -> SessionRef {
         SESSION_ID.parse().expect("valid session id")
@@ -441,6 +517,21 @@ mod tests {
         ctx
     }
 
+    /// Outside a tool call, `ctx:cwd()` and `ctx:instructions()` raise the
+    /// usual capability error, whatever the plugin's permissions.
+    #[test_case("cwd", CWD_IN_START_ERR ; "cwd")]
+    #[test_case("instructions", INSTRUCTIONS_IN_START_ERR ; "instructions")]
+    fn a_session_location_outside_a_call_is_a_capability_error(method: &str, expected: &str) {
+        let lua = Lua::new();
+        lua.globals()
+            .set("ctx", LuaCtx::start(&populated_ctx()))
+            .unwrap();
+        let (value, err): (Option<String>, Option<String>) =
+            smol::block_on(lua.load(format!("return ctx:{method}()")).eval_async()).unwrap();
+        assert_eq!(value, None);
+        assert_eq!(err.as_deref(), Some(expected));
+    }
+
     #[test]
     fn agent_context_keeps_tool_use_id_and_resets_per_call_state() {
         let agent = AgentContext::from(&populated_ctx());
@@ -450,7 +541,7 @@ mod tests {
             Some(session_ref()),
             "the session owns the whole run, so it is not per-call state"
         );
-        assert!(matches!(agent.deadline, Deadline::None));
+        assert!(agent.deadline.at().is_none());
         assert_eq!(agent.tool_output_lines, ToolOutputLines::default());
         assert!(
             agent.local_tools.contains_key(LOCAL_TOOL_NAME),

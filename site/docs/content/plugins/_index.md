@@ -111,12 +111,12 @@ local output_limits = require("maki.output_limits")
 local NO_FILES_FOUND = "No files found"
 
 local opts = maki.api.register_options(output_limits.extend({
-  search_result_limit = { default = 100, min = 10, desc = "Max files returned per search." },
+  search_result_limit = { default = 100, min = 10, desc = "Max files the model sees per search." },
 }))
 
 local function glob_view_opts(ctx)
   local tol = ctx:tool_output_lines()
-  return { max_lines = (tol and tol.other) or 3, keep = "head" }
+  return { max_lines = (tol and tol.grep) or 3, keep = "head" }
 end
 
 maki.api.register_tool({
@@ -157,14 +157,13 @@ maki.api.register_tool({
       return { llm_output = "error: pattern is required", is_error = true }
     end
 
-    local limit = opts.search_result_limit
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
 
     local files, err = maki.fs.glob(pattern, {
       path = input.path,
       gitignore = true,
       sort = "mtime",
-      limit = limit,
+      limit = ctx:output_mode() == "compact" and opts.search_result_limit or nil,
     })
 
     if not files then

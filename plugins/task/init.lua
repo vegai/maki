@@ -15,6 +15,7 @@ require("picker")
 
 local STRUCTURED_OUTPUT_NAME = "structured_output"
 local STRUCTURED_OUTPUT_DESCRIPTION = "Report your final result. Call it exactly once when your task is complete."
+local STRUCTURED_DUPLICATE_ERROR = "structured output was already recorded; the first valid result is retained"
 local STRUCTURED_OUTPUT_ACK = "Output recorded."
 local STRUCTURED_OUTPUT_PROMPT_SUFFIX = "\n\nWhen finished, call the structured_output tool with your final result."
 local MAX_NUDGES = 2
@@ -30,7 +31,9 @@ local NUDGE_SUMMARY =
   "You finished your work but did not provide a summary. Reply with a concise summary of what you did and found."
 local INVALID_INPUT_PREFIX =
   "Input does not match the required schema. Fix the errors and call structured_output again:\n"
-local BODY_INDENT_COLS = 4
+-- Worst case is a batch child: tool body + batch body indents (2 + 2),
+-- plus the transcript's scrollbar column.
+local BODY_CHROME_COLS = 5
 local MIN_MD_WIDTH = 20
 local DEFAULT_OUTPUT_LINES = 5
 
@@ -166,6 +169,9 @@ local function handler(input, ctx)
         description = STRUCTURED_OUTPUT_DESCRIPTION,
         input_schema = input.output_schema,
         handler = function(value)
+          if captured then
+            return nil, STRUCTURED_DUPLICATE_ERROR
+          end
           local errs = validator:validate(value)
           if errs then
             last_errors = bounded_errors(errs)
@@ -261,7 +267,7 @@ local function restore(_input, output, is_error, ctx)
     max_lines = (tol and tol.task) or DEFAULT_OUTPUT_LINES,
     keep = "head",
     max_line_bytes = output_limits.DEFAULT_MAX_LINE_BYTES,
-    width = math.max(maki.ui.terminal_size().cols - BODY_INDENT_COLS, MIN_MD_WIDTH),
+    width = math.max(maki.ui.terminal_size().cols - BODY_CHROME_COLS, MIN_MD_WIDTH),
   })
 end
 

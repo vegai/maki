@@ -43,8 +43,17 @@ impl RewindPicker {
     pub fn open(&mut self, messages: &[Message]) -> Result<(), String> {
         let mut turn_num = 0usize;
         let mut entries: Vec<RewindEntry> = Vec::new();
+        // Context updates go out right before the prompt they came with, so
+        // rewinding to the prompt takes them too, leaving the transcript as
+        // it was before the prompt was sent.
+        let mut updates_from = None;
         for (msg_idx, msg) in messages.iter().enumerate() {
-            if !matches!(msg.role, Role::User) || msg.is_observation() {
+            if msg.is_context_update() {
+                updates_from.get_or_insert(msg_idx);
+                continue;
+            }
+            let sent_from = updates_from.take().unwrap_or(msg_idx);
+            if !matches!(msg.role, Role::User) || msg.is_from_host() {
                 continue;
             }
             let Some(full_text) = msg.user_text() else {
@@ -61,7 +70,7 @@ impl RewindPicker {
                 format!("{turn_num}: {first_line}")
             };
             entries.push(RewindEntry {
-                turn_index: msg_idx,
+                turn_index: sent_from,
                 prompt_preview: preview,
                 prompt_text: full_text.to_owned(),
             });
@@ -210,6 +219,21 @@ mod tests {
         let item = picker.picker.selected_item().unwrap();
         assert!(item.label().contains("real prompt"));
         assert_eq!(item.turn_index, 1);
+    }
+
+    fn context_update() -> Message {
+        Message::context_update("plan mode".into(), Default::default())
+    }
+
+    /// Left behind, an update would sit in front of whatever is sent next,
+    /// and rewinding to the first prompt would not empty the session.
+    #[test_case(vec![context_update(), user_msg("first")], 0 ; "first_prompt")]
+    #[test_case(vec![user_msg("first"), assistant_msg(), Message::observation("note".into()), context_update(), context_update(), user_msg("second")], 3 ; "after_an_observation")]
+    #[test_case(vec![context_update(), user_msg("first"), assistant_msg(), user_msg("second")], 3 ; "earlier_update_stays")]
+    fn rewind_takes_the_updates_sent_with_the_prompt(msgs: Vec<Message>, expected: usize) {
+        let mut picker = RewindPicker::new();
+        picker.open(&msgs).unwrap();
+        assert_eq!(picker.picker.selected_item().unwrap().turn_index, expected);
     }
 
     #[test]

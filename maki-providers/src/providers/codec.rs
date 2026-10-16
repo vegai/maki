@@ -9,7 +9,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value, json};
 
-use maki_config::providers::Protocol;
+use maki_config::providers::{Protocol, ProvidersConfig, configured_base_url};
 use maki_storage::id::SessionRef;
 
 use super::openai::responses;
@@ -17,8 +17,8 @@ use super::openai_compat::{DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiC
 use super::{KeyRotation, ResolvedAuth, Timeouts};
 use crate::model::{Model, ModelInfo, ThinkingSupport};
 use crate::model_registry;
-use crate::provider::{BoxFuture, Provider};
-use crate::spec::{ProviderRegistry, ProviderSpec};
+use crate::provider::{BoxFuture, Provider, RequestScope};
+use crate::spec::ProviderSpec;
 use crate::types::{EffortDialect, ThinkingFallback, dialect, merge_body};
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
@@ -392,14 +392,13 @@ impl CodecOptions {
 }
 
 /// The native provider a custom or plugin slug borrows its codec and fallbacks
-/// from. Resolved through [`ProviderRegistry::get`], never `for_slug`, so the
-/// lookup cannot recurse back into here.
-pub(crate) fn protocol_spec(protocol: Protocol) -> Option<&'static ProviderSpec> {
-    ProviderRegistry::get(match protocol {
-        Protocol::Openai | Protocol::OpenaiResponses => super::openai::SLUG,
-        Protocol::Anthropic => super::anthropic::SLUG,
-        Protocol::Google => super::google::SLUG,
-    })
+/// from. It points straight at the row, so it can never come back empty.
+pub(crate) fn protocol_spec(protocol: Protocol) -> &'static ProviderSpec {
+    match protocol {
+        Protocol::Openai | Protocol::OpenaiResponses => &super::openai::SPEC,
+        Protocol::Anthropic => &super::anthropic::SPEC,
+        Protocol::Google => &super::google::SPEC,
+    }
 }
 
 /// Applied to the final request body, after the codec built it and after the
@@ -441,6 +440,7 @@ pub fn build(
     match options.protocol {
         Protocol::Anthropic => Box::new(
             super::anthropic::Anthropic::with_auth(auth, timeouts)
+                .with_fallback_base_url(fallback_base_url(&options))
                 .with_system_prefix(options.system_prefix),
         ),
         Protocol::Openai | Protocol::OpenaiResponses => Box::new(CompatProvider {
@@ -451,8 +451,19 @@ pub fn build(
             openai: options.openai,
             build_body: options.build_body,
         }),
-        Protocol::Google => Box::new(super::google::Google::with_auth(auth, timeouts)),
+        Protocol::Google => Box::new(
+            super::google::Google::with_auth(auth, timeouts)
+                .with_fallback_base_url(fallback_base_url(&options)),
+        ),
     }
+}
+
+/// The same order [`OpenAiCompatProvider::base_url`] keeps under a hook's
+/// origin, for the codecs that otherwise only know their vendor's host.
+fn fallback_base_url(options: &CodecOptions) -> Option<String> {
+    let config = ProvidersConfig::load();
+    configured_base_url(&options.slug, config.get(&options.slug))
+        .or_else(|| (!options.base_url.is_empty()).then(|| options.base_url.to_string()))
 }
 
 pub(crate) struct CompatProvider {
@@ -464,7 +475,6 @@ pub(crate) struct CompatProvider {
     build_body: Option<Arc<dyn BodyHook>>,
 }
 
-#[warn(clippy::missing_trait_methods)]
 impl Provider for CompatProvider {
     fn stream_message<'a>(
         &'a self,
@@ -474,8 +484,9 @@ impl Provider for CompatProvider {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        let session_id = scope.session_id;
         Box::pin(async move {
             let mut auth = self.auth.lock().unwrap().clone();
             let mut buf = String::new();
@@ -512,7 +523,9 @@ impl Provider for CompatProvider {
                 .await;
             }
 
-            let mut body = self.compat.build_body(model, messages, system, tools);
+            let mut body =
+                self.compat
+                    .build_body(model, messages, system, tools, opts.thinking, auth.top_p);
             self.openai.apply_body(&mut body, &ctx);
             if let Some(hook) = &self.build_body {
                 body = hook.call(body, &ctx).await?;
@@ -571,7 +584,7 @@ mod tests {
     const AFFINITY_HEADER: &str = "x-affinity";
     const SAFE_VALUE: &str = "maki";
     const SESSION_FIELD: &str = "session_id";
-    const MODEL_SPEC: &str = "synthetic/hf:moonshotai/Kimi-K2.5";
+    const MODEL_SPEC: &str = "xai/grok-4.6";
 
     /// One slug per case: `<SLUG>_BASE_URL` is process-wide, and these run in
     /// one process under `cargo test`.
@@ -641,7 +654,7 @@ mod tests {
         serde_json::from_value(authored).map_err(|e| e.to_string())
     }
 
-    fn synthetic_model() -> Model {
+    fn curated_model() -> Model {
         Model::from_spec(MODEL_SPEC).unwrap()
     }
 
@@ -719,7 +732,7 @@ mod tests {
             "session_id": { "body_field": SESSION_FIELD },
         }))
         .unwrap();
-        let model = synthetic_model();
+        let model = curated_model();
         let session = SessionRef::generate();
         let ctx = RequestCtx {
             session: Some(&session),
@@ -747,7 +760,7 @@ mod tests {
             "thinking": { "dialect": "standard", "requires_support": requires_support },
         }))
         .unwrap();
-        let mut model = synthetic_model();
+        let mut model = curated_model();
         model.thinking_override = Some(ThinkingSupport::No);
         let mut body = json!({});
 
@@ -768,7 +781,7 @@ mod tests {
         expected: &str,
     ) {
         let wire = wire(json!({ "thinking": { "dialect": "prefer-high" } })).unwrap();
-        let model = synthetic_model();
+        let model = curated_model();
         let ctx = RequestCtx {
             discovered: Some(ModelInfo {
                 effort: listed.map(|supported| ModelEffort {

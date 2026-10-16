@@ -1,3 +1,4 @@
+pub(crate) mod alert_modal;
 pub(crate) mod btw_modal;
 pub(crate) mod code_view;
 pub mod command;
@@ -25,6 +26,7 @@ pub(crate) mod split_layout;
 pub mod status_bar;
 pub(crate) mod streaming_content;
 pub(crate) mod theme_picker;
+pub(crate) mod thinking;
 pub(crate) mod tool_display;
 pub(crate) mod usage_modal;
 
@@ -35,6 +37,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_agent::AgentInput;
 use maki_agent::{BufferSnapshot, ToolInput, ToolOutput};
 use maki_lua::{PackCommand, PackPlan};
+use maki_providers::provider::ModelListing;
 use maki_providers::{ImageSource, Message, ModelTier};
 use ratatui::text::{Line, Span};
 
@@ -204,7 +207,7 @@ pub enum Action {
     },
     AssignTier(String, ModelTier),
     UnassignTier(String, ModelTier),
-    RefreshModels,
+    RefreshModels(ModelListing),
     RefreshUsage,
     Compact(Option<String>),
     ToggleMcp(String, bool),
@@ -297,7 +300,9 @@ pub struct DisplayMessage {
     pub render_snapshot: Option<BufferSnapshot>,
     pub render_header: Option<BufferSnapshot>,
     pub snapshot_theme_gen: u64,
-    pub thinking_collapsed: bool,
+    /// Only a click sets it, so thinking starts the way `ui.thinking_lines`
+    /// says however the message got here.
+    pub thinking_expanded: bool,
 }
 
 impl DisplayMessage {
@@ -318,7 +323,7 @@ impl DisplayMessage {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
-            thinking_collapsed: false,
+            thinking_expanded: false,
         }
     }
 
@@ -351,7 +356,7 @@ impl DisplayMessage {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
-            thinking_collapsed: false,
+            thinking_expanded: false,
         }
     }
 
@@ -376,6 +381,8 @@ pub enum DisplayRole {
     Tool(Box<ToolRole>),
     Error,
     Done,
+    /// One dim line about what the host told the model on the user's behalf.
+    Notice,
 }
 
 impl DisplayRole {

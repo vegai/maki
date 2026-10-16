@@ -458,6 +458,7 @@ function Batch:run_child(c, ctx)
   c.status = STATUS.RUNNING
   self:rerender()
   local text, err = maki.agent.call_tool(ctx, c.tool, c.params, {
+    output_mode = ctx:output_mode(),
     -- Clicks on a still-streaming child are a no-op: its click handler
     -- lives on the child's own handle, not on this wrapper buf.
     on_live_buf = function(b)

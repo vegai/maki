@@ -1,7 +1,7 @@
 use std::process::Command;
 
-use maki_config::env_var_refs;
 use maki_config::providers::{ProvidersConfig, resolve_api_key_env};
+use maki_config::{PROVIDER_BUILTINS, ShellPreference, env_var_refs};
 
 use crate::providers::anthropic::bedrock;
 use crate::providers::catalog;
@@ -41,16 +41,22 @@ pub fn strip_provider_keys(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
-/// A builtin slug ignores `api_key_env` in `providers.toml`, so that var is
-/// not a key maki reads. Its `headers` are still sent, so their `${VAR}`s count.
+/// `providers.toml` cannot change the `api_key_env` of a known slug, so that
+/// var is never a key maki reads. Its `headers` are still sent though, so
+/// their `${VAR}`s count.
 fn provider_key_vars(config: &ProvidersConfig, catalog_vars: Vec<String>) -> Vec<String> {
-    let builtin = ProviderRegistry::builtins()
-        .iter()
+    let known = ProviderRegistry::all()
+        .into_iter()
         .map(|spec| spec.api_key_env)
         .chain(copilot_auth::TOKEN_ENV_VARS.iter().copied())
         .chain([bedrock::BEARER_TOKEN_ENV])
         .filter(|var| !var.is_empty())
         .map(str::to_owned);
+    // The key stays the user's secret even while its plugin is off or still
+    // loading.
+    let bundled = PROVIDER_BUILTINS
+        .iter()
+        .map(|slug| resolve_api_key_env(slug, None));
     let custom = config
         .providers
         .iter()
@@ -62,12 +68,133 @@ fn provider_key_vars(config: &ProvidersConfig, catalog_vars: Vec<String>) -> Vec
         .flat_map(|def| def.headers.values())
         .flat_map(|value| env_var_refs(value))
         .map(str::to_owned);
-    builtin
+    known
+        .chain(bundled)
         .chain(custom)
         .chain(header_refs)
         .chain(catalog_vars)
         .filter(|var| !SHARED_CREDENTIAL_VARS.contains(&var.as_str()))
         .collect()
+}
+
+pub fn shell_command(cmd: &str, shell: &ShellPreference) -> Command {
+    #[cfg(unix)]
+    {
+        let _ = shell;
+        let mut command = Command::new("bash");
+        command.arg("-c").arg(cmd);
+        command
+    }
+    #[cfg(windows)]
+    {
+        windows::shell_command(cmd, shell)
+    }
+}
+
+/// Compiled into tests on every OS, so Linux CI still checks the path logic.
+#[cfg(any(windows, test))]
+mod windows {
+    use std::env;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use maki_config::ShellPreference;
+
+    const BASH_EXE: &str = "bash.exe";
+
+    pub(super) fn shell_command(cmd: &str, shell: &ShellPreference) -> Command {
+        let bash = match shell {
+            ShellPreference::Auto => git_bash(),
+            ShellPreference::Program(program) if is_cmd(program) => None,
+            ShellPreference::Program(program) => Some(program.clone()),
+        };
+        let (program, flag) = match bash {
+            Some(bash) => (bash, "-c"),
+            None => (PathBuf::from("cmd.exe"), "/C"),
+        };
+        let mut command = Command::new(program);
+        command.arg(flag).arg(cmd);
+        command
+    }
+
+    fn is_cmd(program: &Path) -> bool {
+        program
+            .file_stem()
+            .is_some_and(|stem| stem.eq_ignore_ascii_case("cmd"))
+    }
+
+    /// We never take `bash.exe` straight from PATH, because on many machines
+    /// the first one is WSL's launcher in System32 and the command would run
+    /// inside Linux. The `bash.exe` that ships with Git for Windows is the one
+    /// we want, so we look for `git.exe` and walk over to it.
+    fn git_bash() -> Option<PathBuf> {
+        let on_path = env::var_os("PATH").and_then(|paths| {
+            env::split_paths(&paths)
+                .map(|dir| dir.join("git.exe"))
+                .find(|git| git.is_file())
+        });
+        on_path.and_then(|git| bash_next_to_git(&git)).or_else(|| {
+            let bash = PathBuf::from(env::var_os("ProgramFiles")?)
+                .join("Git")
+                .join("bin")
+                .join(BASH_EXE);
+            bash.is_file().then_some(bash)
+        })
+    }
+
+    /// The Git installer puts `cmd\` (or `bin\`) on PATH, and bash lives in
+    /// `bin\`. Scoop puts a `shims\git.exe` on PATH, and the real install sits
+    /// in `apps\git\current\`.
+    fn bash_next_to_git(git: &Path) -> Option<PathBuf> {
+        let dir = git.parent()?;
+        let root = dir.parent()?;
+        let dir_name = dir.file_name()?;
+        let bin = if dir_name.eq_ignore_ascii_case("cmd") || dir_name.eq_ignore_ascii_case("bin") {
+            root.join("bin")
+        } else if dir_name.eq_ignore_ascii_case("shims") {
+            root.join("apps").join("git").join("current").join("bin")
+        } else {
+            return None;
+        };
+        let bash = bin.join(BASH_EXE);
+        bash.is_file().then_some(bash)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::fs;
+
+        use test_case::test_case;
+
+        use super::*;
+
+        const CMD: &str = "echo hello";
+
+        #[test_case("cmd", "cmd.exe", "/C" ; "cmd")]
+        #[test_case("C:/Windows/System32/CMD.EXE", "cmd.exe", "/C" ; "cmd_full_path")]
+        #[test_case("D:/tools/bash.exe", "D:/tools/bash.exe", "-c" ; "bash_like")]
+        fn shell_command_for_program(program: &str, expected_program: &str, flag: &str) {
+            let shell = ShellPreference::Program(PathBuf::from(program));
+            let command = shell_command(CMD, &shell);
+            assert_eq!(command.get_program(), expected_program);
+            assert_eq!(command.get_args().collect::<Vec<_>>(), [flag, CMD]);
+        }
+
+        #[test_case("Git/cmd/git.exe", Some("Git/bin/bash.exe") ; "installer_cmd")]
+        #[test_case("Git/bin/git.exe", Some("Git/bin/bash.exe") ; "installer_bin")]
+        #[test_case("scoop/shims/git.exe", Some("scoop/apps/git/current/bin/bash.exe") ; "scoop_shim")]
+        #[test_case("tools/git.exe", None ; "unknown_layout")]
+        fn bash_next_to_git_layouts(git: &str, bash: Option<&str>) {
+            let dir = tempfile::tempdir().unwrap();
+            let git = dir.path().join(git);
+            let bash = bash.map(|bash| dir.path().join(bash));
+            for file in [Some(&git), bash.as_ref()].into_iter().flatten() {
+                fs::create_dir_all(file.parent().unwrap()).unwrap();
+                fs::write(file, []).unwrap();
+            }
+            assert_eq!(bash_next_to_git(&git), bash);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -92,6 +219,8 @@ mod tests {
     const CATALOG_KEY_ENV: &str = "FIREWORKS_API_KEY";
     const SHARED_CATALOG_KEY_ENV: &str = "HF_TOKEN";
     const UNRELATED_VAR: &str = "MAKI_TEST_UNRELATED";
+    /// Its plugin never loads in this crate's tests.
+    const BUNDLED_KEY_ENV: &str = "MISTRAL_API_KEY";
     #[cfg(unix)]
     const SECRET: &str = "sk-secret";
 
@@ -127,6 +256,7 @@ mod tests {
     #[test_case(CATALOG_KEY_ENV, true ; "catalog_key")]
     #[test_case(SHARED_CATALOG_KEY_ENV, false ; "shared_credential_in_catalog_kept")]
     #[test_case(UNRELATED_VAR, false ; "unrelated_var_kept")]
+    #[test_case(BUNDLED_KEY_ENV, true ; "unloaded_bundled_plugin_key")]
     fn provider_key_vars_membership(var: &str, stripped: bool) {
         let catalog_vars = vec![CATALOG_KEY_ENV.into(), SHARED_CATALOG_KEY_ENV.into()];
         assert_eq!(
@@ -142,12 +272,14 @@ mod tests {
     fn child_sees_only_keys_set_after_strip() {
         let inherited = anthropic::SPEC.api_key_env;
         let explicit = bedrock::BEARER_TOKEN_ENV;
-        let mut cmd = Command::new("printenv");
-        cmd.args([inherited, explicit]).env(inherited, SECRET);
+        let mut cmd = Command::new("env");
+        cmd.env(inherited, SECRET);
         let output = strip_provider_keys(&mut cmd)
             .env(explicit, SECRET)
             .output()
             .unwrap();
-        assert_eq!(output.stdout, format!("{SECRET}\n").as_bytes());
+        let env = String::from_utf8(output.stdout).unwrap();
+        assert!(!env.contains(&format!("{inherited}=")));
+        assert!(env.contains(&format!("{explicit}={SECRET}")));
     }
 }

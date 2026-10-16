@@ -14,7 +14,7 @@ use maki_storage::sessions::{SessionMeta, StoredMode, StoredSubagent};
 use crate::{AppSession, OpenSession};
 
 use super::session_state::{SessionState, rules_to_stored, stored_to_rules};
-use super::{App, Mode, PendingInput, PlanState, Status};
+use super::{App, MAIN_CHAT, Mode, PendingInput, PlanState, Status};
 
 /// The shortest gap between two writes that carry only UI state.
 const SOFT_SAVE_DELAY: Duration = Duration::from_millis(1000);
@@ -120,7 +120,7 @@ impl App {
     /// and an empty `Vec` does not allocate.
     fn build_meta(&self) -> SessionMeta {
         let state = &self.state;
-        let draft = self.input_box.buffer.value();
+        let draft = self.main_draft();
         SessionMeta {
             mode: Some(state.mode.into()),
             plan_path: state.plan.path().map(|p| p.to_string_lossy().into_owned()),
@@ -133,7 +133,7 @@ impl App {
             } else {
                 self.recoverable_queue.clone()
             },
-            thinking: Some(state.thinking.into()),
+            thinking: Some(state.thinking_intent().into()),
             fast: state.fast_intent(),
             workflow: state.workflow,
             yolo: self.permissions.persisted_yolo(),
@@ -171,6 +171,8 @@ impl App {
     /// Call only once `state.session` is final: the chats it builds are
     /// stamped with that session for life.
     pub(super) fn reset_ui_chrome(&mut self) {
+        // Brings the main draft back to the box before the chats holding it go.
+        self.set_active_chat(MAIN_CHAT);
         self.chats.clear();
         let mut main = Chat::new(
             self.state.session.id,
@@ -181,8 +183,9 @@ impl App {
         );
         main.set_restore_channel(self.restore_event_tx.clone());
         self.chats.push(main);
-        self.active_chat = 0;
+        self.active_chat = MAIN_CHAT;
         self.chat_index.clear();
+        self.deleted_tasks.clear();
         self.status = Status::Idle;
         self.clear_exit_request();
         self.queue.clear();
@@ -220,7 +223,7 @@ impl App {
             self.input_box.buffer.move_to_end();
         }
 
-        self.chats[0].request_restores(restore_items);
+        self.chats[MAIN_CHAT].request_restores(restore_items);
 
         // Read, not taken: the live chats below are the source `sync_subagents`
         // mirrors back, so emptying the session here would only make the next
@@ -319,7 +322,7 @@ impl App {
         );
         open.session.meta = SessionMeta {
             mode: Some(self.state.mode.into()),
-            thinking: Some(self.state.thinking.into()),
+            thinking: Some(self.state.thinking_intent().into()),
             fast: self.state.fast_intent(),
             workflow: self.state.workflow,
             plan_path: None,

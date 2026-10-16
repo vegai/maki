@@ -13,7 +13,7 @@ Scripts to port:
 - If you are maki, load the `maki-plugin-dev` skill.
   Otherwise read https://maki.sh/docs/providers/#plugin-providers and https://maki.sh/docs/lua-api/#maki-provider-register.
   They define the API. Do not guess field names: an unknown key fails registration.
-- Read each script's source.
+{old_maki}- Read each script's source.
   You may run `<script> info` and `<script> models` to see the JSON they print.
   Do not run `resolve`, `refresh`, `reload`, `login` or `logout`: they print live credentials or wait for my input.
 - Do not change, move or delete the scripts or any credential file they use.
@@ -25,8 +25,12 @@ Scripts to port:
 - `base`: keep `base = "<same>"` when it is one of `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `zai`, `opencode`, `xai` or `aperture`.
   Any other old base (`mistral`, `deepseek`, `openrouter`, `requesty`, `synthetic`, `regolo`, `tensorx`) is no longer valid.
   Use `codec = "openai"` instead, with that provider's API origin as `base_url` when `resolve` did not return one.
+  The old base also shaped every request (thinking, reasoning fields, headers, token limits), and that now lives in its bundled plugin.
+  Copy its `openai` table, `max_output_tokens` and any `build_body` hook from https://github.com/tontinton/maki/blob/main/plugins/<base>/init.lua into the new plugin, or the provider loses them.
 - `models`: becomes the `models` table.
   Each `"id": "x"` becomes `prefixes = { "x" }`, and every other field keeps its name and default.
+  Rows describe models but do not limit the list: without a `list_models` hook, maki also lists what the API's model endpoint serves.
+  If the API has no model list, add `list_models = function() return {} end` so only the rows are listed.
   A script without `models` used its base's catalog.
   With a kept `base`, leave `models` out.
   With `codec = "openai"`, add a `list_models` hook that reads the API's model list with `ctx.get_json`, or ask me which models I use.
@@ -40,7 +44,10 @@ Scripts to port:
   If the script kept tokens in its own file, import that file the first time `maki.provider.auth.get` returns nil.
   Then I do not have to log in again.
 - A key read from an environment variable becomes `api_key_env = "VAR"`, with no `auth` hook.
+  A static `base_url` only works with `codec`.
+  If `resolve` returned a `base_url` and the script kept its `base`, return that `base_url` from an `auth` hook instead.
 - A secret from another program (`op`, `pass`, `gcloud`, `security`, `gh`, ...): run that same command from the hook with `maki.fn.jobstart({ ... })` and `maki.fn.jobwait(id, timeout_ms)`.
+  Both return nil and an error message on failure (missing binary, timeout), so raise it: `local id, err = maki.fn.jobstart({ ... }); if not id then error(err) end`, and the same for `jobwait`.
   Do not call the old script. An `auth` hook has 30 seconds, and `login` has no time limit.
 
 ## Details that are easy to get wrong
@@ -74,7 +81,7 @@ Scripts to port:
 
 For each slug:
 
-1. `maki models 2>&1 | grep -E '^warning|^<slug>/'` lists the models I had before, with no `warning:` line about the plugin.
+1. `maki models 2>&1 | grep -E '^warning|^<slug>/'` lists {expected_models}, with no `warning:` line about the plugin.
    A provider that needs a login may warn that it is not logged in. That warning is expected until I log in.
 2. When the credentials come from an imported file, an environment variable or a command, send one real request: `maki -p -m <slug>/<model> "Reply with OK"`.
    When they need a login, stop and ask me to run `maki auth login <slug>`, then send the request.

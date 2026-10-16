@@ -83,6 +83,7 @@ Some pickers add extra bindings on top of the defaults:
 |---------|-----|--------|
 | Queue | `Enter` | Remove item |
 | Commands | `Tab` | Complete command |
+| Model Picker | `Ctrl+R` | Refresh available models |
 | Model Picker | `!/@/#/$` | Set tier (strong/medium/weak/compaction) |
 | Session Picker | `Ctrl+N` | New session |
 | Session Picker | `Ctrl+R` | Rename session |
@@ -91,6 +92,7 @@ Some pickers add extra bindings on top of the defaults:
 | Thinking Picker | `0`-`9` | Type a token budget |
 | Thinking Picker | `Enter` | Apply and close |
 | Thinking Picker | `Esc` | Close without changing anything |
+| Task Picker | `Ctrl+D` | Delete finished task (press twice) |
 
 ## Plugins
 

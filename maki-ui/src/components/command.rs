@@ -13,6 +13,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
+use crate::text_buffer::TextBuffer;
 use crate::theme;
 
 const TICK_TIMEOUT_MS: u64 = 10;
@@ -177,8 +178,16 @@ struct Match {
     indices: Vec<u32>,
 }
 
+/// Every public method takes the input and catches up with it first. Lots of
+/// paths change the text without a keypress (a chat switch, `$EDITOR`, history
+/// recall). If each had to tell the palette, one would forget sooner or later,
+/// and `Enter` would run a command the box no longer shows.
 pub struct CommandPalette {
+    /// `Esc` closes the list but leaves this alone, so the palette stays shut
+    /// until the text changes.
+    synced_version: Option<u64>,
     selected: usize,
+    scroll_offset: usize,
     filtered: Vec<Match>,
     custom: Arc<[CustomCommand]>,
     mcp_reader: McpSnapshotReader,
@@ -209,7 +218,9 @@ impl CommandPalette {
 
         let nucleo = Self::build_nucleo(&custom_commands, &prompts, &lua_commands);
         Self {
+            synced_version: None,
             selected: 0,
+            scroll_offset: 0,
             filtered: Vec::new(),
             custom: custom_commands,
             mcp_reader,
@@ -279,8 +290,8 @@ impl CommandPalette {
         nucleo
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent, input: &str) -> CommandAction {
-        if !self.is_active() {
+    pub fn handle_key(&mut self, key: KeyEvent, input: &TextBuffer) -> CommandAction {
+        if !self.is_active(input) {
             return CommandAction::Passthrough;
         }
         match key.code {
@@ -296,7 +307,7 @@ impl CommandPalette {
                 self.close();
                 CommandAction::Consumed
             }
-            KeyCode::Enter => match self.confirm(input) {
+            KeyCode::Enter => match self.confirm(&input.value()) {
                 Some(cmd) => {
                     self.close();
                     CommandAction::Execute(cmd)
@@ -321,11 +332,26 @@ impl CommandPalette {
         }
     }
 
-    pub fn is_active(&self) -> bool {
+    pub fn is_active(&mut self, input: &TextBuffer) -> bool {
+        self.follow(input);
+        self.is_open()
+    }
+
+    fn is_open(&self) -> bool {
         !self.filtered.is_empty()
     }
 
-    pub fn sync(&mut self, input: &str) {
+    /// The box keeps one buffer for life and its version only climbs, so a
+    /// version we have seen means text we already matched.
+    fn follow(&mut self, input: &TextBuffer) {
+        let version = Some(input.version());
+        if self.synced_version != version {
+            self.synced_version = version;
+            self.sync(&input.value());
+        }
+    }
+
+    fn sync(&mut self, input: &str) {
         let mcp_snap = self.mcp_reader.load();
         let lua_snap = self.lua_reader.load();
         if mcp_snap.generation != self.mcp_generation || lua_snap.generation != self.lua_generation
@@ -443,11 +469,25 @@ impl CommandPalette {
 
     pub fn close(&mut self) {
         self.filtered.clear();
+        self.scroll_offset = 0;
         self.current_arg_count = 0;
         self.current_bang = false;
     }
 
-    pub fn move_up(&mut self) {
+    fn ensure_visible(&mut self, visible: usize) {
+        if self.selected < self.scroll_offset {
+            self.scroll_offset = self.selected;
+        } else if self.selected >= self.scroll_offset + visible {
+            self.scroll_offset = self.selected + 1 - visible;
+        }
+        // A filter that shrinks the list can leave the offset deep in empty
+        // space, where the selection alone would pin a one-row window.
+        self.scroll_offset = self
+            .scroll_offset
+            .min(self.filtered.len().saturating_sub(visible));
+    }
+
+    fn move_up(&mut self) {
         if self.filtered.is_empty() {
             return;
         }
@@ -458,7 +498,7 @@ impl CommandPalette {
         };
     }
 
-    pub fn move_down(&mut self) {
+    fn move_down(&mut self) {
         if self.filtered.is_empty() {
             return;
         }
@@ -496,7 +536,7 @@ impl CommandPalette {
         }
     }
 
-    pub fn confirm(&self, input: &str) -> Option<ParsedCommand> {
+    fn confirm(&self, input: &str) -> Option<ParsedCommand> {
         let item = self.filtered.get(self.selected)?;
         let name = self.item_name(item);
         let args = input
@@ -536,16 +576,33 @@ impl CommandPalette {
         self.lua_commands.iter().find(|c| c.name.as_ref() == name)
     }
 
-    pub fn view(&self, frame: &mut Frame, input_area: Rect) -> Option<Rect> {
-        let filtered = &self.filtered;
-        if filtered.is_empty() {
+    pub fn lua_commands(&self) -> &[LuaCommandInfo] {
+        &self.lua_commands
+    }
+
+    pub fn view(
+        &mut self,
+        frame: &mut Frame,
+        input_area: Rect,
+        input: &TextBuffer,
+    ) -> Option<Rect> {
+        self.follow(input);
+        self.render(frame, input_area)
+    }
+
+    fn render(&mut self, frame: &mut Frame, input_area: Rect) -> Option<Rect> {
+        if !self.is_open() {
             return None;
         }
 
-        let popup_height = (filtered.len() as u16).min(input_area.y);
+        let popup_height = (self.filtered.len() as u16).min(input_area.y);
         if popup_height == 0 {
             return None;
         }
+        self.ensure_visible(popup_height as usize);
+        let start = self.scroll_offset;
+        let filtered = &self.filtered;
+        let end = (start + popup_height as usize).min(filtered.len());
 
         const GAP: usize = 2;
         let max_name = filtered
@@ -569,10 +626,11 @@ impl CommandPalette {
         };
 
         let t = theme::current();
-        let lines: Vec<Line> = filtered
+        let lines: Vec<Line> = filtered[start..end]
             .iter()
             .enumerate()
-            .map(|(i, m)| {
+            .map(|(row, m)| {
+                let i = start + row;
                 let name = self.item_name(m);
                 let desc = self.item_description(m);
                 let selected = i == self.selected;
@@ -645,7 +703,10 @@ impl CommandPalette {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::key;
     use maki_agent::{McpPromptArg, McpSnapshot};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use test_case::test_case;
 
     fn empty_snapshot() -> McpSnapshotReader {
@@ -699,7 +760,7 @@ mod tests {
     fn close_deactivates() {
         let mut p = synced("/");
         p.close();
-        assert!(!p.is_active());
+        assert!(!p.is_open());
     }
 
     #[test_case("/mp", true ; "compact_substring")]
@@ -708,13 +769,13 @@ mod tests {
     #[test_case("/zzz", false ; "no_match")]
     fn filter_by_substring(input: &str, expect_active: bool) {
         let p = synced(input);
-        assert_eq!(p.is_active(), expect_active);
+        assert_eq!(p.is_open(), expect_active);
     }
 
     #[test]
     fn filter_custom_by_substring() {
         let p = synced_with_custom("/review", sample_custom());
-        assert!(p.is_active());
+        assert!(p.is_open());
         assert_eq!(p.filtered.len(), 1);
         assert!(matches!(p.filtered[0].command_type, CommandType::Custom(0)));
     }
@@ -745,7 +806,7 @@ mod tests {
     #[test]
     fn sync_filters_on_first_word_only() {
         let p = synced("/cd ~/foo");
-        assert!(p.is_active());
+        assert!(p.is_open());
         let name = p.item_name(&p.filtered[0]);
         assert_eq!(name, "/cd");
     }
@@ -759,19 +820,19 @@ mod tests {
     #[test_case("/btw hello world", true ; "btw_stays_active_with_many_args")]
     fn sync_respects_nargs(input: &str, expect_active: bool) {
         let p = synced(input);
-        assert_eq!(p.is_active(), expect_active);
+        assert_eq!(p.is_open(), expect_active);
     }
 
     #[test]
     fn custom_command_with_args_stays_active() {
         let p = synced_with_custom("/project:review some args", sample_custom());
-        assert!(p.is_active());
+        assert!(p.is_open());
     }
 
     #[test]
     fn custom_command_without_args_hides_on_space() {
         let p = synced_with_custom("/user:fix ", sample_custom());
-        assert!(!p.is_active());
+        assert!(!p.is_open());
     }
 
     #[test_case("/cd", "/cd", ""              ; "no_args")]
@@ -794,7 +855,7 @@ mod tests {
         let custom = sample_custom();
         let mut p = CommandPalette::new(custom, empty_snapshot(), LuaCommandReader::empty());
         p.sync("/project:review");
-        assert!(p.is_active());
+        assert!(p.is_open());
         let cmd = p.confirm("/project:review some-file.rs").unwrap();
         assert_eq!(cmd.name, "/project:review");
         assert_eq!(cmd.args, "some-file.rs");
@@ -845,7 +906,7 @@ mod tests {
     #[test]
     fn filter_mcp_prompt_by_substring() {
         let p = synced_with_prompts("/code");
-        assert!(p.is_active());
+        assert!(p.is_open());
         assert_eq!(p.filtered.len(), 1);
         assert!(matches!(
             p.filtered[0].command_type,
@@ -856,7 +917,7 @@ mod tests {
     #[test]
     fn mcp_prompt_with_args_stays_active() {
         let p = synced_with_prompts("/myserver:code-review some diff");
-        assert!(p.is_active());
+        assert!(p.is_open());
     }
 
     #[test]
@@ -949,7 +1010,7 @@ mod tests {
     #[test_case("/thm", "/theme" ; "theme_fuzzy")]
     fn nucleo_highlights_matching_indices(input: &str, expected_cmd: &str) {
         let p = synced(input);
-        assert!(p.is_active(), "Input '{}' should activate palette", input);
+        assert!(p.is_open(), "Input '{}' should activate palette", input);
         // Find the expected match
         let matched = p
             .filtered
@@ -1000,10 +1061,7 @@ mod tests {
     #[test_case("/rename", 0, true                    ; "nargs_zero_no_args")]
     #[test_case("/rename title", 0, false             ; "nargs_zero_with_arg")]
     fn lua_command_respects_nargs(input: &str, max_args: usize, expect_active: bool) {
-        assert_eq!(
-            synced_with_nargs(input, max_args).is_active(),
-            expect_active
-        );
+        assert_eq!(synced_with_nargs(input, max_args).is_open(), expect_active);
     }
 
     #[test]
@@ -1034,7 +1092,7 @@ mod tests {
     #[test]
     fn lua_command_filtered_by_substring() {
         let p = synced_with_lua("/mem");
-        assert!(p.is_active());
+        assert!(p.is_open());
         let found = p
             .filtered
             .iter()
@@ -1098,7 +1156,7 @@ mod tests {
     #[test_case("/reload!", false      ; "bang_on_a_command_that_ignores_it")]
     #[test_case("/cd one two", false   ; "more_args_than_the_command_takes")]
     fn bang_and_arg_count_decide_what_the_palette_offers(input: &str, active: bool) {
-        assert_eq!(synced(input).is_active(), active);
+        assert_eq!(synced(input).is_open(), active);
     }
 
     #[test]
@@ -1142,5 +1200,108 @@ mod tests {
         assert_eq!(updated_lua, 2);
         assert!(p.find_lua_command("/old").is_none());
         assert!(p.find_lua_command("/new1").is_some());
+    }
+
+    #[test]
+    fn reads_follow_the_buffer_and_esc_holds_until_it_changes() {
+        let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), LuaCommandReader::empty());
+        let mut input = TextBuffer::new("/he".into());
+        assert!(p.is_active(&input));
+
+        p.handle_key(key(KeyCode::Esc), &input);
+        assert!(!p.is_active(&input));
+
+        input.set_value("/hel".into());
+        assert!(p.is_active(&input));
+
+        input.set_value("hello".into());
+        assert!(!p.is_active(&input));
+    }
+
+    fn many_custom(n: usize) -> Arc<[CustomCommand]> {
+        Arc::from(
+            (0..n)
+                .map(|i| CustomCommand {
+                    name: format!("cmd{i:02}"),
+                    description: "d".into(),
+                    content: String::new(),
+                    scope: maki_agent::command::CommandScope::User,
+                    accepts_args: false,
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn render_rows(p: &mut CommandPalette, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let input_area = Rect::new(0, height - 1, width, 1);
+        terminal
+            .draw(|frame| {
+                p.render(frame, input_area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let area = buffer.area();
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn view_scrolls_to_keep_the_selection_on_screen() {
+        let mut p = synced_with_custom("/", many_custom(30));
+        let last = p.filtered.len() - 1;
+        p.selected = last;
+        let last_name = p.item_name(&p.filtered[last]).to_string();
+        let first_name = p.item_name(&p.filtered[0]).to_string();
+
+        let text = render_rows(&mut p, 60, 10);
+        assert!(
+            text.contains(&last_name),
+            "selected item off screen:\n{text}"
+        );
+        assert!(
+            !text.contains(&first_name),
+            "window did not scroll:\n{text}"
+        );
+
+        p.selected = 0;
+        let text = render_rows(&mut p, 60, 10);
+        assert!(
+            text.contains(&first_name),
+            "scroll did not return to top:\n{text}"
+        );
+    }
+
+    #[test]
+    fn view_keeps_the_window_when_selection_is_already_visible() {
+        let mut p = synced_with_custom("/", many_custom(30));
+        p.selected = 5;
+        let first_name = p.item_name(&p.filtered[0]).to_string();
+        let text = render_rows(&mut p, 60, 10);
+        assert!(
+            text.contains(&first_name),
+            "window scrolled for no reason:\n{text}"
+        );
+    }
+
+    #[test]
+    fn view_clamps_the_window_after_the_list_shrinks() {
+        let mut p = synced_with_custom("/", many_custom(30));
+        p.selected = p.filtered.len() - 1;
+        render_rows(&mut p, 60, 10);
+
+        p.sync("/cmd0");
+        let first_name = p.item_name(&p.filtered[0]).to_string();
+        let text = render_rows(&mut p, 60, 20);
+        assert!(
+            text.contains(&first_name),
+            "window stayed scrolled after the filter shrank the list:\n{text}"
+        );
     }
 }

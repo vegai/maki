@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_lock::Mutex;
+use flume::Receiver;
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_providers::Timeouts;
 use maki_providers::model::Model;
@@ -12,9 +12,10 @@ use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
 use serde_json::Value;
+use smol::lock::Mutex;
 use tracing::error;
 
-use crate::agent;
+use crate::agent::{self, RunContext, RunContextBuilder};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
@@ -25,7 +26,7 @@ use crate::types::EventSender;
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, EventStreamGuard,
     ImageSource, InputSource, McpHandle, McpSession, PermissionsConfig, RunLedger, SessionEvents,
-    SessionMailbox, ToolOutputLines, event_stream,
+    SessionMailbox, ToolDeferral, ToolOutputLines, event_stream,
 };
 
 const SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -43,9 +44,7 @@ async fn connect(
         Ok(p) => Some(Arc::from(p)),
         Err(e) => {
             error!(error = %e, "provider error");
-            let _ = event_tx.send(AgentEvent::Error {
-                message: e.user_message(),
-            });
+            let _ = event_tx.send(AgentEvent::error(&e));
             None
         }
     }
@@ -69,8 +68,8 @@ pub struct HeadlessParams {
     /// Where the transcript is written. The same dir the caller resolved the
     /// session from, so a run cannot read one session and write another.
     pub storage: StateDir,
-    /// The `always_*` knobs. A headless run has no toggle UI, so config is the
-    /// whole answer. The model gate stays in `RequestOptions::clamped`.
+    /// Launch defaults after CLI, config and saved-state precedence. The model
+    /// gate stays in `RequestOptions::clamped`.
     pub defaults: SessionDefaults,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
@@ -79,83 +78,112 @@ pub struct HeadlessParams {
 
 pub struct HeadlessHandle {
     pub tool_names: Vec<String>,
+    /// Provider-adjusted capabilities, so startup metadata matches the run.
+    pub initial_model: Receiver<Model>,
     pub session_id: SessionRef,
     pub cwd: String,
     pub task: smol::Task<()>,
 }
 
-struct AgentSetup {
+/// Read once at startup. A headless host has no `/cd` and its slots come from
+/// the caller, so nothing here changes mid-session.
+struct ContextSpec {
     vars: template::Vars,
-    instructions: agent::Instructions,
-    tools: RequestTools,
+    instructions: String,
+    slots: Arc<ResolvedSlots>,
+    config: AgentConfig,
+    local_tools: LocalTools,
+    excluded_tools: Vec<&'static str>,
+    mcp: bool,
+    system_override: Option<String>,
+    append_system: Option<String>,
 }
 
-/// Takes the handle rather than a second `bool`: two adjacent flags is one
-/// silent swap away from a session that describes tools it cannot call.
-fn setup(
-    model: &Model,
-    config: &AgentConfig,
-    excluded_tools: &[&'static str],
-    workflow: bool,
-    mcp: Option<&McpHandle>,
-) -> AgentSetup {
-    let vars = template::env_vars();
-    let instructions = agent::load_instructions(&vars.apply("{cwd}"));
-    let tools = RequestTools::build(
-        ToolRegistry::global(),
-        &vars,
-        model,
-        config,
-        excluded_tools,
-        workflow,
-        mcp.is_some(),
-    );
+impl ContextSpec {
+    /// Takes the handle rather than a `bool`. Two flags side by side are one
+    /// silent swap away from a session that describes tools it cannot call.
+    fn new(
+        vars: template::Vars,
+        instructions: &agent::Instructions,
+        slots: Arc<ResolvedSlots>,
+        config: AgentConfig,
+        excluded_tools: Vec<&'static str>,
+        mcp: Option<&McpHandle>,
+        local_tools: LocalTools,
+    ) -> Self {
+        Self {
+            vars,
+            instructions: instructions.text.clone(),
+            slots,
+            config,
+            local_tools,
+            excluded_tools,
+            mcp: mcp.is_some(),
+            system_override: None,
+            append_system: None,
+        }
+    }
 
-    AgentSetup {
-        vars,
-        instructions,
-        tools,
+    fn render(&self, model: &Model, workflow: bool) -> RunContext {
+        let tools = RequestTools::build(
+            ToolRegistry::global(),
+            &self.local_tools,
+            &self.vars,
+            model,
+            &self.config,
+            &self.excluded_tools,
+            workflow,
+            self.mcp,
+        );
+        let mut context = match &self.system_override {
+            Some(system) => RunContext::fixed(system.clone(), tools),
+            None => RunContext::render(&self.vars, &self.instructions, &self.slots, model, tools),
+        };
+        if let Some(append) = &self.append_system {
+            for text in [&mut context.system, &mut context.authored] {
+                text.push('\n');
+                text.push_str(append);
+            }
+        }
+        context
+    }
+
+    fn builder(self) -> RunContextBuilder {
+        Arc::new(move |model, workflow| self.render(model, workflow))
     }
 }
 
 /// Names advertised to SDK clients: base tools plus what the first request
-/// would carry from MCP (always-load definitions and `tool_search`).
-fn advertised_tool_names(tools: &Value, mcp: Option<&McpSession>) -> Vec<String> {
-    let mut probe = tools.clone();
-    if let Some(mcp) = mcp {
-        mcp.extend_tools(&mut probe);
-    }
-    extract_tool_names(&probe)
+/// would put in the model's context from MCP (always-load definitions and
+/// `tool_search`). Probed as [`ToolDeferral::Client`] because the native
+/// array lists every deferred definition too.
+fn advertised_tool_names(tools: &RequestTools, mcp: Option<&McpSession>) -> Vec<String> {
+    extract_tool_names(&agent::request_tools(tools, mcp, ToolDeferral::Client))
 }
 
 pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let mode = AgentMode::Build;
-    let AgentSetup {
+    let vars = template::env_vars();
+    let instructions = agent::load_instructions(&vars.apply("{cwd}"));
+    let prompt_slots = Arc::new(params.prompt_slots);
+    let spec = ContextSpec::new(
         vars,
-        instructions,
-        tools,
-    } = setup(
-        &params.model,
-        &params.config,
-        &params.excluded_tools,
-        params.defaults.workflow,
+        &instructions,
+        Arc::clone(&prompt_slots),
+        params.config.clone(),
+        params.excluded_tools,
         params.mcp_handle.as_ref(),
+        LocalTools::default(),
     );
-
-    let system = agent::build_system_prompt(
-        &vars,
-        &mode,
-        &instructions.text,
-        &params.prompt_slots,
-        &params.model,
-    );
+    let initial = spec.render(&params.model, params.defaults.workflow);
+    let context = spec.builder();
 
     let mcp = params
         .mcp_handle
         .clone()
         .map(|h| McpSession::new(h, &params.resumed.history));
-    let tool_names = advertised_tool_names(tools.definitions(), mcp.as_ref());
+    let tool_names = advertised_tool_names(&initial.tools, mcp.as_ref());
 
     let (guard, events) = event_stream();
     let event_tx = guard.sender(0);
@@ -166,11 +194,13 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
     let defaults = params.defaults;
     let working_dir_path = params.initial_wd.clone();
     let task_working_dir = working_dir.clone();
+    let (ready_tx, ready_rx) = flume::bounded(1);
     let task = smol::spawn(run_session(guard, params.mcp_handle.clone(), async move {
         let mut model = params.model;
         let Some(provider) = connect(&mut model, params.timeouts, &event_tx).await else {
             return;
         };
+        let _ = ready_tx.send(model.clone());
         let mut track = SessionTrack::open(
             params.resumed,
             params.claim,
@@ -195,18 +225,19 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
                     params.plugin_rules,
                 )),
                 session_id: Some(run_session_ref),
+                background_for: None,
                 task_id: None,
                 mailbox: Some(mailbox),
                 timeouts: params.timeouts,
                 file_access: FileAccess::fresh(),
-                prompt_slots: Arc::new(params.prompt_slots),
+                prompt_slots: Arc::clone(&prompt_slots),
                 subagent_cancels: Arc::new(CancelMap::new()),
                 ledger: Arc::new(RunLedger::default()),
                 registry: Arc::clone(ToolRegistry::global_arc()),
                 audience: ToolAudience::MAIN,
                 model_policy: Arc::clone(&params.model_policy),
             },
-            turn.run_params(system, event_tx, tools),
+            turn.run_params(event_tx, context),
         )
         .with_loaded_instructions(instructions.loaded)
         .with_mcp(mcp);
@@ -224,14 +255,13 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
 
         if let Err(e) = result {
             error!(error = %e, "agent error");
-            let _ = error_tx.send(AgentEvent::Error {
-                message: e.user_message(),
-            });
+            let _ = error_tx.send(AgentEvent::error(&e));
         }
     }));
     (
         HeadlessHandle {
             tool_names,
+            initial_model: ready_rx,
             session_id: session_ref,
             cwd: working_dir,
             task,
@@ -257,7 +287,7 @@ pub struct InteractiveParams {
     pub yolo: bool,
     pub system_prompt_override: Option<String>,
     pub append_system_prompt: Option<String>,
-    /// The `always_*` knobs. `workflow` picks the tool catalog here; the rest
+    /// Resolved launch defaults. `workflow` picks the tool catalog here; the rest
     /// are what a host without toggles puts on every [`AgentInput`] it sends.
     pub defaults: SessionDefaults,
     pub model_policy: Arc<ModelPolicy>,
@@ -270,6 +300,7 @@ pub struct InteractiveParams {
 
 pub struct InteractiveHandle {
     pub tool_names: Vec<String>,
+    pub initial_model: Receiver<Model>,
     pub input_tx: flume::Sender<AgentInput>,
     pub answer_tx: flume::Sender<String>,
     pub cancel_tx: flume::Sender<()>,
@@ -280,23 +311,29 @@ pub struct InteractiveHandle {
 }
 
 pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, SessionEvents) {
-    let AgentSetup {
-        vars,
-        instructions,
-        mut tools,
-    } = setup(
-        &params.model,
-        &params.config,
-        &params.excluded_tools,
-        params.defaults.workflow,
-        params.mcp_handle.as_ref(),
-    );
+    let vars = template::env_vars();
+    let instructions = agent::load_instructions(&vars.apply("{cwd}"));
+    let spec = ContextSpec {
+        system_override: params.system_prompt_override,
+        append_system: params.append_system_prompt,
+        ..ContextSpec::new(
+            vars,
+            &instructions,
+            Arc::clone(&params.prompt_slots),
+            params.config.clone(),
+            params.excluded_tools,
+            params.mcp_handle.as_ref(),
+            params.local_tools.clone(),
+        )
+    };
+    let initial = spec.render(&params.model, params.defaults.workflow);
+    let context = spec.builder();
 
     let mcp = params
         .mcp_handle
         .clone()
         .map(|h| McpSession::new(h, &params.resumed.history));
-    let tool_names = advertised_tool_names(tools.definitions(), mcp.as_ref());
+    let tool_names = advertised_tool_names(&initial.tools, mcp.as_ref());
 
     let (guard, events) = event_stream();
     let base_tx = guard.sender(0);
@@ -323,11 +360,13 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 
     let session_ref_clone = session_ref.clone();
     let task_permissions = Arc::clone(&permissions);
+    let (ready_tx, ready_rx) = flume::bounded(1);
     let task = smol::spawn(run_session(guard, params.mcp_handle.clone(), async move {
         let mut model = params.model;
         let Some(mut provider) = connect(&mut model, params.timeouts, &base_tx).await else {
             return;
         };
+        let _ = ready_tx.send(model.clone());
         let mut track =
             SessionTrack::open(params.resumed, params.claim, params.storage, &working_dir);
         let mut run_id: u64 = 0;
@@ -365,30 +404,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                     continue;
                 };
                 provider = switched;
-                tools = RequestTools::build(
-                    ToolRegistry::global(),
-                    &vars,
-                    &new_model,
-                    &params.config,
-                    &params.excluded_tools,
-                    params.defaults.workflow,
-                    mcp.is_some(),
-                );
                 model = new_model;
-            }
-
-            let mut system = params.system_prompt_override.clone().unwrap_or_else(|| {
-                agent::build_system_prompt(
-                    &vars,
-                    &input.mode,
-                    &instructions.text,
-                    &params.prompt_slots,
-                    &model,
-                )
-            });
-            if let Some(append) = &params.append_system_prompt {
-                system.push('\n');
-                system.push_str(append);
             }
 
             while answer_rx.lock().await.try_recv().is_ok() {}
@@ -404,6 +420,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                     tool_output_lines: ToolOutputLines::default(),
                     permissions: Arc::clone(&task_permissions),
                     session_id: Some(session_ref_clone.clone()),
+                    background_for: None,
                     task_id: None,
                     mailbox: Some(mailbox.clone()),
                     timeouts: params.timeouts,
@@ -415,7 +432,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                     audience: ToolAudience::MAIN,
                     model_policy: Arc::clone(&params.model_policy),
                 },
-                turn.run_params(system, event_tx, tools.clone()),
+                turn.run_params(event_tx, Arc::clone(&context)),
             )
             .with_loaded_instructions(instructions.loaded.clone())
             .with_user_response_rx(Arc::clone(&answer_rx))
@@ -429,9 +446,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 
             if let Err(ref e) = result {
                 error!(error = %e, "agent error");
-                let _ = error_tx.send(AgentEvent::Error {
-                    message: e.user_message(),
-                });
+                let _ = error_tx.send(AgentEvent::error(e));
             }
 
             run_id += 1;
@@ -441,6 +456,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     (
         InteractiveHandle {
             tool_names,
+            initial_model: ready_rx,
             input_tx,
             answer_tx,
             cancel_tx,
@@ -495,9 +511,11 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use futures_lite::future::poll_once;
+    use test_case::test_case;
 
     use super::*;
     use crate::mcp::McpCommand;
+    use crate::prompt::{PromptId, Slot, SlotEntry};
 
     const RUN_ID: u64 = 7;
     const STREAM_ENDED: &str = "the stream must end with the run, not with teardown";
@@ -506,6 +524,46 @@ mod tests {
     const BODY_EVENT: &str = "the body's event must be delivered before the close";
     const STILL_WORKING: &str = "await_shutdown must not return while the task still works";
     const TASK_DROPPED: &str = "await_shutdown dropped a task that had work left";
+    const MODEL_SPEC: &str = "anthropic/claude-sonnet-4-5";
+
+    /// A host-written prompt never had maki's facts in it. If the frame
+    /// claimed it did, a later edit would be announced to a model that never
+    /// saw the original.
+    #[test_case(None, true ; "rendered_prompt_states_them")]
+    #[test_case(Some("custom"), false ; "override_leaves_them_out")]
+    fn override_states_no_facts(system_override: Option<&str>, tracked: bool) {
+        let mut slots = ResolvedSlots::default();
+        slots.insert(
+            PromptId::System,
+            Slot::AfterInstructions,
+            SlotEntry {
+                plugin: Arc::from("memory"),
+                content: "tags: a".into(),
+            },
+        );
+        let instructions = agent::Instructions {
+            text: "\n\nProject instructions:\nbe nice".into(),
+            ..Default::default()
+        };
+        let spec = ContextSpec {
+            system_override: system_override.map(String::from),
+            ..ContextSpec::new(
+                template::Vars::new(),
+                &instructions,
+                Arc::new(slots),
+                AgentConfig::default(),
+                Vec::new(),
+                None,
+                LocalTools::default(),
+            )
+        };
+        let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        let facts = spec.render(&model, false).facts;
+        assert_eq!(
+            facts.is_some_and(|f| !f.instructions.is_empty() && !f.hints.is_empty()),
+            tracked
+        );
+    }
 
     #[test]
     fn extract_tool_names_filters_valid_entries() {
@@ -516,9 +574,17 @@ mod tests {
     #[test]
     fn advertised_names_show_tool_search_not_deferred_tools() {
         let base = serde_json::json!([{"name": "read"}]);
+        let tools = RequestTools::assembled(
+            ToolRegistry::global(),
+            base.clone(),
+            &LocalTools::default(),
+            &AgentConfig::default(),
+            &Model::from_spec(MODEL_SPEC).unwrap(),
+            ToolAudience::MAIN,
+        );
         let mcp =
             crate::mcp::test_support::stub_session(&[("srv.fetch_issue", "Fetch a GitHub issue")]);
-        let names = advertised_tool_names(&base, Some(&mcp));
+        let names = advertised_tool_names(&tools, Some(&mcp));
         assert_eq!(
             names,
             vec!["read", crate::mcp::TOOL_SEARCH_TOOL_NAME],
@@ -529,7 +595,7 @@ mod tests {
             serde_json::json!([{"name": "read"}]),
             "probing must not bake MCP entries into the base tools"
         );
-        assert_eq!(advertised_tool_names(&base, None), vec!["read"]);
+        assert_eq!(advertised_tool_names(&tools, None), vec!["read"]);
     }
 
     /// The ordering the SDK exit rests on: the stream ends when the run ends,
@@ -551,6 +617,7 @@ mod tests {
                 async move {
                     let _ = event_tx.send(AgentEvent::Error {
                         message: PROVIDER_ERROR.into(),
+                        auth: false,
                     });
                 }
             ));
@@ -565,7 +632,7 @@ mod tests {
             let envelope = events.next().await.expect(BODY_EVENT);
             assert!(matches!(
                 envelope.event,
-                AgentEvent::Error { message } if message == PROVIDER_ERROR
+                AgentEvent::Error { message, .. } if message == PROVIDER_ERROR
             ));
             assert!(
                 matches!(poll_once(events.next()).await, Some(None)),

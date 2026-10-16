@@ -11,15 +11,17 @@
 //! why each test here boots its own host and leans on `cargo nextest` giving
 //! every test its own process.
 
+use maki_providers::provider::RequestScope;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use maki_agent::tools::ToolRegistry;
+use maki_config::providers::{ProviderDef, ProvidersConfig};
 use maki_lua::{PluginHost, PluginPermissions};
 use maki_providers::model::{Model, ModelTier};
-use maki_providers::provider::Provider;
+use maki_providers::provider::{Provider, provider_for_slug};
 use maki_providers::retry::RetryKind;
 use maki_providers::test_support::{Canned, JSON_HEADERS, Recorded, Requests, serve};
 use maki_providers::{
@@ -31,6 +33,10 @@ use maki_storage::auth::{load_plugin_auth, lock_plugin_store};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use test_case::test_case;
+
+#[path = "common/environment.rs"]
+#[allow(dead_code)]
+mod environment;
 
 const SLUG: &str = "acmelua";
 const DISPLAY_NAME: &str = "Acme (Lua)";
@@ -52,6 +58,8 @@ const RETRY_AFTER: &str = "7";
 /// Every plugin written inline loads under this one name, so loading a second
 /// source is a reload of the first.
 const INLINE_PLUGIN: &str = "acme_inline";
+const OTHER_PLUGIN: &str = "other-package";
+const FAILED_SELECTED_LOAD: &str = "selected load failed";
 
 const RESPONSES_SLUG: &str = "acmeresponses";
 const RESPONSES_MODEL: &str = "acme-r1";
@@ -68,11 +76,10 @@ const FREE_SLUG: &str = "acmefree";
 const STUCK_AFTER: Duration = Duration::from_secs(20);
 const RELOADED_SOURCE: &str = "-- the provider plugin, reloaded without its registration\n";
 
-/// A provider maki ships a declaration for, so the slug is both a built-in row
-/// and a decl already standing when the plugin below reaches for it.
+/// Shipped as a bundled plugin, which this file never loads.
 const BUILTIN_SLUG: &str = "deepseek";
 const BUILTIN_HOST: &str = "api.deepseek.com";
-const RESERVED_SLUG_MESSAGE: &str = "belongs to a built-in provider";
+const RESERVED_SLUG_MESSAGE: &str = "is reserved";
 const CLAIM_ALLOWED: &str = "a third-party plugin took a built-in slug";
 const BUILTIN_TAKEN: &str = "a refused declaration must not be serving the slug";
 
@@ -177,7 +184,7 @@ fn isolated_state() -> TempDir {
         "XDG_DATA_HOME",
         "XDG_CACHE_HOME",
     ] {
-        unsafe { std::env::set_var(var, dir.path()) };
+        environment::set(var, dir.path());
     }
     dir
 }
@@ -207,6 +214,53 @@ fn load_inline(host: &PluginHost, source: &str, net_host: &str) {
         .expect(LOAD_FAILED);
 }
 
+#[test_case(None, false ; "unselected")]
+#[test_case(Some(OTHER_PLUGIN), false ; "another_package")]
+#[test_case(Some(INLINE_PLUGIN), false ; "selected")]
+#[test_case(Some(INLINE_PLUGIN), true ; "failed_selected_load")]
+fn an_optional_provider_registers_only_for_its_selected_package(
+    owner: Option<&str>,
+    fail_load: bool,
+) {
+    let _state = isolated_state();
+    let mut config = ProvidersConfig::default();
+    config.providers.insert(
+        SLUG.into(),
+        ProviderDef {
+            plugin: owner.map(str::to_owned),
+            ..ProviderDef::default()
+        },
+    );
+    config.save().unwrap();
+    let host = plugin_host();
+    let source = format!(
+        r#"if not maki.provider.is_selected({SLUG:?}) then return end
+maki.provider.register({{
+  slug = {SLUG:?}, display_name = {DISPLAY_NAME:?}, codec = "openai",
+  base_url = "https://{PARKING_HOST}/v1",
+}})
+if {fail_load} then error({FAILED_SELECTED_LOAD:?}) end"#
+    );
+    plugin::begin_load();
+    let loaded =
+        host.load_source_with_permissions(INLINE_PLUGIN, &source, permissions_for(PARKING_HOST));
+    plugin::commit_load();
+    assert_eq!(loaded.is_err(), fail_load, "{loaded:?}");
+    assert_eq!(
+        plugin::is_registered(SLUG),
+        owner == Some(INLINE_PLUGIN) && !fail_load
+    );
+    if owner == Some(INLINE_PLUGIN) && fail_load {
+        assert!(
+            loaded
+                .unwrap_err()
+                .to_string()
+                .contains(FAILED_SELECTED_LOAD)
+        );
+        assert!(provider_for_slug(SLUG, Timeouts::default()).is_err());
+    }
+}
+
 /// The fixture plugin, loaded from disk with the grant its `plugin.toml`
 /// declares, talking to a recorded server instead of Acme.
 struct Fixture {
@@ -224,7 +278,7 @@ impl Fixture {
 
     fn at(base_url: &str, server: Requests) -> Self {
         let state = isolated_state();
-        unsafe { std::env::set_var(BASE_URL_ENV, base_url) };
+        environment::set(BASE_URL_ENV, base_url);
 
         let host = plugin_host();
         host.load_plugin_file(&fixture_path()).expect(LOAD_FAILED);
@@ -242,7 +296,7 @@ impl Fixture {
         &self,
         thinking: ThinkingConfig,
     ) -> (Vec<ProviderEvent>, Result<StreamResponse, AgentError>) {
-        let model = plugin::lookup_model(SLUG, MODEL).expect(UNKNOWN_MODEL);
+        let model = Model::from_spec(&format!("{SLUG}/{MODEL}")).expect(UNKNOWN_MODEL);
         stream(self.provider.as_ref(), &model, thinking)
     }
 
@@ -285,7 +339,10 @@ fn stream(
             thinking,
             fast: false,
         },
-        None,
+        RequestScope {
+            session_id: None,
+            cwd: Path::new("."),
+        },
     ));
     drop(tx);
     (rx.drain().collect(), result)
@@ -476,7 +533,7 @@ fn a_login_hook_is_what_makes_the_slug_an_auth_target() {
         plugin::auth_providers()
     );
     plugin::login(SLUG).expect(HOOK_FAILED);
-    plugin::logout(SLUG).expect(HOOK_FAILED);
+    assert!(plugin::logout(SLUG).expect(HOOK_FAILED), "{HOOK_FAILED}");
 }
 
 fn responses_plugin(base_url: &str) -> String {
@@ -508,7 +565,8 @@ fn the_responses_codec_applies_the_body_hook_too() {
     plugin::commit_load();
 
     let provider = plugin::create(RESPONSES_SLUG, Timeouts::default()).expect(CREATE_FAILED);
-    let model = plugin::lookup_model(RESPONSES_SLUG, RESPONSES_MODEL).expect(UNKNOWN_MODEL);
+    let model =
+        Model::from_spec(&format!("{RESPONSES_SLUG}/{RESPONSES_MODEL}")).expect(UNKNOWN_MODEL);
 
     let (events, result) = stream(provider.as_ref(), &model, ThinkingConfig::Off);
     let response = result.expect(STREAM_FAILED);
@@ -649,13 +707,10 @@ fn an_in_flight_hook_call_survives_a_plugin_reload() {
     login.join().expect(HOOK_THREAD_FAILED).expect(HOOK_FAILED);
 }
 
-/// A slug maki ships is maki's to declare, and a plugin from outside the
-/// binary may not take it. A decl that claims one inherits its `api_key_env`,
-/// so the key the user set for the built-in would be resolved into the
-/// claimant's credentials and handed straight to it as every hook's
-/// `ctx.headers`, under a name the picker still labels with the built-in's
-/// display name. No `net` grant and no host list ever bought
-/// that reach.
+/// Picture a package that registers `deepseek`. It would get the DeepSeek key
+/// the user saved, in every hook's `ctx.headers`, while the picker still says
+/// "DeepSeek". Asking for `net` and a host list never granted that. So a slug
+/// maki ships stays reserved, even when its bundled plugin is turned off.
 #[test]
 fn a_third_party_plugin_cannot_take_a_builtin_slug() {
     let _state = isolated_state();
@@ -665,7 +720,9 @@ fn a_third_party_plugin_cannot_take_a_builtin_slug() {
     let error = host
         .load_source_with_permissions(
             INLINE_PLUGIN,
-            &format!(r#"maki.provider.register({{ slug = "{BUILTIN_SLUG}", codec = "openai" }})"#),
+            &format!(
+                r#"maki.provider.register({{ slug = "{BUILTIN_SLUG}", display_name = "Taken", codec = "openai" }})"#
+            ),
             permissions_for(BUILTIN_HOST),
         )
         .expect_err(CLAIM_ALLOWED);

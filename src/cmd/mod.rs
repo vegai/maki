@@ -14,6 +14,7 @@ use maki_agent::tools::ToolRegistry;
 use maki_config::project::{self, TrustMode};
 use maki_config::{Config, load_env_files, load_permissions};
 use maki_lua::{DiscoveredPackage, InitFiles, Interaction, PluginHost};
+use maki_providers::spec::ProviderRegistry;
 use maki_storage::StateDir;
 
 use crate::cli::{AuthAction, Cli, Command, McpAction, MigrateAction, SessionAction, TrustAction};
@@ -98,8 +99,11 @@ fn load_plugins(
     // Before any plugin can call `maki.net`, so the first request already sees
     // the hosts the user exempted from the private-address block.
     maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
+    maki_lua::set_shell_preference(config.agent.shell.clone());
+    // Model resolution must wait until the plugin has checked the shared options.
+    let builtins = host.load_builtins(&config.plugins);
 
-    if let Err(e) = host.load_builtins(&config.plugins) {
+    if let Err(e) = builtins {
         let e = color_eyre::eyre::Report::from(e).wrap_err("load builtin plugins");
         match on_builtin_failure {
             BuiltinFailure::Fatal => return Err(e),
@@ -126,7 +130,9 @@ fn load_plugins(
     // Publishes this load's providers in one step. Until here every reader
     // still sees the generation that was serving, so a `/reload` never opens a
     // window in which a registered provider answers "unknown".
+    let loaded = host.loaded_plugins()?;
     maki_providers::plugin::commit_load();
+    ProviderRegistry::configure_plugins(&loaded, &config.plugins.opts);
 
     Ok((config, sanitize_warnings(&warnings)))
 }
@@ -159,8 +165,12 @@ fn cli_stack(
     let trust = project::resolve_noninteractive(&cwd, trust_mode);
     load_env_files(&trust.project_config);
 
-    let mut host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
-        .context("initialize lua plugin host")?;
+    let mut host = PluginHost::start(
+        Arc::clone(ToolRegistry::global_arc()),
+        Interaction::None,
+        !no_jit,
+    )
+    .context("initialize lua plugin host")?;
     let (config, warnings) = load_plugins(
         &mut host,
         no_plugins,
@@ -193,6 +203,7 @@ fn cli_stack(
 }
 
 pub fn dispatch(cli: Cli) -> Result<()> {
+    let thinking = cli.thinking_override();
     // `--trust` is a grant for this process, so every entry point under it
     // reads the same shared project config the TUI would.
     let trust_mode = if cli.trust {
@@ -225,7 +236,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Session { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
             match action {
-                SessionAction::List { global } => session::list(global, &storage)?,
+                SessionAction::List { global, json } => session::list(global, json, &storage)?,
                 SessionAction::Delete { session_id, force } => {
                     session::delete(&session_id, force, &storage)?
                 }
@@ -245,7 +256,14 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             update::rollback().map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
         }
         Some(Command::Acp { model, yolo }) => {
-            acp::run(model, yolo, cli.no_plugins, cli.no_jit, trust_mode)?;
+            acp::run(
+                model,
+                thinking,
+                yolo,
+                cli.no_plugins,
+                cli.no_jit,
+                trust_mode,
+            )?;
         }
         Some(Command::Migrate { action }) => match action {
             MigrateAction::Xdg => migrate::xdg()?,
@@ -290,4 +308,69 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::env;
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    use maki_agent::tools::ToolRegistry;
+    use maki_config::RawConfig;
+    use maki_lua::{Interaction, PluginHost};
+    use maki_providers::{Model, Timeouts, provider};
+    use serde_json::{Value, json};
+    use test_case::test_case;
+
+    use super::{BuiltinFailure, load_plugins};
+
+    const PLUGIN: &str = "claude_code";
+    /// A builtin whose `max_file_size_mb` has a minimum.
+    const OTHER_PLUGIN: &str = "index";
+    const MODEL: &str = "claude-code/claude-haiku-4-5";
+    const EXECUTABLE: &str = "executable";
+
+    /// The provider reads the plugin's options from process-wide state, so
+    /// the cases take turns under a threaded harness.
+    static PLUGIN_OPTIONS: Mutex<()> = Mutex::new(());
+
+    /// A failed builtin load stops later builtins. Enable the provider only if its own plugin
+    /// completed its load.
+    #[test_case(json!({}), None => true ; "a_plugin_that_loaded")]
+    #[test_case(json!({ "max_concurrent": 0 }), None => false ; "a_plugin_that_failed_to_load")]
+    #[test_case(json!({}), Some((OTHER_PLUGIN, json!({ "max_file_size_mb": 0 }))) => false ; "a_plugin_behind_one_that_failed")]
+    fn the_provider_follows_the_plugin_that_loaded(
+        options: Value,
+        other: Option<(&str, Value)>,
+    ) -> bool {
+        let _turn = PLUGIN_OPTIONS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        load_plugins(
+            &mut host,
+            true,
+            BuiltinFailure::Warn,
+            Interaction::None,
+            |_, _, _| {
+                let mut config = RawConfig::default().into_config(&[])?;
+                config.plugins.names = vec![PLUGIN.to_owned()];
+                let mut options = options.as_object().unwrap().clone();
+                // The provider only needs a runnable file here, because no
+                // test runs it and CI has no `claude`.
+                options.insert(EXECUTABLE.to_owned(), json!(env::current_exe()?));
+                config.plugins.opts.insert(PLUGIN.to_owned(), options);
+                if let Some((name, options)) = &other {
+                    config.plugins.names.push((*name).to_owned());
+                    let options = options.as_object().unwrap().clone();
+                    config.plugins.opts.insert((*name).to_owned(), options);
+                }
+                Ok(config)
+            },
+        )
+        .unwrap();
+
+        let mut model = Model::from_spec(MODEL).unwrap();
+        provider::from_model(&mut model, Timeouts::default()).is_ok()
+    }
 }

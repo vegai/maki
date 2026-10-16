@@ -14,6 +14,8 @@ use crate::app::App;
 use crate::components::DisplayRole;
 
 const UNKNOWN_TASK_ERR: &str = "unknown task: ";
+const MAIN_DELETE_ERR: &str = "cannot delete the main chat";
+const RUNNING_DELETE_ERR: &str = "task is still running: ";
 
 /// How a chat ended, from the vaguest to the most specific. `SubagentHistory`
 /// only sees the transcript close, and the `ToolDone` carrying `is_error`
@@ -47,6 +49,7 @@ impl TaskOutcome {
 #[serde(rename_all = "lowercase")]
 pub(crate) enum TaskStatus {
     Working,
+    Queued,
     Done,
     Error,
 }
@@ -110,19 +113,59 @@ impl App {
         self.chats[self.active_chat].task_id_or_main()
     }
 
-    /// Tasks are looked up by id, never by position and never through
-    /// `chat_index`, a routing cache wiped at the end of every turn.
     pub(crate) fn focus_task(&mut self, id: &str) -> Result<(), String> {
-        let idx = if id == MAIN_TASK_ID {
-            0
-        } else {
-            self.chats
-                .iter()
-                .position(|chat| chat.task_id().is_some_and(|task_id| &**task_id == id))
-                .ok_or_else(|| format!("{UNKNOWN_TASK_ERR}{id}"))?
-        };
+        let idx = self.chat_of_task(id)?;
         self.set_active_chat(idx);
         Ok(())
+    }
+
+    /// Drops a finished subagent chat and its stored transcript, so a reload
+    /// cannot bring it back. A running task is refused, since its agent would
+    /// keep writing into a chat that is gone.
+    pub(crate) fn remove_task(&mut self, id: &str) -> Result<(), String> {
+        let pos = self.chat_of_task(id)?;
+        if pos == 0 {
+            return Err(MAIN_DELETE_ERR.to_owned());
+        }
+        if !self.chats[pos].is_finished() {
+            return Err(format!("{RUNNING_DELETE_ERR}{id}"));
+        }
+
+        // Step off through `set_active_chat`, or the box keeps the deleted
+        // chat's draft and the draft of the chat we land on stays parked.
+        if self.active_chat == pos {
+            self.set_active_chat(pos - 1);
+        }
+        self.chats.remove(pos);
+        if self.active_chat > pos {
+            self.active_chat -= 1;
+        }
+        self.chat_index.retain(|_, idx| {
+            let keep = *idx != pos;
+            if *idx > pos {
+                *idx -= 1;
+            }
+            keep
+        });
+        self.state.session_mut().remove_subagent(id, |m| {
+            m.tool_uses()
+                .map(|(tool_id, _, _)| tool_id.to_owned())
+                .collect()
+        });
+        self.deleted_tasks.insert(id.to_owned());
+        Ok(())
+    }
+
+    /// Tasks are looked up by id, never by position and never through
+    /// `chat_index`, a routing cache wiped at the end of every turn.
+    fn chat_of_task(&self, id: &str) -> Result<usize, String> {
+        if id == MAIN_TASK_ID {
+            return Ok(0);
+        }
+        self.chats
+            .iter()
+            .position(|chat| chat.task_id().is_some_and(|task_id| &**task_id == id))
+            .ok_or_else(|| format!("{UNKNOWN_TASK_ERR}{id}"))
     }
 }
 
@@ -140,7 +183,7 @@ pub(crate) fn diff_task_states<'a>(
     for task in current {
         let announce = match previous.iter().find(|(id, _)| id == task.id) {
             Some((_, status)) => *status != task.status,
-            None => task.status == TaskStatus::Working,
+            None => matches!(task.status, TaskStatus::Working | TaskStatus::Queued),
         };
         if announce {
             emit(task);
@@ -153,6 +196,7 @@ pub(crate) fn diff_task_states<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::Msg;
     use crate::app::tests::{
         RESEARCH_NAME, app_with_subagent_id, cancel_app, close_subagent_transcript, end_turn,
         error_app, finish_subagent, start_subagent,
@@ -169,6 +213,13 @@ mod tests {
     fn app_with_two_subagents() -> App {
         let mut app = app_with_subagent_id(TASK_ID);
         start_subagent(&mut app, OTHER_ID, BUILD_NAME);
+        app
+    }
+
+    fn app_with_two_finished_subagents() -> App {
+        let mut app = app_with_two_subagents();
+        close_subagent_transcript(&mut app, TASK_ID);
+        close_subagent_transcript(&mut app, OTHER_ID);
         app
     }
 
@@ -370,6 +421,81 @@ mod tests {
             collect(&mut previous, &working),
             vec![(TASK_ID.to_owned(), TaskStatus::Working)]
         );
+    }
+
+    #[test]
+    fn removing_a_finished_task_drops_it_everywhere() {
+        let mut app = app_with_two_subagents();
+        close_subagent_transcript(&mut app, TASK_ID);
+        assert!(app.state.session.subagent_messages().contains_key(TASK_ID));
+
+        app.remove_task(TASK_ID).unwrap();
+
+        let listed: Vec<_> = app.task_states().map(|task| task.id.to_string()).collect();
+        assert_eq!(listed, [OTHER_ID]);
+        let recorded: Vec<_> = app
+            .state
+            .session
+            .subagents()
+            .iter()
+            .map(|sa| sa.tool_use_id.as_str())
+            .collect();
+        assert_eq!(recorded, [OTHER_ID], "and stays deleted");
+        assert!(!app.state.session.subagent_messages().contains_key(TASK_ID));
+    }
+
+    /// Cancel is the one way to delete a task whose agent is still running.
+    #[test_case(|app: &mut App| close_subagent_transcript(app, TASK_ID) ; "late_transcript")]
+    #[test_case(|app| start_subagent(app, TASK_ID, RESEARCH_NAME)      ; "late_event")]
+    fn a_deleted_task_stays_deleted_after_its_agent_stops(late: fn(&mut App)) {
+        let mut app = app_with_subagent_id(TASK_ID);
+        app.focus_task(TASK_ID).unwrap();
+        app.handle_subagent_cancel();
+        app.remove_task(TASK_ID).unwrap();
+
+        late(&mut app);
+
+        assert_eq!(app.chats.len(), 1);
+        assert!(app.state.session.subagents().is_empty());
+        assert!(!app.state.session.subagent_messages().contains_key(TASK_ID));
+    }
+
+    #[test_case(MAIN_TASK_ID, MAIN_DELETE_ERR ; "main")]
+    #[test_case(MISSING_ID, UNKNOWN_TASK_ERR  ; "unknown_id")]
+    #[test_case(TASK_ID, RUNNING_DELETE_ERR   ; "running")]
+    fn remove_refuses_without_touching_chats(id: &str, prefix: &str) {
+        let mut app = app_with_two_subagents();
+        assert!(app.remove_task(id).unwrap_err().starts_with(prefix));
+        assert_eq!(app.chats.len(), 3);
+    }
+
+    /// `chat_index` routes by position, so the chats after the deleted one
+    /// have to shift down with it.
+    #[test]
+    fn removing_a_task_before_the_focus_keeps_the_same_task_on_screen() {
+        let mut app = app_with_two_finished_subagents();
+        app.focus_task(OTHER_ID).unwrap();
+
+        app.remove_task(TASK_ID).unwrap();
+
+        assert_eq!(app.active_chat, 1);
+        assert_eq!(app.chats[app.active_chat].name, BUILD_NAME);
+        assert_eq!(app.chat_index.get(OTHER_ID), Some(&1));
+    }
+
+    /// One input box serves every chat, so stepping off a deleted chat has to
+    /// bring back the draft of the chat we land on.
+    #[test]
+    fn removing_the_focused_task_moves_the_view_to_the_previous_chat() {
+        const MAIN_DRAFT: &str = "for main";
+        let mut app = app_with_two_finished_subagents();
+        app.update(Msg::Paste(MAIN_DRAFT.into()));
+        app.focus_task(TASK_ID).unwrap();
+
+        app.remove_task(TASK_ID).unwrap();
+
+        assert_eq!(app.active_chat, 0);
+        assert_eq!(app.main_draft(), MAIN_DRAFT);
     }
 
     /// A task first seen already finished stays quiet, so a reload does not

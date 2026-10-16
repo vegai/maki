@@ -30,7 +30,7 @@ use maki_agent::{
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
 use maki_providers::model::Model;
-use maki_providers::{ImageSource, StopReason, Timeouts, TokenUsage, add_cost};
+use maki_providers::{ImageSource, StopReason, ThinkingConfig, Timeouts, TokenUsage, add_cost};
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
@@ -39,32 +39,8 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::cli::Cli;
-
-const TOOL_NAME_MAP: &[(&str, &str)] = &[
-    ("bash", "Bash"),
-    ("read", "Read"),
-    ("edit", "Edit"),
-    ("write", "Write"),
-    ("grep", "Grep"),
-    ("glob", "Glob"),
-    ("todo_write", "TodoWrite"),
-    ("webfetch", "WebFetch"),
-    ("websearch", "WebSearch"),
-    ("task", "Task"),
-    ("multiedit", "MultiEdit"),
-    ("code_execution", "CodeExecution"),
-    ("index", "Index"),
-    ("memory", "Memory"),
-    ("question", "Question"),
-    ("skill", "Skill"),
-];
-
-/// Emits a hyphenated-hex UUIDv7 string for Claude Code SDK wire ids
-/// (message.id, assistant message.id).
-#[allow(clippy::disallowed_methods)]
-fn wire_uuid() -> String {
-    uuid::Uuid::now_v7().to_string()
-}
+use crate::notice::{NOTIFICATION, ProviderNotice, wire_uuid};
+use crate::tool_names::maki_to_claude_tool_name;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum PermissionMode {
@@ -395,14 +371,6 @@ impl StreamSynth {
     }
 }
 
-fn maki_to_claude_tool_name(name: &str) -> &str {
-    TOOL_NAME_MAP
-        .iter()
-        .find(|(m, _)| *m == name)
-        .map(|(_, c)| *c)
-        .unwrap_or(name)
-}
-
 #[derive(Clone)]
 struct SdkWriter {
     session_id: SessionRef,
@@ -570,7 +538,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         eprintln!("MCP config error: {mcp_config_errors}");
     }
 
-    let startup_model = model.clone();
+    let initial_model = model.clone();
     let (handle, events) = headless::spawn_interactive(InteractiveParams {
         model,
         config,
@@ -592,6 +560,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         project_config,
         local_tools: Default::default(),
     });
+    let startup_model = smol::block_on(handle.initial_model.recv_async()).unwrap_or(initial_model);
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
     let writer_thread = std::thread::spawn(move || {
@@ -618,6 +587,7 @@ pub fn run(params: SdkParams) -> Result<()> {
             "cwd": working_dir,
             "tools": tools,
             "model": startup_model.id,
+            "thinking": ThinkingConfig::from(defaults.thinking).clamped(&startup_model).to_string(),
             "permissionMode": permission_mode.as_str(),
             "apiKeySource": "none",
             "mcp_servers": [],
@@ -1062,6 +1032,7 @@ impl EventPump {
             | AgentEvent::ToolHeaderSnapshot { .. }
             | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::Nudge
+            | AgentEvent::Notice { .. }
             | AgentEvent::PromptProgress { .. }
             | AgentEvent::StreamClosed => {}
             // A later kept message overwrites this with its own answer, so the
@@ -1071,6 +1042,15 @@ impl EventPump {
                 text,
             } if parent_tool_use_id.is_none() => self.result_text.clone_from(text),
             AgentEvent::Steered { .. } => {}
+            AgentEvent::ProviderWaiting { message } => {
+                self.writer.emit_system(
+                    NOTIFICATION,
+                    serde_json::to_value(ProviderNotice::new(
+                        message.as_deref(),
+                        parent_tool_use_id.as_deref(),
+                    ))?,
+                )?;
+            }
             AgentEvent::Retry {
                 attempt,
                 message,
@@ -1175,7 +1155,7 @@ impl EventPump {
                 let result = mem::take(&mut self.result_text);
                 self.emit_turn_result(is_error, result, *num_turns, *usage)?;
             }
-            AgentEvent::Error { message } => {
+            AgentEvent::Error { message, .. } => {
                 self.emit_turn_result(true, message.clone(), 0, TokenUsage::default())?;
             }
         }
@@ -1207,19 +1187,12 @@ fn map_tool_names_in_content(content: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use crate::tool_names::claude_to_maki_tool_name;
     use flume::Receiver;
     use maki_config::ToolKey;
     use test_case::test_case;
 
     use super::*;
-
-    fn claude_to_maki_tool_name(name: &str) -> &str {
-        TOOL_NAME_MAP
-            .iter()
-            .find(|(_, c)| *c == name)
-            .map(|(m, _)| *m)
-            .unwrap_or(name)
-    }
 
     #[test_case("bash", "Bash")]
     #[test_case("read", "Read")]
@@ -1669,6 +1642,7 @@ mod tests {
         retained
             .send(AgentEvent::Error {
                 message: PUMP_ERROR.into(),
+                auth: false,
             })
             .unwrap();
         drop(guard);
@@ -1801,6 +1775,32 @@ mod tests {
             subagent: None,
             run_id: 0,
         }
+    }
+
+    #[test]
+    fn provider_waiting_emits_keyed_notifications_and_clear() {
+        const WAITING: &str = "waiting for a provider request slot";
+        let (mut pump, out_rx) = test_pump(PermissionMode::Default, flume::unbounded().0);
+        for message in [Some(WAITING.to_owned()), None] {
+            pump.handle(top_level(AgentEvent::ProviderWaiting { message }))
+                .unwrap();
+        }
+        let notices: Vec<Value> = out_rx
+            .try_iter()
+            .map(|line| serde_json::from_str(&line).unwrap())
+            .collect();
+        assert_eq!(notices.len(), 2);
+        for notice in &notices {
+            assert_eq!(notice["type"], "system");
+            assert_eq!(notice["subtype"], NOTIFICATION);
+            assert_eq!(notice["priority"], "low");
+            assert!(notice["uuid"].as_str().is_some());
+            assert_eq!(notice["session_id"], pump.session_id);
+        }
+        assert_eq!(notices[0]["text"], WAITING);
+        assert_eq!(notices[1]["text"], "");
+        assert_eq!(notices[0]["key"], notices[1]["key"]);
+        assert_eq!(pump.result_text, "");
     }
 
     /// Nothing reached the model, so a client reading `is_error` must not take

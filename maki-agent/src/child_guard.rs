@@ -2,7 +2,9 @@ use std::io;
 use std::process::ExitStatus;
 use std::time::Duration;
 
-use async_process::Child;
+#[cfg(unix)]
+use rustix::process::{Pid, WaitOptions, waitpid};
+use smol::process::Child;
 
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -47,7 +49,7 @@ impl ChildGuard {
                     let _ = child.status().await;
                 },
                 async {
-                    async_io::Timer::after(REAP_TIMEOUT).await;
+                    smol::Timer::after(REAP_TIMEOUT).await;
                 },
             )
             .await;
@@ -57,9 +59,7 @@ impl ChildGuard {
     #[cfg(unix)]
     fn signal_kill(&self) {
         if self.child.is_some() {
-            unsafe {
-                libc::killpg(self.pid as i32, libc::SIGKILL);
-            }
+            maki_providers::process::kill_group(self.pid);
         }
     }
 
@@ -76,10 +76,10 @@ impl ChildGuard {
     // block the async executor.
     #[cfg(unix)]
     fn reap_nonblocking(&mut self) {
-        if self.child.take().is_some() {
-            unsafe {
-                libc::waitpid(self.pid as i32, std::ptr::null_mut(), libc::WNOHANG);
-            }
+        if self.child.take().is_some()
+            && let Some(pid) = unix_pid(self.pid)
+        {
+            let _ = waitpid(Some(pid), WaitOptions::NOHANG);
         }
     }
 
@@ -89,6 +89,11 @@ impl ChildGuard {
             let _ = child.try_status();
         }
     }
+}
+
+#[cfg(unix)]
+fn unix_pid(pid: u32) -> Option<Pid> {
+    i32::try_from(pid).ok().and_then(Pid::from_raw)
 }
 
 impl Drop for ChildGuard {
@@ -105,25 +110,27 @@ mod tests {
     use std::os::unix::process::CommandExt;
     use std::time::{Duration, Instant};
 
-    use async_process::Child;
+    use smol::process::Child;
 
-    use super::ChildGuard;
+    use rustix::process::{setsid, test_kill_process};
+
+    use super::{ChildGuard, unix_pid};
 
     fn spawn_sleep() -> Child {
         let mut std_cmd = std::process::Command::new("sleep");
         std_cmd.arg("60");
         unsafe {
             std_cmd.pre_exec(|| {
-                libc::setsid();
+                let _ = setsid();
                 Ok(())
             });
         }
-        let mut cmd: async_process::Command = std_cmd.into();
+        let mut cmd: smol::process::Command = std_cmd.into();
         cmd.spawn().expect("failed to spawn sleep")
     }
 
     fn is_alive(pid: u32) -> bool {
-        unsafe { libc::kill(pid as i32, 0) == 0 }
+        unix_pid(pid).is_some_and(|pid| test_kill_process(pid).is_ok())
     }
 
     fn wait_for_death(pid: u32) {

@@ -21,6 +21,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | Flag | TUI | `--print` | SDK (`stream-json`) |
 |------|-----|-----------|---------------------|
 | `-m` / `--model` | yes | yes | yes |
+| `--thinking` / `--effort`, `--max-thinking-tokens` | yes | yes | yes |
 | `--yolo` | yes | yes | yes (or `--permission-mode bypassPermissions`) |
 | `--no-plugins` / `--no-commands` / `--no-jit` | yes | yes | yes |
 | `--allowed-tools` / `--disallowed-tools` | yes | yes | yes |
@@ -41,6 +42,9 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `-p`, `--print` | Non-interactive run. See [Headless Mode](/docs/headless/) |
 | `--image <PATH>` | Attach an image in `--print` mode (repeatable). Paths must be png, jpeg, gif, or webp |
 | `-m`, `--model <SPEC>` | Model as `provider/model-id`. Fallback: last used (skipped with a warning when its provider is gone or has no key) → `provider.default_model` in config → auto-detect from available providers |
+| `--thinking <SETTING>` | Thinking for this launch: `off`, `adaptive`, `minimal` through `max`, or a positive token budget. Accepts SDK spellings `disabled` and `enabled`. Overrides `always_thinking` and the saved `/thinking` level |
+| `--effort <LEVEL>` | Thinking effort for this launch: `minimal` through `max`. See [precedence](/docs/headless/#thinking) when combined with other thinking flags |
+| `--max-thinking-tokens <N>` | Positive thinking-token budget for this launch. Takes precedence over effort unless thinking is explicitly disabled |
 | `--verbose` | Full turn-by-turn messages in `--print` output |
 | `-c`, `--continue` | Resume the most recent session in this directory |
 | `-r`, `--resume <ID>` | Resume a specific session (aliases: `-s`, `--session`) |
@@ -64,7 +68,11 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 
 ### Tool name lists
 
-`--allowed-tools` / `--disallowed-tools` accept Claude Code PascalCase (`Read,Edit,Bash`) or snake_case (`read,edit,bash`). Maki lowercases PascalCase to snake_case and checks the result against the built-in tool names, so `CodeExecution` works but `MultiEdit` errors: it normalizes to `multi_edit`, and the tool is called `multiedit`. Write `multiedit` or `edit_lines` as-is. Unknown names error out with the list of valid names. The edit plugin's sub-tools (`multiedit`, `edit_lines`, `insert_lines`) are valid names here even when disabled. Listing a disabled tool has no effect until you enable it in config.
+`--allowed-tools` / `--disallowed-tools` accept built-in, plugin and MCP tool names. PascalCase becomes snake_case (`CodeExecution` becomes `code_execution`). Names with underscores, dots or hyphens keep their spelling and case. Use the exact name for plugin sub-tools, such as `multiedit` or `edit_lines`.
+
+Maki retains names even if their tools have not loaded yet. This lets a filter apply to an MCP tool that connects later. After plugins load, Maki warns about names that do not match a loaded tool. This includes names reserved for MCP or session-local tools. Check the spelling if the tool should already be loaded. A name that never loads has no effect. Filters control both the advertised tools and dispatch, including calls through `batch`, `code_execution` and `maki.agent.call_tool`.
+
+Allow lists apply to built-in, plugin and MCP tools. Session-local tools, such as a task's `structured_output` and ACP client tools, remain available under an allow list. Deny lists and audience limits still apply to these local tools.
 
 ### Permission modes (SDK)
 
@@ -107,10 +115,11 @@ One spec per line, warnings on stderr. Built-in and script providers are listed 
 ```bash
 maki session list            # sessions for the current directory
 maki session list --global   # sessions from all projects
+maki session list --json     # machine-readable JSON array
 maki session delete <id>     # asks first, -f skips
 ```
 
-Prints stored sessions as a table (id, title, project directory with `$HOME` collapsed to `~`, last update as a relative age), newest first. A listed id works with `maki --resume <id>` to resume it. `delete` removes the session log along with its archives and index entries, and asks for confirmation first unless you pass `-f` / `--force`; without a terminal to ask on it refuses outright. A maki that already has the session open will not notice the delete and will lose the rest of that conversation, so close it first. Inside the TUI the same data lives behind `/sessions` (`Ctrl+P`), where `Ctrl+D` deletes.
+Prints stored sessions as a table (id, title, project directory with `$HOME` collapsed to `~`, last update as a relative age), newest first. `--json` prints one JSON array of the same summaries instead, for scripts. A listed id works with `maki --resume <id>` to resume it. `delete` removes the session log along with its archives and index entries, and asks for confirmation first unless you pass `-f` / `--force`; without a terminal to ask on it refuses outright. A maki that already has the session open will not notice the delete and will lose the rest of that conversation, so close it first. Inside the TUI the same data lives behind `/sessions` (`Ctrl+P`), where `Ctrl+D` deletes.
 
 ### `maki mcp`
 
@@ -138,10 +147,11 @@ Uses the same install locations as the install scripts.
 maki acp
 maki acp -m anthropic/claude-sonnet-4-6
 maki acp --yolo
+maki acp --thinking xhigh
 maki --no-jit acp
 ```
 
-Starts an [ACP](/docs/acp/) server on stdio for editors like Zed. Subcommand flags are only `-m` / `--model` and `--yolo`. Global flags like `--no-jit` must come before the subcommand.
+Starts an [ACP](/docs/acp/) server on stdio for editors like Zed. Subcommand flags are `-m` / `--model` and `--yolo`. Thinking flags work before or after `acp`. Other global flags like `--no-jit` must come before the subcommand.
 
 ### `maki index`
 

@@ -20,32 +20,26 @@ use crate::retry::RetryPolicy;
 pub(crate) mod anthropic;
 pub(crate) mod aperture;
 pub(crate) mod catalog;
+pub mod claude_code;
 pub(crate) mod codec;
 pub(crate) mod copilot;
 pub mod custom;
-pub(crate) mod deepseek;
 pub(crate) mod google;
 pub(crate) mod llama_cpp;
 pub(crate) mod local;
-pub(crate) mod mistral;
 pub(crate) mod oauth_loopback;
 pub(crate) mod ollama;
 pub(crate) mod openai;
 pub(crate) mod openai_compat;
 pub mod opencode;
-pub(crate) mod openrouter;
 pub mod plugin;
-pub(crate) mod regolo;
-pub(crate) mod requesty;
-pub(crate) mod synthetic;
-pub(crate) mod tensorx;
 pub(crate) mod xai;
 pub(crate) mod zai;
 
 const LOW_SPEED_BYTES_PER_SEC: u32 = 1;
 const UNMAPPED_SSE_ERROR_STATUS: u16 = 400;
 const EMPTY_SSE_ERROR_MESSAGE: &str = "provider sent an error frame with no detail";
-const UNAUTHORIZED_STATUS: u16 = 401;
+pub(crate) const UNAUTHORIZED_STATUS: u16 = 401;
 const AUTHORIZATION_HEADER: &str = "authorization";
 const BEARER_PREFIX: &str = "Bearer ";
 
@@ -130,6 +124,17 @@ pub(crate) fn refreshed_tokens(
     Ok(fresh)
 }
 
+/// Whether `held` must give way to the stored tokens: it expired, or a peer
+/// rotated, cleared or logged in. A stored copy older than `held` is a failed
+/// save whose refresh token may be spent, so it waits until `held` expires.
+pub(crate) fn needs_refresh(dir: &StateDir, provider: &str, held: Option<&OAuthTokens>) -> bool {
+    match (load_tokens(dir, provider), held) {
+        (Some(stored), Some(held)) => held.is_expired() || stored.expires > held.expires,
+        (None, None) => false,
+        _ => true,
+    }
+}
+
 #[derive(Clone)]
 pub struct ResolvedAuth {
     pub base_url: Option<String>,
@@ -138,6 +143,9 @@ pub struct ResolvedAuth {
     /// the provider sets afterwards, so a key rotation cannot drop a gateway
     /// credential that replaced the built-in auth header.
     config_headers: Vec<String>,
+    /// `[<slug>] top_p`, carried with the auth so whoever the slug's
+    /// credentials reach (aperture routes, catalog sub-providers) sends it.
+    pub top_p: Option<f64>,
 }
 
 impl ResolvedAuth {
@@ -150,9 +158,11 @@ impl ResolvedAuth {
             base_url: None,
             headers,
             config_headers: Vec::new(),
+            top_p: None,
         };
         if let Some(def) = maki_config::providers::ProvidersConfig::load().get(slug) {
             auth.apply_config_headers(slug, &def.headers)?;
+            auth.top_p = def.top_p;
         }
         Ok(auth)
     }
@@ -196,6 +206,7 @@ impl ResolvedAuth {
             base_url: None,
             headers: Vec::new(),
             config_headers: Vec::new(),
+            top_p: None,
         }
     }
 
@@ -251,6 +262,7 @@ impl ResolvedAuth {
             base_url,
             headers,
             config_headers: Vec::new(),
+            top_p: None,
         }
     }
 }
@@ -573,6 +585,9 @@ mod tests {
     const FRESH: &str = "fresh-access";
     const REFRESHED: &str = "refresh should have run";
     const NOT_REFRESHED: &str = "refresh should not have run";
+    const EXPIRED: u64 = 0;
+    const SOONER: u64 = u64::MAX - 1;
+    const LATER: u64 = u64::MAX;
 
     fn state_with_tokens(access: &str) -> TempDir {
         let dir = TempDir::new().expect("temp dir");
@@ -612,6 +627,33 @@ mod tests {
         let state = StateDir::from_path(dir.path().to_path_buf());
         let got = refreshed_tokens(&state, TEST_PROVIDER, rejected, fresh_tokens).expect("refresh");
         assert_eq!(got.access, expected, "{reason}");
+    }
+
+    #[test_case(Some(EXPIRED), Some(EXPIRED), true  ; "held_expired")]
+    #[test_case(Some(LATER),   Some(SOONER),  true  ; "peer_rotated")]
+    #[test_case(None,          Some(LATER),   true  ; "peer_cleared_the_tokens")]
+    #[test_case(Some(SOONER),  Some(LATER),   false ; "older_copy_after_failed_save")]
+    fn needs_refresh_tracks_peers_but_not_a_failed_save(
+        stored: Option<u64>,
+        held: Option<u64>,
+        expected: bool,
+    ) {
+        let dir = TempDir::new().expect("temp dir");
+        let state = StateDir::from_path(dir.path().to_path_buf());
+        let tokens = |access: &str, expires| OAuthTokens {
+            access: access.into(),
+            refresh: "refresh".into(),
+            expires,
+            account_id: None,
+        };
+        if let Some(expires) = stored {
+            save_tokens(&state, TEST_PROVIDER, &tokens(ON_DISK, expires)).expect("save tokens");
+        }
+        let held = held.map(|expires| tokens(FRESH, expires));
+        assert_eq!(
+            needs_refresh(&state, TEST_PROVIDER, held.as_ref()),
+            expected
+        );
     }
 
     // Codex only admits the overload in `code`, and anything we cannot place has to stay a plain

@@ -588,6 +588,7 @@ pub(crate) async fn parse_sse(
         },
         usage,
         stop_reason,
+        ..Default::default()
     })
 }
 
@@ -815,11 +816,7 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "tc_1".to_string(),
-                    content: "file.txt".to_string(),
-                    is_error: false,
-                }],
+                content: vec![ContentBlock::tool_result("tc_1", "file.txt", false)],
                 ..Default::default()
             },
         ];

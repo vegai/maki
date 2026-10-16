@@ -9,8 +9,8 @@ use std::time::Instant;
 
 use serde_json::Value;
 
-use super::CallOrigin;
 use super::registry::BoxFuture;
+use super::{CallOrigin, ToolOutputMode};
 use crate::cancel::CancelToken;
 use maki_config::Permission;
 
@@ -70,6 +70,7 @@ pub struct HookCall<'a> {
     pub input: Option<&'a Value>,
     pub session_id: Option<&'a str>,
     pub origin: CallOrigin,
+    pub output_mode: ToolOutputMode,
     pub authority: Authority,
     /// The call's own cancellation, so a hook that runs elsewhere (the Lua
     /// thread) dies with the call rather than outliving the reply channel.

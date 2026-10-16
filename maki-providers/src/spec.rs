@@ -1,5 +1,9 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use serde_json::{Map, Value};
+
+use maki_config::PROVIDER_BUILTINS;
 use maki_config::providers::{BuiltInProvider, Protocol, ProviderPlan};
 
 use crate::AgentError;
@@ -8,9 +12,8 @@ use crate::model::{ModelEntry, ModelFamily, ModelTier};
 use crate::pricing::PricingSchedule;
 use crate::provider::Provider;
 use crate::providers::{
-    ResolvedAuth, Timeouts, anthropic, aperture, copilot, custom, deepseek, google, llama_cpp,
-    mistral, ollama, openai, opencode, openrouter, plugin, regolo, requesty, synthetic, tensorx,
-    xai, zai,
+    ResolvedAuth, Timeouts, anthropic, aperture, claude_code, copilot, custom, google, llama_cpp,
+    ollama, openai, opencode, plugin, xai, zai,
 };
 
 /// The slugs a plugin may name as its `base`, in documentation order. A `base`
@@ -37,13 +40,14 @@ pub const GENERIC_DISCOVERY_NOTE: &str =
 
 /// Everything maki knows about one provider without asking the network.
 ///
-/// This struct is the checklist for adding a provider. Every field is
+/// This struct is the checklist for adding a native provider. Every field is
 /// mandatory in the literal, and that is the point: there is deliberately no
 /// `Default`, no `#[non_exhaustive]`, and no row uses `..`, so adding a field
 /// here breaks every row until someone answers for each one.
 ///
 /// The checklist is two files: this row, and `models/<slug>.toml` next to it
-/// carrying the provider's curated table.
+/// carrying the provider's curated table. A Lua plugin provider gets one of
+/// these built from its declaration instead, see [`plugin::spec`].
 #[derive(Debug)]
 pub struct ProviderSpec {
     pub slug: &'static str,
@@ -52,18 +56,33 @@ pub struct ProviderSpec {
 
     pub family: ModelFamily,
     pub supports_thinking: bool,
+    /// The endpoint honours `defer_loading` and expands `tool_reference`
+    /// blocks. A property of the backend, not the protocol, so a slug that
+    /// borrows this row's protocol does not inherit it; see
+    /// [`crate::Model::supports_deferred_tools`].
+    pub supports_deferred_tools: bool,
+    /// A transport can reject images even when its model metadata supports vision.
+    pub accepts_images: bool,
     pub accepts_arbitrary_models: bool,
     pub fallback_max_output: Option<u32>,
     pub fallback_context_window: u32,
     /// This provider's curated table, embedded from `models/<slug>.toml`. Read
     /// it through [`ProviderSpec::models`], which serves the parsed rows.
     /// [`NO_CURATED_MODELS`] for a provider whose ids all come from a live
-    /// catalog.
+    /// catalog, and for a declaration, which carries its rows on
+    /// [`Build::Declared`].
     pub models_toml: &'static str,
+    /// The builtin whose models this provider runs under another slug, as
+    /// claude-code runs the Anthropic models through the `claude` CLI. That
+    /// builtin's curated table and models.dev entries describe these models,
+    /// and `models_toml` is [`NO_CURATED_MODELS`].
+    pub models_of: Option<&'static str>,
     /// Set by the providers whose rates move with the wall clock, so the hours
     /// sit next to the prices they scale. Everyone else bills flat.
     pub pricing_schedule: Option<&'static PricingSchedule>,
 
+    /// Plugin that enables and configures this native provider.
+    pub plugin: Option<PluginBinding>,
     pub build: Build,
     /// `Some` iff Aperture can proxy onto this provider. Lives on the spec, not
     /// on [`Native`], so the route survives a provider losing its bespoke impl.
@@ -73,6 +92,12 @@ pub struct ProviderSpec {
     /// see [`ProviderSpec::config_row`].
     pub login: Option<LoginConfig>,
     pub docs: GeneratedDocs,
+}
+
+#[derive(Debug)]
+pub struct PluginBinding {
+    pub name: &'static str,
+    pub configure: fn(Option<&Map<String, Value>>),
 }
 
 /// For a provider whose ids all come from a live catalog.
@@ -89,8 +114,8 @@ pub type WithAuthFn = fn(Arc<Mutex<ResolvedAuth>>, Timeouts, Option<String>) -> 
 pub enum Build {
     /// A bespoke `impl Provider`.
     Native(Native),
-    /// A declaration a bundled plugin registers, claiming this row.
-    Declared,
+    /// A Lua plugin's declaration, with the model rows it states.
+    Declared(&'static [ModelEntry]),
     /// `catalog::try_create`, out of models.dev. The row carries metadata only.
     Catalog,
 }
@@ -101,8 +126,10 @@ pub struct Native {
     /// Built from config and env by maki itself.
     pub new: NewFn,
     /// Build against auth someone else resolved. Used by plugin providers
-    /// that extend a base slug and by Aperture's gateway routing.
-    pub with_auth: WithAuthFn,
+    /// that extend a base slug and by Aperture's gateway routing. `None` for a
+    /// provider that manages its own login, which no plugin or gateway can
+    /// replace.
+    pub with_auth: Option<WithAuthFn>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -160,20 +187,32 @@ pub enum CatalogDoc {
 impl ProviderSpec {
     /// The one way to reach this provider's curated table.
     pub fn models(&self) -> &'static [ModelEntry] {
-        manifest::table(self.slug)
+        match self.build {
+            Build::Declared(models) => models,
+            Build::Native(_) | Build::Catalog => manifest::table(self.models_slug()),
+        }
+    }
+
+    /// The slug whose curated table and models.dev entries describe this
+    /// provider's models.
+    pub fn models_slug(&self) -> &'static str {
+        self.models_of.unwrap_or(self.slug)
+    }
+
+    /// A source provider's table can contain models unavailable on this route. Leave
+    /// discovery to the route provider.
+    pub fn listed_rows(&self) -> &'static [ModelEntry] {
+        match self.models_of {
+            Some(_) => &[],
+            None => self.models(),
+        }
     }
 
     pub const fn native(&self) -> Option<Native> {
         match self.build {
             Build::Native(native) => Some(native),
-            Build::Declared | Build::Catalog => None,
+            Build::Declared(_) | Build::Catalog => None,
         }
-    }
-
-    /// Whether this provider has a bespoke `impl Provider`, as opposed to a
-    /// declaration or a models.dev catalog entry.
-    pub const fn is_native(&self) -> bool {
-        self.native().is_some()
     }
 
     /// The `maki-config` view of this provider, derived. Const-panics for a
@@ -187,7 +226,7 @@ impl ProviderSpec {
                 default_api_key_env: self.api_key_env,
                 protocol: login.protocol,
                 default_base_url: login.default_base_url,
-                default_model: login.default_model,
+                default_model: Some(login.default_model),
                 plans: login.plans,
                 login_url: login.login_url,
                 needs_url: login.needs_url,
@@ -210,41 +249,64 @@ const BUILTINS: &[ProviderSpec] = &[
     copilot::SPEC,
     ollama::SPEC,
     llama_cpp::SPEC,
-    mistral::SPEC,
     zai::SPEC,
-    deepseek::SPEC,
-    openrouter::SPEC,
-    requesty::SPEC,
-    synthetic::SPEC,
-    regolo::SPEC,
-    tensorx::SPEC,
     opencode::ZEN_SPEC,
     xai::SPEC,
     aperture::SPEC,
     opencode::GO_SPEC,
+    claude_code::SPEC,
 ];
 
 pub struct ProviderRegistry;
 
 impl ProviderRegistry {
-    pub fn get(slug: &str) -> Option<&'static ProviderSpec> {
-        BUILTINS.iter().find(|s| s.slug == slug)
+    pub fn configure_plugins(loaded: &[String], options: &HashMap<String, Map<String, Value>>) {
+        let empty = Map::new();
+        for binding in BUILTINS.iter().filter_map(|spec| spec.plugin.as_ref()) {
+            let config = loaded
+                .iter()
+                .any(|name| name == binding.name)
+                .then(|| options.get(binding.name).unwrap_or(&empty));
+            (binding.configure)(config);
+        }
     }
 
-    /// Like `get`, but a plugin or `providers.toml` slug resolves to its base
+    /// The row that describes `slug` itself: compiled in, or built from a
+    /// plugin's declaration. The one to reach for unless plugin providers
+    /// must be left out on purpose, see [`Self::compiled`].
+    pub fn get(slug: &str) -> Option<&'static ProviderSpec> {
+        Self::compiled(slug).or_else(|| plugin::spec(slug))
+    }
+
+    /// Like [`Self::get`], but a `providers.toml` slug resolves to its base
     /// provider's spec, so thinking support, display name and tier defaults
     /// still answer for a stub that declares no models.
     ///
-    /// Both fallbacks resolve through [`Self::get`], never back through here,
-    /// so the lookup cannot recurse.
+    /// The fallback resolves through [`Self::compiled`], never back through
+    /// here, so the lookup cannot recurse.
     pub fn for_slug(slug: &str) -> Option<&'static ProviderSpec> {
-        Self::get(slug)
-            .or_else(|| plugin::base_for_slug(slug))
-            .or_else(|| custom::base_spec(slug))
+        Self::get(slug).or_else(|| custom::base_spec(slug))
     }
 
-    pub fn builtins() -> &'static [ProviderSpec] {
+    /// Every row [`Self::get`] answers for: the compiled-in ones in their
+    /// order, then the plugin providers by slug.
+    pub fn all() -> Vec<&'static ProviderSpec> {
+        BUILTINS.iter().chain(plugin::specs()).collect()
+    }
+
+    /// A row compiled into this binary, never a plugin's.
+    pub fn compiled(slug: &str) -> Option<&'static ProviderSpec> {
+        BUILTINS.iter().find(|s| s.slug == slug)
+    }
+
+    pub fn all_compiled() -> &'static [ProviderSpec] {
         BUILTINS
+    }
+
+    /// Whether maki ships `slug`, compiled in or as a bundled plugin, loaded
+    /// or not. Such a slug is never a third party's to take.
+    pub fn is_shipped(slug: &str) -> bool {
+        Self::compiled(slug).is_some() || PROVIDER_BUILTINS.contains(&slug)
     }
 
     pub fn find_default_for_tier(slug: &str, tier: ModelTier) -> Option<&'static ModelEntry> {
@@ -262,7 +324,7 @@ impl ProviderRegistry {
 /// knows about a slug: a catalog-backed builtin has a spec row and is still
 /// `Catalog` here.
 pub enum Owner {
-    /// A registered declaration.
+    /// A selected or registered declaration.
     Plugin,
     /// Carries the constructor rather than the spec, so "builtin" and
     /// "buildable" cannot come apart.
@@ -276,13 +338,12 @@ pub enum Owner {
 
 impl Owner {
     pub fn of(slug: &str) -> Self {
-        // A declaration answers first, built-in row or not: once a slug has
-        // one, that is what builds it. A provider still on a bespoke `native`
-        // impl keeps its old path, which is how the ports land one at a time.
-        if plugin::is_registered(slug) {
+        // Registration refuses a built-in slug, so a declaration never
+        // shadows a row below.
+        if plugin::owns_slug(slug) {
             return Self::Plugin;
         }
-        let builtin = ProviderRegistry::get(slug);
+        let builtin = ProviderRegistry::compiled(slug);
         if let Some(native) = builtin.and_then(ProviderSpec::native) {
             return Self::Builtin(native.new);
         }
@@ -306,16 +367,14 @@ mod tests {
     /// is only the right filter while the registry is exactly what maki builds
     /// plus what it deliberately reads from the catalog. A duplicate slug would
     /// vanish into the set, so count before comparing.
-    ///
-    /// That a [`Build::Declared`] row really has a bundled plugin claiming it
-    /// is `maki-lua`'s to prove, since only it can load one.
     #[test]
-    fn builtins_are_the_native_declared_and_catalog_backed_slugs() {
+    fn builtins_are_the_native_and_catalog_backed_slugs() {
         let registry: HashSet<&str> = BUILTINS.iter().map(|s| s.slug).collect();
         assert_eq!(registry.len(), BUILTINS.len(), "duplicate slug in BUILTINS");
         for spec in BUILTINS {
             let built = match spec.build {
-                Build::Native(_) | Build::Declared => true,
+                Build::Native(_) => true,
+                Build::Declared(_) => false,
                 Build::Catalog => CATALOG_BACKED_BUILTINS.contains(&spec.slug),
             };
             assert!(built, "nothing builds {}", spec.slug);
@@ -327,11 +386,15 @@ mod tests {
 
     /// A `base` borrows a native constructor, so a slug on the list that lost
     /// its `impl Provider` would pass registration and fail every `create`.
+    /// A native row without `with_auth` fails the same way.
     #[test]
     fn every_base_is_a_native_builtin() {
         for base in BASES {
-            let spec = ProviderRegistry::get(base);
-            assert!(spec.is_some_and(ProviderSpec::is_native), "{base}");
+            let native = ProviderRegistry::get(base).and_then(ProviderSpec::native);
+            assert!(
+                native.is_some_and(|native| native.with_auth.is_some()),
+                "{base}"
+            );
         }
     }
 
@@ -356,12 +419,42 @@ mod tests {
         }
     }
 
+    /// Aperture reaches a native provider through `with_auth`, with the
+    /// gateway's auth, so a native row with a route needs `with_auth`.
+    #[test]
+    fn an_aperture_route_on_a_native_row_comes_with_with_auth() {
+        for spec in BUILTINS.iter().filter(|spec| spec.aperture.is_some()) {
+            assert!(
+                spec.native()
+                    .is_none_or(|native| native.with_auth.is_some()),
+                "{} has an Aperture route but no with_auth",
+                spec.slug
+            );
+        }
+    }
+
     /// A malformed table is a runtime panic now, not a compile error, so this
     /// forces every one of them in CI. Never `#[ignore]` it.
     #[test]
     fn every_builtin_model_table_parses() {
         for spec in BUILTINS {
             spec.models();
+        }
+    }
+
+    /// A provider running another provider's models has no table of its own.
+    /// It borrows a builtin's table and lists only the models it offers.
+    #[test]
+    fn a_provider_running_anothers_models_borrows_a_real_table() {
+        for spec in BUILTINS {
+            let Some(of) = spec.models_of else { continue };
+            let slug = spec.slug;
+            assert!(
+                ProviderRegistry::get(of).is_some(),
+                "{slug} runs {of}, no builtin"
+            );
+            assert_eq!(spec.models_toml, NO_CURATED_MODELS, "{slug}");
+            assert!(!spec.models().is_empty(), "{slug} reads no rows of {of}");
         }
     }
 

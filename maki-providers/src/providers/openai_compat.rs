@@ -12,11 +12,15 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use super::ResolvedAuth;
+use crate::model::ModelFamily;
+use crate::types::rejects_sampling;
 use crate::{
-    AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse, TokenUsage,
+    AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
+    ThinkingConfig, TokenUsage,
 };
 
 const STREAM_DONE: &str = "[DONE]";
+const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 /// `tool_calls[].index` comes straight off the wire; a bogus huge value must
 /// not size the accumulator vec.
 const MAX_TOOL_CALLS_PER_MESSAGE: usize = 512;
@@ -158,6 +162,8 @@ impl OpenAiCompatProvider {
         messages: &[Message],
         system: &str,
         tools: &Value,
+        thinking: ThinkingConfig,
+        top_p: Option<f64>,
     ) -> Value {
         let wire_messages = convert_messages(messages, system);
         let wire_tools = convert_tools(tools);
@@ -167,6 +173,16 @@ impl OpenAiCompatProvider {
             "messages": wire_messages,
             "stream": true,
         });
+        // OpenAI's reasoning models reject `top_p` whenever reasoning effort
+        // is set. Everyone else (deepseek, glm, grok, llama.cpp) takes it
+        // alongside thinking, so only the GPT family is gated. A gateway
+        // serving recent Claude passes the 400 through.
+        if let Some(top_p) = top_p
+            && !(thinking.is_enabled() && model.family == ModelFamily::Gpt)
+            && !rejects_sampling(&model.id)
+        {
+            body["top_p"] = json!(top_p);
+        }
         if let Some(max_output) = model.output_tokens() {
             body[&*self.config.max_tokens_field] = json!(max_output);
         }
@@ -183,12 +199,12 @@ impl OpenAiCompatProvider {
     /// wins, then the construction-time env / `providers.toml` override, then
     /// the static compat default.
     pub(crate) fn base_url(&self, auth: &ResolvedAuth) -> String {
-        if let Some(explicit) = auth.base_url.as_deref() {
-            return explicit.to_string();
-        }
-        self.resolved_base_url
-            .clone()
-            .unwrap_or_else(|| self.config.base_url.to_string())
+        auth.base_url
+            .as_deref()
+            .or(self.resolved_base_url.as_deref())
+            .unwrap_or(&self.config.base_url)
+            .trim_end_matches('/')
+            .to_owned()
     }
 
     fn build_request(
@@ -220,7 +236,7 @@ impl OpenAiCompatProvider {
     ) -> Result<StreamResponse, AgentError> {
         let json_body = serde_json::to_vec(body)?;
         let mut request = self
-            .build_request("POST", "/chat/completions", auth)
+            .build_request("POST", CHAT_COMPLETIONS_PATH, auth)
             .header("content-type", "application/json");
         for &(key, value) in extra_headers {
             if request
@@ -802,6 +818,7 @@ pub async fn parse_sse(
         },
         usage,
         stop_reason,
+        ..Default::default()
     })
 }
 
@@ -809,9 +826,26 @@ pub async fn parse_sse(
 mod tests {
     use super::*;
     use futures_lite::io::Cursor;
+    use std::sync::Arc;
     use test_case::test_case;
 
+    use crate::model::{Model, ModelPricing, ModelTier};
+    use crate::test_support::{Canned, serve};
+
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+    const TEST_BASE_URL: &str = "https://example.test/v1";
+    const FIREWORKS_BASE_URL: &str = "https://api.fireworks.ai/inference/v1";
+    const FIREWORKS_BASE_URL_TRAILING_SLASH: &str = "https://api.fireworks.ai/inference/v1/";
+    const TEST_MODEL_ID: &str = "test-model";
+    const MODELS_ROUTE: &str = "/v1/models";
+    const CHAT_COMPLETIONS_ROUTE: &str = "/v1/chat/completions";
+    const URL_JOIN_RESPONSES: &[Canned] = &[
+        Canned::at(
+            MODELS_ROUTE,
+            Canned::json(200, r#"{"data":[{"id":"test-model"}]}"#),
+        ),
+        Canned::at(CHAT_COMPLETIONS_ROUTE, Canned::sse("data: [DONE]\n\n")),
+    ];
     const COUNTS_SURVIVE_A_BAD_COST: &str =
         "a price we cannot read must not take the token counts down with it";
     const TOOL_NAME: &str = "word_count";
@@ -980,7 +1014,7 @@ data: [DONE]\n";
                     ProviderEvent::ThinkingDelta { text } => thinking.push(text),
                     ProviderEvent::TextDelta { text } => text_deltas.push(text),
                     ProviderEvent::ToolUseStart { .. } => {}
-                    ProviderEvent::PromptProgress { .. } => {}
+                    ProviderEvent::PromptProgress { .. } | ProviderEvent::Waiting { .. } => {}
                 }
             }
             assert_eq!(thinking, vec!["Let me think", "..."]);
@@ -1022,11 +1056,7 @@ data: [DONE]\n";
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "tc_1".to_string(),
-                    content: "file.txt".to_string(),
-                    is_error: false,
-                }],
+                content: vec![ContentBlock::tool_result("tc_1", "file.txt", false)],
                 ..Default::default()
             },
         ];
@@ -1316,11 +1346,7 @@ data: [DONE]\n";
         let msgs = vec![Message {
             role: Role::User,
             content: vec![
-                ContentBlock::ToolResult {
-                    tool_use_id: "t1".into(),
-                    content: "[image: pic.png 1KB]".into(),
-                    is_error: false,
-                },
+                ContentBlock::tool_result("t1", "[image: pic.png 1KB]", false),
                 ContentBlock::Image {
                     source: ImageSource::new(ImageMediaType::Png, Arc::from("abc123")),
                 },
@@ -1434,5 +1460,137 @@ data: [DONE]\n";
             assert_eq!(text_deltas, vec!["Hello"]);
             assert_eq!(thinking_deltas, vec!["Let me think", "..."]);
         })
+    }
+
+    static TEST_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
+        slug: Cow::Borrowed("top-p-test"),
+        api_key_env: Cow::Borrowed(""),
+        base_url: Cow::Borrowed(TEST_BASE_URL),
+        max_tokens_field: Cow::Borrowed(DEFAULT_MAX_TOKENS_FIELD),
+        include_stream_usage: true,
+        provider_name: Cow::Borrowed("test"),
+    };
+
+    fn test_model(family: ModelFamily) -> Model {
+        Model {
+            id: TEST_MODEL_ID.into(),
+            provider: Arc::<str>::from("test"),
+            tier: ModelTier::Medium,
+            family,
+            supports_tool_examples_override: None,
+            thinking_override: None,
+            supports_vision_override: None,
+            supports_fast_override: None,
+            pricing: ModelPricing::default(),
+            subsidised_by: None,
+            discovered_free: false,
+            max_output_tokens: Some(8192),
+            turn_output_tokens: None,
+            context_window: 131_072,
+            thinking_fields: None,
+        }
+    }
+
+    fn test_provider() -> OpenAiCompatProvider {
+        OpenAiCompatProvider {
+            client: super::super::http_client(super::super::Timeouts::default()),
+            config: Cow::Borrowed(&TEST_CONFIG),
+            stream_timeout: TEST_STREAM_TIMEOUT,
+            resolved_base_url: None,
+        }
+    }
+
+    #[test_case(FIREWORKS_BASE_URL, None, None ; "without_trailing_slash")]
+    #[test_case(FIREWORKS_BASE_URL_TRAILING_SLASH, None, None ; "declared_trailing_slash")]
+    #[test_case(TEST_BASE_URL, Some(FIREWORKS_BASE_URL_TRAILING_SLASH), None ; "configured_trailing_slash")]
+    #[test_case(TEST_BASE_URL, Some(TEST_BASE_URL), Some(FIREWORKS_BASE_URL_TRAILING_SLASH) ; "auth_trailing_slash")]
+    fn request_urls_join_base_url(
+        declared: &str,
+        configured: Option<&str>,
+        explicit: Option<&str>,
+    ) {
+        let mut provider = test_provider();
+        provider.config.to_mut().base_url = Cow::Owned(declared.to_owned());
+        provider.resolved_base_url = configured.map(str::to_owned);
+        let auth = ResolvedAuth::withheld().with_base_url(explicit.map(str::to_owned));
+
+        for path in [CHAT_COMPLETIONS_PATH, MODELS_PATH] {
+            let request = provider
+                .build_request("POST", path, &auth)
+                .body(())
+                .unwrap();
+            assert_eq!(
+                request.uri().to_string(),
+                format!("{FIREWORKS_BASE_URL}{path}")
+            );
+        }
+    }
+
+    #[test_case("" ; "without_trailing_slash")]
+    #[test_case("/" ; "with_trailing_slash")]
+    fn stream_and_model_listing_join_base_url(suffix: &str) {
+        smol::block_on(async {
+            let (base_url, requests) = serve(URL_JOIN_RESPONSES);
+            let auth = ResolvedAuth::withheld().with_base_url(Some(format!("{base_url}{suffix}")));
+            let provider = test_provider();
+
+            let models = provider.do_list_models(&auth).await.unwrap();
+            assert_eq!(models.len(), 1);
+            assert_eq!(models[0].id, TEST_MODEL_ID);
+
+            let (event_tx, _) = flume::unbounded();
+            provider
+                .do_stream(
+                    &test_model(ModelFamily::Generic),
+                    &[],
+                    &json!({}),
+                    &event_tx,
+                    &auth,
+                )
+                .await
+                .unwrap();
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests[0].path, MODELS_ROUTE);
+            assert_eq!(requests[1].path, CHAT_COMPLETIONS_ROUTE);
+        });
+    }
+
+    #[test_case("test-model", ModelFamily::Gpt, ThinkingConfig::Off, true ; "gpt_off_sends")]
+    #[test_case("test-model", ModelFamily::Gpt, ThinkingConfig::Adaptive, false ; "gpt_thinking_omits")]
+    #[test_case("test-model", ModelFamily::Generic, ThinkingConfig::Adaptive, true ; "generic_thinking_sends")]
+    #[test_case("test-model", ModelFamily::Glm, ThinkingConfig::Effort(crate::Effort::High), true ; "glm_effort_sends")]
+    #[test_case("anthropic/claude-opus-4-7", ModelFamily::Generic, ThinkingConfig::Off, false ; "gateway_adaptive_only_claude_omits")]
+    fn build_body_top_p_gated(
+        model_id: &str,
+        family: ModelFamily,
+        thinking: ThinkingConfig,
+        sent: bool,
+    ) {
+        let model = Model {
+            id: model_id.into(),
+            ..test_model(family)
+        };
+        let body = test_provider().build_body(
+            &model,
+            &[Message::user("hi".into())],
+            "",
+            &json!([]),
+            thinking,
+            Some(0.8),
+        );
+        assert_eq!(body.get("top_p") == Some(&json!(0.8)), sent);
+    }
+
+    #[test]
+    fn build_body_omits_top_p_when_unset() {
+        let body = test_provider().build_body(
+            &test_model(ModelFamily::Generic),
+            &[Message::user("hi".into())],
+            "",
+            &json!([]),
+            ThinkingConfig::Off,
+            None,
+        );
+        assert!(body.get("top_p").is_none());
     }
 }

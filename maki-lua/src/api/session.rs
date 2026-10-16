@@ -12,7 +12,8 @@ use serde_json::json;
 
 use crate::api::util::command::{SessionRequest, UiAction, ui_json_roundtrip, ui_roundtrip};
 use crate::api::util::convert::json_to_lua;
-use crate::api::util::pair::{Pair, err_pair, try_pair};
+use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
+use crate::plugin_permissions::{Permission, PluginPermissions, denied_error};
 
 /// Answers `maki.session.read` for a driver that has no UI to ask. Takes the
 /// optional session id from Lua and returns a serialized
@@ -26,6 +27,23 @@ const BLANK_NOTIFY_ERR: &str = "text must not be blank";
 const SESSION_REQUIRED_ERR: &str = "session is required";
 const NOT_LIVE_ERR: &str = "session not live";
 const NO_FOCUSED_ERR: &str = "no focused session";
+
+pub(crate) fn not_live(session: MakiId) -> String {
+    format!("{NOT_LIVE_ERR}: {session}")
+}
+
+/// Some calls must name their session. Falling back to the focused tab would
+/// make them follow the user from tab to tab.
+pub(crate) fn required_session(opts: Option<&Table>) -> LuaResult<Result<MakiId, String>> {
+    let Some(raw) = opts
+        .map(|t| t.get::<Option<String>>("session"))
+        .transpose()?
+        .flatten()
+    else {
+        return Ok(Err(SESSION_REQUIRED_ERR.to_owned()));
+    };
+    Ok(raw.parse::<MakiId>().map_err(|e| e.to_string()))
+}
 
 async fn roundtrip(
     lua: Lua,
@@ -160,6 +178,7 @@ fn block_json(block: &ContentBlock) -> Option<serde_json::Value> {
             tool_use_id,
             content,
             is_error,
+            ..
         } => json!({
             "type": "tool_result",
             "tool_use_id": tool_use_id,
@@ -181,7 +200,7 @@ fn message_json(message: &Message) -> serde_json::Value {
             Role::User => "user",
             Role::Assistant => "assistant",
         },
-        "kind": message.kind,
+        "kind": <&'static str>::from(&message.kind),
         "hidden": message.display_text.as_deref() == Some(""),
         "content": content,
     })
@@ -191,10 +210,12 @@ fn message_json(message: &Message) -> serde_json::Value {
 /// been sent so far, tool calls and results included. Read only.
 ///
 /// Each message is `{ role, kind, hidden, content }`. `role` is `"user"` or
-/// `"assistant"`. `kind` is `"turn"` for something the user or the model said
-/// and `"observation"` for a report sent to the model as a user message, like
-/// `maki.session.notify`. `hidden` marks a message only the model sees, such
-/// as a nudge or a compaction note. `content` lists blocks:
+/// `"assistant"`. `kind` is `"turn"` for something the user or the model said,
+/// `"observation"` for a report sent to the model as a user message, like
+/// `maki.session.notify`, and `"context_update"` for a change since the
+/// system prompt was built (date, model, plan mode, ...). `hidden` marks a
+/// message only the model sees, such as a nudge or a compaction note.
+/// `content` lists blocks:
 ///
 /// ```text
 /// { type = "text", text }
@@ -237,7 +258,7 @@ async fn messages(
     };
     let session: MakiId = try_pair!(raw.parse());
     let Some(history) = live_history(session) else {
-        return Ok(err_pair(format!("{NOT_LIVE_ERR}: {session}")));
+        return Ok(err_pair(not_live(session)));
     };
     let skip = last.map_or(0, |n| history.len().saturating_sub(n));
     let out = lua.create_table()?;
@@ -247,14 +268,15 @@ async fn messages(
     Ok((Some(out), None))
 }
 
-/// Returns the id of the currently focused session.
+/// Returns the id of the focused session. Under `maki -p` and the sdk,
+/// that is the one session they run.
 ///
 /// @return (string|nil, string|nil) Session id, or nil and an error.
 /// @example
 /// local id = maki.session.current()
 #[lua_fn]
-async fn current(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
-    roundtrip(lua, tx, SessionRequest::Current).await
+async fn current(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<String>> {
+    Ok(pair(focused_session(&lua, tx.as_ref()).await))
 }
 
 /// Switches the UI to the session with {id}.
@@ -290,8 +312,10 @@ async fn delete(
 
 /// Starts a new session in the current project.
 ///
-/// @param opts table? Optional fields: prompt (string) first user message
-///   to submit right away; focus (boolean) switch the UI to the new session.
+/// @param opts table? Optional fields:
+///   `prompt` (string) first user message to submit right away. Needs the
+///     `agent` permission.
+///   `focus` (boolean) switch the UI to the new session.
 /// @return (string|nil, string|nil) New session id, or nil and an error.
 /// @example
 /// local id, err = maki.session.new({ prompt = "fix the tests", focus = true })
@@ -299,12 +323,16 @@ async fn delete(
 async fn new(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] may_run_agents: bool,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
-    let (prompt, focus) = match opts {
+    let (prompt, focus): (Option<String>, bool) = match opts {
         Some(opts) => (opts.get("prompt")?, opts.get("focus").unwrap_or(false)),
         None => (None, false),
     };
+    if prompt.is_some() && !may_run_agents {
+        return Err(denied_error(Permission::Agent));
+    }
     roundtrip(lua, tx, SessionRequest::New { prompt, focus }).await
 }
 
@@ -319,7 +347,7 @@ async fn new(
 /// @return (string|nil, string|nil) "started" or "queued", or nil and an error.
 /// @example
 /// local state, err = maki.session.prompt("run the tests", { session = id })
-#[lua_fn]
+#[lua_fn(guard = Agent)]
 async fn prompt(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
@@ -339,26 +367,29 @@ async fn prompt(
 /// @param text string What to report. Must not be blank.
 /// @param opts table Options:
 ///   `session` (string) id of a live session.
-///   `wake` (boolean) start a TUI turn when it next becomes idle (default false).
+///   `wake` (boolean) start a TUI turn when it next becomes idle (default
+///     false). Needs the `agent` permission.
 /// @return (boolean|nil, string|nil) true, or nil and an error.
 /// @example
 /// maki.session.notify("[monitor] deploy failed", { session = id, wake = true })
 #[lua_fn]
-fn notify(_lua: &Lua, text: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
+fn notify(
+    _lua: &Lua,
+    #[ctx] may_run_agents: bool,
+    text: String,
+    opts: Option<Table>,
+) -> LuaResult<Pair<bool>> {
+    let wake = opts
+        .as_ref()
+        .and_then(|t| t.get("wake").ok())
+        .unwrap_or(false);
+    if wake && !may_run_agents {
+        return Err(denied_error(Permission::Agent));
+    }
     if text.trim().is_empty() {
         return Ok(err_pair(BLANK_NOTIFY_ERR));
     }
-    let Some(opts) = opts else {
-        return Ok(err_pair(SESSION_REQUIRED_ERR));
-    };
-    let Some(raw_id) = opts.get::<Option<String>>("session")? else {
-        return Ok(err_pair(SESSION_REQUIRED_ERR));
-    };
-    let session_id: MakiId = match raw_id.parse() {
-        Ok(id) => id,
-        Err(error) => return Ok(err_pair(error)),
-    };
-    let wake = opts.get("wake").unwrap_or(false);
+    let session_id = try_pair!(required_session(opts.as_ref())?);
     if let Err(error) = SessionMailbox::notify(session_id, text, wake) {
         return Ok(err_pair(error));
     }
@@ -414,12 +445,20 @@ async fn set_title(
 
 lua_table! {
     /// Host session primitives. The interactive UI can run several sessions
-    /// at once; these functions let plugins list, create, focus, rename, and
-    /// delete them. Session management returns `nil, "no interactive UI
-    /// attached"` without a UI. `notify` instead targets a live agent mailbox
-    /// directly, so it also works under ACP and SDK frontends.
-    "maki.session" => pub(crate) fn create_session_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [list(tx), live(tx), current(tx), read(tx), messages(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), set_mode(tx), set_title(tx)]
+    /// at once. These functions list, create, focus, rename, and delete them.
+    ///
+    /// Without a UI, most functions return `nil, "no interactive UI attached"`.
+    /// `current` and `read` still work under `maki -p` and the sdk.
+    /// `messages` and `notify` work everywhere, ACP included.
+    "maki.session" => pub(crate) fn create_session_table(
+        tx: Option<flume::Sender<UiAction>>,
+        perms: &PluginPermissions,
+        may_run_agents: bool,
+    ),
+    DOCS [
+        list(tx), live(tx), current(tx), read(tx), messages(tx), focus(tx), delete(tx),
+        new(tx, may_run_agents), prompt(perms, tx), notify(may_run_agents), set_mode(tx), set_title(tx),
+    ]
 }
 
 #[cfg(test)]
@@ -448,7 +487,7 @@ mod tests {
 
     fn lua_with_session(tx: Option<flume::Sender<UiAction>>) -> Lua {
         let lua = Lua::new();
-        let t = create_session_table(&lua, tx).unwrap();
+        let t = create_session_table(&lua, tx, &PluginPermissions::trusted(), true).unwrap();
         lua.globals().set("session", t).unwrap();
         lua
     }
@@ -687,6 +726,17 @@ mod tests {
 
     #[test_case(headless_focused_on ; "headless_snapshot_id")]
     #[test_case(ui_focused_on ; "ui_current_bare_id")]
+    fn current_names_the_focused_session(focused_on: fn(MakiId) -> Lua) {
+        let id = MakiId::generate();
+        let lua = focused_on(id);
+        let (got, err): (Option<String>, Option<String>) =
+            smol::block_on(lua.load("return session.current()").eval_async()).unwrap();
+        assert_eq!(err, None);
+        assert_eq!(got, Some(id.to_string()));
+    }
+
+    #[test_case(headless_focused_on ; "headless_snapshot_id")]
+    #[test_case(ui_focused_on ; "ui_current_bare_id")]
     fn messages_defaults_to_the_focused_session(focused_on: fn(MakiId) -> Lua) {
         let id = MakiId::generate();
         let _history = live(id, vec![Message::user(FOCUSED_TEXT.into())]);
@@ -732,7 +782,7 @@ mod tests {
         ; "tool_use_keeps_id_name_and_input"
     )]
     #[test_case(
-        ContentBlock::ToolResult { tool_use_id: TOOL_ID.into(), content: TOOL_OUTPUT.into(), is_error: true },
+        ContentBlock::tool_result(TOOL_ID, TOOL_OUTPUT, true),
         Some(json!({ "type": "tool_result", "tool_use_id": TOOL_ID, "content": TOOL_OUTPUT, "is_error": true }))
         ; "tool_result_keeps_id_content_and_error_flag"
     )]
@@ -758,6 +808,7 @@ mod tests {
     #[test_case(Role::User, MessageKind::Turn, None, "user", "turn", false ; "user_turn_is_visible")]
     #[test_case(Role::User, MessageKind::Observation, Some(""), "user", "observation", true ; "blank_display_text_is_hidden")]
     #[test_case(Role::Assistant, MessageKind::Turn, Some(TEXT), "assistant", "turn", false ; "display_text_with_content_is_visible")]
+    #[test_case(Role::User, MessageKind::ContextUpdate(Default::default()), Some(TEXT), "user", "context_update", false ; "context_update_kind_is_a_plain_name")]
     fn message_json_reports_role_kind_and_hidden(
         role: Role,
         kind: MessageKind,

@@ -17,17 +17,38 @@ use maki_providers::model::Model;
 use maki_storage::StateDir;
 use maki_ui::{OpenSession, RunOutcome};
 
-use crate::cli::{Cli, normalize_tool_name};
+use crate::cli::Cli;
 use crate::provider_scripts;
 use crate::resume::{self, Resolved};
 use crate::setup;
+use maki_agent::mcp::{is_qualified_name, is_wire_name};
 
 const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
-const STALE_PROJECT_CONFIG: &str = ".maki/config.toml";
-const STALE_GLOBAL_CONFIG: &str = "config.toml";
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
 const MODEL_FALLBACK_WARNING: &str = "model resolution failed, keeping previous model";
 const POLICY_GRANT_NOTICE: &str = "folder trusted by trust.paths pattern";
+
+fn tool_filter_warnings(cli: &Cli, registry: &ToolRegistry) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (flag, names) in [
+        ("--allowed-tools", &cli.allowed_tools),
+        ("--disallowed-tools", &cli.disallowed_tools),
+    ] {
+        for name in names {
+            if registry.get(name).is_some() || is_wire_name(name) || is_qualified_name(name) {
+                continue;
+            }
+            let mut warning = format!("no loaded tool matches '{name}' in {flag}.");
+            let suggestion = name.replace('-', "_");
+            if suggestion != *name && registry.get(&suggestion).is_some() {
+                warning.push_str(&format!(" Did you mean '{suggestion}'?"));
+            }
+            warning.push_str(" The entry remains active for tools that load later.");
+            warnings.push(warning);
+        }
+    }
+    warnings
+}
 
 /// One generation of the app: everything torn down and rebuilt on `/reload`.
 /// Dropping it joins the Lua thread via `PluginHost::drop`.
@@ -103,18 +124,13 @@ fn load_config(
         config.permissions.yolo = true;
     }
     if !cli.allowed_tools.is_empty() {
-        config.agent.allowed_tools = cli
-            .allowed_tools
-            .iter()
-            .map(|t| normalize_tool_name(t))
-            .collect::<Result<Vec<_>>>()?;
+        config.agent.allowed_tools = cli.allowed_tools.clone();
     }
     if !cli.disallowed_tools.is_empty() {
-        config.agent.disabled_tools.extend(
-            cli.disallowed_tools
-                .iter()
-                .filter_map(|t| normalize_tool_name(t).ok()),
-        );
+        config
+            .agent
+            .disabled_tools
+            .extend(cli.disallowed_tools.iter().cloned());
     }
     config.validate()?;
     Ok(config)
@@ -151,11 +167,15 @@ fn build_stack(
     fallback: Option<(Config, Model)>,
 ) -> Result<(Stack, Vec<String>)> {
     let cli = launch.cli;
-    let mut plugin_host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !cli.no_jit)
-        .context("initialize lua plugin host")?;
+    let mut plugin_host = PluginHost::start(
+        Arc::clone(ToolRegistry::global_arc()),
+        launch.interaction,
+        !cli.no_jit,
+    )
+    .context("initialize lua plugin host")?;
 
     let (fallback_config, fallback_model) = fallback.unzip();
-    let (config, mut warnings) = super::load_plugins(
+    let (mut config, mut warnings) = super::load_plugins(
         &mut plugin_host,
         cli.no_plugins,
         if fallback_model.is_some() {
@@ -178,9 +198,14 @@ fn build_stack(
         },
     )?;
 
-    warnings.extend(provider_scripts::startup_warning());
+    warnings.extend(tool_filter_warnings(cli, ToolRegistry::global()));
     let commands = discover_commands(cli.no_commands, launch.cwd);
 
+    setup::resolve_thinking(
+        &mut config.session_defaults,
+        launch.storage,
+        cli.thinking_override(),
+    );
     let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, launch.storage);
     let (model, needs_login) = match (model_result, fallback_model) {
         (Ok((m, warning)), _) => {
@@ -308,7 +333,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
     };
     let mut trust = project::resolve(&storage, &cwd, mode);
     load_env_files(&trust.project_config);
-    warn_stale_config_toml(&trust.project_config);
     let mut teardown = Teardown::default();
     let launch = Launch {
         cli: &cli,
@@ -375,7 +399,10 @@ pub fn run(mut cli: Cli) -> Result<()> {
     // mode that never opens the UI has to report them here or a broken
     // package fails in complete silence.
     if cli.is_sdk_mode() || cli.print {
-        for warning in &startup_warnings {
+        for warning in startup_warnings
+            .iter()
+            .chain(&provider_scripts::startup_warning())
+        {
             eprintln!("warning: {warning}");
         }
     }
@@ -472,6 +499,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 focused,
                 startup_warnings: std::mem::take(&mut warnings),
                 startup_notice: notice.take(),
+                // Read per run: plugins have just (re)loaded, and a script one
+                // of them now replaces is no longer worth a word.
+                startup_alert: provider_scripts::startup_warning(),
                 storage: storage.clone(),
                 config: stack.config.agent.clone(),
                 ui_config: stack.config.ui.clone(),
@@ -502,7 +532,11 @@ pub fn run(mut cli: Cli) -> Result<()> {
         match outcome {
             RunOutcome::Exit { session_id, code } => {
                 if let Some(session_id) = session_id {
-                    eprintln!("Resume session:\n\n  maki -r {session_id}");
+                    let argv0 = env::args_os().next().unwrap_or_default();
+                    eprintln!(
+                        "Resume session:\n\n  {} -r {session_id}",
+                        argv0.to_string_lossy()
+                    );
                 }
                 let started = Instant::now();
                 drop(stack);
@@ -562,24 +596,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
     }
 }
 
-/// Trust has nothing to say about this file, because Maki no longer reads it.
-/// Someone who declined trust deserves to hear that the file is inert just as
-/// much as someone who accepted.
-fn warn_stale_config_toml(project_config: &ProjectConfig) {
-    let stale_paths = [
-        maki_config::global_config_dir().map(|dir| dir.join(STALE_GLOBAL_CONFIG)),
-        Some(project_config.config_root().join(STALE_PROJECT_CONFIG)),
-    ];
-    for path in stale_paths.into_iter().flatten() {
-        if path.is_file() {
-            tracing::warn!(
-                path = %path.display(),
-                "config.toml found but no longer used. Migrate to init.lua. See https://maki.sh/docs/configuration/"
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,6 +616,17 @@ mod tests {
     const STORED_SPEC: &str = "zai/glm-4.6";
     const CWD: &str = "/project";
     const STORED_MESSAGE: &str = "the turn the stored session already had";
+
+    #[test_case("srv.probe", true ; "qualified_mcp_tool")]
+    #[test_case("srv__probe", true ; "wire_mcp_tool")]
+    #[test_case("unloaded_tool", false ; "unknown_registry_tool")]
+    fn tool_filter_warnings_accept_mcp_names(name: &str, accepted: bool) {
+        let cli = Cli::parse_from(["maki", "--disallowed-tools", name]);
+        assert_eq!(
+            tool_filter_warnings(&cli, &ToolRegistry::new()).is_empty(),
+            accepted
+        );
+    }
 
     fn no_names(_: &PluginHost) -> Result<Vec<String>> {
         Ok(Vec::new())
@@ -701,7 +728,7 @@ mod tests {
         let cli = Cli::parse_from(["maki", "--no-plugins"]);
         assert!(cli.no_plugins);
 
-        let mut plugin_host = PluginHost::with_jit(Arc::new(ToolRegistry::new()), true)
+        let mut plugin_host = PluginHost::new(Arc::new(ToolRegistry::new()))
             .expect("live host boots under --no-plugins");
 
         let config = load_config(
@@ -743,7 +770,7 @@ mod tests {
         assert!(!cli.no_plugins);
 
         let mut plugin_host =
-            PluginHost::with_jit(Arc::new(ToolRegistry::new()), true).expect("live host boots");
+            PluginHost::new(Arc::new(ToolRegistry::new())).expect("live host boots");
 
         match load_config(
             &plugin_host,

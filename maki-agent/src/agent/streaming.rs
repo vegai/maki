@@ -1,12 +1,11 @@
 use std::time::{Duration, Instant};
 
-use maki_providers::provider::Provider;
+use maki_providers::provider::{Provider, RequestScope};
 use maki_providers::retry::{RetryPolicy, RetryState};
 use maki_providers::{
     ContentBlock, ContextGauge, Message, Model, Overflow, ProviderEvent, RequestOptions,
     StreamResponse, estimate_prompt_tokens,
 };
-use maki_storage::id::SessionRef;
 use serde_json::Value;
 use tracing::warn;
 
@@ -49,6 +48,7 @@ async fn forward_provider_events(
     let mut streamed = String::new();
     while let Ok(pe) = prx.recv_async().await {
         let ae = match pe {
+            ProviderEvent::Waiting { message } => AgentEvent::ProviderWaiting { message },
             ProviderEvent::TextDelta { text } => {
                 streamed.push_str(&text);
                 AgentEvent::TextDelta { text }
@@ -176,7 +176,7 @@ pub(crate) struct StreamRequest<'a> {
     /// Output tokens this kind of turn may generate. A summary needs far less
     /// than a coding turn, so the caller decides.
     pub output_budget: u32,
-    pub session_id: Option<&'a SessionRef>,
+    pub scope: RequestScope<'a>,
     pub retry: RetryPolicy,
 }
 
@@ -197,7 +197,7 @@ pub(crate) async fn stream_with_retry(
         tools,
         opts,
         output_budget,
-        session_id,
+        scope,
         retry,
     } = req;
     let opts = opts.clamped(model);
@@ -240,7 +240,15 @@ pub(crate) async fn stream_with_retry(
         // retry slept on a server `Retry-After` never pays for the attempt it
         // woke up to make.
         let result = cancel
-            .race(provider.stream_message(model, messages, system, tools, &ptx, opts, session_id))
+            .race(provider.stream_message(
+                model,
+                messages,
+                system,
+                tools,
+                &ptx,
+                opts,
+                scope.clone(),
+            ))
             .await
             .unwrap_or(Err(AgentError::Cancelled));
         drop(ptx);
@@ -378,6 +386,7 @@ fn error_description(error: &AgentError) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::Mutex;
 
     use maki_providers::{
@@ -399,6 +408,7 @@ mod tests {
     /// leaves no prompt small enough for `max` effort to fit beside it.
     const DECLARED_MAX_OUTPUT: u32 = WINDOW / 2;
     const TURN_BUDGET: u32 = 32_768;
+    const ANY_CWD: &str = "/";
     const SMALL_PROMPT: u32 = 1_000;
     const EXPLICIT_THINKING: u32 = 30_000;
     /// Less room than `TURN_BUDGET` wants.
@@ -594,7 +604,7 @@ mod tests {
             tools: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: RequestScope<'a>,
         ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 let prompt = (estimate_prompt_tokens(messages, system, tools) as f32
@@ -618,6 +628,7 @@ mod tests {
                         ..Default::default()
                     },
                     stop_reason: Some(maki_providers::StopReason::EndTurn),
+                    ..Default::default()
                 })
             })
         }
@@ -665,7 +676,10 @@ mod tests {
                 tools: &json!([]),
                 opts: RequestOptions::default(),
                 output_budget: TURN_BUDGET,
-                session_id: None,
+                scope: RequestScope {
+                    session_id: None,
+                    cwd: Path::new(ANY_CWD),
+                },
                 retry,
             },
             gauge,
@@ -719,7 +733,10 @@ mod tests {
                     tools: &json!([]),
                     opts: RequestOptions::default(),
                     output_budget: TURN_BUDGET,
-                    session_id: None,
+                    scope: RequestScope {
+                        session_id: None,
+                        cwd: Path::new(ANY_CWD),
+                    },
                     retry: RetryPolicy::default(),
                 },
                 None,
@@ -865,7 +882,7 @@ mod tests {
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: RequestScope<'a>,
         ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 let key = self.pool.current().to_owned();
@@ -878,6 +895,7 @@ mod tests {
                     message: Message::user("ok".into()),
                     usage: TokenUsage::default(),
                     stop_reason: Some(maki_providers::StopReason::EndTurn),
+                    ..Default::default()
                 })
             })
         }

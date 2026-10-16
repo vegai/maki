@@ -1,10 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use agent_client_protocol_schema::{
-    Content, ContentBlock, ContentChunk, Cost, Diff, ImageContent, SessionUpdate, StopReason,
-    TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
+use agent_client_protocol_schema::v1::{
+    Content, ContentBlock, ContentChunk, Cost, Diff, ImageContent, Notice, NoticeSeverity,
+    SessionUpdate, StopReason, TextContent, ToolCall, ToolCallContent, ToolCallId,
+    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use maki_agent::DoneReason;
 use maki_agent::tools::ToolRegistry;
@@ -82,6 +82,14 @@ pub fn thinking_delta(text: &str) -> SessionUpdate {
     SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
         text.to_string(),
     ))))
+}
+
+pub fn provider_waiting(message: String, notices: bool) -> SessionUpdate {
+    if notices {
+        SessionUpdate::Notice(Notice::new(NoticeSeverity::Info, message))
+    } else {
+        thinking_delta(&format!("{message}\n\n"))
+    }
 }
 
 pub fn tool_pending(id: &str, name: &str) -> SessionUpdate {
@@ -384,7 +392,7 @@ pub fn replay_history(messages: &[Message], cwd: &Path, home: Option<&Path>) -> 
 }
 
 fn replay_user(msg: &Message, updates: &mut Vec<SessionUpdate>) {
-    if msg.is_observation() {
+    if msg.is_from_host() {
         return;
     }
     if let Some(text) = msg.user_text() {
@@ -398,6 +406,7 @@ fn replay_user(msg: &Message, updates: &mut Vec<SessionUpdate>) {
                 tool_use_id,
                 content,
                 is_error,
+                ..
             } => updates.push(replay_tool_result(tool_use_id, content, *is_error)),
             MsgBlock::Image { source } => {
                 updates.push(SessionUpdate::UserMessageChunk(ContentChunk::new(
@@ -494,6 +503,8 @@ mod tests {
     const ABS_PATH: &str = "/home/user/project/src/main.rs";
     const OLD_TEXT: &str = "fn main() {}\n";
     const NEW_TEXT: &str = "fn main() { run() }\n";
+    const MONITOR_NOTE: &str = "[monitor] build failed";
+    const CONTEXT_UPDATE_TEXT: &str = "<context-update>date: tomorrow</context-update>";
 
     #[test_case("1: mod render\n2: mod segment", "```\n1: mod render\n2: mod segment\n```" ; "plain_text_gets_default_fence")]
     #[test_case("has ```rust\ncode\n``` inside", "````\nhas ```rust\ncode\n``` inside\n````" ; "fence_longer_than_inner_backticks")]
@@ -542,11 +553,7 @@ mod tests {
             ]),
             Message {
                 role: MsgRole::User,
-                content: vec![MsgBlock::ToolResult {
-                    tool_use_id: "tu-1".into(),
-                    content: "file.rs".into(),
-                    is_error: false,
-                }],
+                content: vec![MsgBlock::tool_result("tu-1", "file.rs", false)],
                 display_text: None,
                 ..Default::default()
             },
@@ -591,21 +598,17 @@ mod tests {
         assert!(updates_json(&[Message::synthetic("injected".into())]).is_empty());
     }
 
-    #[test]
-    fn replay_never_speaks_an_observation_as_the_user() {
-        let obs = Message::observation("[monitor] build failed".into());
-        assert!(updates_json(&[obs]).is_empty());
+    #[test_case(Message::observation(MONITOR_NOTE.into()) ; "observation")]
+    #[test_case(Message::context_update(CONTEXT_UPDATE_TEXT.into(), Default::default()) ; "context_update")]
+    fn replay_never_speaks_host_text_as_the_user(msg: Message) {
+        assert!(updates_json(&[msg]).is_empty());
     }
 
     #[test]
     fn replay_failed_tool_result_maps_to_failed_status() {
         let msg = Message {
             role: MsgRole::User,
-            content: vec![MsgBlock::ToolResult {
-                tool_use_id: "tu-err".into(),
-                content: "boom".into(),
-                is_error: true,
-            }],
+            content: vec![MsgBlock::tool_result("tu-err", "boom", true)],
             display_text: None,
             ..Default::default()
         };

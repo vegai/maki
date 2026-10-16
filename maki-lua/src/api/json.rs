@@ -1,5 +1,7 @@
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{AnyUserData, Lua, LuaSerdeExt, Result as LuaResult, UserData, UserDataMethods, Value};
+use mlua::{
+    AnyUserData, Lua, LuaSerdeExt, LuaString, Result as LuaResult, UserData, UserDataMethods, Value,
+};
 
 use super::util::convert::{json_to_lua, lua_to_json};
 use super::util::pair::{Pair, pair, try_pair};
@@ -43,7 +45,7 @@ impl UserData for LuaSchemaValidator {
                 .validator
                 .iter_errors(&json)
                 .map(|e| {
-                    let path = e.instance_path.to_string();
+                    let path = e.instance_path().to_string();
                     if path.is_empty() {
                         e.to_string()
                     } else {
@@ -87,8 +89,8 @@ fn encode(lua: &Lua, value: Value) -> LuaResult<Pair<String>> {
 /// local t, err = maki.json.decode('{"x": 42}')
 /// print(t.x) -- 42
 #[lua_fn]
-fn decode(lua: &Lua, str: String) -> LuaResult<Pair<Value>> {
-    let value = try_pair!(serde_json::from_str::<serde_json::Value>(&str));
+fn decode(lua: &Lua, str: LuaString) -> LuaResult<Pair<Value>> {
+    let value = try_pair!(serde_json::from_slice::<serde_json::Value>(&str.as_bytes()));
     Ok((Some(json_to_lua(lua, &value)?), None))
 }
 
@@ -133,6 +135,7 @@ lua_table! {
 #[cfg(test)]
 mod tests {
     use mlua::Lua;
+    use test_case::test_case;
 
     fn lua_with_json() -> Lua {
         let lua = Lua::new();
@@ -173,11 +176,14 @@ mod tests {
         assert!(has_err);
     }
 
-    #[test]
-    fn decode_error_returns_nil_and_message() {
+    #[test_case(r#""{invalid}""# ; "invalid_json")]
+    #[test_case(r#""\xff""# ; "non_utf8")]
+    fn decode_error_returns_nil_and_message(input: &str) {
         let lua = lua_with_json();
         let (is_nil, has_err): (bool, bool) = lua
-            .load(r#"local t, err = json.decode("{invalid}"); return t == nil, err ~= nil"#)
+            .load(format!(
+                "local t, err = json.decode({input}); return t == nil, err ~= nil"
+            ))
             .eval()
             .unwrap();
         assert!(is_nil);

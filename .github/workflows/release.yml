@@ -55,13 +55,130 @@ jobs:
             -e CARGO_TERM_COLOR=always \
             -e CARGO_INCREMENTAL=0 \
             alpine:3.21 sh -c '
-              apk add --no-cache gcc g++ musl-dev make perl linux-headers curl git ca-certificates pkgconf python3-dev
+              apk add --no-cache gcc g++ musl-dev make linux-headers curl git ca-certificates pkgconf python3-dev
               git config --global --add safe.directory /workspace
               curl --proto "=https" --tlsv1.2 --retry 5 --retry-delay 2 --retry-all-errors -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --target ${{ matrix.target }}
               source "$HOME/.cargo/env"
               cargo build --release --target ${{ matrix.target }}
             '
           sudo chown -R $(id -u):$(id -g) target/
+
+      - name: Package
+        run: |
+          tag="$GITHUB_REF_NAME"
+          archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
+          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
+          tar czf "${archive}" "${BINARY_NAME}"
+          echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        run: .github/scripts/retry.sh gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" --clobber
+
+  build-netbsd:
+    name: Build (${{ matrix.target }})
+    needs: create-release
+    runs-on: ubuntu-latest
+    # tier 3 on an unpinned nightly breaks on its own schedule, so a failure
+    # there must not hold back the release of every other target
+    continue-on-error: ${{ matrix.toolchain == 'nightly' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-netbsd
+            zig_target: x86_64-netbsd.10.1
+            toolchain: stable
+            std: precompiled
+          - target: aarch64-unknown-netbsd
+            zig_target: aarch64-netbsd.10.1
+            toolchain: nightly
+            std: build-std
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # zig bundles NetBSD 10.1 libc headers, crt objects and stub shared
+      # libraries, so it is a self-contained NetBSD cross toolchain: Ubuntu has
+      # no gcc-*-netbsd packages and NetBSD ships no cross kits for Linux.
+      - name: Install zig
+        env:
+          ZIG_VERSION: 0.16.0
+        run: |
+          .github/scripts/retry.sh curl -sSfL -o "$RUNNER_TEMP/zig.tar.xz" "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          tar xJf "$RUNNER_TEMP/zig.tar.xz" -C "$HOME"
+          echo "$HOME/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: Install Rust toolchain
+        env:
+          TOOLCHAIN: ${{ matrix.toolchain }}
+          TARGET: ${{ matrix.target }}
+          STD: ${{ matrix.std }}
+        run: |
+          rustup toolchain install "$TOOLCHAIN" --profile minimal
+          rustup default "$TOOLCHAIN"
+          if [ "$STD" = precompiled ]; then
+            rustup target add "$TARGET"
+          else
+            # aarch64-unknown-netbsd is tier 3: no precompiled std to download.
+            # llvm-tools provides the llvm-ar/llvm-nm that compiler_builtins
+            # needs when std is built from source.
+            rustup component add rust-src llvm-tools --toolchain "$TOOLCHAIN"
+          fi
+
+      - name: Configure cross toolchain
+        env:
+          TARGET: ${{ matrix.target }}
+          ZIG_TARGET: ${{ matrix.zig_target }}
+        run: |
+          u=${TARGET//-/_}
+          U=${TARGET^^}; U=${U//-/_}
+          w="$PWD/.cross"
+          mkdir -p "$w"
+          for m in cc cxx; do
+            [ "$m" = cxx ] && zm='c++' || zm='cc'
+            cat > "$w/$m" <<EOF
+          #!/bin/bash
+          # the cc crate and openssl-src pass the rust triple as -target / --target=,
+          # which zig cannot parse; swap it for zig's own target syntax
+          args=(); skip=0
+          for a in "\$@"; do
+            if ((skip)); then skip=0; continue; fi
+            case "\$a" in -target|--target) skip=1; continue;; -target=*|--target=*) continue;; esac
+            args+=("\$a")
+          done
+          exec zig $zm -target $ZIG_TARGET "\${args[@]}"
+          EOF
+          done
+          cat > "$w/linker" <<EOF
+          #!/bin/bash
+          exec zig cc -target $ZIG_TARGET "\$@"
+          EOF
+          # wrappers, not "AR=zig ar": openssl-src splits a multi-word AR
+          printf '#!/bin/sh\nexec zig ar "$@"\n' > "$w/ar"
+          printf '#!/bin/sh\nexec zig ranlib "$@"\n' > "$w/ranlib"
+          chmod +x "$w"/*
+          {
+            echo "CC_$u=$w/cc"
+            echo "CXX_$u=$w/cxx"
+            echo "AR_$u=$w/ar"
+            echo "RANLIB_$u=$w/ranlib"
+            echo "CARGO_TARGET_${U}_LINKER=$w/linker"
+          } >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-${{ github.ref_name }}
+
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+          STD: ${{ matrix.std }}
+        run: |
+          if [ "$STD" = build-std ]; then
+            cargo build --release --locked --target "$TARGET" -Z build-std=std,panic_abort
+          else
+            cargo build --release --locked --target "$TARGET"
+          fi
 
       - name: Package
         run: |
@@ -92,8 +209,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        run: rustup target add ${{ matrix.target }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -127,7 +245,7 @@ jobs:
 
   publish:
     name: Publish Release
-    needs: [build-linux, build-other]
+    needs: [build-linux, build-netbsd, build-other]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

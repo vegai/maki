@@ -75,6 +75,7 @@ impl ToolHook for SlotHook {
                 "input": call.input,
                 "session_id": call.session_id,
                 "origin": call.origin.as_str(),
+                "output_mode": call.output_mode.as_str(),
                 "deadline_ms": deadline_ms(call.deadline),
             }),
             may_ask: stage == HookStage::Input,

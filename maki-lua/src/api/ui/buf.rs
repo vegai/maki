@@ -8,6 +8,7 @@ use maki_lua_macro::{lua_class, lua_fn};
 use mlua::{Function, Lua, Result as LuaResult, Table, Value as LuaValue};
 
 use super::{blit, segment_color_to_lua};
+use crate::api::util::callback::call_inline;
 use crate::runtime::{TaskHandle, lock_cell};
 
 /// `live_buf` tracks the first buffer a handler creates, the one
@@ -271,8 +272,9 @@ fn on(lua: &Lua, this: &BufHandle, event: String, callback: Function) -> LuaResu
         // Change callbacks fire inline from buf mutations, so they
         // must not yield or mutate this buffer.
         "change" => {
+            let callback_lua = lua.clone();
             this.buf.set_on_change(move || {
-                if let Err(e) = callback.call::<()>(()) {
+                if let Err(e) = call_inline(&callback_lua, callback.clone(), ()) {
                     tracing::warn!(error = %e, "buf change callback failed");
                 }
             });

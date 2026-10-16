@@ -1,5 +1,6 @@
 pub mod agent_autocmd;
 mod api;
+mod background;
 pub mod docs;
 pub mod docs_render;
 mod error;
@@ -13,6 +14,7 @@ pub(crate) mod plugin_permissions;
 mod runtime;
 pub mod session_snapshot;
 
+pub use api::r#fn::set_shell_preference;
 pub use api::keymap::{KeybindTicket, KeymapEntry, KeymapReader, KeymapSnapshot};
 pub use api::net::set_allowed_private_hosts;
 pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
@@ -21,7 +23,7 @@ pub use api::session::SessionSnapshotFn;
 pub use api::util::command::{
     Anchor, Axis, Border, BuiltinAction, Dimension, Edge, FloatConfig, FloatConfigPatch,
     HintReader, HintSnapshot, InputEdit, InputRequest, LuaCommandInfo, LuaCommandReader,
-    ModelRequest, PlanActionOutcome, PlanFormRow, PlanMenu, PlanRequest, PlanRowAction,
+    ModelRequest, NO_UI_ERR, PlanActionOutcome, PlanFormRow, PlanMenu, PlanRequest, PlanRowAction,
     SessionRequest, Split, TaskRequest, TitlePos, UiAction, UiAttachment, UiReply, WinCommand,
     WinEvent, WinView,
 };

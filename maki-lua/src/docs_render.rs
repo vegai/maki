@@ -3,6 +3,8 @@
 //! repo. `maki-docgen` calls [`site_page`] for the website; the plugin
 //! `require()` sandbox serves [`virtual_module`] to the skill plugin.
 
+use std::iter;
+
 use mlua::{Lua, Table};
 
 use crate::docs::{DocKind, FnDoc, ModuleDoc, api_docs};
@@ -563,9 +565,9 @@ fn field_item(text: &str) -> Option<String> {
     Some(format!("`{name}` (`{ty}`) {desc}"))
 }
 
-fn push_fields_block(out: &mut String, block: &str) {
+fn push_fields_block<'a>(out: &mut String, block: impl Iterator<Item = &'a str>, depth: usize) {
     let mut levels: Vec<usize> = Vec::new();
-    for raw in block.lines() {
+    for raw in block {
         let line = raw.strip_prefix("  ").unwrap_or(raw);
         let text = line.trim_start();
         if text.is_empty() {
@@ -579,12 +581,27 @@ fn push_fields_block(out: &mut String, block: &str) {
             if levels.last() != Some(&indent) {
                 levels.push(indent);
             }
-            out.push_str(&format!("{}- {item}\n", "  ".repeat(levels.len())));
+            let pad = "  ".repeat(depth + levels.len() - 1);
+            out.push_str(&format!("{pad}- {item}\n"));
         } else if levels.last().is_some_and(|&i| indent > i) {
-            out.push_str(&format!("{}{text}\n", "  ".repeat(levels.len() + 1)));
+            let pad = "  ".repeat(depth + levels.len());
+            out.push_str(&format!("{pad}{text}\n"));
         } else {
             levels.clear();
-            out.push_str(&format!("\n  {text}\n\n"));
+            out.push_str(&format!("\n{}{text}\n\n", "  ".repeat(depth)));
+        }
+    }
+}
+
+fn push_desc(out: &mut String, desc: &str) {
+    let mut lines = desc.lines().peekable();
+    while let Some(line) = lines.next() {
+        if line.starts_with(' ') && field_item(line.trim_start()).is_some() {
+            let block = iter::from_fn(|| lines.next_if(|l| l.starts_with(' ')));
+            push_fields_block(out, iter::once(line).chain(block), 0);
+        } else {
+            out.push_str(line);
+            out.push('\n');
         }
     }
 }
@@ -605,8 +622,8 @@ fn push_fn(out: &mut String, module: &ModuleDoc, f: &FnDoc, classes: &ClassLinks
         ));
     }
     if !f.desc.is_empty() {
-        out.push_str(f.desc);
-        out.push_str("\n\n");
+        push_desc(out, f.desc);
+        out.push('\n');
     }
     if let Some(guard) = f.guard {
         if compact {
@@ -626,7 +643,7 @@ fn push_fn(out: &mut String, module: &ModuleDoc, f: &FnDoc, classes: &ClassLinks
                 p.name,
                 link_ty(p.ty, classes)
             ));
-            push_fields_block(out, rest);
+            push_fields_block(out, rest.lines(), 1);
         }
         out.push('\n');
     }
@@ -700,8 +717,8 @@ fn render(compact: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AGENT_NOTES, PERMISSIONS_ANCHOR, REFERENCE_URL, guide_page, reference, reference_index,
-        site_page, skeleton, skill_content,
+        AGENT_NOTES, PERMISSIONS_ANCHOR, REFERENCE_URL, guide_page, push_desc, reference,
+        reference_index, site_page, skeleton, skill_content,
     };
 
     const AGENT_VOICE: &str = "ask the user";
@@ -712,6 +729,15 @@ mod tests {
     fn skeleton_keeps_public_surface_only() {
         let expected = "-- Header line one.\n-- Header line two.\nM.CONST = \"x\"\n\n-- Doc for pub.\nfunction M.pub(a, b)\nfunction M:method()\n";
         assert_eq!(skeleton(MODULE), expected);
+    }
+
+    #[test]
+    fn desc_field_blocks_render_as_nested_lists() {
+        let desc = "Intro.\n\n{spec} fields:\n  `a` (string) First\n          wraps.\n  `b` (table) Holds:\n    `c` (integer) Inner.\n  `d` (boolean) Last.\n\nOutro.";
+        let expected = "Intro.\n\n{spec} fields:\n- `a` (`string`) First\n  wraps.\n- `b` (`table`) Holds:\n  - `c` (`integer`) Inner.\n- `d` (`boolean`) Last.\n\nOutro.\n";
+        let mut out = String::new();
+        push_desc(&mut out, desc);
+        assert_eq!(out, expected);
     }
 
     #[test]

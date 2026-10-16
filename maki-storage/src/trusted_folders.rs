@@ -10,9 +10,6 @@ use crate::{StateDir, StorageError, atomic_write};
 
 const DOCUMENT_FILE: &str = "trusted-folders.json";
 const DOCUMENT_VERSION: u32 = 2;
-/// Version 1 kept a bare path per trusted folder. Those answers are still good,
-/// they just do not say which files they covered, so they load as `Unrecorded`.
-const OLDEST_SUPPORTED_VERSION: u32 = 1;
 const LOCK_FILE: &str = "trusted-folders.lock";
 /// Lives next to the session index on purpose, see [`TrustedFolders::grandfathered_roots`].
 const PRE_TRUST_FILE: &str = "pre-trust-roots.json";
@@ -105,8 +102,6 @@ pub enum TrustDecision {
     Widened {
         added: Vec<String>,
     },
-    /// A yes from a store written before Maki wrote down what a yes covered.
-    Unrecorded,
     /// No answer, but this is the project root of a folder that was already in
     /// use before folder trust existed, so its shared config used to load
     /// without a question.
@@ -163,38 +158,15 @@ pub enum TrustedFoldersError {
 /// arrives in a later pull. It is a set of file names, never a hash of their
 /// contents, so editing a file the user already trusted asks nothing.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(untagged)]
-enum FolderEntry {
-    Recorded {
-        path: String,
-        files: Vec<String>,
-    },
-    /// How version 1 spelled a trusted folder. Nothing recorded what such an
-    /// answer covered, so it keeps covering everything until the next start
-    /// writes down what the folder ships that day.
-    Unrecorded(String),
-}
-
-impl FolderEntry {
-    fn path(&self) -> &str {
-        match self {
-            Self::Recorded { path, .. } | Self::Unrecorded(path) => path,
-        }
-    }
-
-    fn files(&self) -> Option<&[String]> {
-        match self {
-            Self::Recorded { files, .. } => Some(files),
-            Self::Unrecorded(_) => None,
-        }
-    }
+struct FolderEntry {
+    path: String,
+    files: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Document {
     version: u32,
     folders: Vec<FolderEntry>,
-    #[serde(default)]
     rejected: Vec<String>,
 }
 
@@ -353,11 +325,11 @@ impl TrustedFolders {
         let index = document
             .folders
             .iter()
-            .position(|entry| entry.path() == folder.as_str());
+            .position(|entry| entry.path == folder.as_str());
 
         let mut covered: Vec<String> = files.iter().map(|file| (*file).to_owned()).collect();
-        if let Some(recorded) = index.and_then(|index| document.folders[index].files()) {
-            covered.extend_from_slice(recorded);
+        if let Some(index) = index {
+            covered.extend_from_slice(&document.folders[index].files);
         }
         covered.sort();
         covered.dedup();
@@ -366,14 +338,13 @@ impl TrustedFolders {
             .rejected
             .iter()
             .any(|entry| entry == folder.as_str());
-        let already_covered =
-            index.is_some_and(|index| document.folders[index].files() == Some(covered.as_slice()));
+        let already_covered = index.is_some_and(|index| document.folders[index].files == covered);
         if already_covered && !was_rejected {
             return Ok(Change::Unchanged);
         }
 
         document.rejected.retain(|entry| entry != folder.as_str());
-        let entry = FolderEntry::Recorded {
+        let entry = FolderEntry {
             path: folder.as_str().to_owned(),
             files: covered,
         };
@@ -390,8 +361,7 @@ impl TrustedFolders {
     /// the project added and ask about it.
     ///
     /// A folder with no answer keeps none: writing a file into a folder is not
-    /// a reason to trust it. An answer from before file sets already covers
-    /// everything, so it is left alone rather than narrowed to this one file.
+    /// a reason to trust it.
     pub fn cover_written_file(
         &self,
         folder: &CanonicalFolder,
@@ -399,10 +369,10 @@ impl TrustedFolders {
     ) -> Result<Change, TrustedFoldersError> {
         let _lock = self.mutation_lock()?;
         let mut document = self.load()?;
-        let Some(FolderEntry::Recorded { files, .. }) = document
+        let Some(FolderEntry { files, .. }) = document
             .folders
             .iter_mut()
-            .find(|entry| entry.path() == folder.as_str())
+            .find(|entry| entry.path == folder.as_str())
         else {
             return Ok(Change::Unchanged);
         };
@@ -427,7 +397,7 @@ impl TrustedFolders {
         }
         document
             .folders
-            .retain(|entry| entry.path() != folder.as_str());
+            .retain(|entry| entry.path != folder.as_str());
         document.rejected.push(folder.as_str().to_owned());
         self.save(&mut document)?;
         Ok(Change::Changed)
@@ -445,7 +415,7 @@ impl TrustedFolders {
             document
                 .folders
                 .iter()
-                .any(|entry| names_same_folder(entry.path(), candidate))
+                .any(|entry| names_same_folder(&entry.path, candidate))
                 || document
                     .rejected
                     .iter()
@@ -455,7 +425,7 @@ impl TrustedFolders {
         };
         document
             .folders
-            .retain(|entry| !names_same_folder(entry.path(), candidate));
+            .retain(|entry| !names_same_folder(&entry.path, candidate));
         document
             .rejected
             .retain(|entry| !names_same_folder(entry, candidate));
@@ -469,7 +439,7 @@ impl TrustedFolders {
             .folders
             .iter()
             .map(|entry| FolderTrustDecision {
-                path: PathBuf::from(entry.path()),
+                path: PathBuf::from(&entry.path),
                 status: TrustStatus::Trusted,
             })
             .chain(document.rejected.iter().map(|path| FolderTrustDecision {
@@ -502,18 +472,17 @@ impl TrustedFolders {
                 });
             }
         };
-        let mut document: Document =
+        let document: Document =
             serde_json::from_str(&contents).map_err(|source| TrustedFoldersError::Json {
                 path: self.document_path.clone(),
                 source,
             })?;
-        if !(OLDEST_SUPPORTED_VERSION..=DOCUMENT_VERSION).contains(&document.version) {
+        if document.version != DOCUMENT_VERSION {
             return Err(TrustedFoldersError::UnsupportedVersion {
                 path: self.document_path.clone(),
                 version: document.version,
             });
         }
-        document.version = DOCUMENT_VERSION;
 
         // A malformed entry cannot grant anything, because `status` compares
         // against a canonical absolute path and nothing else. Refusing to load
@@ -525,10 +494,10 @@ impl TrustedFolders {
     fn save(&self, document: &mut Document) -> Result<(), TrustedFoldersError> {
         document
             .folders
-            .sort_by(|left, right| left.path().cmp(right.path()));
+            .sort_by(|left, right| left.path.cmp(&right.path));
         document
             .folders
-            .dedup_by(|left, right| left.path() == right.path());
+            .dedup_by(|left, right| left.path == right.path);
         document.rejected.sort();
         document.rejected.dedup();
         let mut bytes =
@@ -548,7 +517,7 @@ impl Document {
     fn entry(&self, folder: &CanonicalFolder) -> Option<&FolderEntry> {
         self.folders
             .iter()
-            .find(|entry| entry.path() == folder.as_str())
+            .find(|entry| entry.path == folder.as_str())
     }
 
     fn status(&self, folder: &CanonicalFolder) -> TrustStatus {
@@ -579,12 +548,9 @@ impl Document {
                 _ => TrustDecision::Unknown,
             };
         };
-        let Some(covered) = entry.files() else {
-            return TrustDecision::Unrecorded;
-        };
         let added: Vec<String> = present
             .iter()
-            .filter(|file| !covered.iter().any(|recorded| recorded == *file))
+            .filter(|file| !entry.files.iter().any(|recorded| recorded == *file))
             .map(|file| (*file).to_owned())
             .collect();
         if added.is_empty() {
@@ -689,6 +655,15 @@ mod tests {
             .to_path_buf()
     }
 
+    fn document_json(folders: &[&str]) -> String {
+        let folders: Vec<_> = folders
+            .iter()
+            .map(|path| serde_json::json!({"path": path, "files": []}))
+            .collect();
+        serde_json::json!({"version": DOCUMENT_VERSION, "folders": folders, "rejected": []})
+            .to_string()
+    }
+
     #[derive(Clone, Deserialize, Serialize)]
     struct StoredMessage;
 
@@ -760,15 +735,6 @@ mod tests {
         assert_eq!(store.status(&folder).unwrap(), TrustStatus::Unknown);
     }
 
-    #[test]
-    fn old_documents_default_to_no_rejections() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(&dir);
-        fs::write(&store.document_path, r#"{"version":1,"folders":[]}"#).unwrap();
-
-        assert!(store.list().unwrap().is_empty());
-    }
-
     /// The recorded set is what a later start compares against, so an answer
     /// only ever covers the kinds of file the user was shown.
     #[test_case(&[INIT_LUA], &[INIT_LUA], TrustDecision::Trusted ; "same_file_is_covered")]
@@ -832,52 +798,6 @@ mod tests {
                 .decide(&folder, &[INIT_LUA, ENV_FILE], &checkout_root)
                 .unwrap(),
             TrustDecision::Trusted
-        );
-    }
-
-    /// Version 1 stored a bare path. Those answers survive the upgrade, and
-    /// they report that nothing recorded what they covered, so the caller can
-    /// write down today's files instead of asking again.
-    #[test]
-    fn a_version_one_document_keeps_its_decisions() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(&dir);
-        let trusted = folder(&dir, "trusted");
-        let rejected = folder(&dir, "rejected");
-        fs::write(
-            &store.document_path,
-            serde_json::json!({
-                "version": 1,
-                "folders": [trusted.as_str()],
-                "rejected": [rejected.as_str()],
-            })
-            .to_string(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            store.decide(&trusted, &[INIT_LUA], &checkout_root).unwrap(),
-            TrustDecision::Unrecorded
-        );
-        assert_eq!(
-            store
-                .decide(&rejected, &[INIT_LUA], &checkout_root)
-                .unwrap(),
-            TrustDecision::Rejected
-        );
-
-        store.add(&trusted, &[INIT_LUA]).unwrap();
-        let upgraded = fs::read_to_string(&store.document_path).unwrap();
-        assert!(upgraded.contains(r#""version": 2"#), "{upgraded}");
-        assert_eq!(
-            store.decide(&trusted, &[INIT_LUA], &checkout_root).unwrap(),
-            TrustDecision::Trusted
-        );
-        assert_eq!(
-            store.decide(&trusted, &[MCP_TOML], &checkout_root).unwrap(),
-            TrustDecision::Widened {
-                added: vec![MCP_TOML.to_owned()],
-            }
         );
     }
 
@@ -1070,7 +990,11 @@ mod tests {
             Err(TrustedFoldersError::Json { .. })
         ));
 
-        fs::write(&store.document_path, r#"{"version":3,"folders":[]}"#).unwrap();
+        fs::write(
+            &store.document_path,
+            r#"{"version":3,"folders":[],"rejected":[]}"#,
+        )
+        .unwrap();
         assert!(matches!(
             store.list(),
             Err(TrustedFoldersError::UnsupportedVersion { version: 3, .. })
@@ -1096,11 +1020,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
         let real = folder(&dir, "project");
-        fs::write(
-            &store.document_path,
-            serde_json::json!({"version": 1, "folders": [entry, real.as_str()]}).to_string(),
-        )
-        .unwrap();
+        fs::write(&store.document_path, document_json(&[entry, real.as_str()])).unwrap();
 
         assert_eq!(store.list().unwrap().len(), 2);
         assert!(store.contains(&real).unwrap());
@@ -1117,8 +1037,7 @@ mod tests {
         let target = folder(&dir, "project");
         fs::write(
             &store.document_path,
-            serde_json::json!({"version": 1, "folders": [format!("{}/", target.as_str())]})
-                .to_string(),
+            document_json(&[&format!("{}/", target.as_str())]),
         )
         .unwrap();
 

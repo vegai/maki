@@ -5,12 +5,14 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use maki_providers::{ContextGauge, Message, TokenUsage};
 use maki_storage::StateDir;
+use maki_storage::frame::StoredFrame;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::{SAVE_FAILED, Session, SessionClaim, SessionError};
 use tracing::warn;
 
-use crate::agent::{History, HistorySnapshot, SharedMessages, publish_live_history};
-use crate::tools::RequestTools;
+use crate::agent::{
+    History, HistorySnapshot, RunContextBuilder, SharedMessages, publish_live_history,
+};
 use crate::types::EventSender;
 use crate::{AgentRunParams, ToolOutput};
 
@@ -29,6 +31,9 @@ pub struct Resumed {
     /// The provider's last prompt count for `history`, so a resumed run budgets
     /// from a measurement instead of an estimate.
     pub context_size: u32,
+    /// The prefix `history` was sent under, so the next request can extend it
+    /// instead of starting the cache and the model's reasoning over.
+    pub frame: Option<Arc<StoredFrame>>,
     /// The stored session `history` came out of, if the driver read one. The
     /// run writes back into it, so the title, spending and meta survive without
     /// a second parse of the file. `None` when nothing is stored under the id
@@ -50,6 +55,7 @@ impl Resumed {
             id,
             history: Vec::new(),
             context_size: 0,
+            frame: None,
             session: None,
         }
     }
@@ -60,6 +66,7 @@ impl Resumed {
             id,
             history: session.drain_messages(),
             context_size: session.meta.context_size,
+            frame: session.frame().cloned(),
             session: Some(session),
         }
     }
@@ -94,7 +101,9 @@ impl SessionTrack {
         publish_live_history(resumed.id.id(), &mirror);
         Self {
             store: SessionStore::open(storage, claim, resumed.session, cwd),
-            history: History::restored(resumed.history).with_mirror(mirror),
+            history: History::restored(resumed.history)
+                .with_frame(resumed.frame)
+                .with_mirror(mirror),
             gauge: ContextGauge::restored(resumed.context_size),
         }
     }
@@ -119,16 +128,14 @@ pub struct SessionTurn<'a>(&'a mut SessionTrack);
 impl SessionTurn<'_> {
     pub fn run_params(
         &mut self,
-        system: String,
         event_tx: EventSender,
-        tools: RequestTools,
+        context: RunContextBuilder,
     ) -> AgentRunParams<'_> {
         AgentRunParams {
             history: &mut self.0.history,
             gauge: &mut self.0.gauge,
-            system,
             event_tx,
-            tools,
+            context,
         }
     }
 }
@@ -147,7 +154,7 @@ impl Drop for SessionTurn<'_> {
         if !history.has_unsaved() {
             return;
         }
-        match store.record_turn(history.as_slice(), gauge.size()) {
+        match store.record_turn(history.as_slice(), history.frame(), gauge.size()) {
             Ok(()) => history.mark_saved(),
             // Only headless runs save through here (the TUI has its own
             // writer), so printing cannot tear a drawn frame.
@@ -193,11 +200,17 @@ impl SessionStore {
     /// resolves to, so a run killed before its first turn would leave a dead
     /// entry behind for good. The same guard stops a history that sanitized
     /// down to nothing from replacing the copy it was restored from.
-    fn record_turn(&mut self, messages: &[Message], context_size: u32) -> Result<(), SessionError> {
+    fn record_turn(
+        &mut self,
+        messages: &[Message],
+        frame: Option<&Arc<StoredFrame>>,
+        context_size: u32,
+    ) -> Result<(), SessionError> {
         if messages.is_empty() {
             return Ok(());
         }
         self.session.replace_messages(messages.to_vec());
+        self.session.set_frame(frame.cloned());
         self.session.meta.context_size = context_size;
         self.session.update_title_if_default();
         self.session.save(&self.claim, &self.dir)
@@ -209,10 +222,14 @@ mod tests {
     use std::path::PathBuf;
 
     use maki_providers::{ContentBlock, Role};
+    use maki_storage::frame::PromptFacts;
     use maki_storage::id::MakiId;
     use maki_storage::sessions::{SESSIONS_DIR, generate_title};
     use tempfile::TempDir;
     use test_case::test_case;
+
+    use crate::RunContext;
+    use crate::tools::RequestTools;
 
     use super::*;
     use crate::agent::live_history;
@@ -234,6 +251,10 @@ mod tests {
     const REPAIRED: &str = "a turn that ran on the repaired transcript has to store it repaired";
     const ORPHAN_TOOL_ID: &str = "tool-nobody-called";
     const ORPHAN_RESULT: &str = "ok";
+    const FRAME_SYSTEM: &str = "system the session was sent under";
+    const FRAME_FINGERPRINT: &str = "0123456789abcdef";
+    const FRAME_MCP_TOOL: &str = "srv__tool";
+    const FRAME_KEPT: &str = "a resumed process must send the prefix the transcript was sent under";
 
     fn session_id() -> MakiId {
         SESSION_ID.parse().unwrap()
@@ -252,11 +273,11 @@ mod tests {
     fn reopen_with_orphan(tmp: &TempDir) -> SessionTrack {
         let orphan = Message {
             role: Role::User,
-            content: vec![ContentBlock::ToolResult {
-                tool_use_id: ORPHAN_TOOL_ID.to_owned(),
-                content: ORPHAN_RESULT.into(),
-                is_error: false,
-            }],
+            content: vec![ContentBlock::tool_result(
+                ORPHAN_TOOL_ID,
+                ORPHAN_RESULT,
+                false,
+            )],
             ..Default::default()
         };
         push_turn(&mut track_on(tmp), MODEL_SPEC, |params| {
@@ -294,9 +315,8 @@ mod tests {
     fn push_turn(track: &mut SessionTrack, spec: &str, edit: impl FnOnce(AgentRunParams<'_>)) {
         let mut turn = track.turn(spec.to_owned());
         edit(turn.run_params(
-            String::new(),
             EventSender::new(flume::unbounded().0, 0),
-            RequestTools::default(),
+            Arc::new(|_, _| RunContext::fixed(String::new(), RequestTools::default())),
         ));
     }
 
@@ -464,6 +484,41 @@ mod tests {
         assert_eq!(loaded.model, OTHER_SPEC);
         assert_eq!(loaded.title, TITLE);
         assert_eq!(loaded.meta.plan_path.as_deref(), Some(PLAN_PATH));
+    }
+
+    /// A turn that never touches the frame still saves the transcript, and
+    /// must save the frame next to it. Otherwise every resume starts a new
+    /// prefix and loses the cache and the thinking.
+    #[test]
+    fn the_frame_survives_a_resume_and_the_next_turn() {
+        let tmp = TempDir::new().unwrap();
+        let frame = Arc::new(StoredFrame {
+            system: FRAME_SYSTEM.into(),
+            fingerprint: FRAME_FINGERPRINT.into(),
+            facts: Some(PromptFacts {
+                cwd: CWD.into(),
+                ..Default::default()
+            }),
+            mcp_tools: vec![serde_json::json!({ "name": FRAME_MCP_TOOL })],
+        });
+        let resumed = Resumed {
+            history: vec![Message::user(PROMPT.into())],
+            frame: Some(Arc::clone(&frame)),
+            ..resumed()
+        };
+        let mut track = SessionTrack::open(resumed, claim(&tmp), state_dir(&tmp), CWD);
+        push_prompt(&mut track, MODEL_SPEC, OBSERVATION);
+        drop(track);
+
+        let stored = load(&tmp);
+        assert_eq!(stored.frame(), Some(&frame), "{FRAME_KEPT}");
+        let reopened = SessionTrack::open(
+            Resumed::stored(SessionRef::from(session_id()), stored),
+            claim(&tmp),
+            state_dir(&tmp),
+            CWD,
+        );
+        assert_eq!(reopened.history.frame(), Some(&frame), "{FRAME_KEPT}");
     }
 
     /// `maki.session.messages` under a headless driver reads what the track

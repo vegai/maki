@@ -109,7 +109,7 @@ deny = ["admin_delete"]
 
 Each tool gets its own section with `allow` and `deny` arrays. Values are glob-like scope patterns.
 
-> **Note:** In MCP server sections (`[mcp.*]`), the boolean forms `allow = true` and `deny = true` are deprecated and ignored. Use `default = "allow"` or `default = "deny"` instead. For native tool sections (e.g. `[bash]`), `allow = true` still works.
+> **Note:** In MCP server sections (`[mcp.*]`), `allow` and `deny` take tool names only. Set a server-wide default with `default = "allow"` or `default = "deny"`. Native tool sections (e.g. `[bash]`) also accept `allow = true`.
 
 ### The `default` key
 
@@ -182,6 +182,11 @@ ACP clients offer the four options the protocol defines. "Allow always" lasts
 for the session, and "Reject always" is a project answer that follows folder
 trust like the TUI, reading "Reject for this session" in an untrusted folder.
 
+Plugin [background subagents](/docs/lua-api/#maki-agent-session) follow these
+rules, but nobody can answer their prompts, so a call that would prompt is
+denied. Give them allow rules for what they run. In plan mode their file writes
+are denied too.
+
 ### Scope Generalization
 
 When you pick "always allow" (or always deny for MCP), the saved scope is generalized so it stays useful beyond that one call:
@@ -234,17 +239,28 @@ table narrows that to an allowlist:
 ```toml
 [permissions]
 net = true
-net_hosts = ["api.acme.com", "*.acme.dev"]
+net_hosts = ["api.acme.com", "*.acme.dev", "127.0.0.1:7777"]
 ```
 
 A pattern is an exact host or a single leading `*.` label. `*.acme.dev` matches
 `api.acme.dev`, and it does not match `acme.dev` or `evilacme.dev`. An empty
 list reaches no host at all, which differs from leaving the key out.
 
+Add `:port` to allow one port only, as in `api.acme.com:443` or
+`*.acme.dev:8443`. Write an IPv6 address in brackets when it has a port, as in
+`[::1]:7777`. A pattern without a port allows every port on that host. Maki
+ignores a pattern it cannot read, such as `acme.com:x` or a bare `*`, and logs a
+warning naming the plugin.
+
 The list covers the plugin's `maki.net` calls and the `base_url` of any
 [provider it registers](/docs/providers/#plugin-providers), so an auth hook
 cannot send credentials to a host the manifest does not name. A plugin that
 calls `maki.provider.register` must declare a non-empty list.
+
+`maki.net.connect` opens raw TCP and only reaches hosts in `net_hosts`, so
+`net = true` alone is not enough for it. Give these entries a port, as in
+`127.0.0.1:7777`. A loopback or LAN address also needs
+`net.allowed_private_hosts`, as described below.
 
 For an installed [package](/docs/packages/#package-permissions), Maki stores
 the hosts with the approval and asks again when an update widens or drops the
@@ -257,6 +273,10 @@ list.
 To reach a service on your own machine or network, list it in [`net.allowed_private_hosts`](/docs/configuration/#net). An allowed host also keeps plain `http://` instead of being upgraded to `https://`, since a service on your LAN rarely has a certificate.
 
 A provider plugin calling its own origin also skips the guard, since chat requests already go there. This covers an origin you set with `<SLUG>_BASE_URL` or `providers.toml`, and a built-in provider's default. It does not cover a `base_url` that a third-party plugin declares.
+
+Maki reads proxy variables the way curl does: `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` in either case, and `http_proxy` (lowercase only) for plain `http://`.
+
+A host Maki cannot resolve is left to the proxy. Sandboxes such as nono need this, because they block DNS and only let traffic out through their proxy. A host that resolves to a private address is still refused. Two cases always resolve locally: `maki.net.connect`, which skips the proxy, and `socks4://` or `socks5://` proxies, which take an address. Use `socks4a://` or `socks5h://` to let the proxy resolve names.
 
 ## Session Persistence
 
