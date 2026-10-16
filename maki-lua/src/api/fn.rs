@@ -246,9 +246,9 @@ struct JobMeta {
     exit_code: Option<i32>,
     /// Recorded at exit so elapsed time stops counting once the process is gone.
     elapsed_secs: Option<u64>,
-    /// Exit code owed to an `on_exit` attached after the process already died,
+    /// Exit event owed to an `on_exit` attached after the process already died,
     /// served once by [`JobStore::next_matching`] as a synthetic event.
-    replay_exit: Option<i32>,
+    replay_exit: Option<(i32, bool)>,
 }
 
 impl JobMeta {
@@ -606,8 +606,8 @@ impl JobStore {
         let id = past_cursor.or(lowest)?;
         self.scan_cursor = id;
         let job = self.jobs.get_mut(&id)?;
-        if let Some(code) = job.replay_exit.take() {
-            return Some((id, JobEvent::Exit(code, false)));
+        if let Some((code, timed_out)) = job.replay_exit.take() {
+            return Some((id, JobEvent::Exit(code, timed_out)));
         }
         Some((id, job.event_rx.as_ref()?.try_recv().ok()?))
     }
@@ -721,7 +721,9 @@ impl JobStore {
             return false;
         }
         if matches!(updates.on_exit, CallbackUpdate::Set(_)) {
-            job.replay_exit = job.exit_code;
+            job.replay_exit = job
+                .exit_code
+                .map(|code| (code, ReapState::lock(&job.reap_state).timed_out));
         }
         updates.on_stdout.apply(lua, &mut job.on_stdout);
         updates.on_stderr.apply(lua, &mut job.on_stderr);
@@ -902,6 +904,7 @@ pub(crate) struct JobSnapshot {
     pub pid: u32,
     pub elapsed_secs: u64,
     pub exit_code: Option<i32>,
+    pub timed_out: bool,
     pub stdout_lines: Vec<String>,
     pub stderr_lines: Vec<String>,
     /// Some output never reached the tails, so what they hold is a window
@@ -921,6 +924,7 @@ impl JobSnapshot {
                 .elapsed_secs
                 .unwrap_or_else(|| job.started.elapsed().as_secs()),
             exit_code: job.exit_code,
+            timed_out: ReapState::lock(&job.reap_state).timed_out,
             stdout_lines: if tails {
                 job.stdout_tail.iter().cloned().collect()
             } else {
@@ -1546,11 +1550,12 @@ fn jobforget(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<()> {
 }
 
 /// Wait for a job to finish and collect its output. Returns a result
-/// table with `stdout`, `stderr`, `exit_code`, and `truncated`. A job that
+/// table with `stdout`, `stderr`, `exit_code`, `timed_out`, and `truncated`. A job that
 /// already exited answers from its captured tail, so `truncated` says
 /// whether that tail ever lost a line (`tail` too small or 0, or the stream
 /// redirected away). Waiting on a live job collects every line and is never
 /// truncated.
+/// `timed_out` is true when the job's own `timeout_ms` deadline stopped it.
 ///
 /// While waiting, the job's `on_stdout`, `on_stderr`, and `on_exit`
 /// callbacks fire as events arrive (like Neovim), so you can stream
@@ -1561,7 +1566,7 @@ fn jobforget(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<()> {
 ///
 /// @param job_id integer Job id returned by `jobstart`.
 /// @param timeout_ms integer? Maximum wait in milliseconds (default 30000).
-/// @return (table?, string?) `{ stdout, stderr, exit_code, truncated }`, or
+/// @return (table?, string?) `{ stdout, stderr, exit_code, timed_out, truncated }`, or
 ///   nil plus an error on timeout or an unknown job.
 /// @example
 /// local id = maki.fn.jobstart("echo hello")
@@ -1585,6 +1590,7 @@ async fn jobwait(
             &snap.stdout_lines,
             &snap.stderr_lines,
             code,
+            snap.timed_out,
             snap.dropped_output,
         );
     }
@@ -1601,7 +1607,7 @@ async fn jobwait(
     let mut stdout_lines = Vec::new();
     let mut stderr_lines = Vec::new();
 
-    let exit_code = loop {
+    let (exit_code, timed_out) = loop {
         let event =
             futures_lite::future::or(async { receiver.get().recv_async().await.ok() }, async {
                 (&mut deadline).await;
@@ -1621,11 +1627,18 @@ async fn jobwait(
         match event {
             JobEvent::Stdout(line) => stdout_lines.push(line),
             JobEvent::Stderr(line) => stderr_lines.push(line),
-            JobEvent::Exit(code, _) => break code,
+            JobEvent::Exit(code, timed_out) => break (code, timed_out),
         }
     };
 
-    wait_result(&lua, &stdout_lines, &stderr_lines, exit_code, false)
+    wait_result(
+        &lua,
+        &stdout_lines,
+        &stderr_lines,
+        exit_code,
+        timed_out,
+        false,
+    )
 }
 
 /// The single shape `jobwait` answers with, so its two paths cannot drift
@@ -1635,12 +1648,14 @@ fn wait_result(
     stdout: &[String],
     stderr: &[String],
     exit_code: i32,
+    timed_out: bool,
     truncated: bool,
 ) -> LuaResult<Pair<Table>> {
     let result = lua.create_table()?;
     result.set("stdout", stdout.join("\n"))?;
     result.set("stderr", stderr.join("\n"))?;
     result.set("exit_code", exit_code)?;
+    result.set("timed_out", timed_out)?;
     result.set("truncated", truncated)?;
     Ok((Some(result), None))
 }
@@ -1819,7 +1834,6 @@ mod tests {
     use std::fs::{self, Permissions};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    #[cfg(target_os = "linux")]
     use test_case::test_case;
 
     use super::*;
@@ -2858,20 +2872,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn attaching_on_exit_after_the_exit_replays_it_once() {
+    #[test_case(false ; "completed")]
+    #[test_case(true ; "timed_out")]
+    fn attaching_on_exit_after_the_exit_replays_it_once(timed_out: bool) {
         const CODE: i32 = 5;
         const REWIND: Duration = Duration::from_secs(60);
         let lua = Lua::new();
         let mut store = make_store();
         exited_session_job(&lua, &mut store, CODE);
+        ReapState::lock(&store.jobs[&1].reap_state).timed_out = timed_out;
         let at_exit = store.jobs[&1].elapsed_secs;
 
         assert!(store.attach(&lua, 1, None, TEST_PLUGIN, exit_updates(&lua)));
 
         let (id, event) = store.next_plugin_event().expect("replayed exit");
         assert_eq!(id, 1);
-        assert!(matches!(event, JobEvent::Exit(CODE, false)));
+        assert!(matches!(event, JobEvent::Exit(CODE, reported) if reported == timed_out));
         assert!(
             store.next_plugin_event().is_none(),
             "the replay must be served once"
@@ -2880,7 +2896,7 @@ mod tests {
         // Rewind the start so a second round of bookkeeping would show up in
         // the elapsed time instead of hiding in the same second.
         store.jobs.get_mut(&1).unwrap().started = Instant::now() - REWIND;
-        deliver(&mut store, &lua, 1, &JobEvent::Exit(CODE, false));
+        deliver(&mut store, &lua, 1, &event);
         assert_eq!(
             store.jobs[&1].elapsed_secs, at_exit,
             "a replayed exit must not restate when the job died"
