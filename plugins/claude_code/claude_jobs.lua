@@ -3,6 +3,7 @@ local M = {}
 
 M.ERROR_PREFIX = "claude_code: "
 M.LEFT_BEHIND = "maki did not remove: "
+M.CANCELLED = "cancelled"
 local STDERR_TAIL_LINES = 10
 M.MS_PER_SEC = 1000
 
@@ -92,6 +93,9 @@ end
 --- `keep_on_cancel` for a job that a kill could interrupt. The startup limit
 --- applies to such a job unless it has its own.
 function Call:spawn(argv, job_opts, how)
+  if self.stopped and not how.keep_on_cancel then
+    error(M.CANCELLED, 0)
+  end
   local limit = how.timeout_ms or how.keep_on_cancel and self.startup_ms or nil
   job_opts.timeout_ms = limit
   local id = self:start(argv, job_opts, function(job, code, timed_out)
@@ -100,14 +104,10 @@ function Call:spawn(argv, job_opts, how)
     end
   end)
   if not how.keep_on_cancel then
-    if self.stopped then
-      maki.fn.jobstop(id)
-    end
     self.stoppable[#self.stoppable + 1] = id
-    -- Each job gets its own hook, because `stop` runs on a cancel only for a
-    -- coding call. A job started after the cancel stops as soon as its hook
-    -- is registered.
+    -- Read-only calls have no artifact cleanup hook to stop subsequent work.
     maki.async.on_cancel(function()
+      self.stopped = true
       maki.fn.jobstop(id)
     end)
   end
