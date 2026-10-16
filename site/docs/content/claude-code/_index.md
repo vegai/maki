@@ -130,6 +130,8 @@ Each model gets the context window Claude Code opens for it. maki reads the wind
 
 Claude Code's own tools are off. When the model calls a tool, maki stops Claude Code and runs the call with its own tools and your permission rules. It sends the results with the next request. Claude Code's own retries are off too.
 
+On a normal shutdown, maki sends SIGTERM to the CLI leader and allows up to one second for Claude Code to remove its session file. Tool calls stay parked during this grace period. maki then kills remaining group members before reaping the leader. A reply at its output limit needs an immediate group kill to stop Claude Code's automatic continuation. This forced stop, cancellation, a crash, or a CLI that ignores SIGTERM can leave a session file in the Claude config directory. maki leaves Claude Code's private files alone.
+
 maki retries rate limits, overloads and server errors as it does for the anthropic provider. It also retries interrupted generations and a reply that stopped to call tools but called none. Held tool calls run only after the whole request succeeds. Login, policy, refusal and invariant errors stop the turn. Handoff, result-finalization and handoff-server deadlines also stop the turn without retrying. No output for `stream_timeout_secs` causes a stream timeout and a retry. Each turn starts a policy probe and a worker. Account and managed policy can change without changes to local files, so each turn checks them again. A changed executable also gets a version check, so this provider is slower than the anthropic one.
 
 Each turn runs on your subscription login, and maki counts it as $0. It shows the API list price of the same tokens beside it, such as `$0.000 (~$0.123 Claude subscription)`.
