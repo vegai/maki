@@ -506,6 +506,7 @@ mod tests {
     use std::io;
     use std::net::{Ipv4Addr, Shutdown};
     use std::sync::Arc;
+    use std::time::Duration;
 
     use flume::Receiver;
     use futures_lite::FutureExt;
@@ -531,7 +532,7 @@ mod tests {
     const TOOL: &str = "read";
     const TOOL_USE_ID: &str = "toolu_1";
     /// A failed handoff must fail the test so the suite can continue.
-    use super::super::fake::WAIT;
+    const WAIT: Duration = Duration::from_secs(30);
     /// A body length the request announces but never sends.
     const BODY_NEVER_SENT: usize = 1000;
 

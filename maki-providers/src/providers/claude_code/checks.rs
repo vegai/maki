@@ -675,12 +675,13 @@ mod tests {
 
     use super::super::error::{Error, Problem};
     use super::super::stream::{ACCOUNT_ANSWER, HOOKS_ANSWER, SETTINGS_ANSWER};
+    #[cfg(unix)]
+    use super::SETTINGS_NOT_A_FILE;
     use super::{
         COMMONDIR_FILE, CONNECTED, DEFAULT_MODE, FLAG_SOURCE, GIT_ENTRY, HANDSHAKE, InitExpect,
-        MAX_SETTINGS_BYTES, NO_KEY_SOURCE, NOT_AN_OBJECT, POLICY_SOURCE, SETTINGS_NOT_A_FILE,
-        SETTINGS_TOO_LARGE, UNREADABLE_FILE, account_problem, child_env, config_dir,
-        file_conflicts, init_problem, local_settings_dirs, plugins_problem, policy_problem,
-        profile, settings_conflicts,
+        MAX_SETTINGS_BYTES, NO_KEY_SOURCE, NOT_AN_OBJECT, POLICY_SOURCE, SETTINGS_TOO_LARGE,
+        UNREADABLE_FILE, account_problem, child_env, config_dir, file_conflicts, init_problem,
+        local_settings_dirs, plugins_problem, policy_problem, profile, settings_conflicts,
     };
 
     const VERSION: &str = "2.1.284";
