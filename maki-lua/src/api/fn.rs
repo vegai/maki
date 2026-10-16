@@ -1819,6 +1819,7 @@ mod tests {
     use std::fs::{self, Permissions};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(target_os = "linux")]
     use test_case::test_case;
 
     use super::*;
