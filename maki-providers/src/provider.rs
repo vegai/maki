@@ -1,7 +1,6 @@
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
 
 use flume::Sender;
 use serde_json::Value;
@@ -191,11 +190,13 @@ pub async fn from_model_async(
     model: &mut Model,
     timeouts: Timeouts,
 ) -> Result<Box<dyn Provider>, AgentError> {
-    let slug = Arc::clone(&model.provider);
-    let id = model.id.clone();
-    let provider = smol::unblock(move || provider_for_slug(&slug, timeouts)).await?;
-    provider.adjust_model(model);
-    debug!(provider = %model.provider, model = %id, "provider created");
+    let mut adjusted = model.clone();
+    let (provider, adjusted) = smol::unblock(move || {
+        let provider = from_model(&mut adjusted, timeouts)?;
+        Ok::<_, AgentError>((provider, adjusted))
+    })
+    .await?;
+    *model = adjusted;
     Ok(provider)
 }
 

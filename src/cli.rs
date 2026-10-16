@@ -1,7 +1,7 @@
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 
-use clap::builder::{StringValueParser, TypedValueParser};
+use clap::builder::{PossibleValuesParser, StringValueParser, TypedValueParser};
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use maki_storage::sessions::{Effort, StoredThinking, ThinkingParseError};
 
@@ -60,7 +60,7 @@ pub struct Cli {
     pub thinking: Option<StoredThinking>,
 
     /// Thinking effort for this launch: minimal through max
-    #[arg(long, global = true)]
+    #[arg(long, global = true, value_parser = PossibleValuesParser::new(Effort::ALL.map(Effort::as_str)).try_map(|value| value.parse::<Effort>()))]
     pub effort: Option<Effort>,
 
     /// Positive thinking-token budget for this launch
@@ -425,6 +425,7 @@ mod tests {
     use test_case::test_case;
 
     const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
+    const EFFORT_VALUES: &str = "[possible values: minimal, low, medium, high, xhigh, max]";
 
     #[test_case(&["--thinking", "xhigh"], "xhigh" ; "thinking_level")]
     #[test_case(&["--thinking", "off"], "off" ; "explicit_off")]
@@ -454,7 +455,7 @@ mod tests {
 
     #[test_case(&["--thinking", "turbo"], ErrorKind::ValueValidation ; "unknown_level")]
     #[test_case(&["--thinking", "0"], ErrorKind::ValueValidation ; "zero_thinking_budget")]
-    #[test_case(&["-p", "--effort", "turbo"], ErrorKind::ValueValidation ; "invalid_print_effort")]
+    #[test_case(&["-p", "--effort", "turbo"], ErrorKind::InvalidValue ; "invalid_print_effort")]
     #[test_case(&["acp", "--thinking", "turbo"], ErrorKind::ValueValidation ; "invalid_acp_thinking")]
     #[test_case(&["--max-thinking-tokens", "0"], ErrorKind::ValueValidation ; "zero_compatibility_budget")]
     #[test_case(&["--max-thinking-tokens", "high"], ErrorKind::ValueValidation ; "non_numeric_compatibility_budget")]
@@ -463,6 +464,17 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(error.kind(), expected);
+    }
+
+    #[test_case("off" ; "off")]
+    #[test_case("adaptive" ; "adaptive")]
+    #[test_case("4096" ; "token_budget")]
+    fn invalid_effort_lists_only_effort_levels(value: &str) {
+        let error = Cli::try_parse_from(["maki", "--effort", value])
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::InvalidValue);
+        assert!(error.to_string().contains(EFFORT_VALUES));
     }
 
     #[test_case("Read", "read")]
