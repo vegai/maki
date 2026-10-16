@@ -475,6 +475,7 @@ pub(crate) struct CompatProvider {
     build_body: Option<Arc<dyn BodyHook>>,
 }
 
+#[warn(clippy::missing_trait_methods)]
 impl Provider for CompatProvider {
     fn stream_message<'a>(
         &'a self,
@@ -540,6 +541,10 @@ impl Provider for CompatProvider {
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         let auth = self.auth.lock().unwrap().clone();
         Box::pin(async move { self.compat.do_list_models(&auth).await })
+    }
+
+    fn list_models_fresh(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        self.list_models()
     }
 
     /// The protocol has no usage endpoint. A declaration whose provider has
