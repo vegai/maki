@@ -630,6 +630,10 @@ impl Provider for CompatProvider {
         Box::pin(async move { self.compat.do_list_models(&auth).await })
     }
 
+    fn list_models_fresh(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        self.list_models()
+    }
+
     /// The protocol has no usage endpoint. A declaration whose provider has
     /// one answers through its `fetch_usage` hook, a layer above this.
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
