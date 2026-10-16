@@ -924,6 +924,7 @@ mod tests {
     #[test_case(Error::HandoffLate(30) => None ; "a_late_handoff")]
     #[test_case(Error::ResultLate(30) => None ; "a_late_result")]
     #[test_case(Error::ServerLate => None ; "a_late_server")]
+    #[test_case(Error::ReapLate => None ; "an_unreaped_process")]
     fn only_a_stalled_reply_is_retried_as_a_timeout(error: Error) -> Option<RetryKind> {
         agent_error(error.after_start(true)).retry_kind()
     }

@@ -88,6 +88,8 @@ pub(crate) enum Error {
     ResultLate(u64),
     #[error("Claude Code did not exit in time")]
     ExitLate,
+    #[error("Claude Code could not be reaped within the shutdown grace")]
+    ReapLate,
     #[error("maki's handoff server did not close in time")]
     ServerLate,
     #[error("`claude --version` printed nothing")]
