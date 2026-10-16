@@ -34,8 +34,14 @@ use maki_storage::id::{MakiId, SessionRef};
 #[cfg(unix)]
 use rustix::process::{Pid, test_kill_process_group};
 use serde_json::{Value, json};
+#[cfg(unix)]
+use test_case::test_case;
 
 const BUILTIN_COMMANDS: &[&str] = &["/sessions", "/rename", "/tasks"];
+#[cfg(unix)]
+const JOB_THAT_COMPLETES: &str = "true";
+#[cfg(unix)]
+const JOB_THAT_WAITS: &str = "sleep 30";
 const NARGS_ERR: &str = r#"'nargs' must be 0, 1, "?", "*", or "+""#;
 const GLOBAL_PACK_ONLY_ERR: &str = "only available in the global init.lua";
 const USAGE_TOOL_NAME: &str = "usage_child";
@@ -2980,6 +2986,59 @@ maki.api.register_tool({{
         "a tail that held everything is not truncated, an empty one we never filled is"
     );
 
+    host.event_handle()
+        .end_sessions_blocking([session], SessionEndReason::Shutdown);
+}
+
+#[cfg(unix)]
+#[test_case(false ; "completed")]
+#[test_case(true ; "timed_out")]
+fn jobwait_and_reattached_callbacks_preserve_timeout_status(timed_out: bool) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let session = MakiId::generate();
+    let _mailbox = SessionMailbox::register(session);
+    let command = if timed_out {
+        JOB_THAT_WAITS
+    } else {
+        JOB_THAT_COMPLETES
+    };
+    let timeout = if timed_out { "0" } else { "nil" };
+    let source = format!(
+        r#"
+maki.api.register_tool({{
+    name = "wait_timeout",
+    description = "timeout status survives waiting and reattachment",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local original
+        local id = maki.fn.jobstart("{command}", {{
+            scope = {{ session = "{session}" }},
+            timeout_ms = {timeout},
+            on_exit = function(_, _, _, expired) original = expired end,
+        }})
+        local first = assert(maki.fn.jobwait(id))
+        local second = assert(maki.fn.jobwait(id))
+        local replay = maki.async.await(1, function(done)
+            assert(maki.fn.jobattach(id, {{
+                on_exit = function(_, _, _, expired) done(expired) end,
+            }}))
+        end)
+        return table.concat({{
+            tostring(first.timed_out), tostring(second.timed_out),
+            tostring(original), tostring(replay),
+        }}, ":")
+    end,
+}})
+"#
+    );
+    host.load_source("deadline", &source).unwrap();
+    let expected = [timed_out; 4].map(|expired| expired.to_string()).join(":");
+    assert_eq!(
+        exec_tool(&reg, "wait_timeout", json!({})).unwrap(),
+        expected
+    );
     host.event_handle()
         .end_sessions_blocking([session], SessionEndReason::Shutdown);
 }

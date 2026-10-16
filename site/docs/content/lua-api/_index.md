@@ -2334,11 +2334,12 @@ maki.fn.jobwait({job_id}, {timeout_ms?})
 ```
 
 Wait for a job to finish and collect its output. Returns a result
-table with `stdout`, `stderr`, `exit_code`, and `truncated`. A job that
+table with `stdout`, `stderr`, `exit_code`, `timed_out`, and `truncated`. A job that
 already exited answers from its captured tail, so `truncated` says
 whether that tail ever lost a line (`tail` too small or 0, or the stream
 redirected away). Waiting on a live job collects every line and is never
 truncated.
+`timed_out` is true when the job's own `timeout_ms` deadline stopped it.
 
 While waiting, the job's `on_stdout`, `on_stderr`, and `on_exit`
 callbacks fire as events arrive (like Neovim), so you can stream
@@ -2354,7 +2355,7 @@ Requires the `run` [plugin permission](#plugin-permissions).
 - `{job_id}` (`integer`) Job id returned by `jobstart`.
 - `{timeout_ms?}` (`integer?`) Maximum wait in milliseconds (default 30000).
 
-**Returns:** (`table?`, `string?`) `{ stdout, stderr, exit_code, truncated }`, or
+**Returns:** (`table?`, `string?`) `{ stdout, stderr, exit_code, timed_out, truncated }`, or
   nil plus an error on timeout or an unknown job.
 
 **Example:**
