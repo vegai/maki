@@ -67,11 +67,6 @@ pub fn handshake() -> Value {
     json!(checks::HANDSHAKE)
 }
 
-pub fn environment(environ: HashMap<String, String>) -> (HashMap<String, String>, Vec<String>) {
-    let (env, withheld) = checks::child_env(environ);
-    (env.into_iter().collect(), withheld)
-}
-
 pub struct LaunchPreparation {
     pub env: Vec<(String, String)>,
     pub withheld: Vec<String>,

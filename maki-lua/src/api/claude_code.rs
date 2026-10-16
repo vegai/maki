@@ -129,15 +129,6 @@ fn base_settings(lua: &Lua) -> LuaResult<LuaValue> {
     json_to_lua(lua, &validation::base_settings())
 }
 
-/// Keep only variables that cannot redirect the subscription login.
-/// @param environ table Environment variables.
-/// @return (table, table) Child environment and withheld variable names.
-#[lua_fn]
-fn environment(lua: &Lua, environ: HashMap<String, String>) -> LuaResult<(Table, Vec<String>)> {
-    let (env, withheld) = validation::environment(environ);
-    Ok((lua.create_table_from(env)?, withheld))
-}
-
 /// Prepare the login environment and validate every skipped settings file.
 /// @param environ table Parent environment variables.
 /// @param configured string? Explicit config directory.
@@ -398,7 +389,7 @@ lua_table! {
     /// Claude Code launch checks shared with the subscription provider. JSON inputs retain
     /// the distinction between null, objects and arrays.
     "maki.claude_code" => pub(crate) fn create_claude_code_table(perms: &PluginPermissions), DOCS [
-        handshake, base_args, base_settings, empty_mcp_config, environment, prepare_launch(perms), private_dir(perms), home_state_files(perms),
+        handshake, base_args, base_settings, empty_mcp_config, prepare_launch(perms), private_dir(perms), home_state_files(perms),
         account_problem, policy_problem, init_problem,
         resolved_model, subscription_type, classify, version_check(perms), invalidate_version, sanitize_git(perms), project_git_dir(perms), unpack_blobs(perms),
     ]

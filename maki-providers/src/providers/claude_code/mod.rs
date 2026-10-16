@@ -67,6 +67,7 @@ const CLAUDE_CODE: EffortDialect = EffortDialect {
     off: None,
 };
 pub(crate) const SLUG: &str = "claude-code";
+pub(crate) const OAUTH_TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 const DISPLAY_NAME: &str = "Claude Code (experimental)";
 const PLUGIN: &str = "claude_code";
 const PLUGIN_OFF: &str =

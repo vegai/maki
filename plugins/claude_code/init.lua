@@ -484,7 +484,6 @@ local function import_handler(input, ctx)
     paths = input.paths,
     project = project,
     root = artifacts,
-    env = (native.environment(maki.uv.os_environ())),
   })
   if not result then
     return refuse(err)

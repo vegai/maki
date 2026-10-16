@@ -14,6 +14,7 @@ use rustix::fs::{Mode, OFlags, open};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
+use super::OAUTH_TOKEN_ENV;
 use super::error::{Error, Problem};
 
 pub(crate) const MINIMUM_VERSION: [u64; 3] = [2, 1, 284];
@@ -55,12 +56,12 @@ const PASSED_ENV: &[&str] = &[
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
     "CLAUDE_CONFIG_DIR",
-    "CLAUDE_CODE_OAUTH_TOKEN",
+    OAUTH_TOKEN_ENV,
 ];
 const PASSED_ENV_PREFIXES: &[&str] = &["LC_", "XDG_"];
 const ROUTE_ENV: &[&str] = &[
     "CLAUDE_CODE_API_BASE_URL",
-    "CLAUDE_CODE_OAUTH_TOKEN",
+    OAUTH_TOKEN_ENV,
     "CLAUDE_CONFIG_DIR",
 ];
 const ROUTE_ENV_PREFIXES: &[&str] = &["CLAUDE_CODE_USE_", "ANTHROPIC_"];

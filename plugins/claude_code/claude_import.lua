@@ -15,12 +15,12 @@ local UNRECORDED = "maki could not record this in the artifact (%s), so a second
   .. "changed."
 
 -- git records the owner's execute bit, whoever runs maki.
-local function owner_executes(call, env, cwd, paths, keep_on_cancel, timeout_ms)
+local function owner_executes(call, cwd, paths, keep_on_cancel, timeout_ms)
   if #paths == 0 then
     return {}
   end
   local out, err = call:run_quick({ "xargs", "-0", "stat", "-c", "%A", "--" }, {
-    env = env,
+    inherit_env = true,
     cwd = cwd,
     stdin = table.concat(paths, "\0"),
     keep_on_cancel = keep_on_cancel,
@@ -39,10 +39,10 @@ end
 -- Maps each path to its `file_state`, false when missing, or a note when it
 -- is not a regular file. Hashes use the object format of {artifact}'s
 -- repository, which can differ from the checkout's.
-local function checkout_state(call, env, artifact, changes, keep_on_cancel)
+local function checkout_state(call, artifact, changes, keep_on_cancel)
   local project = artifact.manifest.project
   local timeout_ms = workspace.import_timeout(changes) * jobs.MS_PER_SEC
-  local git_env = workspace.snapshot_git_env(env, maki.fs.joinpath(artifact.dir, workspace.GIT_DIR), project)
+  local git_env = workspace.snapshot_git_env({}, maki.fs.joinpath(artifact.dir, workspace.GIT_DIR), project)
   local state, files = {}, {}
   for _, change in ipairs(changes) do
     local meta, meta_err = maki.fs.metadata(maki.fs.joinpath(project, change.path), false)
@@ -60,7 +60,7 @@ local function checkout_state(call, env, artifact, changes, keep_on_cancel)
   if not blobs then
     return nil, err
   end
-  local executable, executable_err = owner_executes(call, env, project, files, keep_on_cancel, timeout_ms)
+  local executable, executable_err = owner_executes(call, project, files, keep_on_cancel, timeout_ms)
   if not executable then
     return nil, executable_err
   end
@@ -164,8 +164,8 @@ local function select_changes(manifest, paths)
 end
 
 --- Reject checkout edits made since the snapshot before requesting approval.
-local function check_import(call, env, artifact, todo)
-  local current, current_err = checkout_state(call, env, artifact, todo)
+local function check_import(call, artifact, todo)
+  local current, current_err = checkout_state(call, artifact, todo)
   if not current then
     return "maki cannot examine the checkout: " .. current_err
   end
@@ -202,7 +202,7 @@ local function missing_folders(project, changes)
   return missing
 end
 
-local function stage_blobs(call, env, artifact, todo, stage)
+local function stage_blobs(call, artifact, todo, stage)
   local hashes, seen = {}, {}
   for _, change in ipairs(todo) do
     if change.status ~= workspace.DELETED and not seen[change.new_sha] then
@@ -216,7 +216,8 @@ local function stage_blobs(call, env, artifact, todo, stage)
   local batch = maki.fs.joinpath(stage, "batch")
   local output, err = call:run_quick(workspace.git({ "--git-dir=" .. artifact.git, "cat-file", "--batch" }), {
     cwd = artifact.manifest.project,
-    env = workspace.snapshot_git_env(env, artifact.git, artifact.manifest.project),
+    env = workspace.snapshot_git_env({}, artifact.git, artifact.manifest.project),
+    inherit_env = true,
     stdin = table.concat(hashes, "\n") .. "\n",
     stdout = batch,
     timeout_ms = workspace.import_timeout(todo) * jobs.MS_PER_SEC,
@@ -230,7 +231,7 @@ end
 --- Returns the changes the import applied, and the error if it stopped. The
 --- command can stop anywhere between approval and the last rename, so maki
 --- reads the checkout to see what landed.
-local function apply_import(ctx, call, env, artifact, todo)
+local function apply_import(ctx, call, artifact, todo)
   local project = artifact.manifest.project
   local made = missing_folders(project, todo)
   local stage, stage_err = maki.fs.mkdtemp(maki.fs.joinpath(artifact.dir, workspace.STAGE_TEMPLATE))
@@ -243,7 +244,7 @@ local function apply_import(ctx, call, env, artifact, todo)
     maki.fs.rm(stage, { recursive = true, force = true })
     return nil, IMPORT_TOO_LARGE
   end
-  local staged, blob_err = stage_blobs(call, env, artifact, todo, stage)
+  local staged, blob_err = stage_blobs(call, artifact, todo, stage)
   if not staged then
     maki.fs.rm(stage, { recursive = true, force = true })
     return nil, blob_err
@@ -264,7 +265,7 @@ local function apply_import(ctx, call, env, artifact, todo)
     call.run_to_end,
     call,
     { "bash", "-c", workspace.leftovers_script(todo, project, stage, made) },
-    { env = env, clear_env = true, cwd = project },
+    { cwd = project },
     { keep_on_cancel = true },
     call.startup_ms
   )
@@ -275,7 +276,7 @@ local function apply_import(ctx, call, env, artifact, todo)
   if not ran or code ~= 0 then
     err = err .. "\n" .. LEFTOVERS_REMAIN:format(workspace.temp_name(stage))
   end
-  local now, now_err = checkout_state(call, env, artifact, todo, true)
+  local now, now_err = checkout_state(call, artifact, todo, true)
   if not now then
     local paths = {}
     for i, change in ipairs(todo) do
@@ -303,14 +304,14 @@ local function import_locked(ctx, call, spec)
   if not todo then
     return nil, skipped
   end
-  local problem = check_import(call, spec.env, artifact, todo)
+  local problem = check_import(call, artifact, todo)
   if problem then
     return nil, problem
   end
   if #todo == 0 then
     return { applied = {}, skipped = skipped }
   end
-  local landed, failure, matched = apply_import(ctx, call, spec.env, artifact, todo)
+  local landed, failure, matched = apply_import(ctx, call, artifact, todo)
   if not landed then
     return nil, failure
   end
