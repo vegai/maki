@@ -1,5 +1,6 @@
 local t = require("maki.test_helpers")
 local jobs = require("claude_jobs")
+local snapshot = require("claude_snapshot")
 
 local case, eq, has = t.case, t.eq, t.has
 local STARTUP_MS = 30000
@@ -31,6 +32,9 @@ local function with_jobs(run)
       maki.fn,
       "jobstart",
       function(argv, opts)
+        if state.start_error then
+          return nil, state.start_error
+        end
         state.started[#state.started + 1] = { argv = argv, opts = opts }
         return #state.started
       end,
@@ -281,6 +285,49 @@ case("a_cancel_reports_a_directory_left_before_the_reply", function()
     eq(#state.notices, 1)
     has(state.notices[1].message, DIRECTORY)
     eq(#call.left_behind, 0)
+  end)
+end)
+
+for _, code in ipairs({ SUCCESS_CODE, STOPPED_CODE }) do
+  case("artifact_cleanup_reports_its_exit_" .. code, function()
+    with_jobs(function(state)
+      local releases = 0
+      local call = jobs.new(STARTUP_MS, function()
+        releases = releases + 1
+      end)
+      call:stop()
+      local removed = 0
+      snapshot.discard(call, { dir = DIRECTORY }, function()
+        removed = removed + 1
+      end)
+      eq(call.alive, 1)
+      eq(state.started[1].opts.guard, true)
+      eq(state.stopped[1], nil)
+      call:answer()
+      eq(releases, 0)
+      eq(#state.notices, 0)
+      eq(removed, 0)
+      state.started[1].opts.on_exit(1, code)
+      eq(removed, 1)
+      eq(releases, 1)
+      eq(#state.notices, code == SUCCESS_CODE and 0 or 1)
+      if code ~= SUCCESS_CODE then
+        eq(state.notices[1].message, jobs.ERROR_PREFIX .. jobs.LEFT_BEHIND .. DIRECTORY)
+      end
+    end)
+  end)
+end
+
+case("artifact_cleanup_reports_a_failed_start", function()
+  with_jobs(function(state)
+    state.start_error = CALLBACK_ERROR
+    local call = jobs.new(STARTUP_MS)
+    snapshot.discard(call, { dir = DIRECTORY })
+    eq(call.alive, 0)
+    eq(call.left_behind[1], DIRECTORY)
+    call:answer()
+    eq(#state.notices, 1)
+    eq(state.notices[1].message, jobs.ERROR_PREFIX .. jobs.LEFT_BEHIND .. DIRECTORY)
   end)
 end)
 
