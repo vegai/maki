@@ -161,6 +161,40 @@ case("a_completed_job_reports_its_output", function()
   end)
 end)
 
+for _, cancel_job in ipairs({ false, true }) do
+  case("a_stopped_call_allows_only_cleanup_jobs_cancel_hook_" .. tostring(cancel_job), function()
+    with_jobs(function(state)
+      local call = jobs.new(STARTUP_MS)
+      state.finish = function()
+        if cancel_job then
+          state.cancel[1]()
+        else
+          call:stop()
+        end
+        eq(state.stopped[1], true)
+        state.started[1].opts.on_exit(1, STOPPED_CODE)
+      end
+      call:run_quick(COMMAND, {})
+
+      local output, err = call:run_quick(COMMAND, {})
+      eq(output, nil)
+      eq(#state.started, 1)
+      has(err, jobs.CANCELLED)
+
+      state.finish = function()
+        state.started[2].opts.on_stdout(2, OUTPUT)
+        state.started[2].opts.on_exit(2, SUCCESS_CODE)
+      end
+      output, err = call:run_quick(COMMAND, { keep_on_cancel = true })
+      eq(output, OUTPUT)
+      eq(err, nil)
+      eq(#state.started, 2)
+      eq(state.stopped[2], nil)
+      eq(call.alive, 0)
+    end)
+  end)
+end
+
 case("redirected_output_keeps_the_guard_and_explicit_timeout", function()
   with_jobs(function(state)
     local call = jobs.new(STARTUP_MS)
