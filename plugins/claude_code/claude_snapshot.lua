@@ -680,13 +680,13 @@ local function commit_prepared(call, artifact)
   artifact.base = prepared
 end
 
---- `prepare` runs as the user, outside the sandbox, with maki's environment
---- and the artifact's `TMPDIR`. maki removes external symlinks and makes
+--- `prepare` runs as the user, outside the sandbox, with local Git variables
+--- unset and the artifact's `TMPDIR`. maki removes external symlinks and makes
 --- hard-linked files private before the worker starts.
 --- Records a command error and returns any fatal sanitation or baseline error.
 function M.prepare(call, artifact, command, env, timeout_ms)
   local _, err = call:run_quick(
-    { "sh", "-c", command },
+    { "sh", "-c", workspace.without_local_git_env(command) },
     { env = { TMPDIR = env.TMPDIR }, inherit_env = true, cwd = artifact.snapshot, timeout_ms = timeout_ms }
   )
   artifact.prepare_err = err
