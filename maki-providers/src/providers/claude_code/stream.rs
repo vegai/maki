@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use tracing::debug;
 
 use super::checks::{self, HANDSHAKE, InitExpect};
-use super::error::{Error, TOO_MANY_REQUESTS, UNKNOWN_ERROR, shown};
+use super::error::{Error, Problem, TOO_MANY_REQUESTS, UNKNOWN_ERROR, shown};
 use super::mcp::Handoff;
 use super::transcript::{BATCH_CALL_TOOL, BATCH_CALLS, BATCH_TOOL, Catalog};
 use crate::model::is_same_model;
@@ -441,6 +441,19 @@ impl Handshake {
     }
 
     pub(crate) fn answer(&mut self, response: &Value) -> Result<bool, Error> {
+        self.checked_answer(response, checks::account_problem, checks::policy_problem)
+    }
+
+    pub(crate) fn account(&self) -> &Value {
+        self.answers.get(ACCOUNT_ANSWER).unwrap_or(&Value::Null)
+    }
+
+    pub(crate) fn checked_answer(
+        &mut self,
+        response: &Value,
+        account_problem: impl FnOnce(&Value) -> Option<Problem>,
+        policy_problem: impl FnOnce(&Value, &Value) -> Option<Problem>,
+    ) -> Result<bool, Error> {
         let id = response["request_id"].as_str().unwrap_or_default();
         if !HANDSHAKE.iter().any(|step| step.id == id) || self.answers.contains_key(id) {
             return Err(Error::StrayAnswer(id.to_owned()));
@@ -453,17 +466,28 @@ impl Handshake {
         }
         self.answers
             .insert(id.to_owned(), response["response"].clone());
-        if HANDSHAKE
-            .iter()
-            .any(|step| !self.answers.contains_key(step.id))
-        {
+        if self.answers.len() != HANDSHAKE.len() {
             return Ok(false);
         }
-        match checks::account_problem(&self.answers[ACCOUNT_ANSWER]).or_else(|| {
-            checks::policy_problem(&self.answers[SETTINGS_ANSWER], &self.answers[HOOKS_ANSWER])
-        }) {
+        self.check(account_problem, policy_problem)?;
+        Ok(true)
+    }
+
+    pub(crate) fn check(
+        &self,
+        account_problem: impl FnOnce(&Value) -> Option<Problem>,
+        policy_problem: impl FnOnce(&Value, &Value) -> Option<Problem>,
+    ) -> Result<(), Error> {
+        for step in HANDSHAKE {
+            if !self.answers.contains_key(step.id) {
+                return Err(Error::NotAnswered(step.id.to_owned()));
+            }
+        }
+        match account_problem(self.account())
+            .or_else(|| policy_problem(&self.answers[SETTINGS_ANSWER], &self.answers[HOOKS_ANSWER]))
+        {
             Some(problem) => Err(Error::Check(problem)),
-            None => Ok(true),
+            None => Ok(()),
         }
     }
 }

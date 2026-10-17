@@ -745,14 +745,58 @@ end)
 
 -- ── claude_stream ──
 
+local function handshake_answer(handshake, id, response, subtype)
+  return handshake:answer(maki.json.encode({
+    type = "control_response",
+    response = { request_id = id, subtype = subtype or "success", response = response },
+  }))
+end
+
 case("a_complete_clean_handshake_passes", function()
   local answers = { account = account_answer(), settings = settings_answer(), hooks = HOOKS_OFF }
-  eq(launch.handshake_problem(answers, "", READ), nil)
+  local handshake = launch.worker_handshake("", READ)
+  for i = #launch.HANDSHAKE, 1, -1 do
+    local complete, problem = handshake_answer(handshake, launch.HANDSHAKE[i].id, answers[launch.HANDSHAKE[i].id])
+    eq(problem, nil)
+    eq(complete, i == 1)
+  end
+  local complete, problem = handshake:finish()
+  eq(complete, true)
+  eq(problem, nil)
 end)
 
 case("a_missing_handshake_answer_is_refused", function()
-  local answers = { account = account_answer(), hooks = HOOKS_OFF }
-  has(launch.handshake_problem(answers, "", READ) or "", "did not send a response to the settings request")
+  local handshake = launch.worker_handshake("", READ)
+  handshake_answer(handshake, "account", account_answer())
+  handshake_answer(handshake, "hooks", HOOKS_OFF)
+  local complete, problem = handshake:finish()
+  eq(complete, nil)
+  has(problem or "", "did not answer its settings request")
+end)
+
+for _, c in ipairs({
+  { name = "an_unknown_answer", id = "unknown", want = "never sent" },
+  { name = "a_repeated_answer", id = "account", want = "answered it twice" },
+  { name = "a_refused_answer", id = "settings", subtype = "error", want = "rejected the settings request" },
+}) do
+  case("a_worker_handshake_refuses_" .. c.name, function()
+    local handshake = launch.worker_handshake("", READ)
+    handshake_answer(handshake, "account", account_answer())
+    local complete, problem = handshake_answer(handshake, c.id, {}, c.subtype)
+    eq(complete, nil)
+    has(problem or "", c.want)
+  end)
+end
+
+case("a_worker_checks_the_account_before_the_policy", function()
+  local handshake = launch.worker_handshake("", READ)
+  local pending, problem = handshake_answer(handshake, "account", account_answer({ apiProvider = "other" }))
+  eq(pending, false)
+  eq(problem, nil)
+  handshake_answer(handshake, "settings", {})
+  local complete, failure = handshake_answer(handshake, "hooks", HOOKS_OFF)
+  eq(complete, nil)
+  has(failure or "", "instead of Anthropic")
 end)
 
 for _, accepted in ipairs({ false, true }) do

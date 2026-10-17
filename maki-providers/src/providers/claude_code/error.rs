@@ -314,6 +314,8 @@ fn is_temporary_status(status: u16) -> bool {
 
 #[derive(Debug, Error)]
 pub(crate) enum Problem {
+    #[error("{0}")]
+    WorkerPolicy(String),
     #[error("Claude Code did not report its login")]
     NoLogin,
     #[error("Claude Code would use an API key from {} instead of the subscription", shown(.0))]
