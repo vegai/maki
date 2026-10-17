@@ -40,6 +40,8 @@ type Hold = (&'static str, &'static str);
 /// The tool the command reads each blob from the artifact with.
 const STAGING: Hold = ("git", " cat-file ");
 const USER_GIT_CONFIG: &str = "gitconfig";
+const REVIEW_SCRIPT: &str = "review.sh";
+const INVALID_GIT_SETTING: &str = "invalid-git-setting";
 /// A line git cannot parse, so any git that reads the file fails.
 const BROKEN_GIT_CONFIG: &str = "[core\n";
 /// The artifact folder where each test's import stages its blobs, named as
@@ -75,6 +77,7 @@ local changes = ({
 })["@CHANGES@"]
 maki.fs.write("@OUT@", workspace.import_script(changes, "@PROJECT@", "@GIT@", "@ARTIFACT@", "@STAGE@"))
 maki.fs.write("@LEFTOVERS@", workspace.leftovers_script(changes, "@PROJECT@", "@STAGE@", { [==[@MADE@]==] }))
+maki.fs.write("@REVIEW@", workspace.diff_command({ git = "@GIT@", snapshot = "@PROJECT@", base = "@OLD@", tree = "@NEW@" }))
 "#;
 /// The changes an import applies, by their name in `GENERATE`.
 const EDIT_AND_ADD: &str = "edit_and_add";
@@ -186,6 +189,7 @@ impl Import {
                 &project.join(added).parent().unwrap().to_string_lossy(),
             )
             .replace("@LEFTOVERS@", &leftovers.to_string_lossy())
+            .replace("@REVIEW@", &base.join(REVIEW_SCRIPT).to_string_lossy())
             .replace("@OLD@", &old)
             .replace("@NEW@", &new)
             .replace("@OUT@", &out.to_string_lossy())
@@ -669,6 +673,29 @@ fn a_cleanup_that_cannot_clear_a_folder_fails() {
         "the cleanup removed the temporary files through the link: {:?}",
         listing(&moved)
     );
+}
+
+#[test_case("GIT_OBJECT_DIRECTORY" ; "object_directory")]
+#[test_case("GIT_COMMON_DIR" ; "common_directory")]
+#[test_case("GIT_CONFIG_PARAMETERS" ; "config_parameters")]
+#[test_case("GIT_CONFIG_COUNT" ; "config_count")]
+fn generated_git_commands_ignore_shell_only_variables(variable: &str) {
+    let import = Import::new(STAGING);
+    let review = fs::read_to_string(import.marker(REVIEW_SCRIPT)).unwrap();
+    fs::File::create(import.marker("release")).unwrap();
+    for script in [&review, &import.script] {
+        let output = import
+            .command(script)
+            .env(variable, import.marker(INVALID_GIT_SETTING))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{variable}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(fs::read_to_string(import.target()).unwrap(), RECORDED);
 }
 
 /// User git config must not affect the artifact repository or the import.

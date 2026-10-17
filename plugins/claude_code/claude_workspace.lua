@@ -15,7 +15,24 @@ M.MANIFEST_VERSION = 1
 local DEFAULT_DENY = { ".env*", "**/.env*", "secrets", "**/secrets", "secrets/**", "**/secrets/**" }
 
 local GIT_UNCONFIGURED = { GIT_CONFIG_GLOBAL = "/dev/null", GIT_CONFIG_NOSYSTEM = "1" }
-local GIT_ENV_PREFIX = "GIT_"
+-- Repository-local variables listed by `git rev-parse --local-env-vars`.
+local GIT_LOCAL_ENV_VARS = {
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_CONFIG",
+  "GIT_CONFIG_PARAMETERS",
+  "GIT_CONFIG_COUNT",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_IMPLICIT_WORK_TREE",
+  "GIT_GRAFT_FILE",
+  "GIT_INDEX_FILE",
+  "GIT_NO_REPLACE_OBJECTS",
+  "GIT_REPLACE_REF_BASE",
+  "GIT_PREFIX",
+  "GIT_SHALLOW_FILE",
+  "GIT_COMMON_DIR",
+}
 
 -- With these attributes a blob id is the hash of the bytes on disk, the same
 -- id `git hash-object --no-filters` gives for the checkout.
@@ -262,19 +279,8 @@ function M.shell_quote(text)
 end
 
 local function git_environment()
-  local inherited = { GIT_CONFIG_PARAMETERS = true, GIT_CONFIG_COUNT = true }
-  for name in pairs(maki.uv.os_environ()) do
-    if name:sub(1, #GIT_ENV_PREFIX) == GIT_ENV_PREFIX then
-      inherited[name] = true
-    end
-  end
-  local names = {}
-  for name in pairs(inherited) do
-    names[#names + 1] = name
-  end
-  table.sort(names)
   local words = { "env" }
-  for _, name in ipairs(names) do
+  for _, name in ipairs(GIT_LOCAL_ENV_VARS) do
     words[#words + 1] = "-u"
     words[#words + 1] = M.shell_quote(name)
   end
