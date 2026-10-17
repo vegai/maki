@@ -316,10 +316,17 @@ local function deny_rules(extra)
   return rules
 end
 
+local function worker_policy(deny_read, worker, confine)
+  return {
+    deny = deny_rules(deny_read),
+    sandbox = worker.sandboxed and assert(confine, "a sandboxed worker needs confinement paths") or nil,
+  }
+end
+
 --- Only maki settings and safe managed restrictions can pass. The worker shell must also
 --- remain inside `confine`.
 function M.policy_problem(settings, hooks, deny_read, worker, confine)
-  return native.policy_problem(json(settings), json(hooks), maki.json.encode(M.settings(deny_read, worker, confine)))
+  return native.policy_problem(json(settings), json(hooks), worker_policy(deny_read, worker, confine))
 end
 
 --- The keys of {answers} are the request ids.
@@ -338,23 +345,7 @@ end
 --- {worker} that runs commands gets the sandbox with {confine}'s absolute
 --- paths, and Bash runs only inside it.
 function M.settings(deny_read, worker, confine)
-  local settings = native.base_settings()
-  settings.permissions = {
-    blockReadsOutsideWorkingDirectories = true,
-    deny = deny_rules(deny_read),
-  }
-  if worker.sandboxed then
-    settings.sandbox = {
-      enabled = true,
-      failIfUnavailable = true,
-      autoAllowBashIfSandboxed = true,
-      allowUnsandboxedCommands = false,
-      -- A table from `decode` keeps its array mark, so `encode` writes `[]`.
-      network = { allowedDomains = maki.json.decode("[]"), strictAllowlist = true },
-      filesystem = { denyRead = confine.deny_read, allowRead = confine.allow_read, allowWrite = confine.allow_write },
-    }
-  end
-  return settings
+  return native.worker_settings(worker_policy(deny_read, worker, confine))
 end
 
 --- Returns how many whole seconds a call can run: {requested} or

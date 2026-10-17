@@ -5,6 +5,7 @@ use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::ProviderUsage;
@@ -61,6 +62,46 @@ pub fn base_args(model: &str, tools: &str, mode: &str, settings: &str) -> Vec<St
 
 pub fn base_settings() -> Value {
     json!({ "disableAllHooks": true, "autoMemoryEnabled": false, "claudeMdExcludes": ["**"], "disableClaudeAiConnectors": true })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerPolicy {
+    deny: Vec<String>,
+    sandbox: Option<WorkerPaths>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerPaths {
+    deny_read: Vec<String>,
+    allow_read: Vec<String>,
+    allow_write: Vec<String>,
+}
+
+impl WorkerPolicy {
+    pub fn settings(&self) -> Value {
+        let mut settings = base_settings();
+        settings["permissions"] = json!({
+            "blockReadsOutsideWorkingDirectories": true,
+            "deny": self.deny,
+        });
+        if let Some(paths) = &self.sandbox {
+            settings["sandbox"] = json!({
+                "enabled": true,
+                "failIfUnavailable": true,
+                "autoAllowBashIfSandboxed": true,
+                "allowUnsandboxedCommands": false,
+                "network": { "allowedDomains": [], "strictAllowlist": true },
+                "filesystem": {
+                    "denyRead": paths.deny_read,
+                    "allowRead": paths.allow_read,
+                    "allowWrite": paths.allow_write,
+                },
+            });
+        }
+        settings
+    }
 }
 
 pub fn handshake() -> Value {
@@ -185,18 +226,7 @@ pub fn account_problem(init: &Value, modes: &[String]) -> Option<String> {
     checks::account_problem_in(response(init), modes).map(|problem| problem.to_string())
 }
 
-pub fn worker_policy(settings: &Value, hooks: &Value, expected: &Value) -> Result<(), String> {
-    if expected["permissions"]["blockReadsOutsideWorkingDirectories"] != true
-        || expected["permissions"]["deny"].as_array().is_none()
-        || expected
-            .get("sandbox")
-            .is_some_and(|sandbox| !sandbox.is_object())
-    {
-        return Err(
-            "expected worker settings must contain read restrictions and valid sandbox settings"
-                .to_owned(),
-        );
-    }
+pub fn worker_policy(settings: &Value, hooks: &Value, policy: &WorkerPolicy) -> Result<(), String> {
     let settings = response(settings);
     if let Some(problem) = checks::policy_problem_in(settings, response(hooks), false) {
         return Err(problem.to_string());
@@ -205,7 +235,7 @@ pub fn worker_policy(settings: &Value, hooks: &Value, expected: &Value) -> Resul
     if !effective.is_object() {
         return Err("Claude Code does not report effective settings".to_owned());
     }
-    match worker_problem(effective, expected) {
+    match worker_problem(effective, &policy.settings()) {
         Some(problem) => Err(problem),
         None => Ok(()),
     }
@@ -362,9 +392,9 @@ fn sandbox_problem(sandbox: &Value, expected: &Value) -> Option<String> {
         "filesystem",
     ];
     if sandbox.keys().any(|key| !safe_keys.contains(&key.as_str()))
-        || sandbox.get("enabled") != Some(&Value::Bool(true))
-        || sandbox.get("failIfUnavailable") != Some(&Value::Bool(true))
-        || sandbox.get("allowUnsandboxedCommands") != Some(&Value::Bool(false))
+        || ["enabled", "failIfUnavailable", "allowUnsandboxedCommands"]
+            .iter()
+            .any(|key| sandbox.get(*key) != expected.get(*key))
         || !empty_array(sandbox.get("excludedCommands"))
         || sandbox
             .get("enableWeakerNestedSandbox")
@@ -387,8 +417,12 @@ fn sandbox_problem(sandbox: &Value, expected: &Value) -> Option<String> {
     if network
         .keys()
         .any(|key| !network_keys.contains(&key.as_str()))
-        || network.get("strictAllowlist") != Some(&Value::Bool(true))
-        || !empty_array(network.get("allowedDomains"))
+        || network.get("strictAllowlist") != expected["network"].get("strictAllowlist")
+        || foreign_path(
+            network.get("allowedDomains"),
+            &expected["network"]["allowedDomains"],
+        )
+        .is_some()
         || !empty_array(network.get("allowUnixSockets"))
         || network
             .get("allowAllUnixSockets")
@@ -443,7 +477,9 @@ fn sandbox_problem(sandbox: &Value, expected: &Value) -> Option<String> {
 
 fn worker_problem(effective: &Value, expected: &Value) -> Option<String> {
     let permissions = &effective["permissions"];
-    if permissions["blockReadsOutsideWorkingDirectories"] != true {
+    if permissions["blockReadsOutsideWorkingDirectories"]
+        != expected["permissions"]["blockReadsOutsideWorkingDirectories"]
+    {
         return Some("Claude Code does not block reads outside the project".to_owned());
     }
     if !empty_array(permissions.get("additionalDirectories")) {
@@ -482,7 +518,7 @@ fn worker_problem(effective: &Value, expected: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{sandbox_problem, worker_problem};
+    use super::{WorkerPaths, WorkerPolicy, sandbox_problem, worker_problem};
     use serde_json::{Value, json};
     use test_case::test_case;
 
@@ -491,19 +527,24 @@ mod tests {
     const OUTSIDE: &str = "/outside";
 
     fn expected() -> Value {
-        json!({
-            "permissions": { "blockReadsOutsideWorkingDirectories": true, "deny": [READ_RULE] },
-            "sandbox": {
-                "enabled": true, "failIfUnavailable": true, "allowUnsandboxedCommands": false,
-                "network": { "strictAllowlist": true, "allowedDomains": [] },
-                "filesystem": { "denyRead": [DENIED], "allowRead": [], "allowWrite": [] }
-            }
-        })
+        WorkerPolicy {
+            deny: vec![READ_RULE.into()],
+            sandbox: Some(WorkerPaths {
+                deny_read: vec![DENIED.into()],
+                allow_read: Vec::new(),
+                allow_write: Vec::new(),
+            }),
+        }
+        .settings()
     }
 
     #[test_case("/excludedCommands", json!(null) ; "null_command_exclusions")]
     #[test_case("/network/allowedDomains", json!([null]) ; "null_domain_entry")]
     #[test_case("/network/allowAllUnixSockets", json!(null) ; "null_socket_policy")]
+    #[test_case("/network/strictAllowlist", json!(false) ; "network_allowlist_disabled")]
+    #[test_case("/enabled", json!(false) ; "sandbox_disabled")]
+    #[test_case("/failIfUnavailable", json!(false) ; "sandbox_fallback")]
+    #[test_case("/allowUnsandboxedCommands", json!(true) ; "unsandboxed_commands")]
     #[test_case("/filesystem/allowRead", json!([null]) ; "null_read_entry")]
     #[test_case("/filesystem/allowWrite", json!([OUTSIDE]) ; "foreign_write_path")]
     #[test_case("/unknownEscape", json!(true) ; "unknown_sandbox_setting")]
