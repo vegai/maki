@@ -5,6 +5,7 @@
 //! maki selects once per process.
 #![cfg(target_os = "linux")]
 
+use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
 use std::os::unix::fs::symlink;
@@ -15,6 +16,7 @@ use std::time::{Duration, SystemTime};
 use maki_agent::tools::test_support::stub_ctx_in;
 use maki_agent::tools::{ToolContext, ToolRegistry};
 use maki_lua::PluginHost;
+use maki_providers::claude_code::validation;
 use serde_json::{Map, Value, json};
 use tempfile::{TempDir, tempdir};
 use test_case::test_case;
@@ -208,6 +210,26 @@ fn a_temp_dir_that_leads_into_the_project_is_refused() {
             "maki must make no file in the project"
         );
     }
+}
+
+#[test]
+fn an_empty_tmpdir_is_unset_for_launch_and_worker_checks() {
+    let _scenario = Scenario::enter();
+    let outside = tempdir().unwrap();
+    let claude = fake_claude(outside.path(), VERSION_ONLY);
+    let _tmpdir = EnvVar::set(TMPDIR, "");
+    let prepared = validation::prepared_launch(
+        HashMap::from([(TMPDIR.to_owned(), String::new())]),
+        Some(outside.path().to_str().unwrap().to_owned()),
+        &env::current_dir().unwrap(),
+    )
+    .unwrap();
+    assert!(prepared.temp_dir.is_absolute());
+    assert!(prepared.env.iter().all(|(name, _)| name != TMPDIR));
+
+    let (reg, _host) = fake_host(&claude, outside.path());
+    let error = ask(&reg, &session_ctx()).unwrap_err();
+    assert!(error.contains(NO_EVENT_STOP), "{error}");
 }
 
 /// Artifact cleanup can take a long time. It must run outside the Lua thread so subsequent
