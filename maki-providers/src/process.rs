@@ -109,8 +109,8 @@ pub fn kill_group(pid: u32) {
     {
         tracing::warn!(pid, %err, "failed to kill process group");
     }
-    // Hold the process handle until `taskkill` completes. Otherwise the pid can identify
-    // another process before `taskkill` sends its signal.
+    // The caller must keep the child handle alive until taskkill finishes, for example
+    // by holding its reap lock, so Windows cannot reuse the pid during termination.
     #[cfg(windows)]
     {
         let _ = Command::new("taskkill")
