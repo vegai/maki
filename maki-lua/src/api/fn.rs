@@ -495,11 +495,14 @@ impl JobStore {
             let state = Arc::clone(&reap_state);
             smol::spawn(async move {
                 smol::Timer::after(timeout).await;
-                let mut state = ReapState::lock(&state);
-                if !state.reaped {
-                    state.timed_out = true;
-                    process::kill_group(pid);
-                }
+                smol::unblock(move || {
+                    let mut state = ReapState::lock(&state);
+                    if !state.reaped {
+                        state.timed_out = true;
+                        process::kill_group(pid);
+                    }
+                })
+                .await;
             })
         });
 
