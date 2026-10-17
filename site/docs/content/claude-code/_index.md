@@ -18,6 +18,8 @@ The checkout is your git work tree. The session's directory is where you started
 
 If your Anthropic account uses API keys, use the [anthropic provider](/docs/providers/). The plugin runs only on a Claude subscription login.
 
+maki removes provider credentials, including `CLAUDE_CODE_OAUTH_TOKEN`, from commands started through its `bash` tool. A nested `claude` command must use its stored login or receive the token explicitly.
+
 ## Installation
 
 1. Install Claude Code.
