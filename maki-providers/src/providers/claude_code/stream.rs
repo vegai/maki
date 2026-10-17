@@ -1863,11 +1863,11 @@ mod tests {
 
     #[test]
     fn an_error_before_init_preserves_the_startup_cause() {
-        let event = json!({ "type": "result", "subtype": "error_during_execution", "errors": ["socat not installed"] }).to_string();
+        let event =
+            json!({ "type": RESULT_EVENT, "subtype": EXECUTION_ERROR, "errors": [FAILURE_DETAIL] })
+                .to_string();
         let step = with_turn(|mut turn| turn.feed(&event));
-        assert!(
-            matches!(step, Err(Error::Failed(ref message)) if message.contains("socat not installed"))
-        );
+        assert!(matches!(step, Err(Error::Failed(ref message)) if message == FAILURE_WITH_ERRORS));
     }
 
     #[test_case(json!({ "subtype": MAX_TURNS_ERROR }), MAX_TURNS_ERROR ; "without_details")]

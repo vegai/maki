@@ -60,7 +60,7 @@ pub fn base_args(model: &str, tools: &str, mode: &str, settings: &str) -> Vec<St
     args
 }
 
-pub fn base_settings() -> Value {
+pub(crate) fn base_settings() -> Value {
     json!({ "disableAllHooks": true, "autoMemoryEnabled": false, "claudeMdExcludes": ["**"], "disableClaudeAiConnectors": true })
 }
 
