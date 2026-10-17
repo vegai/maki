@@ -124,6 +124,7 @@ const FOR_ANOTHER_CHECKOUT: &str = "contains changes for";
 const UNRECORDED: &str = "maki could not record this in the artifact";
 const EXECUTABLE_MODE: u32 = 0o755;
 const PREPARE_FAILED: &str = "the prepare command stopped with an error";
+const GIT_ENV_RESET: &str = "unset GIT_";
 /// Longer than `DEADLINE`, so a stop that fails makes the test fail while it
 /// waits.
 const PREPARE_NEVER_ENDS: &str = "sleep 240";
@@ -1664,7 +1665,13 @@ fn a_prepare_timeout_is_reported_without_requiring_command_output() {
         reply.contains(PREPARE_FAILED) && reply.contains(NO_ANSWER_IN_TIME),
         "{reply}"
     );
-    assert!(coding.fake.log("prompt").contains(PREPARE_TOLD));
+    let shown = format!("`{PREPARE_NEVER_ENDS}` {NO_ANSWER_IN_TIME}");
+    assert!(reply.contains(&shown), "{reply}");
+    let prompt = coding.fake.log("prompt");
+    assert!(prompt.contains(PREPARE_TOLD), "{prompt}");
+    assert!(prompt.contains(&shown), "{prompt}");
+    assert!(!reply.contains(GIT_ENV_RESET), "{reply}");
+    assert!(!prompt.contains(GIT_ENV_RESET), "{prompt}");
 }
 
 /// If the prepare step fails or times out, the checks it enables are
@@ -1683,10 +1690,11 @@ fn a_failed_prepare_reaches_the_worker_and_the_reply(command: &str, limit_secs: 
         reply.contains(PREPARE_FAILED) && reply.contains(detail),
         "got: {reply}"
     );
-    assert!(
-        coding.fake.log("prompt").contains(PREPARE_TOLD),
-        "maki did not tell the worker"
-    );
+    assert!(reply.contains(&format!("`{command}`")), "{reply}");
+    let prompt = coding.fake.log("prompt");
+    assert!(prompt.contains(PREPARE_TOLD), "{prompt}");
+    assert!(!reply.contains(GIT_ENV_RESET), "{reply}");
+    assert!(!prompt.contains(GIT_ENV_RESET), "{prompt}");
     assert!(reply.contains(PREPARED_NOTE), "{reply}");
     assert!(!reply.contains(&format!("A {PREPARED_FILE}")), "{reply}");
     let snapshot = coding

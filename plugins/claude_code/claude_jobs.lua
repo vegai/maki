@@ -197,7 +197,7 @@ end
 --- The `inherit_env` option merges `env` into maki's environment without provider keys.
 --- Otherwise `env` supplies the entire child environment.
 function Call:run_quick(argv, spec)
-  local shown = "`" .. table.concat(argv, " ") .. "`"
+  local shown = "`" .. (spec.display or table.concat(argv, " ")) .. "`"
   local stderr_tail = {}
   local job_opts = {
     cwd = spec.cwd,
