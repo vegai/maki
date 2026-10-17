@@ -21,6 +21,8 @@ pub const EMPTY_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
 pub(super) const CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 pub(super) const HOME_ENV: &str = "HOME";
 const TMPDIR_ENV: &str = "TMPDIR";
+#[cfg(unix)]
+const UNIX_TEMP_DIR: &str = "/tmp";
 const PROBE_PATH_NOT_UTF8: &str = "probe path is not valid UTF-8";
 
 pub use super::checks::{GIT_ENTRY, git_directory};
@@ -109,8 +111,6 @@ pub fn handshake() -> Value {
     json!(checks::HANDSHAKE)
 }
 
-pub struct LaunchPreparation {
-    pub env: Vec<(String, String)>,
 pub struct WorkerHandshake {
     answers: Handshake,
     modes: Vec<String>,
@@ -158,12 +158,23 @@ impl WorkerHandshake {
     }
 }
 
+pub struct LaunchPreparation {
+    pub env: Vec<(String, String)>,
     pub withheld: Vec<String>,
     pub config_dir: PathBuf,
     pub own_config_dir: Option<PathBuf>,
     pub temp_dir: PathBuf,
     pub local_dirs: Vec<PathBuf>,
     pub git_dir: Option<PathBuf>,
+}
+
+fn default_temp_dir() -> PathBuf {
+    let path = env::temp_dir();
+    #[cfg(unix)]
+    if path.as_os_str().is_empty() {
+        return PathBuf::from(UNIX_TEMP_DIR);
+    }
+    path
 }
 
 pub(super) fn prepare_launch(
@@ -180,9 +191,13 @@ pub(super) fn prepare_launch(
         .filter(|path| !path.is_empty())
         .map(PathBuf::from);
     let config_dir = login_dir(&vars, configured.as_deref())?;
-    let temp_dir = var(TMPDIR_ENV).map_or_else(env::temp_dir, PathBuf::from);
+    let temp_dir = var(TMPDIR_ENV)
+        .filter(|path| !path.is_empty())
+        .map_or_else(default_temp_dir, PathBuf::from);
     let (mut env, withheld) = checks::child_env(vars);
-    env.retain(|(name, value)| name != CONFIG_DIR_ENV || !value.is_empty());
+    env.retain(|(name, value)| {
+        ![CONFIG_DIR_ENV, TMPDIR_ENV].contains(&name.as_str()) || !value.is_empty()
+    });
     if configured.is_some() {
         env.retain(|(name, _)| name != CONFIG_DIR_ENV);
         env.push((CONFIG_DIR_ENV.to_owned(), config_dir.display().to_string()));
@@ -241,7 +256,8 @@ pub async fn private_dir(
 ) -> Result<String, String> {
     smol::unblock(move || {
         let base = base
-            .unwrap_or_else(env::temp_dir)
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(default_temp_dir)
             .canonicalize()
             .map_err(|error| error.to_string())?;
         let inside_checkout = |path: &Path| {
