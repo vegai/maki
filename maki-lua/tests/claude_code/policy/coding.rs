@@ -142,6 +142,8 @@ const TRUNCATION_LINES: usize = 2;
 /// lock file.
 const PREPARED_FILE: &str = "lock.json";
 const PREPARE_WRITES_LOCK: &str = "printf 'locked\\n' > lock.json";
+const PREPARED_GIT_INFO: &str = "prepared-git";
+const PREPARE_RECORDS_GIT: &str = "git rev-parse --show-toplevel --absolute-git-dir > prepared-git";
 const CREATE_DEPENDENCY: &str =
     "mkdir -p node_modules/pkg; printf 'module.exports = 1;\\n' > node_modules/pkg/index.js";
 const BREAK_BASELINE: &str = "git config core.repositoryformatversion 999";
@@ -1624,6 +1626,30 @@ fn prepare_runs_with_the_users_environment() {
 
     let seen = fs::read_to_string(snapshot.join(PREPARED_ENV)).unwrap();
     assert_eq!(seen, env::var(USER_ONLY_VARIABLE).unwrap());
+}
+
+#[test_case("GIT_DIR", true ; "git_directory_from_a_hook")]
+#[test_case("GIT_WORK_TREE", false ; "worktree_from_a_hook")]
+fn prepare_git_commands_use_the_snapshot(variable: &str, git_directory: bool) {
+    let coding = Coding::new();
+    let inherited = if git_directory {
+        coding.project().join(".git")
+    } else {
+        coding.project()
+    };
+    environment::set(variable, inherited);
+    let (reg, _host) = coding.host(&[("prepare", json!(PREPARE_RECORDS_GIT))]);
+    let id = artifact_id(&coding.code(&reg, CODE_EDIT, &[]).unwrap());
+    let artifact = coding.artifact(&id);
+    let snapshot = artifact.join(SNAPSHOT_DIR);
+    assert_eq!(
+        fs::read_to_string(snapshot.join(PREPARED_GIT_INFO)).unwrap(),
+        format!(
+            "{}\n{}\n",
+            snapshot.display(),
+            artifact.join(ARTIFACT_GIT).display()
+        )
+    );
 }
 
 #[test]

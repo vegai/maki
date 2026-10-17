@@ -278,6 +278,10 @@ function M.shell_quote(text)
   return "'" .. text:gsub("'", "'\\''") .. "'"
 end
 
+function M.without_local_git_env(command)
+  return "unset " .. table.concat(GIT_LOCAL_ENV_VARS, " ") .. "\n" .. command
+end
+
 local function git_environment()
   local words = { "env" }
   for _, name in ipairs(GIT_LOCAL_ENV_VARS) do
