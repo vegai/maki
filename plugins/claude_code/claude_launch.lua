@@ -542,7 +542,7 @@ function M.preflight(input, ctx, call, opts, plan)
     if not output then
       return nil, output_err
     end
-    version, version_err = check:save(output, maki.uv.os_uname().sysname)
+    version, version_err = check:save(output)
   end
   if not version then
     return nil, version_err

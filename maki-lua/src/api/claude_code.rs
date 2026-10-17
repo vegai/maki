@@ -277,15 +277,15 @@ struct VersionCheck(validation::VersionCheck);
 impl UserData for VersionCheck {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("version", |_, this, ()| Ok(this.0.version.clone()));
-        methods.add_method("save", |_, this, (output, system): (String, String)| {
-            Ok(pair(this.0.save(&output, &system)))
+        methods.add_method("save", |_, this, output: String| {
+            Ok(pair(this.0.save(&output)))
         });
     }
 }
 
 /// Capture the executable identity before reading its version.
 /// @param executable string Absolute CLI path.
-/// @return (userdata?, string?) Check with version() and save(output, system).
+/// @return (userdata?, string?) Check with version() and save(output).
 #[lua_fn(guard = FsRead)]
 async fn version_check(_lua: Lua, executable: String) -> LuaResult<Pair<VersionCheck>> {
     Ok(pair(

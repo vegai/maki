@@ -7487,26 +7487,6 @@ Requires the `env` [plugin permission](#plugin-permissions).
 for name in pairs(maki.uv.os_environ()) do print(name) end
 ```
 
----
-
-### `maki.uv.os_uname()` {#maki-uv-os_uname}
-
-```lua
-maki.uv.os_uname()
-```
-
-Return the operating system's name and version, like `vim.uv.os_uname`.
-
-**Returns:** (`table`) `sysname` (for example "Linux", "Darwin" or "Windows_NT"),
-  `release`, `version` and `machine`. On Windows, `release` and `version`
-  are empty.
-
-**Example:**
-
-```lua
-if maki.uv.os_uname().sysname == "Linux" then print("on Linux") end
-```
-
 
 ## maki.yaml {#maki-yaml}
 
