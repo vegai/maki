@@ -1,17 +1,9 @@
 use std::env;
-#[cfg(windows)]
-use std::env::consts::ARCH;
 
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table};
 
-#[cfg(unix)]
-use rustix::system::uname;
-
 use crate::plugin_permissions::PluginPermissions;
-
-#[cfg(windows)]
-const WINDOWS_SYSNAME: &str = "Windows_NT";
 
 /// Return the current working directory as an absolute path. Like `vim.uv.cwd`.
 ///
@@ -64,34 +56,6 @@ fn os_environ(lua: &Lua) -> LuaResult<Table> {
     )
 }
 
-/// Return the operating system's name and version, like `vim.uv.os_uname`.
-///
-/// @return (table) `sysname` (for example "Linux", "Darwin" or "Windows_NT"),
-///   `release`, `version` and `machine`. On Windows, `release` and `version`
-///   are empty.
-/// @example
-/// if maki.uv.os_uname().sysname == "Linux" then print("on Linux") end
-#[lua_fn]
-fn os_uname(lua: &Lua) -> LuaResult<Table> {
-    let table = lua.create_table()?;
-    #[cfg(unix)]
-    {
-        let system = uname();
-        table.set("sysname", system.sysname().to_string_lossy())?;
-        table.set("release", system.release().to_string_lossy())?;
-        table.set("version", system.version().to_string_lossy())?;
-        table.set("machine", system.machine().to_string_lossy())?;
-    }
-    #[cfg(windows)]
-    {
-        table.set("sysname", WINDOWS_SYSNAME)?;
-        table.set("release", "")?;
-        table.set("version", "")?;
-        table.set("machine", ARCH)?;
-    }
-    Ok(table)
-}
-
 lua_table! {
     /// System and environment utilities, modelled after `vim.uv`.
     ///
@@ -106,6 +70,6 @@ lua_table! {
     /// local home = maki.uv.os_homedir()
     /// ```
     "maki.uv" => pub(crate) fn create_uv_table(perms: &PluginPermissions), DOCS [
-        cwd(perms), os_homedir(perms), os_getenv(perms), os_environ(perms), os_uname,
+        cwd(perms), os_homedir(perms), os_getenv(perms), os_environ(perms),
     ]
 }

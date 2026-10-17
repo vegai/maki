@@ -198,8 +198,9 @@ impl VersionCheck {
             );
     }
 
-    pub fn save(&self, output: &str, system: &str) -> Result<String, String> {
-        let profile = checks::profile(output, system).map_err(|error| error.to_string())?;
+    pub fn save(&self, output: &str) -> Result<String, String> {
+        let profile =
+            checks::profile(output, env::consts::OS).map_err(|error| error.to_string())?;
         self.remember(&profile);
         Ok(profile.version)
     }

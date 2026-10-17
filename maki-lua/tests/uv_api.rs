@@ -8,13 +8,6 @@ const CWD: &str = "maki.uv.cwd()";
 const HOMEDIR: &str = "maki.uv.os_homedir()";
 const GETENV: &str = r#"maki.uv.os_getenv("HOME")"#;
 const ENVIRON: &str = "maki.uv.os_environ()";
-/// What `maki.uv.os_uname()` calls this system.
-#[cfg(target_os = "linux")]
-const SYSNAME: &str = "Linux";
-#[cfg(target_os = "macos")]
-const SYSNAME: &str = "Darwin";
-#[cfg(windows)]
-const SYSNAME: &str = "Windows_NT";
 
 fn setup() -> PluginHost {
     let reg = Arc::new(ToolRegistry::new());
@@ -43,24 +36,6 @@ fn os_environ_agrees_with_os_getenv() {
             r#"local env = maki.uv.os_environ()
             assert(env.CARGO_MANIFEST_DIR ~= nil, "CARGO_MANIFEST_DIR has no value")
             assert(env.CARGO_MANIFEST_DIR == maki.uv.os_getenv("CARGO_MANIFEST_DIR"), "the two values are different")"#,
-        )
-        .unwrap();
-}
-
-/// Needs no permission, because it describes the system, not the user or
-/// the host.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
-#[test]
-fn os_uname_names_the_system_without_permissions() {
-    setup()
-        .load_source_with_permissions(
-            "uname",
-            &format!(
-                r#"local u = maki.uv.os_uname()
-                assert(u.sysname == "{SYSNAME}", "sysname: " .. tostring(u.sysname))
-                assert(type(u.machine) == "string" and u.machine ~= "", "machine: " .. tostring(u.machine))"#
-            ),
-            PluginPermissions::denied(),
         )
         .unwrap();
 }
