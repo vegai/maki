@@ -95,10 +95,12 @@ local function sandbox_problem(sandbox, confine)
   local expected = launch.settings("", launch.WORKERS.code, confine)
   local effective = table.clone(expected)
   effective.sandbox = sandbox
-  return native.policy_problem(
+  return launch.policy_problem(
     maki.json.encode({ effective = effective, sources = maki.json.decode("[]") }),
     maki.json.encode({ hooks = maki.json.decode("[]"), policy = { allDisabled = true } }),
-    maki.json.encode(expected)
+    "",
+    launch.WORKERS.code,
+    confine
   )
 end
 
