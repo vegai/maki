@@ -441,19 +441,18 @@ impl Handshake {
     }
 
     pub(crate) fn answer(&mut self, response: &Value) -> Result<bool, Error> {
-        self.checked_answer(response, checks::account_problem, checks::policy_problem)
+        if !self.record(response)? {
+            return Ok(false);
+        }
+        self.check(checks::account_problem, checks::policy_problem)?;
+        Ok(true)
     }
 
     pub(crate) fn account(&self) -> &Value {
         self.answers.get(ACCOUNT_ANSWER).unwrap_or(&Value::Null)
     }
 
-    pub(crate) fn checked_answer(
-        &mut self,
-        response: &Value,
-        account_problem: impl FnOnce(&Value) -> Option<Problem>,
-        policy_problem: impl FnOnce(&Value, &Value) -> Option<Problem>,
-    ) -> Result<bool, Error> {
+    pub(crate) fn record(&mut self, response: &Value) -> Result<bool, Error> {
         let id = response["request_id"].as_str().unwrap_or_default();
         if !HANDSHAKE.iter().any(|step| step.id == id) || self.answers.contains_key(id) {
             return Err(Error::StrayAnswer(id.to_owned()));
@@ -466,11 +465,7 @@ impl Handshake {
         }
         self.answers
             .insert(id.to_owned(), response["response"].clone());
-        if self.answers.len() != HANDSHAKE.len() {
-            return Ok(false);
-        }
-        self.check(account_problem, policy_problem)?;
-        Ok(true)
+        Ok(self.answers.len() == HANDSHAKE.len())
     }
 
     pub(crate) fn check(

@@ -296,14 +296,6 @@ function M.in_checkout(path, spec)
   return spec.git_dir ~= nil and workspace.within(path, spec.git_dir)
 end
 
-local function json(value)
-  return type(value) == "string" and value or maki.json.encode(value)
-end
-
-function M.account_problem(init, worker)
-  return native.account_problem(json(init), sorted_keys(worker.reported_modes))
-end
-
 local function deny_rules(extra)
   local rules = {}
   for i, pattern in ipairs(assert(workspace.denied_paths(extra))) do
@@ -317,12 +309,6 @@ local function worker_policy(deny_read, worker, confine)
     deny = deny_rules(deny_read),
     sandbox = worker.sandboxed and assert(confine, "a sandboxed worker needs confinement paths") or nil,
   }
-end
-
---- Only maki settings and safe managed restrictions can pass. The worker shell must also
---- remain inside `confine`.
-function M.policy_problem(settings, hooks, deny_read, worker, confine)
-  return native.policy_problem(json(settings), json(hooks), worker_policy(deny_read, worker, confine))
 end
 
 function M.worker_handshake(deny_read, worker, confine)
