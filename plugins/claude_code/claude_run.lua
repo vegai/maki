@@ -67,13 +67,11 @@ Run.__index = Run
 function Run.new(ctx, call, spec, confine, timeout_secs, opts)
   local self = setmetatable({
     ctx = ctx,
-    deny_read = opts.deny_read,
     call = call,
     spec = spec,
-    confine = confine,
     timeout_secs = timeout_secs,
     route = CHECKING:format(spec.cli.version),
-    answers = {},
+    handshake = launch.worker_handshake(opts.deny_read, spec.worker, confine),
     stderr_tail = {},
     has_progress = false,
     -- Claude Code sends init after it reads the prompt. An earlier init means it bypassed the
@@ -172,7 +170,7 @@ function Run:send(data)
 end
 
 function Run:on_answer()
-  local model = launch.resolved_model(self.answers.account, self.spec.model)
+  local model = self.handshake:resolved_model(self.spec.model)
   if not model then
     self:stop("Claude Code did not resolve the requested model " .. self.spec.model)
     return
@@ -193,8 +191,7 @@ function Run:on_line(line)
   if self.finished then
     return
   end
-  local step, problem, complete =
-    launch.checked_step(self.stream, line, self.answers, self.spec, self.confine, self.deny_read)
+  local step, problem, complete = launch.checked_step(self.stream, line, self.handshake)
   if not step or self.stopped then
     return
   end
@@ -211,7 +208,7 @@ function Run:on_line(line)
     self:stop(UNCHECKED_START)
   elseif step.init then
     self.clock:stop()
-    local subscription = " (" .. native.subscription_type(self.answers.account) .. ")"
+    local subscription = " (" .. self.handshake:subscription_type() .. ")"
     self.route = ROUTE_OK:format(subscription, self.spec.cli.version)
     self.view:set_header(dim_lines(self:header_lines()))
   elseif step.lines then

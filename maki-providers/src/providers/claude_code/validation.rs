@@ -11,9 +11,10 @@ use serde_json::{Value, json};
 use crate::ProviderUsage;
 
 use super::checks;
-use super::error::Error;
+use super::error::{Error, Problem};
 use super::stream::{
-    self, API_ERROR_MARK, ASSISTANT_EVENT, EventKind, RATE_LIMIT_EVENT, StreamMode, count,
+    self, API_ERROR_MARK, ASSISTANT_EVENT, EventKind, Handshake, RATE_LIMIT_EVENT, StreamMode,
+    count,
 };
 
 pub const EMPTY_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
@@ -110,6 +111,53 @@ pub fn handshake() -> Value {
 
 pub struct LaunchPreparation {
     pub env: Vec<(String, String)>,
+pub struct WorkerHandshake {
+    answers: Handshake,
+    modes: Vec<String>,
+    policy: WorkerPolicy,
+}
+
+impl WorkerHandshake {
+    pub fn new(modes: Vec<String>, policy: WorkerPolicy) -> Self {
+        Self {
+            answers: Handshake::default(),
+            modes,
+            policy,
+        }
+    }
+
+    pub fn answer(&mut self, response: &Value) -> Result<bool, String> {
+        self.answers
+            .checked_answer(
+                response,
+                |account| checks::account_problem_in(account, &self.modes),
+                |settings, hooks| {
+                    worker_policy(settings, hooks, &self.policy)
+                        .err()
+                        .map(Problem::WorkerPolicy)
+                },
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn finish(&self) -> Result<(), String> {
+        self.answers
+            .check(
+                |account| checks::account_problem_in(account, &self.modes),
+                |settings, hooks| {
+                    worker_policy(settings, hooks, &self.policy)
+                        .err()
+                        .map(Problem::WorkerPolicy)
+                },
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn account(&self) -> &Value {
+        self.answers.account()
+    }
+}
+
     pub withheld: Vec<String>,
     pub config_dir: PathBuf,
     pub own_config_dir: Option<PathBuf>,

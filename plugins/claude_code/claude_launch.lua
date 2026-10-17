@@ -300,10 +300,6 @@ local function json(value)
   return type(value) == "string" and value or maki.json.encode(value)
 end
 
-function M.resolved_model(account, requested)
-  return native.resolved_model(json(account), requested)
-end
-
 function M.account_problem(init, worker)
   return native.account_problem(json(init), sorted_keys(worker.reported_modes))
 end
@@ -329,15 +325,8 @@ function M.policy_problem(settings, hooks, deny_read, worker, confine)
   return native.policy_problem(json(settings), json(hooks), worker_policy(deny_read, worker, confine))
 end
 
---- The keys of {answers} are the request ids.
-function M.handshake_problem(answers, deny_read, worker, confine)
-  for _, request in ipairs(M.HANDSHAKE) do
-    if answers[request.id] == nil then
-      return "Claude Code did not send a response to the " .. request.id .. " request"
-    end
-  end
-  return M.account_problem(answers.account, worker)
-    or M.policy_problem(answers.settings, answers.hooks, deny_read, worker, confine)
+function M.worker_handshake(deny_read, worker, confine)
+  return native.worker_handshake(sorted_keys(worker.reported_modes), worker_policy(deny_read, worker, confine))
 end
 
 --- `--setting-sources ""` drops the user's hooks, permissions and MCP
@@ -396,32 +385,7 @@ function M.argv(spec)
   return args
 end
 
--- Returns why the responses stop the run, or nil, and whether all responses
--- are in.
-function M.take_answer(answers, control, worker, confine, deny_read)
-  local asked = false
-  for _, request in ipairs(M.HANDSHAKE) do
-    asked = asked or request.id == control.id
-  end
-  -- A second or unknown response would run the checks again, and the prompt
-  -- could go out twice.
-  if not asked or answers[control.id] ~= nil then
-    return "Claude Code answered a " .. tostring(control.id) .. " request that maki never sent, or answered it twice",
-      false
-  end
-  if not control.ok then
-    return "Claude Code rejected the " .. tostring(control.id) .. " request: " .. tostring(control.error), false
-  end
-  answers[control.id] = control.json or control.response or false
-  for _, request in ipairs(M.HANDSHAKE) do
-    if answers[request.id] == nil then
-      return nil, false
-    end
-  end
-  return M.handshake_problem(answers, deny_read, worker, confine), true
-end
-
-function M.checked_step(stream, line, answers, spec, confine, deny_read)
+function M.checked_step(stream, line, handshake)
   local step = stream:feed(line)
   if not step then
     return nil
@@ -430,7 +394,7 @@ function M.checked_step(stream, line, answers, spec, confine, deny_read)
     return step, step.stop
   end
   if step.control then
-    local problem, complete = M.take_answer(answers, step.control, spec.worker, confine, deny_read)
+    local complete, problem = handshake:answer(step.control)
     return step, problem, complete
   end
   return step
@@ -468,7 +432,8 @@ function M.probe(call, spec, argv, env, confine, deny_read)
     return dir_err
   end
   local stream = Stream.new({ cwd = dir, worker = spec.worker, cli = spec.cli })
-  local answers, problem, stderr_tail = {}, nil, {}
+  local handshake = M.worker_handshake(deny_read, spec.worker, confine)
+  local problem, stderr_tail = nil, {}
   local ok, code, _, run_error = pcall(call.run_to_end, call, argv, M.job_opts(dir, env, stderr_tail), {
     leftover = function()
       return dir
@@ -477,7 +442,7 @@ function M.probe(call, spec, argv, env, confine, deny_read)
       if problem then
         return
       end
-      local step, failure = M.checked_step(stream, line, answers, spec, confine, deny_read)
+      local step, failure = M.checked_step(stream, line, handshake)
       problem = failure or step and not step.control and PROBE_RUN or nil
       if problem then
         maki.fn.jobstop(id)
@@ -504,7 +469,7 @@ function M.probe(call, spec, argv, env, confine, deny_read)
   if code ~= 0 then
     return jobs.with_stderr("Claude Code exited with code " .. code .. " during its checks", stderr_tail)
   end
-  local incomplete = M.handshake_problem(answers, deny_read, spec.worker, confine)
+  local _, incomplete = handshake:finish()
   if incomplete then
     return jobs.with_stderr(incomplete, stderr_tail)
   end

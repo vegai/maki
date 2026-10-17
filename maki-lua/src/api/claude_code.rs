@@ -9,7 +9,9 @@ use std::io::{Error as IoError, ErrorKind};
 use std::path::{Path, PathBuf};
 
 use maki_lua_macro::{lua_fn, lua_table};
-use maki_providers::claude_code::validation::{self, WorkerPolicy};
+use maki_providers::claude_code::validation::{
+    self, WorkerHandshake as NativeHandshake, WorkerPolicy,
+};
 use mlua::{
     Lua, LuaSerdeExt, Result as LuaResult, Table, UserData, UserDataMethods, Value as LuaValue,
 };
@@ -106,6 +108,35 @@ async fn home_state_files(_lua: Lua, home: String) -> LuaResult<Pair<Vec<String>
 #[lua_fn]
 fn handshake(lua: &Lua) -> LuaResult<LuaValue> {
     json_to_lua(lua, &validation::handshake())
+}
+
+struct WorkerHandshake(NativeHandshake);
+
+impl UserData for WorkerHandshake {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method_mut("answer", |_, this, line: String| {
+            Ok(pair(this.0.answer(&json(&line)?["response"])))
+        });
+        methods.add_method("finish", |_, this, ()| {
+            Ok(pair(this.0.finish().map(|()| true)))
+        });
+        methods.add_method("resolved_model", |_, this, requested: String| {
+            Ok(validation::resolved_model(this.0.account(), &requested))
+        });
+        methods.add_method("subscription_type", |_, this, ()| {
+            Ok(validation::subscription_type(this.0.account()))
+        });
+    }
+}
+
+/// Collect and validate worker control responses with the provider's handshake rules.
+/// @param modes table Allowed permission modes.
+/// @param policy table Deny rules and optional sandbox paths.
+/// @return (userdata) Handshake with answer, finish, resolved_model and subscription_type methods.
+#[lua_fn]
+fn worker_handshake(lua: &Lua, modes: Vec<String>, policy: Table) -> LuaResult<WorkerHandshake> {
+    let policy = lua.from_value(LuaValue::Table(policy))?;
+    Ok(WorkerHandshake(NativeHandshake::new(modes, policy)))
 }
 
 /// Launch arguments shared with the subscription provider.
@@ -374,30 +405,13 @@ fn classify(lua: &Lua, line: String, mode: Table) -> LuaResult<Pair<Table>> {
     Ok((Some(result), None))
 }
 
-/// Extract an account's billing label from a control response.
-/// @param account string JSON account response or control event.
-/// @return (string?) Subscription label.
-#[lua_fn]
-fn subscription_type(_lua: &Lua, account: String) -> LuaResult<Option<String>> {
-    Ok(validation::subscription_type(&json(&account)?))
-}
-
-/// Resolve an alias from the checked account rather than from a local model table.
-/// @param account string JSON account response or control event.
-/// @param requested string Model alias.
-/// @return (string?) Resolved model, or nil if the account did not report it.
-#[lua_fn]
-fn resolved_model(_lua: &Lua, account: String, requested: String) -> LuaResult<Option<String>> {
-    Ok(validation::resolved_model(&json(&account)?, &requested))
-}
-
 lua_table! {
     /// Claude Code launch checks shared with the subscription provider. JSON inputs retain
     /// the distinction between null, objects and arrays.
     "maki.claude_code" => pub(crate) fn create_claude_code_table(perms: &PluginPermissions), DOCS [
-        handshake, base_args, worker_settings, empty_mcp_config, prepare_launch(perms), private_dir(perms), home_state_files(perms),
+        handshake, worker_handshake, base_args, worker_settings, empty_mcp_config, prepare_launch(perms), private_dir(perms), home_state_files(perms),
         account_problem, policy_problem, init_problem,
-        resolved_model, subscription_type, classify, version_check(perms), invalidate_version, sanitize_git(perms), project_git_dir(perms), unpack_blobs(perms),
+        classify, version_check(perms), invalidate_version, sanitize_git(perms), project_git_dir(perms), unpack_blobs(perms),
     ]
 }
 

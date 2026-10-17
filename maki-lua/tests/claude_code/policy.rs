@@ -107,7 +107,8 @@ const REFUSE_SETTINGS: &str = "refuse_settings";
 const ANSWER_TWICE: &str = "answer_twice";
 const STRAY_ANSWER: &str = "request that maki never sent, or answered it twice";
 const SETTINGS_REFUSAL: &str = "settings unavailable";
-const SETTINGS_REFUSED: &str = "Claude Code rejected the settings request: settings unavailable";
+const SETTINGS_REFUSED: &str =
+    "Claude Code rejected the settings request: \"settings unavailable\"";
 
 const LOGIN_HINT: &str = "claude auth login";
 const TOO_OLD: &str = "2.1.283 is older than 2.1.284";

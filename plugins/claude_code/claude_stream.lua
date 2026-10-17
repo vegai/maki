@@ -94,7 +94,7 @@ function Stream:tool_line(name, input)
 end
 
 --- Returns what to do with one stdout line, or nil:
----   `{ control = { id, ok, response, error } }`  a handshake response
+---   `{ control = line }`  a handshake response
 ---   `{ stop = reason }`  kill the child, the run is unusable
 ---   `{ init = event }`   the checks found no problem in the child
 ---   `{ lines = {...} }`  status lines for the view
@@ -116,10 +116,7 @@ function Stream:feed(line)
     return { stop = classified.problem }
   end
   if ev.type == CONTROL_RESPONSE and type(ev.response) == "table" then
-    local r = ev.response
-    return {
-      control = { id = r.request_id, ok = r.subtype == SUCCESS, response = r.response, error = r.error, json = line },
-    }
+    return { control = line }
   end
   if ev.type == RATE_LIMIT_EVENT and type(ev.rate_limit_info) == "table" then
     self.rate_limit = classified.rate_limit
