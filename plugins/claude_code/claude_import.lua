@@ -217,7 +217,6 @@ local function stage_blobs(call, artifact, todo, stage)
   local output, err = call:run_quick(workspace.git({ "--git-dir=" .. artifact.git, "cat-file", "--batch" }), {
     cwd = artifact.manifest.project,
     env = workspace.snapshot_git_env({}, artifact.git, artifact.manifest.project),
-    inherit_env = true,
     stdin = table.concat(hashes, "\n") .. "\n",
     stdout = batch,
     timeout_ms = workspace.import_timeout(todo) * jobs.MS_PER_SEC,
