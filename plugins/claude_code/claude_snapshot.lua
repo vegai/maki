@@ -685,10 +685,13 @@ end
 --- hard-linked files private before the worker starts.
 --- Records a command error and returns any fatal sanitation or baseline error.
 function M.prepare(call, artifact, command, env, timeout_ms)
-  local _, err = call:run_quick(
-    { "sh", "-c", workspace.without_local_git_env(command) },
-    { env = { TMPDIR = env.TMPDIR }, inherit_env = true, cwd = artifact.snapshot, timeout_ms = timeout_ms }
-  )
+  local _, err = call:run_quick({ "sh", "-c", workspace.without_local_git_env(command) }, {
+    display = command,
+    env = { TMPDIR = env.TMPDIR },
+    inherit_env = true,
+    cwd = artifact.snapshot,
+    timeout_ms = timeout_ms,
+  })
   artifact.prepare_err = err
   local dropped, links_err = drop_escaping_links(call, artifact, env)
   if not dropped then
