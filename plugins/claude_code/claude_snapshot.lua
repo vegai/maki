@@ -14,7 +14,8 @@ local SWEEP_CONTENTS = [[
 set -e
 cd -P -- "$1"
 [ "$(pwd -P)" = "$1" ]
-find -P . -type d ! -perm -u=rwx -exec chmod u+rwx -- {} \;
+find -P . -type d ! -perm -u=rx -exec chmod u+rwx -- {} \;
+find -P . -type d ! -perm -u=w -exec chmod u+w -- {} +
 find . -mindepth 1 -maxdepth 1 ! -name "$2" -exec rm -rf -- {} +
 rm -f -- "./$2"
 rmdir -- "$1"
