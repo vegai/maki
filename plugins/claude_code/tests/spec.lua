@@ -23,6 +23,12 @@ local BUILTIN_PLUGINS = {
 }
 local MISSING = {}
 local READ = launch.WORKERS.read
+local HOOKS_OFF = { hooks = maki.json.decode("[]"), policy = { allDisabled = true, policyHookCount = 0 } }
+local CONFINE = {
+  deny_read = { "/work", "/home/u/.claude", "/artifacts" },
+  allow_read = { "/artifacts/a1/git" },
+  allow_write = { "/artifacts/a1/tmp" },
+}
 
 local function local_settings_dirs(cwd)
   local home = t.mktmpdir("cc_launch_home")
@@ -80,6 +86,40 @@ local function contains(list, value)
   return false
 end
 
+local function account_answer(overrides, mode)
+  local account = { apiProvider = "firstParty", subscriptionType = "Claude Pro" }
+  for k, v in pairs(overrides or {}) do
+    account[k] = v ~= MISSING and v or nil
+  end
+  return { current_permission_mode = mode or "default", account = account }
+end
+
+local function handshake_answer(handshake, id, response, subtype)
+  return handshake:answer(maki.json.encode({
+    type = "control_response",
+    response = { request_id = id, subtype = subtype or "success", response = response },
+  }))
+end
+
+local function handshake_problem(answers, worker, confine)
+  worker = worker or READ
+  local responses = {
+    account = account_answer(nil, next(worker.reported_modes)),
+    settings = { effective = launch.settings("", worker, confine), sources = maki.json.decode("[]") },
+    hooks = HOOKS_OFF,
+  }
+  for id, response in pairs(answers) do
+    responses[id] = response
+  end
+  local handshake = launch.worker_handshake("", worker, confine)
+  for _, request in ipairs(launch.HANDSHAKE) do
+    local _, problem = handshake_answer(handshake, request.id, responses[request.id])
+    if problem then
+      return problem
+    end
+  end
+end
+
 for _, code in ipairs({ 0x80, 0x9b, 0x2028, 0x2029, 0x200b, 0x202e, 0xfeff }) do
   case("invisible_path_" .. code, function()
     local path = "visible" .. utf8.char(code) .. "path"
@@ -95,10 +135,8 @@ local function sandbox_problem(sandbox, confine)
   local expected = launch.settings("", launch.WORKERS.code, confine)
   local effective = table.clone(expected)
   effective.sandbox = sandbox
-  return launch.policy_problem(
-    maki.json.encode({ effective = effective, sources = maki.json.decode("[]") }),
-    maki.json.encode({ hooks = maki.json.decode("[]"), policy = { allDisabled = true } }),
-    "",
+  return handshake_problem(
+    { settings = { effective = effective, sources = maki.json.decode("[]") } },
     launch.WORKERS.code,
     confine
   )
@@ -219,14 +257,6 @@ for _, home in ipairs({ "", false }) do
   end)
 end
 
-local function account_answer(overrides, mode)
-  local account = { apiProvider = "firstParty", subscriptionType = "Claude Pro" }
-  for k, v in pairs(overrides or {}) do
-    account[k] = v ~= MISSING and v or nil
-  end
-  return { current_permission_mode = mode or "default", account = account }
-end
-
 local function has_pair(argv, flag, value)
   for i = 1, #argv - 1 do
     if argv[i] == flag and argv[i + 1] == value then
@@ -237,16 +267,10 @@ local function has_pair(argv, flag, value)
 end
 
 case("a_coding_worker_expects_accept_edits_and_a_reader_refuses_it", function()
-  eq(launch.account_problem(account_answer(nil, "acceptEdits"), launch.WORKERS.code), nil)
-  has(launch.account_problem(account_answer(nil, "acceptEdits"), READ) or "", "acceptEdits")
-  has(launch.account_problem(account_answer(), launch.WORKERS.code) or "", "default")
+  eq(handshake_problem({ account = account_answer(nil, "acceptEdits") }, launch.WORKERS.code, CONFINE), nil)
+  has(handshake_problem({ account = account_answer(nil, "acceptEdits") }) or "", "acceptEdits")
+  has(handshake_problem({ account = account_answer() }, launch.WORKERS.code, CONFINE) or "", "default")
 end)
-
-local CONFINE = {
-  deny_read = { "/work", "/home/u/.claude", "/artifacts" },
-  allow_read = { "/artifacts/a1/git" },
-  allow_write = { "/artifacts/a1/tmp" },
-}
 
 -- The values here are literal on purpose. The coding worker gets only these
 -- tools, in this mode, with no bypass, and Bash runs only in its sandbox.
@@ -401,10 +425,13 @@ case("a_coding_handshake_checks_the_sandbox_and_a_read_one_does_not", function()
     effective = launch.settings("", READ),
   }
   local hooks = { hooks = maki.json.decode("[]"), policy = { allDisabled = true } }
-  eq(launch.policy_problem(settings, hooks, "", READ), nil)
-  has(launch.policy_problem(settings, hooks, "", launch.WORKERS.code, CONFINE) or "", "outside its sandbox")
+  eq(handshake_problem({ settings = settings, hooks = hooks }), nil)
+  has(
+    handshake_problem({ settings = settings, hooks = hooks }, launch.WORKERS.code, CONFINE) or "",
+    "outside its sandbox"
+  )
   settings.effective = launch.settings("", launch.WORKERS.code, CONFINE)
-  eq(launch.policy_problem(settings, hooks, "", launch.WORKERS.code, CONFINE), nil)
+  eq(handshake_problem({ settings = settings, hooks = hooks }, launch.WORKERS.code, CONFINE), nil)
 end)
 
 local function read_argv()
@@ -470,23 +497,21 @@ local function settings_answer(policy, edit)
   return { effective = effective, sources = sources }
 end
 
-local HOOKS_OFF = { hooks = maki.json.decode("[]"), policy = { allDisabled = true, policyHookCount = 0 } }
-
 case("our_settings_alone_pass", function()
-  eq(launch.policy_problem(settings_answer(), HOOKS_OFF, "", READ), nil)
+  eq(handshake_problem({ settings = settings_answer() }), nil)
 end)
 
 case("missing_effective_settings_return_a_problem", function()
   local answer = settings_answer()
   answer.effective = nil
-  has(launch.policy_problem(answer, HOOKS_OFF, "", READ), "does not report effective settings")
+  has(handshake_problem({ settings = answer }), "does not report effective settings")
 end)
 
 -- An empty settings error list means every setting is valid.
 case("an_empty_settings_error_list_passes", function()
   local answer = settings_answer()
   answer.errors = maki.json.decode("[]")
-  eq(launch.policy_problem(answer, HOOKS_OFF, "", READ), nil)
+  eq(handshake_problem({ settings = answer }), nil)
 end)
 
 case("managed_keys_that_only_restrict_pass", function()
@@ -495,7 +520,7 @@ case("managed_keys_that_only_restrict_pass", function()
     forceLoginMethod = "claudeai",
     permissions = { deny = { "Read(./vault/**)" }, disableBypassPermissionsMode = "disable" },
   }
-  eq(launch.policy_problem(settings_answer(policy), HOOKS_OFF, "", READ), nil)
+  eq(handshake_problem({ settings = settings_answer(policy) }), nil)
 end)
 
 for _, c in ipairs({
@@ -511,7 +536,7 @@ for _, c in ipairs({
   { name = "no_settings_object", policy = "anything", want = "not a settings object" },
 }) do
   case("managed_policy_with_" .. c.name .. "_is_refused", function()
-    has(launch.policy_problem(settings_answer(c.policy), HOOKS_OFF, "", READ) or "", c.want)
+    has(handshake_problem({ settings = settings_answer(c.policy) }) or "", c.want)
   end)
 end
 
@@ -546,7 +571,7 @@ for _, c in ipairs({
   },
 }) do
   case("merged_settings_with_" .. c.name .. "_are_refused", function()
-    has(launch.policy_problem(settings_answer(nil, c.edit), HOOKS_OFF, "", READ) or "", c.want)
+    has(handshake_problem({ settings = settings_answer(nil, c.edit) }) or "", c.want)
   end)
 end
 
@@ -566,7 +591,7 @@ for _, c in ipairs({
   case("settings_with_" .. c.name .. "_are_refused", function()
     local answer = settings_answer()
     answer.errors = c.errors
-    local problem = launch.policy_problem(answer, HOOKS_OFF, "", READ) or ""
+    local problem = handshake_problem({ settings = answer }) or ""
     has(problem, c.want)
     assert(not problem:find("TOKEN_42", 1, true), "the error message shows the secret: " .. problem)
   end)
@@ -592,7 +617,7 @@ for _, c in ipairs({
   case("settings_with_" .. c.name .. "_are_refused", function()
     local answer = settings_answer()
     c.reshape(answer)
-    has(launch.policy_problem(answer, HOOKS_OFF, "", READ) or "", c.want)
+    has(handshake_problem({ settings = answer }) or "", c.want)
   end)
 end
 
@@ -744,13 +769,6 @@ case("settings_deny_the_defaults_and_the_configured_paths", function()
 end)
 
 -- ── claude_stream ──
-
-local function handshake_answer(handshake, id, response, subtype)
-  return handshake:answer(maki.json.encode({
-    type = "control_response",
-    response = { request_id = id, subtype = subtype or "success", response = response },
-  }))
-end
 
 case("a_complete_clean_handshake_passes", function()
   local answers = { account = account_answer(), settings = settings_answer(), hooks = HOOKS_OFF }

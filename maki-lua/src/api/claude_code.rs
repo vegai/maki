@@ -222,31 +222,6 @@ fn json(text: &str) -> LuaResult<Value> {
     serde_json::from_str(text).map_err(mlua::Error::external)
 }
 
-/// Check a subscription login before a prompt is sent.
-/// @param init string JSON account response or control event.
-/// @param modes table Allowed permission modes.
-/// @return (string?) Reason the login is unsafe, or nil.
-#[lua_fn]
-fn account_problem(_lua: &Lua, init: String, modes: Vec<String>) -> LuaResult<Option<String>> {
-    Ok(validation::account_problem(&json(&init)?, &modes))
-}
-
-/// Reject unsafe policy and require the worker's expected settings.
-/// @param settings string JSON settings response or control event.
-/// @param hooks string JSON hooks response or control event.
-/// @param policy table Deny rules and optional sandbox paths.
-/// @return (string?) Reason the policy is unsafe, or nil.
-#[lua_fn]
-fn policy_problem(
-    lua: &Lua,
-    settings: String,
-    hooks: String,
-    policy: Table,
-) -> LuaResult<Option<String>> {
-    let policy: WorkerPolicy = lua.from_value(LuaValue::Table(policy))?;
-    Ok(validation::worker_policy(&json(&settings)?, &json(&hooks)?, &policy).err())
-}
-
 /// Check the worker catalog, login route and directory before accepting output.
 /// @param event string JSON init event.
 /// @param version string Validated version.
@@ -410,7 +385,7 @@ lua_table! {
     /// the distinction between null, objects and arrays.
     "maki.claude_code" => pub(crate) fn create_claude_code_table(perms: &PluginPermissions), DOCS [
         handshake, worker_handshake, base_args, worker_settings, empty_mcp_config, prepare_launch(perms), private_dir(perms), home_state_files(perms),
-        account_problem, policy_problem, init_problem,
+        init_problem,
         classify, version_check(perms), invalidate_version, sanitize_git(perms), project_git_dir(perms), unpack_blobs(perms),
     ]
 }
@@ -490,8 +465,12 @@ mod tests {
         let policy = json_to_lua(&lua, &policy).unwrap();
         let settings: Function = table.get("worker_settings").unwrap();
         assert!(settings.call::<LuaValue>(policy.clone()).is_err());
-        let check: Function = table.get("policy_problem").unwrap();
-        assert!(check.call::<Option<String>>(("{}", "{}", policy)).is_err());
+        let handshake: Function = table.get("worker_handshake").unwrap();
+        assert!(
+            handshake
+                .call::<LuaValue>((Vec::<String>::new(), policy))
+                .is_err()
+        );
     }
 
     #[test_case("" ; "checkout")]

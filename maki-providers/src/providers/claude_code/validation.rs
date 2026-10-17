@@ -127,17 +127,15 @@ impl WorkerHandshake {
     }
 
     pub fn answer(&mut self, response: &Value) -> Result<bool, String> {
-        self.answers
-            .checked_answer(
-                response,
-                |account| checks::account_problem_in(account, &self.modes),
-                |settings, hooks| {
-                    worker_policy(settings, hooks, &self.policy)
-                        .err()
-                        .map(Problem::WorkerPolicy)
-                },
-            )
-            .map_err(|error| error.to_string())
+        if !self
+            .answers
+            .record(response)
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(false);
+        }
+        self.finish()?;
+        Ok(true)
     }
 
     pub fn finish(&self) -> Result<(), String> {
@@ -145,9 +143,10 @@ impl WorkerHandshake {
             .check(
                 |account| checks::account_problem_in(account, &self.modes),
                 |settings, hooks| {
-                    worker_policy(settings, hooks, &self.policy)
-                        .err()
-                        .map(Problem::WorkerPolicy)
+                    checks::policy_problem_in(settings, hooks, false).or_else(|| {
+                        worker_problem(&settings["effective"], &self.policy.settings())
+                            .map(Problem::WorkerPolicy)
+                    })
                 },
             )
             .map_err(|error| error.to_string())
@@ -278,33 +277,6 @@ pub async fn private_dir(
     .await
 }
 
-fn response(value: &Value) -> &Value {
-    if value["type"] == "control_response" {
-        &value["response"]["response"]
-    } else {
-        value
-    }
-}
-
-pub fn account_problem(init: &Value, modes: &[String]) -> Option<String> {
-    checks::account_problem_in(response(init), modes).map(|problem| problem.to_string())
-}
-
-pub fn worker_policy(settings: &Value, hooks: &Value, policy: &WorkerPolicy) -> Result<(), String> {
-    let settings = response(settings);
-    if let Some(problem) = checks::policy_problem_in(settings, response(hooks), false) {
-        return Err(problem.to_string());
-    }
-    let effective = &settings["effective"];
-    if !effective.is_object() {
-        return Err("Claude Code does not report effective settings".to_owned());
-    }
-    match worker_problem(effective, &policy.settings()) {
-        Some(problem) => Err(problem),
-        None => Ok(()),
-    }
-}
-
 pub fn init_problem(
     event: &Value,
     version: &str,
@@ -385,7 +357,7 @@ pub fn usage_counts(usage: &Value) -> Value {
 }
 
 pub fn resolved_model(account: &Value, requested: &str) -> Option<String> {
-    response(account)["models"]
+    account["models"]
         .as_array()?
         .iter()
         .find(|offer| offer["value"] == requested)?["resolvedModel"]
@@ -410,7 +382,7 @@ fn file_conflicts(config_dir: &Path, cwd: &Path, local_dirs: &[PathBuf]) -> Vec<
 }
 
 pub fn subscription_type(account: &Value) -> Option<String> {
-    response(account)["account"]["subscriptionType"]
+    account["account"]["subscriptionType"]
         .as_str()
         .map(str::to_owned)
 }
@@ -540,6 +512,9 @@ fn sandbox_problem(sandbox: &Value, expected: &Value) -> Option<String> {
 }
 
 fn worker_problem(effective: &Value, expected: &Value) -> Option<String> {
+    if !effective.is_object() {
+        return Some("Claude Code does not report effective settings".to_owned());
+    }
     let permissions = &effective["permissions"];
     if permissions["blockReadsOutsideWorkingDirectories"]
         != expected["permissions"]["blockReadsOutsideWorkingDirectories"]
