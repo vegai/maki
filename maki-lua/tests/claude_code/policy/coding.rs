@@ -25,8 +25,8 @@ use test_case::test_case;
 
 use super::super::support::{
     ARTIFACT_LINE, BASH_SRC, DEADLINE, IMPORT_TOOL, LEFT_BEHIND, NOTHING_IMPORTED, ORIGINALS,
-    PWNED, SNAPSHOT_DIR, TOOL, WRITE_SRC, commit_all, contents, git, listing, load, mode_bits_hold,
-    tool_reply, try_load, wait_until, write,
+    PWNED, SNAPSHOT_DIR, TOOL, WRITE_SRC, commit_all, contents, environment, git, listing, load,
+    mode_bits_hold, tool_reply, try_load, wait_until, write,
 };
 use super::{
     ANSWERS, CODE_CLAUDE_CONFIG, CODE_EDIT, CODE_HANG, CODE_HOSTILE, CODE_LONG, CODE_PROFILE,
@@ -132,6 +132,7 @@ const PREPARE_LOCKS_DIRECTORIES: &str =
 const LOCKED_SNAPSHOT_FILE: &str = "locked/nested/file";
 const READ_ONLY_DIRECTORY_MODE: u32 = 0o555;
 const READ_ONLY_FILE_MODE: u32 = 0o400;
+const INHERITED_GIT_PATH: &str = "/no-such-maki-git-path";
 const TRASH_PREFIX: &str = ".trash-";
 const SNAPSHOT_STAYS: &str = "The worker's snapshot stays in";
 const REPLY_LINES: usize = 8;
@@ -758,6 +759,25 @@ fn an_import_lands_what_the_artifact_recorded(object_format: &str) {
         "the executable bit is missing"
     );
 
+    let again = coding.import(&reg, json!({ "id": id })).unwrap();
+    assert!(again.contains(ALREADY_IMPORTED), "got: {again}");
+}
+
+#[test_case("GIT_OBJECT_DIRECTORY" ; "object_directory_from_a_git_hook")]
+#[test_case("GIT_INDEX_FILE" ; "another_git_index")]
+#[test_case("GIT_DIR" ; "another_repository")]
+fn an_import_ignores_inherited_git_paths(variable: &str) {
+    let coding = Coding::new();
+    environment::set(variable, INHERITED_GIT_PATH);
+    let (reg, _host) = coding.host(&[]);
+    let id = artifact_id(&coding.code(&reg, CODE_EDIT, &[]).unwrap());
+
+    let reply = coding.import(&reg, json!({ "id": id })).unwrap();
+    assert!(reply.contains(ORIGINALS_KEPT), "got: {reply}");
+    assert_eq!(
+        fs::read_to_string(coding.project().join(IMPORTED_LIB)).unwrap(),
+        WORKER_LIB
+    );
     let again = coding.import(&reg, json!({ "id": id })).unwrap();
     assert!(again.contains(ALREADY_IMPORTED), "got: {again}");
 }

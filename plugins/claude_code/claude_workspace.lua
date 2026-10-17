@@ -15,6 +15,7 @@ M.MANIFEST_VERSION = 1
 local DEFAULT_DENY = { ".env*", "**/.env*", "secrets", "**/secrets", "secrets/**", "**/secrets/**" }
 
 local GIT_UNCONFIGURED = { GIT_CONFIG_GLOBAL = "/dev/null", GIT_CONFIG_NOSYSTEM = "1" }
+local GIT_ENV_PREFIX = "GIT_"
 
 -- With these attributes a blob id is the hash of the bytes on disk, the same
 -- id `git hash-object --no-filters` gives for the checkout.
@@ -261,7 +262,22 @@ function M.shell_quote(text)
 end
 
 local function git_environment()
-  local words = { "env", "-u", "GIT_CONFIG_PARAMETERS", "-u", "GIT_CONFIG_COUNT" }
+  local inherited = { GIT_CONFIG_PARAMETERS = true, GIT_CONFIG_COUNT = true }
+  for name in pairs(maki.uv.os_environ()) do
+    if name:sub(1, #GIT_ENV_PREFIX) == GIT_ENV_PREFIX then
+      inherited[name] = true
+    end
+  end
+  local names = {}
+  for name in pairs(inherited) do
+    names[#names + 1] = name
+  end
+  table.sort(names)
+  local words = { "env" }
+  for _, name in ipairs(names) do
+    words[#words + 1] = "-u"
+    words[#words + 1] = M.shell_quote(name)
+  end
   local assignments = {}
   for name, value in pairs(GIT_UNCONFIGURED) do
     assignments[#assignments + 1] = name .. "=" .. M.shell_quote(value)
