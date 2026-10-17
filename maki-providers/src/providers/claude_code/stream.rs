@@ -32,6 +32,7 @@ const SYSTEM_EVENT: &str = "system";
 pub(super) const ASSISTANT_EVENT: &str = "assistant";
 const USER_EVENT: &str = "user";
 const RESULT_EVENT: &str = "result";
+const MAX_TURNS_ERROR: &str = "error_max_turns";
 const STREAM_EVENT: &str = "stream_event";
 const UNKNOWN_EVENT_KIND: &str = "?";
 const CONTROL_REQUEST: &str = "control_request";
@@ -182,7 +183,7 @@ pub(crate) fn classify(
     if !accepted {
         if kind == EventKind::Result && failed_result(event) {
             if mode == StreamMode::Provider {
-                return Err(Error::Failed(shown(&event["errors"])));
+                return Err(Error::Failed(result_message(event)));
             }
         } else if matches!(
             kind,
@@ -199,6 +200,21 @@ fn failed_result(event: &Value) -> bool {
         || event["subtype"]
             .as_str()
             .is_some_and(|kind| kind.starts_with("error_"))
+}
+
+fn result_message(event: &Value) -> String {
+    let kind = event["subtype"].as_str().unwrap_or(UNKNOWN_ERROR);
+    let detail = event["result"]
+        .as_str()
+        .filter(|text| !text.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            event["errors"]
+                .as_array()
+                .filter(|errors| !errors.is_empty())
+                .map(|_| shown(&event["errors"]))
+        });
+    detail.map_or_else(|| kind.to_owned(), |text| format!("{kind}: {text}"))
 }
 
 pub(crate) fn check_model(ran: &str, expected: &str) -> Result<(), Error> {
@@ -809,22 +825,26 @@ impl<'a> Turn<'a> {
         if let Some(refusal) = self.refusal.take() {
             return Err(self.refused(refusal, status_of(&event["api_error_status"])));
         }
-        if event["subtype"] != SUCCESS || event["is_error"] == true {
+        // The one-turn cap stops Claude Code after a rejected tool call. Maki already
+        // owns the complete reply and must return that call through its own dispatch.
+        let rejected_at_limit = event["subtype"] == MAX_TURNS_ERROR
+            && self.rejected
+            && self.is_complete()
+            && self.stop_reason.as_deref() == Some(TOOL_USE_STOP)
+            && self.lost.is_none()
+            && event["api_error_status"].is_null();
+        if (event["subtype"] != SUCCESS || event["is_error"] == true) && !rejected_at_limit {
             if let Some(status) = status_of(&event["api_error_status"]) {
                 return Err(self.refused(
                     Refusal {
                         kind: UNKNOWN_ERROR.into(),
-                        text: event["result"]
-                            .as_str()
-                            .map_or_else(|| shown(&event["errors"]), str::to_owned),
+                        text: result_message(event),
                         status: Some(status),
                     },
                     None,
                 ));
             }
-            return Err(Error::Failed(
-                event["result"].as_str().unwrap_or(NO_MESSAGE).to_owned(),
-            ));
+            return Err(Error::Failed(result_message(event)));
         }
         if let Some(lost) = self.lost.take() {
             return Err(lost);
@@ -1123,10 +1143,10 @@ mod tests {
     use super::super::transcript::Catalog;
     use super::{
         ACCOUNT_ANSWER, API_ERROR_MARK, BATCH_CALL_TOOL, BATCH_CALLS, BATCH_TOOL, EXTRA_USAGE,
-        EXTRA_USAGE_IN_USE, HOOKS_ANSWER, INPUT_REJECTED, MAX_TOKENS_STOP, NO_SUCH_TOOL,
-        PLAN_REJECTED, RATE_LIMITED, REFUSAL_STOP, SETTINGS_ANSWER, SHOWN_LINE_CHARS, SUCCESS,
-        Step, TOOL_RESULT, TOOL_USE_STOP, Turn, WINDOW_FULL_STOP, dropped_by_claude_code, usage_of,
-        user_message,
+        EXTRA_USAGE_IN_USE, HOOKS_ANSWER, INPUT_REJECTED, MAX_TOKENS_STOP, MAX_TURNS_ERROR,
+        NO_SUCH_TOOL, PLAN_REJECTED, RATE_LIMITED, REFUSAL_STOP, RESULT_EVENT, SETTINGS_ANSWER,
+        SHOWN_LINE_CHARS, SUCCESS, Step, TOOL_RESULT, TOOL_USE_STOP, Turn, WINDOW_FULL_STOP,
+        dropped_by_claude_code, usage_of, user_message,
     };
     use crate::{ContentBlock, StopReason, StreamResponse};
 
@@ -1166,6 +1186,10 @@ mod tests {
     /// Claude Code's placeholders, as its output filter spells them.
     const NO_CONTENT: &str = "(no content)";
     const INTERRUPTED: &str = "[Request interrupted by user for tool use]";
+    const EXECUTION_ERROR: &str = "error_during_execution";
+    const FAILURE_DETAIL: &str = "socat not installed";
+    const FAILURE_WITH_RESULT: &str = "error_during_execution: socat not installed";
+    const FAILURE_WITH_ERRORS: &str = "error_during_execution: [\"socat not installed\"]";
 
     fn catalog() -> Catalog {
         Catalog::new(&json!([
@@ -1564,6 +1588,7 @@ mod tests {
         let call = json!({ "type": "tool_use", "id": FIRST_CALL, "name": name, "input": {} });
         let mut lines = reply(&[call], TOOL_USE_STOP);
         lines.push(no_such_tool(FIRST_CALL, name));
+        lines.push(max_turns_result());
         let (step, response) = run(&lines, Vec::new(), false);
         assert!(matches!(step, Ok(Step::Done)), "{step:?}");
         let response = response.unwrap().unwrap();
@@ -1583,12 +1608,19 @@ mod tests {
         .to_string()
     }
 
+    fn max_turns_result() -> String {
+        json!({ "type": RESULT_EVENT, "subtype": MAX_TURNS_ERROR, "is_error": true, "errors": [] })
+            .to_string()
+    }
+
     /// When Claude Code rejects a call against maki's schema, maki runs it
     /// anyway, it fails the same way, and the model can retry. Claude Code
     /// rejects at the end of the call's block, before the reply is complete.
-    #[test_case(false ; "before_the_reply_ends")]
-    #[test_case(true ; "after_the_reply_ends")]
-    fn a_call_claude_code_rejects_is_handed_to_maki(after_the_reply: bool) {
+    #[test_case(false, false ; "before_the_reply_ends")]
+    #[test_case(true, false ; "after_the_reply_ends")]
+    #[test_case(false, true ; "before_the_reply_ends_with_a_turn_limit")]
+    #[test_case(true, true ; "after_the_reply_ends_with_a_turn_limit")]
+    fn a_call_claude_code_rejects_is_handed_to_maki(after_the_reply: bool, turn_limit: bool) {
         let mut lines = vec![start()];
         lines.extend(streamed(call(FIRST_CALL, "a")));
         if after_the_reply {
@@ -1598,11 +1630,59 @@ mod tests {
             lines.push(rejected(FIRST_CALL));
             lines.extend(stop(TOOL_USE_STOP));
         }
+        if turn_limit {
+            lines.push(max_turns_result());
+        }
         let (step, response) = run(&lines, Vec::new(), false);
         assert!(matches!(step, Ok(Step::Done)), "{step:?}");
         let response = response.unwrap().unwrap();
         assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
         assert_eq!(response.message.tool_uses().count(), 1);
+    }
+
+    #[test_case(false, true, None ; "without_a_tool_rejection")]
+    #[test_case(true, false, None ; "before_the_reply_is_complete")]
+    #[test_case(true, true, Some(TOO_MANY) ; "with_an_api_error")]
+    fn a_turn_limit_preserves_unresolved_failures(
+        rejected_call: bool,
+        complete: bool,
+        status: Option<u16>,
+    ) {
+        let mut lines = reply(&[call(FIRST_CALL, "a")], TOOL_USE_STOP);
+        if !complete {
+            lines.pop();
+        }
+        if rejected_call {
+            lines.push(rejected(FIRST_CALL));
+        }
+        lines.push(json!({ "type": RESULT_EVENT, "subtype": MAX_TURNS_ERROR, "is_error": true, "api_error_status": status }).to_string());
+        let (step, response) = run(&lines, Vec::new(), false);
+        assert!(response.is_none());
+        match status {
+            Some(expected) => assert!(
+                matches!(step, Err(Error::ApiRefused { status: Some(actual), .. }) if actual == expected),
+                "{step:?}"
+            ),
+            None => assert!(
+                matches!(step, Err(Error::Failed(ref message)) if message == MAX_TURNS_ERROR),
+                "{step:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn a_rejected_call_at_the_turn_limit_still_needs_final_usage() {
+        let mut lines = vec![start()];
+        lines.extend(streamed(call(FIRST_CALL, "a")));
+        lines.push(rejected(FIRST_CALL));
+        lines.push(stream(
+            json!({ "type": "message_delta", "delta": { "stop_reason": TOOL_USE_STOP } }),
+        ));
+        lines.push(stream(json!({ "type": "message_stop" })));
+        lines.push(max_turns_result());
+        let (step, response) = run(&lines, Vec::new(), false);
+        assert!(matches!(step, Ok(Step::Done)), "{step:?}");
+        assert!(matches!(response, Some(Err(Error::NoFinalOutput))));
     }
 
     /// Any other answer, or an answer to a call the reply did not make, means
@@ -1788,6 +1868,24 @@ mod tests {
         assert!(
             matches!(step, Err(Error::Failed(ref message)) if message.contains("socat not installed"))
         );
+    }
+
+    #[test_case(json!({ "subtype": MAX_TURNS_ERROR }), MAX_TURNS_ERROR ; "without_details")]
+    #[test_case(json!({ "subtype": EXECUTION_ERROR, "result": FAILURE_DETAIL }), FAILURE_WITH_RESULT ; "with_result_text")]
+    #[test_case(json!({ "subtype": EXECUTION_ERROR, "errors": [FAILURE_DETAIL] }), FAILURE_WITH_ERRORS ; "with_error_messages")]
+    #[test_case(json!({ "subtype": EXECUTION_ERROR, "result": "", "errors": [FAILURE_DETAIL] }), FAILURE_WITH_ERRORS ; "with_empty_result_text")]
+    fn result_errors_preserve_kind_and_details(mut event: Value, expected: &str) {
+        event["type"] = json!(RESULT_EVENT);
+        event["is_error"] = json!(true);
+        let line = event.to_string();
+        let before_init = with_turn(|mut turn| turn.feed(&line));
+        let after_init = run(&[start(), line], Vec::new(), false).0;
+        for error in [before_init, after_init] {
+            assert!(
+                matches!(error, Err(Error::Failed(ref message)) if message == expected),
+                "{error:?}"
+            );
+        }
     }
 
     /// A text reply that ends at its result.

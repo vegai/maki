@@ -599,6 +599,7 @@ mod tests {
     /// final usage, and no process or private file is left behind.
     #[test_case("batch" ; "the_generation_first")]
     #[test_case("cut_line" ; "a_last_line_the_stop_cut_short")]
+    #[test_case("rejected_max_turns" ; "a_rejected_call_at_the_turn_limit")]
     fn a_batch_hands_off_whole_and_leaves_nothing(scenario: &str) {
         let fake = Fake::new(scenario);
         let (result, events) = smol::block_on(fake.request());

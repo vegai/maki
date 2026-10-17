@@ -71,6 +71,9 @@ generation() {
     block "$(call toolu_2 b)"
     event '{"type":"content_block_stop","index":2}'
   fi
+  if [ "$scenario" = rejected_max_turns ]; then
+    line '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":true,"content":"<tool_use_error>InputValidationError: read was called with input that does not match its schema</tool_use_error>"}]}}'
+  fi
   event "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"$1\"}$final_usage}"
   event '{"type":"message_stop"}'
 }
@@ -126,6 +129,11 @@ case $scenario in
     IFS= read -r held <&4
     ;;
   batch) init none; connect; generation tool_use; dispatch a; sleep @WAIT_SECS@ ;;
+  rejected_max_turns)
+    trap '' TERM
+    init none; connect; generation tool_use
+    line '{"type":"result","subtype":"error_max_turns","is_error":true,"errors":[]}'
+    ;;
   cut_line) init none; connect; generation tool_use; printf '{"type":"keep_al'; dispatch a; sleep @WAIT_SECS@ ;;
   missing_block_eof | missing_block_late)
     init none
