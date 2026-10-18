@@ -12,6 +12,7 @@ local path_utils = require("claude_paths")
 local M = {}
 
 local TRASH_PREFIX = ".trash-"
+local SWEEP_LOCK = ".sweep.lock"
 local SWEEP_CONTENTS = [[
 set -e
 cd -P -- "$1"
@@ -149,14 +150,7 @@ local function commit_snapshot(call, artifact, message)
   if commit_err then
     return nil, commit_err
   end
-  local head, err = maki.fs.read(maki.fs.joinpath(artifact.git, "HEAD"))
-  if head then
-    local reference = head:match("^ref: ([^\n]+)")
-    if reference then
-      head, err = maki.fs.read(maki.fs.joinpath(artifact.git, reference))
-    end
-  end
-  return head and path_utils.trim(head), err
+  return snapshot_git(call, artifact, { "rev-parse", "HEAD" })
 end
 
 function M.disk_blobs(call, env, cwd, paths, keep_on_cancel, timeout_ms)
@@ -500,6 +494,11 @@ end
 --- unfinished import. An artifact that stopped before the collect step is
 --- dated by its marker.
 function M.sweep(call, root, ttl_hours)
+  -- Artifact locks are unlinked during deletion. Keep this lock outside the deleted tree.
+  local sweep_lock = maki.fs.try_lock(maki.fs.joinpath(root, SWEEP_LOCK))
+  if not sweep_lock then
+    return
+  end
   local entries = maki.fs.dir(root)
   local cutoff = os.time() - ttl_hours * SECS_PER_HOUR
   for _, entry in ipairs(entries or {}) do
@@ -532,6 +531,9 @@ function M.sweep(call, root, ttl_hours)
       end
     end
   end
+  call:when_idle(function()
+    sweep_lock:close()
+  end)
 end
 
 --- Returns {root} resolved on disk, even when it is missing. It must lie

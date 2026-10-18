@@ -374,22 +374,22 @@ pub(crate) fn control_request(id: &str, request: &Value) -> String {
 /// blocks that an earlier request already sent.
 #[derive(Serialize)]
 struct UserText<'a> {
-    text: &'a str,
     #[serde(rename = "type")]
     kind: &'static str,
+    text: &'a str,
 }
 
 #[derive(Serialize)]
 struct UserContent<'a> {
-    content: Vec<UserText<'a>>,
     role: &'static str,
+    content: Vec<UserText<'a>>,
 }
 
 #[derive(Serialize)]
 struct UserEvent<'a> {
-    message: UserContent<'a>,
     #[serde(rename = "type")]
     kind: &'static str,
+    message: UserContent<'a>,
 }
 
 pub(crate) fn user_message(blocks: &[String]) -> Result<String, Error> {
@@ -397,9 +397,12 @@ pub(crate) fn user_message(blocks: &[String]) -> Result<String, Error> {
         message: UserContent {
             content: blocks
                 .iter()
-                .map(|text| UserText { text, kind: "text" })
+                .map(|text| UserText {
+                    text,
+                    kind: TEXT_BLOCK,
+                })
                 .collect(),
-            role: "user",
+            role: USER_EVENT,
         },
         kind: USER_EVENT,
     };
@@ -1621,6 +1624,16 @@ mod tests {
         );
         assert_eq!(usage.limits[0].reset_at, None);
         assert_eq!(usage.limits[0].percentage, Some(50));
+    }
+
+    #[test]
+    fn prompt_envelope_preserves_the_original_wire_order() {
+        const PROMPT: &str = "first\nsecond";
+        const WIRE: &str = concat!(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"first\nsecond"}]}}"#,
+            "\n"
+        );
+        assert_eq!(user_message(&[PROMPT.into()]).unwrap(), WIRE);
     }
 
     #[test]

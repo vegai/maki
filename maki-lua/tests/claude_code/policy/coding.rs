@@ -25,8 +25,8 @@ use test_case::test_case;
 
 use super::super::support::{
     ARTIFACT_LINE, BASH_SRC, DEADLINE, IMPORT_TOOL, LEFT_BEHIND, NOTHING_IMPORTED, ORIGINALS,
-    PWNED, SNAPSHOT_DIR, TOOL, WRITE_SRC, commit_all, contents, environment, git, listing, load,
-    mode_bits_hold, tool_reply, try_load, wait_until, write,
+    PWNED, SNAPSHOT_DIR, TOOL, WRITE_SRC, artifact_listing, commit_all, contents, environment, git,
+    listing, load, mode_bits_hold, tool_reply, try_load, wait_until, write,
 };
 use super::{
     ANSWERS, CODE_CLAUDE_CONFIG, CODE_EDIT, CODE_HANG, CODE_HOSTILE, CODE_LONG, CODE_PROFILE,
@@ -910,7 +910,7 @@ fn a_file_name_maki_cannot_pass_on_is_refused() {
         !coding.fake.log("calls").contains("print"),
         "maki must not send a prompt"
     );
-    assert_eq!(fs::read_dir(coding.artifacts.path()).unwrap().count(), 0);
+    assert_eq!(artifact_listing(coding.artifacts.path()).len(), 0);
 }
 
 /// A submodule is a different repository, so the snapshot leaves it out and
@@ -1273,9 +1273,7 @@ fn a_cancel_while_the_snapshot_is_made_discards_it(locked: bool) {
         "{error}"
     );
     let artifacts = coding.artifacts.path().to_owned();
-    let emptied = wait_until(DEADLINE, || {
-        fs::read_dir(&artifacts).unwrap().next().is_none()
-    });
+    let emptied = wait_until(DEADLINE, || artifact_listing(&artifacts).is_empty());
     assert!(emptied, "these files stay: {:?}", listing(&artifacts));
 }
 
@@ -1372,7 +1370,7 @@ fn a_cancel_during_the_run_keeps_the_workers_snapshot(prompt: &str) {
     assert!(err.contains(SNAPSHOT_STAYS), "got: {err}");
     let next = json!({ "prompt": ANSWERS, "model": MODEL_ALIAS });
     run_tool(&reg, &coding.ctx(&reg), TOOL, next).unwrap();
-    let kept = listing(coding.artifacts.path());
+    let kept = artifact_listing(coding.artifacts.path());
     let [artifact] = kept.as_slice() else {
         panic!("kept {kept:?}");
     };
@@ -1646,6 +1644,32 @@ fn prepare_runs_with_the_users_environment() {
     assert_eq!(seen, env::var(USER_ONLY_VARIABLE).unwrap());
 }
 
+#[test]
+fn a_prepared_snapshot_can_use_the_reftable_backend() {
+    const MIGRATE: &str = "git refs migrate --ref-format=reftable";
+    const REFTABLE: &str = "reftable";
+    let probe = tempdir().unwrap();
+    git(probe.path(), &["init", "-q"]);
+    let supported = Command::new("git")
+        .args(["refs", "migrate", "--ref-format=reftable"])
+        .current_dir(probe.path())
+        .output()
+        .unwrap();
+    if !supported.status.success() {
+        return;
+    }
+    let coding = Coding::new();
+    let (reg, _host) = coding.host(&[("prepare", json!(MIGRATE))]);
+    let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
+    let artifact = coding.artifact(&artifact_id(&reply));
+    assert!(
+        artifact.join(ARTIFACT_GIT).join(REFTABLE).is_dir(),
+        "{reply}"
+    );
+    assert!(!reply.contains(PREPARE_FAILED), "{reply}");
+    assert!(reply.contains(REPORTED_CHANGES[0]), "{reply}");
+}
+
 #[test_case("GIT_DIR", true ; "git_directory_from_a_hook")]
 #[test_case("GIT_WORK_TREE", false ; "worktree_from_a_hook")]
 fn prepare_git_commands_use_the_snapshot(variable: &str, git_directory: bool) {
@@ -1894,7 +1918,7 @@ fn the_sweep_takes_only_stale_artifacts(files: &[&str], fresh_manifest: bool, sw
     for file in files {
         assert_eq!(old.join(file).exists(), !swept, "{file}");
     }
-    let kept = fs::read_dir(coding.artifacts.path()).unwrap().count();
+    let kept = artifact_listing(coding.artifacts.path()).len();
     assert_eq!(
         kept,
         if swept { 1 } else { 2 },
@@ -1939,7 +1963,7 @@ fn the_sweep_removes_protected_directories_without_changing_link_targets(mode: u
     let (reg, _host) = coding.host(&[]);
     coding.code(&reg, CODE_EDIT, &[]).unwrap();
     let removed = wait_until(DEADLINE, || {
-        fs::read_dir(coding.artifacts.path()).unwrap().count() == 1
+        artifact_listing(coding.artifacts.path()).len() == 1
     });
     let final_directory_permissions = fs::metadata(directory).unwrap().permissions();
     fs::set_permissions(directory, fs::Permissions::from_mode(EXECUTABLE_MODE)).unwrap();

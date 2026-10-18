@@ -24,6 +24,8 @@ use smol::future::or;
 #[allow(dead_code)]
 pub mod environment;
 
+const SWEEP_LOCK: &str = ".sweep.lock";
+
 pub const TOOL: &str = "claude_code";
 /// The Claude Code version the fakes report: the oldest maki runs.
 pub const MINIMUM_VERSION: &str = "2.1.284";
@@ -181,6 +183,13 @@ pub fn listing(dir: &Path) -> Vec<PathBuf> {
         .collect();
     entries.sort();
     entries
+}
+
+pub fn artifact_listing(dir: &Path) -> Vec<PathBuf> {
+    listing(dir)
+        .into_iter()
+        .filter(|path| path.file_name() != Some(SWEEP_LOCK.as_ref()))
+        .collect()
 }
 
 /// Returns true if `done` turned true within `limit`.

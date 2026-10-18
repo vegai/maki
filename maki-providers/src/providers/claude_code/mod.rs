@@ -151,6 +151,8 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
 /// Shared by all sessions, because each request is a process. The plugin
 /// limits its calls separately.
 static SLOTS: Mutex<Option<(usize, Arc<Semaphore>)>> = Mutex::new(None);
+type PlanUsage = Arc<Mutex<Option<ProviderUsage>>>;
+static PLAN_USAGE: Mutex<BTreeMap<(PathBuf, PathBuf), PlanUsage>> = Mutex::new(BTreeMap::new());
 /// `None` when the provider is off.
 static PLUGIN_OPTIONS: Mutex<Option<PluginOptions>> = Mutex::new(None);
 /// Failed listings, keyed by `claude` and login like the saved list. The
@@ -464,7 +466,6 @@ struct ClaudeCode {
     environment: Arc<Environment>,
     models_cache: Option<PathBuf>,
     windows: Arc<Mutex<Option<SavedModels>>>,
-    plan_usage: Arc<Mutex<Option<ProviderUsage>>>,
     /// Takes precedence over `$CLAUDE_CONFIG_DIR`.
     config_dir: Option<PathBuf>,
 }
@@ -490,9 +491,18 @@ impl ClaudeCode {
             }),
             models_cache: models_cache_path(),
             windows: Arc::default(),
-            plan_usage: Arc::default(),
             config_dir: options.config_dir.clone(),
         })
+    }
+
+    fn plan_usage(&self, config_dir: &Path) -> PlanUsage {
+        Arc::clone(
+            PLAN_USAGE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry((self.executable.clone(), config_dir.to_owned()))
+                .or_default(),
+        )
     }
 
     fn login_dir(&self) -> Result<PathBuf, Error> {
@@ -625,7 +635,8 @@ impl ClaudeCode {
         let slots = slots();
         let _slot = slots.acquire().await;
         let prepared = self.prepare_async(cwd, vars).await?;
-        let models = run::models(&self.launch(&prepared, cwd), &self.plan_usage).await?;
+        let usage = self.plan_usage(&prepared.config_dir);
+        let models = run::models(&self.launch(&prepared, cwd), &usage).await?;
         let saved = SavedModels {
             executable: self.executable.clone(),
             config_dir: prepared.config_dir,
@@ -666,11 +677,12 @@ impl ClaudeCode {
             "claude-code: request slot acquired"
         );
         let prepared = self.prepare_async(&cwd, (self.environment)(None)).await?;
+        let usage = self.plan_usage(&prepared.config_dir);
         run::request(Request {
             launch: self.launch(&prepared, &cwd),
             model: &model.id,
             exchange,
-            plan_usage: &self.plan_usage,
+            plan_usage: &usage,
             max_output: model.output_tokens(),
             thinking,
         })
@@ -734,8 +746,9 @@ impl Provider for ClaudeCode {
     /// ask.
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
         Box::pin(async {
+            let login = self.login_dir().map_err(agent_error)?;
             Ok(self
-                .plan_usage
+                .plan_usage(&login)
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone())
@@ -1377,25 +1390,52 @@ mod on_the_fake {
             }),
             models_cache,
             windows: Arc::default(),
-            plan_usage: Arc::default(),
             config_dir: None,
         }
     }
 
     #[test]
-    fn plan_usage_belongs_to_the_provider_login_and_survives_cloning() {
+    fn plan_usage_is_shared_by_login_even_after_the_reporting_instance_is_dropped() {
         let fake = Fake::new("text");
         let home = tempdir().unwrap();
         let first = provider_for(&fake, home.path(), &env::temp_dir(), None);
-        let second = provider_for(&fake, home.path(), &env::temp_dir(), None);
-        let cloned = first.clone();
         let usage = ProviderUsage {
             plan: Some("Claude Pro".into()),
             ..Default::default()
         };
-        *first.plan_usage.lock().unwrap() = Some(usage.clone());
-        assert_eq!(smol::block_on(cloned.fetch_usage()).unwrap(), Some(usage));
-        assert_eq!(smol::block_on(second.fetch_usage()).unwrap(), None);
+        *first
+            .plan_usage(&first.login_dir().unwrap())
+            .lock()
+            .unwrap() = Some(usage.clone());
+        let second = provider_for(&fake, home.path(), &env::temp_dir(), None);
+        assert_eq!(
+            smol::block_on(second.fetch_usage()).unwrap(),
+            Some(usage.clone())
+        );
+        drop(first);
+        drop(second);
+        let later = provider_for(&fake, home.path(), &env::temp_dir(), None);
+        assert_eq!(smol::block_on(later.fetch_usage()).unwrap(), Some(usage));
+    }
+
+    #[test_case(false ; "another_login")]
+    #[test_case(true ; "another_executable")]
+    fn plan_usage_cannot_cross_login_or_executable_boundaries(executable: bool) {
+        let fake = Fake::new("text");
+        let home = tempdir().unwrap();
+        let other_home = tempdir().unwrap();
+        let other_fake = Fake::new("text");
+        let first = provider_for(&fake, home.path(), &env::temp_dir(), None);
+        *first
+            .plan_usage(&first.login_dir().unwrap())
+            .lock()
+            .unwrap() = Some(ProviderUsage::default());
+        let other = if executable {
+            provider_for(&other_fake, home.path(), &env::temp_dir(), None)
+        } else {
+            provider_for(&fake, other_home.path(), &env::temp_dir(), None)
+        };
+        assert_eq!(smol::block_on(other.fetch_usage()).unwrap(), None);
     }
 
     /// The plugin's `config_dir` picks the login, and Claude Code gets it as

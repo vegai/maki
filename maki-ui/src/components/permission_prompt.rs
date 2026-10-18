@@ -478,15 +478,19 @@ impl PermissionPrompt {
         let inner_width = width.saturating_sub(2);
         let lines = self.build_lines();
         let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-        para.line_count(inner_width) as u16 + 2
+        u16::try_from(para.line_count(inner_width))
+            .unwrap_or(u16::MAX)
+            .saturating_add(2)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::components::form::CLIPPED_CONTENT;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use maki_agent::permissions::PermissionAnswer;
     use maki_config::ToolKey;
+    use ratatui::{Terminal, backend::TestBackend};
     use test_case::test_case;
 
     use super::{
@@ -573,6 +577,41 @@ mod tests {
         assert_eq!(lines[first + 1].trim(), "# M src/main.rs");
         assert_eq!(lines[first + 3].trim(), "set -e");
         assert_eq!(prompt.queue.front().unwrap().scopes, [SCOPE]);
+    }
+
+    #[test_case(80, 12, false ; "short_scope")]
+    #[test_case(80, 12, true ; "multiline_scope")]
+    #[test_case(32, 12, true ; "wrapped_scope")]
+    fn clipped_permission_content_has_a_visible_notice(width: u16, height: u16, clipped: bool) {
+        const COMMAND: &str = "echo read_the_complete_command";
+        let scope = if clipped {
+            vec![COMMAND; 30].join("\n")
+        } else {
+            COMMAND.to_owned()
+        };
+        let mut prompt = PermissionPrompt::new();
+        prompt.push(
+            MAIN_ID.into(),
+            ToolKey::native("bash"),
+            vec![scope.clone()],
+            None,
+            true,
+            None,
+        );
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| prompt.view(frame, frame.area()))
+            .unwrap();
+        let visible: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert_eq!(visible.contains(CLIPPED_CONTENT), clipped, "{visible}");
+        assert_eq!(prompt.queue.front().unwrap().scopes, [scope]);
     }
 
     #[test]

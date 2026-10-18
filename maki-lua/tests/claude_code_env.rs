@@ -30,8 +30,9 @@ mod support;
 use support::environment::EnvVar;
 
 use support::{
-    DEADLINE, MINIMUM_VERSION, TOOL, WorkingDir, commit_all, executable, git, listing, load,
-    on_path, tool_reply, use_fixture_user, wait_for_release, wait_until, within, write,
+    DEADLINE, MINIMUM_VERSION, TOOL, WorkingDir, artifact_listing, commit_all, executable, git,
+    listing, load, on_path, tool_reply, use_fixture_user, wait_for_release, wait_until, within,
+    write,
 };
 
 const HELD_REMOVAL: &str =
@@ -604,6 +605,6 @@ fn code_with_cp(cp: &str, dependencies: &str) -> DisturbedCopy {
     DisturbedCopy {
         err,
         prompt: fs::read_to_string(tools.path().join("prompt")).unwrap_or_default(),
-        artifacts_left: listing(artifacts.path()),
+        artifacts_left: artifact_listing(artifacts.path()),
     }
 }
