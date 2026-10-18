@@ -10,10 +10,10 @@ use ratatui::widgets::{Paragraph, Wrap};
 use maki_agent::permissions::{DEFAULT_DENY_GUIDANCE, PermissionAnswer, generalized_scopes};
 use maki_config::ToolKey;
 
-use crate::components::Overlay;
 use crate::components::form::render_form;
 use crate::components::hint_line;
 use crate::components::is_ctrl;
+use crate::components::{ModalScroll, Overlay};
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 
@@ -76,6 +76,8 @@ const CONFIRM_DENY_PROJECT_SESSION_HINTS: &[(&str, &str)] = &[
 
 const DENY_GUIDANCE_HINTS: &[(&str, &str)] = &[("Enter", "Deny"), ("Esc", "Cancel")];
 const QUEUED_NOTICE: &str = "more request(s) waiting";
+const TITLE: &str = " Permission Required ";
+const SCROLL_TITLE: &str = " Permission Required (PgUp/PgDn: scroll) ";
 
 fn aligned_hint_rows(rows: &[&[(&str, &str)]]) -> Vec<Line<'static>> {
     let t = theme::current();
@@ -149,6 +151,7 @@ pub struct PermissionPrompt {
     queue: VecDeque<Request>,
     state: PromptState,
     buffer: TextBuffer,
+    scroll: ModalScroll,
 }
 
 impl Overlay for PermissionPrompt {
@@ -174,6 +177,7 @@ impl PermissionPrompt {
             queue: VecDeque::new(),
             state: PromptState::Normal,
             buffer: TextBuffer::new(String::new()),
+            scroll: ModalScroll::new_top(),
         }
     }
 
@@ -206,6 +210,7 @@ impl PermissionPrompt {
     fn reset_entry(&mut self) {
         self.state = PromptState::Normal;
         self.buffer = TextBuffer::new(String::new());
+        self.scroll = ModalScroll::new_top();
     }
 
     /// A cancelled subagent has nothing left to answer with, so its asks leave
@@ -242,6 +247,10 @@ impl PermissionPrompt {
             return Some(PermissionAnswer::Deny);
         }
         if *state == PromptState::DenyEditing {
+            if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+                self.scroll.handle_key(key);
+                return None;
+            }
             return match key.code {
                 KeyCode::Enter => {
                     let text = buffer.value().trim().to_string();
@@ -261,6 +270,9 @@ impl PermissionPrompt {
                     None
                 }
             };
+        }
+        if self.scroll.handle_key(key) {
+            return None;
         }
         if key
             .modifiers
@@ -289,6 +301,7 @@ impl PermissionPrompt {
             KeyCode::Char('y') => Some(PermissionAnswer::AllowOnce),
             KeyCode::Char('n') => {
                 *state = PromptState::DenyEditing;
+                self.scroll = ModalScroll::new();
                 None
             }
             KeyCode::Char('a') => {
@@ -465,13 +478,22 @@ impl PermissionPrompt {
         lines
     }
 
-    pub fn view(&self, frame: &mut Frame, area: Rect) {
+    pub fn view(&mut self, frame: &mut Frame, area: Rect) {
         if !self.is_open() {
             return;
         }
-        let lines = self.build_lines();
+        let paragraph = Paragraph::new(self.build_lines()).wrap(Wrap { trim: false });
+        let total =
+            u16::try_from(paragraph.line_count(area.width.saturating_sub(2))).unwrap_or(u16::MAX);
+        let viewport = area.height.saturating_sub(2);
+        self.scroll.update_dimensions(total, viewport);
+        let title = if total > viewport {
+            SCROLL_TITLE
+        } else {
+            TITLE
+        };
         let t = theme::current();
-        render_form(&t, " Permission Required ", frame, area, lines, (0, 0));
+        render_form(&t, title, frame, area, paragraph, (self.scroll.offset(), 0));
     }
 
     pub fn height(&self, width: u16) -> u16 {
@@ -487,6 +509,7 @@ impl PermissionPrompt {
 #[cfg(test)]
 mod tests {
     use crate::components::form::CLIPPED_CONTENT;
+    use crate::components::keybindings::key as binding;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use maki_agent::permissions::PermissionAnswer;
     use maki_config::ToolKey;
@@ -496,12 +519,16 @@ mod tests {
     use super::{
         CONFIRM_ALLOW_PROJECT_HINTS, CONFIRM_ALLOW_PROJECT_SESSION_HINTS,
         CONFIRM_DENY_PROJECT_HINTS, CONFIRM_DENY_PROJECT_SESSION_HINTS, Overlay, PermissionPrompt,
-        PromptState, QUEUED_NOTICE, UNTRUSTED_DURABLE_ANSWER, UNTRUSTED_NOTICE,
+        PromptState, QUEUED_NOTICE, SCROLL_TITLE, UNTRUSTED_DURABLE_ANSWER, UNTRUSTED_NOTICE,
     };
 
     const MAIN_ID: &str = "id";
     const SUB_ID: &str = "id-2";
     const SUB_AGENT: &str = "sub-2";
+    const VIEW_HEIGHT: u16 = 12;
+    const LONG_COMMAND_LINES: usize = 60;
+    const LONG_COMMAND: &str = "echo long_command";
+    const GUIDANCE: &str = "Read the script first";
 
     fn open_trusted(prompt: &mut PermissionPrompt, project_trusted: bool) {
         prompt.push(
@@ -545,6 +572,20 @@ mod tests {
             .collect()
     }
 
+    fn draw(prompt: &mut PermissionPrompt, width: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, VIEW_HEIGHT)).unwrap();
+        terminal
+            .draw(|frame| prompt.view(frame, frame.area()))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
     fn ctrl_c() -> KeyEvent {
         KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
     }
@@ -579,10 +620,10 @@ mod tests {
         assert_eq!(prompt.queue.front().unwrap().scopes, [SCOPE]);
     }
 
-    #[test_case(80, 12, false ; "short_scope")]
-    #[test_case(80, 12, true ; "multiline_scope")]
-    #[test_case(32, 12, true ; "wrapped_scope")]
-    fn clipped_permission_content_has_a_visible_notice(width: u16, height: u16, clipped: bool) {
+    #[test_case(80, false ; "short_scope")]
+    #[test_case(80, true ; "multiline_scope")]
+    #[test_case(32, true ; "wrapped_scope")]
+    fn clipped_permission_content_has_a_visible_notice(width: u16, clipped: bool) {
         const COMMAND: &str = "echo read_the_complete_command";
         let scope = if clipped {
             vec![COMMAND; 30].join("\n")
@@ -598,20 +639,111 @@ mod tests {
             true,
             None,
         );
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| prompt.view(frame, frame.area()))
-            .unwrap();
-        let visible: String = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
+        let visible = draw(&mut prompt, width);
         assert_eq!(visible.contains(CLIPPED_CONTENT), clipped, "{visible}");
         assert_eq!(prompt.queue.front().unwrap().scopes, [scope]);
+    }
+
+    #[test_case(80 ; "multiline_command")]
+    #[test_case(32 ; "wrapped_command")]
+    fn every_command_line_can_be_read_before_answering(width: u16) {
+        let markers: Vec<String> = (0..LONG_COMMAND_LINES)
+            .map(|line| format!("line_{line:03}"))
+            .collect();
+        let scope = markers
+            .iter()
+            .map(|marker| format!("{marker} echo import_changes_here"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut prompt = PermissionPrompt::new();
+        prompt.push(
+            MAIN_ID.into(),
+            ToolKey::native("bash"),
+            vec![scope.clone()],
+            None,
+            true,
+            None,
+        );
+        let mut seen = vec![false; markers.len()];
+        for _ in 0..LONG_COMMAND_LINES {
+            let visible = draw(&mut prompt, width);
+            for (seen, marker) in seen.iter_mut().zip(&markers) {
+                *seen |= visible.contains(marker);
+            }
+            let previous = prompt.scroll.offset();
+            assert!(prompt.handle_key(key(KeyCode::PageDown)).is_none());
+            if prompt.scroll.offset() == previous {
+                break;
+            }
+        }
+        assert!(
+            seen.iter().all(|seen| *seen),
+            "unread command lines: {seen:?}"
+        );
+        assert_eq!(prompt.queue.front().unwrap().scopes, [scope]);
+        assert!(!draw(&mut prompt, width).contains(CLIPPED_CONTENT));
+        assert!(
+            prompt
+                .handle_key(binding::SCROLL_TOP.to_key_event())
+                .is_none()
+        );
+        let top = draw(&mut prompt, width);
+        assert!(top.contains(&markers[0]), "{top}");
+        assert!(top.contains(CLIPPED_CONTENT), "{top}");
+        let answered = prompt.handle_key(key(KeyCode::Char('y'))).unwrap();
+        assert_eq!(answered.id, MAIN_ID);
+        assert_eq!(answered.answer, PermissionAnswer::AllowOnce);
+    }
+
+    #[test_case(false ; "answered_request")]
+    #[test_case(true ; "cancelled_subagent")]
+    fn the_next_request_starts_at_the_top(cancelled: bool) {
+        let mut prompt = PermissionPrompt::new();
+        for id in [SUB_ID, MAIN_ID] {
+            prompt.push(
+                id.into(),
+                ToolKey::native("bash"),
+                vec![vec![LONG_COMMAND; LONG_COMMAND_LINES].join("\n")],
+                (id == SUB_ID).then(|| SUB_AGENT.into()),
+                true,
+                None,
+            );
+        }
+        assert!(draw(&mut prompt, 80).contains(SCROLL_TITLE));
+        prompt.handle_key(binding::SCROLL_BOTTOM.to_key_event());
+        assert!(prompt.scroll.offset() > 0);
+        if cancelled {
+            prompt.drop_subagent(SUB_AGENT);
+        } else {
+            prompt.handle_key(key(KeyCode::Char('y')));
+        }
+        assert_eq!(prompt.queue.front().unwrap().id, MAIN_ID);
+        assert_eq!(prompt.scroll.offset(), 0);
+        assert!(draw(&mut prompt, 80).contains(CLIPPED_CONTENT));
+    }
+
+    #[test]
+    fn denying_a_long_command_reveals_the_guidance_editor() {
+        let mut prompt = PermissionPrompt::new();
+        prompt.push(
+            MAIN_ID.into(),
+            ToolKey::native("bash"),
+            vec![vec![LONG_COMMAND; LONG_COMMAND_LINES].join("\n")],
+            None,
+            true,
+            None,
+        );
+        draw(&mut prompt, 80);
+        prompt.handle_key(key(KeyCode::Char('n')));
+        assert!(draw(&mut prompt, 80).contains("guide"));
+        prompt.handle_paste(GUIDANCE);
+        prompt.handle_key(key(KeyCode::PageUp));
+        assert!(draw(&mut prompt, 80).contains(CLIPPED_CONTENT));
+        assert_eq!(prompt.state, PromptState::DenyEditing);
+        assert_eq!(
+            answer(&mut prompt, key(KeyCode::Enter)),
+            Some(PermissionAnswer::DenyWithGuidance(GUIDANCE.into()))
+        );
     }
 
     #[test]

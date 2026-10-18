@@ -13,7 +13,7 @@ pub(crate) fn render_form(
     title: &str,
     frame: &mut Frame,
     area: Rect,
-    lines: Vec<Line<'static>>,
+    paragraph: Paragraph<'static>,
     scroll: (u16, u16),
 ) {
     let mut block = Block::default()
@@ -23,7 +23,7 @@ pub(crate) fn render_form(
         .title_top(Line::from(title.to_string()).left_aligned())
         .title_style(t.panel_title);
 
-    let paragraph = Paragraph::new(lines)
+    let paragraph = paragraph
         .style(Style::new().fg(t.foreground))
         .wrap(Wrap { trim: false })
         .scroll(scroll);

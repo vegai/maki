@@ -19,7 +19,7 @@ const EXPOSED_PREFIX: &str = "mcp__maki__";
 /// Anthropic's API limit, prefix included.
 const MAX_EXPOSED_NAME: usize = 64;
 const HASH_HEX_DIGITS: usize = 8;
-const USER_ROLE: &str = "user";
+pub(super) const USER_ROLE: &str = "user";
 const ASSISTANT_ROLE: &str = "assistant";
 const TOOL_RESULT_ROLE: &str = "tool_result";
 #[cfg(test)]

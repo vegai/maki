@@ -1645,19 +1645,10 @@ fn prepare_runs_with_the_users_environment() {
 }
 
 #[test]
+#[ignore = "requires Git with `refs migrate --ref-format=reftable`; run explicitly"]
 fn a_prepared_snapshot_can_use_the_reftable_backend() {
     const MIGRATE: &str = "git refs migrate --ref-format=reftable";
     const REFTABLE: &str = "reftable";
-    let probe = tempdir().unwrap();
-    git(probe.path(), &["init", "-q"]);
-    let supported = Command::new("git")
-        .args(["refs", "migrate", "--ref-format=reftable"])
-        .current_dir(probe.path())
-        .output()
-        .unwrap();
-    if !supported.status.success() {
-        return;
-    }
     let coding = Coding::new();
     let (reg, _host) = coding.host(&[("prepare", json!(MIGRATE))]);
     let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();

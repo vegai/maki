@@ -12,6 +12,7 @@ local CLOSE_ERROR = "stdin close failed"
 local DIRECTORY = "/probe/hook-output"
 local SUCCESS_CODE = 0
 local STOPPED_CODE = 137
+local SWEEP_LOCK = ".sweep.lock"
 
 local function with_jobs(run)
   local state = { started = {}, stopped = {}, notices = {}, cancel = {}, timers = {}, closes = 0 }
@@ -337,6 +338,34 @@ case("artifact_cleanup_reports_a_failed_start", function()
   end)
 end)
 
+case("a_sweep_lock_error_is_reported", function()
+  local root = t.mktmpdir("cc_sweep_error")
+  local lock_path = maki.fs.joinpath(root, SWEEP_LOCK)
+  assert(maki.fs.mkdir(lock_path))
+  with_jobs(function(state)
+    local _, lock_err = maki.fs.try_lock(lock_path)
+    assert(lock_err)
+    snapshot.sweep(jobs.new(STARTUP_MS), root, -1)
+    eq(#state.started, 0)
+    eq(#state.notices, 1)
+    eq(state.notices[1].level, "warn")
+    eq(state.notices[1].message, snapshot.CANNOT_SWEEP .. root .. ": " .. lock_err)
+  end)
+  t.rmtree(root)
+end)
+
+case("a_missing_artifact_root_needs_no_cleanup", function()
+  local parent = t.mktmpdir("cc_sweep_missing")
+  local root = maki.fs.joinpath(parent, "missing")
+  with_jobs(function(state)
+    snapshot.sweep(jobs.new(STARTUP_MS), root, -1)
+    eq(#state.started, 0)
+    eq(#state.notices, 0)
+    eq(maki.fs.metadata(root), nil)
+  end)
+  t.rmtree(parent)
+end)
+
 for _, trashed in ipairs({ false, true }) do
   case("one_sweep_owns_a_tree_until_deletion_finishes_" .. tostring(trashed), function()
     local root = t.mktmpdir("cc_sweep")
@@ -353,6 +382,7 @@ for _, trashed in ipairs({ false, true }) do
       snapshot.sweep(second, root, -1)
       eq(#state.started, 1)
       eq(#second.left_behind, 0)
+      eq(#state.notices, 0)
       state.started[1].opts.on_exit(1, SUCCESS_CODE)
       snapshot.sweep(second, root, -1)
       eq(#state.started, 2)
