@@ -265,11 +265,14 @@ function M.home_credentials(home, extra, environ)
       end
     end
   end
-  for prefix, directory in pairs({ ["%.config"] = env.XDG_CONFIG_HOME, ["%.local/share"] = env.XDG_DATA_HOME }) do
-    for _, path in ipairs(HOME_CREDENTIALS) do
-      local relative = path:match("^" .. prefix .. "/(.+)$")
-      if relative and directory ~= "" then
-        relocated(maki.fs.joinpath(directory, relative))
+  for _, location in ipairs({ { "%.config", env.XDG_CONFIG_HOME }, { "%.local/share", env.XDG_DATA_HOME } }) do
+    local prefix, directory = location[1], location[2]
+    if directory and directory ~= "" then
+      for _, path in ipairs(HOME_CREDENTIALS) do
+        local relative = path:match("^" .. prefix .. "/(.+)$")
+        if relative then
+          relocated(maki.fs.joinpath(directory, relative))
+        end
       end
     end
   end

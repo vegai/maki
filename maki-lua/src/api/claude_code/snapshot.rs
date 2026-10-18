@@ -15,6 +15,7 @@ use rustix::path::Arg;
 use maki_providers::claude_code::validation::GIT_ENTRY;
 
 const MAX_DEPTH: usize = 64;
+const DEPTH_EXCEEDED: &str = "snapshot exceeds";
 const MAX_FAILURES: usize = 10;
 const CONFIG: &str = "config";
 const HEAD: &str = "HEAD";
@@ -104,16 +105,16 @@ fn move_entry(
     parent: &impl AsFd,
     name: impl Arg + Copy,
     quarantine: &Path,
-) -> io::Result<Option<File>> {
+) -> io::Result<Option<PathBuf>> {
     let destination = tempfile::Builder::new()
         .prefix(QUARANTINE_PREFIX)
         .tempdir_in(quarantine)?;
     let dir = File::from(open(destination.path(), DIRECTORY_FLAGS, Mode::empty())?);
     renameat(parent, name, &dir, QUARANTINE_ENTRY)?;
-    let _ = destination.keep();
+    let destination = destination.keep();
     let metadata = statat(&dir, QUARANTINE_ENTRY, AtFlags::SYMLINK_NOFOLLOW)?;
     if FileType::from_raw_mode(metadata.st_mode) == FileType::Directory {
-        return directory(&dir, QUARANTINE_ENTRY).map(Some);
+        return Ok(Some(destination.join(QUARANTINE_ENTRY)));
     }
     Ok(None)
 }
@@ -128,7 +129,8 @@ fn quarantine_entry(
         .into_iter()
         .map(|root| (root, depth))
         .collect();
-    while let Some((root, depth)) = pending.pop() {
+    while let Some((path, depth)) = pending.pop() {
+        let root = File::from(open(&path, DIRECTORY_FLAGS, Mode::empty())?);
         walk(root, depth, |parent, name, path, _metadata| {
             if name.to_bytes() == CONFIG.as_bytes() && repository(parent) {
                 if let Some(child) = move_entry(parent, name, quarantine)? {
@@ -256,7 +258,7 @@ fn walk(
 }
 
 fn depth_error() -> io::Error {
-    io::Error::other(format!("snapshot exceeds {MAX_DEPTH} directory levels"))
+    io::Error::other(format!("{DEPTH_EXCEEDED} {MAX_DEPTH} directory levels"))
 }
 
 pub(super) fn sanitize_snapshot(
@@ -313,13 +315,15 @@ pub(super) fn sanitize_snapshot(
 #[cfg(test)]
 mod tests {
     use super::{
-        COMMONDIR, CONFIG, GIT_ENTRY, HEAD, MAX_DEPTH, MAX_FAILURES, QUARANTINE_ENTRY, Visit,
-        quarantine_entry, sanitize_snapshot, walk,
+        COMMONDIR, CONFIG, DEPTH_EXCEEDED, GIT_ENTRY, HEAD, MAX_DEPTH, MAX_FAILURES,
+        QUARANTINE_ENTRY, Visit, quarantine_entry, sanitize_snapshot, walk,
     };
+    use std::env;
     use std::fs::{self, File, Permissions};
     use std::io;
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use std::path::Path;
+    use std::process::Command;
     use tempfile::tempdir;
     use test_case::test_case;
 
@@ -328,6 +332,11 @@ mod tests {
     const UNREADABLE: &str = "unreadable";
     const WALK_FAILURE: &str = "cannot inspect entry";
     const LARGE_POINTER_BYTES: u64 = 1024 * 1024;
+    const FD_LIMIT_ENV: &str = "MAKI_SNAPSHOT_FD_LIMIT_TEST";
+    const FD_LIMIT: usize = 128;
+    const PENDING_REPOSITORIES: usize = FD_LIMIT * 2;
+    const LIMIT_DESCRIPTORS: &str = "ulimit -n \"$1\" && shift && exec \"$@\"";
+    const CHILD_TEST_PASSED: &str = "1 passed";
 
     #[test]
     fn the_trusted_git_pointer_cannot_share_an_external_inode() {
@@ -507,11 +516,7 @@ mod tests {
             Ok(Visit::Scan)
         })
         .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains(&format!("snapshot exceeds {MAX_DEPTH} directory levels"))
-        );
+        assert!(error.to_string().contains(DEPTH_EXCEEDED));
     }
 
     #[test_case(false ; "directories")]
@@ -537,10 +542,47 @@ mod tests {
         )
         .err()
         .unwrap();
-        assert!(
-            error
-                .to_string()
-                .contains(&format!("snapshot exceeds {MAX_DEPTH} directory levels"))
+        assert!(error.to_string().contains(DEPTH_EXCEEDED));
+    }
+
+    #[test]
+    fn quarantine_does_not_exhaust_descriptors() {
+        if env::var_os(FD_LIMIT_ENV).is_none() {
+            let test = concat!(module_path!(), "::quarantine_does_not_exhaust_descriptors")
+                .split_once("::")
+                .unwrap()
+                .1;
+            let output = Command::new("sh")
+                .args(["-c", LIMIT_DESCRIPTORS, "sh", &FD_LIMIT.to_string()])
+                .arg(env::current_exe().unwrap())
+                .args(["--exact", test])
+                .env(FD_LIMIT_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains(CHILD_TEST_PASSED),
+                "{output:?}"
+            );
+            return;
+        }
+        let root = tempdir().unwrap();
+        let snapshot = root.path().join("snapshot");
+        let quarantine = root.path().join("quarantine");
+        let repository = snapshot.join(GIT_ENTRY);
+        fs::create_dir_all(repository.join("objects")).unwrap();
+        fs::write(repository.join(HEAD), CONTENT).unwrap();
+        for index in 0..PENDING_REPOSITORIES {
+            let child = repository.join(index.to_string());
+            fs::create_dir_all(child.join("objects")).unwrap();
+            fs::create_dir(child.join(CONFIG)).unwrap();
+            fs::write(child.join(HEAD), CONTENT).unwrap();
+            fs::write(child.join(CONFIG).join(HEAD), CONTENT).unwrap();
+        }
+        sanitize_snapshot(&snapshot, &quarantine, &root.path().join("repository")).unwrap();
+        assert_eq!(
+            fs::read_dir(quarantine).unwrap().count(),
+            PENDING_REPOSITORIES + 1
         );
     }
 
