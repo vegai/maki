@@ -145,28 +145,28 @@ pub(crate) fn system_prompt(system: &str) -> String {
 #[derive(Serialize)]
 struct TranscriptCall<'a> {
     id: &'a str,
-    input: Cow<'a, Value>,
     name: Cow<'a, str>,
+    input: Cow<'a, Value>,
 }
 
 #[derive(Serialize)]
 struct TranscriptResult<'a> {
+    role: &'static str,
+    tool_use_id: &'a str,
     content: &'a str,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     is_error: bool,
-    role: &'static str,
-    tool_use_id: &'a str,
 }
 
 #[derive(Serialize)]
 struct TranscriptEntry<'a> {
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    observation: bool,
     role: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<Cow<'a, str>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tool_calls: Vec<TranscriptCall<'a>>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    observation: bool,
 }
 
 fn push_line(out: &mut Vec<u8>, value: &impl Serialize) -> Result<(), Error> {
@@ -379,6 +379,46 @@ mod tests {
             },
             Message::observation("the build broke".into()),
         ]
+    }
+
+    #[test_case(false ; "successful_result")]
+    #[test_case(true ; "failed_result")]
+    fn transcript_bytes_keep_the_documented_field_order(failed: bool) {
+        const USER: &str = concat!(
+            "\n",
+            r#"{"role":"user","text":"fix </user> the \"bug\"\nplease"}"#
+        );
+        const ASSISTANT: &str = concat!(
+            "\n",
+            r#"{"role":"assistant","text":"Reading.","tool_calls":[{"id":"toolu_1","name":"mcp__maki__read","input":{"path":"a.rs"}}]}"#
+        );
+        const RESULT: &str = concat!(
+            "\n",
+            r#"{"role":"tool_result","tool_use_id":"toolu_1","content":"fn main() {}"}"#
+        );
+        const FAILED_RESULT: &str = concat!(
+            "\n",
+            r#"{"role":"tool_result","tool_use_id":"toolu_1","content":"fn main() {}","is_error":true}"#
+        );
+        const OBSERVATION: &str = concat!(
+            "\n",
+            r#"{"role":"user","text":"the build broke","observation":true}"#
+        );
+        let mut messages = history();
+        let ContentBlock::ToolResult { is_error, .. } = &mut messages[2].content[0] else {
+            unreachable!();
+        };
+        *is_error = failed;
+        assert_eq!(
+            transcript(&messages).unwrap(),
+            [
+                TRANSCRIPT_HEADER,
+                USER,
+                ASSISTANT,
+                if failed { FAILED_RESULT } else { RESULT },
+                OBSERVATION
+            ]
+        );
     }
 
     #[test]

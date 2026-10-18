@@ -337,4 +337,29 @@ case("artifact_cleanup_reports_a_failed_start", function()
   end)
 end)
 
+for _, trashed in ipairs({ false, true }) do
+  case("one_sweep_owns_a_tree_until_deletion_finishes_" .. tostring(trashed), function()
+    local root = t.mktmpdir("cc_sweep")
+    local artifact = maki.fs.joinpath(root, trashed and ".trash-old" or "old")
+    assert(maki.fs.mkdir(artifact))
+    assert(maki.fs.write(maki.fs.joinpath(artifact, ".maki-claude-code-artifact"), ""))
+    with_jobs(function(state)
+      local first, second = jobs.new(STARTUP_MS), jobs.new(STARTUP_MS)
+      snapshot.sweep(first, root, -1)
+      eq(#state.started, 1)
+      -- The deletion command unlinks the artifact lock before exiting.
+      local deleting = state.started[1].argv[5]
+      assert(maki.fs.rm(maki.fs.joinpath(deleting, "import.lock")))
+      snapshot.sweep(second, root, -1)
+      eq(#state.started, 1)
+      eq(#second.left_behind, 0)
+      state.started[1].opts.on_exit(1, SUCCESS_CODE)
+      snapshot.sweep(second, root, -1)
+      eq(#state.started, 2)
+      state.started[2].opts.on_exit(2, SUCCESS_CODE)
+    end)
+    t.rmtree(root)
+  end)
+end
+
 t.report()

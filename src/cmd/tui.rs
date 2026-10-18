@@ -29,8 +29,9 @@ const MODEL_FALLBACK_WARNING: &str = "model resolution failed, keeping previous 
 const POLICY_GRANT_NOTICE: &str = "folder trusted by trust.paths pattern";
 const NO_ALLOWED_TOOLS: &str = "--allowed-tools matches no loaded tools or qualified MCP names";
 
-fn tool_filter_warnings(cli: &Cli, registry: &ToolRegistry) -> Result<Vec<String>> {
-    if !cli.allowed_tools.is_empty()
+fn tool_filter_warnings(cli: &Cli, registry: &ToolRegistry, startup: bool) -> Result<Vec<String>> {
+    if startup
+        && !cli.allowed_tools.is_empty()
         && !cli.allowed_tools.iter().any(|name| {
             registry.get(name).is_some() || is_wire_name(name) || is_qualified_name(name)
         })
@@ -215,7 +216,11 @@ fn build_stack(
         },
     )?;
 
-    warnings.extend(tool_filter_warnings(cli, ToolRegistry::global())?);
+    warnings.extend(tool_filter_warnings(
+        cli,
+        ToolRegistry::global(),
+        fallback_model.is_none(),
+    )?);
     let commands = discover_commands(cli.no_commands, launch.cwd);
 
     setup::resolve_thinking(
@@ -640,7 +645,7 @@ mod tests {
     fn tool_filter_warnings_accept_mcp_names(name: &str, accepted: bool) {
         let cli = Cli::parse_from(["maki", "--disallowed-tools", name]);
         assert_eq!(
-            tool_filter_warnings(&cli, &ToolRegistry::new())
+            tool_filter_warnings(&cli, &ToolRegistry::new(), true)
                 .unwrap()
                 .is_empty(),
             accepted
@@ -653,7 +658,7 @@ mod tests {
     #[test_case("srv__probe", true ; "wire_mcp")]
     fn empty_allow_lists_fail_unless_an_mcp_tool_can_load_later(name: &str, accepted: bool) {
         let cli = Cli::parse_from(["maki", "--allowed-tools", name]);
-        let result = tool_filter_warnings(&cli, &ToolRegistry::new());
+        let result = tool_filter_warnings(&cli, &ToolRegistry::new(), true);
         assert_eq!(result.is_ok(), accepted);
         if !accepted {
             assert_eq!(
@@ -663,11 +668,29 @@ mod tests {
         }
     }
 
+    #[test_case(true ; "startup")]
+    #[test_case(false ; "reload")]
+    fn missing_allowed_plugin_tools_only_abort_startup(startup: bool) {
+        const MISSING_TOOL: &str = "unloaded_plugin_tool";
+        let cli = Cli::parse_from(["maki", "--allowed-tools", MISSING_TOOL]);
+        let result = tool_filter_warnings(&cli, &ToolRegistry::new(), startup);
+        if startup {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                format!("{NO_ALLOWED_TOOLS}: {MISSING_TOOL}")
+            );
+        } else {
+            let warnings = result.unwrap();
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains(MISSING_TOOL));
+        }
+    }
+
     #[test_case("Bash(git log:*)")]
     #[test_case("srv.probe(argument:*)")]
     fn tool_filter_warnings_explain_unsupported_argument_patterns(name: &str) {
         let cli = Cli::parse_from(["maki", "--disallowed-tools", name]);
-        let warnings = tool_filter_warnings(&cli, &ToolRegistry::new()).unwrap();
+        let warnings = tool_filter_warnings(&cli, &ToolRegistry::new(), true).unwrap();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains(TOOL_ARGUMENT_PATTERNS_UNSUPPORTED));
         assert!(!warnings[0].contains("load later"));
