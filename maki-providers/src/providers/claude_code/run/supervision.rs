@@ -58,7 +58,7 @@ pub(in crate::providers::claude_code) async fn within<T>(
 /// Kills the group on drop until reaping starts.
 pub(super) struct Group {
     pub(super) child: Child,
-    pub(super) reaped: bool,
+    pub(super) signals_disabled: bool,
     #[cfg(target_os = "linux")]
     _lifetime: UnixStream,
 }
@@ -75,13 +75,13 @@ impl Group {
 
     /// Only while the unreaped leader's pid still names the group.
     pub(super) fn kill(&self) {
-        if !self.reaped {
+        if !self.signals_disabled {
             kill_group(self.child.id());
         }
     }
 
     pub(super) fn terminate(&self) {
-        if self.reaped {
+        if self.signals_disabled {
             return;
         }
         #[cfg(unix)]
@@ -104,7 +104,7 @@ impl Group {
         }
         // The status future may reap even if its caller stops waiting. Disable further
         // signals before it starts, while the leader's pid still belongs to the group.
-        self.reaped = true;
+        self.signals_disabled = true;
         let status = within(Instant::now() + SHUTDOWN_GRACE, self.child.status())
             .await
             .ok_or(Error::ReapLate)?;
@@ -151,7 +151,7 @@ pub(super) fn spawn_piped(command: process::Command) -> io::Result<Group> {
         .spawn()?;
     Ok(Group {
         child,
-        reaped: false,
+        signals_disabled: false,
         #[cfg(target_os = "linux")]
         _lifetime: lifetime,
     })
@@ -186,7 +186,7 @@ pub(super) async fn supervised<T>(
     debug!(pid = group.child.id(), "claude-code: process started");
     let stderr = watch_stderr(&mut group.child);
     let result = work(&mut group).await;
-    if !group.reaped {
+    if !group.signals_disabled {
         drop(group.child.stdin.take());
         group.terminate();
         if matches!(

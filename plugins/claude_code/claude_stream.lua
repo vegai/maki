@@ -24,7 +24,6 @@ local USAGE_FIELDS = {
   { key = OUTPUT_FIELD, label = "out" },
 }
 local THOUSAND = 1000
-local SUCCESS = "success"
 local NO_ANSWER = "Claude Code completed its run without a reply"
 local PARTIAL = "at least: "
 local UNREADABLE_DENIAL = "a denial that maki cannot read"
@@ -56,7 +55,6 @@ function Stream.new(expect)
       cli = expect.cli,
     },
     accepted = false,
-    model = expect.model,
     model_checked = false,
     usage_by_message = {},
     result = nil,
@@ -133,6 +131,7 @@ function Stream:feed(line)
   end
   if ev.type == RESULT then
     self.result = ev
+    self.failure = classified.failure
     ev.usage = classified.usage
     if not self.accepted then
       return { stop = self:outcome() }
@@ -153,28 +152,13 @@ end
 
 function Stream:outcome()
   local r = self.result
-  if r.subtype == SUCCESS and not r.is_error then
-    if type(r.result) ~= "string" or r.result:match("^%s*$") then
-      return NO_ANSWER, true
-    end
-    return r.result, false
+  if self.failure then
+    return self.failure, true
   end
-  -- A non-string would raise in the job's exit handler and the call would
-  -- never finish.
-  local detail = type(r.result) == "string" and r.result or ""
-  if detail == "" and type(r.errors) == "table" then
-    local errors = {}
-    for _, entry in ipairs(r.errors) do
-      errors[#errors + 1] = type(entry) == "string" and entry or maki.json.encode(entry)
-    end
-    detail = table.concat(errors, "; ")
+  if type(r.result) ~= "string" or r.result:match("^%s*$") then
+    return NO_ANSWER, true
   end
-  local kind = r.subtype == SUCCESS and "error_during_execution" or tostring(r.subtype)
-  local msg = "Claude Code stopped with an error (" .. kind .. ")"
-  if detail ~= "" then
-    msg = msg .. ": " .. detail
-  end
-  return msg, true
+  return r.result, false
 end
 
 function Stream:denials()

@@ -18,14 +18,22 @@ use mlua::{Lua, RegistryKey};
 use shell_words::join as shell_join;
 
 use crate::api::fs::expand_tilde;
-use crate::runtime::with_jobs;
 
+use super::{JOB_NOT_FOUND_ERR, MAX_TAIL_LINES};
+
+const DEFAULT_TAIL: usize = 20;
+const MAX_COMPLETED_SESSION_JOBS: usize = 256;
 #[cfg(not(target_os = "linux"))]
-use super::GUARD_UNSUPPORTED;
-use super::{
-    DEFAULT_TAIL, EXIT_EVENT, JOB_EXITED_ERR, JOB_NOT_FOUND_ERR, MAX_COMPLETED_SESSION_JOBS,
-    MAX_TAIL_LINES, NO_STDIN_ERR, READER_BUF_SIZE, STDERR_STREAM, STDIN_WRITE_ERR, STDOUT_STREAM,
-};
+const GUARD_UNSUPPORTED: &str = "jobstart: guard requires Linux";
+const READER_BUF_SIZE: usize = 8 * 1024;
+const JOB_EXITED_ERR: &str = "job: exited or closed its stdin";
+const STDIN_WRITE_ERR: &str = "job: writing stdin failed";
+const NO_STDIN_ERR: &str = "job: stdin is not an open pipe";
+const STDOUT_STREAM: &str = "stdout";
+const STDERR_STREAM: &str = "stderr";
+const EXIT_EVENT: &str = "exit";
+
+const CWD_NOT_DIRECTORY: &str = "cwd is not a directory";
 
 /// `agent.shell`, set once from config at startup. Jobs get built far away
 /// from any config, on whatever Lua thread runs the plugin, so they read it here.
@@ -293,12 +301,6 @@ pub(crate) struct JobStore {
     scan_cursor: u32,
 }
 
-pub(super) struct CheckedOutReceiver {
-    lua: Lua,
-    job_id: u32,
-    receiver: Option<flume::Receiver<JobEvent>>,
-}
-
 impl JobStore {
     pub fn new() -> Self {
         Self {
@@ -325,9 +327,15 @@ impl JobStore {
             on_stderr,
             on_exit,
         } = spec;
+        let cwd = cwd.as_deref().map(expand_tilde);
+        if let Some(dir) = &cwd
+            && !dir.is_dir()
+        {
+            return Err(format!("{CWD_NOT_DIRECTORY}: {}", dir.display()));
+        }
         let lookup_dir = if clear_env && env.as_ref().is_none_or(|env| !env.contains_key("PATH")) {
-            Some(match cwd.as_deref() {
-                Some(dir) => expand_tilde(dir),
+            Some(match &cwd {
+                Some(dir) => dir.clone(),
                 None => env::current_dir().map_err(|error| error.to_string())?,
             })
         } else {
@@ -364,10 +372,7 @@ impl JobStore {
             }
         }
 
-        if let Some(dir) = cwd.as_deref().map(expand_tilde) {
-            if !dir.is_dir() {
-                return Err(format!("cwd is not a directory: {}", dir.display()));
-            }
+        if let Some(dir) = cwd {
             command.current_dir(dir);
         }
         if clear_env {
@@ -462,14 +467,7 @@ impl JobStore {
             let state = Arc::clone(&reap_state);
             smol::spawn(async move {
                 smol::Timer::after(timeout).await;
-                smol::unblock(move || {
-                    let mut state = ReapState::lock(&state);
-                    if !state.reaped {
-                        state.timed_out = true;
-                        process::kill_group(pid);
-                    }
-                })
-                .await;
+                smol::unblock(move || kill_unreaped(pid, &state, true)).await;
             })
         });
 
@@ -842,30 +840,6 @@ impl Drop for JobStore {
     }
 }
 
-impl CheckedOutReceiver {
-    pub(super) fn new(lua: &Lua, job_id: u32, receiver: flume::Receiver<JobEvent>) -> Self {
-        Self {
-            lua: lua.clone(),
-            job_id,
-            receiver: Some(receiver),
-        }
-    }
-
-    pub(super) fn get(&self) -> &flume::Receiver<JobEvent> {
-        self.receiver.as_ref().expect("receiver is checked out")
-    }
-}
-
-impl Drop for CheckedOutReceiver {
-    fn drop(&mut self) {
-        if let Some(receiver) = self.receiver.take() {
-            with_jobs(&self.lua, |store| {
-                store.restore_receiver(self.job_id, receiver);
-            });
-        }
-    }
-}
-
 pub(crate) struct JobSnapshot {
     pub id: u32,
     pub command: String,
@@ -1032,15 +1006,18 @@ impl Drop for Unwatched {
 
 /// A reaped pid can identify another process. Hold the lock until the signal completes so
 /// [`reap`] cannot release the pid first.
+fn kill_unreaped(pid: u32, state: &Mutex<ReapState>, timed_out: bool) {
+    let mut state = ReapState::lock(state);
+    if !state.reaped {
+        state.timed_out |= timed_out;
+        process::kill_group(pid);
+    }
+}
+
 fn kill_job(job: &JobMeta) {
     let pid = job.pid;
     let state = Arc::clone(&job.reap_state);
-    let kill = move || {
-        let state = ReapState::lock(&state);
-        if !state.reaped {
-            process::kill_group(pid);
-        }
-    };
+    let kill = move || kill_unreaped(pid, &state, false);
     #[cfg(windows)]
     if let Err(error) = thread::Builder::new().name("job-kill".into()).spawn(kill) {
         tracing::warn!(pid, %error, "could not start the job termination thread");
@@ -1061,6 +1038,7 @@ fn text_line(mut bytes: Vec<u8>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::runtime::with_jobs;
     #[cfg(unix)]
     use std::fs::{self, Permissions};
     #[cfg(unix)]
@@ -1069,7 +1047,7 @@ mod tests {
 
     use super::*;
     use crate::api::r#fn::{
-        chansend_bytes, deliver_job_event, winrestview__register, winsaveview__register,
+        call_back, chansend_bytes, deliver_job_event, winrestview__register, winsaveview__register,
     };
     use crate::api::util::command::{NO_UI_ERR, UiAction, WinView};
     use mlua::{Table, Value};
@@ -1081,8 +1059,10 @@ mod tests {
     #[cfg(unix)]
     const SELECTED_SHELL: &str = "the shell selected from the invoking path";
     const TEST_PLUGIN: &str = "test-plugin";
+    const CALLBACK_LINE: &str = "output";
     const JOB_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
     const JOB_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
     #[cfg(unix)]
     const EXIT_WITHOUT_REAP: &str =
         "an exit event must mean the child was reaped, or a later kill can signal a recycled pid";
@@ -1121,6 +1101,25 @@ mod tests {
     /// Keeps a `sleep` that closed all its output, and prints its pid.
     #[cfg(target_os = "linux")]
     const LEFT_ITS_OUTPUT: &str = "sleep 30 >/dev/null 2>&1 </dev/null & echo $!";
+
+    #[test_case(JobEvent::Stdout(CALLBACK_LINE.into()), 3 ; "stdout")]
+    #[test_case(JobEvent::Stderr(CALLBACK_LINE.into()), 3 ; "stderr")]
+    #[test_case(JobEvent::Exit(0, false), 4 ; "normal_exit")]
+    #[test_case(JobEvent::Exit(1, true), 4 ; "timeout_exit")]
+    fn output_callbacks_keep_three_arguments(event: JobEvent, count: usize) {
+        let lua = Lua::new();
+        let callback = lua
+            .load("return function(...) args = table.pack(...) end")
+            .eval()
+            .unwrap();
+        smol::block_on(call_back(&lua, callback, 1, &event)).unwrap();
+        let args: Table = lua.globals().get("args").unwrap();
+        assert_eq!(args.get::<usize>("n").unwrap(), count);
+        assert_eq!(args.get::<String>(3).unwrap(), event.name());
+        if let JobEvent::Exit(_, timed_out) = event {
+            assert_eq!(args.get::<bool>(4).unwrap(), timed_out);
+        }
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1284,14 +1283,28 @@ mod tests {
         );
     }
 
-    #[test]
-    fn start_invalid_cwd_returns_error() {
+    #[test_case(false ; "inherited_environment")]
+    #[test_case(true ; "clear_environment")]
+    fn start_validates_cwd_before_lookup_and_redirection(clear_env: bool) {
+        const INVALID_CWD: &str = "missing-cwd";
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join(INVALID_CWD);
+        let redirected = temp.path().join("output");
         let mut store = make_store();
         let result = store.start(JobSpec {
-            cwd: Some("/nonexistent_dir_abc_xyz_123".into()),
-            ..JobSpec::new(task_owner(1), "echo hello")
+            cwd: Some(cwd.to_str().unwrap().into()),
+            clear_env,
+            stdout: Redirect::File(redirected.clone()),
+            ..JobSpec::new(
+                task_owner(1),
+                JobCommand::Argv(vec!["nonexistent_program_xyz".into()]),
+            )
         });
-        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            format!("{CWD_NOT_DIRECTORY}: {}", cwd.display())
+        );
+        assert!(!redirected.exists());
     }
 
     #[test]

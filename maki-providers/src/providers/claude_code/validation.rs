@@ -18,6 +18,7 @@ use super::stream::{
 };
 
 pub const EMPTY_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
+pub const STARTUP_TIMEOUT_SECS: u64 = 60;
 pub(super) const CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 pub(super) const HOME_ENV: &str = "HOME";
 const TMPDIR_ENV: &str = "TMPDIR";
@@ -292,6 +293,7 @@ pub struct WorkerEvent {
     pub rate_limit: Option<ProviderUsage>,
     pub model_checked: bool,
     pub problem: Option<String>,
+    pub failure: Option<String>,
 }
 
 /// Workers may compact and retry within their own run. Provider turns must preserve maki's
@@ -336,12 +338,16 @@ pub fn classify(
     let usage = usage.is_object().then(|| usage_counts(usage));
     let rate_limit = (event["type"] == RATE_LIMIT_EVENT && event["rate_limit_info"].is_object())
         .then(|| plan_usage(&event["rate_limit_info"]));
+    let failure = (event["type"] == stream::RESULT_EVENT)
+        .then(|| stream::result_failure(&event))
+        .flatten();
     Ok(WorkerEvent {
         event,
         usage,
         rate_limit,
         model_checked,
         problem,
+        failure,
     })
 }
 

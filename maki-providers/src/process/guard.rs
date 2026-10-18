@@ -21,6 +21,8 @@ const RECORD_NAME_OFFSET: usize = 19;
 
 /// The guard shares the worker's group and reserves its id after the leader exits. Only
 /// maki holds the lifetime socket's other endpoint.
+/// Keep the returned socket alive until cleanup finishes. Dropping it stops
+/// the worker's process group, even if the leader has already exited.
 pub fn bind(command: &mut Command) -> io::Result<UnixStream> {
     bind_with_setup(command, watcher_setup)
 }

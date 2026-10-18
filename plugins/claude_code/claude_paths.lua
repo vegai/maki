@@ -200,6 +200,7 @@ end
 --- Terminal control bytes can execute commands. Escape them and non-UTF-8 path bytes before
 --- display.
 function M.printable(path)
+  path = path:gsub("\\", "\\\\")
   return (
     M.escape_invisible(
       path:gsub(utf8.len(path) and "%c" or "[%c\128-\255]", function(char)

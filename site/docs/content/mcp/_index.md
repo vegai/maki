@@ -91,7 +91,7 @@ One option lives at the top level of `mcp.toml`, outside any server:
 
 ## Tool filters
 
-`--allowed-tools` and `--disallowed-tools` apply to MCP tools, including tools that connect later. Use `server.tool` or `server__tool`. Allow lists now restrict MCP access too. A list containing only `read,grep` excludes MCP tools. Add the required MCP names and `tool_search` to retain deferred loading. If `tool_search` is excluded, permitted MCP tools load directly. See [tool name lists](/docs/cli/#tool-name-lists) for migration details.
+See [tool name lists](/docs/cli/#tool-name-lists) for MCP name syntax and how filters affect deferred loading.
 
 ## Tool search
 

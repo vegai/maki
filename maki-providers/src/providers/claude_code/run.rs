@@ -7,17 +7,18 @@ pub(super) use self::launch::version_check;
 pub(crate) use self::launch::{Launch, models};
 use self::launch::{MCP_CONFIG_FLAG, base_args, checked_profile, command, probe};
 pub use self::launch::{VersionCheck, invalidate_profile};
+pub(super) use self::private_files::private_dir;
 use self::private_files::private_file;
-pub(super) use self::private_files::{PrivateDir, private_dir};
 pub(super) use self::supervision::within;
 use self::supervision::{
     Group, Next, SHUTDOWN_GRACE, next, send, send_handshake, stdout_lines, supervised, unreadable,
 };
 use super::checks::{InitExpect, require_system};
 use super::error::Error;
-use super::mcp::{self, Handoff, Server};
+use super::mcp::{self, Handoff};
 use super::stream::{Step, Turn, Wait, user_message};
 use super::transcript::{Catalog, SERVER, system_prompt, transcript};
+use super::validation::STARTUP_TIMEOUT_SECS;
 use crate::providers::anthropic::shared::{long_context_window, strip_long_context};
 use crate::{Message, ProviderEvent, ProviderUsage, StreamResponse};
 use base64::Engine;
@@ -27,8 +28,9 @@ use futures_lite::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::env;
+use std::ffi::OsString;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -38,7 +40,7 @@ const PROMPT_FILE: &str = "system-prompt.md";
 const MCP_FILE: &str = "mcp.json";
 const TOKEN_BYTES: usize = 32;
 const LONG_CONTEXT_NAME: &str = "[1m]";
-const STARTUP: Duration = Duration::from_secs(60);
+const STARTUP: Duration = Duration::from_secs(STARTUP_TIMEOUT_SECS);
 const MCP_READ: Duration = Duration::from_secs(60);
 const HANDOFF: Duration = Duration::from_secs(30);
 const EXIT: Duration = Duration::from_secs(10);
@@ -119,14 +121,6 @@ fn token() -> Result<String, Error> {
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
-struct PreparedRequest {
-    dir: PrivateDir,
-    prompt_file: PathBuf,
-    mcp_file: PathBuf,
-    server: Server,
-    handoffs: Receiver<Handoff>,
-}
-
 /// Recheck current policy and the executable's identity before starting in the project.
 pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
     let started = Instant::now();
@@ -135,7 +129,7 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
     // Before any process starts, so a conversation maki cannot send costs
     // none.
     let (catalog, tools) = Catalog::new(req.exchange.tools)?;
-    let conversation = user_message(&transcript(req.exchange.messages, &catalog)?)?;
+    let conversation = user_message(&transcript(req.exchange.messages)?)?;
     require_system(env::consts::OS)?;
     // maki marks the 1M window with a `-1m` id and Claude Code with a `[1m]`
     // name. The generation reports the model without either.
@@ -174,29 +168,15 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
             Ok::<_, Error>((dir, prompt_file, mcp_file))
         })
         .await?;
-        Ok::<_, Error>(PreparedRequest {
-            dir,
-            prompt_file,
-            mcp_file,
-            server,
-            handoffs,
-        })
+        Ok::<_, Error>((dir, prompt_file, mcp_file, server, handoffs))
     };
     let checks = async {
         let profile = checked_profile(launch).await?;
         let offered = probe(launch, req.plan_usage).await?;
         Ok::<_, Error>((profile, offered))
     };
-    let (
-        (profile, offered),
-        PreparedRequest {
-            dir,
-            prompt_file,
-            mcp_file,
-            server,
-            handoffs,
-        },
-    ) = futures::future::try_join(checks, setup).await?;
+    let ((profile, offered), (dir, prompt_file, mcp_file, server, handoffs)) =
+        futures::future::try_join(checks, setup).await?;
     // An alias such as `sonnet` runs whatever model the account answer maps
     // it to.
     let runs = offered
@@ -272,13 +252,16 @@ fn run_args(
     model_arg: &str,
     mcp_file: &Path,
     prompt_file: &Path,
-) -> (Vec<String>, Vec<(String, String)>) {
-    let mut args = base_args(model_arg);
+) -> (Vec<OsString>, Vec<(String, String)>) {
+    let mut args: Vec<OsString> = base_args(model_arg)
+        .into_iter()
+        .map(OsString::from)
+        .collect();
     args.extend([
-        MCP_CONFIG_FLAG.to_owned(),
-        mcp_file.display().to_string(),
-        SYSTEM_PROMPT_FILE_FLAG.to_owned(),
-        prompt_file.display().to_string(),
+        MCP_CONFIG_FLAG.into(),
+        mcp_file.as_os_str().to_owned(),
+        SYSTEM_PROMPT_FILE_FLAG.into(),
+        prompt_file.as_os_str().to_owned(),
     ]);
     let mut env = req.launch.env.to_vec();
     for (name, value) in [
@@ -296,10 +279,10 @@ fn run_args(
     match req.thinking {
         Thinking::Default => {}
         Thinking::Off => env.push((NO_THINKING.0.to_owned(), NO_THINKING.1.to_owned())),
-        Thinking::Effort(level) => args.extend([EFFORT_FLAG.to_owned(), level.to_owned()]),
+        Thinking::Effort(level) => args.extend([EFFORT_FLAG.into(), level.into()]),
         Thinking::Budget(tokens) => env.push((THINKING_BUDGET_ENV.to_owned(), tokens.to_string())),
     }
-    args.extend([SHOWN_THINKING.0.to_owned(), SHOWN_THINKING.1.to_owned()]);
+    args.extend([SHOWN_THINKING.0.into(), SHOWN_THINKING.1.into()]);
     (args, env)
 }
 
@@ -552,8 +535,10 @@ async fn drain(
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::env;
+    use std::ffi::OsStr;
     use std::fs;
     use std::io;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::symlink;
     use std::os::unix::process::ExitStatusExt;
     use std::path::Path;
@@ -582,16 +567,18 @@ mod tests {
     use super::private_files::{DIR_PREFIX, OWNER_SEPARATOR, pid_namespace, sweep_dead_owners};
     use super::supervision::spawn_piped;
     use super::{
-        EFFORT_FLAG, Group, HANDOFF, HELD_CALL_TIMEOUT_MS, Launch, Limits, Listed, NO_AUTO_COMPACT,
-        NO_CLI_RETRIES, NO_MID_CONVERSATION_SYSTEM, NO_NONSTREAMING_FALLBACK, NO_THINKING,
-        SHOWN_THINKING, STARTUP, Thinking, Wait, command, finish_deadline, models, probe,
-        queued_handoffs, stdout_lines,
+        EFFORT_FLAG, Exchange, Group, HANDOFF, HELD_CALL_TIMEOUT_MS, Launch, Limits, Listed,
+        MCP_CONFIG_FLAG, NO_AUTO_COMPACT, NO_CLI_RETRIES, NO_MID_CONVERSATION_SYSTEM,
+        NO_NONSTREAMING_FALLBACK, NO_THINKING, Request, SHOWN_THINKING, STARTUP,
+        SYSTEM_PROMPT_FILE_FLAG, Thinking, Wait, command, finish_deadline, models, probe,
+        queued_handoffs, run_args, stdout_lines,
     };
     use crate::providers::anthropic::{LABEL_SESSION, LABEL_WEEK_ALL};
     use crate::{ContentBlock, ImageMediaType, ImageSource, Role, StopReason};
     use crate::{Message, ProviderEvent, StreamResponse};
 
     const SHORT_EXIT: Duration = Duration::from_secs(5);
+
     const SLEEP: &str = "/bin/sleep";
     const MAKI_ROLE: &str = "MAKI_TEST_PLAYS_MAKI";
     const MEMBER_PID: &str = "member-pid";
@@ -641,10 +628,46 @@ mod tests {
     /// Prints the pid of a `sleep` that closed all its standard streams.
     const LINGERING_MEMBER: &str = "sleep 30 </dev/null >/dev/null 2>&1 & echo $!";
 
-    /// The call can reach the server before or after the generation ends,
-    /// which the stream tests pin in both orders. maki gets the whole batch with its own tool
-    /// names and the
-    /// final usage, and no process or private file is left behind.
+    #[test]
+    fn request_file_arguments_preserve_non_utf8_paths() {
+        const RAW_DIRECTORY: &[u8] = b"/tmp/private-\xff";
+        let root = Path::new(OsStr::from_bytes(RAW_DIRECTORY));
+        let mcp = root.join(super::MCP_FILE);
+        let prompt = root.join(super::PROMPT_FILE);
+        let limits = Limits::new(IDLE);
+        let (events, _) = flume::unbounded();
+        let req = Request {
+            launch: Launch {
+                executable: Path::new(SLEEP),
+                env: &[],
+                project: root,
+                temp_dir: root,
+                limits: &limits,
+            },
+            model: ALIAS,
+            exchange: Exchange {
+                system: "",
+                messages: &[],
+                tools: &Value::Null,
+                events: &events,
+            },
+            plan_usage: &Mutex::new(None),
+            max_output: None,
+            thinking: Thinking::Default,
+        };
+        let (args, env) = run_args(&req, ALIAS, &mcp, &prompt);
+        let command = command(Path::new(SLEEP), &env, root, &args);
+        let args: Vec<_> = command.get_args().collect();
+        for (flag, path) in [(MCP_CONFIG_FLAG, &mcp), (SYSTEM_PROMPT_FILE_FLAG, &prompt)] {
+            assert_eq!(
+                args.windows(2)
+                    .find(|pair| pair[0] == flag)
+                    .map(|pair| pair[1]),
+                Some(path.as_os_str())
+            );
+        }
+    }
+
     #[test_case(Wait::Handoff, Wait::Handoff, false ; "handoff_events_keep_the_deadline")]
     #[test_case(Wait::Result, Wait::Result, false ; "result_events_keep_the_deadline")]
     #[test_case(Wait::Handoff, Wait::Result, true ; "broken_handoff_gets_a_result_deadline")]
@@ -659,7 +682,8 @@ mod tests {
         );
     }
 
-    /// Set in the copy of the test binary that plays maki.
+    /// The call can reach the server before or after the generation ends. Maki gets
+    /// the whole batch and final usage, with no process or private file left behind.
     #[test_case("batch" ; "the_generation_first")]
     #[test_case("cut_line" ; "a_last_line_the_stop_cut_short")]
     #[test_case("rejected_max_turns" ; "a_rejected_call_at_the_turn_limit")]
@@ -1527,7 +1551,7 @@ mod tests {
         let args = [LONG_SLEEP_SECS.to_owned()];
         let sleep = command(Path::new(SLEEP), &Fake::env(), &here, &args);
         let mut group = smol::block_on(Group::spawn(sleep)).unwrap();
-        group.reaped = true;
+        group.signals_disabled = true;
 
         if graceful {
             group.terminate();

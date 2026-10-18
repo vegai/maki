@@ -166,21 +166,18 @@ pub async fn run(
         }
     };
 
-    let source = maki_otel::enabled().then(|| resolved.route.source());
+    let source = maki_otel::enabled().then(|| {
+        resolved
+            .route
+            .as_ref()
+            .map_or(Cow::Borrowed(SOURCE_UNKNOWN), Route::source)
+    });
     let started = Instant::now();
-    let mut done = if allowed {
-        run_inner(
-            resolved,
-            id,
-            &input,
-            ctx,
-            origin,
-            ask.as_deref(),
-            hook.as_ref(),
-        )
-        .await
-    } else {
-        unavailable(ctx, name, id, matches!(resolved.route, Route::Unknown))
+    let mut done = match resolved.route {
+        Some(route) if allowed => {
+            run_inner(name, route, id, &input, ctx, origin, ask.as_deref(), hook.as_ref()).await
+        }
+        route => unavailable(ctx, name, id, route.is_none()),
     };
     let took = started.elapsed();
     if let Some(hook) = &hook {
@@ -249,11 +246,11 @@ impl<'a> Hook<'a> {
             ctx,
             tool: resolved.name,
             native: match &resolved.route {
-                Route::Native(entry) => Some(Arc::clone(&entry.tool)),
+                Some(Route::Native(entry)) => Some(Arc::clone(&entry.tool)),
                 _ => None,
             },
             origin,
-            authority: resolved.route.authority()?,
+            authority: resolved.route.as_ref()?.authority(),
         })
     }
 
@@ -394,7 +391,6 @@ enum Route<'a> {
     Native(RegisteredTool),
     ToolSearch(&'a McpSession),
     Mcp(&'a McpSession, Arc<str>),
-    Unknown,
 }
 
 impl Route<'_> {
@@ -406,7 +402,6 @@ impl Route<'_> {
             Self::Local(_) => Cow::Borrowed(SOURCE_LOCAL),
             Self::Mcp(..) => Cow::Borrowed(SOURCE_MCP),
             Self::ToolSearch(_) => Cow::Borrowed(TOOL_SEARCH_TOOL_NAME),
-            Self::Unknown => Cow::Borrowed(SOURCE_UNKNOWN),
         }
     }
 
@@ -415,13 +410,10 @@ impl Route<'_> {
     /// capability narrows it: reading undeclared as free is what would let an
     /// unprivileged plugin steer `batch` or `code_execution` into any tool it
     /// likes.
-    fn authority(&self) -> Option<Authority> {
+    fn authority(&self) -> Authority {
         match self {
-            Self::Native(entry) => Some(Authority::from(entry.tool.reach())),
-            Self::ToolSearch(_) | Self::Local(_) | Self::Mcp(..) => Some(Authority::Unbounded),
-            // A rewrite cannot make the name exist, so firing here would hand
-            // out a tool's authority without the tool.
-            Self::Unknown => None,
+            Self::Native(entry) => Authority::from(entry.tool.reach()),
+            Self::ToolSearch(_) | Self::Local(_) | Self::Mcp(..) => Authority::Unbounded,
         }
     }
 }
@@ -430,7 +422,7 @@ impl Route<'_> {
 /// no caller can act on a name it forgot to canonicalize.
 struct Resolved<'a> {
     name: &'a str,
-    route: Route<'a>,
+    route: Option<Route<'a>>,
 }
 
 /// Precedence, highest first: client (ACP) tools, the registry, then MCP.
@@ -444,28 +436,30 @@ fn resolve<'a>(ctx: &'a ToolContext, name: &'a str) -> Resolved<'a> {
     // interpreter bridge) never passed through streaming.rs, so clean up here.
     let name = super::streaming::canonical_tool_name(name);
     let route = if let Some(local) = ctx.local_tools.get(name) {
-        Route::Local(local)
+        Some(Route::Local(local))
     } else if let Some(entry) = ctx.registry.get(name) {
-        Route::Native(entry)
+        Some(Route::Native(entry))
     } else if let Some(mcp) = ctx.mcp.as_ref() {
         match mcp.resolve(name) {
-            Some(qualified) => Route::Mcp(mcp, qualified),
-            None if name == TOOL_SEARCH_TOOL_NAME => Route::ToolSearch(mcp),
-            None => Route::Unknown,
+            Some(qualified) => Some(Route::Mcp(mcp, qualified)),
+            None if name == TOOL_SEARCH_TOOL_NAME => Some(Route::ToolSearch(mcp)),
+            None => None,
         }
     } else {
-        Route::Unknown
+        None
     };
     Resolved { name, route }
 }
 
 fn offered(ctx: &ToolContext, resolved: &Resolved<'_>) -> bool {
-    let audience = match &resolved.route {
+    let Some(route) = &resolved.route else {
+        return false;
+    };
+    let audience = match route {
         Route::Native(entry) => entry.tool.audience(),
         Route::Local(tool) => tool.audience,
         Route::Mcp(_, qualified) => return ctx.tool_filter.matches_external(qualified),
         Route::ToolSearch(_) => return ctx.tool_filter.matches_external(resolved.name),
-        Route::Unknown => return false,
     };
     ctx.tool_filter.admits(
         resolved.name,
@@ -511,7 +505,14 @@ pub fn callable(ctx: &ToolContext) -> Vec<Callable> {
     // name, or MCP would publish a way around it.
     let mut claim = |name: &str, route: Route<'_>| {
         let first = claimed.insert(name.to_owned());
-        first && offered(ctx, &Resolved { name, route })
+        first
+            && offered(
+                ctx,
+                &Resolved {
+                    name,
+                    route: Some(route),
+                },
+            )
     };
     let entry_of = |name: &str, source, audience, schema| Callable {
         name: name.to_owned(),
@@ -608,7 +609,8 @@ fn identifier_alias(name: &str) -> Option<String> {
 /// rules would have judged. Local tools and tool search have no gate, so they
 /// get one here.
 async fn run_inner(
-    resolved: Resolved<'_>,
+    name: &str,
+    route: Route<'_>,
     id: String,
     input: &Value,
     ctx: &ToolContext,
@@ -616,8 +618,7 @@ async fn run_inner(
     ask: Option<&str>,
     hook: Option<&Hook<'_>>,
 ) -> ToolDoneEvent {
-    let name = resolved.name;
-    if let (Some(_), Route::Local(_) | Route::ToolSearch(_)) = (ask, &resolved.route)
+    if let (Some(_), Route::Local(_) | Route::ToolSearch(_)) = (ask, &route)
         && let Err(e) = gate_on_input(ctx, &ToolKey::native(name), &id, input, ask, None).await
     {
         return ToolDoneEvent {
@@ -625,7 +626,7 @@ async fn run_inner(
             ..ToolDoneEvent::error(id, e)
         };
     }
-    match resolved.route {
+    match route {
         Route::Local(local) => run_local_tool(&local.handler, id, name, input, ctx, origin).await,
         Route::Native(entry) => {
             run_native_tool(entry, id, name, input, ctx, origin, ask, hook).await
@@ -634,7 +635,6 @@ async fn run_inner(
         Route::Mcp(mcp, qualified) => {
             execute_mcp_tool(ctx, mcp, &id, qualified, input, origin, ask, hook).await
         }
-        Route::Unknown => unavailable(ctx, name, id, true),
     }
 }
 
@@ -2591,8 +2591,14 @@ mod tests {
     fn telemetry_source_names_the_plugin_for_registry_tools() {
         let mut ctx = mcp_ctx(&stub_mcp(&[PROBE_QUALIFIED, OTHER_QUALIFIED]));
         ctx.registry = registry_with(&[PROBE_WIRE]);
-        assert_eq!(resolve(&ctx, PROBE_WIRE).route.source(), TEST_PLUGIN_SOURCE);
-        assert_eq!(resolve(&ctx, OTHER_WIRE).route.source(), SOURCE_MCP);
+        assert_eq!(
+            resolve(&ctx, PROBE_WIRE).route.unwrap().source(),
+            TEST_PLUGIN_SOURCE
+        );
+        assert_eq!(
+            resolve(&ctx, OTHER_WIRE).route.unwrap().source(),
+            SOURCE_MCP
+        );
     }
 
     #[test]
@@ -2601,13 +2607,22 @@ mod tests {
         let mut ctx = with_mcp(local_ctx(PROBE_WIRE, |_| Ok(String::new())), &mcp);
         ctx.registry = registry_with(&[PROBE_WIRE]);
 
-        assert!(matches!(resolve(&ctx, PROBE_WIRE).route, Route::Local(_)));
+        assert!(matches!(
+            resolve(&ctx, PROBE_WIRE).route,
+            Some(Route::Local(_))
+        ));
 
         ctx.local_tools = Arc::default();
-        assert!(matches!(resolve(&ctx, PROBE_WIRE).route, Route::Native(_)));
+        assert!(matches!(
+            resolve(&ctx, PROBE_WIRE).route,
+            Some(Route::Native(_))
+        ));
 
         ctx.registry = Arc::new(ToolRegistry::new());
-        assert!(matches!(resolve(&ctx, PROBE_WIRE).route, Route::Mcp(..)));
+        assert!(matches!(
+            resolve(&ctx, PROBE_WIRE).route,
+            Some(Route::Mcp(..))
+        ));
     }
 
     fn callable_names(ctx: &ToolContext) -> Vec<String> {

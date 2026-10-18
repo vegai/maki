@@ -12,7 +12,7 @@ local M = {}
 
 M.MODELS = { "sonnet", "opus", "haiku", "fable" }
 local MODEL_SET = path_utils.set_of(M.MODELS)
-M.STARTUP_TIMEOUT_SECS = 30
+M.STARTUP_TIMEOUT_SECS = native.startup_timeout_secs
 M.STARTUP_MS = M.STARTUP_TIMEOUT_SECS * jobs.MS_PER_SEC
 M.READ_PROFILE = "read"
 M.CODE_PROFILE = "code"
@@ -377,7 +377,6 @@ function M.job_opts(cwd, env, stderr_tail)
     env = env,
     clear_env = true,
     stdin = "pipe",
-    guard = true,
     on_stderr = function(_, line)
       jobs.keep_tail(stderr_tail, line)
     end,
@@ -500,9 +499,15 @@ function M.preflight(input, ctx, call, opts, plan)
     if not dir then
       return nil, dir_err
     end
-    local output, output_err = call:run_quick({ executable, "--version" }, { cwd = dir, env = env })
-    call:remove_dir(dir)
+    local output, output_err = call:run_quick({ executable, "--version" }, {
+      cwd = dir,
+      env = env,
+      leftover = function()
+        return dir
+      end,
+    })
     if not output then
+      call:remove_dir(dir)
       return nil, output_err
     end
     version, version_err = check:save(output)

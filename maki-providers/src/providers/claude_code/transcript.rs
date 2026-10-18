@@ -3,7 +3,6 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::io;
 
 use serde::Serialize;
 
@@ -49,7 +48,6 @@ cannot call now is no longer available. Your reply ends at a tool call: maki run
 results in the next transcript.";
 
 pub(crate) struct Catalog {
-    to_exposed: HashMap<String, String>,
     to_maki: HashMap<String, String>,
 }
 
@@ -85,10 +83,13 @@ fn server_name(name: &str) -> String {
     format!("{kept}_{}", &hash[..HASH_HEX_DIGITS])
 }
 
+fn exposed_name(name: &str) -> String {
+    format!("{EXPOSED_PREFIX}{}", server_name(name))
+}
+
 impl Catalog {
     pub fn new(tools: &Value) -> Result<(Self, Vec<McpTool>), Error> {
         let mut catalog = Self {
-            to_exposed: HashMap::new(),
             to_maki: HashMap::new(),
         };
         let mut offered = Vec::new();
@@ -98,7 +99,6 @@ impl Catalog {
             };
             let server = server_name(name);
             let exposed = format!("{EXPOSED_PREFIX}{server}");
-            catalog.to_exposed.insert(name.to_owned(), exposed.clone());
             if catalog.to_maki.insert(exposed, name.to_owned()).is_some() {
                 return Err(Error::SharedName(server));
             }
@@ -111,13 +111,6 @@ impl Catalog {
         Ok((catalog, offered))
     }
 
-    pub fn exposed_name(&self, name: &str) -> Cow<'_, str> {
-        self.to_exposed.get(name).map_or_else(
-            || Cow::Owned(format!("{EXPOSED_PREFIX}{}", server_name(name))),
-            |exposed| Cow::Borrowed(exposed.as_str()),
-        )
-    }
-
     pub fn exposed(&self) -> HashSet<String> {
         self.to_maki.keys().cloned().collect()
     }
@@ -126,8 +119,7 @@ impl Catalog {
         self.to_maki.get(exposed).map(String::as_str)
     }
 
-    /// A name the model made up comes back without the prefix, which the
-    /// transcript adds again, so the model reads the name it wrote.
+    /// Map an offered name back, or strip the MCP prefix from an unknown name.
     pub fn maki_name_or_made_up<'n>(&'n self, exposed: &'n str) -> &'n str {
         self.maki_name(exposed)
             .unwrap_or_else(|| exposed.strip_prefix(EXPOSED_PREFIX).unwrap_or(exposed))
@@ -145,7 +137,7 @@ pub(crate) fn system_prompt(system: &str) -> String {
 #[derive(Serialize)]
 struct TranscriptCall<'a> {
     id: &'a str,
-    name: Cow<'a, str>,
+    name: String,
     input: Cow<'a, Value>,
 }
 
@@ -174,13 +166,13 @@ fn push_line(out: &mut Vec<u8>, value: &impl Serialize) -> Result<(), Error> {
     serde_json::to_writer(out, value).map_err(Error::from)
 }
 
-fn expose_input(catalog: &Catalog, name: &str, input: &mut Value) {
+fn expose_input(name: &str, input: &mut Value) {
     if name == BATCH_TOOL
         && let Some(calls) = input[BATCH_CALLS].as_array_mut()
     {
         for call in calls {
             if let Some(name) = call[BATCH_CALL_TOOL].as_str() {
-                call[BATCH_CALL_TOOL] = Value::String(catalog.exposed_name(name).into_owned());
+                call[BATCH_CALL_TOOL] = Value::String(exposed_name(name));
             }
         }
     }
@@ -191,7 +183,7 @@ fn expose_input(catalog: &Catalog, name: &str, input: &mut Value) {
 ///
 /// Use the tool names visible to the model. Omit thinking because its signature is valid only
 /// for its original request. Reject images after maki's image adaptation.
-pub(crate) fn transcript(messages: &[Message], catalog: &Catalog) -> Result<Vec<String>, Error> {
+pub(crate) fn transcript(messages: &[Message]) -> Result<Vec<String>, Error> {
     let mut blocks = vec![TRANSCRIPT_HEADER.to_owned()];
     for message in messages {
         let mut out = Vec::new();
@@ -206,14 +198,14 @@ pub(crate) fn transcript(messages: &[Message], catalog: &Catalog) -> Result<Vec<
                 } => {
                     let input = if name == BATCH_TOOL {
                         let mut input = input.clone();
-                        expose_input(catalog, name, &mut input);
+                        expose_input(name, &mut input);
                         Cow::Owned(input)
                     } else {
                         Cow::Borrowed(input)
                     };
                     calls.push(TranscriptCall {
                         id,
-                        name: catalog.exposed_name(name),
+                        name: exposed_name(name),
                         input,
                     });
                 }
@@ -241,10 +233,7 @@ pub(crate) fn transcript(messages: &[Message], catalog: &Catalog) -> Result<Vec<
             push_line(&mut out, &entry_of(message, &text, calls))?;
         }
         if !out.is_empty() {
-            blocks.push(String::from_utf8(out).map_err(|source| Error::Io {
-                what: "decode the serialized conversation",
-                source: io::Error::other(source),
-            })?);
+            blocks.push(String::from_utf8(out)?);
         }
     }
     Ok(blocks)
@@ -279,7 +268,7 @@ mod tests {
     use super::super::error::Error;
     use super::{
         Catalog, EXPOSED_PREFIX, IS_ERROR, MAX_EXPOSED_NAME, SERVER, TEXT, TRANSCRIPT_HEADER,
-        entry_of, fits, server_name,
+        entry_of, fits, server_name, transcript,
     };
     use crate::{ContentBlock, ImageMediaType, ImageSource, Message, Role};
 
@@ -292,11 +281,6 @@ mod tests {
     fn host_updates_are_marked_as_observations(message: Message) {
         let entry = serde_json::to_value(entry_of(&message, &[HOST_UPDATE], Vec::new())).unwrap();
         assert_eq!(entry["observation"], true);
-    }
-
-    fn transcript(messages: &[Message]) -> Result<Vec<String>, Error> {
-        let (catalog, _) = Catalog::new(&tools(&[]))?;
-        super::transcript(messages, &catalog)
     }
 
     fn tools(names: &[&str]) -> Value {
@@ -476,17 +460,6 @@ mod tests {
             assert_eq!(whole[..part.len()], part[..], "after {end} messages");
         }
         assert_eq!(transcript(&messages).unwrap(), whole);
-    }
-
-    #[test]
-    fn transcript_prefixes_survive_tool_catalog_changes() {
-        let messages = history();
-        let (empty, _) = Catalog::new(&tools(&[])).unwrap();
-        let (current, _) = Catalog::new(&tools(&["read", "bash", LONG_NAME])).unwrap();
-        assert_eq!(
-            super::transcript(&messages, &current).unwrap(),
-            super::transcript(&messages, &empty).unwrap(),
-        );
     }
 
     /// The next request must show the model the name it can call for the

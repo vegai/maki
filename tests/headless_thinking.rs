@@ -29,6 +29,9 @@ const XHIGH_BUDGET: u64 = 51_200;
 const MINIMAL_BUDGET: u64 = 6_400;
 const EXPLICIT_BUDGET: u64 = 2048;
 const SDK_BUDGET: u64 = 4096;
+const INVALID_THINKING: &str = "unknown thinking value \"turbo\"";
+const INVALID_EFFORT: &str = "invalid value 'turbo' for '--effort <EFFORT>'";
+const INVALID_BUDGET: &str = "unexpected argument '-1' found";
 const PROTOCOL_TIMEOUT: Duration = Duration::from_secs(30);
 const INITIALIZE_ID: u64 = 1;
 const NEW_SESSION_ID: u64 = 2;
@@ -256,13 +259,15 @@ fn acp_launch_thinking_reaches_the_request(flags: &[&str], budget: Option<u64>) 
     fixture.assert_budget(budget);
 }
 
-#[test_case(&["-p", "--thinking", "turbo"] ; "print")]
-#[test_case(&["-p", "--input-format", "stream-json", "--effort", "turbo"] ; "sdk")]
-#[test_case(&["acp", "--max-thinking-tokens", "-1"] ; "acp")]
-fn invalid_launch_thinking_exits_before_a_provider_request(flags: &[&str]) {
+#[test_case(&["-p", "--thinking", "turbo"], INVALID_THINKING ; "print")]
+#[test_case(&["-p", "--input-format", "stream-json", "--effort", "turbo"], INVALID_EFFORT ; "sdk")]
+#[test_case(&["acp", "--max-thinking-tokens", "-1"], INVALID_BUDGET ; "acp")]
+fn invalid_launch_thinking_exits_before_a_provider_request(flags: &[&str], expected: &str) {
     let fixture = Fixture::new(None, Yes);
     let output = fixture.command().args(flags).output().unwrap();
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains(expected), "{stderr}");
     assert!(output.stdout.is_empty());
     assert!(fixture.requests.lock().unwrap().is_empty());
 }

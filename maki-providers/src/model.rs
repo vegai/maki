@@ -704,11 +704,10 @@ impl Model {
     /// Vision requires an image-capable transport. Model support then follows
     /// per-model overrides, discovery, [`ModelSources`] and the family default.
     pub fn supports_vision(&self) -> bool {
-        let spec = ProviderRegistry::for_slug(&self.provider);
         if let Some(vision) = self.supports_vision_override {
             return vision;
         }
-        let Some(spec) = spec else {
+        let Some(spec) = ProviderRegistry::for_slug(&self.provider) else {
             return self.family.supports_vision();
         };
         model_registry::discovered(spec.slug, &self.id)

@@ -1,5 +1,3 @@
-local native = require("maki.claude_code.internal")
-
 -- Send the task only after the probe and worker pass the handshake.
 --
 -- Managed hooks can run at startup. Run the probe in an empty directory so a rejected hook
@@ -19,6 +17,7 @@ local path_utils = require("claude_paths")
 local MODELS = launch.MODELS
 local MS_PER_SEC = jobs.MS_PER_SEC
 local STARTUP_MS = launch.STARTUP_MS
+local NO_STATE_DIR = "maki cannot find its state directory as a UTF-8 path for the coding sandbox"
 -- Each step of a coding snapshot, such as the copy, must finish in this time.
 local SNAPSHOT_TIMEOUT_MS = 120 * MS_PER_SEC
 local MAX_SHOWN_CHANGES = 50
@@ -198,12 +197,16 @@ end
 -- A read-only mount of the entire artifact would also block snapshot writes. The sandbox
 -- skips nonexistent denied paths.
 local function coding_confine(spec, artifact)
+  local state_dir = maki.env.state_dir()
+  if not state_dir then
+    return nil, NO_STATE_DIR
+  end
   local deny = table.clone(spec.checkout_dirs)
   deny[#deny + 1] = spec.config_dir
   deny[#deny + 1] = maki.fs.dirname(artifact.dir)
   -- Optional paths can be nil. Use explicit inserts so later paths remain in the list.
   deny[#deny + 1] = spec.git_dir
-  deny[#deny + 1] = maki.env.state_dir()
+  deny[#deny + 1] = state_dir
   deny[#deny + 1] = maki.env.config_dir()
   deny[#deny + 1] = maki.env.logs_dir()
   for _, name in ipairs({ "XDG_RUNTIME_DIR", "SSH_AUTH_SOCK" }) do
@@ -314,7 +317,11 @@ local function run(input, ctx, call, timeout_secs)
       return refuse(artifact_err)
     end
     call.artifact = artifact
-    confine = coding_confine(spec, artifact)
+    local confine_err
+    confine, confine_err = coding_confine(spec, artifact)
+    if not confine then
+      return refuse(confine_err)
+    end
     env = table.clone(spec.env)
     env.TMPDIR = artifact.tmp
   end

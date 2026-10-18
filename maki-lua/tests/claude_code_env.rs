@@ -1,5 +1,4 @@
 //! Environment tests use fresh repositories so checkout settings cannot affect the result.
-//! Each test holds the environment lock.
 //!
 //! nextest gives each test its own process. This also isolates the state directory, which
 //! maki selects once per process.
@@ -7,10 +6,12 @@
 
 use std::collections::HashMap;
 use std::env;
+use std::ffi::OsStr;
 use std::fs::{self, File};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use maki_agent::tools::test_support::stub_ctx_in;
@@ -110,30 +111,25 @@ const MANIFEST: &str = "manifest.json";
 const SWEEP_TRASH: &str = ".trash-old";
 /// Older than the default artifact time limit of a day.
 const STALE_AGE: Duration = Duration::from_secs(48 * 60 * 60);
-
-/// Each test holds this lock while it runs, because these tests change the
-/// whole process's environment and a threaded harness would run them at
-/// once.
-static PROCESS: Mutex<()> = Mutex::new(());
+const NO_STATE_DIR: &str =
+    "maki cannot find its state directory as a UTF-8 path for the coding sandbox";
 
 /// A test's turn on the process: inside an empty repository, with the
 /// fixture as the user's directories, until it drops.
 struct Scenario {
     _in_project: WorkingDir,
     _project: TempDir,
-    _turn: MutexGuard<'static, ()>,
 }
 
 impl Scenario {
     fn enter() -> Self {
-        let turn = PROCESS.lock().unwrap_or_else(PoisonError::into_inner);
+        support::environment::require_nextest();
         use_fixture_user();
         let project = tempdir().unwrap();
         fs::create_dir(project.path().join(".git")).unwrap();
         Self {
             _in_project: WorkingDir::enter(project.path()),
             _project: project,
-            _turn: turn,
         }
     }
 }
@@ -163,6 +159,30 @@ fn fake_host(claude: &Path, config_dir: &Path) -> (Arc<ToolRegistry>, PluginHost
     fake_host_with(claude, config_dir, Map::new())
 }
 
+#[test]
+fn coding_refuses_a_state_directory_it_cannot_deny() {
+    let _scenario = Scenario::enter();
+    let outside = tempdir().unwrap();
+    let state = outside.path().join(OsStr::from_bytes(b"state-\xff"));
+    fs::create_dir(&state).unwrap();
+    let _state = EnvVar::set(XDG_STATE_HOME, &state);
+    let claude = fake_claude(outside.path(), VERSION_ONLY);
+    let artifacts = outside.path().join("artifacts");
+    let (reg, _host) = fake_host_with(
+        &claude,
+        outside.path(),
+        Map::from_iter([("artifact_dir".into(), json!(artifacts))]),
+    );
+    let err = ask_with(
+        &reg,
+        &session_ctx(),
+        json!({ "prompt": "anything", "profile": "code" }),
+    )
+    .unwrap_err();
+    assert!(err.contains(NO_STATE_DIR), "{err}");
+    assert!(artifact_listing(&artifacts).is_empty());
+}
+
 fn fake_host_with(
     claude: &Path,
     config_dir: &Path,
@@ -190,8 +210,9 @@ fn ask_with(reg: &ToolRegistry, ctx: &ToolContext, input: Value) -> Result<Strin
 /// A `TMPDIR` that leads into the project, directly or through a symlink
 /// from outside it, is refused before any file is made there. The fake
 /// answers only `--version`, so no probe can run, even after an error.
-#[test]
-fn a_temp_dir_that_leads_into_the_project_is_refused() {
+#[test_case(false ; "direct_path")]
+#[test_case(true ; "symlink_alias")]
+fn a_temp_dir_that_leads_into_the_project_is_refused(linked: bool) {
     let _scenario = Scenario::enter();
     let project = env::current_dir().unwrap().canonicalize().unwrap();
     let outside = tempdir().unwrap();
@@ -200,17 +221,16 @@ fn a_temp_dir_that_leads_into_the_project_is_refused() {
     symlink(&project, &link).unwrap();
     let before = listing(&project);
 
-    for tmpdir in [&project, &link] {
-        let _tmpdir = EnvVar::set(TMPDIR, tmpdir);
-        let (reg, _host) = fake_host(&claude, outside.path());
-        let err = ask(&reg, &session_ctx()).unwrap_err();
-        assert!(err.contains(INSIDE_PROJECT), "got: {err}");
-        assert_eq!(
-            listing(&project),
-            before,
-            "maki must make no file in the project"
-        );
-    }
+    let tmpdir = if linked { &link } else { &project };
+    let _tmpdir = EnvVar::set(TMPDIR, tmpdir);
+    let (reg, _host) = fake_host(&claude, outside.path());
+    let err = ask(&reg, &session_ctx()).unwrap_err();
+    assert!(err.contains(INSIDE_PROJECT), "got: {err}");
+    assert_eq!(
+        listing(&project),
+        before,
+        "maki must make no file in the project"
+    );
 }
 
 #[test]

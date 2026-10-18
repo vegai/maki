@@ -1,5 +1,3 @@
-#[cfg(test)]
-use maki_providers::provider::ModelListing;
 use std::time::{Duration, Instant};
 
 use maki_providers::provider::{Provider, RequestScope};
@@ -391,6 +389,7 @@ mod tests {
     use std::path::Path;
     use std::sync::Mutex;
 
+    use maki_providers::provider::ModelListing;
     use maki_providers::{
         Effort, KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Role, ThinkingConfig, TokenUsage,
     };

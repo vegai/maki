@@ -813,7 +813,7 @@ fn version_number(token: &str) -> Option<u32> {
 /// version check, not an allowlist, so future releases and new families work
 /// automatically. Reads the id, not the provider, so a gateway serving Claude
 /// is covered too.
-fn requires_adaptive(model_id: &str) -> bool {
+pub(crate) fn requires_adaptive(model_id: &str) -> bool {
     claude_version(model_id).is_some_and(|(family, version)| {
         let since = if family == OPUS {
             ADAPTIVE_SINCE_OPUS
@@ -1250,10 +1250,6 @@ impl ThinkingConfig {
                 body["thinking"] = json!({"type": "enabled", "budget_tokens": n});
             }
         }
-    }
-
-    pub(crate) fn requires_adaptive(model_id: &str) -> bool {
-        requires_adaptive(model_id)
     }
 
     pub fn apply_reasoning_effort(self, body: &mut Value, dialect: &EffortDialect, model: &Model) {
