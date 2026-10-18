@@ -1,5 +1,3 @@
-#[cfg(test)]
-use maki_providers::provider::ModelListing;
 use std::collections::HashMap;
 use std::env;
 
@@ -620,7 +618,7 @@ mod tests {
     use std::path::Path;
     use std::sync::Mutex;
 
-    use maki_providers::provider::{BoxFuture, Provider, RequestScope};
+    use maki_providers::provider::{BoxFuture, ModelListing, Provider, RequestScope};
     use maki_providers::{
         ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
         StreamResponse, TokenUsage,

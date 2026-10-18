@@ -25,8 +25,9 @@ use test_case::test_case;
 
 use super::super::support::{
     ARTIFACT_LINE, BASH_SRC, DEADLINE, IMPORT_TOOL, LEFT_BEHIND, NOTHING_IMPORTED, ORIGINALS,
-    PWNED, SNAPSHOT_DIR, TOOL, WRITE_SRC, artifact_listing, commit_all, contents, environment, git,
-    listing, load, mode_bits_hold, tool_reply, try_load, wait_until, write,
+    PWNED, SNAPSHOT_DIR, TOOL, WRITE_SRC, artifact_listing, commit_all, contents, environment,
+    executable, git, listing, load, mode_bits_hold, on_path, tool_reply, try_load, wait_until,
+    write,
 };
 use super::{
     ANSWERS, CODE_CLAUDE_CONFIG, CODE_EDIT, CODE_HANG, CODE_HOSTILE, CODE_LONG, CODE_PROFILE,
@@ -166,6 +167,8 @@ const BREAK_BASELINE: &str = "git config core.repositoryformatversion 999";
 const CANNOT_RECORD_PREPARED: &str = "maki cannot record the prepared snapshot";
 const PREPARED_NOTE: &str = "the prepare command changed lock.json";
 const WORKER_EDIT: &str = "worker\n";
+const WORKER_DIFF: &str = "+worker";
+const PROMPT_START: &str = "print";
 const PREPARED_LINK: &str = "prepared_link";
 const LINKS_LEFT_OUT: &str = "maki removed external symlinks from the snapshot";
 const PRIVATE_COPIES: &str = "hard-linked files in the snapshot";
@@ -907,7 +910,7 @@ fn a_file_name_maki_cannot_pass_on_is_refused() {
     let err = coding.code(&reg, CODE_EDIT, &[]).unwrap_err();
     assert!(err.contains(NOT_UTF8_STOP), "got: {err}");
     assert!(
-        !coding.fake.log("calls").contains("print"),
+        !coding.fake.log("calls").contains(PROMPT_START),
         "maki must not send a prompt"
     );
     assert_eq!(artifact_listing(coding.artifacts.path()).len(), 0);
@@ -1497,9 +1500,28 @@ fn an_import_refuses_a_link_swapped_in_during_approval(swapped: &str) {
 
 /// `prepare` runs outside the sandbox and can create external links. Remove these links
 /// before the worker starts.
-#[test]
-fn a_link_prepare_makes_out_of_the_snapshot_is_dropped() {
+#[test_case(false ; "batched_resolution")]
+#[test_case(true ; "partial_resolution_failure")]
+fn an_unsafe_link_prepare_makes_is_dropped(fail_batch: bool) {
     let coding = Coding::new();
+    if fail_batch {
+        let realpath = on_path("realpath");
+        executable(
+            coding.fake.dir.path(),
+            "realpath",
+            &format!(
+                "#!/bin/sh\nif [ \"$2\" = -z ]; then printf '/partial\\0'; exit 1; fi\nexec '{}' \"$@\"\n",
+                realpath.display()
+            ),
+        );
+        let path = env::join_paths(
+            [coding.fake.dir.path().to_owned()]
+                .into_iter()
+                .chain(env::split_paths(&env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        environment::set("PATH", path);
+    }
     let prepare = format!("ln -s {OUTSIDE_TARGET} {PREPARED_LINK}");
     let (reg, _host) = coding.host(&[("prepare", json!(prepare))]);
     let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
@@ -1516,6 +1538,78 @@ fn a_link_prepare_makes_out_of_the_snapshot_is_dropped() {
     assert!(
         reply.contains(LINKS_LEFT_OUT) && reply.contains(PREPARED_LINK),
         "got: {reply}"
+    );
+    assert_eq!(
+        fs::read_link(snapshot.join("src/inner")).unwrap(),
+        Path::new("lib.rs")
+    );
+}
+
+#[test]
+fn escaping_links_are_checked_in_batches() {
+    const LINK_COUNT: usize = 256;
+    const MAX_REALPATH_CALLS: usize = 2;
+    let coding = Coding::new();
+    let tools = tempdir().unwrap();
+    let realpath = on_path("realpath");
+    let log = tools.path().join("realpath_calls");
+    executable(
+        tools.path(),
+        "realpath",
+        &format!(
+            "#!/bin/sh\necho call >> '{}'\nexec '{}' \"$@\"\n",
+            log.display(),
+            realpath.display()
+        ),
+    );
+    let path = env::join_paths(
+        [tools.path().to_owned()]
+            .into_iter()
+            .chain(env::split_paths(&env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    environment::set("PATH", path);
+    let prepare = format!(
+        "i=0; while [ \"$i\" -lt {LINK_COUNT} ]; do ln -s lib.rs src/link_$i; i=$((i + 1)); done; ln -s {OUTSIDE_TARGET} {PREPARED_LINK}"
+    );
+    let (reg, _host) = coding.host(&[("prepare", json!(prepare))]);
+    let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
+    let snapshot = coding.snapshot(&artifact_id(&reply));
+    for index in 0..LINK_COUNT {
+        assert_eq!(
+            fs::read_link(snapshot.join(format!("src/link_{index}"))).unwrap(),
+            Path::new("lib.rs")
+        );
+    }
+    assert!(fs::symlink_metadata(snapshot.join(PREPARED_LINK)).is_err());
+    let calls = fs::read_to_string(log).unwrap().lines().count();
+    assert!(
+        (1..=MAX_REALPATH_CALLS).contains(&calls),
+        "{calls} realpath processes"
+    );
+}
+
+#[test]
+fn displayed_paths_select_the_intended_change_when_escapes_overlap() {
+    const NEWLINE_PATH: &str = "src/a\nb";
+    const BACKSLASH_PATH: &str = "src/a\\012b";
+    const DISPLAYED_NEWLINE: &str = "src/a\\012b";
+    const DISPLAYED_BACKSLASH: &str = "src/a\\\\012b";
+    let (coding, reg, _host, id) = Coding::coded("code_ambiguous");
+    coding
+        .import(&reg, json!({ "id": id, "paths": [DISPLAYED_NEWLINE] }))
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(coding.project().join(NEWLINE_PATH)).unwrap(),
+        "newline\n"
+    );
+    assert!(!coding.project().join(BACKSLASH_PATH).exists());
+    coding
+        .import(&reg, json!({ "id": id, "paths": [DISPLAYED_BACKSLASH] }))
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(coding.project().join(BACKSLASH_PATH)).unwrap(),
+        "backslash\n"
     );
 }
 
@@ -2347,5 +2441,5 @@ fn worker_attributes_cannot_hide_text_changes_from_review() {
             IMPORTED_LIB,
         ],
     );
-    assert!(diff.contains("+worker"), "{diff}");
+    assert!(diff.contains(WORKER_DIFF), "{diff}");
 }

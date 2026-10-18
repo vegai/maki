@@ -70,7 +70,7 @@ permissions() {
     printf '%s\0' "${files[@]}" | xargs -0 chmod "$mode" --
   done
   [ "${#executable[@]}" = 0 ] || printf '%s\0' "${executable[@]}" | xargs -0 chmod +x --
-  [ "${#regular_files[@]}" = 0 ] || printf '%s\0' "${regular_files[@]}" | xargs -0 chmod -x --
+  [ "${#regular_files[@]}" = 0 ] || printf '%s\0' "${regular_files[@]}" | xargs -0 chmod a-x --
 }
 keep() {
   local folder=$1 path

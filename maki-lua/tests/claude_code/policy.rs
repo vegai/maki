@@ -17,6 +17,7 @@ use maki_agent::tools::test_support::stub_ctx_in;
 use maki_agent::tools::{ToolContext, ToolRegistry};
 use maki_agent::{AgentEvent, Envelope, EventSender, ToolOutput, ToolOutputLines};
 use maki_lua::{MAX_INFLIGHT_TOOLS, PluginHost, RestoreItem, RestoreReason};
+use maki_providers::claude_code::validation::STARTUP_TIMEOUT_SECS;
 use serde_json::{Map, Value, json};
 use tempfile::{TempDir, tempdir};
 use test_case::test_case;
@@ -124,7 +125,7 @@ const NOT_AN_OBJECT: &str = "settings.json: is not a JSON object";
 const SYNTAX_ERROR_AT: &str = "settings.json: EOF while parsing a value at line 2 column 17";
 const BROKEN_SETTINGS: &str = "{\n  \"apiKeyHelper\":";
 const API_KEY_STOP: &str = "API key source \"ANTHROPIC_API_KEY\"";
-const NO_INIT_STOP: &str = "no init event in 30 s";
+const NO_INIT_STOP: &str = "no init event in ";
 const NO_ANSWER_IN_TIME: &str = "did not complete in time";
 /// The fake's exit code, when it came, and its stderr, whatever text
 /// surrounds them.
@@ -189,6 +190,7 @@ done
 echo $$ >> "$dir/pids"
 if [ "$1" = --version ]; then
   echo version >> "$dir/calls"
+  pwd -P >> "$dir/version_started_in"
   if [ -e "$dir/@STALL_VERSION@" ]; then touch "$dir/version_stalled"; secs=$(cat "$dir/@STALL_VERSION@"); sleep "${secs:-30}"; fi
   cat "$dir/version"; exit 0
 fi
@@ -287,6 +289,11 @@ case "$scenario" in
   code_hostile*)
     init none
     printf 'hostile\n' > "@HOSTILE@"
+    answer ;;
+  code_ambiguous*)
+    init none
+    printf 'newline\n' > "$(printf 'src/a\nb')"
+    printf 'backslash\n' > 'src/a\012b'
     answer ;;
   code_retype*)
     init none
@@ -439,11 +446,15 @@ impl FakeClaude {
     /// Returns the directories, other than `project`, where the fake started
     /// and which still exist: probe directories that were never removed.
     fn probe_dirs_left(&self, project: &Path) -> Vec<PathBuf> {
-        self.log("started_in")
-            .lines()
-            .map(PathBuf::from)
-            .filter(|dir| dir != project && dir.exists())
-            .collect()
+        format!(
+            "{}{}",
+            self.log("started_in"),
+            self.log("version_started_in")
+        )
+        .lines()
+        .map(PathBuf::from)
+        .filter(|dir| dir != project && dir.exists())
+        .collect()
     }
 
     fn pid(&self) -> i32 {
@@ -938,7 +949,8 @@ fn the_startup_limit_holds_with_every_slot_taken() {
         holder.join().unwrap();
     }
     let err = result.unwrap_err();
-    assert!(err.contains(NO_INIT_STOP), "got: {err}");
+    let expected = format!("{NO_INIT_STOP}{} s", STARTUP_TIMEOUT_SECS);
+    assert!(err.contains(&expected), "got: {err}");
     assert!(
         group_gone(fake.pid(), DEADLINE),
         "no process of the stopped child must stay"

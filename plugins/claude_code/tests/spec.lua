@@ -133,6 +133,19 @@ for _, code in ipairs({ 0x80, 0x9b, 0x2028, 0x2029, 0x200b, 0x202e, 0xfeff }) do
   end)
 end
 
+for _, path in ipairs({ "café.rs", "cafe" .. utf8.char(0x301) .. ".rs", "emoji" .. utf8.char(0xfe0f) .. ".rs" }) do
+  case("visible_unicode_path_" .. path, function()
+    eq(path_utils.printable(path), path)
+  end)
+end
+
+case("escaped_paths_are_distinct_from_literal_backslashes", function()
+  eq(path_utils.printable("a\nb"), "a\\012b")
+  eq(path_utils.printable("a\\012b"), "a\\\\012b")
+  eq(path_utils.printable("a" .. utf8.char(0x202e) .. "b"), "a\\u202eb")
+  eq(path_utils.printable("a\\u202eb"), "a\\\\u202eb")
+end)
+
 -- ── claude_launch ──
 
 local function sandbox_problem(sandbox, confine)
@@ -954,7 +967,7 @@ for _, c in ipairs({
   {
     name = "error_subtype",
     result = { subtype = "error_max_turns", errors = { "turn limit" } },
-    want = "error_max_turns): turn limit",
+    want = 'error_max_turns: ["turn limit"]',
   },
   {
     name = "error_flag",
@@ -964,12 +977,12 @@ for _, c in ipairs({
   {
     name = "a_table_for_its_result",
     result = { subtype = "error_during_execution", result = { code = 1 }, errors = { "overloaded" } },
-    want = "error_during_execution): overloaded",
+    want = 'error_during_execution: ["overloaded"]',
   },
   {
     name = "errors_that_are_no_strings",
     result = { subtype = "error_during_execution", errors = { { code = 529 }, "retry later" } },
-    want = 'error_during_execution): {"code":529}; retry later',
+    want = 'error_during_execution: [{"code":529},"retry later"]',
   },
 }) do
   case("a_result_with_" .. c.name .. "_is_an_error", function()
@@ -1608,7 +1621,8 @@ for _, path in ipairs({ ".maki/init.lua", "nested/.MaKi/permissions.toml", ".Cla
 end
 
 case("synthetic_api_errors_preserve_the_result_cause", function()
-  local stream = Stream.new({ cwd = CWD, worker = READ, cli = CLI, model = "claude-haiku-4-5" })
+  local stream = Stream.new({ cwd = CWD, worker = READ, cli = CLI })
+  stream:set_model("claude-haiku-4-5")
   stream:feed(init_event())
   stream:set_model("claude-haiku-4-5")
   local step = stream:feed(maki.json.encode({

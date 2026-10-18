@@ -158,7 +158,4 @@ function M.summary(changes)
   return lines
 end
 
---- The prefix of the temporary files of the import staging in {stage}: the
---- artifact id and the stage name.
-
 return M

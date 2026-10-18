@@ -3,10 +3,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use flume::Receiver;
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::process;
 use maki_storage::id::MakiId;
-use mlua::{Function, Lua, LuaString, RegistryKey, Result as LuaResult, Table, Value};
+use mlua::{
+    Function, IntoLuaMulti, Lua, LuaString, RegistryKey, Result as LuaResult, Table, Value,
+};
 
 use crate::api::fs::expand_tilde;
 use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
@@ -16,19 +19,11 @@ use crate::runtime::{active_task_id, job_task_id, strip_traceback, with_jobs};
 
 mod jobs;
 pub use jobs::set_shell_preference;
-use jobs::{
-    CallbackUpdate, CallbackUpdates, CheckedOutReceiver, JobCommand, JobSnapshot, Redirect,
-};
+use jobs::{CallbackUpdate, CallbackUpdates, JobCommand, JobSnapshot, Redirect};
 pub(crate) use jobs::{JobEvent, JobOwner, JobSpec, JobStore};
 
-const DEFAULT_TAIL: usize = 20;
 const MAX_TAIL_LINES: usize = 1024;
-const MAX_COMPLETED_SESSION_JOBS: usize = 256;
 const DEFAULT_WAIT_MS: u64 = 30_000;
-
-#[cfg(not(target_os = "linux"))]
-const GUARD_UNSUPPORTED: &str = "jobstart: guard requires Linux";
-const READER_BUF_SIZE: usize = 8 * 1024;
 
 const NO_TASK_SCOPE_ERR: &str =
     "jobstart: no active task; use scope = \"plugin\" or { session = ... }";
@@ -43,15 +38,39 @@ const CMD_TYPE_ERR: &str = "jobstart: cmd must be a shell string or an argv tabl
 const STDIN_MODE_ERR: &str = "jobstart: stdin must be \"pipe\" or \"null\"";
 const STDIN_PIPE: &str = "pipe";
 const STDIN_NULL: &str = "null";
-const JOB_EXITED_ERR: &str = "job: exited or closed its stdin";
-const STDIN_WRITE_ERR: &str = "job: writing stdin failed";
-const NO_STDIN_ERR: &str = "job: stdin is not an open pipe";
 const CHANCLOSE_STREAM_ERR: &str = "chanclose: you can close only \"stdin\"";
 const CHANSEND_DATA_ERR: &str = "chansend: data must be a string or a list";
 const STDIN_STREAM: &str = "stdin";
-const STDOUT_STREAM: &str = "stdout";
-const STDERR_STREAM: &str = "stderr";
-const EXIT_EVENT: &str = "exit";
+
+struct CheckedOutReceiver {
+    lua: Lua,
+    job_id: u32,
+    receiver: Option<Receiver<JobEvent>>,
+}
+
+impl CheckedOutReceiver {
+    fn new(lua: &Lua, job_id: u32, receiver: Receiver<JobEvent>) -> Self {
+        Self {
+            lua: lua.clone(),
+            job_id,
+            receiver: Some(receiver),
+        }
+    }
+
+    fn get(&self) -> &Receiver<JobEvent> {
+        self.receiver.as_ref().expect("receiver is checked out")
+    }
+}
+
+impl Drop for CheckedOutReceiver {
+    fn drop(&mut self) {
+        if let Some(receiver) = self.receiver.take() {
+            with_jobs(&self.lua, |store| {
+                store.restore_receiver(self.job_id, receiver);
+            });
+        }
+    }
+}
 
 /// Run a command in the background. A string runs through `bash -c` on Unix
 /// and through [`agent.shell`](/docs/configuration/#agent) on Windows. A table
@@ -445,7 +464,7 @@ fn jobstop(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<()> {
 ///
 /// @param id integer Job id returned by `jobstart`.
 /// @param data string|table Text to write, or a list of lines.
-/// @return (integer?, string?) Bytes in the queue for the job, or nil and an error.
+/// @return (integer?, string?) Bytes accepted from this call, or nil and an error.
 /// @example
 /// local id = maki.fn.jobstart({ "cat" }, { stdin = "pipe" })
 /// maki.fn.chansend(id, "hello\n")
@@ -663,14 +682,11 @@ async fn call_back(lua: &Lua, callback: Function, job_id: u32, event: &JobEvent)
         JobEvent::Stdout(line) | JobEvent::Stderr(line) => Value::String(lua.create_string(line)?),
         JobEvent::Exit(code, _) => Value::Integer((*code).into()),
     };
-    lua.create_thread(callback)?
-        .into_async::<()>((
-            job_id,
-            arg,
-            event.name(),
-            matches!(event, JobEvent::Exit(_, true)),
-        ))?
-        .await
+    let mut args = (job_id, arg, event.name()).into_lua_multi(lua)?;
+    if let JobEvent::Exit(_, timed_out) = event {
+        args.push_back(Value::Boolean(*timed_out));
+    }
+    lua.create_thread(callback)?.into_async::<()>(args)?.await
 }
 
 /// Check whether {name} names a runnable file, resolving relative paths

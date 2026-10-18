@@ -12,7 +12,7 @@ Maki uses a permission system to decide what each tool is allowed to do and when
 Whether a project's `.maki` configuration loads at all is a separate question,
 answered once per folder. See [folder trust](/docs/folder-trust/).
 
-CLI [tool name lists](/docs/cli/#tool-name-lists) control which tools are available before permission rules run. Allow lists now include MCP tools. Add their qualified names to an existing list if you need to keep them available.
+CLI [tool name lists](/docs/cli/#tool-name-lists) control which tools are available before permission rules run.
 
 ## Rule Layers
 

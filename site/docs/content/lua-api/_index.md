@@ -2518,7 +2518,7 @@ Requires the `run` [plugin permission](#plugin-permissions).
 - `{id}` (`integer`) Job id returned by `jobstart`.
 - `{data}` (`string|table`) Text to write, or a list of lines.
 
-**Returns:** (`integer?`, `string?`) Bytes in the queue for the job, or nil and an error.
+**Returns:** (`integer?`, `string?`) Bytes accepted from this call, or nil and an error.
 
 **Example:**
 

@@ -192,6 +192,7 @@ end
 --- The `inherit_env` option merges `env` into maki's environment without provider keys.
 --- Otherwise `env` supplies the entire child environment.
 --- The `display` option replaces the joined argv in error messages.
+--- `leftover` returns a directory to remove after exit, including cancellation.
 function Call:run_quick(argv, spec)
   local shown = "`" .. (spec.display or table.concat(argv, " ")) .. "`"
   local stderr_tail = {}
@@ -205,7 +206,7 @@ function Call:run_quick(argv, spec)
       M.keep_tail(stderr_tail, line)
     end,
   }
-  local how = { keep_on_cancel = spec.keep_on_cancel }
+  local how = { keep_on_cancel = spec.keep_on_cancel, leftover = spec.leftover }
   if spec.stdin then
     how.started = function(id)
       return M.feed_stdin(id, spec.stdin)

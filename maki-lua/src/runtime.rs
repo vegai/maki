@@ -2310,7 +2310,7 @@ fn spawn_deferred_callback(
     ex.spawn(async move {
         smol::Timer::after(cb.delay).await;
         let _hold = DrainHold::new(&gate);
-        let _guard = timer_gate.acquire().await;
+        let _guard = timer_gate.admit(None).await;
         // Only now stop advertising the timer as pending: up to here a
         // `clear_plugin` can still flip the flag we read below, and from here
         // on the drain barrier waits for the guard instead.

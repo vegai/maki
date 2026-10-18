@@ -7,7 +7,7 @@ use std::future::Future;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, LazyLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -75,10 +75,6 @@ const GLOBAL_INSTRUCTIONS: &str = "maki/AGENTS.md";
 /// avoid test labels so the model treats them as ordinary instructions.
 pub const FIXTURE_GLOBAL_RULE: &str = "Write the replies in English.";
 
-/// All threads share one working directory, so under a threaded harness
-/// this lets only one test at a time move it.
-static WORKING_DIR: Mutex<()> = Mutex::new(());
-
 /// Keep only the developer's Claude Code login. Fixture home and XDG directories isolate maki
 /// config and instruction files.
 static DEVELOPER_LOGIN: LazyLock<PathBuf> = LazyLock::new(|| {
@@ -109,15 +105,14 @@ static DEVELOPER_LOGIN: LazyLock<PathBuf> = LazyLock::new(|| {
 /// on drop.
 pub struct WorkingDir {
     left: PathBuf,
-    _turn: MutexGuard<'static, ()>,
 }
 
 impl WorkingDir {
     pub fn enter(dir: &Path) -> Self {
-        let turn = WORKING_DIR.lock().unwrap_or_else(PoisonError::into_inner);
+        environment::require_nextest();
         let left = env::current_dir().unwrap();
         env::set_current_dir(dir).unwrap();
-        Self { left, _turn: turn }
+        Self { left }
     }
 }
 

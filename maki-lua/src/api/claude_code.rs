@@ -30,6 +30,7 @@ pub(crate) fn create_private_module(
 ) -> LuaResult<(&'static str, Table)> {
     let table = create_claude_code_table(lua, perms)?;
     table.set("lock_busy", LOCK_BUSY)?;
+    table.set("startup_timeout_secs", validation::STARTUP_TIMEOUT_SECS)?;
     Ok((MODULE, table))
 }
 
@@ -298,7 +299,7 @@ async fn sanitize_git(
         match result {
             Ok(paths) => {
                 let result = lua.create_table()?;
-                result.set("metadata", paths.metadata)?;
+                result.set("git_metadata", paths.git_metadata)?;
                 result.set("repositories", paths.repositories)?;
                 result.set("private_files", paths.private_files)?;
                 Ok((Some(result), None))
@@ -359,6 +360,7 @@ fn classify(lua: &Lua, line: String, mode: Table) -> LuaResult<Pair<Table>> {
     result.set("event", json_to_lua(lua, event)?)?;
     result.set("model_checked", classified.model_checked)?;
     result.set("problem", classified.problem)?;
+    result.set("failure", classified.failure)?;
     if let Some(usage) = &classified.usage {
         result.set("usage", json_to_lua(lua, usage)?)?;
     }

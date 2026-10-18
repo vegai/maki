@@ -5,7 +5,6 @@
 //! quotes, camelCase keys, extra wrappers). Plan mode rejects writes to
 //! anything but the plan file before they reach the tool.
 
-use maki_providers::provider::ModelListing;
 mod deadline;
 mod file_access;
 pub mod grep;
@@ -43,7 +42,7 @@ use crate::{AgentConfig, AgentMode, EventSender, RunLedger, SharedBuf};
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_providers::Model;
 use maki_providers::RequestOptions;
-use maki_providers::provider::{Provider, RequestScope};
+use maki_providers::provider::{ModelListing, Provider, RequestScope};
 use maki_storage::id::{MakiId, SessionRef};
 
 pub(crate) const TOOL_NAME_FIELD: &str = "name";

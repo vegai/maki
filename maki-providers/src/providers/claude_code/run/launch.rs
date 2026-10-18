@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use smol::process::ChildStdin;
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::ffi::OsStr;
 use std::fs::Metadata;
 use std::io;
 #[cfg(unix)]
@@ -95,7 +96,7 @@ pub(super) fn command(
     executable: &Path,
     env: &[(String, String)],
     cwd: &Path,
-    args: &[String],
+    args: &[impl AsRef<OsStr>],
 ) -> process::Command {
     let mut command = process::Command::new(executable);
     command
@@ -302,8 +303,8 @@ async fn windows(launch: &Launch<'_>, models: &[String]) -> Result<Vec<Option<u3
 }
 
 /// Sends `request` and waits for its answer. Requests go one at a time,
-/// because Claude Code can answer a later request first. Other lines are
-/// ignored, because this process has no prompt and its events do not matter.
+/// because Claude Code can answer a later request first. Other events pass
+/// discovery protocol checks before the wait continues.
 async fn ask(
     stdin: &mut Option<ChildStdin>,
     lines: &mut (impl Stream<Item = io::Result<String>> + Unpin),

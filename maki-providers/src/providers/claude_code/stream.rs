@@ -32,7 +32,7 @@ pub(crate) const HOOKS_ANSWER: &str = checks::HOOKS_ANSWER;
 const SYSTEM_EVENT: &str = "system";
 pub(super) const ASSISTANT_EVENT: &str = "assistant";
 const USER_EVENT: &str = "user";
-const RESULT_EVENT: &str = "result";
+pub(super) const RESULT_EVENT: &str = "result";
 const MAX_TURNS_ERROR: &str = "error_max_turns";
 const STREAM_EVENT: &str = "stream_event";
 const UNKNOWN_EVENT_KIND: &str = "?";
@@ -51,7 +51,6 @@ const THINKING_BLOCK: &str = "thinking";
 const REDACTED_THINKING_BLOCK: &str = "redacted_thinking";
 const TEXT_DELTA: &str = "text_delta";
 const THINKING_DELTA: &str = "thinking_delta";
-const ERROR_PREFIX: &str = "error_";
 /// Claude Code's own placeholders. Its output filter drops a message whose
 /// only block is one of these, as it drops blank text.
 const DROPPED_TEXTS: [&str; 2] = ["(no content)", "[Request interrupted by user for tool use]"];
@@ -202,10 +201,7 @@ pub(crate) fn classify(
 }
 
 fn failed_result(event: &Value) -> bool {
-    event["is_error"] == true
-        || event["subtype"]
-            .as_str()
-            .is_some_and(|kind| kind.starts_with(ERROR_PREFIX))
+    event["subtype"] != SUCCESS || event["is_error"] == true
 }
 
 fn result_message(event: &Value) -> String {
@@ -221,6 +217,10 @@ fn result_message(event: &Value) -> String {
                 .map(|_| shown(&event["errors"]))
         });
     detail.map_or_else(|| kind.to_owned(), |text| format!("{kind}: {text}"))
+}
+
+pub(super) fn result_failure(event: &Value) -> Option<String> {
+    failed_result(event).then(|| Error::Failed(result_message(event)).to_string())
 }
 
 pub(crate) fn check_model(ran: &str, expected: &str) -> Result<(), Error> {
@@ -899,7 +899,7 @@ impl<'a> Turn<'a> {
             && self.stop_reason.as_deref() == Some(TOOL_USE_STOP)
             && self.lost.is_none()
             && event["api_error_status"].is_null();
-        if (event["subtype"] != SUCCESS || event["is_error"] == true) && !rejected_at_limit {
+        if failed_result(event) && !rejected_at_limit {
             if let Some(status) = status_of(&event["api_error_status"]) {
                 return Err(self.refused(
                     Refusal {

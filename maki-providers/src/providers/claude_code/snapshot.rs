@@ -29,7 +29,7 @@ const PRIVATE_COPY_PREFIX: &str = ".maki-private-";
 
 #[derive(Default)]
 pub struct SnapshotMetadata {
-    pub metadata: Vec<String>,
+    pub git_metadata: Vec<String>,
     pub repositories: Vec<String>,
     pub private_files: usize,
 }
@@ -285,7 +285,9 @@ pub fn sanitize_snapshot(
         }
         if name.to_bytes().eq_ignore_ascii_case(GIT_ENTRY.as_bytes()) {
             quarantine_entry(parent, name, quarantine, path.components().count())?;
-            relocated.metadata.push(path.to_string_lossy().into_owned());
+            relocated
+                .git_metadata
+                .push(path.to_string_lossy().into_owned());
             return Ok(Visit::Skip);
         }
         let kind = FileType::from_raw_mode(metadata.st_mode);
@@ -404,7 +406,7 @@ mod tests {
         assert_eq!(
             sanitize_snapshot(&snapshot, &quarantine, &git)
                 .unwrap()
-                .metadata,
+                .git_metadata,
             [format!("nested/{name}")]
         );
         assert_eq!(
@@ -415,7 +417,7 @@ mod tests {
         assert!(
             sanitize_snapshot(&snapshot, &quarantine, &git)
                 .unwrap()
-                .metadata
+                .git_metadata
                 .is_empty()
         );
         assert_eq!(fs::read_dir(&quarantine).unwrap().count(), 1);
@@ -438,7 +440,7 @@ mod tests {
         assert!(
             sanitize_snapshot(&snapshot, &quarantine, &git)
                 .unwrap()
-                .metadata
+                .git_metadata
                 .is_empty()
         );
         assert_eq!(fs::read_to_string(&target).unwrap(), pointer);

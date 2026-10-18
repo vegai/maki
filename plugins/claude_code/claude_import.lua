@@ -131,10 +131,10 @@ end
 local function select_changes(manifest, paths)
   local by_path = {}
   for _, change in ipairs(manifest.changes) do
-    by_path[path_utils.printable(change.path)] = change
+    by_path[change.path] = change
   end
   for _, change in ipairs(manifest.changes) do
-    by_path[change.path] = change
+    by_path[path_utils.printable(change.path)] = change
   end
   local selected = manifest.changes
   if paths then

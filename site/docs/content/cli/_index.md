@@ -74,7 +74,7 @@ Maki retains qualified MCP names even if their tools have not loaded yet. An all
 
 Allow lists apply to built-in, plugin and MCP tools. Session-local tools, such as a task's `structured_output` and ACP client tools, remain available under an allow list. Deny lists and audience limits still apply to these local tools.
 
-Migration: allow lists previously left MCP tools reachable. They now apply to MCP tools too. For example, `--allowed-tools read,grep` excludes every MCP tool. Add each required MCP name, such as `github.search_code` or `github__search_code`. Include `tool_search` to keep MCP deferral active. Excluding `tool_search` loads the permitted MCP tools directly.
+For example, `--allowed-tools read,grep` excludes every MCP tool. Add each required MCP name, such as `github.search_code` or `github__search_code`. Include `tool_search` to keep MCP deferral active. Excluding `tool_search` loads the permitted MCP tools directly.
 
 ### Permission modes (SDK)
 

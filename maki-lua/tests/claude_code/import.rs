@@ -75,6 +75,9 @@ local changes = ({
   mode_only = {
     { path = [==[@PATH@]==], status = "M", old_sha = "@OLD@", new_sha = "@OLD@", old_mode = "100644", new_mode = "100755" },
   },
+  mode_cleared = {
+    { path = [==[@PATH@]==], status = "M", old_sha = "@OLD@", new_sha = "@OLD@", old_mode = "100755", new_mode = "100644" },
+  },
 })["@CHANGES@"]
 maki.fs.write("@OUT@", import_scripts.import_script(changes, "@PROJECT@", "@GIT@", "@ARTIFACT@", "@STAGE@"))
 maki.fs.write("@LEFTOVERS@", import_scripts.leftovers_script(changes, "@PROJECT@", "@STAGE@", { [==[@MADE@]==] }))
@@ -83,6 +86,7 @@ maki.fs.write("@REVIEW@", git_utils.diff_command({ git = "@GIT@", snapshot = "@P
 /// The changes an import applies, by their name in `GENERATE`.
 const EDIT_AND_ADD: &str = "edit_and_add";
 const MODE_ONLY: &str = "mode_only";
+const MODE_CLEARED: &str = "mode_cleared";
 const TARGET: &str = "src/lib.rs";
 const ADDED: &str = "src/new/added.rs";
 /// Names that survive only with proper shell quoting: a quote, a command
@@ -387,6 +391,27 @@ fn a_mode_change_lands_with_the_same_bytes() {
     assert_eq!(fs::read_to_string(import.target()).unwrap(), ORIGINAL);
     let mode = fs::metadata(import.target()).unwrap().permissions().mode();
     assert_ne!(mode & OWNER_EXECUTE, 0, "mode {mode:o}");
+}
+
+#[test_case(0o755, "022" ; "public_execute_default_umask")]
+#[test_case(0o755, "027" ; "public_execute_restricted_umask")]
+#[test_case(0o755, "077" ; "public_execute_private_umask")]
+#[test_case(0o750, "077" ; "group_execute_private_umask")]
+fn an_import_clears_execute_bits_regardless_of_umask(mode: u32, umask: &str) {
+    const EXECUTE_BITS: u32 = 0o111;
+    let import = Import::with(STAGING, MODE_CLEARED, TARGET, ADDED);
+    fs::set_permissions(import.target(), fs::Permissions::from_mode(mode)).unwrap();
+    let output = import.run(&format!("umask {umask}\n{}", import.script));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read_to_string(import.target()).unwrap(), ORIGINAL);
+    assert_eq!(
+        fs::metadata(import.target()).unwrap().permissions().mode() & PERMISSION_BITS,
+        mode & !EXECUTE_BITS,
+    );
 }
 
 #[test_case(PRIVATE_MODE ; "owner_only")]

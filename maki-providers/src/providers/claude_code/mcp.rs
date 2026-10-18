@@ -86,6 +86,7 @@ struct Shared {
     read_limit: Duration,
     authenticated_slots: Arc<Semaphore>,
     overloaded: AtomicBool,
+    invalid_notification: AtomicBool,
 }
 
 impl Shared {
@@ -103,6 +104,7 @@ impl Shared {
             read_limit,
             authenticated_slots: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             overloaded: AtomicBool::new(false),
+            invalid_notification: AtomicBool::new(false),
         }
     }
 }
@@ -414,7 +416,7 @@ fn answer(shared: &Shared, body: &[u8]) -> Reply {
         // A call sent as a notification expects no answer, so Claude Code
         // would continue without maki's result, and the call stops the
         // request.
-        if method == TOOLS_CALL {
+        if method == TOOLS_CALL && !shared.invalid_notification.swap(true, Ordering::Relaxed) {
             let _ = shared.handoffs.send(Handoff::Invalid(Error::NoCallId));
         }
         return plain(ACCEPTED);
@@ -522,8 +524,8 @@ mod tests {
         ACCEPTED, BAD_REQUEST, CONTENT_TOO_LARGE, ENDPOINT, HEADERS_TOO_LARGE, Handoff, INITIALIZE,
         LENGTH_REQUIRED, MAX_BODY_BYTES, MAX_CONNECTIONS, MAX_HEAD_BYTES, MAX_UNAUTHENTICATED,
         METHOD_NOT_ALLOWED, METHOD_NOT_FOUND, McpTool, NOT_FOUND, OK, PING, PROTOCOL_VERSIONS,
-        Server, Shared, TOOL_USE_ID_META, TOOLS_CALL, TOOLS_LIST, UNAUTHORIZED, UNAVAILABLE,
-        accept_loop, serve,
+        Reply, Server, Shared, TOOL_USE_ID_META, TOOLS_CALL, TOOLS_LIST, UNAUTHORIZED, UNAVAILABLE,
+        accept_loop, answer, serve,
     };
 
     const TOKEN: &str = "secret-token";
@@ -880,6 +882,28 @@ mod tests {
         let call = json!({ "jsonrpc": "2.0", "method": TOOLS_CALL, "params": { "name": TOOL, "arguments": {} } });
         let (reply, handoffs) = reply_to(&post(&call, TOKEN));
         assert!(reply.contains(ACCEPTED), "{reply}");
+        assert!(
+            matches!(handoffs.as_slice(), [Handoff::Invalid(Error::NoCallId)]),
+            "{handoffs:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_call_notifications_queue_only_one_failure() {
+        const NOTIFICATIONS: usize = 128;
+        let (sender, handoffs) = flume::unbounded();
+        let shared = Shared::new(TOKEN.into(), tools(), sender, WAIT);
+        let call = serde_json::to_vec(&json!({ "jsonrpc": "2.0", "method": TOOLS_CALL, "params": { "name": TOOL, "arguments": {} } })).unwrap();
+        for _ in 0..NOTIFICATIONS {
+            assert!(matches!(
+                answer(&shared, &call),
+                Reply::Send {
+                    status: ACCEPTED,
+                    ..
+                }
+            ));
+        }
+        let handoffs: Vec<_> = handoffs.try_iter().collect();
         assert!(
             matches!(handoffs.as_slice(), [Handoff::Invalid(Error::NoCallId)]),
             "{handoffs:?}"

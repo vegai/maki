@@ -1,5 +1,3 @@
-#[cfg(test)]
-use maki_providers::provider::ModelListing;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -1159,7 +1157,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use maki_config::ProjectConfig;
-    use maki_providers::provider::{BoxFuture, Provider, RequestScope};
+    use maki_providers::provider::{BoxFuture, ModelListing, Provider, RequestScope};
     use maki_providers::{
         ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
         StreamResponse, ThinkingSupport, TokenUsage,

@@ -1196,18 +1196,6 @@ impl PluginProvider {
     }
 }
 
-impl PluginProvider {
-    fn list_models_with(
-        &self,
-        listing: ModelListing,
-    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async move {
-            let result = self.models(listing).await;
-            self.mapped(result).await
-        })
-    }
-}
-
 #[warn(clippy::missing_trait_methods)]
 impl Provider for PluginProvider {
     fn stream_message<'a>(
@@ -1293,7 +1281,10 @@ impl Provider for PluginProvider {
         &self,
         listing: ModelListing,
     ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        self.list_models_with(listing)
+        Box::pin(async move {
+            let result = self.models(listing).await;
+            self.mapped(result).await
+        })
     }
 
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {

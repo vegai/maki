@@ -386,8 +386,8 @@ const SUBAGENT_TASK_ID: &str = "toolu_sub";
 
 /// A subagent shares the parent's session id, so the task id is what a
 /// plugin keys per-chat state on.
-#[test_case::test_case(None, "task:main" ; "session_owner")]
-#[test_case::test_case(Some(SUBAGENT_TASK_ID), "task:toolu_sub" ; "subagent")]
+#[test_case(None, "task:main" ; "session_owner")]
+#[test_case(Some(SUBAGENT_TASK_ID), "task:toolu_sub" ; "subagent")]
 fn ctx_task_id_names_the_calling_chat(task_id: Option<&str>, expected: &str) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -519,10 +519,10 @@ fn load_package_with(
 /// permission the named tool exposes and that tool is one the permission
 /// manager would ever consult. When it does not survive it costs the rule and
 /// not the plugin: the call simply prompts as it would have without it.
-#[test_case::test_case(EDIT_TOOL_SRC, true => 1 ; "granted_plugin_pre_approves_a_checked_tool")]
-#[test_case::test_case(EDIT_TOOL_SRC, false => 0 ; "plugin_granted_nothing_pre_approves_nothing")]
-#[test_case::test_case(NO_RULE_SRC, true => 0 ; "no_such_tool_is_registered")]
-#[test_case::test_case(UNCHECKED_EDIT_TOOL_SRC, true => 0 ; "tool_is_never_permission_checked")]
+#[test_case(EDIT_TOOL_SRC, true => 1 ; "granted_plugin_pre_approves_a_checked_tool")]
+#[test_case(EDIT_TOOL_SRC, false => 0 ; "plugin_granted_nothing_pre_approves_nothing")]
+#[test_case(NO_RULE_SRC, true => 0 ; "no_such_tool_is_registered")]
+#[test_case(UNCHECKED_EDIT_TOOL_SRC, true => 0 ; "tool_is_never_permission_checked")]
 fn allow_rule_survives_only_when_delegated(owner_src: &str, granted: bool) -> usize {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -588,18 +588,18 @@ fn permission_rule_can_name_a_tool_the_same_plugin_registers() {
     assert_eq!(host.plugin_rules().snapshot().len(), 1);
 }
 
-#[test_case::test_case(r#"{ tool = "srv.tool", scope = "/x/**" }"#, "only native tools are allowed" ; "mcp_tool")]
-#[test_case::test_case(r#"{ tool = "mcp:srv", scope = "/x/**" }"#, "invalid tool name" ; "invalid_tool_chars")]
-#[test_case::test_case(r#"{ tool = "*", scope = "/x/**" }"#, "only native tools are allowed" ; "wildcard_tool")]
-#[test_case::test_case(r#"{ scope = "/x/**" }"#, "'tool' must be a native tool name string" ; "missing_tool")]
-#[test_case::test_case(r#"{ tool = "edit" }"#, "'scope' must be a string" ; "missing_scope")]
-#[test_case::test_case(r#"{ tool = "edit", scope = "" }"#, "'scope' must be non-empty" ; "empty_scope")]
-#[test_case::test_case(r#"{ tool = "edit", scope = "/x/**", effect = "maybe" }"#, "invalid effect 'maybe'" ; "bad_effect")]
-#[test_case::test_case(r#"{ tool = "edit", scope = "/x/**", bogus = 1 }"#, "unknown key 'bogus'" ; "unknown_key")]
-#[test_case::test_case(r#"{ tool = "edit", scope = "*" }"#, "matches every scope" ; "star_scope")]
-#[test_case::test_case(r#"{ tool = "edit", scope = "**" }"#, "matches every scope" ; "double_star_scope")]
-#[test_case::test_case(r#"{ tool = "edit", scope = "/*" }"#, "matches every scope" ; "root_star_scope")]
-#[test_case::test_case(r#"{ tool = "edit", scope = "/**" }"#, "matches every scope" ; "root_double_star_scope")]
+#[test_case(r#"{ tool = "srv.tool", scope = "/x/**" }"#, "only native tools are allowed" ; "mcp_tool")]
+#[test_case(r#"{ tool = "mcp:srv", scope = "/x/**" }"#, "invalid tool name" ; "invalid_tool_chars")]
+#[test_case(r#"{ tool = "*", scope = "/x/**" }"#, "only native tools are allowed" ; "wildcard_tool")]
+#[test_case(r#"{ scope = "/x/**" }"#, "'tool' must be a native tool name string" ; "missing_tool")]
+#[test_case(r#"{ tool = "edit" }"#, "'scope' must be a string" ; "missing_scope")]
+#[test_case(r#"{ tool = "edit", scope = "" }"#, "'scope' must be non-empty" ; "empty_scope")]
+#[test_case(r#"{ tool = "edit", scope = "/x/**", effect = "maybe" }"#, "invalid effect 'maybe'" ; "bad_effect")]
+#[test_case(r#"{ tool = "edit", scope = "/x/**", bogus = 1 }"#, "unknown key 'bogus'" ; "unknown_key")]
+#[test_case(r#"{ tool = "edit", scope = "*" }"#, "matches every scope" ; "star_scope")]
+#[test_case(r#"{ tool = "edit", scope = "**" }"#, "matches every scope" ; "double_star_scope")]
+#[test_case(r#"{ tool = "edit", scope = "/*" }"#, "matches every scope" ; "root_star_scope")]
+#[test_case(r#"{ tool = "edit", scope = "/**" }"#, "matches every scope" ; "root_double_star_scope")]
 fn permission_rule_validation_rejects(spec: &str, expected_err: &str) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -613,20 +613,20 @@ fn permission_rule_validation_rejects(spec: &str, expected_err: &str) {
     assert!(err.to_string().contains(expected_err), "got: {err}");
 }
 
-#[test_case::test_case(BAD_NAME_SRC, MINIMAL_SCHEMA, "invalid name" ; "invalid_tool_name")]
-#[test_case::test_case(EMPTY_DESC_SRC, MINIMAL_SCHEMA, "description must be non-empty" ; "empty_description")]
-#[test_case::test_case(EMPTY_AUD_SRC, MINIMAL_SCHEMA, "audiences" ; "empty_audiences")]
-#[test_case::test_case(UNKNOWN_AUD_SRC, MINIMAL_SCHEMA, "unknown audience" ; "unknown_audience")]
-#[test_case::test_case(STRING_EXAMPLES_SRC, MINIMAL_SCHEMA, "'examples' must be a table" ; "string_examples")]
-#[test_case::test_case(TIMEOUT_FIELD_NOT_IN_SCHEMA_SRC, MINIMAL_SCHEMA, "not type 'integer'" ; "timeout_field_not_in_schema")]
-#[test_case::test_case(SCOPE_MISSING_FIELD_SRC, STRING_FIELD_SCHEMA, INVALID_PERMISSION_SCOPE_ERR ; "permission_scopes_missing_field")]
-#[test_case::test_case(SCOPE_NON_STRING_FIELD_SRC, NON_STRING_FIELD_SCHEMA, INVALID_PERMISSION_SCOPE_ERR ; "permission_scopes_non_string_field")]
-#[test_case::test_case(OLD_SCOPE_KEY_SRC, MINIMAL_SCHEMA, "'permission_scope' was removed" ; "old_permission_scope_key")]
-#[test_case::test_case(WRONG_TYPE_SCOPES_SRC, MINIMAL_SCHEMA, "'permission_scopes' must be a string field name or a function" ; "permission_scopes_wrong_type")]
-#[test_case::test_case(SCOPES_WITHOUT_PERMISSION_SRC, STRING_FIELD_SCHEMA, "must declare 'permission'" ; "scopes_without_permission")]
-#[test_case::test_case(PERMISSION_WITHOUT_SCOPES_SRC, STRING_FIELD_SCHEMA, "needs 'permission_scopes'" ; "permission_without_scopes")]
-#[test_case::test_case(UNKNOWN_PERMISSION_SRC, STRING_FIELD_SCHEMA, "unknown permission 'filesystem'" ; "unknown_permission")]
-#[test_case::test_case(FS_WRITE_WITHOUT_MUTABLE_PATH_SRC, STRING_FIELD_SCHEMA, "no 'mutable_path'" ; "fs_write_without_mutable_path")]
+#[test_case(BAD_NAME_SRC, MINIMAL_SCHEMA, "invalid name" ; "invalid_tool_name")]
+#[test_case(EMPTY_DESC_SRC, MINIMAL_SCHEMA, "description must be non-empty" ; "empty_description")]
+#[test_case(EMPTY_AUD_SRC, MINIMAL_SCHEMA, "audiences" ; "empty_audiences")]
+#[test_case(UNKNOWN_AUD_SRC, MINIMAL_SCHEMA, "unknown audience" ; "unknown_audience")]
+#[test_case(STRING_EXAMPLES_SRC, MINIMAL_SCHEMA, "'examples' must be a table" ; "string_examples")]
+#[test_case(TIMEOUT_FIELD_NOT_IN_SCHEMA_SRC, MINIMAL_SCHEMA, "not type 'integer'" ; "timeout_field_not_in_schema")]
+#[test_case(SCOPE_MISSING_FIELD_SRC, STRING_FIELD_SCHEMA, INVALID_PERMISSION_SCOPE_ERR ; "permission_scopes_missing_field")]
+#[test_case(SCOPE_NON_STRING_FIELD_SRC, NON_STRING_FIELD_SCHEMA, INVALID_PERMISSION_SCOPE_ERR ; "permission_scopes_non_string_field")]
+#[test_case(OLD_SCOPE_KEY_SRC, MINIMAL_SCHEMA, "'permission_scope' was removed" ; "old_permission_scope_key")]
+#[test_case(WRONG_TYPE_SCOPES_SRC, MINIMAL_SCHEMA, "'permission_scopes' must be a string field name or a function" ; "permission_scopes_wrong_type")]
+#[test_case(SCOPES_WITHOUT_PERMISSION_SRC, STRING_FIELD_SCHEMA, "must declare 'permission'" ; "scopes_without_permission")]
+#[test_case(PERMISSION_WITHOUT_SCOPES_SRC, STRING_FIELD_SCHEMA, "needs 'permission_scopes'" ; "permission_without_scopes")]
+#[test_case(UNKNOWN_PERMISSION_SRC, STRING_FIELD_SCHEMA, "unknown permission 'filesystem'" ; "unknown_permission")]
+#[test_case(FS_WRITE_WITHOUT_MUTABLE_PATH_SRC, STRING_FIELD_SCHEMA, "no 'mutable_path'" ; "fs_write_without_mutable_path")]
 fn registration_validation_rejects(fields: &str, schema: &str, expected_err: &str) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -821,8 +821,8 @@ fn restore_snapshot_text(
     text
 }
 
-#[test_case::test_case(true, "n=3 tag=hi" ; "state_present")]
-#[test_case::test_case(false, "no state" ; "state_absent_falls_back")]
+#[test_case(true, "n=3 tag=hi" ; "state_present")]
+#[test_case(false, "no state" ; "state_absent_falls_back")]
 fn restore_reads_persisted_state(with_state: bool, expected: &str) {
     let state = with_state.then(|| serde_json::json!({ "n": 3, "tag": "hi" }));
     let src = format!(
@@ -995,8 +995,8 @@ fn resolve_model_spec_takes_precedence_over_tier() {
 /// landed in the global spawn queue, which runs after the snapshot is
 /// taken. The runtime must run them inline, after the restore fn and after
 /// each replayed click.
-#[test_case::test_case(Vec::new(), "restore async line" ; "restore_async_task_runs_inline")]
-#[test_case::test_case(vec![0], "click async line" ; "click_replay_async_task_runs_inline")]
+#[test_case(Vec::new(), "restore async line" ; "restore_async_task_runs_inline")]
+#[test_case(vec![0], "click async line" ; "click_replay_async_task_runs_inline")]
 fn restore_snapshot_contains_async_run_content(clicks: Vec<usize>, expected: &str) {
     let src = format!(
         r#"maki.api.register_tool({{
@@ -1309,8 +1309,8 @@ fn incompatible_plugin_warns_instead_of_aborting_startup() {
 /// An `init.lua` registers tools on the same name-keyed permission model a
 /// package does, and it is the path a plugin under the lua directory is loaded
 /// from, so a name carrying maki's builtin defaults has to be reported here too.
-#[test_case::test_case(PERMISSION_KEYED_TOOL, 1 ; "permission_keyed_name_warns")]
-#[test_case::test_case(PLAIN_TOOL, 0 ; "ordinary_name_is_quiet")]
+#[test_case(PERMISSION_KEYED_TOOL, 1 ; "permission_keyed_name_warns")]
+#[test_case(PLAIN_TOOL, 0 ; "ordinary_name_is_quiet")]
 fn init_file_taking_a_permission_keyed_tool_name_warns(tool: &str, expected: usize) {
     let tmp = tempfile::TempDir::new().unwrap();
     let maki_dir = tmp.path().join(".maki");
@@ -2065,8 +2065,8 @@ fn exec_warm_tool(
 /// A click on a finished tool takes the warm path: it mutates the live
 /// root buf and the fallback restore stays unused. Failed tools stay
 /// warm too, since people click them to see what went wrong.
-#[test_case::test_case(false ; "success")]
-#[test_case::test_case(true ; "error_finish")]
+#[test_case(false ; "success")]
+#[test_case(true ; "error_finish")]
 fn warm_click_reaches_finished_tool(is_error: bool) {
     const WARM_ID: &str = "warm-click-1";
     let (reg, host) = warm_host(is_error, true);
@@ -3045,9 +3045,9 @@ maki.api.register_tool({{
 }
 
 /// A stdin mode, stream or payload a job cannot use is an error.
-#[test_case::test_case(r#"maki.fn.jobstart("true", { stdin = "file" })"#, STDIN_MODE_ERR ; "an_unknown_stdin_mode")]
-#[test_case::test_case(r#"maki.fn.chanclose(1, "stdout")"#, CHANCLOSE_STREAM_ERR ; "closing_stdout")]
-#[test_case::test_case("maki.fn.chansend(1, 42)", CHANSEND_DATA_ERR ; "a_number_to_send")]
+#[test_case(r#"maki.fn.jobstart("true", { stdin = "file" })"#, STDIN_MODE_ERR ; "an_unknown_stdin_mode")]
+#[test_case(r#"maki.fn.chanclose(1, "stdout")"#, CHANCLOSE_STREAM_ERR ; "closing_stdout")]
+#[test_case("maki.fn.chansend(1, 42)", CHANSEND_DATA_ERR ; "a_number_to_send")]
 fn job_input_it_cannot_take_is_refused(call: &str, expected: &str) {
     const TOOL: &str = "job_input";
     let mut perms = maki_lua::PluginPermissions::denied();
@@ -3523,12 +3523,12 @@ fn project_init_can_activate_an_installed_global_package() {
     );
 }
 
-#[test_case::test_case(
+#[test_case(
     r#"maki.setup({ agent = { compaction_buffer = 10000 } })"#,
     maki_config::CompactionBuffer::Tokens(10_000)
     ; "compaction_buffer_tokens"
 )]
-#[test_case::test_case(
+#[test_case(
     r#"maki.setup({ agent = { compaction_buffer = "15%" } })"#,
     maki_config::CompactionBuffer::Percent(15)
     ; "compaction_buffer_percent"
@@ -3543,22 +3543,22 @@ fn setup_compaction_buffer(lua_src: &str, expected: maki_config::CompactionBuffe
     assert_eq!(raw.agent.compaction_buffer, Some(expected));
 }
 
-#[test_case::test_case(
+#[test_case(
     "maki.setup({ ui = { splash_animaton = false } })",
     UNKNOWN_FIELD_ERR
     ; "unknown_field"
 )]
-#[test_case::test_case(
+#[test_case(
     r#"maki.setup({ agent = { max_output_lines = "not a number" } })"#,
     ""
     ; "wrong_type"
 )]
-#[test_case::test_case(
+#[test_case(
     "maki.setup({ agent = { bash_timeout_secs = 120 } })",
     UNKNOWN_FIELD_ERR
     ; "moved_plugin_option"
 )]
-#[test_case::test_case(
+#[test_case(
     r#"maki.setup({ provider = { allowed_models = "anthropic/*" } })"#,
     ""
     ; "model_policy_wrong_type"
@@ -3731,12 +3731,12 @@ fn json_obj(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> 
     v.as_object().expect("test opts must be an object").clone()
 }
 
-#[test_case::test_case(
+#[test_case(
     serde_json::json!({}),
     serde_json::json!(120), serde_json::Value::Null
     ; "defaults_without_user_opts"
 )]
-#[test_case::test_case(
+#[test_case(
     serde_json::json!({ "timeout_secs": 30, "label": "x" }),
     serde_json::json!(30), serde_json::json!("x")
     ; "user_opts_win"
@@ -3756,10 +3756,10 @@ fn register_options_merges(
     assert_eq!(snap["label"], label);
 }
 
-#[test_case::test_case(serde_json::json!({ "typo": 1 }), UNKNOWN_OPTION_ERR ; "unknown_key")]
-#[test_case::test_case(serde_json::json!({ "timeout_secs": "abc" }), OPTION_TYPE_ERR ; "wrong_type")]
-#[test_case::test_case(serde_json::json!({ "timeout_secs": 12.5 }), OPTION_TYPE_ERR ; "float_for_integer")]
-#[test_case::test_case(serde_json::json!({ "timeout_secs": 1 }), OPTION_MIN_ERR ; "below_min")]
+#[test_case(serde_json::json!({ "typo": 1 }), UNKNOWN_OPTION_ERR ; "unknown_key")]
+#[test_case(serde_json::json!({ "timeout_secs": "abc" }), OPTION_TYPE_ERR ; "wrong_type")]
+#[test_case(serde_json::json!({ "timeout_secs": 12.5 }), OPTION_TYPE_ERR ; "float_for_integer")]
+#[test_case(serde_json::json!({ "timeout_secs": 1 }), OPTION_MIN_ERR ; "below_min")]
 fn register_options_rejects_bad_user_opts(opts: serde_json::Value, expected: &str) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -3769,42 +3769,42 @@ fn register_options_rejects_bad_user_opts(opts: serde_json::Value, expected: &st
     assert!(err.to_string().contains(expected), "got: {err}");
 }
 
-#[test_case::test_case(
+#[test_case(
     r#"maki.api.register_options({ timeout_secs = { default = 120 } })"#,
     OPTION_DESC_ERR
     ; "missing_desc"
 )]
-#[test_case::test_case(
+#[test_case(
     r#"maki.api.register_options({ bare = { desc = "no type or default" } })"#,
     OPTION_NO_TYPE_ERR
     ; "missing_type_and_default"
 )]
-#[test_case::test_case(
+#[test_case(
     r#"maki.api.register_options({ timeout_secs = { default = 120, mins = 5, desc = "T." } })"#,
     OPTION_SPEC_KEY_ERR
     ; "unknown_spec_key"
 )]
-#[test_case::test_case(
+#[test_case(
     r#"maki.api.register_options({ timeout_secs = { type = "string", default = 120, desc = "T." } })"#,
     OPTION_DEFAULT_TYPE_ERR
     ; "default_contradicts_type"
 )]
-#[test_case::test_case(
+#[test_case(
     r#"maki.api.register_options({ timeout_secs = { default = 1, min = 5, desc = "T." } })"#,
     OPTION_DEFAULT_MIN_ERR
     ; "default_below_min"
 )]
-#[test_case::test_case(
+#[test_case(
     r#"maki.api.register_options({ label = { type = "string", min = 1, desc = "L." } })"#,
     OPTION_MIN_ON_STRING_ERR
     ; "min_on_string"
 )]
-#[test_case::test_case(
+#[test_case(
     r#"maki.api.register_options({ enabled = { default = true, desc = "E." } })"#,
     OPTION_RESERVED_ERR
     ; "reserved_enabled"
 )]
-#[test_case::test_case(
+#[test_case(
     r#"
     maki.api.register_options({ a = { default = 1, desc = "A." } })
     maki.api.register_options({ b = { default = 2, desc = "B." } })
@@ -3879,8 +3879,8 @@ fn websearch_config(provider: &str) -> PluginsConfig {
 
 /// The backend the plugin talks to is invisible from Rust, so we read it off
 /// the one thing it leaks: the description the model gets.
-#[test_case::test_case("exa", "Exa AI" ; "default_backend")]
-#[test_case::test_case("youcom", "You.com" ; "opt_in_backend")]
+#[test_case("exa", "Exa AI" ; "default_backend")]
+#[test_case("youcom", "You.com" ; "opt_in_backend")]
 fn websearch_provider_option_selects_the_backend(provider: &str, expected: &str) {
     let (reg, _host) = builtins_host_with(&websearch_config(provider));
     let description = tool_description(&reg, &maki_config::AgentConfig::default(), "websearch");
@@ -3897,12 +3897,12 @@ fn websearch_unknown_provider_fails_the_load() {
     assert!(err.to_string().contains("unknown provider"), "got: {err}");
 }
 
-#[test_case::test_case(
+#[test_case(
     serde_json::json!({}),
     &["edit", "multiedit", "edit_lines"], &["insert_lines"]
     ; "defaults_on_insert_lines_opt_in"
 )]
-#[test_case::test_case(
+#[test_case(
     serde_json::json!({ "multiedit": false, "edit_lines": false, "insert_lines": true }),
     &["edit", "insert_lines"], &["multiedit", "edit_lines"]
     ; "toggles_flip_sub_tools"
@@ -4106,9 +4106,9 @@ fn disabled_plugin_opts_are_ignored_not_rejected() {
     assert!(reg.get("grep").is_some(), "enabled plugin still loads");
 }
 
-#[test_case::test_case("true", AlwaysThinking::Toggle(true) ; "bool")]
-#[test_case::test_case("8192", AlwaysThinking::Budget(8192) ; "number")]
-#[test_case::test_case("\"adaptive\"", AlwaysThinking::Mode("adaptive".into()) ; "string")]
+#[test_case("true", AlwaysThinking::Toggle(true) ; "bool")]
+#[test_case("8192", AlwaysThinking::Budget(8192) ; "number")]
+#[test_case("\"adaptive\"", AlwaysThinking::Mode("adaptive".into()) ; "string")]
 fn setup_always_thinking_variants(lua_val: &str, expected: AlwaysThinking) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -4170,12 +4170,12 @@ fn register_command_happy_path() {
     assert_eq!(snap.commands[0].plugin.as_ref(), "cmd_plugin");
 }
 
-#[test_case::test_case("" => 0 ; "default_zero")]
-#[test_case::test_case("nargs = 0," => 0 ; "zero")]
-#[test_case::test_case("nargs = 1," => 1 ; "one")]
-#[test_case::test_case(r#"nargs = "?","# => 1 ; "zero_or_one")]
-#[test_case::test_case(r#"nargs = "*","# => usize::MAX ; "any")]
-#[test_case::test_case(r#"nargs = "+","# => usize::MAX ; "one_or_more")]
+#[test_case("" => 0 ; "default_zero")]
+#[test_case("nargs = 0," => 0 ; "zero")]
+#[test_case("nargs = 1," => 1 ; "one")]
+#[test_case(r#"nargs = "?","# => 1 ; "zero_or_one")]
+#[test_case(r#"nargs = "*","# => usize::MAX ; "any")]
+#[test_case(r#"nargs = "+","# => usize::MAX ; "one_or_more")]
 fn register_command_nargs_values(nargs_field: &str) -> usize {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -4190,8 +4190,8 @@ fn register_command_nargs_values(nargs_field: &str) -> usize {
     host.command_reader().load().commands[0].max_args
 }
 
-#[test_case::test_case("a  b c", "a  b c|a,b,c" ; "raw_text_and_split_list")]
-#[test_case::test_case("", "|" ; "empty_args")]
+#[test_case("a  b c", "a  b c|a,b,c" ; "raw_text_and_split_list")]
+#[test_case("", "|" ; "empty_args")]
 fn command_handler_receives_args_and_fargs(args: &str, expected_flash: &str) {
     let host = PluginHost::new(fresh_registry()).unwrap();
     host.load_source(
@@ -4223,8 +4223,8 @@ const RUN_COMMAND_NO_ACTION: &str = "run_command did not reach the UI";
 /// command line travels untouched, since the UI is the side that parses it, and
 /// a handler reached at depth 0 asks for depth 1 so a chain of aliases keeps
 /// counting toward the cap.
-#[test_case::test_case(Ok(()), "true|nil" ; "dispatched")]
-#[test_case::test_case(Err("unknown command".into()), "nil|unknown command" ; "rejected")]
+#[test_case(Ok(()), "true|nil" ; "dispatched")]
+#[test_case(Err("unknown command".into()), "nil|unknown command" ; "rejected")]
 fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash: &str) {
     let host = PluginHost::new(fresh_registry()).unwrap();
     host.load_source(
@@ -4262,23 +4262,23 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
         .expect(RUN_COMMAND_NO_ACTION);
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == expected_flash));
 }
-#[test_case::test_case(
+#[test_case(
     r#"maki.api.register_command({ name = "", handler = function() end })"#,
     "non-empty" ; "empty_name"
 )]
-#[test_case::test_case(
+#[test_case(
     r#"maki.api.register_command({ name = "/test", description = "no handler" })"#,
     "handler" ; "missing_handler"
 )]
-#[test_case::test_case(
+#[test_case(
     r#"maki.api.register_command({ name = "/test", nargs = -1, handler = function() end })"#,
     NARGS_ERR ; "negative_nargs"
 )]
-#[test_case::test_case(
+#[test_case(
     r#"maki.api.register_command({ name = "/test", nargs = 2, handler = function() end })"#,
     NARGS_ERR ; "nargs_two"
 )]
-#[test_case::test_case(
+#[test_case(
     r#"maki.api.register_command({ name = "/test", nargs = "!", handler = function() end })"#,
     NARGS_ERR ; "unknown_string_nargs"
 )]
@@ -4537,9 +4537,9 @@ fn site_with_package(sub: &str, name: &str, files: &[(&str, &str)]) -> tempfile:
 /// a name maki's builtin defaults are written for inherits those defaults, and
 /// any "always allow" the user stored for the builtin. The load is allowed, the
 /// user is told, once for the package however many names it took.
-#[test_case::test_case(&[PERMISSION_KEYED_TOOL], 1 ; "permission_keyed_name_warns")]
-#[test_case::test_case(&[PERMISSION_KEYED_TOOL, OTHER_PERMISSION_KEYED_TOOL], 1 ; "two_names_warn_once")]
-#[test_case::test_case(&[PLAIN_TOOL], 0 ; "ordinary_name_is_quiet")]
+#[test_case(&[PERMISSION_KEYED_TOOL], 1 ; "permission_keyed_name_warns")]
+#[test_case(&[PERMISSION_KEYED_TOOL, OTHER_PERMISSION_KEYED_TOOL], 1 ; "two_names_warn_once")]
+#[test_case(&[PLAIN_TOOL], 0 ; "ordinary_name_is_quiet")]
 fn package_taking_a_permission_keyed_tool_name_warns(tools: &[&str], expected: usize) {
     let source = tools
         .iter()
@@ -5137,8 +5137,8 @@ fn malformed_floor() -> (String, String) {
 /// The version floor covers installed packages, not just `init.lua`: a package
 /// asking for a newer Maki is skipped with a warning, registers nothing, and
 /// leaves the packages loading beside it alone.
-#[test_case::test_case(floor_above_running_version ; "required version is newer")]
-#[test_case::test_case(malformed_floor ; "required version is not a string")]
+#[test_case(floor_above_running_version ; "required version is newer")]
+#[test_case(malformed_floor ; "required version is not a string")]
 fn incompatible_package_is_skipped_and_its_sibling_still_loads(floor: fn() -> (String, String)) {
     let (manifest, expected) = floor();
     let site = site_with_package(
@@ -5453,14 +5453,14 @@ fn restore_tool_async_ordering_and_delivery() {
     );
 }
 
-#[test_case::test_case(
+#[test_case(
     "write",
     serde_json::json!({"path": "/tmp/x.md", "content": "alpha\nbeta"}),
     "wrote 10 bytes to /tmp/x.md",
     &["alpha", "beta"]
     ; "write_tool_restores_file_content"
 )]
-#[test_case::test_case(
+#[test_case(
     "memory",
     serde_json::json!({"command": "write", "path": "n.md", "content": "gamma"}),
     "wrote n.md (1 lines)",
@@ -5522,8 +5522,8 @@ fn restore_rebuilds_body_from_input_content(
 /// Guards the stale-cancelled-handle bug: `permission_scopes` must call
 /// the plugin callback and return parsed scopes, not fall back to raw JSON.
 /// A leaked `{"command":...}` scope would break allow rules.
-#[test_case::test_case("git status" ; "parseable command")]
-#[test_case::test_case("echo 'unterminated" ; "unparseable command")]
+#[test_case("git status" ; "parseable command")]
+#[test_case("echo 'unterminated" ; "unparseable command")]
 fn bash_permission_scopes_never_falls_back_to_json(command: &str) {
     let (reg, _host) = builtins_host();
 
@@ -5544,22 +5544,22 @@ fn bash_permission_scopes_never_falls_back_to_json(command: &str) {
 /// covers commands nobody approved. The redirect case is the one that used to
 /// slip: tree-sitter hangs a trailing `2>&1` off the whole chain, so the chain
 /// arrived as a single scope starting with `cd `, and a `cd *` rule took it.
-#[test_case::test_case(
+#[test_case(
     "cd /tmp && cargo check 2>&1 | tail -3",
     &["cd /tmp", "cargo check 2>&1", "tail -3"]
     ; "chain_with_redirect_and_pipe"
 )]
-#[test_case::test_case(
+#[test_case(
     "ls\n# a note\npwd",
     &["ls", "pwd"]
     ; "comments_are_not_scopes"
 )]
-#[test_case::test_case(
+#[test_case(
     "if [ -f x ]; then rm x; fi",
     &["if [ -f x ]; then rm x; fi"]
     ; "block_stays_one_scope"
 )]
-#[test_case::test_case(
+#[test_case(
     "cd /tmp && > log",
     &["cd /tmp", "> log"]
     ; "bodiless_redirect_is_its_own_scope"
@@ -5602,63 +5602,63 @@ fn perm_tool_src(name: &str, handler_body: &str) -> String {
     )
 }
 
-#[test_case::test_case(
+#[test_case(
     "read_deny",
     r#"local ok, err = pcall(function() maki.fs.read("/etc/hostname") end)
                 return tostring(err)"#,
     "fs_read"
     ; "fs_read_denied"
 )]
-#[test_case::test_case(
+#[test_case(
     "write_deny",
     r#"local ok, err = pcall(function() maki.fs.write("/tmp/test", "x") end)
                 return tostring(err)"#,
     "fs_write"
     ; "fs_write_denied"
 )]
-#[test_case::test_case(
+#[test_case(
     "run_deny",
     r#"local ok, err = pcall(function() maki.fn.jobstart("echo hi") end)
                 return tostring(err)"#,
     "run"
     ; "run_denied"
 )]
-#[test_case::test_case(
+#[test_case(
     "agent_deny",
     r#"local ok, err = pcall(function() maki.agent.session({ session = "x" }) end)
                 return tostring(err)"#,
     "agent"
     ; "agent_denied"
 )]
-#[test_case::test_case(
+#[test_case(
     "prompt_deny",
     r#"local ok, err = pcall(function() maki.session.prompt("go") end)
                 return tostring(err)"#,
     "agent"
     ; "agent_denied_for_session_prompt"
 )]
-#[test_case::test_case(
+#[test_case(
     "wake_deny",
     r#"local ok, err = pcall(function() maki.session.notify("ci red", { session = "x", wake = true }) end)
                 return tostring(err)"#,
     "agent"
     ; "agent_denied_for_a_waking_notify"
 )]
-#[test_case::test_case(
+#[test_case(
     "new_prompt_deny",
     r#"local ok, err = pcall(function() maki.session.new({ prompt = "go" }) end)
                 return tostring(err)"#,
     "agent"
     ; "agent_denied_for_new_with_a_prompt"
 )]
-#[test_case::test_case(
+#[test_case(
     "chansend_deny",
     r#"local ok, err = pcall(function() maki.fn.chansend(1, "x") end)
                 return tostring(err)"#,
     "run"
     ; "chansend_denied"
 )]
-#[test_case::test_case(
+#[test_case(
     "chanclose_deny",
     r#"local ok, err = pcall(function() maki.fn.chanclose(1) end)
                 return tostring(err)"#,
@@ -5716,10 +5716,10 @@ fn user_plugin_with_fs_read_can_read_but_not_write() {
 /// session's directory, or read the instruction files there. They reveal
 /// file locations or contents rather than the environment, so they need
 /// `fs_read`, and `env` stays reserved for the process environment.
-#[test_case::test_case("maki.env.state_dir()" ; "state_dir")]
-#[test_case::test_case(r#"maki.fn.executable("ls")"# ; "executable")]
-#[test_case::test_case("ctx:cwd()" ; "session_dir")]
-#[test_case::test_case("ctx:instructions()" ; "session_instructions")]
+#[test_case("maki.env.state_dir()" ; "state_dir")]
+#[test_case(r#"maki.fn.executable("ls")"# ; "executable")]
+#[test_case("ctx:cwd()" ; "session_dir")]
+#[test_case("ctx:instructions()" ; "session_instructions")]
 fn location_queries_cost_fs_read(call: &str) {
     const TOOL: &str = "location_test";
     let src = perm_tool_src(
@@ -5752,8 +5752,8 @@ const PATH_FIELD_SCHEMA: &str = r#"{
     required = { "path" },
 }"#;
 
-#[test_case::test_case(STRING_FIELD_SCHEMA, "nonexistent" ; "missing_field")]
-#[test_case::test_case(NON_STRING_FIELD_SCHEMA, "count" ; "non_string_field")]
+#[test_case(STRING_FIELD_SCHEMA, "nonexistent" ; "missing_field")]
+#[test_case(NON_STRING_FIELD_SCHEMA, "count" ; "non_string_field")]
 fn mutable_path_invalid_rejected(schema: &str, scope_field: &str) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -6028,7 +6028,7 @@ fn start_annotation_count_happy_path() {
     assert_eq!(inv.start_annotation(), Some("3 edits".to_owned()));
 }
 
-#[test_case::test_case(START_ANNOTATION_COUNT_NON_ARRAY_SRC, STRING_NAME_SCHEMA, "not in schema properties or not type 'array'" ; "start_annotation_count_non_array")]
+#[test_case(START_ANNOTATION_COUNT_NON_ARRAY_SRC, STRING_NAME_SCHEMA, "not in schema properties or not type 'array'" ; "start_annotation_count_non_array")]
 fn registration_with_schema_rejects(fields: &str, schema: &str, expected_err: &str) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -6252,9 +6252,9 @@ fn session_close_idempotent_and_prompt_after_close_errors() {
     assert_eq!(out, SESSION_CLOSED_ERR);
 }
 
-#[test_case::test_case("{ audience = 'wurkflow' }", "unknown audience: wurkflow" ; "unknown_audience")]
-#[test_case::test_case("{ local_tools = { foo = { handler = function() return '' end } } }", "local_tools.foo: 'description' is required" ; "local_tool_missing_description")]
-#[test_case::test_case("{ local_tools = { foo = { description = 'd' } } }", "local_tools.foo: 'handler' is required" ; "local_tool_missing_handler")]
+#[test_case("{ audience = 'wurkflow' }", "unknown audience: wurkflow" ; "unknown_audience")]
+#[test_case("{ local_tools = { foo = { handler = function() return '' end } } }", "local_tools.foo: 'description' is required" ; "local_tool_missing_description")]
+#[test_case("{ local_tools = { foo = { description = 'd' } } }", "local_tools.foo: 'handler' is required" ; "local_tool_missing_handler")]
 fn session_opts_validation_rejects(opts: &str, expected: &str) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -6913,13 +6913,13 @@ maki.api.register_tool({{
 /// A key compared inside Lua is one the host never parses, so the source lint
 /// is the only thing that can catch it, and it has to work through a real load.
 // The `legacy_spelling` case goes away with `key_lint::legacy`.
-#[test_case::test_case(
+#[test_case(
     r#"local function on_key(ev) return ev.key == "ctrl+n" end
 return on_key"#,
     "<C-n>" ;
     "legacy_spelling"
 )]
-#[test_case::test_case(
+#[test_case(
     r#"local function on_key(ev) return ev.key == "<Escc>" end
 return on_key"#,
     "<Esc>" ;
@@ -7127,8 +7127,8 @@ end)
 /// maki stays responsive only because the runs it queues are detached and
 /// the loop yields. The work runs off the test thread, so a host that stops
 /// answering fails the test instead of hanging it.
-#[test_case::test_case(SPAWN_QUEUER ; "queueing_parked_runs")]
-#[test_case::test_case(SPAWN_SPINNER ; "spinning_on_sleep_zero")]
+#[test_case(SPAWN_QUEUER ; "queueing_parked_runs")]
+#[test_case(SPAWN_SPINNER ; "spinning_on_sleep_zero")]
 fn a_spawned_loop_never_blocks_calls_loads_or_unloads(subject: &'static str) {
     let (reg, host) = spawn_host();
     host.load_source(SPAWN_SUBJECT_PLUGIN, subject).unwrap();
@@ -7147,8 +7147,8 @@ fn a_spawned_loop_never_blocks_calls_loads_or_unloads(subject: &'static str) {
 /// An unloaded plugin's `on_cancel` hook still runs, and a task it spawned
 /// would never end. A reload right after the unload lifts the cancel mark,
 /// so it must not beat the old instance's hook.
-#[test_case::test_case(false ; "unload")]
-#[test_case::test_case(true ; "unload_then_reload")]
+#[test_case(false ; "unload")]
+#[test_case(true ; "unload_then_reload")]
 fn an_on_cancel_hook_of_an_unloaded_spawn_cannot_spawn_again(reload: bool) {
     let (reg, host) = spawn_host();
     host.load_source(SPAWN_SUBJECT_PLUGIN, SPAWN_HOOK_RESPAWNER)
@@ -8090,8 +8090,8 @@ fn background_session_is_listed_until_its_chat_session_ends() {
 /// Opened straight from a tool handler, so the opening task is the tool
 /// call. The monitor source is loaded a second time under another name, so
 /// its list tool survives the opener's unload.
-#[test_case::test_case("task", false ; "task_scope_ends_with_the_handler")]
-#[test_case::test_case("session", true ; "session_scope_outlives_the_handler")]
+#[test_case("task", false ; "task_scope_ends_with_the_handler")]
+#[test_case("session", true ; "session_scope_outlives_the_handler")]
 fn background_session_scope_decides_what_ends_it(scope: &str, outlives_handler: bool) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -8161,11 +8161,11 @@ fn reach_probe_host(session_args: &str) -> (Arc<ToolRegistry>, PluginHost) {
 /// Nobody answers a prompt in a session of the plugin's own, so what it can
 /// reach is priced like a hook on the same tool. MCP reaches whatever its
 /// servers do, which is nothing on a chat without any.
-#[test_case::test_case(r#"{ { name = "edit" } }"#, false, false, "fs_write" ; "a_declared_capability_costs_itself")]
-#[test_case::test_case(r#"{ { name = "echo_" } }"#, false, false, "every permission" ; "undeclared_reach_costs_everything")]
-#[test_case::test_case("nil", true, true, "mcp" ; "mcp_costs_everything")]
-#[test_case::test_case("nil", true, false, "nil" ; "mcp_without_servers_costs_nothing")]
-#[test_case::test_case(r#"{ { name = "nobody_registered_this" } }"#, false, false, "nil" ; "an_unknown_name_never_dispatches")]
+#[test_case(r#"{ { name = "edit" } }"#, false, false, "fs_write" ; "a_declared_capability_costs_itself")]
+#[test_case(r#"{ { name = "echo_" } }"#, false, false, "every permission" ; "undeclared_reach_costs_everything")]
+#[test_case("nil", true, true, "mcp" ; "mcp_costs_everything")]
+#[test_case("nil", true, false, "nil" ; "mcp_without_servers_costs_nothing")]
+#[test_case(r#"{ { name = "nobody_registered_this" } }"#, false, false, "nil" ; "an_unknown_name_never_dispatches")]
 fn a_plugin_session_can_only_reach_what_its_plugin_holds(
     tools: &str,
     mcp: bool,
@@ -8192,8 +8192,8 @@ fn a_plugin_session_can_only_reach_what_its_plugin_holds(
 /// the plugin registered gets a ctx inside its own background session, or
 /// under `maki -p`. There it pays the same price. With a user to ask, the
 /// prompt stays in its place and the session opens.
-#[test_case::test_case(false, "fs_write" ; "unanswerable_ctx_pays_for_reach")]
-#[test_case::test_case(true, "nil" ; "answerable_ctx_keeps_the_prompt")]
+#[test_case(false, "fs_write" ; "unanswerable_ctx_pays_for_reach")]
+#[test_case(true, "nil" ; "answerable_ctx_keeps_the_prompt")]
 fn a_ctx_session_pays_for_reach_only_when_nobody_can_answer(answerable: bool, expected: &str) {
     let (reg, _host) = reach_probe_host(r#"ctx, { tools = { { name = "edit" } }, mcp = false }"#);
     let inv = reg

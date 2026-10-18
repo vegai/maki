@@ -55,8 +55,16 @@ local PREPARED = "the prepare command changed %s, and the changes for import do 
 local DROP_ESCAPING_LINKS = [[
 root=$1
 shift
+mapfile -d '' -t targets < <(realpath -m -z -- "$@" 2>/dev/null)
+if wait "$!" && [ "${#targets[@]}" = "$#" ]; then batched=1; else batched=0; fi
+index=0
 for link do
-  target=$(realpath -m -- "$link" 2>/dev/null) || target=
+  if [ "$batched" = 1 ]; then
+    target=${targets[index]}
+  else
+    target=$(realpath -m -- "$link" 2>/dev/null) || target=
+  fi
+  index=$((index + 1))
   case $target in "$root" | "$root"/*) continue ;; esac
   rm -f -- "$link" || exit
   printf '%s' "${link#"$root"/}" | od -An -v -tx1 | tr -d ' \n'
@@ -311,10 +319,10 @@ local function drop_escaping_links(call, artifact, env)
     "-type",
     "l",
     "-exec",
-    "sh",
+    "bash",
     "-c",
     DROP_ESCAPING_LINKS,
-    "sh",
+    "bash",
     artifact.snapshot,
     "{}",
     "+",
@@ -627,9 +635,9 @@ function M.sanitize(artifact)
   if not paths then
     return err
   end
-  if #paths.metadata > 0 then
+  if #paths.git_metadata > 0 then
     artifact.notes[#artifact.notes + 1] = "maki preserved the Git metadata for "
-      .. M.shown(paths.metadata)
+      .. M.shown(paths.git_metadata)
       .. " in "
       .. quarantine
       .. ". Their ordinary files remain in the snapshot."

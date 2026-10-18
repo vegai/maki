@@ -41,6 +41,7 @@ use sha2::{Digest, Sha256};
 use smol::lock::{Mutex as AsyncMutex, Semaphore, SemaphoreGuard};
 use tracing::{debug, info, warn};
 
+use self::validation::LaunchPreparation;
 use crate::model::{Model, ModelFamily, ModelInfo, is_same_model};
 use crate::process::find_program;
 use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
@@ -51,6 +52,7 @@ use crate::providers::{Timeouts, anthropic, catalog};
 use crate::spec::{
     AuthDoc, Build, CatalogDoc, GeneratedDocs, NO_CURATED_MODELS, Native, ProviderSpec,
 };
+use crate::types::requires_adaptive;
 use crate::{
     AgentError, Effort, EffortDialect, Message, ProviderEvent, ProviderUsage, RequestOptions,
     StreamResponse, ThinkingConfig,
@@ -434,7 +436,7 @@ fn with_long_context(models: Vec<Listed>, can_open: impl Fn(&str) -> bool) -> Ve
 fn thinking_for(thinking: ThinkingConfig, model: &Model) -> Thinking {
     match thinking {
         ThinkingConfig::Off => Thinking::Off,
-        _ if ThinkingConfig::requires_adaptive(&model.id) => thinking
+        _ if requires_adaptive(&model.id) => thinking
             .effort_str(&CLAUDE_CODE, model)
             .map_or(Thinking::Default, Thinking::Effort),
         _ => thinking
@@ -448,12 +450,6 @@ fn thinking_for(thinking: ThinkingConfig, model: &Model) -> Thinking {
 fn utf8_vars(vars: impl Iterator<Item = (OsString, OsString)>) -> Vec<(String, String)> {
     vars.filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
         .collect()
-}
-
-struct Prepared {
-    env: Vec<(String, String)>,
-    temp_dir: PathBuf,
-    config_dir: PathBuf,
 }
 
 type Environment = dyn Fn(Option<&[&str]>) -> Vec<(String, String)> + Send + Sync;
@@ -512,19 +508,15 @@ impl ClaudeCode {
         )
     }
 
-    fn prepare(&self, cwd: &Path, vars: Vec<(String, String)>) -> Result<Prepared, Error> {
+    fn prepare(&self, cwd: &Path, vars: Vec<(String, String)>) -> Result<LaunchPreparation, Error> {
         let prepared = validation::prepare_launch(vars, self.config_dir.clone(), cwd)?;
         if !prepared.withheld.is_empty() {
             info!(withheld = ?prepared.withheld, "claude-code: maki did not give the route variables to Claude Code");
         }
-        Ok(Prepared {
-            env: prepared.env,
-            temp_dir: prepared.temp_dir,
-            config_dir: prepared.config_dir,
-        })
+        Ok(prepared)
     }
 
-    fn launch<'a>(&'a self, prepared: &'a Prepared, cwd: &'a Path) -> Launch<'a> {
+    fn launch<'a>(&'a self, prepared: &'a LaunchPreparation, cwd: &'a Path) -> Launch<'a> {
         Launch {
             executable: &self.executable,
             env: &prepared.env,
@@ -538,7 +530,7 @@ impl ClaudeCode {
         &self,
         cwd: &Path,
         vars: Vec<(String, String)>,
-    ) -> Result<Prepared, Error> {
+    ) -> Result<LaunchPreparation, Error> {
         let provider = self.clone();
         let cwd = cwd.to_owned();
         smol::unblock(move || provider.prepare(&cwd, vars)).await
@@ -695,19 +687,6 @@ impl ClaudeCode {
     }
 }
 
-impl ClaudeCode {
-    fn list_models_with(
-        &self,
-        listing: ModelListing,
-    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async move {
-            let cwd = smol::unblock(working_dir).await?;
-            let models = self.list(&cwd, listing).await.map_err(config_error)?;
-            Ok(with_long_context(models, takes_a_million))
-        })
-    }
-}
-
 impl Provider for ClaudeCode {
     fn stream_message<'a>(
         &'a self,
@@ -739,7 +718,11 @@ impl Provider for ClaudeCode {
         &self,
         listing: ModelListing,
     ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        self.list_models_with(listing)
+        Box::pin(async move {
+            let cwd = smol::unblock(working_dir).await?;
+            let models = self.list(&cwd, listing).await.map_err(config_error)?;
+            Ok(with_long_context(models, takes_a_million))
+        })
     }
 
     /// The last request's usage, because Claude Code has no endpoint maki can

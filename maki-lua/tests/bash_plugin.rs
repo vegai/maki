@@ -3,8 +3,6 @@
 //! binary and need cargo nextest, which gives every test its own process.
 #![cfg(unix)]
 
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,18 +12,16 @@ use maki_agent::tools::ToolRegistry;
 use maki_agent::tools::test_support::stub_ctx;
 use maki_lua::PluginHost;
 use serde_json::{Map, json};
-use smol::Timer;
-use smol::future::or;
 use tempfile::tempdir;
 use test_case::test_case;
 
-#[path = "common/environment.rs"]
+#[path = "claude_code/support.rs"]
 #[allow(dead_code)]
-mod environment;
+mod support;
 
-const BASH_SRC: &str = include_str!("../../plugins/bash/init.lua");
+use support::{BASH_SRC, environment, executable, within};
+
 const BASH_TOOL: &str = "bash";
-const OWNER_ONLY: u32 = 0o700;
 const DEADLINE: Duration = Duration::from_secs(60);
 /// A fake `rtk` that rewrites every command into one printing @REWRITTEN@.
 const REWRITING_RTK: &str =
@@ -42,9 +38,11 @@ const SECOND_LINE_OUTPUT: &str = "second";
 #[test_case(ONE_LINE_WITH_NEWLINE, REWRITTEN ; "a_single_line_ending_in_a_newline_is_rewritten")]
 fn rtk_rewrites_a_single_line_only(command: &str, want: &str) {
     let tools = tempdir().unwrap();
-    let rtk = tools.path().join("rtk");
-    fs::write(&rtk, REWRITING_RTK.replace("@REWRITTEN@", REWRITTEN)).unwrap();
-    fs::set_permissions(&rtk, fs::Permissions::from_mode(OWNER_ONLY)).unwrap();
+    executable(
+        tools.path(),
+        "rtk",
+        &REWRITING_RTK.replace("@REWRITTEN@", REWRITTEN),
+    );
     let _path = environment::EnvVar::prepend_path(tools.path());
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -55,12 +53,7 @@ fn rtk_rewrites_a_single_line_only(command: &str, want: &str) {
     let input = json!({ "command": command, "description": "a command" });
     let inv = reg.get(BASH_TOOL).unwrap().tool.parse(&input).unwrap();
 
-    let expired = async {
-        Timer::after(DEADLINE).await;
-        None
-    };
-    let output = smol::block_on(or(async { Some(inv.execute(&ctx).await) }, expired))
-        .unwrap_or_else(|| panic!("bash did not reply in {DEADLINE:?}"))
+    let output = smol::block_on(within(DEADLINE, inv.execute(&ctx)))
         .output
         .unwrap();
 

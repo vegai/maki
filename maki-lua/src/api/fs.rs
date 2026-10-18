@@ -80,9 +80,8 @@ async fn mkdtemp(_lua: Lua, template: String) -> LuaResult<Pair<String>> {
         })
         .await
     );
-    Ok(pair(
-        touched(PathBuf::from(&directory), Ok::<_, IoError>(directory)).await,
-    ))
+    touched(PathBuf::from(&directory), true).await;
+    Ok((Some(directory), None))
 }
 
 /// Remove an empty directory.
@@ -93,7 +92,8 @@ async fn rmdir(_lua: Lua, path: String) -> LuaResult<Pair<bool>> {
     let path = try_pair!(make_absolute(&path));
     let removed = path.clone();
     let result = smol::unblock(move || fs::remove_dir(path)).await;
-    Ok(pair(touched(removed, result).await.map(|()| true)))
+    touched(removed, result.is_ok()).await;
+    Ok(pair(result.map(|()| true)))
 }
 
 /// Rename a file or directory.
@@ -107,8 +107,9 @@ async fn rename(_lua: Lua, path: String, new_path: String) -> LuaResult<Pair<boo
     let moved_from = path.clone();
     let moved_to = new_path.clone();
     let result = smol::unblock(move || fs::rename(path, new_path)).await;
-    let result = touched(moved_from, result).await;
-    Ok(pair(touched(moved_to, result).await.map(|()| true)))
+    touched(moved_from, result.is_ok()).await;
+    touched(moved_to, result.is_ok()).await;
+    Ok(pair(result.map(|()| true)))
 }
 
 struct FileLock(Option<File>);
@@ -137,20 +138,21 @@ impl UserData for FileLock {
 /// @return (userdata?, string?) Lock with close(), or nil and the error if locking fails.
 #[lua_fn(guard = FsWrite)]
 async fn try_lock(_lua: Lua, path: String) -> LuaResult<Pair<FileLock>> {
-    let file = try_pair!(
-        smol::unblock(move || {
-            let mut options = File::options();
-            options.read(true).write(true).create(true).truncate(false);
-            #[cfg(unix)]
-            options
-                .mode(PRIVATE_FILE_MODE)
-                .custom_flags(OFlags::NOFOLLOW.bits() as i32);
-            let file = options.open(expand_tilde(&path))?;
-            FileLock::try_lock(file)
-        })
-        .await
-    );
-    Ok((Some(file), None))
+    let path = try_pair!(make_absolute(&path));
+    let lock_path = path.clone();
+    let result = smol::unblock(move || {
+        let mut options = File::options();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        options
+            .mode(PRIVATE_FILE_MODE)
+            .custom_flags(OFlags::NOFOLLOW.bits() as i32);
+        let file = options.open(lock_path)?;
+        FileLock::try_lock(file)
+    })
+    .await;
+    touched(path, result.is_ok()).await;
+    Ok(pair(result))
 }
 
 pub(crate) fn expand_tilde(path: &str) -> PathBuf {
@@ -587,7 +589,8 @@ async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Tabl
 async fn write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
     let abs = try_pair!(make_absolute(&path));
     let result = smol::fs::write(&abs, content).await;
-    Ok(pair(touched(abs, result).await.map(|()| true)))
+    touched(abs, result.is_ok()).await;
+    Ok(pair(result.map(|()| true)))
 }
 
 /// Append {content} to the file at {path}, creating it (but not its parent
@@ -614,7 +617,8 @@ async fn append(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool
             .and_then(|mut f| f.write_all(content.as_bytes()))
     })
     .await;
-    Ok(pair(touched(appended, result).await.map(|()| true)))
+    touched(appended, result.is_ok()).await;
+    Ok(pair(result.map(|()| true)))
 }
 
 /// Atomically replace {path} with {content}. The parent directory must exist.
@@ -632,7 +636,8 @@ async fn atomic_write(_lua: Lua, path: String, content: String) -> LuaResult<Pai
     let abs = try_pair!(make_absolute(&path));
     let written = abs.clone();
     let result = smol::unblock(move || maki_storage::atomic_write(&abs, content.as_bytes())).await;
-    Ok(pair(touched(written, result).await.map(|()| true)))
+    touched(written, result.is_ok()).await;
+    Ok(pair(result.map(|()| true)))
 }
 
 /// Delete the file, symlink, or directory at {path}.
@@ -680,7 +685,8 @@ async fn rm(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool
         }
     })
     .await;
-    Ok(pair(touched(removed, result).await.map(|()| true)))
+    touched(removed, result.is_ok()).await;
+    Ok(pair(result.map(|()| true)))
 }
 
 /// Create the directory at {path}. Set `parents = true` to create
@@ -703,7 +709,8 @@ async fn mkdir(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<b
     } else {
         smol::fs::create_dir(&abs).await
     };
-    Ok(pair(touched(abs, result).await.map(|()| true)))
+    touched(abs, result.is_ok()).await;
+    Ok(pair(result.map(|()| true)))
 }
 
 /// The path {path} really names, for the prefix match the file index picks
@@ -774,11 +781,10 @@ fn descend(mut base: PathBuf, component: &Component<'_>) -> PathBuf {
 /// Resolving the path is a realpath per ancestor and one more per `..` left
 /// in the tail, and this runs on the one executor every plugin shares, so it
 /// waits for a blocking thread the way the call it follows did.
-async fn touched<T, E>(path: PathBuf, result: Result<T, E>) -> Result<T, E> {
-    if result.is_ok() {
+async fn touched(path: PathBuf, succeeded: bool) {
+    if succeeded {
         smol::unblock(move || maki_agent::invalidate_for(&resolved(&path))).await;
     }
-    result
 }
 
 /// Find files matching one or more glob patterns, walked fresh on every call.
@@ -3023,8 +3029,9 @@ mod tests {
 
     /// A file the agent has just written is a file the user is about to ask
     /// for, and the walk behind the answer can be twenty seconds old.
-    #[test]
-    fn a_written_file_is_findable_before_the_index_goes_stale() {
+    #[test_case(false ; "written_file")]
+    #[test_case(true ; "created_lock")]
+    fn a_created_file_is_findable_before_the_index_goes_stale(lock: bool) {
         let base = cwd_root().unwrap();
         let tmp = small_tree(&base);
         let lua = Lua::new();
@@ -3034,11 +3041,19 @@ mod tests {
         // would then spin out the whole debounce waiting for one.
         walked(tmp.path());
 
-        let written: mlua::Function = tbl.get("write").unwrap();
         let made = tmp.path().join(NEW_FILE);
-        let (ok, err): (Option<bool>, Option<String>) =
-            smol::block_on(written.call_async((made.to_str().unwrap(), ""))).unwrap();
-        assert_eq!((ok, err), (Some(true), None));
+        if lock {
+            let acquire: Function = tbl.get("try_lock").unwrap();
+            let (held, err): (Option<AnyUserData>, Option<String>) =
+                smol::block_on(acquire.call_async(made.to_str().unwrap())).unwrap();
+            assert!(held.is_some());
+            assert_eq!(err, None);
+        } else {
+            let written: Function = tbl.get("write").unwrap();
+            let (ok, err): (Option<bool>, Option<String>) =
+                smol::block_on(written.call_async((made.to_str().unwrap(), ""))).unwrap();
+            assert_eq!((ok, err), (Some(true), None));
+        }
 
         // The write left a mark on the index rather than a walk, and the
         // mark is the whole of what makes the file findable: `expire` brings

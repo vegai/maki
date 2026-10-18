@@ -15,6 +15,7 @@ use maki_config::{Config, ProjectConfig, load_env_files, load_permissions};
 use maki_lua::{InitFiles, Interaction, PackPlan, PackReport, PluginHost};
 use maki_providers::model::Model;
 use maki_storage::StateDir;
+use maki_storage::sessions::StoredThinking;
 use maki_ui::{OpenSession, RunOutcome};
 
 use crate::cli::{Cli, TOOL_ARGUMENT_PATTERNS_UNSUPPORTED, is_tool_argument_pattern};
@@ -30,11 +31,9 @@ const POLICY_GRANT_NOTICE: &str = "folder trusted by trust.paths pattern";
 const NO_ALLOWED_TOOLS: &str = "--allowed-tools matches no loaded tools or qualified MCP names";
 
 fn tool_filter_warnings(cli: &Cli, registry: &ToolRegistry, startup: bool) -> Result<Vec<String>> {
-    if startup
-        && !cli.allowed_tools.is_empty()
-        && !cli.allowed_tools.iter().any(|name| {
-            registry.get(name).is_some() || is_wire_name(name) || is_qualified_name(name)
-        })
+    let known =
+        |name: &str| registry.get(name).is_some() || is_wire_name(name) || is_qualified_name(name);
+    if startup && !cli.allowed_tools.is_empty() && !cli.allowed_tools.iter().any(|name| known(name))
     {
         return Err(eyre!(
             "{NO_ALLOWED_TOOLS}: {}",
@@ -42,20 +41,23 @@ fn tool_filter_warnings(cli: &Cli, registry: &ToolRegistry, startup: bool) -> Re
         ));
     }
     let mut warnings = Vec::new();
+    for name in cli
+        .disallowed_tools
+        .iter()
+        .filter(|name| is_tool_argument_pattern(name))
+    {
+        warnings.push(format!(
+            "--disallowed-tools: {TOOL_ARGUMENT_PATTERNS_UNSUPPORTED}: '{name}'"
+        ));
+    }
     for (flag, names) in [
         ("--allowed-tools", &cli.allowed_tools),
         ("--disallowed-tools", &cli.disallowed_tools),
     ] {
-        for name in names {
-            if is_tool_argument_pattern(name) {
-                warnings.push(format!(
-                    "{flag}: {TOOL_ARGUMENT_PATTERNS_UNSUPPORTED}: '{name}'"
-                ));
-                continue;
-            }
-            if registry.get(name).is_some() || is_wire_name(name) || is_qualified_name(name) {
-                continue;
-            }
+        for name in names
+            .iter()
+            .filter(|name| !known(name) && !is_tool_argument_pattern(name))
+        {
             let mut warning = format!("no loaded tool matches '{name}' in {flag}.");
             let suggestion = name.replace('-', "_");
             if suggestion != *name && registry.get(&suggestion).is_some() {
@@ -258,13 +260,20 @@ fn build_stack(
 }
 
 /// The tab a run opens on. Which session that is lives in [`crate::resume`],
-/// and the only step left here is the TUI-only one: an explicit `--model` is a
-/// choice about the session being opened, and a session's own spec is what
-/// every later switch reads.
-fn open_tab(resolved: Resolved, model: &str, explicit_model: bool, cwd: &str) -> OpenSession {
+/// and explicit launch flags override the saved model and thinking level.
+fn open_tab(
+    resolved: Resolved,
+    model: &str,
+    explicit_model: bool,
+    thinking: Option<StoredThinking>,
+    cwd: &str,
+) -> OpenSession {
     let mut tab = resolved.into_session(model, cwd);
     if explicit_model {
         tab.session.set_model(model.to_owned());
+    }
+    if let Some(thinking) = thinking {
+        tab.session.meta.thinking = Some(thinking);
     }
     tab
 }
@@ -489,6 +498,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         resolved,
         &stack.model.spec(),
         cli.model.is_some(),
+        cli.thinking_override(),
         &cwd_str,
     )];
     let mut focused = 0;
@@ -626,7 +636,7 @@ mod tests {
     use maki_agent::tools::ToolRegistry;
     use maki_config::RawConfig;
     use maki_providers::Message;
-    use maki_storage::sessions::SessionClaim;
+    use maki_storage::sessions::{Effort, SessionClaim};
     use maki_ui::AppSession;
     use std::fs;
     use std::path::PathBuf;
@@ -855,18 +865,24 @@ mod tests {
         plugin_host.begin_shutdown();
     }
 
-    /// A session's recorded spec is the single source of truth for the model
-    /// its tab runs on, so both directions matter. An explicit `--model` used
-    /// to be ignored on a resumed session, and without one the startup default
-    /// must not overwrite the recorded spec, or per tab models die on every
-    /// restart.
-    #[test_case(false, STORED_SPEC ; "a resumed tab keeps its own spec")]
-    #[test_case(true, STARTUP_SPEC ; "explicit model wins over a resumed spec")]
-    fn explicit_model_overrides_only_a_resumed_spec(explicit_model: bool, expected_spec: &str) {
+    /// Explicit launch flags replace saved settings. Startup defaults leave
+    /// those settings intact when the flags are absent.
+    #[test_case(&[], STORED_SPEC, None ; "a resumed tab keeps its saved settings")]
+    #[test_case(&["--model", STARTUP_SPEC], STARTUP_SPEC, None ; "explicit model wins")]
+    #[test_case(&["--thinking", "off"], STORED_SPEC, Some(StoredThinking::Off) ; "explicit thinking wins")]
+    #[test_case(&["--effort", "low"], STORED_SPEC, Some(StoredThinking::Effort { level: Effort::Low }) ; "explicit effort wins")]
+    #[test_case(&["--max-thinking-tokens", "2048"], STORED_SPEC, Some(StoredThinking::Budget { tokens: 2048 }) ; "explicit budget wins")]
+    fn launch_flags_override_resumed_settings(
+        flags: &[&str],
+        expected_spec: &str,
+        thinking: Option<StoredThinking>,
+    ) {
+        const SAVED_THINKING: StoredThinking = StoredThinking::Effort { level: Effort::Max };
         let dir = tempdir().expect("tempdir");
         let storage = StateDir::from_path(dir.path().join("state"));
         let cwd = dir.path().to_string_lossy().into_owned();
         let mut stored = AppSession::new(STORED_SPEC, &cwd);
+        stored.meta.thinking = Some(SAVED_THINKING);
         stored.push_message(Message::user(STORED_MESSAGE.to_owned()));
         let stored_id = stored.id;
         stored
@@ -875,10 +891,17 @@ mod tests {
                 &storage,
             )
             .expect("write session to disk");
-        let resolved = resume::resolve(&Cli::parse_from(["maki", "-c"]), &cwd, &storage)
-            .expect("continue resolves");
+        let cli = Cli::parse_from(["maki", "-c"].into_iter().chain(flags.iter().copied()));
+        let resolved = resume::resolve(&cli, &cwd, &storage).expect("continue resolves");
 
-        let session = open_tab(resolved, STARTUP_SPEC, explicit_model, &cwd).session;
+        let session = open_tab(
+            resolved,
+            STARTUP_SPEC,
+            cli.model.is_some(),
+            cli.thinking_override(),
+            &cwd,
+        )
+        .session;
 
         assert_eq!(session.id, stored_id);
         assert_eq!(
@@ -890,6 +913,10 @@ mod tests {
             vec![STORED_MESSAGE]
         );
         assert_eq!(session.model, expected_spec);
+        assert_eq!(
+            session.meta.thinking,
+            Some(thinking.unwrap_or(SAVED_THINKING))
+        );
     }
 
     /// A fresh tab opens on the startup spec, which already folded in
@@ -901,7 +928,7 @@ mod tests {
         let storage = StateDir::from_path(dir.path().join("state"));
         let resolved = Resolved::fresh(&storage);
         let id = resolved.id.id();
-        let session = open_tab(resolved, STARTUP_SPEC, false, CWD).session;
+        let session = open_tab(resolved, STARTUP_SPEC, false, None, CWD).session;
 
         assert_eq!(session.id, id);
         assert!(session.messages().is_empty());
