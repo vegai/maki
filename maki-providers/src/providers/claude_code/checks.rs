@@ -127,6 +127,8 @@ const BUILTIN_PLUGIN_MARKER: &str = "builtin";
 const UNREADABLE_FILE: &str = "maki cannot read it";
 const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
 const MAX_GIT_PATH_BYTES: u64 = 4096;
+const SETTINGS_TOO_LARGE: &str = "settings file exceeds the 1 MiB limit";
+const GIT_PATH_TOO_LARGE: &str = "Git path file exceeds the 4 KiB limit";
 const NOT_A_FILE: &str = "path is not a regular file";
 const NOT_AN_OBJECT: &str = "is not a JSON object";
 
@@ -272,7 +274,7 @@ pub fn git_directory(entry: &Path) -> io::Result<PathBuf> {
     if fs::metadata(entry)?.is_dir() {
         return Ok(entry.to_owned());
     }
-    let text = limited_text(entry, MAX_GIT_PATH_BYTES)?;
+    let text = limited_text(entry, MAX_GIT_PATH_BYTES, GIT_PATH_TOO_LARGE)?;
     let pointed = text
         .trim()
         .strip_prefix(GITDIR_PREFIX)
@@ -289,7 +291,11 @@ pub fn git_directory(entry: &Path) -> io::Result<PathBuf> {
 /// Claude Code and the plugin do.
 fn main_checkout(git_file: &Path) -> io::Result<(Option<PathBuf>, Option<PathBuf>)> {
     let gitdir = git_directory(git_file)?;
-    let common = match limited_text(&gitdir.join(COMMONDIR_FILE), MAX_GIT_PATH_BYTES) {
+    let common = match limited_text(
+        &gitdir.join(COMMONDIR_FILE),
+        MAX_GIT_PATH_BYTES,
+        GIT_PATH_TOO_LARGE,
+    ) {
         Ok(common) => common,
         Err(e) if e.kind() == ErrorKind::NotFound => {
             return Ok((None, Some(normalize_path(&gitdir))));
@@ -413,7 +419,7 @@ fn settings_conflicts(settings: &Value) -> Vec<String> {
     keys
 }
 
-fn limited_text(path: &Path, max_bytes: u64) -> io::Result<String> {
+fn limited_text(path: &Path, max_bytes: u64, too_large: &'static str) -> io::Result<String> {
     #[cfg(unix)]
     let file = File::from(open(
         path,
@@ -428,10 +434,7 @@ fn limited_text(path: &Path, max_bytes: u64) -> io::Result<String> {
     let mut text = String::new();
     file.take(max_bytes + 1).read_to_string(&mut text)?;
     if text.len() as u64 > max_bytes {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            format!("file exceeds the {max_bytes}-byte limit"),
-        ));
+        return Err(io::Error::new(ErrorKind::InvalidData, too_large));
     }
     Ok(text)
 }
@@ -441,7 +444,7 @@ pub(crate) fn file_conflicts(paths: &[PathBuf]) -> Vec<String> {
     let mut found = Vec::new();
     for path in paths {
         let shown = path.display();
-        let text = match limited_text(path, MAX_SETTINGS_BYTES) {
+        let text = match limited_text(path, MAX_SETTINGS_BYTES, SETTINGS_TOO_LARGE) {
             Ok(text) => text,
             Err(e) if e.kind() == ErrorKind::NotFound => continue,
             Err(e) => {
@@ -689,9 +692,9 @@ mod tests {
     use super::{
         COMMONDIR_FILE, CONNECTED, DEFAULT_MODE, ESSENTIAL_TRAFFIC_ONLY, FLAG_SOURCE, GIT_ENTRY,
         HANDSHAKE, InitExpect, MAX_GIT_PATH_BYTES, MAX_SETTINGS_BYTES, NO_KEY_SOURCE,
-        NOT_AN_OBJECT, POLICY_SOURCE, UNREADABLE_FILE, account_problem, child_env, config_dir,
-        file_conflicts, init_problem, local_settings_dirs, plugins_problem, policy_problem,
-        profile, settings_conflicts,
+        NOT_AN_OBJECT, POLICY_SOURCE, SETTINGS_TOO_LARGE, UNREADABLE_FILE, account_problem,
+        child_env, config_dir, file_conflicts, init_problem, local_settings_dirs, plugins_problem,
+        policy_problem, profile, settings_conflicts,
     };
 
     const VERSION: &str = "2.1.284";
@@ -705,10 +708,7 @@ mod tests {
             .unwrap()
             .set_len(MAX_SETTINGS_BYTES + 1)
             .unwrap();
-        assert!(
-            file_conflicts(&[path])[0]
-                .contains(&format!("file exceeds the {MAX_SETTINGS_BYTES}-byte limit"))
-        );
+        assert!(file_conflicts(&[path])[0].contains(SETTINGS_TOO_LARGE));
     }
 
     #[cfg(unix)]

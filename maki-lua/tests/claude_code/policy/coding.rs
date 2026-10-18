@@ -2,7 +2,7 @@
 
 use std::env;
 use std::ffi::OsStr;
-use std::fs::{self, File};
+use std::fs::{self, File, Permissions};
 use std::iter;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
@@ -50,6 +50,17 @@ const REPOSITORIES_LEFT_OUT: &str = "maki did not copy the repositories under in
 const INCLUDED_REPOSITORY: &str = "fixtures/repository";
 const NEGATED_EXCLUSIONS: &str =
     ".*\n!.gitignore\n!.claude/\n!.maki/\n!.Claude/\n!/node_modules/\n";
+const TRACKED_DEPENDENCY: &str = "src";
+const TRACKED_DEPENDENCY_NOTE: &str = "contains tracked files";
+const BASELINE_RAW_FILES: &[(&str, &[u8], u32)] = &[
+    ("raw/crlf.txt", b"first\r\nsecond\r\n", 0o644),
+    ("raw/binary.dat", b"\0\xff\r\n", 0o644),
+    ("raw/run.sh", b"#!/bin/sh\nexit 0\n", 0o755),
+    ("raw/[*] quote\".txt", b"literal name\n", 0o644),
+];
+const BASELINE_RAW_LINK: &str = "raw/link";
+const BASELINE_RAW_TARGET: &str = "crlf.txt";
+const TEXT_ATTRIBUTES: &str = "* text eol=lf\n";
 
 const BARE_REPOSITORY: &str = "fixtures/x.git";
 const EXISTING_BARE_FILE: &str = "fixtures/x.git/work.txt";
@@ -2122,6 +2133,74 @@ fn agent_config_the_worker_writes_stays_out_of_the_changes(negated: bool) {
     assert!(!project.join(".maki/init.lua").exists());
     assert!(!project.join("src/.MaKi").exists());
     assert!(!project.join(".Claude").exists());
+}
+
+#[test_case(false ; "ignored_dependency")]
+#[test_case(true ; "negated_dependency")]
+fn tracked_dependency_edits_and_deletions_remain_importable(negated: bool) {
+    let coding = Coding::new();
+    let project = coding.project();
+    let ignore = if negated { "src/\n!src/\n" } else { "src/\n" };
+    write(&project.join(".gitignore"), ignore);
+    git(&project, &["add", ".gitignore"]);
+    let (reg, _host) = coding.host(&[("dependencies", json!(TRACKED_DEPENDENCY))]);
+    let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
+    assert!(reply.contains(TRACKED_DEPENDENCY_NOTE), "{reply}");
+    assert!(reply.contains(REPORTED_CHANGES[0]), "{reply}");
+    assert!(reply.contains(REPORTED_CHANGES[2]), "{reply}");
+    assert!(!reply.contains(REPORTED_CHANGES[1]), "{reply}");
+    coding
+        .import(&reg, json!({ "id": artifact_id(&reply) }))
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(project.join(IMPORTED_LIB)).unwrap(),
+        WORKER_LIB
+    );
+    assert!(!project.join(DELETED_FILE).exists());
+    assert!(!project.join(ADDED_FILE).exists());
+}
+
+#[test]
+fn the_baseline_preserves_raw_bytes_modes_and_literal_names() {
+    let coding = Coding::new();
+    let project = coding.project();
+    for (path, contents, mode) in BASELINE_RAW_FILES {
+        let file = project.join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, contents).unwrap();
+        fs::set_permissions(file, Permissions::from_mode(*mode)).unwrap();
+    }
+    symlink(BASELINE_RAW_TARGET, project.join(BASELINE_RAW_LINK)).unwrap();
+    write(&project.join(".gitattributes"), TEXT_ATTRIBUTES);
+    commit_all(&project);
+    let (reg, _host) = coding.host(&[]);
+    let id = artifact_id(&coding.code(&reg, CODE_EDIT, &[]).unwrap());
+    let snapshot = coding.snapshot(&id);
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(coding.artifact(&id).join(MANIFEST)).unwrap()).unwrap();
+    let base = manifest["base"].as_str().unwrap();
+    for (path, _, _) in BASELINE_RAW_FILES {
+        let expected = git(&project, &["hash-object", "--no-filters", "--", path]);
+        let actual = git(&snapshot, &["rev-parse", &format!("{base}:{path}")]);
+        assert_eq!(actual, expected, "{path}");
+        let original = git(
+            &project,
+            &["ls-files", "-s", "--", &format!(":(literal){path}")],
+        );
+        let copied = git(
+            &snapshot,
+            &["ls-tree", base, "--", &format!(":(literal){path}")],
+        );
+        assert_eq!(
+            original.split_whitespace().next(),
+            copied.split_whitespace().next(),
+            "{path}"
+        );
+    }
+    assert_eq!(
+        git(&snapshot, &["show", &format!("{base}:{BASELINE_RAW_LINK}")]),
+        BASELINE_RAW_TARGET
+    );
 }
 
 #[test_case(false ; "copied_dependency")]

@@ -90,7 +90,7 @@ checkout --snapshot--> artifact --claude -p--> changes --claude_code_import--> c
 
 2. maki copies untracked `dependencies` directories, such as `node_modules`, into the snapshot. It uses copy-on-write when the filesystem supports it. Then your `prepare` command runs. maki skips Python virtual environments because their scripts contain the checkout path. Recreate them in `prepare`.
 
-   Untracked dependency files stay outside the import, including files that `prepare` creates. Preparation changes form the worker baseline even if the command fails or times out. The worker starts only after maki records that baseline.
+   Untracked dependency files stay outside the import, including files that `prepare` creates. If a dependency folder contains tracked files, maki copies only those files and reports this. Their edits and deletions remain importable. Preparation changes form the worker baseline even if the command fails or times out. The worker starts only after maki records that baseline.
 
    Before starting the worker, maki removes external symlinks. It replaces hard-linked files with private copies, preserving their contents, modes and timestamps. Writes in the snapshot cannot change a shared dependency cache or another snapshot file through those links.
 

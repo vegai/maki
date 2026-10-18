@@ -135,6 +135,14 @@ local function snapshot_git(call, artifact, args, stdin)
   )
 end
 
+local function index_files(call, artifact, paths)
+  if #paths == 0 then
+    return nil
+  end
+  local _, err = snapshot_git(call, artifact, { "update-index", "--add", "-z", "--stdin" }, table.concat(paths, "\0"))
+  return err
+end
+
 function M.disk_blobs(call, env, cwd, paths, keep_on_cancel, timeout_ms)
   if #paths == 0 then
     return {}
@@ -344,19 +352,9 @@ local function commit_base(call, artifact, paths, dependencies)
     end
     paths = kept
   end
-  if #paths > 0 then
-    local _, add_err = call:run_quick(
-      workspace.git({ "--literal-pathspecs", "add", "-f", "--pathspec-from-file=-", "--pathspec-file-nul" }),
-      {
-        env = artifact.git_env,
-        cwd = artifact.snapshot,
-        stdin = table.concat(paths, "\0"),
-        timeout_ms = artifact.timeout_ms,
-      }
-    )
-    if add_err then
-      return add_err
-    end
+  local add_err = index_files(call, artifact, paths)
+  if add_err then
+    return add_err
   end
   local _, commit_err = snapshot_git(call, artifact, { "commit", "-q", "--allow-empty", "-m", "maki snapshot" })
   if commit_err then
@@ -630,7 +628,11 @@ function M.sanitize(artifact)
 end
 
 local function stage_changes(call, artifact)
-  local args = { "ls-files", "--cached", "--others", "--exclude-standard", "--", "." }
+  local _, update_err = snapshot_git(call, artifact, { "add", "-u" })
+  if update_err then
+    return nil, update_err
+  end
+  local args = { "ls-files", "--others", "--exclude-standard", "--", "." }
   for _, pathspec in ipairs(artifact.excluded_pathspecs) do
     args[#args + 1] = pathspec
   end
@@ -638,17 +640,9 @@ local function stage_changes(call, artifact)
   if not listed then
     return nil, list_err
   end
-  local paths = workspace.listed_paths(listed)
-  if #paths > 0 then
-    local _, add_err = snapshot_git(
-      call,
-      artifact,
-      { "--literal-pathspecs", "add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul" },
-      table.concat(paths, "\0")
-    )
-    if add_err then
-      return nil, add_err
-    end
+  local add_err = index_files(call, artifact, workspace.listed_paths(listed))
+  if add_err then
+    return nil, add_err
   end
   -- After staging, only gitignored paths remain untracked. Exclude maki's
   -- dependency paths from this list without also hiding the .gitignore paths.
