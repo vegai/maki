@@ -112,11 +112,12 @@ local function handshake_problem(answers, worker, confine)
     responses[id] = response
   end
   local handshake = launch.worker_handshake("", worker, confine)
-  for _, request in ipairs(launch.HANDSHAKE) do
-    local _, problem = handshake_answer(handshake, request.id, responses[request.id])
+  for index, request in ipairs(launch.HANDSHAKE) do
+    local complete, problem = handshake_answer(handshake, request.id, responses[request.id])
     if problem then
       return problem
     end
+    eq(complete, index == #launch.HANDSHAKE)
   end
 end
 
