@@ -17,7 +17,7 @@ use maki_providers::model::Model;
 use maki_storage::StateDir;
 use maki_ui::{OpenSession, RunOutcome};
 
-use crate::cli::Cli;
+use crate::cli::{Cli, TOOL_ARGUMENT_PATTERNS_UNSUPPORTED, is_tool_argument_pattern};
 use crate::provider_scripts;
 use crate::resume::{self, Resolved};
 use crate::setup;
@@ -35,6 +35,12 @@ fn tool_filter_warnings(cli: &Cli, registry: &ToolRegistry) -> Vec<String> {
         ("--disallowed-tools", &cli.disallowed_tools),
     ] {
         for name in names {
+            if is_tool_argument_pattern(name) {
+                warnings.push(format!(
+                    "{flag}: {TOOL_ARGUMENT_PATTERNS_UNSUPPORTED}: '{name}'"
+                ));
+                continue;
+            }
             if registry.get(name).is_some() || is_wire_name(name) || is_qualified_name(name) {
                 continue;
             }
@@ -626,6 +632,16 @@ mod tests {
             tool_filter_warnings(&cli, &ToolRegistry::new()).is_empty(),
             accepted
         );
+    }
+
+    #[test_case("Bash(git log:*)")]
+    #[test_case("srv.probe(argument:*)")]
+    fn tool_filter_warnings_explain_unsupported_argument_patterns(name: &str) {
+        let cli = Cli::parse_from(["maki", "--disallowed-tools", name]);
+        let warnings = tool_filter_warnings(&cli, &ToolRegistry::new());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains(TOOL_ARGUMENT_PATTERNS_UNSUPPORTED));
+        assert!(!warnings[0].contains("load later"));
     }
 
     fn no_names(_: &PluginHost) -> Result<Vec<String>> {

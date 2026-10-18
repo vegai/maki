@@ -154,6 +154,14 @@ case $scenario in
   text_then_fail) text_reply; exit 23 ;;
   text_then_linger) text_reply; exec >&-; sleep @WAIT_SECS@ ;;
   text_then_slow_stdout) text_reply; sleep @WAIT_SECS@ ;;
+  text_then_detached_stdout)
+    mkfifo "$dir/detached-ready"
+    setsid bash -c 'echo $$ > "$1/detached-ready"; exec sleep "$2"' bash "$dir" @WAIT_SECS@ &
+    IFS= read -r detached < "$dir/detached-ready"
+    printf '%s' "$detached" > "$dir/detached-pid"
+    text_reply
+    sleep @WAIT_SECS@
+    ;;
   text_then_api_key) text_reply; init ANTHROPIC_API_KEY ;;
   text_then_keep_alive) text_reply; line '{"type":"keep_alive"}' ;;
   text_then_limits) text_reply; limits ;;

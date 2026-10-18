@@ -1,3 +1,4 @@
+use super::super::MAX_EVENT_BYTES;
 use super::super::checks::HANDSHAKE;
 use super::super::error::Error;
 use super::super::mcp::Handoff;
@@ -36,7 +37,6 @@ pub(super) const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 const STDERR_DRAIN: Duration = Duration::from_secs(1);
 const STDERR_TAIL_LINES: usize = 10;
 const STDERR_LINE_BYTES: usize = 4096;
-const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 const TRUNCATED_LINE: &str = "…";
 
 #[derive(Debug, ThisError)]

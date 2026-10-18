@@ -100,11 +100,11 @@ fn repository(dir: &impl AsFd) -> bool {
     }))
 }
 
-fn quarantine_entry(
+fn move_entry(
     parent: &impl AsFd,
     name: impl Arg + Copy,
     quarantine: &Path,
-) -> io::Result<()> {
+) -> io::Result<Option<File>> {
     let destination = tempfile::Builder::new()
         .prefix(QUARANTINE_PREFIX)
         .tempdir_in(quarantine)?;
@@ -113,10 +113,27 @@ fn quarantine_entry(
     let _ = destination.keep();
     let metadata = statat(&dir, QUARANTINE_ENTRY, AtFlags::SYMLINK_NOFOLLOW)?;
     if FileType::from_raw_mode(metadata.st_mode) == FileType::Directory {
-        let root = directory(&dir, QUARANTINE_ENTRY)?;
-        walk(root, |parent, name, _path, _metadata| {
+        return directory(&dir, QUARANTINE_ENTRY).map(Some);
+    }
+    Ok(None)
+}
+
+fn quarantine_entry(
+    parent: &impl AsFd,
+    name: impl Arg + Copy,
+    quarantine: &Path,
+    depth: usize,
+) -> io::Result<()> {
+    let mut pending: Vec<_> = move_entry(parent, name, quarantine)?
+        .into_iter()
+        .map(|root| (root, depth))
+        .collect();
+    while let Some((root, depth)) = pending.pop() {
+        walk(root, depth, |parent, name, path, _metadata| {
             if name.to_bytes() == CONFIG.as_bytes() && repository(parent) {
-                quarantine_entry(parent, name, quarantine)?;
+                if let Some(child) = move_entry(parent, name, quarantine)? {
+                    pending.push((child, depth + path.components().count()));
+                }
                 return Ok(Visit::Skip);
             }
             Ok(Visit::Scan)
@@ -150,7 +167,7 @@ fn restore_pointer(root: &File, quarantine: &Path, git: &Path) -> io::Result<()>
         }
     }
     if statat(root, GIT_ENTRY, AtFlags::SYMLINK_NOFOLLOW).is_ok() {
-        quarantine_entry(root, GIT_ENTRY, quarantine)?;
+        quarantine_entry(root, GIT_ENTRY, quarantine, 1)?;
     }
     let mut pointer = File::from(openat(
         root,
@@ -169,8 +186,12 @@ enum Visit {
 
 fn walk(
     root: File,
+    depth: usize,
     mut visit: impl FnMut(&BorrowedFd<'_>, &CStr, &Path, &Stat) -> io::Result<Visit>,
 ) -> io::Result<()> {
+    if depth > MAX_DEPTH {
+        return Err(depth_error());
+    }
     let mut pending = vec![(Dir::new(root)?, PathBuf::new())];
     let mut failures = Vec::new();
     let mut failure_count = 0;
@@ -211,10 +232,8 @@ fn walk(
                 }
                 Visit::Scan => return Ok(None),
             };
-            if path.components().count() > MAX_DEPTH {
-                return Err(io::Error::other(format!(
-                    "snapshot exceeds {MAX_DEPTH} directory levels"
-                )));
+            if depth + path.components().count() > MAX_DEPTH {
+                return Err(depth_error());
             }
             Ok(Some(Dir::new(child)?))
         })();
@@ -236,6 +255,10 @@ fn walk(
     Err(io::Error::other(failures.join("\n")))
 }
 
+fn depth_error() -> io::Error {
+    io::Error::other(format!("snapshot exceeds {MAX_DEPTH} directory levels"))
+}
+
 pub(super) fn sanitize_snapshot(
     snapshot: &Path,
     quarantine: &Path,
@@ -249,7 +272,7 @@ pub(super) fn sanitize_snapshot(
     if root_repository {
         relocated.repositories.push(".".into());
     }
-    let scanned = walk(root, |parent, name, path, metadata| {
+    let scanned = walk(root, 0, |parent, name, path, metadata| {
         if path == Path::new(GIT_ENTRY) {
             return Ok(Visit::Skip);
         }
@@ -257,11 +280,11 @@ pub(super) fn sanitize_snapshot(
             && path.parent() == Some(Path::new(""))
             && (name.to_bytes() == HEAD.as_bytes() || name.to_bytes() == CONFIG.as_bytes())
         {
-            quarantine_entry(parent, name, quarantine)?;
+            quarantine_entry(parent, name, quarantine, path.components().count())?;
             return Ok(Visit::Skip);
         }
         if name.to_bytes().eq_ignore_ascii_case(GIT_ENTRY.as_bytes()) {
-            quarantine_entry(parent, name, quarantine)?;
+            quarantine_entry(parent, name, quarantine, path.components().count())?;
             relocated.metadata.push(path.to_string_lossy().into_owned());
             return Ok(Visit::Skip);
         }
@@ -273,7 +296,7 @@ pub(super) fn sanitize_snapshot(
         if kind == FileType::Directory {
             let child = directory(parent, name)?;
             if repository(&child) {
-                quarantine_entry(parent, name, quarantine)?;
+                quarantine_entry(parent, name, quarantine, path.components().count())?;
                 relocated
                     .repositories
                     .push(path.to_string_lossy().into_owned());
@@ -465,7 +488,7 @@ mod tests {
         for index in 0..count {
             fs::write(root.path().join(format!("entry\n{index}")), CONTENT).unwrap();
         }
-        let error = walk(File::open(root.path()).unwrap(), |_, _, _, _| {
+        let error = walk(File::open(root.path()).unwrap(), 0, |_, _, _, _| {
             Err(io::Error::other(WALK_FAILURE))
         })
         .unwrap_err()
@@ -480,10 +503,40 @@ mod tests {
         let root = tempdir().unwrap();
         let deep = (0..=MAX_DEPTH).fold(root.path().to_path_buf(), |path, _| path.join("nested"));
         fs::create_dir_all(deep).unwrap();
-        let error = walk(File::open(root.path()).unwrap(), |_, _, _, _| {
+        let error = walk(File::open(root.path()).unwrap(), 0, |_, _, _, _| {
             Ok(Visit::Scan)
         })
         .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("snapshot exceeds {MAX_DEPTH} directory levels"))
+        );
+    }
+
+    #[test_case(false ; "directories")]
+    #[test_case(true ; "symlink_markers")]
+    fn quarantined_repositories_share_the_depth_limit(linked: bool) {
+        let root = tempdir().unwrap();
+        let snapshot = root.path().join("snapshot");
+        let mut nested = snapshot.join(GIT_ENTRY);
+        for _ in 0..=MAX_DEPTH {
+            fs::create_dir_all(&nested).unwrap();
+            fs::write(nested.join(HEAD), CONTENT).unwrap();
+            if linked {
+                symlink("missing", nested.join("objects")).unwrap();
+            } else {
+                fs::create_dir(nested.join("objects")).unwrap();
+            }
+            nested.push(CONFIG);
+        }
+        let error = sanitize_snapshot(
+            &snapshot,
+            &root.path().join("quarantine"),
+            &root.path().join("repository"),
+        )
+        .err()
+        .unwrap();
         assert!(
             error
                 .to_string()
@@ -497,7 +550,7 @@ mod tests {
         fs::write(dir.path().join(UNREADABLE), CONTENT).unwrap();
         fs::write(dir.path().join(HEAD), CONTENT).unwrap();
         let mut visited = false;
-        let error = walk(File::open(dir.path()).unwrap(), |_, name, _, _| {
+        let error = walk(File::open(dir.path()).unwrap(), 0, |_, name, _, _| {
             if name.to_bytes() == UNREADABLE.as_bytes() {
                 return Err(io::Error::other(WALK_FAILURE));
             }
@@ -565,11 +618,12 @@ mod tests {
         fs::write(outside.join(GIT_ENTRY), CONTENT).unwrap();
         walk(
             File::open(&snapshot).unwrap(),
+            0,
             |parent, name, path, _metadata| {
                 if path == Path::new("nested/.git") {
                     fs::rename(snapshot.join("nested"), &moved)?;
                     symlink(&outside, snapshot.join("nested"))?;
-                    quarantine_entry(parent, name, &quarantine)?;
+                    quarantine_entry(parent, name, &quarantine, path.components().count())?;
                     return Ok(Visit::Skip);
                 }
                 Ok(Visit::Scan)

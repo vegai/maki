@@ -37,8 +37,9 @@ maki -p --max-thinking-tokens 8192 "explain this function"
 `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or a positive token budget.
 The CLI also accepts the SDK spellings `disabled` and `enabled` for `off`
 and `adaptive`. `--effort` accepts `minimal` through `max`, and
-`--max-thinking-tokens` accepts a positive integer. When flags are combined,
-`--thinking off` or `disabled` wins, followed by `--max-thinking-tokens`,
+`--max-thinking-tokens` accepts a non-negative integer, with `0` disabling
+thinking. When flags are combined, `--thinking off`, `disabled`, or a zero
+token budget wins, followed by a positive `--max-thinking-tokens`,
 `--effort`, then other `--thinking` settings. Invalid values fail before a
 provider starts.
 

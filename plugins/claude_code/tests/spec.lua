@@ -214,6 +214,12 @@ case("home_credentials_include_the_default_claude_login", function()
   assert(contains(paths, "/home/u/.ssh"), "~/.ssh must be denied")
 end)
 
+case("home_credentials_follow_xdg_data_home", function()
+  local paths = assert(launch.home_credentials("/home/u", nil, { XDG_DATA_HOME = "/data" }))
+  assert(contains(paths, "/data/keyrings"))
+  assert(contains(paths, "/data/fish/fish_history"))
+end)
+
 case("home_credentials_cover_standard_stores_and_user_paths", function()
   local home = "/home/u"
   local paths = assert(launch.home_credentials(home, "custom/login.json,tool/credentials"))

@@ -46,6 +46,10 @@ const METADATA_MARKER: &str = "metadata_ran";
 const QUARANTINE: &str = "git-metadata";
 const SPARSE_MISSING: &str = "omitted/file.rs";
 const DENIED_CONTENT: &str = "secret\n";
+const REPOSITORIES_LEFT_OUT: &str = "maki did not copy the repositories under include";
+const INCLUDED_REPOSITORY: &str = "fixtures/repository";
+const NEGATED_EXCLUSIONS: &str =
+    ".*\n!.gitignore\n!.claude/\n!.maki/\n!.Claude/\n!/node_modules/\n";
 
 const BARE_REPOSITORY: &str = "fixtures/x.git";
 const EXISTING_BARE_FILE: &str = "fixtures/x.git/work.txt";
@@ -2095,9 +2099,16 @@ fn a_session_in_a_linked_project_imports() {
     );
 }
 
-#[test]
-fn agent_config_the_worker_writes_stays_out_of_the_changes() {
-    let (coding, reg, _host, id) = Coding::coded(CODE_CLAUDE_CONFIG);
+#[test_case(false ; "ordinary_ignore_rules")]
+#[test_case(true ; "negated_ignore_rules")]
+fn agent_config_the_worker_writes_stays_out_of_the_changes(negated: bool) {
+    let coding = Coding::new();
+    if negated {
+        write(&coding.project().join(".gitignore"), NEGATED_EXCLUSIONS);
+        git(&coding.project(), &["add", "--", ".gitignore"]);
+    }
+    let (reg, _host) = coding.host(&[]);
+    let id = artifact_id(&coding.code(&reg, CODE_CLAUDE_CONFIG, &[]).unwrap());
     coding.import(&reg, json!({ "id": id })).unwrap();
 
     let project = coding.project();
@@ -2111,6 +2122,56 @@ fn agent_config_the_worker_writes_stays_out_of_the_changes() {
     assert!(!project.join(".maki/init.lua").exists());
     assert!(!project.join("src/.MaKi").exists());
     assert!(!project.join(".Claude").exists());
+}
+
+#[test_case(false ; "copied_dependency")]
+#[test_case(true ; "prepared_dependency")]
+fn negated_ignore_rules_cannot_collect_dependencies(prepared: bool) {
+    let coding = Coding::new();
+    let project = coding.project();
+    write(&project.join(".gitignore"), NEGATED_EXCLUSIONS);
+    git(&project, &["add", "--", ".gitignore"]);
+    let mut options = vec![("dependencies", json!(NODE_MODULES))];
+    if prepared {
+        options.push(("prepare", json!(CREATE_DEPENDENCY)));
+    } else {
+        write(&project.join(DEPENDENCY), DEPENDENCY_CONTENT);
+    }
+    let (reg, _host) = coding.host(&options);
+    let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
+    let id = artifact_id(&reply);
+    coding.import(&reg, json!({ "id": id })).unwrap();
+    assert_eq!(
+        fs::read_to_string(project.join(IMPORTED_LIB)).unwrap(),
+        WORKER_LIB
+    );
+    if prepared {
+        assert!(!project.join(NODE_MODULES).exists());
+    } else {
+        assert_eq!(
+            fs::read_to_string(project.join(DEPENDENCY)).unwrap(),
+            DEPENDENCY_CONTENT
+        );
+    }
+}
+
+#[test_case(UNTRACKED_INPUT ; "containing_folder")]
+#[test_case(INCLUDED_REPOSITORY ; "repository_itself")]
+fn included_nested_repositories_are_skipped_with_a_note(include: &str) {
+    let coding = Coding::new();
+    let repository = coding.project().join(INCLUDED_REPOSITORY);
+    fs::create_dir(&repository).unwrap();
+    git(&repository, &["init", "-q"]);
+    write(&repository.join("local.txt"), DENIED_CONTENT);
+    let (reg, _host) = coding.host(&[]);
+    let reply = coding.code(&reg, CODE_EDIT, &[include]).unwrap();
+    let snapshot = coding.snapshot(&artifact_id(&reply));
+    assert!(reply.contains(REPOSITORIES_LEFT_OUT), "{reply}");
+    assert!(reply.contains(INCLUDED_REPOSITORY), "{reply}");
+    assert!(!snapshot.join(INCLUDED_REPOSITORY).exists());
+    if include == UNTRACKED_INPUT {
+        assert!(snapshot.join("fixtures/in.json").is_file());
+    }
 }
 
 /// A file that became a folder, and a name that the manifest cannot hold, are
