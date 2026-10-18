@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rustix::process::{Pid, test_kill_process_group};
+use rustix::process::{Pid, Signal, kill_process, test_kill_process_group};
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
 
@@ -17,6 +17,7 @@ use super::run::{Exchange, Launch, Limits, Request, Thinking, request};
 use crate::{Message, ProviderEvent, ProviderUsage, StreamResponse};
 
 const OWNER_ONLY_MODE: &str = "700";
+const DETACHED_PID: &str = "detached-pid";
 pub(super) const TOOL: &str = "read";
 pub(super) const IDLE: Duration = Duration::from_secs(10);
 /// Generous for a loaded machine. Only a test that waits out the whole
@@ -190,6 +191,16 @@ pub(super) fn wait_until(mut done: impl FnMut() -> bool) -> bool {
         thread::sleep(POLL);
     }
     false
+}
+
+impl Drop for Fake {
+    fn drop(&mut self) {
+        if let Ok(pid) = self.log(DETACHED_PID).trim().parse()
+            && let Some(pid) = Pid::from_raw(pid)
+        {
+            let _ = kill_process(pid, Signal::KILL);
+        }
+    }
 }
 
 /// The only tool maki offers in these tests.

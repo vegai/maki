@@ -68,6 +68,7 @@ const CLAUDE_CODE: EffortDialect = EffortDialect {
 };
 pub(crate) const SLUG: &str = "claude-code";
 pub(crate) const OAUTH_TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 const DISPLAY_NAME: &str = "Claude Code (experimental)";
 const PLUGIN: &str = "claude_code";
 const PLUGIN_OFF: &str =

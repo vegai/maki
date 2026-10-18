@@ -126,8 +126,8 @@ const LOCAL_SETTINGS_FILE: &str = "settings.local.json";
 const BUILTIN_PLUGIN_MARKER: &str = "builtin";
 const UNREADABLE_FILE: &str = "maki cannot read it";
 const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
-const SETTINGS_TOO_LARGE: &str = "settings file exceeds the 1 MiB limit";
-const SETTINGS_NOT_A_FILE: &str = "settings path is not a regular file";
+const MAX_GIT_PATH_BYTES: u64 = 4096;
+const NOT_A_FILE: &str = "path is not a regular file";
 const NOT_AN_OBJECT: &str = "is not a JSON object";
 
 pub(crate) const DEFAULT_MODE: &str = "default";
@@ -269,10 +269,10 @@ pub(crate) fn child_env(
 }
 
 pub fn git_directory(entry: &Path) -> io::Result<PathBuf> {
-    if !fs::metadata(entry)?.is_file() {
+    if fs::metadata(entry)?.is_dir() {
         return Ok(entry.to_owned());
     }
-    let text = fs::read_to_string(entry)?;
+    let text = limited_text(entry, MAX_GIT_PATH_BYTES)?;
     let pointed = text
         .trim()
         .strip_prefix(GITDIR_PREFIX)
@@ -289,7 +289,7 @@ pub fn git_directory(entry: &Path) -> io::Result<PathBuf> {
 /// Claude Code and the plugin do.
 fn main_checkout(git_file: &Path) -> io::Result<(Option<PathBuf>, Option<PathBuf>)> {
     let gitdir = git_directory(git_file)?;
-    let common = match fs::read_to_string(gitdir.join(COMMONDIR_FILE)) {
+    let common = match limited_text(&gitdir.join(COMMONDIR_FILE), MAX_GIT_PATH_BYTES) {
         Ok(common) => common,
         Err(e) if e.kind() == ErrorKind::NotFound => {
             return Ok((None, Some(normalize_path(&gitdir))));
@@ -316,7 +316,7 @@ pub(crate) fn local_settings_dirs(cwd: &Path) -> Result<(Vec<PathBuf>, Option<Pa
         if !dirs.contains(&root) {
             dirs.push(root);
         }
-        if meta.is_file() {
+        if !meta.is_dir() {
             let (main, external_git) = main_checkout(&git).map_err(|source| Error::Path {
                 what: "examine the worktree of",
                 path: git.clone(),
@@ -413,7 +413,7 @@ fn settings_conflicts(settings: &Value) -> Vec<String> {
     keys
 }
 
-fn settings_text(path: &Path) -> io::Result<String> {
+fn limited_text(path: &Path, max_bytes: u64) -> io::Result<String> {
     #[cfg(unix)]
     let file = File::from(open(
         path,
@@ -423,13 +423,15 @@ fn settings_text(path: &Path) -> io::Result<String> {
     #[cfg(not(unix))]
     let file = File::open(path)?;
     if !file.metadata()?.is_file() {
-        return Err(io::Error::new(ErrorKind::InvalidData, SETTINGS_NOT_A_FILE));
+        return Err(io::Error::new(ErrorKind::InvalidData, NOT_A_FILE));
     }
     let mut text = String::new();
-    file.take(MAX_SETTINGS_BYTES + 1)
-        .read_to_string(&mut text)?;
-    if text.len() as u64 > MAX_SETTINGS_BYTES {
-        return Err(io::Error::new(ErrorKind::InvalidData, SETTINGS_TOO_LARGE));
+    file.take(max_bytes + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > max_bytes {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("file exceeds the {max_bytes}-byte limit"),
+        ));
     }
     Ok(text)
 }
@@ -439,7 +441,7 @@ pub(crate) fn file_conflicts(paths: &[PathBuf]) -> Vec<String> {
     let mut found = Vec::new();
     for path in paths {
         let shown = path.display();
-        let text = match settings_text(path) {
+        let text = match limited_text(path, MAX_SETTINGS_BYTES) {
             Ok(text) => text,
             Err(e) if e.kind() == ErrorKind::NotFound => continue,
             Err(e) => {
@@ -668,7 +670,8 @@ pub(super) fn init_problem_in(
 mod tests {
     use std::collections::HashSet;
     use std::ffi::OsString;
-    use std::fs;
+    use std::fs::{self, File};
+    use std::io::ErrorKind;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
@@ -682,11 +685,11 @@ mod tests {
     use super::super::error::{Error, Problem};
     use super::super::stream::{ACCOUNT_ANSWER, HOOKS_ANSWER, SETTINGS_ANSWER};
     #[cfg(unix)]
-    use super::SETTINGS_NOT_A_FILE;
+    use super::NOT_A_FILE;
     use super::{
         COMMONDIR_FILE, CONNECTED, DEFAULT_MODE, ESSENTIAL_TRAFFIC_ONLY, FLAG_SOURCE, GIT_ENTRY,
-        HANDSHAKE, InitExpect, MAX_SETTINGS_BYTES, NO_KEY_SOURCE, NOT_AN_OBJECT, POLICY_SOURCE,
-        SETTINGS_TOO_LARGE, UNREADABLE_FILE, account_problem, child_env, config_dir,
+        HANDSHAKE, InitExpect, MAX_GIT_PATH_BYTES, MAX_SETTINGS_BYTES, NO_KEY_SOURCE,
+        NOT_AN_OBJECT, POLICY_SOURCE, UNREADABLE_FILE, account_problem, child_env, config_dir,
         file_conflicts, init_problem, local_settings_dirs, plugins_problem, policy_problem,
         profile, settings_conflicts,
     };
@@ -698,11 +701,14 @@ mod tests {
     fn oversized_settings_fail_closed() {
         let dir = tempdir().unwrap();
         let path = dir.path().join(SETTINGS_FIXTURE);
-        fs::File::create(&path)
+        File::create(&path)
             .unwrap()
             .set_len(MAX_SETTINGS_BYTES + 1)
             .unwrap();
-        assert!(file_conflicts(&[path])[0].contains(SETTINGS_TOO_LARGE));
+        assert!(
+            file_conflicts(&[path])[0]
+                .contains(&format!("file exceeds the {MAX_SETTINGS_BYTES}-byte limit"))
+        );
     }
 
     #[cfg(unix)]
@@ -716,7 +722,7 @@ mod tests {
         } else {
             mkfifoat(AT_CWD, &path, Mode::RUSR | Mode::WUSR).unwrap();
         }
-        assert!(file_conflicts(&[path])[0].contains(SETTINGS_NOT_A_FILE));
+        assert!(file_conflicts(&[path])[0].contains(NOT_A_FILE));
     }
     const LINUX: &str = "linux";
     const SERVER: &str = "maki";
@@ -945,6 +951,47 @@ mod tests {
         fs::create_dir(&tree).unwrap();
         fs::write(tree.join(GIT_ENTRY), git_file).unwrap();
         (dir, tree)
+    }
+
+    #[test_case(false ; "git_pointer")]
+    #[test_case(true ; "commondir")]
+    fn oversized_git_paths_fail_closed(common: bool) {
+        let (_dir, tree) = worktree(b"gitdir: ../main/.git/worktrees/wt\n", Some(b"../..\n"));
+        let path = if common {
+            tree.join("../main/.git/worktrees/wt").join(COMMONDIR_FILE)
+        } else {
+            tree.join(GIT_ENTRY)
+        };
+        File::create(path)
+            .unwrap()
+            .set_len(MAX_GIT_PATH_BYTES + 1)
+            .unwrap();
+        let error = local_settings_dirs(&tree).unwrap_err();
+        assert!(
+            matches!(error, Error::Path { source, .. } if source.kind() == ErrorKind::InvalidData)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test_case(false, false ; "git_pointer_fifo")]
+    #[test_case(false, true ; "git_pointer_device")]
+    #[test_case(true, false ; "commondir_fifo")]
+    #[test_case(true, true ; "commondir_device")]
+    fn nonregular_git_paths_fail_without_waiting(common: bool, device: bool) {
+        let (_dir, tree) = worktree(b"gitdir: ../main/.git/worktrees/wt\n", Some(b"../..\n"));
+        let path = if common {
+            tree.join("../main/.git/worktrees/wt").join(COMMONDIR_FILE)
+        } else {
+            tree.join(GIT_ENTRY)
+        };
+        fs::remove_file(&path).unwrap();
+        if device {
+            symlink("/dev/zero", &path).unwrap();
+        } else {
+            mkfifoat(AT_CWD, &path, Mode::RUSR | Mode::WUSR).unwrap();
+        }
+        let error = local_settings_dirs(&tree).unwrap_err();
+        assert!(matches!(error, Error::Path { source, .. } if source.to_string() == NOT_A_FILE));
     }
 
     /// Claude Code follows a `.git` link, so a link to a worktree's `.git`

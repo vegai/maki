@@ -191,6 +191,7 @@ impl Drop for Process {
 #[test_case(false, Some("low"), &["--thinking", "xhigh"], Yes, "xhigh", Some(XHIGH_BUDGET) ; "print_thinking_overrides_config_and_state")]
 #[test_case(false, Some("low"), &["--effort", "high"], Yes, "high", Some(HIGH_BUDGET) ; "print_effort")]
 #[test_case(false, Some("low"), &["--max-thinking-tokens", "2048"], Yes, "2048", Some(EXPLICIT_BUDGET) ; "print_budget")]
+#[test_case(false, Some("high"), &["--max-thinking-tokens", "0"], Yes, "off", None ; "print_zero_budget")]
 #[test_case(false, Some("high"), &["--thinking", "off"], Yes, "off", None ; "explicit_off")]
 #[test_case(false, Some("xhigh"), &[], Yes, "xhigh", Some(XHIGH_BUDGET) ; "configured_fallback")]
 #[test_case(false, None, &[], Yes, "max", Some(MAX_BUDGET) ; "saved_fallback")]
@@ -199,6 +200,7 @@ impl Drop for Process {
 #[test_case(true, Some("low"), &["--thinking", "xhigh"], Yes, "xhigh", Some(XHIGH_BUDGET) ; "sdk_thinking")]
 #[test_case(true, Some("low"), &["--effort", "xhigh"], Yes, "xhigh", Some(XHIGH_BUDGET) ; "sdk_effort")]
 #[test_case(true, Some("low"), &["--max-thinking-tokens", "2048"], Yes, "2048", Some(EXPLICIT_BUDGET) ; "sdk_budget")]
+#[test_case(true, Some("high"), &["--max-thinking-tokens", "0"], Yes, "off", None ; "sdk_zero_budget")]
 #[test_case(true, None, &["--thinking", "max"], No, "off", None ; "sdk_model_clamping")]
 #[test_case(true, None, &["--thinking", "disabled"], Yes, "off", None ; "sdk_disabled")]
 #[test_case(true, None, &["--thinking", "enabled", "--effort", "high"], Yes, "high", Some(HIGH_BUDGET) ; "sdk_enabled_with_effort")]
@@ -238,6 +240,7 @@ fn headless_thinking_reaches_the_request_and_init(
 #[test_case(&["--thinking", "xhigh"], Some(XHIGH_BUDGET) ; "thinking")]
 #[test_case(&["--effort", "high"], Some(HIGH_BUDGET) ; "effort")]
 #[test_case(&["--max-thinking-tokens", "2048"], Some(EXPLICIT_BUDGET) ; "budget")]
+#[test_case(&["--max-thinking-tokens", "0"], None ; "zero_budget")]
 fn acp_launch_thinking_reaches_the_request(flags: &[&str], budget: Option<u64>) {
     let fixture = Fixture::new(Some("low"), Yes);
     let mut command = fixture.command();
@@ -255,7 +258,7 @@ fn acp_launch_thinking_reaches_the_request(flags: &[&str], budget: Option<u64>) 
 
 #[test_case(&["-p", "--thinking", "turbo"] ; "print")]
 #[test_case(&["-p", "--input-format", "stream-json", "--effort", "turbo"] ; "sdk")]
-#[test_case(&["acp", "--max-thinking-tokens", "0"] ; "acp")]
+#[test_case(&["acp", "--max-thinking-tokens", "-1"] ; "acp")]
 fn invalid_launch_thinking_exits_before_a_provider_request(flags: &[&str]) {
     let fixture = Fixture::new(None, Yes);
     let output = fixture.command().args(flags).output().unwrap();

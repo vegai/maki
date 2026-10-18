@@ -84,7 +84,7 @@ claude_code = { enabled = true, config_dir = "/home/me/.claude-maki" },
 checkout --snapshot--> artifact --claude -p--> changes --claude_code_import--> checkout
 ```
 
-1. maki takes a snapshot of the session's directory in a new artifact directory. It copies tracked files from disk, including uncommitted edits. The call can list additional untracked paths in `include`. The snapshot excludes `.env*`, files and directories named `secrets`, `deny_read` paths, `.claude`, `.maki`, sparse-checkout omissions, submodules and external links. Protected agent directory names are checked without regard to case. The reply names skipped submodules.
+1. maki takes a snapshot of the session's directory in a new artifact directory. It copies tracked files from disk, including uncommitted edits. The call can list additional untracked paths in `include`. The snapshot excludes `.env*`, files and directories named `secrets`, `deny_read` paths, `.claude`, `.maki`, sparse-checkout omissions, submodules, untracked nested repositories and external links. Protected agent directory names are checked without regard to case. The reply names skipped repositories.
 
    A secret under another name, such as a tracked `.npmrc`, enters the snapshot. Add it to `deny_read`. The snapshot gets a fresh git repository. If a file changes during the copy, the call stops.
 

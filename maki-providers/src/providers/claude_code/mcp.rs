@@ -20,13 +20,13 @@ use smol::net::{TcpListener, TcpStream};
 use smol::{Task, Timer};
 use tracing::warn;
 
+use super::MAX_EVENT_BYTES;
 use super::error::Error;
 use super::run::within;
 
 const ENDPOINT: &str = "/mcp";
 const MAX_HEAD_BYTES: usize = 16 * 1024;
-/// A `write` call carries a whole file, so the body limit is large.
-const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+const MAX_BODY_BYTES: usize = MAX_EVENT_BYTES;
 const MAX_CONNECTIONS: usize = 32;
 const MAX_UNAUTHENTICATED: usize = 8;
 const HEAD_TIMEOUT: Duration = Duration::from_secs(2);

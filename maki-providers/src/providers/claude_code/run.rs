@@ -425,14 +425,20 @@ async fn exchange_reply(
         Err(Error::ExitLate) => {
             group.kill();
             warn!("claude-code: output stayed open after a complete reply; stopping the CLI");
-            drain(
+            match drain(
                 turn,
                 &mut lines,
                 handoffs,
                 Instant::now() + limits.exit,
                 true,
             )
-            .await?;
+            .await
+            {
+                Err(Error::ExitLate) => {
+                    warn!("claude-code: output stayed open after the kill; keeping the reply");
+                }
+                result => result?,
+            }
             deadline = Instant::now() + limits.exit;
         }
         result => result?,
@@ -905,6 +911,7 @@ mod tests {
     /// the exit limit, and so does the process.
     #[test_case("text_then_linger" ; "closed_stdout")]
     #[test_case("text_then_slow_stdout" ; "open_stdout")]
+    #[test_case("text_then_detached_stdout" ; "stdout_open_after_kill")]
     fn a_complete_reply_survives_a_cli_that_does_not_exit(scenario: &str) {
         let fake = Fake::new(scenario);
         let (result, _) = smol::block_on(fake.request_with(

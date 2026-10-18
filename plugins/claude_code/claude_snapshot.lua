@@ -190,7 +190,12 @@ local function snapshot_paths(call, artifact, spec)
     if not untracked then
       return nil, untracked_err
     end
-    for _, path in ipairs(workspace.listed_paths(untracked)) do
+    local included, repositories = workspace.untracked_paths(untracked)
+    if #repositories > 0 then
+      artifact.notes[#artifact.notes + 1] = "maki did not copy the repositories under include: "
+        .. M.shown(repositories)
+    end
+    for _, path in ipairs(included) do
       local dependency = false
       for _, dir in ipairs(spec.dependencies) do
         dependency = dependency or workspace.within(path, dir)
@@ -240,12 +245,7 @@ local function copy_dependencies(call, artifact, spec, paths)
       if not listed then
         return nil, "maki cannot list the dependency " .. dir .. ": " .. list_err
       end
-      -- git lists a nested repository as the directory itself.
-      local files, nested = {}, {}
-      for _, path in ipairs(workspace.listed_paths(listed)) do
-        local list = path:sub(-1) == "/" and nested or files
-        list[#list + 1] = path
-      end
+      local files, nested = workspace.untracked_paths(listed)
       local unusual = workspace.first_non_utf8(files)
       if unusual then
         return nil, NON_UTF8_PATH:format(workspace.printable(unusual))
@@ -420,6 +420,7 @@ end
 --- `dependencies`. A dependency that changed during the copy sets
 --- `artifact.unsettled`.
 function M.fill(call, artifact, spec)
+  artifact.excluded_pathspecs = workspace.collection_pathspecs(spec.dependencies)
   local paths, paths_err, tracked = snapshot_paths(call, artifact, spec)
   if not paths then
     return paths_err
@@ -629,9 +630,25 @@ function M.sanitize(artifact)
 end
 
 local function stage_changes(call, artifact)
-  local _, add_err = snapshot_git(call, artifact, { "add", "-A" })
-  if add_err then
-    return nil, add_err
+  local args = { "ls-files", "--cached", "--others", "--exclude-standard", "--", "." }
+  for _, pathspec in ipairs(artifact.excluded_pathspecs) do
+    args[#args + 1] = pathspec
+  end
+  local listed, list_err = snapshot_git(call, artifact, args)
+  if not listed then
+    return nil, list_err
+  end
+  local paths = workspace.listed_paths(listed)
+  if #paths > 0 then
+    local _, add_err = snapshot_git(
+      call,
+      artifact,
+      { "--literal-pathspecs", "add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul" },
+      table.concat(paths, "\0")
+    )
+    if add_err then
+      return nil, add_err
+    end
   end
   -- After staging, only gitignored paths remain untracked. Exclude maki's
   -- dependency paths from this list without also hiding the .gitignore paths.

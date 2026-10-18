@@ -209,15 +209,23 @@ function M.snapshot_git_env(env, git_dir, snapshot)
   return git_env
 end
 
-function M.excluded_pathspecs(deny_read)
+function M.collection_pathspecs(dependencies)
   local specs = {}
-  for _, pattern in ipairs(assert(M.denied_paths(deny_read))) do
-    specs[#specs + 1] = ":(exclude,glob)" .. pattern
-    specs[#specs + 1] = ":(exclude,glob)" .. pattern .. "/**"
-  end
   for _, pattern in ipairs(ALSO_EXCLUDED) do
     specs[#specs + 1] = ":(exclude,icase,glob)" .. pattern
     specs[#specs + 1] = ":(exclude,icase,glob)" .. pattern .. "/**"
+  end
+  for _, dir in ipairs(dependencies) do
+    specs[#specs + 1] = ":(exclude,literal)" .. dir
+  end
+  return specs
+end
+
+function M.excluded_pathspecs(deny_read)
+  local specs = M.collection_pathspecs({})
+  for _, pattern in ipairs(assert(M.denied_paths(deny_read))) do
+    specs[#specs + 1] = ":(exclude,glob)" .. pattern
+    specs[#specs + 1] = ":(exclude,glob)" .. pattern .. "/**"
   end
   return specs
 end
@@ -417,6 +425,15 @@ function M.listed_paths(output)
     paths[#paths + 1] = M.unquote(line)
   end
   return paths
+end
+
+function M.untracked_paths(output)
+  local files, repositories = {}, {}
+  for _, path in ipairs(M.listed_paths(output)) do
+    local list = path:sub(-1) == "/" and repositories or files
+    list[#list + 1] = path
+  end
+  return files, repositories
 end
 
 --- maki can only pass UTF-8 names to a process.
