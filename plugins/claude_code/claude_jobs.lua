@@ -196,6 +196,7 @@ end
 
 --- The `inherit_env` option merges `env` into maki's environment without provider keys.
 --- Otherwise `env` supplies the entire child environment.
+--- The `display` option replaces the joined argv in error messages.
 function Call:run_quick(argv, spec)
   local shown = "`" .. (spec.display or table.concat(argv, " ")) .. "`"
   local stderr_tail = {}
