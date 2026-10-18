@@ -15,7 +15,7 @@ use tracing::debug;
 use super::checks::{self, HANDSHAKE, InitExpect};
 use super::error::{Error, Problem, TOO_MANY_REQUESTS, UNKNOWN_ERROR, shown};
 use super::mcp::Handoff;
-use super::transcript::{BATCH_CALL_TOOL, BATCH_CALLS, BATCH_TOOL, Catalog};
+use super::transcript::{BATCH_CALL_TOOL, BATCH_CALLS, BATCH_TOOL, Catalog, USER_ROLE};
 use crate::model::is_same_model;
 use crate::providers::anthropic::{LABEL_SESSION, LABEL_WEEK_ALL};
 use crate::{
@@ -402,7 +402,7 @@ pub(crate) fn user_message(blocks: &[String]) -> Result<String, Error> {
                     kind: TEXT_BLOCK,
                 })
                 .collect(),
-            role: USER_EVENT,
+            role: USER_ROLE,
         },
         kind: USER_EVENT,
     };

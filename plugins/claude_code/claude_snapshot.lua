@@ -13,6 +13,7 @@ local M = {}
 
 local TRASH_PREFIX = ".trash-"
 local SWEEP_LOCK = ".sweep.lock"
+M.CANNOT_SWEEP = "claude_code: maki cannot lock artifact cleanup in "
 local SWEEP_CONTENTS = [[
 set -e
 cd -P -- "$1"
@@ -495,8 +496,15 @@ end
 --- dated by its marker.
 function M.sweep(call, root, ttl_hours)
   -- Artifact locks are unlinked during deletion. Keep this lock outside the deleted tree.
-  local sweep_lock = maki.fs.try_lock(maki.fs.joinpath(root, SWEEP_LOCK))
+  local sweep_lock, lock_err = maki.fs.try_lock(maki.fs.joinpath(root, SWEEP_LOCK))
   if not sweep_lock then
+    if lock_err == native.lock_busy then
+      return
+    end
+    local meta, meta_err = maki.fs.metadata(root)
+    if meta or meta_err then
+      maki.notify(M.CANNOT_SWEEP .. root .. ": " .. lock_err, "warn")
+    end
     return
   end
   local entries = maki.fs.dir(root)

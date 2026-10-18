@@ -14,7 +14,7 @@ use mlua::{
 };
 use serde_json::Value;
 
-use crate::api::fs::path_text;
+use crate::api::fs::{LOCK_BUSY, path_text};
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::pair::{Pair, pair, try_pair};
 use crate::plugin_permissions::PluginPermissions;
@@ -28,7 +28,9 @@ pub(crate) fn create_private_module(
     lua: &Lua,
     perms: &PluginPermissions,
 ) -> LuaResult<(&'static str, Table)> {
-    Ok((MODULE, create_claude_code_table(lua, perms)?))
+    let table = create_claude_code_table(lua, perms)?;
+    table.set("lock_busy", LOCK_BUSY)?;
+    Ok((MODULE, table))
 }
 
 /// Resolve the checkout's Git directory for the shared import lock.
