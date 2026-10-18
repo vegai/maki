@@ -363,13 +363,19 @@ impl PermissionPrompt {
                 Span::styled(format!("{waiting} {QUEUED_NOTICE}"), t.item_desc),
             ]));
         }
-        for (i, s) in scopes.iter().enumerate() {
-            let label = if i == 0 { "scope " } else { "    + " };
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(label, label_style),
-                Span::styled(s.clone(), value_style),
-            ]));
+        for (i, scope) in scopes.iter().enumerate() {
+            for (line, text) in scope.split('\n').enumerate() {
+                let label = match (i, line) {
+                    (0, 0) => "scope ",
+                    (_, 0) => "    + ",
+                    _ => "      ",
+                };
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(label, label_style),
+                    Span::styled(text.to_owned(), value_style),
+                ]));
+            }
         }
 
         if !allow_scopes.is_empty() {
@@ -541,6 +547,32 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn multiline_scopes_keep_the_change_list_above_the_command() {
+        const SCOPE: &str = "# Import changes\n# M src/main.rs\n\nset -e";
+        let mut prompt = PermissionPrompt::new();
+        prompt.push(
+            MAIN_ID.into(),
+            ToolKey::native("bash"),
+            vec![SCOPE.into()],
+            None,
+            true,
+            None,
+        );
+        let lines: Vec<String> = prompt
+            .build_lines()
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect();
+        let first = lines
+            .iter()
+            .position(|line| line.contains("# Import changes"))
+            .unwrap();
+        assert_eq!(lines[first + 1].trim(), "# M src/main.rs");
+        assert_eq!(lines[first + 3].trim(), "set -e");
+        assert_eq!(prompt.queue.front().unwrap().scopes, [SCOPE]);
     }
 
     #[test]

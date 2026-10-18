@@ -34,13 +34,11 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     family: ModelFamily::Generic,
     supports_thinking: false,
     supports_deferred_tools: false,
-    accepts_images: true,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(16_384),
     fallback_context_window: 128_000,
     models_toml: NO_CURATED_MODELS,
     models_of: None,
-    plugin: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,

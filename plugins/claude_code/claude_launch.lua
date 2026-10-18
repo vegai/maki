@@ -6,15 +6,17 @@ local native = require("maki.claude_code.internal")
 
 local jobs = require("claude_jobs")
 local Stream = require("claude_stream")
-local workspace = require("claude_workspace")
+local path_utils = require("claude_paths")
 
 local M = {}
 
 M.MODELS = { "sonnet", "opus", "haiku", "fable" }
+local MODEL_SET = path_utils.set_of(M.MODELS)
 M.STARTUP_TIMEOUT_SECS = 30
 M.STARTUP_MS = M.STARTUP_TIMEOUT_SECS * jobs.MS_PER_SEC
 M.READ_PROFILE = "read"
 M.CODE_PROFILE = "code"
+M.DENY_HOME_OUTSIDE = "a deny_read_home path must stay inside the home directory"
 M.NO_SESSION_DIR = "maki cannot find the session's working directory: "
 local PROBE_RUN = "Claude Code started a run during its checks, before maki sent a prompt"
 
@@ -47,34 +49,6 @@ M.WORKERS = {
     contract = CODE_CONTRACT,
   },
 }
-
---- `ipairs` skips object entries. Require a JSON array so an object cannot bypass list validation.
-function M.is_list(value)
-  if type(value) ~= "table" then
-    return false
-  end
-  if next(value) == nil and getmetatable(value) == nil then
-    return false
-  end
-  local count = 0
-  for _ in pairs(value) do
-    count = count + 1
-  end
-  for key in pairs(value) do
-    if type(key) ~= "number" or key % 1 ~= 0 or key < 1 or key > count then
-      return false
-    end
-  end
-  return true
-end
-
-function M.set_of(list)
-  local set = {}
-  for _, item in ipairs(M.is_list(list) and list or {}) do
-    set[item] = true
-  end
-  return set
-end
 
 -- Limits for a call's `timeout` and for the option.
 M.MIN_TIMEOUT_SECS = 30
@@ -157,7 +131,7 @@ local HOME_CREDENTIALS = {
   "snap",
 }
 
-local NO_HOME = "maki cannot find your home directory, so it cannot keep the coding worker's shell away from "
+M.NO_HOME = "maki cannot find your home directory, so it cannot keep the coding worker's shell away from "
   .. "the logins and keys there. Set HOME, or use the read profile."
 
 local function sorted_keys(t)
@@ -173,7 +147,7 @@ end
 --- login token, or a proxy URL with a user or password in it. Names compare
 --- in upper case, because `https_proxy` and the like reach the child too.
 function M.shell_secret_problem(worker, env)
-  if not M.set_of(worker.tools)[SHELL_TOOL] then
+  if not path_utils.set_of(worker.tools)[SHELL_TOOL] then
     return nil
   end
   for name, value in pairs(env) do
@@ -195,9 +169,9 @@ function M.shell_secret_problem(worker, env)
 end
 
 function M.denied_home_paths(extra)
-  return workspace.comma_list(extra, function(path)
+  return path_utils.comma_list(extra, function(path)
     if path:sub(1, 1) == "/" or path:sub(1, 1) == "~" or ("/" .. path .. "/"):find("/../", 1, true) then
-      return nil, "a deny_read_home path must stay inside the home directory"
+      return nil, M.DENY_HOME_OUTSIDE
     end
     return path
   end)
@@ -207,7 +181,7 @@ end
 --- cannot read, or nil and the reason when there is no home directory.
 function M.home_credentials(home, extra, environ)
   if not home or home == "" then
-    return nil, NO_HOME
+    return nil, M.NO_HOME
   end
   local cwd, cwd_err = maki.uv.cwd()
   if not cwd then
@@ -241,7 +215,7 @@ function M.home_credentials(home, extra, environ)
   add(maki.fs.joinpath(resolved_home, ".claude.json*"))
   for _, path in ipairs(state_files) do
     local resolved = maki.fs.realpath(maki.fs.joinpath(resolved_home, path))
-    if resolved and not workspace.within(resolved, resolved_home) then
+    if resolved and not path_utils.within(resolved, resolved_home) then
       add(resolved)
     end
   end
@@ -292,16 +266,16 @@ end
 --- the session's directory when that is a subdirectory or a worktree.
 function M.in_checkout(path, spec)
   for _, dir in ipairs(spec.checkout_dirs) do
-    if workspace.within(path, dir) then
+    if path_utils.within(path, dir) then
       return true
     end
   end
-  return spec.git_dir ~= nil and workspace.within(path, spec.git_dir)
+  return spec.git_dir ~= nil and path_utils.within(path, spec.git_dir)
 end
 
 local function deny_rules(extra)
   local rules = {}
-  for i, pattern in ipairs(assert(workspace.denied_paths(extra))) do
+  for i, pattern in ipairs(assert(path_utils.denied_paths(extra))) do
     rules[i] = "Read(./" .. pattern .. ")"
   end
   return rules
@@ -470,7 +444,7 @@ end
 -- Only a coding call has a `plan`.
 function M.preflight(input, ctx, call, opts, plan)
   local model = input.model or opts.model
-  if not M.set_of(M.MODELS)[model] then
+  if not MODEL_SET[model] then
     return nil, "unknown model " .. tostring(model) .. ", use one of " .. table.concat(M.MODELS, ", ")
   end
   local worker = M.WORKERS[input.profile or M.READ_PROFILE]

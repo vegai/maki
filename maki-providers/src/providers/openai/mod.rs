@@ -36,13 +36,11 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     family: ModelFamily::Gpt,
     supports_thinking: true,
     supports_deferred_tools: false,
-    accepts_images: true,
     accepts_arbitrary_models: false,
     fallback_max_output: Some(100_000),
     fallback_context_window: 200_000,
     models_toml: include_str!("../../../models/openai.toml"),
     models_of: None,
-    plugin: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,

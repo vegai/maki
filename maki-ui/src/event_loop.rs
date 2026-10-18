@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
-use futures::FutureExt;
+use futures_lite::FutureExt;
 
 use crossterm::event::{
     Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,

@@ -4,6 +4,8 @@
 //! maki executes the calls with its own tools and permissions. The plugin setting enables
 //! both the plugin and the provider.
 
+#[cfg(unix)]
+pub mod blobs;
 mod checks;
 mod error;
 #[cfg(all(test, target_os = "linux"))]
@@ -12,6 +14,8 @@ mod fake;
 mod live;
 mod mcp;
 mod run;
+#[cfg(unix)]
+pub mod snapshot;
 mod stream;
 mod transcript;
 pub mod validation;
@@ -29,6 +33,8 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use flume::Sender;
+#[cfg(unix)]
+use rustix::fs::OFlags;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -43,8 +49,7 @@ use crate::providers::anthropic::shared::{
 };
 use crate::providers::{Timeouts, anthropic, catalog};
 use crate::spec::{
-    AuthDoc, Build, CatalogDoc, GeneratedDocs, NO_CURATED_MODELS, Native, PluginBinding,
-    ProviderSpec,
+    AuthDoc, Build, CatalogDoc, GeneratedDocs, NO_CURATED_MODELS, Native, ProviderSpec,
 };
 use crate::{
     AgentError, Effort, EffortDialect, Message, ProviderEvent, ProviderUsage, RequestOptions,
@@ -68,9 +73,14 @@ const CLAUDE_CODE: EffortDialect = EffortDialect {
 };
 pub(crate) const SLUG: &str = "claude-code";
 pub(crate) const OAUTH_TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+#[cfg(unix)]
+const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
 const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 const DISPLAY_NAME: &str = "Claude Code (experimental)";
-const PLUGIN: &str = "claude_code";
+pub const PLUGIN: &str = "claude_code";
 const PLUGIN_OFF: &str =
     "enable the claude_code plugin in init.lua: `plugins = { claude_code = { enabled = true } }`";
 // The provider reads these plugin options too, so the plugin and the
@@ -116,17 +126,12 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     api_key_env: NO_KEY_ENV,
     family: ModelFamily::Claude,
     supports_thinking: true,
-    accepts_images: false,
     supports_deferred_tools: false,
     accepts_arbitrary_models: false,
     fallback_max_output: None,
     fallback_context_window: 200_000,
     models_toml: NO_CURATED_MODELS,
     models_of: Some(anthropic::SLUG),
-    plugin: Some(PluginBinding {
-        name: PLUGIN,
-        configure: configure_plugin,
-    }),
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
@@ -146,8 +151,6 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
 /// Shared by all sessions, because each request is a process. The plugin
 /// limits its calls separately.
 static SLOTS: Mutex<Option<(usize, Arc<Semaphore>)>> = Mutex::new(None);
-/// All sessions share one login, so each sees the latest usage.
-static PLAN_USAGE: Mutex<Option<ProviderUsage>> = Mutex::new(None);
 /// `None` when the provider is off.
 static PLUGIN_OPTIONS: Mutex<Option<PluginOptions>> = Mutex::new(None);
 /// Failed listings, keyed by `claude` and login like the saved list. The
@@ -183,11 +186,11 @@ impl PluginOptions {
     }
 }
 
-fn configure_plugin(options: Option<&Map<String, Value>>) {
+pub fn configure_plugin(enabled: bool, options: Option<&Map<String, Value>>) {
     *PLUGIN_OPTIONS
         .lock()
         .unwrap_or_else(PoisonError::into_inner) =
-        options.map(|options| PluginOptions::from_table(Some(options)));
+        enabled.then(|| PluginOptions::from_table(options));
 }
 
 /// New limits need new slots. Active and queued requests keep their old limit until completion.
@@ -461,6 +464,7 @@ struct ClaudeCode {
     environment: Arc<Environment>,
     models_cache: Option<PathBuf>,
     windows: Arc<Mutex<Option<SavedModels>>>,
+    plan_usage: Arc<Mutex<Option<ProviderUsage>>>,
     /// Takes precedence over `$CLAUDE_CONFIG_DIR`.
     config_dir: Option<PathBuf>,
 }
@@ -486,6 +490,7 @@ impl ClaudeCode {
             }),
             models_cache: models_cache_path(),
             windows: Arc::default(),
+            plan_usage: Arc::default(),
             config_dir: options.config_dir.clone(),
         })
     }
@@ -620,7 +625,7 @@ impl ClaudeCode {
         let slots = slots();
         let _slot = slots.acquire().await;
         let prepared = self.prepare_async(cwd, vars).await?;
-        let models = run::models(&self.launch(&prepared, cwd), &PLAN_USAGE).await?;
+        let models = run::models(&self.launch(&prepared, cwd), &self.plan_usage).await?;
         let saved = SavedModels {
             executable: self.executable.clone(),
             config_dir: prepared.config_dir,
@@ -665,7 +670,7 @@ impl ClaudeCode {
             launch: self.launch(&prepared, &cwd),
             model: &model.id,
             exchange,
-            plan_usage: &PLAN_USAGE,
+            plan_usage: &self.plan_usage,
             max_output: model.output_tokens(),
             thinking,
         })
@@ -718,19 +723,19 @@ impl Provider for ClaudeCode {
 
     /// Asks Claude Code which models the account can use, so a new model
     /// shows up without a maki update.
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        self.list_models_with(ModelListing::Cached)
-    }
-
-    fn list_models_fresh(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        self.list_models_with(ModelListing::Refresh)
+    fn list_models(
+        &self,
+        listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        self.list_models_with(listing)
     }
 
     /// The last request's usage, because Claude Code has no endpoint maki can
     /// ask.
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
         Box::pin(async {
-            Ok(PLAN_USAGE
+            Ok(self
+                .plan_usage
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone())
@@ -741,6 +746,7 @@ impl Provider for ClaudeCode {
     /// window until a listing reports it. models.dev gives the 1M a model can
     /// open, but Claude Code opens it only for `[1m]`.
     fn adjust_model(&self, model: &mut Model) {
+        model.supports_vision_override = Some(false);
         model.subsidised_by = Some(Arc::from(SUBSIDY));
         if long_context_window(&model.id).is_none() {
             model.context_window = self
@@ -770,6 +776,7 @@ mod tests {
     use tempfile::tempdir;
     use test_case::test_case;
 
+    use super::configure_plugin;
     use super::error::Error;
     use super::run::Thinking;
     #[cfg(unix)]
@@ -784,7 +791,6 @@ mod tests {
     use crate::provider::Provider;
     use crate::providers::Timeouts;
     use crate::retry::RetryKind;
-    use crate::spec::ProviderRegistry;
     use crate::types::Effort::{High, Max, Minimal};
     use crate::{Model, ProviderEvent, TokenUsage};
 
@@ -912,6 +918,7 @@ mod tests {
     #[test_case(Error::WentQuiet.after_start(false) => (false, false) ; "interrupted_before_init")]
     #[test_case(Error::ApiRefused { kind: UNKNOWN_KIND.into(), text: "API Error: Stream idle timeout".into(), status: None } => (false, true) ; "a_reported_stream_idle_timeout")]
     #[test_case(Error::NoCallsToRun => (false, true) ; "a_tool_stop_without_calls")]
+    #[test_case(Error::StoppedFor("end_turn".into()) => (false, true) ; "calls_with_an_end_turn_stop")]
     fn a_refused_request_reads_as_the_anthropic_provider_reports_it(error: Error) -> (bool, bool) {
         let error = agent_error(error);
         (error.is_context_overflow(), error.is_retryable())
@@ -1115,9 +1122,7 @@ mod tests {
     fn a_model_it_runs_takes_no_images() {
         let dir = tempdir().unwrap();
         let mut model = Model::from_spec(&format!("{SLUG}/{VISION_ROW}")).unwrap();
-        assert!(!model.supports_vision());
         model.supports_vision_override = Some(true);
-        assert!(!model.supports_vision());
         provider_in(dir.path(), Vec::new()).adjust_model(&mut model);
         assert!(!model.supports_vision());
     }
@@ -1234,7 +1239,7 @@ mod tests {
 
     impl Drop for ProviderOff {
         fn drop(&mut self) {
-            ProviderRegistry::configure_plugins(&[], &HashMap::new());
+            configure_plugin(false, None);
             *SLOTS.lock().unwrap_or_else(PoisonError::into_inner) = None;
         }
     }
@@ -1242,15 +1247,14 @@ mod tests {
     #[test]
     fn slots_follow_a_new_max_concurrent() {
         let _off = ProviderOff;
-        let enabled = [PLUGIN.to_owned()];
         let options = |max: usize| {
             let table = json!({ MAX_CONCURRENT: max }).as_object().unwrap().clone();
             HashMap::from([(PLUGIN.to_owned(), table)])
         };
-        ProviderRegistry::configure_plugins(&enabled, &options(1));
+        configure_plugin(true, options(1).get(PLUGIN));
         let _running = slots().try_acquire_arc().expect("the one slot");
 
-        ProviderRegistry::configure_plugins(&enabled, &options(2));
+        configure_plugin(true, options(2).get(PLUGIN));
         let wider = slots();
         let taken = [wider.try_acquire_arc(), wider.try_acquire_arc()];
         assert!(
@@ -1281,8 +1285,8 @@ mod on_the_fake {
     use super::fake::{Fake, HAIKU, IDLE, MARKER, OPUS, SYSTEM, VERSION_ERROR, WAIT, tools};
     use super::run::{Limits, Listed, Thinking};
     use super::{ClaudeCode, Exchange, keyed_models_path, slots};
-    use crate::provider::ModelListing;
-    use crate::{Message, Model, StreamResponse};
+    use crate::provider::{ModelListing, Provider};
+    use crate::{Message, Model, ProviderUsage, StreamResponse};
 
     const HAIKU_SPEC: &str = "claude-code/claude-haiku-4-5";
     /// Haiku's output limit in the model table.
@@ -1373,8 +1377,25 @@ mod on_the_fake {
             }),
             models_cache,
             windows: Arc::default(),
+            plan_usage: Arc::default(),
             config_dir: None,
         }
+    }
+
+    #[test]
+    fn plan_usage_belongs_to_the_provider_login_and_survives_cloning() {
+        let fake = Fake::new("text");
+        let home = tempdir().unwrap();
+        let first = provider_for(&fake, home.path(), &env::temp_dir(), None);
+        let second = provider_for(&fake, home.path(), &env::temp_dir(), None);
+        let cloned = first.clone();
+        let usage = ProviderUsage {
+            plan: Some("Claude Pro".into()),
+            ..Default::default()
+        };
+        *first.plan_usage.lock().unwrap() = Some(usage.clone());
+        assert_eq!(smol::block_on(cloned.fetch_usage()).unwrap(), Some(usage));
+        assert_eq!(smol::block_on(second.fetch_usage()).unwrap(), None);
     }
 
     /// The plugin's `config_dir` picks the login, and Claude Code gets it as

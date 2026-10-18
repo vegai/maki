@@ -131,7 +131,7 @@ mod tests {
     use flume::Sender;
     use futures_lite::FutureExt;
     use maki_agent::AgentError;
-    use maki_providers::provider::{BoxFuture, Provider, RequestScope};
+    use maki_providers::provider::{BoxFuture, ModelListing, Provider, RequestScope};
     use maki_providers::{
         ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
         TokenUsage,
@@ -173,7 +173,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
     }

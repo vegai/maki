@@ -1183,10 +1183,7 @@ impl PluginProvider {
         // rows too, and falling back to them alone, is `fetch_all_models`'s job.
         match &self.entry.hooks.list_models {
             Some(hook) => hook.call(()).await,
-            None => match listing {
-                ModelListing::Cached => self.inner.list_models().await,
-                ModelListing::Refresh => self.inner.list_models_fresh().await,
-            },
+            None => self.inner.list_models(listing).await,
         }
     }
 
@@ -1292,12 +1289,11 @@ impl Provider for PluginProvider {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        self.list_models_with(ModelListing::Cached)
-    }
-
-    fn list_models_fresh(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        self.list_models_with(ModelListing::Refresh)
+    fn list_models(
+        &self,
+        listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        self.list_models_with(listing)
     }
 
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
@@ -1803,7 +1799,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             Box::pin(async {
                 Err(AgentError::Config {
                     message: INNER_UNUSED.to_string(),
@@ -2013,7 +2012,7 @@ mod tests {
             let provider = create(SLUG, Timeouts::default()).unwrap();
             config.providers.get_mut(SLUG).unwrap().plugin = Some(NEXT_OWNER.into());
             config.save().unwrap();
-            smol::block_on(provider.list_models()).unwrap();
+            smol::block_on(provider.list_models(ModelListing::Cached)).unwrap();
         }
         assert_eq!(first.calls(), 1);
         assert_eq!(next.calls(), 1);

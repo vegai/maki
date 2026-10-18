@@ -321,7 +321,6 @@ fn the_provider_is_on_with_the_plugin(plugin: bool, want: &str) {
 #[test_case("--allowed-tools", "ClaudeCode", &[CLAUDE_TOOL], None ; "allow_a_plugin_tool")]
 #[test_case("--allowed-tools", "claude_code_import", &[IMPORT_TOOL], None ; "allow_a_plugin_subtool")]
 #[test_case("--allowed-tools", "view_image", &[], None ; "image_support_overrides_an_allow_list")]
-#[test_case("--allowed-tools", "claude-code", &[], Some(CLAUDE_TOOL_SUGGESTION) ; "warn_for_misspelled_allow_entry")]
 #[test_case("--disallowed-tools", "claude-code", &REVIEW_ALL_TOOLS, Some(CLAUDE_TOOL_SUGGESTION) ; "warn_for_misspelled_deny_entry")]
 #[test_case("--allowed-tools", "future__GetDocs", &[], None ; "retain_an_unresolved_mcp_entry_without_warning")]
 fn cli_filters_plugin_tools_in_the_init_event(
@@ -368,6 +367,24 @@ fn cli_filters_plugin_tools_in_the_init_event(
         claude.with_extension(RAN_EXTENSION).exists(),
         "the enabled provider must still run its CLI checks"
     );
+}
+
+#[test]
+fn a_misspelled_allow_list_stops_before_starting_the_provider() {
+    const NO_ALLOWED_TOOLS: &str = "--allowed-tools matches no loaded tools or qualified MCP names";
+    let fixture = Fixture::new();
+    let claude = stand_in(&fixture.dir("bin"));
+    fixture.enable_plugin(Some(&claude));
+    let mut command = fixture.maki(MODEL, PROMPT, STREAM_FORMAT);
+    command.args(["--allowed-tools", "raed"]);
+    let output = command.output().unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains(NO_ALLOWED_TOOLS)
+    );
+    assert!(!claude.with_extension(RAN_EXTENSION).exists());
 }
 
 fn stand_in(dir: &Path) -> PathBuf {

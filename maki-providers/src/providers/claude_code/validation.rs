@@ -176,16 +176,18 @@ fn default_temp_dir() -> PathBuf {
     path
 }
 
+fn env_value(vars: &[(String, String)], name: &str) -> Option<OsString> {
+    vars.iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| OsString::from(value))
+}
+
 pub(super) fn prepare_launch(
     vars: Vec<(String, String)>,
     configured: Option<PathBuf>,
     cwd: &Path,
 ) -> Result<LaunchPreparation, Error> {
-    let var = |name: &str| {
-        vars.iter()
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| OsString::from(value))
-    };
+    let var = |name| env_value(&vars, name);
     let own_config_dir = var(CONFIG_DIR_ENV)
         .filter(|path| !path.is_empty())
         .map(PathBuf::from);
@@ -193,7 +195,7 @@ pub(super) fn prepare_launch(
     let temp_dir = var(TMPDIR_ENV)
         .filter(|path| !path.is_empty())
         .map_or_else(default_temp_dir, PathBuf::from);
-    let (mut env, withheld) = checks::child_env(vars);
+    let (mut env, withheld) = checks::launch_env(vars);
     env.retain(|(name, value)| {
         ![CONFIG_DIR_ENV, TMPDIR_ENV].contains(&name.as_str()) || !value.is_empty()
     });
@@ -221,11 +223,7 @@ pub(super) fn login_dir(
     vars: &[(String, String)],
     configured: Option<&Path>,
 ) -> Result<PathBuf, Error> {
-    let var = |name: &str| {
-        vars.iter()
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| OsString::from(value))
-    };
+    let var = |name| env_value(vars, name);
     checks::config_dir(
         configured
             .map(OsString::from)

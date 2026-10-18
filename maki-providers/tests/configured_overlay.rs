@@ -4,6 +4,7 @@
 //! because the config is read from the process-wide home directory: each case
 //! needs its own, and `cargo nextest` is what gives a test its own process.
 
+use maki_providers::provider::ModelListing;
 use std::fs;
 use std::sync::Arc;
 
@@ -294,7 +295,7 @@ fn selection_changes_take_effect_only_after_reload() {
     plugin::commit_load();
     assert!(!matches!(Owner::of(CATALOG_SLUG), Owner::Plugin));
     let fallback = provider_for_slug(CATALOG_SLUG, Timeouts::default()).unwrap();
-    let models = smol::block_on(fallback.list_models()).unwrap();
+    let models = smol::block_on(fallback.list_models(ModelListing::Cached)).unwrap();
     assert_eq!(
         models
             .iter()

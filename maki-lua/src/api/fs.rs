@@ -40,7 +40,7 @@ const TEMP_SUFFIX: &str = "XXXXXX";
 #[cfg(unix)]
 const PRIVATE_DIR_MODE: u32 = 0o700;
 
-fn path_text(path: PathBuf) -> IoResult<String> {
+pub(super) fn path_text(path: PathBuf) -> IoResult<String> {
     path.into_os_string()
         .into_string()
         .map_err(|_| IoError::new(ErrorKind::InvalidData, INVALID_UTF8_PATH))

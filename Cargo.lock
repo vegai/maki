@@ -3322,7 +3322,6 @@ dependencies = [
  "criterion",
  "crossterm",
  "flume",
- "futures",
  "futures-lite",
  "getrandom 0.4.3",
  "image",

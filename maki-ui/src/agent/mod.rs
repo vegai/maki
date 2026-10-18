@@ -1,3 +1,5 @@
+#[cfg(test)]
+use maki_providers::provider::ModelListing;
 mod agent_loop;
 mod model_slots;
 mod run_cancels;
@@ -336,7 +338,10 @@ mod tests {
             Box::pin(std::future::pending())
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
     }
@@ -441,7 +446,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
     }

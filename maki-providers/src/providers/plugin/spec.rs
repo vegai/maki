@@ -81,7 +81,6 @@ fn spec_row(decl: &ProviderDecl, target: Target, models: &'static [ModelEntry]) 
         api_key_env: decl.api_key_env.as_deref().map_or("", leak_str),
         family: decl.family.unwrap_or(native.family),
         supports_thinking: native.supports_thinking,
-        accepts_images: native.accepts_images,
         supports_deferred_tools: false,
         accepts_arbitrary_models: decl
             .accepts_arbitrary_models
@@ -90,7 +89,6 @@ fn spec_row(decl: &ProviderDecl, target: Target, models: &'static [ModelEntry]) 
         fallback_context_window: decl.context_window.unwrap_or(context_window),
         models_toml: NO_CURATED_MODELS,
         models_of: None,
-        plugin: None,
         pricing_schedule: decl.pricing_schedule.clone().map(leak),
         build: Build::Declared(models),
         aperture: decl.aperture.as_ref().map(|route| ApertureRoute {

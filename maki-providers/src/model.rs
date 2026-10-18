@@ -678,9 +678,6 @@ impl Model {
     /// per-model overrides, discovery, [`ModelSources`] and the family default.
     pub fn supports_vision(&self) -> bool {
         let spec = ProviderRegistry::for_slug(&self.provider);
-        if spec.is_some_and(|spec| !spec.accepts_images) {
-            return false;
-        }
         if let Some(vision) = self.supports_vision_override {
             return vision;
         }

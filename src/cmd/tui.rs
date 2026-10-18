@@ -6,7 +6,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use color_eyre::Result;
-use color_eyre::eyre::Context;
+use color_eyre::eyre::{Context, eyre};
 
 use maki_agent::command::{self, CustomCommand};
 use maki_agent::tools::ToolRegistry;
@@ -27,8 +27,19 @@ const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
 const MODEL_FALLBACK_WARNING: &str = "model resolution failed, keeping previous model";
 const POLICY_GRANT_NOTICE: &str = "folder trusted by trust.paths pattern";
+const NO_ALLOWED_TOOLS: &str = "--allowed-tools matches no loaded tools or qualified MCP names";
 
-fn tool_filter_warnings(cli: &Cli, registry: &ToolRegistry) -> Vec<String> {
+fn tool_filter_warnings(cli: &Cli, registry: &ToolRegistry) -> Result<Vec<String>> {
+    if !cli.allowed_tools.is_empty()
+        && !cli.allowed_tools.iter().any(|name| {
+            registry.get(name).is_some() || is_wire_name(name) || is_qualified_name(name)
+        })
+    {
+        return Err(eyre!(
+            "{NO_ALLOWED_TOOLS}: {}",
+            cli.allowed_tools.join(", ")
+        ));
+    }
     let mut warnings = Vec::new();
     for (flag, names) in [
         ("--allowed-tools", &cli.allowed_tools),
@@ -53,7 +64,7 @@ fn tool_filter_warnings(cli: &Cli, registry: &ToolRegistry) -> Vec<String> {
             warnings.push(warning);
         }
     }
-    warnings
+    Ok(warnings)
 }
 
 /// One generation of the app: everything torn down and rebuilt on `/reload`.
@@ -204,7 +215,7 @@ fn build_stack(
         },
     )?;
 
-    warnings.extend(tool_filter_warnings(cli, ToolRegistry::global()));
+    warnings.extend(tool_filter_warnings(cli, ToolRegistry::global())?);
     let commands = discover_commands(cli.no_commands, launch.cwd);
 
     setup::resolve_thinking(
@@ -629,16 +640,34 @@ mod tests {
     fn tool_filter_warnings_accept_mcp_names(name: &str, accepted: bool) {
         let cli = Cli::parse_from(["maki", "--disallowed-tools", name]);
         assert_eq!(
-            tool_filter_warnings(&cli, &ToolRegistry::new()).is_empty(),
+            tool_filter_warnings(&cli, &ToolRegistry::new())
+                .unwrap()
+                .is_empty(),
             accepted
         );
+    }
+
+    #[test_case("raed", false ; "typo")]
+    #[test_case("unloaded_tool", false ; "unknown_plugin_name")]
+    #[test_case("srv.probe", true ; "qualified_mcp")]
+    #[test_case("srv__probe", true ; "wire_mcp")]
+    fn empty_allow_lists_fail_unless_an_mcp_tool_can_load_later(name: &str, accepted: bool) {
+        let cli = Cli::parse_from(["maki", "--allowed-tools", name]);
+        let result = tool_filter_warnings(&cli, &ToolRegistry::new());
+        assert_eq!(result.is_ok(), accepted);
+        if !accepted {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                format!("{NO_ALLOWED_TOOLS}: {name}")
+            );
+        }
     }
 
     #[test_case("Bash(git log:*)")]
     #[test_case("srv.probe(argument:*)")]
     fn tool_filter_warnings_explain_unsupported_argument_patterns(name: &str) {
         let cli = Cli::parse_from(["maki", "--disallowed-tools", name]);
-        let warnings = tool_filter_warnings(&cli, &ToolRegistry::new());
+        let warnings = tool_filter_warnings(&cli, &ToolRegistry::new()).unwrap();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains(TOOL_ARGUMENT_PATTERNS_UNSUPPORTED));
         assert!(!warnings[0].contains("load later"));

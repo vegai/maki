@@ -576,6 +576,8 @@ fn sparse_checkout_omissions_stay_out_of_the_snapshot() {
 }
 
 #[test_case(".env/prod" ; "an_env_directory")]
+#[test_case(".ENV/prod" ; "an_uppercase_env_directory")]
+#[test_case("Secrets/key" ; "a_casefolded_secret_directory")]
 #[test_case("deep/.env/prod" ; "a_nested_env_directory")]
 #[test_case(".maki/init.lua" ; "maki_configuration")]
 #[test_case("deep/.MaKi/permissions.toml" ; "casefolded_maki_configuration")]

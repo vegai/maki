@@ -1,6 +1,7 @@
 //! Anthropic allows 4 cache breakpoints per request. We place them on: the last tool
 //! definition, the system prompt, and the last block of the 2 most recent messages.
 
+use crate::provider::ModelListing;
 pub(crate) mod bedrock;
 pub(crate) mod shared;
 
@@ -77,13 +78,11 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     family: ModelFamily::Claude,
     supports_thinking: true,
     supports_deferred_tools: true,
-    accepts_images: true,
     accepts_arbitrary_models: false,
     fallback_max_output: Some(128_000),
     fallback_context_window: 200_000,
     models_toml: include_str!("../../../models/anthropic.toml"),
     models_of: None,
-    plugin: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
@@ -559,7 +558,10 @@ impl Provider for Anthropic {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(self.do_list_models())
     }
 
@@ -1590,7 +1592,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
             crate::providers::Timeouts::default(),
         );
 
-        let models = smol::block_on(provider.list_models()).unwrap();
+        let models = smol::block_on(provider.list_models(ModelListing::Cached)).unwrap();
 
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, expected);

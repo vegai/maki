@@ -14,7 +14,7 @@ const CALLER: &str = "nested_caller";
 const INSPECT: &str = "inspect_calls";
 const BATCH: &str = "batch";
 const CODE_EXECUTION: &str = "code_execution";
-const UNKNOWN_TOOL: &str = "unknown tool: hidden_write";
+const UNAVAILABLE_TOOL: &str = "tool is not available in this request: hidden_write";
 const NAME_ERROR: &str = "NameError";
 const CALL_ID: &str = "dispatch_probe";
 const ZERO_INVOCATIONS: &str = "0";
@@ -128,7 +128,7 @@ fn an_unoffered_tool_never_runs(origin: Origin, filtered: bool) {
     let expected = if matches!(origin, Origin::CodeExecution) {
         NAME_ERROR
     } else {
-        UNKNOWN_TOOL
+        UNAVAILABLE_TOOL
     };
     assert!(text.contains(expected), "{text}");
     assert_eq!(

@@ -61,7 +61,8 @@ const WRITING: Hold = ("chmod", " ./src/new/");
 /// Shell paths can contain arbitrary bytes. Long Lua strings preserve them in the generated
 /// import and cleanup commands.
 const GENERATE: &str = r#"
-local workspace = require("claude_workspace")
+local git_utils = require("claude_git")
+local import_scripts = require("claude_import_script")
 local changes = ({
   edit_and_add = {
     { path = [==[@PATH@]==], status = "M", old_sha = "@OLD@", new_sha = "@NEW@", old_mode = "100644", new_mode = "100644" },
@@ -75,9 +76,9 @@ local changes = ({
     { path = [==[@PATH@]==], status = "M", old_sha = "@OLD@", new_sha = "@OLD@", old_mode = "100644", new_mode = "100755" },
   },
 })["@CHANGES@"]
-maki.fs.write("@OUT@", workspace.import_script(changes, "@PROJECT@", "@GIT@", "@ARTIFACT@", "@STAGE@"))
-maki.fs.write("@LEFTOVERS@", workspace.leftovers_script(changes, "@PROJECT@", "@STAGE@", { [==[@MADE@]==] }))
-maki.fs.write("@REVIEW@", workspace.diff_command({ git = "@GIT@", snapshot = "@PROJECT@", base = "@OLD@", tree = "@NEW@" }))
+maki.fs.write("@OUT@", import_scripts.import_script(changes, "@PROJECT@", "@GIT@", "@ARTIFACT@", "@STAGE@"))
+maki.fs.write("@LEFTOVERS@", import_scripts.leftovers_script(changes, "@PROJECT@", "@STAGE@", { [==[@MADE@]==] }))
+maki.fs.write("@REVIEW@", git_utils.diff_command({ git = "@GIT@", snapshot = "@PROJECT@", base = "@OLD@", tree = "@NEW@" }))
 "#;
 /// The changes an import applies, by their name in `GENERATE`.
 const EDIT_AND_ADD: &str = "edit_and_add";

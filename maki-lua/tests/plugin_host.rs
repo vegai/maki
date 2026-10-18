@@ -1,3 +1,4 @@
+use maki_providers::provider::ModelListing;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -7560,7 +7561,10 @@ impl Provider for TurnThenPark {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }
@@ -7751,7 +7755,10 @@ impl Provider for OptsRecorder {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }
@@ -7908,7 +7915,10 @@ impl Provider for CallOnce {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }

@@ -1,3 +1,4 @@
+use crate::provider::ModelListing;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -538,13 +539,12 @@ impl Provider for CompatProvider {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         let auth = self.auth.lock().unwrap().clone();
         Box::pin(async move { self.compat.do_list_models(&auth).await })
-    }
-
-    fn list_models_fresh(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        self.list_models()
     }
 
     /// The protocol has no usage endpoint. A declaration whose provider has

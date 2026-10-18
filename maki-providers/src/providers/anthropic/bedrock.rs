@@ -1,3 +1,4 @@
+use crate::provider::ModelListing;
 use std::env;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
@@ -706,7 +707,10 @@ impl Provider for Bedrock {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async {
             let models: Vec<crate::model::ModelInfo> = super::SPEC
                 .models()

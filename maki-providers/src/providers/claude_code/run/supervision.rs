@@ -7,7 +7,7 @@ use super::super::stream::control_request;
 use crate::process::guard;
 use crate::process::kill_group;
 #[cfg(unix)]
-use crate::process::wait_without_reaping;
+use crate::process::{group_of, wait_without_reaping};
 use flume::Receiver;
 use futures_lite::future;
 use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -16,7 +16,7 @@ use futures_lite::{FutureExt, Stream, StreamExt};
 #[cfg(unix)]
 use rustix::io::Errno;
 #[cfg(unix)]
-use rustix::process::{Pid, Signal, kill_process};
+use rustix::process::{Signal, kill_process};
 use serde_json::json;
 use smol::process::{Child, ChildStdin, ChildStdout, Command};
 use smol::{Task, Timer};
@@ -85,7 +85,7 @@ impl Group {
             return;
         }
         #[cfg(unix)]
-        if let Some(pid) = i32::try_from(self.child.id()).ok().and_then(Pid::from_raw)
+        if let Some(pid) = group_of(self.child.id())
             && let Err(error) = kill_process(pid, Signal::TERM)
             && error != Errno::SRCH
         {
