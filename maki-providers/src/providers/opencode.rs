@@ -1,3 +1,4 @@
+use crate::provider::ModelListing;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
@@ -52,13 +53,11 @@ pub(crate) const ZEN_SPEC: ProviderSpec = ProviderSpec {
     supports_deferred_tools: false,
     adaptive_effort,
     thinking_fields_fallback: |_| None,
-    accepts_images: true,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(128_000),
     fallback_context_window: 256_000,
     models_toml: NO_CURATED_MODELS,
     models_of: None,
-    plugin: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
@@ -84,13 +83,11 @@ pub(crate) const GO_SPEC: ProviderSpec = ProviderSpec {
     supports_deferred_tools: false,
     adaptive_effort: |_| adaptive_effort_if_available(GO_SLUG),
     thinking_fields_fallback: |_| None,
-    accepts_images: true,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(64_000),
     fallback_context_window: 128_000,
     models_toml: NO_CURATED_MODELS,
     models_of: None,
-    plugin: None,
     pricing_schedule: None,
     build: Build::Catalog,
     aperture: None,
@@ -278,7 +275,10 @@ impl Provider for Opencode {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(self.do_list_models())
     }
 

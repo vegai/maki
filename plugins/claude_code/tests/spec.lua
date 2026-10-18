@@ -5,6 +5,9 @@ local Stream = require("claude_stream")
 local snapshot = require("claude_snapshot")
 local importer = require("claude_import")
 local workspace = require("claude_workspace")
+local git_utils = require("claude_git")
+local import_scripts = require("claude_import_script")
+local path_utils = require("claude_paths")
 
 local case, eq, has = t.case, t.eq, t.has
 
@@ -124,9 +127,9 @@ end
 for _, code in ipairs({ 0x80, 0x9b, 0x2028, 0x2029, 0x200b, 0x202e, 0xfeff }) do
   case("invisible_path_" .. code, function()
     local path = "visible" .. utf8.char(code) .. "path"
-    local escaped = workspace.printable(path)
+    local escaped = path_utils.printable(path)
     has(escaped, string.format("\\u%04x", code))
-    eq(workspace.escape_invisible("normal-é"), "normal-é")
+    eq(path_utils.escape_invisible("normal-é"), "normal-é")
   end)
 end
 
@@ -192,7 +195,7 @@ end
 -- As in `.gitignore`, a pattern without a `/` matches at any depth, and one
 -- with a `/` is anchored at the project.
 case("denied_paths_twin_a_pattern_without_a_slash", function()
-  local patterns = assert(workspace.denied_paths("*.pem, certs/key.pem, ./local.txt"))
+  local patterns = assert(path_utils.denied_paths("*.pem, certs/key.pem, ./local.txt"))
   assert(contains(patterns, "*.pem") and contains(patterns, "**/*.pem"), "*.pem must match at any depth")
   assert(contains(patterns, "certs/key.pem") and not contains(patterns, "**/certs/key.pem"), "a path stays anchored")
   assert(contains(patterns, "**/local.txt"), "a leading ./ goes")
@@ -200,7 +203,7 @@ end)
 
 for _, pattern in ipairs({ "/etc/passwd", "../secret", "a/../b", "x)" }) do
   case("denied_paths_refuse_" .. pattern:gsub("%W", "_"), function()
-    local patterns, err = workspace.denied_paths(pattern)
+    local patterns, err = path_utils.denied_paths(pattern)
     eq(patterns, nil)
     has(err or "", pattern)
   end)
@@ -252,7 +255,7 @@ case("home_credentials_cover_standard_stores_and_user_paths", function()
   for _, path in ipairs({ "/etc/passwd", "../outside", "nested/../../outside" }) do
     local denied, problem = launch.home_credentials(home, path)
     eq(denied, nil)
-    has(problem, "must stay inside")
+    eq(problem, launch.DENY_HOME_OUTSIDE)
   end
 end)
 
@@ -260,7 +263,7 @@ for _, home in ipairs({ "", false }) do
   case("home_credentials_without_a_home_" .. tostring(home), function()
     local paths, err = launch.home_credentials(home or nil)
     eq(paths, nil)
-    has(err or "", "cannot find your home directory")
+    eq(err, launch.NO_HOME)
   end)
 end
 
@@ -636,7 +639,7 @@ for _, c in ipairs({
   { name = "a_string", value = "Read", want = false },
 }) do
   case("is_list_" .. c.name, function()
-    eq(launch.is_list(c.value), c.want)
+    eq(path_utils.is_list(c.value), c.want)
   end)
 end
 
@@ -748,7 +751,7 @@ for _, c in ipairs({
     local dirs, err = local_settings_dirs(maki.fs.joinpath(root, "wt"))
     t.rmtree(root)
     eq(dirs, nil)
-    has(err or "", "maki cannot examine")
+    has(err, maki.fs.joinpath(root, "wt/.git"))
   end)
 end
 
@@ -761,7 +764,7 @@ for _, c in ipairs({
   { name = "an_unrelated_dir", path = "/tmp/x", root = "/work", want = false },
 }) do
   case("within_" .. c.name, function()
-    eq(workspace.within(c.path, c.root), c.want)
+    eq(path_utils.within(c.path, c.root), c.want)
   end)
 end
 
@@ -1137,14 +1140,14 @@ for _, c in ipairs({
   { mode = "-rw-r-xr-x", want = false },
 }) do
   case("owner_executes_" .. c.mode, function()
-    eq(workspace.owner_executes(c.mode), c.want)
+    eq(path_utils.owner_executes(c.mode), c.want)
   end)
 end
 
 case("a_snapshot_leaves_out_credentials_and_claude_config", function()
-  local specs = table.concat(workspace.excluded_pathspecs("config/prod.yml"), "|")
+  local specs = table.concat(git_utils.excluded_pathspecs("config/prod.yml"), "|")
   for _, excluded in ipairs({ ".env*", "**/.env*", "secrets/**", "config/prod.yml" }) do
-    has(specs, ":(exclude,glob)" .. excluded)
+    has(specs, ":(exclude,icase,glob)" .. excluded)
   end
   has(specs, ":(exclude,icase,glob).claude/**")
   has(specs, ":(exclude,icase,glob).maki/**")
@@ -1159,7 +1162,7 @@ for _, c in ipairs({
   { var = "GIT_CONFIG_NOSYSTEM", want = "1" },
 }) do
   case("snapshot_git_env_overrides_the_callers_" .. c.var:lower(), function()
-    local env = workspace.snapshot_git_env({ HOME = "/home/u", [c.var] = "/from/caller" }, "/artifact/git", "/snap")
+    local env = git_utils.snapshot_git_env({ HOME = "/home/u", [c.var] = "/from/caller" }, "/artifact/git", "/snap")
     eq(env[c.var], c.want)
     eq(env.HOME, "/home/u")
   end)
@@ -1169,7 +1172,7 @@ end
 -- config could run a program inside maki's git commands, or unquote a
 -- listing. Git reads them only before the subcommand.
 case("git_commands_override_hooks_fsmonitor_and_quoting", function()
-  local argv = workspace.git({ "status" })
+  local argv = git_utils.git({ "status" })
   local joined = table.concat(argv, " ")
   for _, setting in ipairs({ "core.hooksPath=/dev/null", "core.fsmonitor=false", "core.quotePath=true", "gc.auto=0" }) do
     has(joined, "-c " .. setting)
@@ -1189,7 +1192,7 @@ for _, c in ipairs({
   { name = "the_whole_project", path = "./", problem = "the full project" },
 }) do
   case("relative_path_" .. c.name, function()
-    local spelled, problem = workspace.relative_path(c.path)
+    local spelled, problem = path_utils.relative_path(c.path)
     eq(spelled, c.want)
     if c.problem then
       has(problem or "", c.problem)
@@ -1207,7 +1210,7 @@ for _, c in ipairs({
   { name = "a_climb_out", path = "../a.rs", want = "goes out of the project" },
 }) do
   case("manifest_path_" .. c.name, function()
-    local problem = workspace.path_problem(c.path)
+    local problem = path_utils.path_problem(c.path)
     if c.want then
       has(problem or "", c.want)
     else
@@ -1217,9 +1220,9 @@ for _, c in ipairs({
 end
 
 case("a_larger_import_gets_more_time_than_the_bash_default", function()
-  local one = workspace.import_timeout({ {} })
+  local one = import_scripts.import_timeout({ {} })
   assert(one >= 120, "less than the bash default: " .. one)
-  assert(workspace.import_timeout({ {}, {}, {} }) > one, "a larger import does not receive more time")
+  assert(import_scripts.import_timeout({ {}, {}, {} }) > one, "a larger import does not receive more time")
 end)
 
 -- Each list follows a different word, so swapped lists would read wrong.
@@ -1233,39 +1236,54 @@ local SHA_A = string.rep("a", 40)
 local SHA_B = string.rep("b", 40)
 local SHA_0 = string.rep("0", 40)
 
+case("artifact_ids_use_only_ascii_letters_and_digits", function()
+  assert(("aZ09"):match(path_utils.ARTIFACT_ID))
+  for _, id in ipairs({ "", "a-b", "../outside", "é", "a_b" }) do
+    eq(id:match(path_utils.ARTIFACT_ID), nil)
+  end
+end)
+
+case("import_approval_lists_escaped_paths_before_the_script", function()
+  local path = "src/a\n$(touch pwned).rs"
+  local changes = { { path = path, status = "A", new_sha = SHA_A, new_mode = git_utils.REGULAR_MODE } }
+  local script = import_scripts.import_script(changes, "/project", "/git", "/artifacts/a1", "/artifacts/a1/stage.z9")
+  local heading = "# Import changes into /project\n# A " .. path_utils.printable(path) .. "\n\nset -e\n"
+  eq(script:sub(1, #heading), heading)
+end)
+
 case("dependency_dirs_are_project_relative", function()
-  local dirs = assert(workspace.dependency_dirs(" node_modules/ , ./web//./node_modules,"))
+  local dirs = assert(path_utils.dependency_dirs(" node_modules/ , ./web//./node_modules,"))
   eq(table.concat(dirs, "|"), "node_modules|web/node_modules")
-  local dirs_none, err = workspace.dependency_dirs("../shared")
+  local dirs_none, err = path_utils.dependency_dirs("../shared")
   eq(dirs_none, nil)
-  has(err, "goes out of the project")
+  eq(err, "../shared" .. path_utils.OUTSIDE_PROJECT)
 end)
 
 case("an_exclude_rule_matches_its_dir_literally", function()
-  eq(workspace.exclude_rule("node_modules"), "/node_modules/\n")
-  eq(workspace.exclude_rule("#a b[1]*"), "/\\#a\\ b\\[1\\]\\*/\n")
-  eq(workspace.exclude_rule("d\195\169p"), "/d\195\169p/\n")
+  eq(path_utils.exclude_rule("node_modules"), "/node_modules/\n")
+  eq(path_utils.exclude_rule("#a b[1]*"), "/\\#a\\ b\\[1\\]\\*/\n")
+  eq(path_utils.exclude_rule("d\195\169p"), "/d\195\169p/\n")
 end)
 
 case("a_quoted_path_reads_back_byte_for_byte", function()
-  eq(workspace.unquote("plain/name.rs"), "plain/name.rs")
-  eq(workspace.unquote('"new\\nline"'), "new\nline")
-  eq(workspace.unquote('"q\\"uote\\\\"'), 'q"uote\\')
-  eq(workspace.unquote('"\\303\\244.txt"'), "\195\164.txt")
-  eq(workspace.unquote('"\\\\303"'), "\\303")
+  eq(git_utils.unquote("plain/name.rs"), "plain/name.rs")
+  eq(git_utils.unquote('"new\\nline"'), "new\nline")
+  eq(git_utils.unquote('"q\\"uote\\\\"'), 'q"uote\\')
+  eq(git_utils.unquote('"\\303\\244.txt"'), "\195\164.txt")
+  eq(git_utils.unquote('"\\\\303"'), "\\303")
 end)
 
 case("paths_for_hash_object_are_quoted_whole", function()
-  eq(workspace.quoted_lines({ "a b", 'q"\\', "x\ny" }), '"a b"\n"q\\042\\134"\n"x\\012y"\n')
+  eq(git_utils.quoted_lines({ "a b", 'q"\\', "x\ny" }), '"a b"\n"q\\042\\134"\n"x\\012y"\n')
 end)
 
 case("a_name_that_is_not_utf8_is_found", function()
-  eq(workspace.first_non_utf8({ "ok.txt", "\195\164.txt" }), nil)
-  eq(workspace.first_non_utf8({ "ok.txt", "bad\255.txt" }), "bad\255.txt")
+  eq(path_utils.first_non_utf8({ "ok.txt", "\195\164.txt" }), nil)
+  eq(path_utils.first_non_utf8({ "ok.txt", "bad\255.txt" }), "bad\255.txt")
 end)
 
 case("a_shell_word_survives_quotes", function()
-  eq(workspace.shell_quote("it's here"), "'it'\\''s here'")
+  eq(path_utils.shell_quote("it's here"), "'it'\\''s here'")
 end)
 
 local function raw(old_mode, new_mode, old_sha, new_sha, status, path)
@@ -1273,7 +1291,7 @@ local function raw(old_mode, new_mode, old_sha, new_sha, status, path)
 end
 
 case("the_raw_diff_reads_every_change", function()
-  local changes = workspace.parse_raw_diff(
+  local changes = git_utils.parse_raw_diff(
     raw("100644", "100644", SHA_A, SHA_B, "M", "src/lib.rs")
       .. raw("000000", "100755", SHA_0, SHA_B, "A", "bin/run")
       .. raw("100644", "000000", SHA_A, SHA_0, "D", '"old\\tname.txt"')
@@ -1287,7 +1305,7 @@ case("the_raw_diff_reads_every_change", function()
 end)
 
 case("numstat_marks_binary_files", function()
-  local binary = workspace.binary_paths('3\t1\tsrc/lib.rs\n-\t-\tlogo.png\n-\t-\t"\\303\\244.png"')
+  local binary = git_utils.binary_paths('3\t1\tsrc/lib.rs\n-\t-\tlogo.png\n-\t-\t"\\303\\244.png"')
   eq(binary["logo.png"], true)
   eq(binary["\195\164.png"], true)
   eq(binary["src/lib.rs"], nil)
@@ -1303,10 +1321,10 @@ local STAGED = table.concat({
 }, "\n")
 
 case("a_snapshot_takes_each_file_once_and_no_submodule", function()
-  local files, submodules = workspace.tracked_paths(STAGED)
+  local files, submodules = git_utils.tracked_paths(STAGED)
   eq(table.concat(files, "|"), "src/lib.rs|link|merging.rs|sp\195\164ce.rs")
   eq(table.concat(submodules, "|"), "vendor/x")
-  eq(table.concat(workspace.listed_paths('a.rs\n"b\\nc.rs"'), "|"), "a.rs|b\nc.rs")
+  eq(table.concat(git_utils.listed_paths('a.rs\n"b\\nc.rs"'), "|"), "a.rs|b\nc.rs")
 end)
 
 for _, c in ipairs({
@@ -1408,114 +1426,114 @@ for _, c in ipairs({
       -- As long as a SHA-1 id, so only the hex check refuses it.
       c.new_sha = "$(touch pwned)" .. string.rep("a", 26)
     end,
-    "no object id in new_sha",
+    workspace.NO_OBJECT_ID:format("src/lib.rs", "new_sha"),
   },
   {
     "a_short_object_id",
     function(c)
       c.old_sha = "abc"
     end,
-    "no object id in old_sha",
+    workspace.NO_OBJECT_ID:format("src/lib.rs", "old_sha"),
   },
   {
     "a_path_out_of_the_project",
     function(c)
       c.path = "../outside.rs"
     end,
-    "goes out of the project",
+    "../outside.rs" .. path_utils.OUTSIDE_PROJECT,
   },
   {
     "an_absolute_path",
     function(c)
       c.path = "/etc/passwd"
     end,
-    "relative to the project",
+    "/etc/passwd" .. path_utils.ABSOLUTE_PATH,
   },
   {
     "an_unknown_status",
     function(c)
       c.status = "R"
     end,
-    "unknown status",
+    workspace.UNKNOWN_STATUS:format("src/lib.rs", "R"),
   },
   {
     "an_unknown_mode",
     function(c)
       c.new_mode = "100777; rm -rf ~"
     end,
-    "unknown new_mode",
+    workspace.UNKNOWN_MODE:format("src/lib.rs", "new_mode"),
   },
   {
     "an_unknown_kind",
     function(c)
       c.kind = "script"
     end,
-    "text change, and not script",
+    workspace.KIND_MISMATCH:format("src/lib.rs", "text", "script"),
   },
   {
     "a_git_path",
     function(c)
       c.path = ".git/hooks/pre-commit"
     end,
-    "a snapshot does not copy",
+    workspace.PROTECTED_PATH:format(".git/hooks/pre-commit", ".git"),
   },
   {
     "a_nested_git_path",
     function(c)
       c.path = "vendor/lib/.git/config"
     end,
-    "a snapshot does not copy",
+    workspace.PROTECTED_PATH:format("vendor/lib/.git/config", ".git"),
   },
   {
     "a_claude_config_path",
     function(c)
       c.path = "src/.claude/settings.json"
     end,
-    "a snapshot does not copy",
+    workspace.PROTECTED_PATH:format("src/.claude/settings.json", ".claude"),
   },
   {
     "an_addition_with_an_old_mode",
     function(c)
       c.status, c.old_sha = "A", SHA_0
     end,
-    "old_mode does not agree with its status A",
+    workspace.STATUS_MODE_MISMATCH:format("src/lib.rs", "old", "A"),
   },
   {
     "a_deletion_with_a_new_file",
     function(c)
       c.status = "D"
     end,
-    "new_mode does not agree with its status D",
+    workspace.STATUS_MODE_MISMATCH:format("src/lib.rs", "new", "D"),
   },
   {
     "an_edit_from_no_object",
     function(c)
       c.old_sha = SHA_0
     end,
-    "old object id that does not agree with",
+    workspace.OBJECT_MODE_MISMATCH:format("src/lib.rs", "old", "old"),
   },
   {
     "a_mode_change_called_text",
     function(c)
       c.new_sha = SHA_A
     end,
-    "mode change, and not text",
+    workspace.KIND_MISMATCH:format("src/lib.rs", "mode", "text"),
   },
   {
     "a_link_called_text",
     function(c)
       c.new_mode = "120000"
     end,
-    "symlink change, and not text",
+    workspace.KIND_MISMATCH:format("src/lib.rs", "symlink", "text"),
   },
 }) do
   case("a_change_with_" .. c[1] .. "_is_refused", function()
-    has(workspace.change_problem(a_change(c[2])) or "", c[3])
+    eq(workspace.change_problem(a_change(c[2])), c[3])
   end)
 end
 
 case("a_change_that_is_no_table_is_refused", function()
-  has(workspace.change_problem("not a table") or "", "not a table")
+  eq(workspace.change_problem("not a table"), workspace.CHANGE_NOT_TABLE)
 end)
 
 case("the_summary_says_what_needs_applying_by_hand", function()
@@ -1560,7 +1578,7 @@ end)
 -- changes under its path. A name that merely shares the prefix is not under
 -- it.
 case("retyped_paths_finds_both_sides_of_a_file_that_became_a_folder", function()
-  local retyped = workspace.retyped_paths({
+  local retyped = git_utils.retyped_paths({
     { path = "a" },
     { path = "a/b" },
     { path = "c/d/e" },
@@ -1585,7 +1603,7 @@ end)
 
 for _, path in ipairs({ ".maki/init.lua", "nested/.MaKi/permissions.toml", ".Claude/settings.json" }) do
   case("protected_configuration_is_not_importable_" .. path, function()
-    has(workspace.change_problem({ path = path }), "which a snapshot does not copy")
+    eq(workspace.change_problem({ path = path }), workspace.PROTECTED_PATH:format(path, path:match("%.[^/]+")))
   end)
 end
 

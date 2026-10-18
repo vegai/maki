@@ -3,6 +3,7 @@ use super::super::error::Error;
 use super::super::stream::{
     CONTROL_RESPONSE, Handshake, INITIALIZE, Offered, SUCCESS, Step, control_request, parse_event,
 };
+use super::super::transcript::SERVER;
 use super::super::validation;
 use super::private_files::private_dir_async;
 use super::supervision::{
@@ -33,6 +34,7 @@ const SET_MODEL: &str = "set_model";
 const CONTEXT_USAGE: &str = "get_context_usage";
 const PROBE_MODEL: &str = "haiku";
 const VERSION_FLAG: &str = "--version";
+const PARTIAL_MESSAGES_FLAG: &str = "--include-partial-messages";
 pub(super) const MCP_CONFIG_FLAG: &str = "--mcp-config";
 
 pub(crate) struct Launch<'a> {
@@ -82,10 +84,10 @@ pub fn invalidate_profile(executable: &Path) {
 
 pub(super) fn base_args(model: &str) -> Vec<String> {
     let mut settings = validation::base_settings();
-    settings["autoCompactEnabled"] = json!(false);
-    settings["permissions"] = json!({ "allow": ["mcp__maki"] });
+    settings[checks::AUTO_COMPACT] = json!(false);
+    settings["permissions"] = json!({ "allow": [format!("mcp__{SERVER}")] });
     let mut args = validation::base_args(model, "", checks::DEFAULT_MODE, &settings.to_string());
-    args.extend(["--include-partial-messages", "--max-turns", "1"].map(str::to_owned));
+    args.extend([PARTIAL_MESSAGES_FLAG, "--max-turns", "1"].map(str::to_owned));
     args
 }
 
@@ -313,7 +315,7 @@ async fn ask(
     loop {
         match next(lines, None, deadline).await {
             Next::Line(Some(Ok(line))) => {
-                let event: Value = serde_json::from_str(&line).unwrap_or_default();
+                let event = parse_event(&line)?;
                 let answer = &event["response"];
                 if event["type"] == CONTROL_RESPONSE && answer["request_id"] == id {
                     return match answer["subtype"] == SUCCESS {

@@ -58,7 +58,13 @@ impl Fake {
     pub(super) fn new(scenario: &str) -> Self {
         let dir = tempdir().unwrap();
         let script = FAKE
-            .replace("@DIR@", &dir.path().display().to_string())
+            .replace(
+                "@QUOTED_DIR@",
+                &format!(
+                    "'{}'",
+                    dir.path().display().to_string().replace('\'', "'\\''")
+                ),
+            )
             .replace("@WAIT_SECS@", &(EXIT_LIMIT + WAIT).as_secs().to_string());
         let source = dir.path().join("claude.sh");
         fs::write(&source, script).unwrap();

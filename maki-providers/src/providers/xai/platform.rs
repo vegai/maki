@@ -1,3 +1,4 @@
+use crate::provider::ModelListing;
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
@@ -245,7 +246,10 @@ impl Provider for Xai {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async {
             self.refresh_if_stale().await?;
             if self.is_oauth() {

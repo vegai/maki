@@ -1,3 +1,5 @@
+#[cfg(test)]
+use maki_providers::provider::ModelListing;
 use std::time::{Duration, Instant};
 
 use maki_providers::provider::{Provider, RequestScope};
@@ -635,6 +637,7 @@ mod tests {
 
         fn list_models(
             &self,
+            _listing: ModelListing,
         ) -> maki_providers::provider::BoxFuture<
             '_,
             Result<Vec<maki_providers::ModelInfo>, AgentError>,
@@ -902,6 +905,7 @@ mod tests {
 
         fn list_models(
             &self,
+            _listing: ModelListing,
         ) -> maki_providers::provider::BoxFuture<
             '_,
             Result<Vec<maki_providers::ModelInfo>, AgentError>,

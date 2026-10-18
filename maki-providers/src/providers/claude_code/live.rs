@@ -16,7 +16,7 @@ use smol::Timer;
 use tempfile::{TempDir, tempdir};
 use test_case::test_case;
 
-use super::checks::child_env;
+use super::checks::launch_env;
 use super::error::Error;
 use super::run::{Exchange, Launch, Limits, Request, Thinking, models, request};
 use super::{SLUG, agent_error, utf8_vars};
@@ -89,7 +89,7 @@ impl Live {
         let claude = find_program("claude", &here).expect("claude must be on PATH");
         let project = tempdir().unwrap();
         let cwd = project.path().canonicalize().unwrap();
-        let (env, _) = child_env(utf8_vars(env::vars_os()));
+        let (env, _) = launch_env(utf8_vars(env::vars_os()));
         Self {
             claude,
             env,

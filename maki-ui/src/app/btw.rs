@@ -133,7 +133,7 @@ mod tests {
     use maki_agent::prompt::{PromptId, Slot};
     use maki_agent::tools::ToolRegistry;
     use maki_lua::PluginHost;
-    use maki_providers::provider::BoxFuture;
+    use maki_providers::provider::{BoxFuture, ModelListing};
     use maki_providers::{AgentError, ContentBlock, ModelInfo, StreamResponse};
     use maki_storage::frame::{PromptFacts, StoredFrame};
     use smol::Timer;
@@ -165,8 +165,8 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-            Box::pin(async { Ok(Vec::new()) })
+        fn list_models(&self) -> BoxFuture<'_, Result<ModelListing, AgentError>> {
+            Box::pin(async { Ok(ModelListing::complete(Vec::new())) })
         }
     }
 
@@ -246,7 +246,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
     }

@@ -1,3 +1,4 @@
+use crate::provider::ModelListing;
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
@@ -74,13 +75,11 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     supports_deferred_tools: false,
     adaptive_effort: |_| dialect::GLM.adaptive_effort(),
     thinking_fields_fallback: |_| None,
-    accepts_images: true,
     accepts_arbitrary_models: false,
     fallback_max_output: Some(16_000),
     fallback_context_window: 128_000,
     models_toml: include_str!("../../../models/zai.toml"),
     models_of: None,
-    plugin: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
@@ -258,7 +257,10 @@ impl Provider for Zai {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
             self.compat.do_list_models(&auth).await

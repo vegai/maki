@@ -89,12 +89,15 @@ pub fn internal_tool_name(wire: &str) -> String {
 
 pub(crate) fn same_tool_name(name: &str, candidate: &str) -> bool {
     name == candidate
-        || name
-            .split_once(SEPARATOR)
-            .is_some_and(|parts| candidate.split_once(WIRE_SEPARATOR) == Some(parts))
-        || name
-            .split_once(WIRE_SEPARATOR)
-            .is_some_and(|parts| candidate.split_once(SEPARATOR) == Some(parts))
+        || [(name, candidate), (candidate, name)]
+            .into_iter()
+            .any(|(qualified, wire)| {
+                qualified.match_indices(SEPARATOR).any(|(at, _)| {
+                    wire.strip_prefix(&qualified[..at])
+                        .and_then(|rest| rest.strip_prefix(WIRE_SEPARATOR))
+                        == Some(&qualified[at + SEPARATOR.len()..])
+                })
+            })
 }
 
 /// Shaped like an MCP tool's wire name, whether or not a server publishes it.
@@ -1634,6 +1637,17 @@ mod tests {
             ready_rx: flume::bounded(0).1,
         };
         (inner, McpSession::new(handle, &[]))
+    }
+
+    #[test_case("srv.tool", "srv__tool", true ; "simple")]
+    #[test_case("srv.tool__part", "srv__tool__part", true ; "tool_underscores")]
+    #[test_case("srv.part.tool", "srv.part__tool", true ; "dot_before_boundary")]
+    #[test_case("srv__part.tool", "srv__part__tool", true ; "underscores_before_boundary")]
+    #[test_case("srv.tool.part", "srv__tool__part", false ; "multiple_boundaries_differ")]
+    #[test_case("srv.tool", "srv2__tool", false ; "different_server")]
+    fn tool_aliases_change_one_separator(name: &str, candidate: &str, expected: bool) {
+        assert_eq!(super::same_tool_name(name, candidate), expected);
+        assert_eq!(super::same_tool_name(candidate, name), expected);
     }
 
     #[test]

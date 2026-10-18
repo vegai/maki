@@ -1,8 +1,8 @@
 use std::ffi::{CStr, OsStr};
-use std::fs::{self, File, FileTimes};
+use std::fs::{self, File, FileTimes, Permissions};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use maki_storage::id::MakiId;
@@ -12,11 +12,13 @@ use rustix::fs::{
 };
 use rustix::path::Arg;
 
-use maki_providers::claude_code::validation::GIT_ENTRY;
+use super::DIRECTORY_FLAGS;
+use super::validation::GIT_ENTRY;
 
 const MAX_DEPTH: usize = 64;
 const DEPTH_EXCEEDED: &str = "snapshot exceeds";
 const MAX_FAILURES: usize = 10;
+const PRIVATE_MODE_MASK: u32 = 0o777;
 const CONFIG: &str = "config";
 const HEAD: &str = "HEAD";
 const COMMONDIR: &str = "commondir";
@@ -24,13 +26,9 @@ const REPOSITORY_ENTRIES: &[&str] = &["objects", "refs"];
 const QUARANTINE_PREFIX: &str = "repository.";
 const QUARANTINE_ENTRY: &str = "metadata";
 const PRIVATE_COPY_PREFIX: &str = ".maki-private-";
-const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
-    .union(OFlags::DIRECTORY)
-    .union(OFlags::NOFOLLOW)
-    .union(OFlags::CLOEXEC);
 
 #[derive(Default)]
-pub(super) struct SnapshotMetadata {
+pub struct SnapshotMetadata {
     pub metadata: Vec<String>,
     pub repositories: Vec<String>,
     pub private_files: usize,
@@ -56,7 +54,7 @@ fn private_copy(parent: &impl AsFd, name: impl Arg + Copy) -> io::Result<()> {
     )?);
     let result = (|| {
         io::copy(&mut source, &mut copy)?;
-        copy.set_permissions(metadata.permissions())?;
+        copy.set_permissions(Permissions::from_mode(metadata.mode() & PRIVATE_MODE_MASK))?;
         copy.set_times(
             FileTimes::new()
                 .set_accessed(metadata.accessed()?)
@@ -261,7 +259,7 @@ fn depth_error() -> io::Error {
     io::Error::other(format!("{DEPTH_EXCEEDED} {MAX_DEPTH} directory levels"))
 }
 
-pub(super) fn sanitize_snapshot(
+pub fn sanitize_snapshot(
     snapshot: &Path,
     quarantine: &Path,
     git: &Path,
@@ -354,9 +352,10 @@ mod tests {
         assert_eq!(fs::read_to_string(outside).unwrap(), expected);
     }
 
-    #[test_case(false ; "external_cache")]
-    #[test_case(true ; "tracked_alias")]
-    fn sanitizing_hard_links_preserves_contents_modes_and_timestamps(internal: bool) {
+    #[test_case(false, 0o751 ; "external_cache")]
+    #[test_case(true, 0o751 ; "tracked_alias")]
+    #[test_case(false, 0o6751 ; "special_bits_are_removed")]
+    fn sanitizing_hard_links_preserves_contents_modes_and_timestamps(internal: bool, mode: u32) {
         let dir = tempdir().unwrap();
         let snapshot = dir.path().join("snapshot");
         let quarantine = dir.path().join("quarantine");
@@ -368,7 +367,7 @@ mod tests {
             dir.path().join(HEAD)
         };
         fs::write(&source, CONTENT).unwrap();
-        fs::set_permissions(&source, Permissions::from_mode(0o751)).unwrap();
+        fs::set_permissions(&source, Permissions::from_mode(mode)).unwrap();
         let before = fs::metadata(&source).unwrap();
         let copied = snapshot.join(CONFIG);
         fs::hard_link(&source, &copied).unwrap();
@@ -380,7 +379,10 @@ mod tests {
         );
         let after = fs::metadata(&copied).unwrap();
         assert_eq!(after.nlink(), 1);
-        assert_eq!(after.permissions().mode(), before.permissions().mode());
+        assert_eq!(
+            after.permissions().mode() & 0o7777,
+            mode & super::PRIVATE_MODE_MASK
+        );
         assert_eq!(after.modified().unwrap(), before.modified().unwrap());
         assert_eq!(fs::read_to_string(&copied).unwrap(), CONTENT);
         assert_eq!(fs::read_to_string(&source).unwrap(), CONTENT);

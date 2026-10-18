@@ -1,3 +1,5 @@
+#[cfg(test)]
+use maki_providers::provider::ModelListing;
 use std::collections::HashMap;
 use std::env;
 
@@ -703,7 +705,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
             Box::pin(async { unimplemented!() })
         }
     }

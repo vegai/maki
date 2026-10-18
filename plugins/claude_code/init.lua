@@ -13,6 +13,8 @@ local snapshot = require("claude_snapshot")
 local importer = require("claude_import")
 local Run = require("claude_run")
 local workspace = require("claude_workspace")
+local git_utils = require("claude_git")
+local path_utils = require("claude_paths")
 
 local MODELS = launch.MODELS
 local MS_PER_SEC = jobs.MS_PER_SEC
@@ -133,11 +135,11 @@ if opts.artifact_dir ~= "" then
   end
   -- A `..` after a missing directory has no meaning until that directory
   -- exists.
-  if workspace.climbs(opts.artifact_dir) then
+  if path_utils.climbs(opts.artifact_dir) then
     error("the `artifact_dir` option must not contain `..`")
   end
 end
-local dependencies, dependencies_err = workspace.dependency_dirs(opts.dependencies)
+local dependencies, dependencies_err = path_utils.dependency_dirs(opts.dependencies)
 if not dependencies then
   error("the `dependencies` option: " .. dependencies_err)
 end
@@ -145,7 +147,7 @@ local _, home_deny_err = launch.denied_home_paths(opts.deny_read_home)
 if home_deny_err then
   error("the `deny_read_home` option: " .. home_deny_err)
 end
-local _, denied_err = workspace.denied_paths(opts.deny_read)
+local _, denied_err = path_utils.denied_paths(opts.deny_read)
 if denied_err then
   error("the `deny_read` option: " .. denied_err)
 end
@@ -173,7 +175,7 @@ end
 local function snapshot_plan(input)
   local include = {}
   for _, path in ipairs(input.include or {}) do
-    local spelled, problem = workspace.relative_path(path)
+    local spelled, problem = path_utils.relative_path(path)
     if not spelled then
       return nil, problem
     end
@@ -253,14 +255,14 @@ local function change_report(call, artifact, project)
     lines[1] = "The worker changed no files."
   else
     lines[1] = "Changes in artifact " .. artifact.id .. ", not yet in the checkout:"
-    local shown, more = workspace.first(workspace.summary(changes), MAX_SHOWN_CHANGES)
+    local shown, more = path_utils.first(workspace.summary(changes), MAX_SHOWN_CHANGES)
     for _, line in ipairs(shown) do
       lines[#lines + 1] = line
     end
     if more > 0 then
       lines[#lines + 1] = "and " .. more .. " more"
     end
-    lines[#lines + 1] = "Review the recorded changes with: " .. workspace.diff_command(artifact)
+    lines[#lines + 1] = "Review the recorded changes with: " .. git_utils.diff_command(artifact)
     lines[#lines + 1] = "Apply them with claude_code_import, id " .. artifact.id .. "."
   end
   if artifact.prepare_err then
@@ -277,7 +279,9 @@ local function open_artifact(call, spec)
   if not root then
     return nil, "maki cannot make a coding artifact: " .. root_err
   end
-  snapshot.sweep(call, root, opts.artifact_ttl_hours)
+  local sweep = jobs.new(SNAPSHOT_TIMEOUT_MS)
+  snapshot.sweep(sweep, root, opts.artifact_ttl_hours)
+  sweep:answer()
   local artifact, allocate_err = snapshot.allocate(call, root, spec.env, SNAPSHOT_TIMEOUT_MS)
   if not artifact then
     return nil, "maki cannot make a coding artifact: " .. allocate_err
@@ -365,7 +369,6 @@ local function discard_unkept(call, removed)
   local artifact = call.artifact
   if artifact then
     call.artifact = nil
-    call:stop()
     call:when_idle(function()
       snapshot.discard(call, artifact, removed)
     end)
@@ -392,6 +395,7 @@ local function handler(input, ctx)
   -- A cancel stops this coroutine where it waits, so the hook finishes the
   -- call.
   maki.async.on_cancel(function()
+    call:stop()
     call:answer()
     discard_unkept(call)
   end)

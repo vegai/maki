@@ -38,13 +38,11 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     supports_deferred_tools: false,
     adaptive_effort: platform::adaptive_effort,
     thinking_fields_fallback: platform::thinking_fields_fallback,
-    accepts_images: true,
     accepts_arbitrary_models: false,
     fallback_max_output: Some(100_000),
     fallback_context_window: 200_000,
     models_toml: include_str!("../../../models/openai.toml"),
     models_of: None,
-    plugin: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,

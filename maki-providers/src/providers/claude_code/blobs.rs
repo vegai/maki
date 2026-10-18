@@ -4,15 +4,13 @@ use std::path::Path;
 
 use rustix::fs::{Mode, OFlags, open, openat};
 
+use super::DIRECTORY_FLAGS;
+
 const OBJECT_ID_LENGTHS: &[usize] = &[40, 64];
 const MAX_HEADER_BYTES: u64 = 128;
 const INVALID_BATCH: &str = "invalid git blob batch";
-const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
-    .union(OFlags::DIRECTORY)
-    .union(OFlags::NOFOLLOW)
-    .union(OFlags::CLOEXEC);
 
-pub(super) fn unpack(batch: &Path, stage: &Path, hashes: &[String]) -> io::Result<()> {
+pub fn unpack(batch: &Path, stage: &Path, hashes: &[String]) -> io::Result<()> {
     let stage = open(stage, DIRECTORY_FLAGS, Mode::empty())?;
     let input = File::from(open(
         batch,

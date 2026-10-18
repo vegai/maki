@@ -14,7 +14,7 @@ use maki_agent::tools::ToolRegistry;
 use maki_config::project::{self, TrustMode};
 use maki_config::{Config, load_env_files, load_permissions};
 use maki_lua::{DiscoveredPackage, InitFiles, Interaction, PluginHost};
-use maki_providers::spec::ProviderRegistry;
+use maki_providers::claude_code;
 use maki_storage::StateDir;
 
 use crate::cli::{AuthAction, Cli, Command, McpAction, MigrateAction, SessionAction, TrustAction};
@@ -132,7 +132,10 @@ fn load_plugins(
     // window in which a registered provider answers "unknown".
     let loaded = host.loaded_plugins()?;
     maki_providers::plugin::commit_load();
-    ProviderRegistry::configure_plugins(&loaded, &config.plugins.opts);
+    claude_code::configure_plugin(
+        loaded.iter().any(|name| name == claude_code::PLUGIN),
+        config.plugins.opts.get(claude_code::PLUGIN),
+    );
 
     Ok((config, sanitize_warnings(&warnings)))
 }

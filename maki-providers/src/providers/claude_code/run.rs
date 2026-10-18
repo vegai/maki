@@ -33,6 +33,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+const DRAIN_ATTEMPTS: usize = 2;
 const PROMPT_FILE: &str = "system-prompt.md";
 const MCP_FILE: &str = "mcp.json";
 const TOKEN_BYTES: usize = 32;
@@ -134,7 +135,7 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
     // Before any process starts, so a conversation maki cannot send costs
     // none.
     let (catalog, tools) = Catalog::new(req.exchange.tools)?;
-    let conversation = user_message(&transcript(req.exchange.messages, &catalog)?);
+    let conversation = user_message(&transcript(req.exchange.messages, &catalog)?)?;
     require_system(env::consts::OS)?;
     // maki marks the 1M window with a `-1m` id and Claude Code with a `[1m]`
     // name. The generation reports the model without either.
@@ -352,8 +353,16 @@ async fn exchange_reply(
         let waiting = turn.waiting();
         let deadline = match waiting {
             Wait::Startup => startup,
-            Wait::Handoff => *finish_by.get_or_insert_with(|| Instant::now() + limits.handoff),
-            Wait::Result => *finish_by.get_or_insert_with(|| Instant::now() + limits.exit),
+            Wait::Handoff => finish_deadline(
+                &mut finish_by,
+                waiting.clone(),
+                Instant::now() + limits.handoff,
+            ),
+            Wait::Result => finish_deadline(
+                &mut finish_by,
+                waiting.clone(),
+                Instant::now() + limits.exit,
+            ),
             Wait::Idle => last_event + limits.idle,
         };
         let step = match next(&mut lines, Some(handoffs), deadline).await {
@@ -410,6 +419,28 @@ async fn exchange_reply(
             Step::Nothing | Step::Alive => {}
         }
     }
+    stop_and_drain(
+        group,
+        turn,
+        &mut lines,
+        handoffs,
+        limits,
+        server,
+        result_late,
+    )
+    .await?;
+    Ok(prompted)
+}
+
+async fn stop_and_drain(
+    group: &mut Group,
+    turn: &mut Turn<'_>,
+    lines: &mut (impl Stream<Item = io::Result<String>> + Unpin),
+    handoffs: &Receiver<Handoff>,
+    limits: &Limits,
+    server: &mut Option<mcp::Server>,
+    result_late: bool,
+) -> Result<(), Error> {
     // Claude Code would continue after a handoff or a cut reply, so it is
     // stopped here. Every event up to the end of the output is still checked,
     // so nothing after the reply can contradict it unnoticed.
@@ -421,27 +452,26 @@ async fn exchange_reply(
         group.terminate();
         deadline = deadline.min(Instant::now() + SHUTDOWN_GRACE);
     }
-    match drain(turn, &mut lines, handoffs, deadline, stopped).await {
-        Err(Error::ExitLate) => {
-            group.kill();
-            warn!("claude-code: output stayed open after a complete reply; stopping the CLI");
-            match drain(
-                turn,
-                &mut lines,
-                handoffs,
-                Instant::now() + limits.exit,
-                true,
-            )
-            .await
-            {
-                Err(Error::ExitLate) => {
-                    warn!("claude-code: output stayed open after the kill; keeping the reply");
-                }
-                result => result?,
-            }
+    for attempt in 0..DRAIN_ATTEMPTS {
+        let result = drain(turn, lines, handoffs, deadline, stopped || attempt > 0).await;
+        if attempt > 0 {
             deadline = Instant::now() + limits.exit;
         }
-        result => result?,
+        match result {
+            Err(Error::ExitLate) if attempt + 1 < DRAIN_ATTEMPTS => {
+                group.kill();
+                warn!("claude-code: output stayed open after a complete reply; stopping the CLI");
+                deadline = Instant::now() + limits.exit;
+            }
+            Err(Error::ExitLate) => {
+                warn!("claude-code: output stayed open after the kill; keeping the reply");
+                break;
+            }
+            result => {
+                result?;
+                break;
+            }
+        }
     }
     let status = match group.wait(deadline).await {
         Ok(status) => Some(status),
@@ -458,7 +488,19 @@ async fn exchange_reply(
     if !stopped && let Some(status) = status.filter(|status| !status.success()) {
         warn!(%status, "claude-code: the CLI exited with an error after a validated reply");
     }
-    Ok(prompted)
+    Ok(())
+}
+
+fn finish_deadline(
+    state: &mut Option<(Wait, Instant)>,
+    waiting: Wait,
+    deadline: Instant,
+) -> Instant {
+    let current = state.get_or_insert((waiting.clone(), deadline));
+    if current.0 != waiting {
+        *current = (waiting, deadline);
+    }
+    current.1
 }
 
 async fn queued_handoffs(
@@ -542,7 +584,8 @@ mod tests {
     use super::{
         EFFORT_FLAG, Group, HANDOFF, HELD_CALL_TIMEOUT_MS, Launch, Limits, Listed, NO_AUTO_COMPACT,
         NO_CLI_RETRIES, NO_MID_CONVERSATION_SYSTEM, NO_NONSTREAMING_FALLBACK, NO_THINKING,
-        SHOWN_THINKING, STARTUP, Thinking, command, models, probe, queued_handoffs, stdout_lines,
+        SHOWN_THINKING, STARTUP, Thinking, Wait, command, finish_deadline, models, probe,
+        queued_handoffs, stdout_lines,
     };
     use crate::providers::anthropic::{LABEL_SESSION, LABEL_WEEK_ALL};
     use crate::{ContentBlock, ImageMediaType, ImageSource, Role, StopReason};
@@ -550,7 +593,6 @@ mod tests {
 
     const SHORT_EXIT: Duration = Duration::from_secs(5);
     const SLEEP: &str = "/bin/sleep";
-    /// Set in the copy of the test binary that plays maki.
     const MAKI_ROLE: &str = "MAKI_TEST_PLAYS_MAKI";
     const MEMBER_PID: &str = "member-pid";
     const LONG_SLEEP_SECS: &str = "30";
@@ -603,6 +645,21 @@ mod tests {
     /// which the stream tests pin in both orders. maki gets the whole batch with its own tool
     /// names and the
     /// final usage, and no process or private file is left behind.
+    #[test_case(Wait::Handoff, Wait::Handoff, false ; "handoff_events_keep_the_deadline")]
+    #[test_case(Wait::Result, Wait::Result, false ; "result_events_keep_the_deadline")]
+    #[test_case(Wait::Handoff, Wait::Result, true ; "broken_handoff_gets_a_result_deadline")]
+    fn finalization_deadline_tracks_what_is_pending(first: Wait, next: Wait, reset: bool) {
+        let original = Instant::now();
+        let later = original + EXIT_LIMIT;
+        let mut state = None;
+        assert_eq!(finish_deadline(&mut state, first, original), original);
+        assert_eq!(
+            finish_deadline(&mut state, next, later),
+            if reset { later } else { original }
+        );
+    }
+
+    /// Set in the copy of the test binary that plays maki.
     #[test_case("batch" ; "the_generation_first")]
     #[test_case("cut_line" ; "a_last_line_the_stop_cut_short")]
     #[test_case("rejected_max_turns" ; "a_rejected_call_at_the_turn_limit")]

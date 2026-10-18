@@ -8,6 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
+use serde::Serialize;
 use serde_json::{Value, json};
 use tracing::debug;
 
@@ -46,6 +47,11 @@ const COMPACT_BOUNDARY_EVENT: &str = "compact_boundary";
 const TOOL_USE_STOP: &str = "tool_use";
 const TOOL_USE_BLOCK: &str = "tool_use";
 const TEXT_BLOCK: &str = "text";
+const THINKING_BLOCK: &str = "thinking";
+const REDACTED_THINKING_BLOCK: &str = "redacted_thinking";
+const TEXT_DELTA: &str = "text_delta";
+const THINKING_DELTA: &str = "thinking_delta";
+const ERROR_PREFIX: &str = "error_";
 /// Claude Code's own placeholders. Its output filter drops a message whose
 /// only block is one of these, as it drops blank text.
 const DROPPED_TEXTS: [&str; 2] = ["(no content)", "[Request interrupted by user for tool use]"];
@@ -199,7 +205,7 @@ fn failed_result(event: &Value) -> bool {
     event["is_error"] == true
         || event["subtype"]
             .as_str()
-            .is_some_and(|kind| kind.starts_with("error_"))
+            .is_some_and(|kind| kind.starts_with(ERROR_PREFIX))
 }
 
 fn result_message(event: &Value) -> String {
@@ -280,7 +286,7 @@ pub(crate) struct Turn<'a> {
     trace: VecDeque<Cow<'static, str>>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Wait {
     Startup,
     Idle,
@@ -332,10 +338,7 @@ pub(crate) struct Offered {
 }
 
 fn answered(message: &Value) -> String {
-    message_text(message)
-        .chars()
-        .take(SHOWN_LINE_CHARS)
-        .collect()
+    line_preview(&message_text(message))
 }
 
 fn message_text(message: &Value) -> String {
@@ -369,13 +372,40 @@ pub(crate) fn control_request(id: &str, request: &Value) -> String {
 
 /// One text block per transcript block, so the prompt cache can reuse the
 /// blocks that an earlier request already sent.
-pub(crate) fn user_message(blocks: &[String]) -> String {
-    let content: Vec<Value> = blocks
-        .iter()
-        .map(|text| json!({ "type": "text", "text": text }))
-        .collect();
-    let message = json!({ "type": USER_EVENT, "message": { "role": "user", "content": content } });
-    format!("{message}\n")
+#[derive(Serialize)]
+struct UserText<'a> {
+    text: &'a str,
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+#[derive(Serialize)]
+struct UserContent<'a> {
+    content: Vec<UserText<'a>>,
+    role: &'static str,
+}
+
+#[derive(Serialize)]
+struct UserEvent<'a> {
+    message: UserContent<'a>,
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+pub(crate) fn user_message(blocks: &[String]) -> Result<String, Error> {
+    let message = UserEvent {
+        message: UserContent {
+            content: blocks
+                .iter()
+                .map(|text| UserText { text, kind: "text" })
+                .collect(),
+            role: "user",
+        },
+        kind: USER_EVENT,
+    };
+    let mut line = serde_json::to_string(&message)?;
+    line.push('\n');
+    Ok(line)
 }
 
 pub(super) fn count(usage: &Value, key: &str) -> Option<u32> {
@@ -487,17 +517,30 @@ impl Handshake {
     }
 }
 
+fn line_preview(line: &str) -> String {
+    line.chars().take(SHOWN_LINE_CHARS).collect()
+}
+
+fn text_field(value: &Value, key: &str) -> String {
+    value[key].as_str().unwrap_or_default().to_owned()
+}
+
+fn call_id(block: &Value) -> Result<&str, Error> {
+    block["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or(Error::NoCallId)
+}
+
 pub(crate) fn parse_event(line: &str) -> Result<Value, Error> {
     let event = serde_json::from_str::<Value>(line).map_err(|source| Error::NotAnEvent {
-        preview: line.chars().take(SHOWN_LINE_CHARS).collect(),
+        preview: line_preview(line),
         category: source.classify(),
         bytes: line.len(),
         source,
     })?;
     if !event.is_object() || !event["type"].is_string() {
-        return Err(Error::InvalidEvent(
-            line.chars().take(SHOWN_LINE_CHARS).collect(),
-        ));
+        return Err(Error::InvalidEvent(line_preview(line)));
     }
     Ok(event)
 }
@@ -654,7 +697,10 @@ impl<'a> Turn<'a> {
             }
             EventKind::User => Err(Error::AnsweredItself(answered(&event["message"]))),
             EventKind::Result => self.result(&event),
-            _ => Err(Error::UnknownEvent(event["type"].clone())),
+            EventKind::ControlResponse
+            | EventKind::RateLimit
+            | EventKind::Alive
+            | EventKind::System => Err(Error::UnknownEvent(event["type"].clone())),
         }
     }
 
@@ -706,9 +752,7 @@ impl<'a> Turn<'a> {
                 if block["type"] != TOOL_USE_BLOCK {
                     return Ok(Step::Nothing);
                 }
-                let Some(id) = block["id"].as_str().filter(|id| !id.is_empty()) else {
-                    return Err(Error::NoCallId);
-                };
+                let id = call_id(block)?;
                 let name = self.maki_name(&block["name"])?;
                 Ok(Step::Event(ProviderEvent::ToolUseStart {
                     id: id.to_owned(),
@@ -717,17 +761,16 @@ impl<'a> Turn<'a> {
             }
             Some(BLOCK_DELTA) => {
                 let delta = &event["delta"];
-                let text = |key: &str| delta[key].as_str().unwrap_or_default().to_owned();
                 Ok(match delta["type"].as_str() {
-                    Some("text_delta") => {
-                        let text = text("text");
+                    Some(TEXT_DELTA) => {
+                        let text = text_field(delta, TEXT_BLOCK);
                         if let Some(Some(streamed)) = self.started.last_mut() {
                             streamed.push(&text);
                         }
                         Step::Event(ProviderEvent::TextDelta { text })
                     }
-                    Some("thinking_delta") => Step::Event(ProviderEvent::ThinkingDelta {
-                        text: text("thinking"),
+                    Some(THINKING_DELTA) => Step::Event(ProviderEvent::ThinkingDelta {
+                        text: text_field(delta, THINKING_BLOCK),
                     }),
                     _ => Step::Nothing,
                 })
@@ -799,18 +842,19 @@ impl<'a> Turn<'a> {
             .map(Vec::as_slice)
             .unwrap_or_default()
         {
-            let text = |key: &str| block[key].as_str().unwrap_or_default().to_owned();
             let parsed = match block["type"].as_str() {
-                Some(TEXT_BLOCK) => ContentBlock::Text { text: text("text") },
-                Some("thinking") => ContentBlock::Thinking {
-                    thinking: text("thinking"),
+                Some(TEXT_BLOCK) => ContentBlock::Text {
+                    text: text_field(block, TEXT_BLOCK),
+                },
+                Some(THINKING_BLOCK) => ContentBlock::Thinking {
+                    thinking: text_field(block, THINKING_BLOCK),
                     signature: None,
                 },
-                Some("redacted_thinking") => ContentBlock::RedactedThinking { data: text("data") },
+                Some(REDACTED_THINKING_BLOCK) => ContentBlock::RedactedThinking {
+                    data: text_field(block, "data"),
+                },
                 Some(TOOL_USE_BLOCK) => {
-                    let Some(id) = block["id"].as_str().filter(|id| !id.is_empty()) else {
-                        return Err(Error::NoCallId);
-                    };
+                    let id = call_id(block)?;
                     let name = self.maki_name(&block["name"])?;
                     let input = &block["input"];
                     if input.get(UNPARSED_TOOL_INPUT).is_some() {
@@ -1067,6 +1111,11 @@ impl<'a> Turn<'a> {
 /// The model names a batch's calls as Claude Code shows the tools, but maki
 /// runs them by its own names. An unknown name stays, so maki reports it.
 fn unexpose_batch(catalog: &Catalog, input: &mut Value) {
+    if let Some(Value::String(encoded)) = input.get(BATCH_CALLS)
+        && let Ok(Value::Array(calls)) = serde_json::from_str(encoded)
+    {
+        input[BATCH_CALLS] = Value::Array(calls);
+    }
     let Some(calls) = input.get_mut(BATCH_CALLS).and_then(Value::as_array_mut) else {
         return;
     };
@@ -1577,7 +1626,7 @@ mod tests {
     #[test]
     fn each_transcript_block_is_a_text_block_of_its_own() {
         let blocks = ["first".to_owned(), "see @.env\nline".to_owned()];
-        let sent = user_message(&blocks);
+        let sent = user_message(&blocks).unwrap();
         let line = sent.strip_suffix('\n').unwrap();
         assert!(!line.contains('\n'), "{sent}");
         let message: Value = serde_json::from_str(line).unwrap();
@@ -1840,8 +1889,14 @@ mod tests {
     #[test_case(UNKNOWN_TOOL, "unknown" ; "an_unknown_exposed_tool_gets_its_local_name")]
     #[test_case("mcp__maki__made_up", "made_up" ; "an_unknown_exposed_name_loses_its_prefix")]
     fn a_batch_names_its_calls_by_maki_names(inner: &str, expected: &str) {
+        check_batch_names(inner, expected, false);
+        check_batch_names(inner, expected, true);
+    }
+
+    fn check_batch_names(inner: &str, expected: &str, encoded: bool) {
+        let calls = json!([{ BATCH_CALL_TOOL: inner, "parameters": { "path": "a" } }]);
         let input =
-            json!({ BATCH_CALLS: [{ BATCH_CALL_TOOL: inner, "parameters": { "path": "a" } }] });
+            json!({ BATCH_CALLS: if encoded { Value::String(calls.to_string()) } else { calls } });
         let call =
             json!({ "type": "tool_use", "id": FIRST_CALL, "name": EXPOSED_BATCH, "input": input });
         let handoff = Handoff::Parked {

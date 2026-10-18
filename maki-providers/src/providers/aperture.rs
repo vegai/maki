@@ -1,3 +1,4 @@
+use crate::provider::ModelListing;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -59,13 +60,11 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     supports_deferred_tools: false,
     adaptive_effort,
     thinking_fields_fallback,
-    accepts_images: true,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(16_384),
     fallback_context_window: 128_000,
     models_toml: NO_CURATED_MODELS,
     models_of: None,
-    plugin: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
@@ -456,7 +455,10 @@ impl Provider for Aperture {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
             let base = auth.base_url.as_deref().unwrap_or("");

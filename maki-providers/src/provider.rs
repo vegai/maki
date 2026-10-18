@@ -48,11 +48,10 @@ pub trait Provider: Send + Sync {
         scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>>;
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>>;
-
-    fn list_models_fresh(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        self.list_models()
-    }
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>>;
 
     /// Fetch provider-side usage quota (remaining percentage / reset times).
     /// `Ok(None)` means the provider does not expose a programmatic usage endpoint.
@@ -177,7 +176,10 @@ impl Provider for UnconfiguredProvider {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async {
             Err(AgentError::Config {
                 message: NOT_CONFIGURED.to_string(),
@@ -265,11 +267,7 @@ pub async fn fetch_all_models(
         };
         let tx = tx.clone();
         smol::spawn(async move {
-            let listed = match listing {
-                ModelListing::Cached => provider.list_models(),
-                ModelListing::Refresh => provider.list_models_fresh(),
-            }
-            .await;
+            let listed = provider.list_models(listing).await;
             let batch = match listed {
                 Ok(models) => {
                     let mut specs: Vec<String> =

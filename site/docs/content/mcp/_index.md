@@ -89,6 +89,10 @@ One option lives at the top level of `mcp.toml`, outside any server:
 |-------|------|---------|-------|
 | `defer_tools` | usize | 10 | Defer tools only when more than this many exist. Ignored with [native tool search](#loads-and-the-prompt-cache), which always defers |
 
+## Tool filters
+
+`--allowed-tools` and `--disallowed-tools` apply to MCP tools, including tools that connect later. Use `server.tool` or `server__tool`. Allow lists now restrict MCP access too. A list containing only `read,grep` excludes MCP tools. Add the required MCP names and `tool_search` to retain deferred loading. If `tool_search` is excluded, permitted MCP tools load directly. See [tool name lists](/docs/cli/#tool-name-lists) for migration details.
+
 ## Tool search
 
 Every tool definition a server exposes costs context window space, on every request. Take Datadog's MCP server: with all toolsets on it ships over 100 tools, when a task often needs three.

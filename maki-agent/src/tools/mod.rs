@@ -5,6 +5,7 @@
 //! quotes, camelCase keys, extra wrappers). Plan mode rejects writes to
 //! anything but the plan file before they reach the tool.
 
+use maki_providers::provider::ModelListing;
 mod deadline;
 mod file_access;
 pub mod grep;
@@ -359,7 +360,8 @@ pub type LocalTools = Arc<HashMap<String, LocalTool>>;
 /// A tool the session's host supplies: an ACP client tool, a subagent's
 /// `structured_output`. Dispatch puts it ahead of the registry, so it carries
 /// its own audience: a host tool must not reach a sandbox by wearing the name
-/// of a registry tool that may.
+/// of a registry tool that may. Host tools bypass the registry allow list, so the host
+/// must enforce its own policy before supplying them.
 #[derive(Clone)]
 pub struct LocalTool {
     pub handler: LocalToolFn,
@@ -612,6 +614,7 @@ impl Provider for NullProvider {
 
     fn list_models(
         &self,
+        _listing: ModelListing,
     ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, crate::AgentError>> {
         Box::pin(async { unimplemented!() })
     }

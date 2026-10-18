@@ -2,6 +2,7 @@
 //! Scripted providers exercise subagent dispatch, and Lua stubs isolate retry
 //! and cleanup policy.
 
+use maki_providers::provider::ModelListing;
 use std::sync::{Arc, Mutex};
 
 use futures_lite::future::poll_once;
@@ -965,7 +966,10 @@ impl Provider for StructuredOutputProvider {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }

@@ -1,3 +1,4 @@
+use crate::provider::ModelListing;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -57,13 +58,11 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     supports_deferred_tools: false,
     adaptive_effort: api_decides,
     thinking_fields_fallback: |_| None,
-    accepts_images: true,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(65_536),
     fallback_context_window: 1_000_000,
     models_toml: include_str!("../../models/google.toml"),
     models_of: None,
-    plugin: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
@@ -285,7 +284,10 @@ impl Provider for Google {
         Box::pin(self.do_stream(model, messages, system, tools, event_tx, opts.thinking))
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         let url = self.models_url();
         let request = self.build_request("GET", &url).body(()).unwrap();
         let client = self.client.clone();

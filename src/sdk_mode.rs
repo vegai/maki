@@ -17,7 +17,7 @@ use std::time::Instant;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use flume::Sender;
-use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
+use maki_agent::headless::{self, InteractiveHandle, InteractiveParams, Ready};
 use maki_agent::mcp;
 use maki_agent::permissions::{PermissionAnswer, PluginRuleStore, TaggedAnswer};
 use maki_agent::prompt::ResolvedPrompts;
@@ -39,7 +39,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::cli::Cli;
-use crate::notice::{NOTIFICATION, ProviderNotice, wire_uuid};
+use crate::notice::{NOTIFICATION, ProviderNotice, system_event, wire_uuid};
 use crate::tool_names::maki_to_claude_tool_name;
 
 const NOTICE_SUBTYPE: &str = "notice";
@@ -102,20 +102,12 @@ struct WireMessage {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WireInner {
-    System(SystemPayload),
     Assistant(AssistantPayload),
     User(UserPayload),
     Result(ResultPayload),
     StreamEvent(StreamEventPayload),
     ControlResponse(ControlResponsePayload),
     ControlRequest(ControlRequestPayload),
-}
-
-#[derive(Serialize)]
-struct SystemPayload {
-    subtype: &'static str,
-    #[serde(flatten)]
-    extra: Value,
 }
 
 #[derive(Serialize)]
@@ -386,13 +378,17 @@ impl SdkWriter {
             session_id: self.session_id.clone(),
             uuid: wire_uuid(),
         };
+        self.write(&msg)
+    }
+
+    fn write(&self, message: &impl Serialize) -> Result<()> {
         self.out_tx
-            .send(serde_json::to_string(&msg)?)
+            .send(serde_json::to_string(message)?)
             .map_err(|_| eyre!("stdout writer closed"))
     }
 
     fn emit_system(&self, subtype: &'static str, extra: Value) -> Result<()> {
-        self.emit(WireInner::System(SystemPayload { subtype, extra }))
+        self.write(&system_event(&self.session_id, subtype, extra))
     }
 
     fn emit_control_response(
@@ -562,7 +558,13 @@ pub fn run(params: SdkParams) -> Result<()> {
         project_config,
         local_tools: Default::default(),
     });
-    let startup_model = smol::block_on(handle.initial_model.recv_async()).unwrap_or(initial_model);
+    let Ready {
+        model: startup_model,
+        tool_names,
+    } = smol::block_on(handle.ready.recv_async()).unwrap_or(Ready {
+        model: initial_model,
+        tool_names: Vec::new(),
+    });
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
     let writer_thread = std::thread::spawn(move || {
@@ -578,8 +580,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         session_id: handle.session_id.clone(),
         out_tx,
     };
-    let tools: Vec<&str> = handle
-        .tool_names
+    let tools: Vec<&str> = tool_names
         .iter()
         .map(|t| maki_to_claude_tool_name(t))
         .collect();
@@ -1438,19 +1439,14 @@ mod tests {
 
     #[test]
     fn wire_init_serializes_correctly() {
-        let msg = WireMessage {
-            inner: WireInner::System(SystemPayload {
-                subtype: "init",
-                extra: serde_json::json!({
-                    "cwd": "/tmp",
-                    "tools": ["Read"],
-                    "model": "test",
-                    "permissionMode": "default",
-                }),
+        let session_id = SessionRef::generate();
+        let msg = system_event(
+            &session_id,
+            "init",
+            serde_json::json!({
+                "cwd": "/tmp", "tools": ["Read"], "model": "test", "permissionMode": "default",
             }),
-            session_id: SessionRef::generate(),
-            uuid: "u".into(),
-        };
+        );
         let json: Value = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["type"], "system");
         assert_eq!(json["subtype"], "init");

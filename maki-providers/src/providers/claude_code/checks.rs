@@ -159,7 +159,7 @@ const SOURCES: &str = "sources";
 const ERRORS: &str = "errors";
 const SETTINGS: &str = "settings";
 const EFFECTIVE: &str = "effective";
-const AUTO_COMPACT: &str = "autoCompactEnabled";
+pub(super) const AUTO_COMPACT: &str = "autoCompactEnabled";
 const HOOKS: &str = "hooks";
 const POLICY: &str = "policy";
 const ALL_DISABLED: &str = "allDisabled";
@@ -215,11 +215,10 @@ pub(crate) fn profile(output: &str, os: &str) -> Result<Profile, Error> {
 }
 
 fn passed(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    PASSED_ENV.contains(&upper.as_str())
+    PASSED_ENV.contains(&name)
         || PASSED_ENV_PREFIXES
             .iter()
-            .any(|prefix| upper.starts_with(prefix))
+            .any(|prefix| name.starts_with(prefix))
 }
 
 /// A new `CLAUDE_CODE_USE_*` cloud switch fails closed, and only the model
@@ -234,15 +233,16 @@ fn routes_login(name: &str) -> bool {
 
 /// Also returns the sorted names held back because they can change the
 /// login.
-pub(crate) fn child_env(
+pub(crate) fn launch_env(
     environ: impl IntoIterator<Item = (String, String)>,
 ) -> (Vec<(String, String)>, Vec<String>) {
     let mut env = Vec::new();
     let mut withheld = Vec::new();
     for (name, value) in environ {
-        if passed(&name) {
+        let upper = name.to_ascii_uppercase();
+        if passed(&upper) {
             env.push((name, value));
-        } else if routes_login(&name) {
+        } else if routes_login(&upper) {
             withheld.push(name);
         }
     }
@@ -411,7 +411,10 @@ fn settings_conflicts(settings: &Value) -> Vec<String> {
         keys.push(LOGIN_METHOD_KEY.to_owned());
     }
     if let Some(env) = settings.get(ENV_KEY).and_then(Value::as_object) {
-        let mut names: Vec<&String> = env.keys().filter(|name| routes_login(name)).collect();
+        let mut names: Vec<&String> = env
+            .keys()
+            .filter(|name| routes_login(&name.to_ascii_uppercase()))
+            .collect();
         names.sort();
         let env_key = ENV_KEY;
         keys.extend(names.into_iter().map(|name| format!("{env_key}.{name}")));
@@ -431,12 +434,12 @@ fn limited_text(path: &Path, max_bytes: u64, too_large: &'static str) -> io::Res
     if !file.metadata()?.is_file() {
         return Err(io::Error::new(ErrorKind::InvalidData, NOT_A_FILE));
     }
-    let mut text = String::new();
-    file.take(max_bytes + 1).read_to_string(&mut text)?;
-    if text.len() as u64 > max_bytes {
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
         return Err(io::Error::new(ErrorKind::InvalidData, too_large));
     }
-    Ok(text)
+    String::from_utf8(bytes).map_err(|error| io::Error::new(ErrorKind::InvalidData, error))
 }
 
 /// An unreadable file could hold an API key helper, so it counts as a conflict.
@@ -693,7 +696,7 @@ mod tests {
         COMMONDIR_FILE, CONNECTED, DEFAULT_MODE, ESSENTIAL_TRAFFIC_ONLY, FLAG_SOURCE, GIT_ENTRY,
         HANDSHAKE, InitExpect, MAX_GIT_PATH_BYTES, MAX_SETTINGS_BYTES, NO_KEY_SOURCE,
         NOT_AN_OBJECT, POLICY_SOURCE, SETTINGS_TOO_LARGE, UNREADABLE_FILE, account_problem,
-        child_env, config_dir, file_conflicts, init_problem, local_settings_dirs, plugins_problem,
+        config_dir, file_conflicts, init_problem, launch_env, local_settings_dirs, plugins_problem,
         policy_problem, profile, settings_conflicts,
     };
 
@@ -709,6 +712,17 @@ mod tests {
             .set_len(MAX_SETTINGS_BYTES + 1)
             .unwrap();
         assert!(file_conflicts(&[path])[0].contains(SETTINGS_TOO_LARGE));
+    }
+
+    #[test]
+    fn oversized_utf8_settings_report_the_size_limit() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(SETTINGS_FIXTURE);
+        let mut bytes = vec![b' '; MAX_SETTINGS_BYTES as usize];
+        bytes.extend_from_slice("é".as_bytes());
+        fs::write(&path, bytes).unwrap();
+        let error = super::limited_text(&path, MAX_SETTINGS_BYTES, SETTINGS_TOO_LARGE).unwrap_err();
+        assert_eq!(error.to_string(), SETTINGS_TOO_LARGE);
     }
 
     #[cfg(unix)]
@@ -757,7 +771,7 @@ mod tests {
             ("CARGO_HOME", "/cargo"),
         ]
         .map(|(name, value)| (name.to_owned(), value.to_owned()));
-        let (env, withheld) = child_env(environ);
+        let (env, withheld) = launch_env(environ);
         let names: Vec<&str> = env.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(
             names,
@@ -777,7 +791,7 @@ mod tests {
     #[test_case(Some(ESSENTIAL_TRAFFIC_ONLY.1) ; "already_disabled")]
     fn children_disable_nonessential_traffic(setting: Option<&str>) {
         let environ = setting.map(|value| (ESSENTIAL_TRAFFIC_ONLY.0.to_owned(), value.to_owned()));
-        let (env, _) = child_env(environ);
+        let (env, _) = launch_env(environ);
         let settings: Vec<_> = env
             .iter()
             .filter(|(name, _)| name == ESSENTIAL_TRAFFIC_ONLY.0)
@@ -808,6 +822,8 @@ mod tests {
     #[test_case("LC_ALL" => (true, false) ; "passed_lc_all")]
     #[test_case("XDG_RUNTIME_DIR" => (true, false) ; "passed_xdg_runtime_dir")]
     #[test_case("CLAUDE_CONFIG_DIR" => (true, false) ; "passed_claude_config_dir")]
+    #[test_case("anthropic_api_key" => (false, true) ; "lowercase_api_key_is_reported")]
+    #[test_case("claude_code_use_bedrock" => (false, true) ; "lowercase_cloud_route_is_reported")]
     #[test_case("ANTHROPIC_API_KEY" => (false, true) ; "withheld_anthropic_api_key")]
     #[test_case("ANTHROPIC_BASE_URL" => (false, true) ; "withheld_anthropic_base_url")]
     #[test_case("ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION" => (false, true) ; "withheld_anthropic_small_fast_model_aws_region")]
@@ -818,7 +834,7 @@ mod tests {
     #[test_case("ANTHROPIC_MODEL" => (false, false) ; "dropped_anthropic_model")]
     #[test_case("CARGO_HOME" => (false, false) ; "dropped_cargo_home")]
     fn environment_names_are_passed_withheld_or_dropped(name: &str) -> (bool, bool) {
-        let (env, withheld) = child_env([(name.to_owned(), String::new())]);
+        let (env, withheld) = launch_env([(name.to_owned(), String::new())]);
         (env.iter().any(|(key, _)| key == name), !withheld.is_empty())
     }
 

@@ -31,6 +31,7 @@ use maki_storage::id::SessionRef;
 const DOOM_LOOP_THRESHOLD: usize = 3;
 const DOOM_LOOP_MESSAGE: &str = "You have called this tool with the same (or nearly identical) input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
+const UNAVAILABLE_TOOL_PREFIX: &str = "tool is not available in this request";
 /// A frame never drops a tool, so a server that went away, or stopped
 /// publishing one, leaves its names listed. Saying so stops the model from
 /// retrying them.
@@ -904,7 +905,12 @@ fn run_tool_search(
 
 fn unavailable(ctx: &ToolContext, name: &str, id: String, unknown: bool) -> ToolDoneEvent {
     warn!(tool = name, unknown, "tool is unavailable");
-    let mut text = format!("{UNKNOWN_TOOL_PREFIX}: {name}");
+    let prefix = if unknown {
+        UNKNOWN_TOOL_PREFIX
+    } else {
+        UNAVAILABLE_TOOL_PREFIX
+    };
+    let mut text = format!("{prefix}: {name}");
     if unknown && ctx.mcp.is_some() && is_wire_name(name) {
         text = format!("{text}. {MCP_SERVER_GONE}");
     }
@@ -2671,7 +2677,7 @@ mod tests {
         assert!(done.is_error);
         assert_eq!(
             done.output.as_text(),
-            format!("{UNKNOWN_TOOL_PREFIX}: {PROBE_WIRE}")
+            format!("{UNAVAILABLE_TOOL_PREFIX}: {PROBE_WIRE}")
         );
     }
 
@@ -2713,7 +2719,7 @@ mod tests {
         assert!(done.is_error);
         assert_eq!(
             done.output.as_text(),
-            format!("{UNKNOWN_TOOL_PREFIX}: {CLIENT_NAME}")
+            format!("{UNAVAILABLE_TOOL_PREFIX}: {CLIENT_NAME}")
         );
         assert!(!started.load(Ordering::SeqCst));
     }
@@ -2786,7 +2792,7 @@ mod tests {
             assert_eq!(done.is_error, denied);
             assert_eq!(started.load(Ordering::SeqCst), !denied);
             let expected = if denied {
-                format!("{UNKNOWN_TOOL_PREFIX}: {CLIENT_NAME}")
+                format!("{UNAVAILABLE_TOOL_PREFIX}: {CLIENT_NAME}")
             } else {
                 CHILD_TEXT.to_owned()
             };
@@ -2798,7 +2804,7 @@ mod tests {
     #[test_case(PROBE_WIRE, CallOrigin::Nested ; "nested_tool")]
     #[test_case(TOOL_SEARCH_TOOL_NAME, CallOrigin::Model ; "model_search")]
     #[test_case(TOOL_SEARCH_TOOL_NAME, CallOrigin::Nested ; "nested_search")]
-    fn filtered_mcp_route_is_unknown(name: &str, origin: CallOrigin) {
+    fn filtered_mcp_route_is_unavailable(name: &str, origin: CallOrigin) {
         let mut ctx = mcp_ctx(&stub_mcp(&[PROBE_QUALIFIED]));
         ctx.tool_filter = Arc::new(ToolFilter {
             excluded: vec![name.to_owned()],
@@ -2815,7 +2821,7 @@ mod tests {
         assert!(done.is_error);
         assert_eq!(
             done.output.as_text(),
-            format!("{UNKNOWN_TOOL_PREFIX}: {name}")
+            format!("{UNAVAILABLE_TOOL_PREFIX}: {name}")
         );
     }
 
@@ -2838,7 +2844,7 @@ mod tests {
         let done = smol::block_on(dispatch(&ctx, called, &json!({})));
         assert_eq!(
             done.output.as_text(),
-            format!("{UNKNOWN_TOOL_PREFIX}: {called}")
+            format!("{UNAVAILABLE_TOOL_PREFIX}: {called}")
         );
     }
 
@@ -2920,7 +2926,7 @@ mod tests {
             let done = dispatch(&ctx, PROBE_WIRE, &serde_json::json!({})).await;
 
             assert!(done.is_error);
-            assert!(done.output.as_text().starts_with(UNKNOWN_TOOL_PREFIX));
+            assert!(done.output.as_text().starts_with(UNAVAILABLE_TOOL_PREFIX));
         });
     }
 
@@ -3006,7 +3012,7 @@ mod tests {
             let done = dispatch(&ctx, CLIENT_NAME, &serde_json::json!({})).await;
             assert!(done.is_error);
             assert_eq!(done.tool.as_ref(), CLIENT_NAME);
-            assert!(done.output.as_text().starts_with(UNKNOWN_TOOL_PREFIX));
+            assert!(done.output.as_text().starts_with(UNAVAILABLE_TOOL_PREFIX));
         });
     }
 

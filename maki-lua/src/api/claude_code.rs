@@ -1,8 +1,3 @@
-#[cfg(unix)]
-mod blobs;
-#[cfg(unix)]
-mod snapshot;
-
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Error as IoError, ErrorKind};
@@ -12,11 +7,14 @@ use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::claude_code::validation::{
     self, WorkerHandshake as NativeHandshake, WorkerPolicy,
 };
+#[cfg(unix)]
+use maki_providers::claude_code::{blobs, snapshot};
 use mlua::{
     Lua, LuaSerdeExt, Result as LuaResult, Table, UserData, UserDataMethods, Value as LuaValue,
 };
 use serde_json::Value;
 
+use crate::api::fs::path_text;
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::pair::{Pair, pair, try_pair};
 use crate::plugin_permissions::PluginPermissions;
@@ -41,8 +39,7 @@ async fn project_git_dir(_lua: Lua, project: String) -> LuaResult<Pair<String>> 
     Ok(pair(
         smol::unblock(move || {
             let project = validation::checkout_root(Path::new(&project)).map_err(IoError::other)?;
-            validation::git_directory(&project.join(validation::GIT_ENTRY))
-                .map(|path| path.to_string_lossy().into_owned())
+            validation::git_directory(&project.join(validation::GIT_ENTRY)).and_then(path_text)
         })
         .await,
     ))
@@ -89,12 +86,7 @@ async fn home_state_files(_lua: Lua, home: String) -> LuaResult<Pair<Vec<String>
                     .as_encoded_bytes()
                     .starts_with(HOME_STATE_PREFIX.as_bytes())
                 {
-                    files.push(name.into_string().map_err(|_| {
-                        IoError::new(
-                            ErrorKind::InvalidData,
-                            "Claude Code state path is not valid UTF-8",
-                        )
-                    })?);
+                    files.push(path_text(PathBuf::from(name))?);
                 }
             }
             Ok(files)
@@ -115,7 +107,8 @@ struct WorkerHandshake(NativeHandshake);
 impl UserData for WorkerHandshake {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method_mut("answer", |_, this, line: String| {
-            Ok(pair(this.0.answer(&json(&line)?["response"])))
+            let event = try_pair!(json(&line));
+            Ok(pair(this.0.answer(&event["response"])))
         });
         methods.add_method("finish", |_, this, ()| {
             Ok(pair(this.0.finish().map(|()| true)))
@@ -181,18 +174,13 @@ async fn prepare_launch(
         smol::unblock(move || validation::prepared_launch(environ, configured, Path::new(&cwd)))
             .await
     );
-    let paths = |path: PathBuf| {
-        path.into_os_string()
-            .into_string()
-            .map_err(|_| "launch path is not valid UTF-8")
-    };
     let result = lua.create_table()?;
     result.set("env", lua.create_table_from(prepared.env)?)?;
     result.set("withheld", prepared.withheld)?;
-    result.set("config_dir", try_pair!(paths(prepared.config_dir)))?;
+    result.set("config_dir", try_pair!(path_text(prepared.config_dir)))?;
     result.set(
         "own_config_dir",
-        try_pair!(prepared.own_config_dir.map(paths).transpose()),
+        try_pair!(prepared.own_config_dir.map(path_text).transpose()),
     )?;
     result.set(
         "dirs",
@@ -200,13 +188,13 @@ async fn prepare_launch(
             prepared
                 .local_dirs
                 .into_iter()
-                .map(paths)
+                .map(path_text)
                 .collect::<Result<Vec<_>, _>>()
         ),
     )?;
     result.set(
         "git_dir",
-        try_pair!(prepared.git_dir.map(paths).transpose()),
+        try_pair!(prepared.git_dir.map(path_text).transpose()),
     )?;
     Ok((Some(result), None))
 }
@@ -218,8 +206,8 @@ fn empty_mcp_config(_lua: &Lua) -> LuaResult<&'static str> {
     Ok(validation::EMPTY_MCP_CONFIG)
 }
 
-fn json(text: &str) -> LuaResult<Value> {
-    serde_json::from_str(text).map_err(mlua::Error::external)
+fn json(text: &str) -> Result<Value, serde_json::Error> {
+    serde_json::from_str(text)
 }
 
 /// Check the worker catalog, login route and directory before accepting output.
@@ -238,8 +226,12 @@ fn init_problem(
     tools: Vec<String>,
     modes: Vec<String>,
 ) -> LuaResult<Option<String>> {
+    let event = match json(&event) {
+        Ok(event) => event,
+        Err(error) => return Ok(Some(error.to_string())),
+    };
     Ok(validation::init_problem(
-        &json(&event)?,
+        &event,
         &version,
         Path::new(&cwd),
         tools.into_iter().collect::<HashSet<_>>(),
@@ -381,9 +373,9 @@ fn classify(lua: &Lua, line: String, mode: Table) -> LuaResult<Pair<Table>> {
 }
 
 lua_table! {
-    /// Claude Code launch checks shared with the subscription provider. JSON inputs retain
+    /// Private helpers for the bundled Claude Code plugin. JSON inputs retain
     /// the distinction between null, objects and arrays.
-    "maki.claude_code" => pub(crate) fn create_claude_code_table(perms: &PluginPermissions), DOCS [
+    "maki.claude_code.internal" => pub(crate) fn create_claude_code_table(perms: &PluginPermissions), DOCS [
         handshake, worker_handshake, base_args, worker_settings, empty_mcp_config, prepare_launch(perms), private_dir(perms), home_state_files(perms),
         init_problem,
         classify, version_check(perms), invalidate_version, sanitize_git(perms), project_git_dir(perms), unpack_blobs(perms),
@@ -395,7 +387,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
 
-    use mlua::{Function, Lua, Value as LuaValue};
+    use mlua::{AnyUserData, Function, Lua, ObjectLike, Value as LuaValue};
     use serde_json::{Value, json};
     use tempfile::tempdir;
     use test_case::test_case;
@@ -407,6 +399,34 @@ mod tests {
 
     const LINKED: &str = "linked";
     const NESTED: &str = "src";
+
+    #[test]
+    fn malformed_worker_json_returns_errors_without_throwing() {
+        const INVALID_JSON: &str = "{";
+        let expected = serde_json::from_str::<Value>(INVALID_JSON)
+            .unwrap_err()
+            .to_string();
+        let lua = Lua::new();
+        let table = create_claude_code_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let create: Function = table.get("worker_handshake").unwrap();
+        let policy = json_to_lua(&lua, &json!({ "deny": [] })).unwrap();
+        let handshake: AnyUserData = create.call((vec!["default"], policy)).unwrap();
+        let (complete, error): (Option<bool>, Option<String>) =
+            handshake.call_method("answer", INVALID_JSON).unwrap();
+        assert_eq!(complete, None);
+        assert_eq!(error, Some(expected.clone()));
+        let init: Function = table.get("init_problem").unwrap();
+        let error: Option<String> = init
+            .call((
+                INVALID_JSON,
+                "2.1.284",
+                "/",
+                Vec::<String>::new(),
+                Vec::<String>::new(),
+            ))
+            .unwrap();
+        assert_eq!(error, Some(expected));
+    }
 
     #[test_case(false ; "direct_denied_directory")]
     #[test_case(true ; "symlinked_denied_directory")]

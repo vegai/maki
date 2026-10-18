@@ -35,6 +35,8 @@ pub(super) fn shown(value: &Value) -> String {
 
 #[derive(Debug, Error)]
 pub(crate) enum Error {
+    #[error("maki cannot encode the Claude Code conversation: {0}")]
+    Encode(#[from] serde_json::Error),
     #[error(transparent)]
     Check(#[from] Problem),
     #[error("Claude Code ran {ran:?} for {asked}, which organization policy can cause")]
@@ -283,7 +285,7 @@ impl Error {
                 let status = status.unwrap_or(SERVER_ERROR);
                 is_temporary_status(status).then_some((status, *delay))
             }
-            Self::NoCallsToRun => Some((SERVER_ERROR, None)),
+            Self::NoCallsToRun | Self::StoppedFor(_) => Some((SERVER_ERROR, None)),
             Self::Interrupted(_) => Some((SERVER_ERROR, None)),
             _ => None,
         }

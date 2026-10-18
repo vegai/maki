@@ -169,6 +169,11 @@ for _, cancel_job in ipairs({ false, true }) do
   case("a_stopped_call_allows_only_cleanup_jobs_cancel_hook_" .. tostring(cancel_job), function()
     with_jobs(function(state)
       local call = jobs.new(STARTUP_MS)
+      if cancel_job then
+        maki.async.on_cancel(function()
+          call:stop()
+        end)
+      end
       state.finish = function()
         if cancel_job then
           state.cancel[1]()
@@ -195,6 +200,7 @@ for _, cancel_job in ipairs({ false, true }) do
       eq(#state.started, 2)
       eq(state.stopped[2], nil)
       eq(call.alive, 0)
+      eq(#state.cancel, cancel_job and 1 or 0)
     end)
   end)
 end

@@ -77,7 +77,7 @@ fn runnable(path: &Path) -> bool {
 
 /// A child started as a group leader has its pid as the group id.
 #[cfg(unix)]
-fn group_of(pid: u32) -> Option<Pid> {
+pub(crate) fn group_of(pid: u32) -> Option<Pid> {
     i32::try_from(pid).ok().and_then(Pid::from_raw)
 }
 

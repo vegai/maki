@@ -1,7 +1,4 @@
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-
-use serde_json::{Map, Value};
 
 use maki_config::PROVIDER_BUILTINS;
 use maki_config::providers::{BuiltInProvider, Protocol, ProviderPlan};
@@ -70,8 +67,6 @@ pub struct ProviderSpec {
     /// `None` ignores the fields, `Some` names their fallback. This also says
     /// whether a toggle fragment can carry an explicit token budget.
     pub thinking_fields_fallback: fn(&Model) -> Option<ThinkingFallback>,
-    /// A transport can reject images even when its model metadata supports vision.
-    pub accepts_images: bool,
     pub accepts_arbitrary_models: bool,
     pub fallback_max_output: Option<u32>,
     pub fallback_context_window: u32,
@@ -90,8 +85,6 @@ pub struct ProviderSpec {
     /// sit next to the prices they scale. Everyone else bills flat.
     pub pricing_schedule: Option<&'static PricingSchedule>,
 
-    /// Plugin that enables and configures this native provider.
-    pub plugin: Option<PluginBinding>,
     pub build: Build,
     /// `Some` iff Aperture can proxy onto this provider. Lives on the spec, not
     /// on [`Native`], so the route survives a provider losing its bespoke impl.
@@ -106,12 +99,6 @@ pub struct ProviderSpec {
 /// For a provider whose API has an adaptive mode of its own.
 pub(crate) fn api_decides(_: &Model) -> Option<Effort> {
     None
-}
-
-#[derive(Debug)]
-pub struct PluginBinding {
-    pub name: &'static str,
-    pub configure: fn(Option<&Map<String, Value>>),
 }
 
 /// For a provider whose ids all come from a live catalog.
@@ -274,17 +261,6 @@ const BUILTINS: &[ProviderSpec] = &[
 pub struct ProviderRegistry;
 
 impl ProviderRegistry {
-    pub fn configure_plugins(loaded: &[String], options: &HashMap<String, Map<String, Value>>) {
-        let empty = Map::new();
-        for binding in BUILTINS.iter().filter_map(|spec| spec.plugin.as_ref()) {
-            let config = loaded
-                .iter()
-                .any(|name| name == binding.name)
-                .then(|| options.get(binding.name).unwrap_or(&empty));
-            (binding.configure)(config);
-        }
-    }
-
     /// The row that describes `slug` itself: compiled in, or built from a
     /// plugin's declaration. The one to reach for unless plugin providers
     /// must be left out on purpose, see [`Self::compiled`].

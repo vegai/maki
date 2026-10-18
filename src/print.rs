@@ -15,7 +15,7 @@ use std::time::Instant;
 use clap::ValueEnum;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
-use maki_agent::headless::{self, HeadlessHandle, HeadlessParams};
+use maki_agent::headless::{self, HeadlessHandle, HeadlessParams, Ready};
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::session::Resumed;
 use maki_agent::tools::QUESTION_TOOL_NAME;
@@ -33,7 +33,7 @@ use maki_storage::sessions::SessionClaim;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::notice::{NOTIFICATION, ProviderNotice, wire_uuid};
+use crate::notice::{NOTIFICATION, ProviderNotice, system_event};
 
 const SESSION_LINE_PREFIX: &str = "session: ";
 
@@ -127,17 +127,6 @@ struct RetryEvent<'a> {
     attempt: u32,
     retry_delay_ms: u64,
     error: &'a str,
-    session_id: &'a SessionRef,
-}
-
-#[derive(Serialize)]
-struct NoticeEvent<'a> {
-    #[serde(rename = "type")]
-    event_type: &'static str,
-    subtype: &'static str,
-    #[serde(flatten)]
-    notice: ProviderNotice<'a>,
-    uuid: String,
     session_id: &'a SessionRef,
 }
 
@@ -242,14 +231,16 @@ pub fn run(params: PrintParams) -> Result<()> {
     });
 
     let HeadlessHandle {
-        tool_names,
-        initial_model,
+        ready,
         session_id,
         cwd,
         task,
     } = handle;
     let start = Instant::now();
-    let model = smol::block_on(initial_model.recv_async()).unwrap_or(model);
+    let Ready { model, tool_names } = smol::block_on(ready.recv_async()).unwrap_or(Ready {
+        model,
+        tool_names: Vec::new(),
+    });
 
     let mut verbose_out = match format {
         OutputFormat::StreamJson => Some(VerboseOutput::StreamJson),
@@ -348,13 +339,11 @@ pub fn run(params: PrintParams) -> Result<()> {
             }
             AgentEvent::ProviderWaiting { message } => {
                 if let Some(out) = &mut verbose_out {
-                    out.emit(&NoticeEvent {
-                        event_type: "system",
-                        subtype: NOTIFICATION,
-                        notice: ProviderNotice::new(message.as_deref(), parent_tool_use_id),
-                        uuid: wire_uuid(),
-                        session_id: &session_id,
-                    })?;
+                    out.emit(&system_event(
+                        &session_id,
+                        NOTIFICATION,
+                        ProviderNotice::new(message.as_deref(), parent_tool_use_id),
+                    ))?;
                 } else if let Some(message) = message {
                     match &subagent {
                         Some(info) => eprintln!("{}: {message}", info.name),

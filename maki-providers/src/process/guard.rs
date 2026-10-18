@@ -146,7 +146,9 @@ unsafe fn watcher_setup(reader: i32, ready: i32) -> io::Result<()> {
 // of closing every possible descriptor up to RLIMIT_NOFILE.
 unsafe fn close_inherited(reader: i32, ready: i32) -> io::Result<()> {
     let (first, last) = (reader.min(ready) as u32, reader.max(ready) as u32);
-    // SAFETY: all arguments are integer descriptors and flags.
+    // SAFETY: close_range uses integer descriptors and flags. getdents64 writes at most
+    // buffer.len() bytes into the live buffer and accepts byte alignment. Records are read
+    // as bytes, with their lengths and name bounds checked before indexing.
     unsafe {
         if (first == 0 || syscall(SYS_close_range, 0u32, first - 1, 0u32) == 0)
             && (first + 1 == last || syscall(SYS_close_range, first + 1, last - 1, 0u32) == 0)

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-dir=@DIR@
+dir=@QUOTED_DIR@
 echo $$ > "$dir/pid"
 version=$(cat "$dir/version" 2>/dev/null || echo "2.1.284 (Claude Code)")
 if [ "$1" = --version ]; then

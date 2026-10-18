@@ -29,13 +29,11 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     supports_deferred_tools: false,
     adaptive_effort: |model| LLAMACPP.adaptive_effort(model),
     thinking_fields_fallback: |_| LLAMACPP.fields_fallback(),
-    accepts_images: true,
     accepts_arbitrary_models: true,
     fallback_max_output: None,
     fallback_context_window: 128_000,
     models_toml: NO_CURATED_MODELS,
     models_of: None,
-    plugin: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,

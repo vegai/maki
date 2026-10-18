@@ -23,6 +23,8 @@ A headless run never asks about [folder trust](/docs/folder-trust/), so a
 project `.maki` directory it has no stored answer for is skipped and reported on
 standard error. In a container, add `--trust` to load it for that run.
 
+`--allowed-tools` now limits MCP tools as well as built-in and plugin tools. Scripted callers must include each required MCP name and `tool_search` if they use deferred loading. See [tool name lists](/docs/cli/#tool-name-lists).
+
 ## Thinking
 
 Set thinking explicitly when a script needs a predictable level:

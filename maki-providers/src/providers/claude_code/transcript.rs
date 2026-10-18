@@ -3,9 +3,11 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::fmt::Write;
+use std::io;
 
-use serde_json::{Value, json};
+use serde::Serialize;
+
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::error::Error;
@@ -20,7 +22,9 @@ const HASH_HEX_DIGITS: usize = 8;
 const USER_ROLE: &str = "user";
 const ASSISTANT_ROLE: &str = "assistant";
 const TOOL_RESULT_ROLE: &str = "tool_result";
+#[cfg(test)]
 const IS_ERROR: &str = "is_error";
+#[cfg(test)]
 const TEXT: &str = "text";
 pub(super) const BATCH_TOOL: &str = "batch";
 pub(super) const BATCH_CALLS: &str = "tool_calls";
@@ -138,8 +142,36 @@ pub(crate) fn system_prompt(system: &str) -> String {
     format!("{system}\n\n{TRANSPORT_NOTE}")
 }
 
-fn push_line(out: &mut String, value: &Value) {
-    let _ = write!(out, "\n{value}");
+#[derive(Serialize)]
+struct TranscriptCall<'a> {
+    id: &'a str,
+    input: Cow<'a, Value>,
+    name: Cow<'a, str>,
+}
+
+#[derive(Serialize)]
+struct TranscriptResult<'a> {
+    content: &'a str,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    is_error: bool,
+    role: &'static str,
+    tool_use_id: &'a str,
+}
+
+#[derive(Serialize)]
+struct TranscriptEntry<'a> {
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    observation: bool,
+    role: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<Cow<'a, str>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<TranscriptCall<'a>>,
+}
+
+fn push_line(out: &mut Vec<u8>, value: &impl Serialize) -> Result<(), Error> {
+    out.push(b'\n');
+    serde_json::to_writer(out, value).map_err(Error::from)
 }
 
 fn expose_input(catalog: &Catalog, name: &str, input: &mut Value) {
@@ -162,7 +194,7 @@ fn expose_input(catalog: &Catalog, name: &str, input: &mut Value) {
 pub(crate) fn transcript(messages: &[Message], catalog: &Catalog) -> Result<Vec<String>, Error> {
     let mut blocks = vec![TRANSCRIPT_HEADER.to_owned()];
     for message in messages {
-        let mut out = String::new();
+        let mut out = Vec::new();
         let mut text = Vec::new();
         let mut calls = Vec::new();
         let mut results = Vec::new();
@@ -172,10 +204,18 @@ pub(crate) fn transcript(messages: &[Message], catalog: &Catalog) -> Result<Vec<
                 ContentBlock::ToolUse {
                     id, name, input, ..
                 } => {
-                    let mut call =
-                        json!({ "id": id, "name": catalog.exposed_name(name), "input": input });
-                    expose_input(catalog, name, &mut call["input"]);
-                    calls.push(call);
+                    let input = if name == BATCH_TOOL {
+                        let mut input = input.clone();
+                        expose_input(catalog, name, &mut input);
+                        Cow::Owned(input)
+                    } else {
+                        Cow::Borrowed(input)
+                    };
+                    calls.push(TranscriptCall {
+                        id,
+                        name: catalog.exposed_name(name),
+                        input,
+                    });
                 }
                 ContentBlock::ToolResult {
                     tool_use_id,
@@ -183,49 +223,51 @@ pub(crate) fn transcript(messages: &[Message], catalog: &Catalog) -> Result<Vec<
                     is_error,
                     ..
                 } => {
-                    let mut result = json!({
-                        "role": TOOL_RESULT_ROLE,
-                        "tool_use_id": tool_use_id,
-                        "content": content,
+                    results.push(TranscriptResult {
+                        role: TOOL_RESULT_ROLE,
+                        tool_use_id,
+                        content,
+                        is_error: *is_error,
                     });
-                    if *is_error {
-                        result[IS_ERROR] = Value::Bool(true);
-                    }
-                    results.push(result);
                 }
                 ContentBlock::Image { .. } => return Err(Error::Image),
                 ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {}
             }
         }
         for result in &results {
-            push_line(&mut out, result);
+            push_line(&mut out, result)?;
         }
         if !text.is_empty() || !calls.is_empty() {
-            push_line(&mut out, &entry_of(message, &text, calls));
+            push_line(&mut out, &entry_of(message, &text, calls))?;
         }
         if !out.is_empty() {
-            blocks.push(out);
+            blocks.push(String::from_utf8(out).map_err(|source| Error::Io {
+                what: "decode the serialized conversation",
+                source: io::Error::other(source),
+            })?);
         }
     }
     Ok(blocks)
 }
 
-fn entry_of(message: &Message, text: &[&str], calls: Vec<Value>) -> Value {
-    let role = match message.role {
-        Role::User => USER_ROLE,
-        Role::Assistant => ASSISTANT_ROLE,
-    };
-    let mut entry = json!({ "role": role });
-    if !text.is_empty() {
-        entry[TEXT] = Value::String(text.join("\n"));
+fn entry_of<'a>(
+    message: &Message,
+    text: &[&'a str],
+    calls: Vec<TranscriptCall<'a>>,
+) -> TranscriptEntry<'a> {
+    TranscriptEntry {
+        role: match message.role {
+            Role::User => USER_ROLE,
+            Role::Assistant => ASSISTANT_ROLE,
+        },
+        text: match text {
+            [] => None,
+            [text] => Some(Cow::Borrowed(text)),
+            text => Some(Cow::Owned(text.join("\n"))),
+        },
+        tool_calls: calls,
+        observation: message.is_from_host(),
     }
-    if !calls.is_empty() {
-        entry["tool_calls"] = Value::Array(calls);
-    }
-    if message.is_from_host() {
-        entry["observation"] = Value::Bool(true);
-    }
-    entry
 }
 
 #[cfg(test)]
@@ -248,7 +290,7 @@ mod tests {
     #[test_case(Message::observation(HOST_UPDATE.into()) ; "observation")]
     #[test_case(Message::context_update(HOST_UPDATE.into(), Default::default()) ; "context_update")]
     fn host_updates_are_marked_as_observations(message: Message) {
-        let entry = entry_of(&message, &[HOST_UPDATE], Vec::new());
+        let entry = serde_json::to_value(entry_of(&message, &[HOST_UPDATE], Vec::new())).unwrap();
         assert_eq!(entry["observation"], true);
     }
 

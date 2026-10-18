@@ -6,6 +6,8 @@ local native = require("maki.claude_code.internal")
 
 local launch = require("claude_launch")
 local workspace = require("claude_workspace")
+local git_utils = require("claude_git")
+local path_utils = require("claude_paths")
 
 local M = {}
 
@@ -41,7 +43,6 @@ local CLONE_UNSUPPORTED = {
   ["Invalid argument"] = true,
 }
 local SECS_PER_HOUR = 3600
--- Stands in for the script in a denied import's error.
 
 local NON_UTF8_PATH = "the file name %s is not UTF-8, and maki cannot give it to a process"
 local NOT_UTF8_CHANGES = "the names of %s are not UTF-8, so the manifest cannot hold these changes. "
@@ -66,9 +67,9 @@ done
 local CHANGED_SINCE = [[find "./$1" -cnewer "$2" -print | LC_ALL=C tr -c '\n[:print:]' '?']]
 
 function M.shown(paths)
-  local listed, more = workspace.first(paths, SHOWN_PATHS)
+  local listed, more = path_utils.first(paths, SHOWN_PATHS)
   for i, path in ipairs(listed) do
-    listed[i] = workspace.printable(path)
+    listed[i] = path_utils.printable(path)
   end
   return table.concat(listed, ", ") .. (more > 0 and " and " .. more .. " more" or "")
 end
@@ -80,7 +81,7 @@ local function from_hex(line)
 end
 
 local function checkout_git(call, spec, args)
-  return call:run_quick(workspace.git(args), { env = spec.env, cwd = spec.cwd })
+  return call:run_quick(git_utils.git(args), { env = spec.env, cwd = spec.cwd })
 end
 
 local function list_files(call, spec, mode, pathspecs)
@@ -91,7 +92,7 @@ local function list_files(call, spec, mode, pathspecs)
   for _, pathspec in ipairs(pathspecs) do
     args[#args + 1] = pathspec
   end
-  for _, pathspec in ipairs(workspace.excluded_pathspecs(spec.deny_read)) do
+  for _, pathspec in ipairs(spec.excluded_pathspecs) do
     args[#args + 1] = pathspec
   end
   return checkout_git(call, spec, args)
@@ -130,7 +131,7 @@ end
 
 local function snapshot_git(call, artifact, args, stdin)
   return call:run_quick(
-    workspace.git(args),
+    git_utils.git(args),
     { env = artifact.git_env, cwd = artifact.snapshot, stdin = stdin, timeout_ms = artifact.timeout_ms }
   )
 end
@@ -143,14 +144,29 @@ local function index_files(call, artifact, paths)
   return err
 end
 
+local function commit_snapshot(call, artifact, message)
+  local _, commit_err = snapshot_git(call, artifact, { "commit", "-q", "--allow-empty", "-m", message })
+  if commit_err then
+    return nil, commit_err
+  end
+  local head, err = maki.fs.read(maki.fs.joinpath(artifact.git, "HEAD"))
+  if head then
+    local reference = head:match("^ref: ([^\n]+)")
+    if reference then
+      head, err = maki.fs.read(maki.fs.joinpath(artifact.git, reference))
+    end
+  end
+  return head and path_utils.trim(head), err
+end
+
 function M.disk_blobs(call, env, cwd, paths, keep_on_cancel, timeout_ms)
   if #paths == 0 then
     return {}
   end
-  local out, err = call:run_quick(workspace.git({ "hash-object", "--no-filters", "--stdin-paths" }), {
+  local out, err = call:run_quick(git_utils.git({ "hash-object", "--no-filters", "--stdin-paths" }), {
     env = env,
     cwd = cwd,
-    stdin = workspace.quoted_lines(paths),
+    stdin = git_utils.quoted_lines(paths),
     keep_on_cancel = keep_on_cancel,
     timeout_ms = timeout_ms,
   })
@@ -172,7 +188,7 @@ local function snapshot_paths(call, artifact, spec)
     return nil, deleted_err
   end
   local seen = {}
-  for _, path in ipairs(workspace.listed_paths(deleted)) do
+  for _, path in ipairs(git_utils.listed_paths(deleted)) do
     seen[path] = true
   end
   local paths = {}
@@ -182,7 +198,7 @@ local function snapshot_paths(call, artifact, spec)
       paths[#paths + 1] = path
     end
   end
-  local files, submodules = workspace.tracked_paths(tracked)
+  local files, submodules = git_utils.tracked_paths(tracked)
   for _, path in ipairs(files) do
     take(path)
   end
@@ -198,7 +214,7 @@ local function snapshot_paths(call, artifact, spec)
     if not untracked then
       return nil, untracked_err
     end
-    local included, repositories = workspace.untracked_paths(untracked)
+    local included, repositories = git_utils.untracked_paths(untracked)
     if #repositories > 0 then
       artifact.notes[#artifact.notes + 1] = "maki did not copy the repositories under include: "
         .. M.shown(repositories)
@@ -206,16 +222,16 @@ local function snapshot_paths(call, artifact, spec)
     for _, path in ipairs(included) do
       local dependency = false
       for _, dir in ipairs(spec.dependencies) do
-        dependency = dependency or workspace.within(path, dir)
+        dependency = dependency or path_utils.within(path, dir)
       end
       if not dependency then
         take(path)
       end
     end
   end
-  local unusual = workspace.first_non_utf8(paths)
+  local unusual = path_utils.first_non_utf8(paths)
   if unusual then
-    return nil, NON_UTF8_PATH:format(workspace.printable(unusual))
+    return nil, NON_UTF8_PATH:format(path_utils.printable(unusual))
   end
   if #submodules > 0 then
     artifact.notes[#artifact.notes + 1] = SUBMODULES_LEFT_OUT .. M.shown(submodules)
@@ -226,20 +242,22 @@ end
 -- The project's exclusions apply, because the worker's shell can read the
 -- whole copy.
 local function copy_dependencies(call, artifact, spec, paths)
-  local copied = {}
+  local copied, tracked_folders = {}, {}
+  for _, path in ipairs(paths) do
+    tracked_folders[path] = true
+    for slash in path:gmatch("()/") do
+      tracked_folders[path:sub(1, slash - 1)] = true
+    end
+  end
   for _, dir in ipairs(spec.dependencies) do
     local source = maki.fs.joinpath(spec.cwd, dir)
     local target = maki.fs.joinpath(artifact.snapshot, dir)
     local meta = maki.fs.metadata(source)
-    local holds_tracked = false
-    for _, path in ipairs(paths) do
-      holds_tracked = holds_tracked or workspace.within(path, dir)
-    end
     if not (meta and meta.is_dir) then
       artifact.notes[#artifact.notes + 1] = "the dependency "
         .. dir
         .. " is not a directory here, so maki did not copy it"
-    elseif holds_tracked then
+    elseif tracked_folders[dir] then
       artifact.notes[#artifact.notes + 1] = "the dependency "
         .. dir
         .. " contains tracked files, so maki copied only those. List only untracked directories."
@@ -253,10 +271,10 @@ local function copy_dependencies(call, artifact, spec, paths)
       if not listed then
         return nil, "maki cannot list the dependency " .. dir .. ": " .. list_err
       end
-      local files, nested = workspace.untracked_paths(listed)
-      local unusual = workspace.first_non_utf8(files)
+      local files, nested = git_utils.untracked_paths(listed)
+      local unusual = path_utils.first_non_utf8(files)
       if unusual then
-        return nil, NON_UTF8_PATH:format(workspace.printable(unusual))
+        return nil, NON_UTF8_PATH:format(path_utils.printable(unusual))
       end
       local cloned, clone_err, timed_out = copy_into(call, artifact, spec, files, "--reflink=always")
       if timed_out then
@@ -331,12 +349,12 @@ local function commit_base(call, artifact, paths, dependencies)
     return init_err
   end
   local info = maki.fs.joinpath(artifact.git, "info")
-  local exclude = { workspace.UNCOLLECTED_RULE }
+  local exclude = { git_utils.UNCOLLECTED_RULE }
   for _, dir in ipairs(dependencies) do
-    exclude[#exclude + 1] = workspace.exclude_rule(dir)
+    exclude[#exclude + 1] = path_utils.exclude_rule(dir)
   end
   local _, mkdir_err = maki.fs.mkdir(info)
-  local _, attributes_err = maki.fs.write(maki.fs.joinpath(info, "attributes"), workspace.RAW_ATTRIBUTES)
+  local _, attributes_err = maki.fs.write(maki.fs.joinpath(info, "attributes"), git_utils.RAW_ATTRIBUTES)
   local _, exclude_err = maki.fs.write(maki.fs.joinpath(info, "exclude"), table.concat(exclude))
   local link_err = M.sanitize(artifact)
   local setup_err = mkdir_err or attributes_err or exclude_err or link_err
@@ -356,11 +374,7 @@ local function commit_base(call, artifact, paths, dependencies)
   if add_err then
     return add_err
   end
-  local _, commit_err = snapshot_git(call, artifact, { "commit", "-q", "--allow-empty", "-m", "maki snapshot" })
-  if commit_err then
-    return commit_err
-  end
-  local base, base_err = snapshot_git(call, artifact, { "rev-parse", "HEAD" })
+  local base, base_err = commit_snapshot(call, artifact, "maki snapshot")
   artifact.base = base
   return base_err
 end
@@ -369,7 +383,7 @@ end
 -- write during the copy. A temporary index leaves the snapshot's index
 -- alone.
 local function consistency_problem(call, artifact, spec)
-  local env = workspace.snapshot_git_env(spec.env, artifact.git, spec.cwd)
+  local env = git_utils.snapshot_git_env(spec.env, artifact.git, spec.cwd)
   env.GIT_INDEX_FILE = maki.fs.joinpath(artifact.dir, CHECK_INDEX)
   local changed, err
   for _, args in ipairs({
@@ -377,7 +391,7 @@ local function consistency_problem(call, artifact, spec)
     { "update-index", "-q", "--refresh" },
     { "diff-files", "--name-only" },
   }) do
-    changed, err = call:run_quick(workspace.git(args), { env = env, cwd = spec.cwd, timeout_ms = artifact.timeout_ms })
+    changed, err = call:run_quick(git_utils.git(args), { env = env, cwd = spec.cwd, timeout_ms = artifact.timeout_ms })
     if not changed then
       break
     end
@@ -386,7 +400,7 @@ local function consistency_problem(call, artifact, spec)
   if not changed then
     return "maki cannot compare the snapshot with the checkout: " .. err
   end
-  local paths = workspace.listed_paths(changed)
+  local paths = git_utils.listed_paths(changed)
   if #paths > 0 then
     return "the checkout changed during the snapshot: "
       .. M.shown(paths)
@@ -418,7 +432,8 @@ end
 --- `dependencies`. A dependency that changed during the copy sets
 --- `artifact.unsettled`.
 function M.fill(call, artifact, spec)
-  artifact.excluded_pathspecs = workspace.collection_pathspecs(spec.dependencies)
+  spec.excluded_pathspecs = git_utils.excluded_pathspecs(spec.deny_read)
+  artifact.excluded_pathspecs = git_utils.collection_pathspecs(spec.dependencies)
   local paths, paths_err, tracked = snapshot_paths(call, artifact, spec)
   if not paths then
     return paths_err
@@ -491,11 +506,11 @@ function M.sweep(call, root, ttl_hours)
     local name, kind = entry[1], entry[2]
     local dir = maki.fs.joinpath(root, name)
     local marker = kind == "directory" and maki.fs.metadata(maki.fs.joinpath(dir, OWNER_MARKER))
-    local meta = marker and (maki.fs.metadata(maki.fs.joinpath(dir, workspace.MANIFEST)) or marker)
+    local meta = marker and (maki.fs.metadata(maki.fs.joinpath(dir, path_utils.MANIFEST)) or marker)
     if meta and meta.mtime and meta.mtime < cutoff then
-      local lock = maki.fs.try_lock(maki.fs.joinpath(dir, workspace.IMPORT_LOCK))
+      local lock = maki.fs.try_lock(maki.fs.joinpath(dir, path_utils.IMPORT_LOCK))
       if lock then
-        local current = maki.fs.metadata(maki.fs.joinpath(dir, workspace.MANIFEST)) or marker
+        local current = maki.fs.metadata(maki.fs.joinpath(dir, path_utils.MANIFEST)) or marker
         if current.mtime and current.mtime < cutoff then
           local trash = maki.fs.joinpath(root, TRASH_PREFIX .. name)
           local already_trash = name:sub(1, #TRASH_PREFIX) == TRASH_PREFIX
@@ -568,15 +583,15 @@ function M.allocate(call, root, env, timeout_ms)
     discard_failed_allocation(call, dir)
     return nil, "maki cannot mark " .. dir .. " as an artifact: " .. mark_err
   end
-  local snapshot = maki.fs.joinpath(dir, workspace.SNAPSHOT_DIR)
-  local git = maki.fs.joinpath(dir, workspace.GIT_DIR)
+  local snapshot = maki.fs.joinpath(dir, path_utils.SNAPSHOT_DIR)
+  local git = maki.fs.joinpath(dir, path_utils.GIT_DIR)
   local artifact = {
     id = maki.fs.basename(dir),
     dir = dir,
     snapshot = snapshot,
     git = git,
     tmp = maki.fs.joinpath(dir, TMP_DIR),
-    git_env = workspace.snapshot_git_env(env, git, snapshot),
+    git_env = git_utils.snapshot_git_env(env, git, snapshot),
     timeout_ms = timeout_ms,
     notes = {},
   }
@@ -640,7 +655,7 @@ local function stage_changes(call, artifact)
   if not listed then
     return nil, list_err
   end
-  local add_err = index_files(call, artifact, workspace.listed_paths(listed))
+  local add_err = index_files(call, artifact, git_utils.listed_paths(listed))
   if add_err then
     return nil, add_err
   end
@@ -656,7 +671,7 @@ local function stage_changes(call, artifact)
   if not ignored then
     return nil, ignored_err
   end
-  return workspace.listed_paths(ignored)
+  return git_utils.listed_paths(ignored)
 end
 
 -- Preparation changes become the worker baseline. The checkout lacks these
@@ -670,12 +685,8 @@ local function commit_prepared(call, artifact)
   if not ignored then
     return add_err
   end
-  artifact.prepared_ignored = launch.set_of(ignored)
-  local _, commit_err = snapshot_git(call, artifact, { "commit", "-q", "--allow-empty", "-m", "maki prepare" })
-  if commit_err then
-    return commit_err
-  end
-  local prepared, prepared_err = snapshot_git(call, artifact, { "rev-parse", "HEAD" })
+  artifact.prepared_ignored = path_utils.set_of(ignored)
+  local prepared, prepared_err = commit_snapshot(call, artifact, "maki prepare")
   if not prepared then
     return prepared_err
   end
@@ -684,7 +695,7 @@ local function commit_prepared(call, artifact)
   if not changed then
     return changed_err
   end
-  local paths = workspace.listed_paths(changed)
+  local paths = git_utils.listed_paths(changed)
   if #paths > 0 then
     artifact.notes[#artifact.notes + 1] = PREPARED:format(M.shown(paths))
   end
@@ -696,7 +707,7 @@ end
 --- hard-linked files private before the worker starts.
 --- Records a command error and returns any fatal sanitation or baseline error.
 function M.prepare(call, artifact, command, env, timeout_ms)
-  local _, err = call:run_quick({ "sh", "-c", workspace.without_local_git_env(command) }, {
+  local _, err = call:run_quick({ "sh", "-c", git_utils.without_local_git_env(command) }, {
     display = command,
     env = { TMPDIR = env.TMPDIR },
     inherit_env = true,
@@ -737,26 +748,22 @@ function M.collect(call, artifact, project)
     return nil, tree_err
   end
   artifact.tree = tree
-  local raw, raw_err = snapshot_git(call, artifact, { "diff-tree", "-r", "--raw", "--no-renames", artifact.base, tree })
+  local raw, raw_err =
+    snapshot_git(call, artifact, { "diff-tree", "-r", "--raw", "--numstat", "--no-renames", artifact.base, tree })
   if not raw then
     return nil, raw_err
   end
-  local numstat, numstat_err =
-    snapshot_git(call, artifact, { "diff-tree", "-r", "--numstat", "--no-renames", artifact.base, tree })
-  if not numstat then
-    return nil, numstat_err
-  end
   -- JSON holds only UTF-8, so the manifest cannot record the other names.
   local changes, unnamed = {}, {}
-  for _, change in ipairs(workspace.parse_raw_diff(raw)) do
+  for _, change in ipairs(git_utils.parse_raw_diff(raw)) do
     if utf8.len(change.path) then
       changes[#changes + 1] = change
     else
       unnamed[#unnamed + 1] = change.path
     end
   end
-  local binary = workspace.binary_paths(numstat)
-  local retyped = workspace.retyped_paths(changes)
+  local binary = git_utils.binary_paths(raw)
+  local retyped = git_utils.retyped_paths(changes)
   for _, change in ipairs(changes) do
     change.kind = workspace.repository_path(change.path, artifact.repositories) and workspace.REPOSITORY_KIND
       or retyped[change.path] and workspace.TYPE_KIND
@@ -774,7 +781,7 @@ function M.collect(call, artifact, project)
     imported = {},
   }
   local _, save_err =
-    maki.fs.atomic_write(maki.fs.joinpath(artifact.dir, workspace.MANIFEST), maki.json.encode(manifest))
+    maki.fs.atomic_write(maki.fs.joinpath(artifact.dir, path_utils.MANIFEST), maki.json.encode(manifest))
   if save_err then
     return nil, save_err
   end

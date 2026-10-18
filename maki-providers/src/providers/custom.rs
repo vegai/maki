@@ -1,3 +1,4 @@
+use crate::provider::ModelListing;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use maki_config::providers::{
@@ -331,7 +332,7 @@ pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
         match create(slug, timeouts) {
             Ok(provider) => {
                 let slug_c = slug.clone();
-                let result = smol::block_on(provider.list_models());
+                let result = smol::block_on(provider.list_models(ModelListing::Cached));
                 match result {
                     Ok(mut models) => {
                         overlay_declared_tiers(def, &mut models);

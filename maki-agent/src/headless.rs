@@ -76,10 +76,14 @@ pub struct HeadlessParams {
     pub project_config: ProjectConfig,
 }
 
-pub struct HeadlessHandle {
+/// Provider-adjusted startup metadata, matching the first request's capabilities.
+pub struct Ready {
+    pub model: Model,
     pub tool_names: Vec<String>,
-    /// Provider-adjusted capabilities, so startup metadata matches the run.
-    pub initial_model: Receiver<Model>,
+}
+
+pub struct HeadlessHandle {
+    pub ready: Receiver<Ready>,
     pub session_id: SessionRef,
     pub cwd: String,
     pub task: smol::Task<()>,
@@ -178,14 +182,10 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
         params.mcp_handle.as_ref(),
         LocalTools::default(),
     );
-    let initial = spec.render(&params.model, params.defaults.workflow);
-    let context = spec.builder();
-
     let mcp = params
         .mcp_handle
         .clone()
         .map(|h| McpSession::new(h, &params.resumed.history));
-    let tool_names = advertised_tool_names(&initial.tools, mcp.as_ref());
 
     let (guard, events) = event_stream();
     let event_tx = guard.sender(0);
@@ -199,10 +199,16 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
     let (ready_tx, ready_rx) = flume::bounded(1);
     let task = smol::spawn(run_session(guard, params.mcp_handle.clone(), async move {
         let mut model = params.model;
-        let Some(provider) = connect(&mut model, params.timeouts, &event_tx).await else {
+        let provider = connect(&mut model, params.timeouts, &event_tx).await;
+        let tools = spec.render(&model, params.defaults.workflow).tools;
+        let _ = ready_tx.send(Ready {
+            model: model.clone(),
+            tool_names: advertised_tool_names(&tools, mcp.as_ref()),
+        });
+        let Some(provider) = provider else {
             return;
         };
-        let _ = ready_tx.send(model.clone());
+        let context = spec.builder();
         let mut track = SessionTrack::open(
             params.resumed,
             params.claim,
@@ -261,8 +267,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
     }));
     (
         HeadlessHandle {
-            tool_names,
-            initial_model: ready_rx,
+            ready: ready_rx,
             session_id: session_ref,
             cwd: working_dir,
             task,
@@ -300,8 +305,7 @@ pub struct InteractiveParams {
 }
 
 pub struct InteractiveHandle {
-    pub tool_names: Vec<String>,
-    pub initial_model: Receiver<Model>,
+    pub ready: Receiver<Ready>,
     pub input_tx: flume::Sender<AgentInput>,
     pub answer_tx: flume::Sender<String>,
     pub cancel_tx: flume::Sender<()>,
@@ -327,14 +331,10 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             params.local_tools.clone(),
         )
     };
-    let initial = spec.render(&params.model, params.defaults.workflow);
-    let context = spec.builder();
-
     let mcp = params
         .mcp_handle
         .clone()
         .map(|h| McpSession::new(h, &params.resumed.history));
-    let tool_names = advertised_tool_names(&initial.tools, mcp.as_ref());
 
     let (guard, events) = event_stream();
     let base_tx = guard.sender(0);
@@ -364,10 +364,16 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     let (ready_tx, ready_rx) = flume::bounded(1);
     let task = smol::spawn(run_session(guard, params.mcp_handle.clone(), async move {
         let mut model = params.model;
-        let Some(mut provider) = connect(&mut model, params.timeouts, &base_tx).await else {
+        let provider = connect(&mut model, params.timeouts, &base_tx).await;
+        let tools = spec.render(&model, params.defaults.workflow).tools;
+        let _ = ready_tx.send(Ready {
+            model: model.clone(),
+            tool_names: advertised_tool_names(&tools, mcp.as_ref()),
+        });
+        let Some(mut provider) = provider else {
             return;
         };
-        let _ = ready_tx.send(model.clone());
+        let context = spec.builder();
         let mut track =
             SessionTrack::open(params.resumed, params.claim, params.storage, &working_dir);
         let mut run_id: u64 = 0;
@@ -456,8 +462,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 
     (
         InteractiveHandle {
-            tool_names,
-            initial_model: ready_rx,
+            ready: ready_rx,
             input_tx,
             answer_tx,
             cancel_tx,

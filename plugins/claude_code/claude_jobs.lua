@@ -105,11 +105,6 @@ function Call:spawn(argv, job_opts, how)
   end)
   if not how.keep_on_cancel then
     self.stoppable[#self.stoppable + 1] = id
-    -- Read-only calls have no artifact cleanup hook to stop subsequent work.
-    maki.async.on_cancel(function()
-      self.stopped = true
-      maki.fn.jobstop(id)
-    end)
   end
   return id
 end
