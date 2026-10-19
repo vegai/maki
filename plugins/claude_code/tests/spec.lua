@@ -140,14 +140,22 @@ for _, path in ipairs({ "café.rs", "cafe" .. utf8.char(0x301) .. ".rs", "☀" .
 end
 
 for _, code in ipairs({ 0x180b, 0x180f, 0xfe0f, 0xe0100 }) do
-  case("a_selector_after_ascii_is_escaped_" .. code, function()
+  case("variation_selectors_require_a_visible_base_" .. code, function()
     local selector = utf8.char(code)
     local escape = string.format(code <= 0xffff and "\\u%04x" or "\\U%08x", code)
     eq(path_utils.printable("src/main" .. selector .. ".rs"), "src/main" .. escape .. ".rs")
     eq(path_utils.printable(selector .. ".rs"), escape .. ".rs")
     eq(path_utils.printable("字" .. selector .. ".rs"), "字" .. selector .. ".rs")
+    local invisible_prefix = "a" .. utf8.char(0x200b)
+    eq(path_utils.printable(invisible_prefix .. selector .. ".rs"), "a\\u200b" .. escape .. ".rs")
+    eq(path_utils.printable("字" .. selector .. selector .. ".rs"), "字" .. selector .. escape .. ".rs")
+    eq(path_utils.printable("a" .. selector .. selector .. ".rs"), "a" .. escape .. escape .. ".rs")
     local shell = path_utils.bash_quote("src/main" .. selector .. ".rs")
     eq(shell:find(selector, 1, true), nil)
+    shell = path_utils.bash_quote(invisible_prefix .. selector .. ".rs")
+    eq(shell:find(selector, 1, true), nil)
+    local _, raw_selectors = path_utils.bash_quote("字" .. selector .. selector .. ".rs"):gsub(selector, "")
+    eq(raw_selectors, 1)
   end)
 end
 
