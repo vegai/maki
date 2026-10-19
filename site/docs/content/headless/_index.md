@@ -75,6 +75,8 @@ because every turn after the first reads the prompt from cache.
 
 Add `--verbose` to include full turn-by-turn messages in the output.
 
+Provider queue waits go to stderr in text output. `stream-json` and SDK output use `system` events with `subtype: "notification"` and a stable `key`. An empty `text` clears the wait. ACP sends notices when the client supports them, or thought chunks otherwise.
+
 ## Sessions
 
 A `--print` run stores its session, so `maki session list` shows it and the next

@@ -701,8 +701,8 @@ impl Model {
         }
     }
 
-    /// Vision requires an image-capable transport. Model support then follows
-    /// per-model overrides, discovery, [`ModelSources`] and the family default.
+    /// Vision support, most specific first: per-model override, discovery,
+    /// [`ModelSources`], the family default.
     pub fn supports_vision(&self) -> bool {
         if let Some(vision) = self.supports_vision_override {
             return vision;

@@ -128,7 +128,10 @@ pub async fn run(
     origin: CallOrigin,
 ) -> ToolDoneEvent {
     let resolved = resolve(ctx, name);
-    let allowed = offered(ctx, &resolved);
+    let allowed = resolved
+        .route
+        .as_ref()
+        .is_some_and(|route| offered(ctx, resolved.name, route));
     let name = resolved.name;
     let hook = allowed.then(|| Hook::of(ctx, &resolved, origin)).flatten();
 
@@ -451,22 +454,15 @@ fn resolve<'a>(ctx: &'a ToolContext, name: &'a str) -> Resolved<'a> {
     Resolved { name, route }
 }
 
-fn offered(ctx: &ToolContext, resolved: &Resolved<'_>) -> bool {
-    let Some(route) = &resolved.route else {
-        return false;
-    };
+fn offered(ctx: &ToolContext, name: &str, route: &Route<'_>) -> bool {
     let audience = match route {
         Route::Native(entry) => entry.tool.audience(),
         Route::Local(tool) => tool.audience,
         Route::Mcp(_, qualified) => return ctx.tool_filter.matches_external(qualified),
-        Route::ToolSearch(_) => return ctx.tool_filter.matches_external(resolved.name),
+        Route::ToolSearch(_) => return ctx.tool_filter.matches_external(name),
     };
-    ctx.tool_filter.admits(
-        resolved.name,
-        audience,
-        ctx.audience,
-        Some(&ctx.local_tools),
-    )
+    ctx.tool_filter
+        .admits(name, audience, ctx.audience, Some(&ctx.local_tools))
 }
 
 /// One callable name, as [`resolve`] would route it.
@@ -505,14 +501,7 @@ pub fn callable(ctx: &ToolContext) -> Vec<Callable> {
     // name, or MCP would publish a way around it.
     let mut claim = |name: &str, route: Route<'_>| {
         let first = claimed.insert(name.to_owned());
-        first
-            && offered(
-                ctx,
-                &Resolved {
-                    name,
-                    route: Some(route),
-                },
-            )
+        first && offered(ctx, name, &route)
     };
     let entry_of = |name: &str, source, audience, schema| Callable {
         name: name.to_owned(),

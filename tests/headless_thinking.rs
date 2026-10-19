@@ -31,7 +31,8 @@ const EXPLICIT_BUDGET: u64 = 2048;
 const SDK_BUDGET: u64 = 4096;
 const INVALID_THINKING: &str = "unknown thinking value \"turbo\"";
 const INVALID_EFFORT: &str = "invalid value 'turbo' for '--effort <EFFORT>'";
-const INVALID_BUDGET: &str = "unexpected argument '-1' found";
+const INVALID_BUDGET: &str = "invalid value '-1' for '--max-thinking-tokens <MAX_THINKING_TOKENS>'";
+const BUDGET_RANGE: &str = "not in 0..=4294967295";
 const PROTOCOL_TIMEOUT: Duration = Duration::from_secs(30);
 const INITIALIZE_ID: u64 = 1;
 const NEW_SESSION_ID: u64 = 2;
@@ -261,13 +262,16 @@ fn acp_launch_thinking_reaches_the_request(flags: &[&str], budget: Option<u64>) 
 
 #[test_case(&["-p", "--thinking", "turbo"], INVALID_THINKING ; "print")]
 #[test_case(&["-p", "--input-format", "stream-json", "--effort", "turbo"], INVALID_EFFORT ; "sdk")]
-#[test_case(&["acp", "--max-thinking-tokens", "-1"], INVALID_BUDGET ; "acp")]
+#[test_case(&["acp", "--max-thinking-tokens=-1"], INVALID_BUDGET ; "acp")]
 fn invalid_launch_thinking_exits_before_a_provider_request(flags: &[&str], expected: &str) {
     let fixture = Fixture::new(None, Yes);
     let output = fixture.command().args(flags).output().unwrap();
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains(expected), "{stderr}");
+    if expected == INVALID_BUDGET {
+        assert!(stderr.contains(BUDGET_RANGE), "{stderr}");
+    }
     assert!(output.stdout.is_empty());
     assert!(fixture.requests.lock().unwrap().is_empty());
 }

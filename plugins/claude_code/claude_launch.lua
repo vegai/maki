@@ -507,6 +507,7 @@ function M.preflight(input, ctx, call, opts, plan)
       end,
     })
     if not output then
+      -- A failed spawn has no exit callback to remove its private directory.
       call:remove_dir(dir)
       return nil, output_err
     end

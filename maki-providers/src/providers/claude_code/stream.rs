@@ -34,6 +34,7 @@ pub(super) const ASSISTANT_EVENT: &str = "assistant";
 const USER_EVENT: &str = "user";
 pub(super) const RESULT_EVENT: &str = "result";
 const MAX_TURNS_ERROR: &str = "error_max_turns";
+const ERROR_PREFIX: &str = "error";
 const STREAM_EVENT: &str = "stream_event";
 const UNKNOWN_EVENT_KIND: &str = "?";
 const CONTROL_REQUEST: &str = "control_request";
@@ -186,7 +187,12 @@ pub(crate) fn classify(
         _ => return Err(Error::UnknownEvent(event["type"].clone())),
     };
     if !accepted {
-        if kind == EventKind::Result && failed_result(event) {
+        if kind == EventKind::Result
+            && (event["is_error"] == true
+                || event["subtype"]
+                    .as_str()
+                    .is_some_and(|kind| kind.starts_with(ERROR_PREFIX)))
+        {
             if mode == StreamMode::Provider {
                 return Err(Error::Failed(result_message(event)));
             }
@@ -214,9 +220,24 @@ fn result_message(event: &Value) -> String {
             event["errors"]
                 .as_array()
                 .filter(|errors| !errors.is_empty())
-                .map(|_| shown(&event["errors"]))
+                .map(|errors| {
+                    errors
+                        .iter()
+                        .map(|error| error.as_str().map_or_else(|| shown(error), str::to_owned))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
         });
-    detail.map_or_else(|| kind.to_owned(), |text| format!("{kind}: {text}"))
+    detail.map_or_else(
+        || if kind == SUCCESS { UNKNOWN_ERROR } else { kind }.to_owned(),
+        |text| {
+            if kind == SUCCESS {
+                text
+            } else {
+                format!("{kind}: {text}")
+            }
+        },
+    )
 }
 
 pub(super) fn result_failure(event: &Value) -> Option<String> {
@@ -406,7 +427,7 @@ pub(crate) fn user_message(blocks: &[String]) -> Result<String, Error> {
         },
         kind: USER_EVENT,
     };
-    let mut line = serde_json::to_string(&message)?;
+    let mut line = serde_json::to_string(&message).map_err(Error::Encode)?;
     line.push('\n');
     Ok(line)
 }
@@ -1216,8 +1237,8 @@ mod tests {
         ACCOUNT_ANSWER, API_ERROR_MARK, BATCH_CALL_TOOL, BATCH_CALLS, BATCH_TOOL, EXTRA_USAGE,
         EXTRA_USAGE_IN_USE, HOOKS_ANSWER, INPUT_REJECTED, MAX_TOKENS_STOP, MAX_TURNS_ERROR,
         NO_SUCH_TOOL, PLAN_REJECTED, RATE_LIMITED, REFUSAL_STOP, RESULT_EVENT, SETTINGS_ANSWER,
-        SHOWN_LINE_CHARS, SUCCESS, Step, TOOL_RESULT, TOOL_USE_STOP, Turn, WINDOW_FULL_STOP,
-        dropped_by_claude_code, usage_of, user_message,
+        SHOWN_LINE_CHARS, SUCCESS, Step, StreamMode, TOOL_RESULT, TOOL_USE_STOP, Turn,
+        WINDOW_FULL_STOP, classify, dropped_by_claude_code, usage_of, user_message,
     };
     use crate::{ContentBlock, StopReason, StreamResponse};
 
@@ -1260,7 +1281,6 @@ mod tests {
     const EXECUTION_ERROR: &str = "error_during_execution";
     const FAILURE_DETAIL: &str = "socat not installed";
     const FAILURE_WITH_RESULT: &str = "error_during_execution: socat not installed";
-    const FAILURE_WITH_ERRORS: &str = "error_during_execution: [\"socat not installed\"]";
 
     fn catalog() -> Catalog {
         Catalog::new(&json!([
@@ -1954,13 +1974,14 @@ mod tests {
             json!({ "type": RESULT_EVENT, "subtype": EXECUTION_ERROR, "errors": [FAILURE_DETAIL] })
                 .to_string();
         let step = with_turn(|mut turn| turn.feed(&event));
-        assert!(matches!(step, Err(Error::Failed(ref message)) if message == FAILURE_WITH_ERRORS));
+        assert!(matches!(step, Err(Error::Failed(ref message)) if message == FAILURE_WITH_RESULT));
     }
 
     #[test_case(json!({ "subtype": MAX_TURNS_ERROR }), MAX_TURNS_ERROR ; "without_details")]
     #[test_case(json!({ "subtype": EXECUTION_ERROR, "result": FAILURE_DETAIL }), FAILURE_WITH_RESULT ; "with_result_text")]
-    #[test_case(json!({ "subtype": EXECUTION_ERROR, "errors": [FAILURE_DETAIL] }), FAILURE_WITH_ERRORS ; "with_error_messages")]
-    #[test_case(json!({ "subtype": EXECUTION_ERROR, "result": "", "errors": [FAILURE_DETAIL] }), FAILURE_WITH_ERRORS ; "with_empty_result_text")]
+    #[test_case(json!({ "subtype": EXECUTION_ERROR, "errors": [FAILURE_DETAIL] }), FAILURE_WITH_RESULT ; "with_error_messages")]
+    #[test_case(json!({ "subtype": EXECUTION_ERROR, "result": "", "errors": [FAILURE_DETAIL] }), FAILURE_WITH_RESULT ; "with_empty_result_text")]
+    #[test_case(json!({ "subtype": SUCCESS, "result": FAILURE_DETAIL }), FAILURE_DETAIL ; "an_error_flag_overrides_success")]
     fn result_errors_preserve_kind_and_details(mut event: Value, expected: &str) {
         event["type"] = json!(RESULT_EVENT);
         event["is_error"] = json!(true);
@@ -1972,6 +1993,18 @@ mod tests {
                 matches!(error, Err(Error::Failed(ref message)) if message == expected),
                 "{error:?}"
             );
+        }
+    }
+
+    #[test_case(json!({}) ; "missing_subtype")]
+    #[test_case(json!({ "subtype": "unknown" }) ; "unknown_subtype")]
+    fn an_unknown_result_before_init_does_not_bypass_startup_checks(mut event: Value) {
+        event["type"] = json!(RESULT_EVENT);
+        for mode in [StreamMode::Provider, StreamMode::Worker] {
+            assert!(matches!(
+                classify(&event, mode, false),
+                Err(Error::UncheckedStart)
+            ));
         }
     }
 

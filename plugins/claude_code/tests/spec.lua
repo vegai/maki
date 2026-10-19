@@ -133,9 +133,21 @@ for _, code in ipairs({ 0x80, 0x9b, 0x2028, 0x2029, 0x200b, 0x202e, 0xfeff }) do
   end)
 end
 
-for _, path in ipairs({ "café.rs", "cafe" .. utf8.char(0x301) .. ".rs", "emoji" .. utf8.char(0xfe0f) .. ".rs" }) do
+for _, path in ipairs({ "café.rs", "cafe" .. utf8.char(0x301) .. ".rs", "☀" .. utf8.char(0xfe0f) .. ".rs" }) do
   case("visible_unicode_path_" .. path, function()
     eq(path_utils.printable(path), path)
+  end)
+end
+
+for _, code in ipairs({ 0x180b, 0x180f, 0xfe0f, 0xe0100 }) do
+  case("a_selector_after_ascii_is_escaped_" .. code, function()
+    local selector = utf8.char(code)
+    local escape = string.format(code <= 0xffff and "\\u%04x" or "\\U%08x", code)
+    eq(path_utils.printable("src/main" .. selector .. ".rs"), "src/main" .. escape .. ".rs")
+    eq(path_utils.printable(selector .. ".rs"), escape .. ".rs")
+    eq(path_utils.printable("字" .. selector .. ".rs"), "字" .. selector .. ".rs")
+    local shell = path_utils.bash_quote("src/main" .. selector .. ".rs")
+    eq(shell:find(selector, 1, true), nil)
   end)
 end
 
@@ -967,7 +979,7 @@ for _, c in ipairs({
   {
     name = "error_subtype",
     result = { subtype = "error_max_turns", errors = { "turn limit" } },
-    want = 'error_max_turns: ["turn limit"]',
+    want = "error_max_turns: turn limit",
   },
   {
     name = "error_flag",
@@ -977,12 +989,12 @@ for _, c in ipairs({
   {
     name = "a_table_for_its_result",
     result = { subtype = "error_during_execution", result = { code = 1 }, errors = { "overloaded" } },
-    want = 'error_during_execution: ["overloaded"]',
+    want = "error_during_execution: overloaded",
   },
   {
     name = "errors_that_are_no_strings",
     result = { subtype = "error_during_execution", errors = { { code = 529 }, "retry later" } },
-    want = 'error_during_execution: [{"code":529},"retry later"]',
+    want = 'error_during_execution: {"code":529}; retry later',
   },
 }) do
   case("a_result_with_" .. c.name .. "_is_an_error", function()
@@ -1624,7 +1636,6 @@ case("synthetic_api_errors_preserve_the_result_cause", function()
   local stream = Stream.new({ cwd = CWD, worker = READ, cli = CLI })
   stream:set_model("claude-haiku-4-5")
   stream:feed(init_event())
-  stream:set_model("claude-haiku-4-5")
   local step = stream:feed(maki.json.encode({
     type = "assistant",
     is_api_error_message = true,

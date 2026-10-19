@@ -130,11 +130,16 @@ end
 --- report shows it, with control bytes escaped.
 local function select_changes(manifest, paths)
   local by_path = {}
-  for _, change in ipairs(manifest.changes) do
-    by_path[change.path] = change
+  local function add(path, change)
+    if by_path[path] == nil then
+      by_path[path] = change
+    elseif by_path[path] ~= change then
+      by_path[path] = false
+    end
   end
   for _, change in ipairs(manifest.changes) do
-    by_path[path_utils.printable(change.path)] = change
+    add(change.path, change)
+    add(path_utils.printable(change.path), change)
   end
   local selected = manifest.changes
   if paths then
@@ -142,6 +147,9 @@ local function select_changes(manifest, paths)
     local named = {}
     for _, path in ipairs(paths) do
       local change = by_path[path]
+      if change == false then
+        return nil, path_utils.printable(path) .. " matches more than one change. Omit `paths` to import all changes"
+      end
       if not change then
         return nil, path_utils.printable(path) .. " is not a change of the artifact"
       end
