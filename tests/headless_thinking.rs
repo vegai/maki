@@ -15,6 +15,7 @@ use maki_storage::model::{persist_thinking, read_thinking};
 use maki_storage::sessions::StoredThinking;
 use serde_json::{Value, json};
 use test_case::test_case;
+use wait_timeout::ChildExt;
 
 #[path = "support/isolation.rs"]
 mod isolation;
@@ -36,6 +37,10 @@ const INVALID_EFFORT: &str = "invalid value 'turbo' for '--effort <EFFORT>'";
 const INVALID_BUDGET: &str = "invalid value '-1' for '--max-thinking-tokens <MAX_THINKING_TOKENS>'";
 const BUDGET_RANGE: &str = "not in 0..=4294967295";
 const PROTOCOL_TIMEOUT: Duration = Duration::from_secs(30);
+const STREAM_FORMAT: &str = "stream-json";
+const SYSTEM: &str = "system";
+const INIT: &str = "init";
+const RESULT: &str = "result";
 const INITIALIZE_ID: u64 = 1;
 const NEW_SESSION_ID: u64 = 2;
 const PROMPT_ID: u64 = 3;
@@ -160,12 +165,17 @@ impl Process {
     fn response(&self, id: u64) -> Value {
         let response = self.until(|event| event["id"] == id);
         assert!(response.get("error").is_none(), "{response}");
-        response["result"].clone()
+        response[RESULT].clone()
     }
 
     fn finish(&mut self) {
         self.child.stdin.take();
-        assert!(self.child.wait().unwrap().success());
+        let status = self
+            .child
+            .wait_timeout(PROTOCOL_TIMEOUT)
+            .unwrap()
+            .unwrap_or_else(|| panic!("maki did not exit in {PROTOCOL_TIMEOUT:?}"));
+        assert!(status.success(), "{status}");
     }
 }
 
@@ -205,22 +215,22 @@ fn headless_thinking_reaches_the_request_and_init(
 ) {
     let fixture = Fixture::new(configured, support);
     let mut command = fixture.command();
-    command.args(["-p", "--model", MODEL, "--output-format", "stream-json"]);
+    command.args(["-p", "--model", MODEL, "--output-format", STREAM_FORMAT]);
     command.args(flags);
     if sdk {
-        command.args(["--input-format", "stream-json"]);
+        command.args(["--input-format", STREAM_FORMAT]);
     } else {
         command.arg(PROMPT);
     }
     let mut process = Process::start(command);
-    let init = process.until(|event| event["type"] == "system" && event["subtype"] == "init");
+    let init = process.until(|event| event["type"] == SYSTEM && event["subtype"] == INIT);
     assert_eq!(init["thinking"], expected);
     if sdk {
         process.send(json!({"type": "user", "message": {"role": "user", "content": PROMPT}}));
     }
-    let result = process.until(|event| event["type"] == "result");
+    let result = process.until(|event| event["type"] == RESULT);
     assert_eq!(result["is_error"], false, "{result}");
-    assert_eq!(result["result"], REPLY);
+    assert_eq!(result[RESULT], REPLY);
     process.finish();
     fixture.assert_budget(budget);
 }
@@ -245,7 +255,7 @@ fn acp_launch_thinking_reaches_the_request(flags: &[&str], budget: Option<u64>) 
 }
 
 #[test_case(&["-p", "--thinking", "turbo"], INVALID_THINKING ; "print")]
-#[test_case(&["-p", "--input-format", "stream-json", "--effort", "turbo"], INVALID_EFFORT ; "sdk")]
+#[test_case(&["-p", "--input-format", STREAM_FORMAT, "--effort", "turbo"], INVALID_EFFORT ; "sdk")]
 #[test_case(&["acp", "--max-thinking-tokens=-1"], INVALID_BUDGET ; "acp")]
 fn invalid_launch_thinking_exits_before_a_provider_request(flags: &[&str], expected: &str) {
     let fixture = Fixture::new(None, Yes);

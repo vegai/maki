@@ -95,7 +95,7 @@ local function checkout_git(call, spec, args)
 end
 
 local function list_files(call, spec, mode, pathspecs)
-  local args = { "ls-files", mode, "--" }
+  local args = mode == "-d" and { "diff-files", "--name-only", "--diff-filter=D", "--" } or { "ls-files", mode, "--" }
   if mode == "-s" then
     table.insert(args, 2, "-t")
   end
@@ -179,6 +179,26 @@ function M.disk_blobs(call, env, cwd, paths, keep_on_cancel, timeout_ms)
   return maki.split(out, "\n")
 end
 
+local function symlinked_parent(cwd, path)
+  local parent = cwd
+  for part in path:gmatch("([^/]+)/") do
+    parent = maki.fs.joinpath(parent, part)
+    local meta = maki.fs.metadata(parent, false)
+    if meta and meta.is_symlink then
+      return parent
+    end
+  end
+end
+
+local function tracked_parent_problem(cwd, path)
+  local parent = symlinked_parent(cwd, path)
+  if parent then
+    return "the tracked folder "
+      .. path_utils.printable(parent)
+      .. " is a symlink. Restore a directory before retrying the snapshot."
+  end
+end
+
 -- Returns the tracked files as they are on disk, plus the untracked files
 -- under {spec.include}. Submodules are left out, with a note in {artifact}.
 local function snapshot_paths(call, artifact, spec)
@@ -192,6 +212,10 @@ local function snapshot_paths(call, artifact, spec)
   end
   local seen = {}
   for _, path in ipairs(git_utils.listed_paths(deleted)) do
+    local problem = tracked_parent_problem(spec.cwd, path)
+    if problem then
+      return nil, problem
+    end
     seen[path] = true
   end
   local paths = {}
@@ -255,8 +279,15 @@ local function copy_dependencies(call, artifact, spec, paths)
   for _, dir in ipairs(spec.dependencies) do
     local source = maki.fs.joinpath(spec.cwd, dir)
     local target = maki.fs.joinpath(artifact.snapshot, dir)
-    local meta = maki.fs.metadata(source)
-    if not (meta and meta.is_dir) then
+    local parent = symlinked_parent(spec.cwd, dir)
+    local meta = maki.fs.metadata(source, false)
+    if parent then
+      artifact.notes[#artifact.notes + 1] = "the dependency "
+        .. dir
+        .. " is under the symlink "
+        .. path_utils.printable(parent)
+        .. ", so maki did not copy it"
+    elseif not (meta and meta.is_dir) then
       artifact.notes[#artifact.notes + 1] = "the dependency "
         .. dir
         .. " is not a directory here, so maki did not copy it"
@@ -406,15 +437,9 @@ local function consistency_problem(call, artifact, spec)
   local paths = git_utils.listed_paths(changed)
   if #paths > 0 then
     for _, path in ipairs(paths) do
-      local parent = spec.cwd
-      for part in path:gmatch("([^/]+)/") do
-        parent = maki.fs.joinpath(parent, part)
-        local meta = maki.fs.metadata(parent, false)
-        if meta and meta.is_symlink then
-          return "the tracked folder "
-            .. path_utils.printable(parent)
-            .. " is a symlink. Restore a directory before retrying the snapshot."
-        end
+      local problem = tracked_parent_problem(spec.cwd, path)
+      if problem then
+        return problem
       end
     end
     return "the checkout changed during the snapshot: "

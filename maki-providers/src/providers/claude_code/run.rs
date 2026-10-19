@@ -60,7 +60,6 @@ const NO_MID_CONVERSATION_SYSTEM: (&str, &str) =
 // Held calls must outlive generation, so Claude Code cannot answer them before maki stops it.
 const HELD_CALL_TIMEOUT_MS: u64 = i32::MAX as u64;
 
-#[derive(Clone)]
 pub(crate) struct Limits {
     /// Time for Claude Code to start, answer the handshake and send its init
     /// event, and also for each write to its stdin.
@@ -573,7 +572,7 @@ mod tests {
     use super::super::stream::Turn;
     use super::super::transcript::{Catalog, SERVER};
     #[cfg(target_os = "linux")]
-    use super::private_files::{DIR_PREFIX, OWNER_SEPARATOR, pid_namespace, sweep_dead_owners};
+    use super::private_files::{DIR_PREFIX, OWNER_SEPARATOR, owner_namespace, sweep_dead_owners};
     use super::supervision::spawn_piped;
     use super::{
         EFFORT_FLAG, Exchange, Group, HANDOFF, HELD_CALL_TIMEOUT_MS, Launch, Limits, Listed,
@@ -1305,7 +1304,7 @@ mod tests {
     }
 
     /// Only a directory whose maki is gone goes, and only one from this pid
-    /// namespace, where its pid names the same maki. A link to a directory
+    /// namespace and boot, where its pid names the same maki. A link to a directory
     /// stays, and so does what it points to.
     #[cfg(target_os = "linux")]
     #[test]
@@ -1313,28 +1312,30 @@ mod tests {
         let base = tempdir().unwrap();
         let mut exited = process::Command::new("true").spawn().unwrap();
         exited.wait().unwrap();
-        let namespace = pid_namespace().unwrap();
-        let named = |namespace: u64, pid: u32, tail: &str| {
+        let namespace = owner_namespace().unwrap();
+        let named = |namespace: &str, pid: u32, tail: &str| {
             base.path().join(format!(
                 "{DIR_PREFIX}{namespace}{OWNER_SEPARATOR}{pid}.{tail}"
             ))
         };
-        let dead = named(namespace, exited.id(), "x");
-        let alive = named(namespace, process::id(), "x");
-        let elsewhere = named(namespace + 1, exited.id(), "x");
+        let dead = named(&namespace, exited.id(), "x");
+        let alive = named(&namespace, process::id(), "x");
+        let elsewhere = named(&format!("{namespace}-other"), exited.id(), "x");
+        let (boot, pid_namespace) = namespace.rsplit_once(OWNER_SEPARATOR).unwrap();
+        let other_boot = named(&format!("{boot}-other-{pid_namespace}"), exited.id(), "x");
         let other = base.path().join("unrelated");
         let target = tempdir().unwrap();
-        for dir in [&dead, &alive, &elsewhere, &other] {
+        for dir in [&dead, &alive, &elsewhere, &other_boot, &other] {
             fs::create_dir(dir).unwrap();
             fs::write(dir.join("mcp.json"), "{}").unwrap();
         }
-        let link = named(namespace, exited.id(), "link");
+        let link = named(&namespace, exited.id(), "link");
         symlink(target.path(), &link).unwrap();
 
         sweep_dead_owners(base.path());
 
         assert!(!dead.exists(), "the dead maki's directory stayed");
-        for kept in [&alive, &elsewhere, &other, &link] {
+        for kept in [&alive, &elsewhere, &other_boot, &other, &link] {
             assert!(kept.exists(), "{kept:?} went");
         }
     }

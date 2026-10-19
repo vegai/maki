@@ -491,7 +491,11 @@ fn a_link_that_fails_partway_keeps_what_landed_and_every_original() {
     import.failing("ln", &Path::new(CURRENT_DIR).join(ADDED));
 
     let out = import.run(&import.script);
-    assert!(!out.status.success());
+    assert!(
+        !out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(fs::read_to_string(import.target()).unwrap(), RECORDED);
     assert!(!added.exists());
     let kept = import.artifact.join(ORIGINALS).join(STAGE).join(TARGET);
@@ -552,7 +556,12 @@ fn an_atomic_editor_save_survives_import(hold: Hold, succeeds: bool) {
     fs::rename(replacement, import.target()).unwrap();
     let output = import.release(child);
 
-    assert_eq!(output.status.success(), succeeds);
+    assert_eq!(
+        output.status.success(),
+        succeeds,
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let saved = if succeeds {
         import.artifact.join(DISPLACED).join(STAGE).join(TARGET)
     } else {
@@ -575,7 +584,11 @@ fn a_failed_hard_link_stops_before_any_checkout_write() {
         .unwrap();
     let output = import.run(&import.script);
 
-    assert!(!output.status.success());
+    assert!(
+        !output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(String::from_utf8_lossy(&output.stderr).contains(CANNOT_PRESERVE));
     assert!(String::from_utf8_lossy(&output.stderr).contains(LINK_FAILURE));
     writer.write_all(NEWER.as_bytes()).unwrap();
@@ -589,7 +602,12 @@ fn failed_attempt() -> Import {
     import.failing("ln", Path::new(NEW_FILE_PREFIX));
     let child = import.start_held();
     fs::write(import.target(), NEWER).unwrap();
-    assert!(!import.release(child).status.success());
+    let output = import.release(child);
+    assert!(
+        !output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(!import.target().exists());
     fs::write(import.target(), ORIGINAL).unwrap();
     import
@@ -600,7 +618,11 @@ fn a_retry_cannot_overwrite_a_preserved_save() {
     let import = failed_attempt();
     fs::create_dir(import.artifact.join(STAGE)).unwrap();
     let output = import.run(&import.script);
-    assert!(!output.status.success());
+    assert!(
+        !output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(fs::read_to_string(import.target()).unwrap(), ORIGINAL);
     for saved in [
         import.artifact.join(ORIGINALS).join(STAGE).join(TARGET),
@@ -712,7 +734,8 @@ fn a_cleanup_that_cannot_clear_a_folder_fails() {
     let output = import.run(&import.leftovers);
     assert!(
         !output.status.success(),
-        "the cleanup exited without an error"
+        "the cleanup exited without an error: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
     assert!(
         listing(&moved).len() > 1,

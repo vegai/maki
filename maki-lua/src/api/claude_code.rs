@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 use std::fs;
 use std::io::{Error as IoError, ErrorKind};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
+use std::str::from_utf8;
 
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::claude_code::validation::{
@@ -11,8 +13,8 @@ use maki_providers::claude_code::validation::{
 #[cfg(unix)]
 use maki_providers::claude_code::{blobs, snapshot};
 use mlua::{
-    Lua, LuaSerdeExt, LuaString, Result as LuaResult, Table, UserData, UserDataMethods,
-    Value as LuaValue,
+    Error as LuaError, Lua, LuaSerdeExt, LuaString, Result as LuaResult, Table, UserData,
+    UserDataMethods, Value as LuaValue,
 };
 use serde_json::Value;
 
@@ -26,6 +28,7 @@ pub(crate) const MODULE: &str = "maki.claude_code.internal";
 pub(crate) const PLUGIN: &str = "claude_code";
 const HOME_STATE_PREFIX: &str = ".claude.json";
 const BMP_LIMIT: u32 = 0xffff;
+const MAX_UTF8_BYTES: usize = 4;
 const VARIATION_SELECTORS: &[RangeInclusive<u32>] = &[
     0x180b..=0x180d,
     0x180f..=0x180f,
@@ -52,15 +55,14 @@ pub(crate) fn create_private_module(
     Ok((MODULE, table))
 }
 
-fn is_printable(character: char, previous: Option<char>) -> bool {
+fn is_printable(character: char) -> bool {
     if character.is_ascii() {
         !character.is_control()
     } else {
-        VARIATION_SELECTORS
-            .iter()
-            .any(|range| range.contains(&u32::from(character)))
-            && previous.is_some_and(|base| !base.is_ascii())
-            || format!("a{character}").escape_debug().count() == 2
+        let mut buffer = [0; MAX_UTF8_BYTES + 1];
+        buffer[0] = b'a';
+        let length = character.encode_utf8(&mut buffer[1..]).len() + 1;
+        from_utf8(&buffer[..length]).is_ok_and(|text| text.escape_debug().count() == 2)
     }
 }
 
@@ -74,25 +76,32 @@ fn escape_invisible(lua: &Lua, text: LuaString, shell: Option<bool>) -> LuaResul
         return Ok(text);
     };
     let mut escaped = String::with_capacity(value.len());
-    let mut previous = None;
+    let mut previous: Option<char> = None;
     for character in value.chars() {
-        if is_printable(character, previous) {
+        let visible = is_printable(character);
+        if visible
+            || previous.is_some_and(|base| !base.is_ascii())
+                && VARIATION_SELECTORS
+                    .iter()
+                    .any(|range| range.contains(&u32::from(character)))
+        {
             escaped.push(character);
         } else if shell == Some(true) {
             escaped.push_str("'$'");
-            for byte in character.encode_utf8(&mut [0; 4]).bytes() {
-                escaped.push_str(&format!("\\{byte:03o}"));
+            for byte in character.encode_utf8(&mut [0; MAX_UTF8_BYTES]).bytes() {
+                write!(escaped, "\\{byte:03o}").map_err(LuaError::external)?;
             }
             escaped.push_str("''");
         } else {
             let code = u32::from(character);
-            escaped.push_str(&if code <= BMP_LIMIT {
-                format!("\\u{code:04x}")
+            if code <= BMP_LIMIT {
+                write!(escaped, "\\u{code:04x}")
             } else {
-                format!("\\U{code:08x}")
-            });
+                write!(escaped, "\\U{code:08x}")
+            }
+            .map_err(LuaError::external)?;
         }
-        previous = is_printable(character, None).then_some(character);
+        previous = visible.then_some(character);
     }
     lua.create_string(escaped)
 }
@@ -474,15 +483,15 @@ mod tests {
     #[test_case('é', true ; "accented_letter")]
     #[test_case('\u{301}', true ; "combining_accent")]
     #[test_case('\u{94d}', true ; "virama")]
-    #[test_case('\u{fe0f}', true ; "emoji_variation_selector")]
-    #[test_case('\u{e0100}', true ; "supplemental_variation_selector")]
-    #[test_case('\u{180b}', true ; "mongolian_variation_selector")]
+    #[test_case('\u{fe0f}', false ; "emoji_variation_selector")]
+    #[test_case('\u{e0100}', false ; "supplemental_variation_selector")]
+    #[test_case('\u{180b}', false ; "mongolian_variation_selector")]
     #[test_case('\u{200b}', false ; "zero_width_space")]
     #[test_case('\u{202e}', false ; "bidi_override")]
     #[test_case('\u{2028}', false ; "line_separator")]
     #[test_case('\u{80}', false ; "control")]
-    fn printability_preserves_combining_characters(character: char, expected: bool) {
-        assert_eq!(is_printable(character, Some('字')), expected);
+    fn printability_identifies_standalone_visible_characters(character: char, expected: bool) {
+        assert_eq!(is_printable(character), expected);
     }
 
     #[test_case(0x180b ; "mongolian")]
@@ -490,8 +499,17 @@ mod tests {
     #[test_case(0xfe0f ; "emoji")]
     #[test_case(0xe0100 ; "supplemental")]
     fn variation_selectors_need_a_non_ascii_predecessor(code: u32) {
+        let lua = Lua::new();
+        let table = create_claude_code_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let escape: Function = table.get("escape_invisible").unwrap();
         for previous in [None, Some('n')] {
-            assert!(!is_printable(char::from_u32(code).unwrap(), previous));
+            let input = format!(
+                "{}{}",
+                previous.map(String::from).unwrap_or_default(),
+                char::from_u32(code).unwrap()
+            );
+            let escaped: String = escape.call(input.clone()).unwrap();
+            assert_ne!(escaped, input);
         }
     }
 

@@ -89,15 +89,8 @@ pub fn internal_tool_name(wire: &str) -> String {
 
 pub(crate) fn same_tool_name(name: &str, candidate: &str) -> bool {
     name == candidate
-        || [(name, candidate), (candidate, name)]
-            .into_iter()
-            .any(|(qualified, wire)| {
-                qualified.match_indices(SEPARATOR).any(|(at, _)| {
-                    wire.strip_prefix(&qualified[..at])
-                        .and_then(|rest| rest.strip_prefix(WIRE_SEPARATOR))
-                        == Some(&qualified[at + SEPARATOR.len()..])
-                })
-            })
+        || internal_tool_name(candidate) == name
+        || internal_tool_name(name) == candidate
 }
 
 /// Shaped like an MCP tool's wire name, whether or not a server publishes it.
@@ -454,6 +447,18 @@ impl McpSession {
         let defer =
             filter.matches_external(TOOL_SEARCH_TOOL_NAME) && self.deferring(&idx, deferral);
         if arrival == Arrival::Late && deferral == ToolDeferral::Native && !defer {
+            let omitted: Vec<_> = idx
+                .descriptors
+                .iter()
+                .filter(|tool| {
+                    !existing.contains(tool.wire_name())
+                        && filter.matches_external(&tool.qualified_name)
+                })
+                .map(|tool| tool.qualified_name.as_ref())
+                .collect();
+            if !omitted.is_empty() {
+                warn!(tools = ?omitted, "late MCP tools cannot be advertised without tool_search; they remain callable through code_execution");
+            }
             return;
         }
         let loaded = self.lock_loaded();
@@ -1641,8 +1646,8 @@ mod tests {
 
     #[test_case("srv.tool", "srv__tool", true ; "simple")]
     #[test_case("srv.tool__part", "srv__tool__part", true ; "tool_underscores")]
-    #[test_case("srv.part.tool", "srv.part__tool", true ; "dot_before_boundary")]
-    #[test_case("srv__part.tool", "srv__part__tool", true ; "underscores_before_boundary")]
+    #[test_case("my-server.tool__part", "my-server__tool__part", true ; "server_hyphens")]
+    #[test_case("srv.tool__part", "srv__other__part", false ; "different_tool")]
     #[test_case("srv.tool.part", "srv__tool__part", false ; "multiple_boundaries_differ")]
     #[test_case("srv.tool", "srv2__tool", false ; "different_server")]
     fn tool_aliases_change_one_separator(name: &str, candidate: &str, expected: bool) {

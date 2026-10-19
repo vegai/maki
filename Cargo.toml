@@ -43,6 +43,7 @@ unicode-width = { workspace = true }
 rustix = { workspace = true }
 
 [dev-dependencies]
+wait-timeout = { workspace = true }
 maki-config = { workspace = true, features = ["test-util"] }
 maki-providers = { workspace = true, features = ["test-support"] }
 test-case = { workspace = true }
@@ -197,7 +198,6 @@ notify-rust = "4.18.1"
 serde_yaml = "0.9"
 shell-words = "1"
 agent-client-protocol-schema = { version = "1.10", features = ["unstable_session_notices"] }
-
 wait-timeout = "0.2"
 inventory = "0.3"
 

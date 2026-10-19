@@ -1,4 +1,3 @@
-use crate::provider::ModelListing;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -9,7 +8,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry};
-use crate::provider::{BoxFuture, Provider, RequestScope};
+use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use crate::spec::{
     AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, NO_CURATED_MODELS, Native,
     ProviderRegistry, ProviderSpec,

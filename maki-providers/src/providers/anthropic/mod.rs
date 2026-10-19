@@ -1,7 +1,6 @@
 //! Anthropic allows 4 cache breakpoints per request. We place them on: the last tool
 //! definition, the system prompt, and the last block of the 2 most recent messages.
 
-use crate::provider::ModelListing;
 pub(crate) mod bedrock;
 pub(crate) mod shared;
 
@@ -19,7 +18,7 @@ use url::Url;
 use maki_config::providers::Protocol;
 
 use crate::model::{Model, ModelFamily};
-use crate::provider::{BoxFuture, Provider, RequestScope};
+use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use crate::providers::aperture::NO_PATH_PREFIX;
 use crate::spec::{
     ApertureRoute, AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,

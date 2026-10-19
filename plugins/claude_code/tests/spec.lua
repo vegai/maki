@@ -257,6 +257,28 @@ case("home_credentials_follow_xdg_data_home", function()
   assert(contains(paths, "/data/fish/fish_history"))
 end)
 
+for _, name in ipairs({
+  "AWS_SHARED_CREDENTIALS_FILE",
+  "AWS_CONFIG_FILE",
+  "GH_CONFIG_DIR",
+  "PASSWORD_STORE_DIR",
+  "ZDOTDIR",
+  "PGPASSFILE",
+  "AZURE_CONFIG_DIR",
+  "CLOUDSDK_CONFIG",
+  "RCLONE_CONFIG",
+}) do
+  case("home_credentials_follow_" .. name, function()
+    local absolute = "/elsewhere/credentials"
+    local relative = "relocated-credentials"
+    for _, path in ipairs({ absolute, relative }) do
+      local paths = assert(launch.home_credentials("/home/u", nil, { [name] = path }))
+      local expected = path == absolute and absolute or maki.fs.joinpath(assert(maki.uv.cwd()), relative)
+      assert(contains(paths, expected), expected)
+    end
+  end)
+end
+
 case("home_credentials_cover_standard_stores_and_user_paths", function()
   local home = "/home/u"
   local paths = assert(launch.home_credentials(home, "custom/login.json,tool/credentials"))

@@ -150,7 +150,7 @@ end
 
 function M.denied_home_paths(extra)
   return path_utils.comma_list(extra, function(path)
-    if path:sub(1, 1) == "/" or path:sub(1, 1) == "~" or ("/" .. path .. "/"):find("/../", 1, true) then
+    if path:sub(1, 1) == "/" or path:sub(1, 1) == "~" or path_utils.climbs(path) then
       return nil, M.DENY_HOME_OUTSIDE
     end
     return path
@@ -234,9 +234,22 @@ function M.home_credentials(home, extra, environ)
     relocated(maki.fs.joinpath(env.CARGO_HOME, "credentials"))
     relocated(maki.fs.joinpath(env.CARGO_HOME, "credentials.toml"))
   end
-  relocated(env.GNUPGHOME)
-  relocated(env.DOCKER_CONFIG)
-  relocated(env.CLAUDE_CONFIG_DIR)
+  for _, name in ipairs({
+    "GNUPGHOME",
+    "DOCKER_CONFIG",
+    "CLAUDE_CONFIG_DIR",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_CONFIG_FILE",
+    "GH_CONFIG_DIR",
+    "PASSWORD_STORE_DIR",
+    "ZDOTDIR",
+    "PGPASSFILE",
+    "AZURE_CONFIG_DIR",
+    "CLOUDSDK_CONFIG",
+    "RCLONE_CONFIG",
+  }) do
+    relocated(env[name])
+  end
   for path in (env.KUBECONFIG or ""):gmatch("[^:]+") do
     relocated(path)
   end
@@ -487,7 +500,7 @@ function M.preflight(input, ctx, call, opts)
       end,
     })
     if not output then
-      -- A failed spawn has no exit callback to remove its private directory.
+      -- Remove the probe directory on every failure, including a spawn with no exit callback.
       call:remove_dir(dir)
       return nil, output_err
     end

@@ -1,4 +1,3 @@
-use crate::provider::ModelListing;
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
@@ -13,7 +12,7 @@ use tracing::{debug, warn};
 
 use crate::model::{FastSupport, Model, ModelInfo};
 use crate::model_registry;
-use crate::provider::{BoxFuture, Provider, RequestScope};
+use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use crate::types::{EffortDialect, ThinkingFallback};
 use crate::{
     AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,

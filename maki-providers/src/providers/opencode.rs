@@ -1,4 +1,3 @@
-use crate::provider::ModelListing;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
@@ -6,7 +5,7 @@ use maki_storage::id::SessionRef;
 use serde_json::Value;
 
 use crate::model::{Model, ModelFamily, ModelInfo};
-use crate::provider::{BoxFuture, Provider, RequestScope};
+use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use crate::providers::catalog::{
     CatalogMeta, CatalogTransport, EndpointType, FreeTier, ProviderQuirks,
     init_shared_catalog_if_needed,

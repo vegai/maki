@@ -14,6 +14,7 @@ if [ -e "$dir/track_sessions" ]; then
   trap 'exit 0' TERM
 fi
 echo start >> "$dir/calls"
+if [ -e "$dir/probe_error" ]; then cat "$dir/probe_error" >&2; exit 1; fi
 printf '%s' "$CLAUDE_CODE_DISABLE_ATTACHMENTS" > "$dir/attachments_disabled"
 hooks='[]'
 if [ -e "$dir/policy_hook" ]; then

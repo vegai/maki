@@ -1,4 +1,3 @@
-use crate::provider::ModelListing;
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
@@ -9,7 +8,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::model::{Model, ModelFamily, ThinkingSupport};
-use crate::provider::{BoxFuture, Provider, RequestScope};
+use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use crate::providers::aperture::NO_PATH_PREFIX;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::spec::{

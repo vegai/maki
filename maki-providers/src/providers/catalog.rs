@@ -8,7 +8,6 @@
 //! their own [`CatalogProvider`] instance, created from the same
 //! [`ProviderData`].
 
-use crate::provider::ModelListing;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
@@ -28,7 +27,7 @@ use maki_storage::auth::load_provider_credentials;
 use maki_storage::id::SessionRef;
 
 use crate::model::{Model, ModelInfo, ModelPricing};
-use crate::provider::{BoxFuture, Provider, RequestScope};
+use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use crate::providers::anthropic::shared;
 use crate::providers::openai_compat::{
     DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiCompatProvider,

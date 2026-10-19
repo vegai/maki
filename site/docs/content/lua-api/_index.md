@@ -2811,24 +2811,6 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 
 ---
 
-### `maki.fs.rmdir()` {#maki-fs-rmdir}
-
-```lua
-maki.fs.rmdir({path})
-```
-
-Remove an empty directory.
-
-Requires the `fs_write` [plugin permission](#plugin-permissions).
-
-**Parameters:**
-
-- `{path}` (`string`) Directory to remove.
-
-**Returns:** (`boolean?`, `string?`) True on success, or nil and the error.
-
----
-
 ### `maki.fs.rename()` {#maki-fs-rename}
 
 ```lua
@@ -3103,7 +3085,7 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 
 - `{path}` (`string`) Lock file, created privately if absent. Symlinks are refused on Unix.
 
-**Returns:** (`userdata?`, `string?`) Lock with close(), or nil and the error if locking fails.
+**Returns:** (`userdata?`, `string?`) Lock with close(), nil and "lock is held" if busy, or nil and an I/O error.
 
 ---
 

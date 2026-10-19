@@ -1,4 +1,3 @@
-use crate::provider::ModelListing;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use maki_config::providers::{
@@ -14,7 +13,7 @@ use super::catalog;
 use super::codec::{CodecOptions, protocol_spec};
 use crate::AgentError;
 use crate::model::{FastPricing, Model, ModelEntry, ModelInfo, ModelPricing, ModelTier};
-use crate::provider::Provider;
+use crate::provider::{ModelListing, Provider};
 use crate::providers::Timeouts;
 use crate::spec::{ProviderRegistry, ProviderSpec};
 

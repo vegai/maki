@@ -1,4 +1,3 @@
-use crate::provider::ModelListing;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,7 +12,7 @@ use tracing::warn;
 use maki_config::providers::Protocol;
 
 use crate::model::{Model, ModelFamily};
-use crate::provider::{BoxFuture, Provider, RequestScope};
+use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use crate::providers::Timeouts;
 use crate::providers::aperture::GEMINI_PATH_PREFIX;
 use crate::spec::{

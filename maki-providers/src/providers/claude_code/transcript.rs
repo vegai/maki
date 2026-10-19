@@ -21,10 +21,6 @@ const HASH_HEX_DIGITS: usize = 8;
 pub(super) const USER_ROLE: &str = "user";
 const ASSISTANT_ROLE: &str = "assistant";
 const TOOL_RESULT_ROLE: &str = "tool_result";
-#[cfg(test)]
-const IS_ERROR: &str = "is_error";
-#[cfg(test)]
-const TEXT: &str = "text";
 pub(super) const BATCH_TOOL: &str = "batch";
 pub(super) const BATCH_CALLS: &str = "tool_calls";
 pub(super) const BATCH_CALL_TOOL: &str = "tool";
@@ -161,15 +157,14 @@ struct TranscriptEntry<'a> {
     observation: bool,
 }
 
-fn push_line(out: &mut Vec<u8>, value: &impl Serialize) -> Result<(), Error> {
-    out.push(b'\n');
-    serde_json::to_writer(out, value).map_err(Error::Encode)
+fn push_line(out: &mut String, value: &impl Serialize) -> Result<(), Error> {
+    out.push('\n');
+    out.push_str(&serde_json::to_string(value).map_err(Error::Encode)?);
+    Ok(())
 }
 
-fn expose_input(name: &str, input: &mut Value) {
-    if name == BATCH_TOOL
-        && let Some(calls) = input[BATCH_CALLS].as_array_mut()
-    {
+fn expose_input(input: &mut Value) {
+    if let Some(calls) = input[BATCH_CALLS].as_array_mut() {
         for call in calls {
             if let Some(name) = call[BATCH_CALL_TOOL].as_str() {
                 call[BATCH_CALL_TOOL] = Value::String(exposed_name(name));
@@ -186,7 +181,7 @@ fn expose_input(name: &str, input: &mut Value) {
 pub(crate) fn transcript(messages: &[Message]) -> Result<Vec<String>, Error> {
     let mut blocks = vec![TRANSCRIPT_HEADER.to_owned()];
     for message in messages {
-        let mut out = Vec::new();
+        let mut out = String::new();
         let mut text = Vec::new();
         let mut calls = Vec::new();
         let mut results = Vec::new();
@@ -198,7 +193,7 @@ pub(crate) fn transcript(messages: &[Message]) -> Result<Vec<String>, Error> {
                 } => {
                     let input = if name == BATCH_TOOL {
                         let mut input = input.clone();
-                        expose_input(name, &mut input);
+                        expose_input(&mut input);
                         Cow::Owned(input)
                     } else {
                         Cow::Borrowed(input)
@@ -233,7 +228,7 @@ pub(crate) fn transcript(messages: &[Message]) -> Result<Vec<String>, Error> {
             push_line(&mut out, &entry_of(message, &text, calls))?;
         }
         if !out.is_empty() {
-            blocks.push(String::from_utf8(out)?);
+            blocks.push(out);
         }
     }
     Ok(blocks)
@@ -267,11 +262,13 @@ mod tests {
 
     use super::super::error::Error;
     use super::{
-        Catalog, EXPOSED_PREFIX, IS_ERROR, MAX_EXPOSED_NAME, SERVER, TEXT, TRANSCRIPT_HEADER,
-        entry_of, fits, server_name, transcript,
+        Catalog, EXPOSED_PREFIX, MAX_EXPOSED_NAME, SERVER, TRANSCRIPT_HEADER, entry_of, fits,
+        server_name, transcript,
     };
     use crate::{ContentBlock, ImageMediaType, ImageSource, Message, Role};
 
+    const IS_ERROR: &str = "is_error";
+    const TEXT: &str = "text";
     const LONG_NAME: &str =
         "mcp__some_server_with_a_long_name__and_a_tool_whose_name_is_longer_still";
     const HOST_UPDATE: &str = "the context changed";

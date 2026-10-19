@@ -101,8 +101,7 @@ const MODELS_CACHE_FILE: &str = "claude-code-models.json";
 /// processes.
 const MODELS_CACHE_TTL: Duration = Duration::from_secs(86_400);
 const MAX_MODEL_CACHES: usize = 16;
-/// A failed listing answers for this long, so a logged-out `claude` does not
-/// start its processes on each fetch.
+/// Transient listing failures suppress repeat process launches for this long.
 const FAILED_LISTING_TTL: Duration = Duration::from_secs(300);
 const ERROR_PREFIX: &str = "claude-code: ";
 /// Each turn runs on the subscription login, so maki counts it as `$0` and
@@ -581,7 +580,10 @@ impl ClaudeCode {
         let listed = self.ask_models(cwd, vars).await;
         match &listed {
             Ok(_) => failures.remove(&key),
-            Err(error) => failures.insert(key, (Instant::now(), error.to_string())),
+            Err(error) if !error.invalidates_version() => {
+                failures.insert(key, (Instant::now(), error.to_string()))
+            }
+            Err(_) => failures.remove(&key),
         };
         listed
     }
@@ -1303,6 +1305,7 @@ mod on_the_fake {
     const PATH: &str = "PATH";
     const HOME: &str = "HOME";
     const TMPDIR: &str = "TMPDIR";
+    const OLD_VERSION: &str = "2.1.283 (Claude Code)";
 
     /// maki's output budget for a request reaches Claude Code as its limit,
     /// through the provider as maki calls it, wherever the budget came from.
@@ -1591,7 +1594,7 @@ mod on_the_fake {
     #[test]
     fn a_failed_listing_is_remembered_until_a_refresh() {
         let fake = Fake::new("text");
-        fs::write(fake.dir.path().join("version_error"), VERSION_ERROR).unwrap();
+        fs::write(fake.dir.path().join("probe_error"), VERSION_ERROR).unwrap();
         let home = tempdir().unwrap();
         let cache = Some(home.path().join(SAVED_LIST));
         let provider = provider_for(&fake, home.path(), &env::temp_dir(), cache);
@@ -1602,8 +1605,25 @@ mod on_the_fake {
         assert!(!matches!(first, Error::ListedRecently { .. }), "{first}");
         assert!(matches!(again, Error::ListedRecently { .. }), "{again}");
         assert_eq!(fake.log("versions").lines().count(), 1);
+        assert_eq!(fake.log("calls").lines().count(), 1);
 
         let _ = smol::block_on(provider.list(&cwd, ModelListing::Refresh));
+        assert_eq!(fake.log("versions").lines().count(), 1);
+        assert_eq!(fake.log("calls").lines().count(), 2);
+    }
+
+    #[test_case("version_error", VERSION_ERROR ; "version_check_failed")]
+    #[test_case("version", OLD_VERSION ; "outdated_version")]
+    fn version_failures_do_not_delay_a_cached_listing_retry(file: &str, output: &str) {
+        let fake = Fake::new("text");
+        let home = tempdir().unwrap();
+        let provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
+        let marker = fake.dir.path().join(file);
+        fs::write(&marker, output).unwrap();
+        let list = || smol::block_on(provider.list(&fake.project(), ModelListing::Cached));
+        assert!(list().unwrap_err().invalidates_version());
+        fs::remove_file(marker).unwrap();
+        assert!(!list().unwrap().is_empty());
         assert_eq!(fake.log("versions").lines().count(), 2);
     }
 
@@ -1612,7 +1632,7 @@ mod on_the_fake {
         let fake = Fake::new("text");
         let home = tempdir().unwrap();
         let provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
-        let list = || smol::block_on(provider.list(&fake.project(), ModelListing::Refresh));
+        let list = || smol::block_on(provider.list(&fake.project(), ModelListing::Cached));
         list().unwrap();
         let hook = fake.dir.path().join("policy_hook");
         fs::write(&hook, "").unwrap();

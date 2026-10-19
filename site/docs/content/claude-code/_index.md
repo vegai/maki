@@ -116,7 +116,7 @@ Claude Code adds environment and account context to provider turns, including th
 
 Provider concurrency is configured separately from plugin tool calls. See the [plugin options](/docs/configuration/#plugins). Queued generations show a waiting message, and queued subagents are marked in `/tasks`.
 
-Claude Code lists the models available to your account. The provider uses Anthropic model ids, such as `claude-code/claude-sonnet-5`. A listing uses one request slot and starts up to six short `claude` processes. maki keeps the list for a day. Opening the model picker uses the cached list. `maki models --refresh` or Ctrl+r in the picker reads it again. A failed listing waits five minutes before a retry unless you refresh. Tiers and list prices are the anthropic provider's, as the [providers page](/docs/providers/) lists them.
+Claude Code lists the models available to your account. The provider uses Anthropic model ids, such as `claude-code/claude-sonnet-5`. A listing uses one request slot and starts up to six short `claude` processes. maki keeps the list for a day. Opening the model picker uses the cached list. `maki models --refresh` or Ctrl+r in the picker reads it again. A failed listing waits five minutes before a retry unless you refresh. Version and policy check failures allow an immediate retry. See the [providers page](/docs/providers/) for tiers, reference prices and their sources.
 
 Organization policy can make Claude Code run a different model. A reply from a different model stops the turn.
 
