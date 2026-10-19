@@ -41,7 +41,6 @@ pub(crate) fn create_private_module(
     table.set("lock_busy", LOCK_BUSY)?;
     table.set("startup_timeout_secs", validation::STARTUP_TIMEOUT_SECS)?;
     table.set("default_executable", validation::DEFAULT_EXECUTABLE)?;
-    table.set("default_config_dir", validation::DEFAULT_CONFIG_DIR)?;
     table.set(
         "default_provider_max_concurrent",
         validation::DEFAULT_MAX_CONCURRENT,
@@ -253,10 +252,6 @@ async fn prepare_launch(
     result.set("env", lua.create_table_from(prepared.env)?)?;
     result.set("withheld", prepared.withheld)?;
     result.set("config_dir", try_pair!(path_text(prepared.config_dir)))?;
-    result.set(
-        "own_config_dir",
-        try_pair!(prepared.own_config_dir.map(path_text).transpose()),
-    )?;
     result.set(
         "dirs",
         try_pair!(

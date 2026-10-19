@@ -231,7 +231,7 @@ async fn request_files(
     } } });
     let temp_dir = launch.temp_dir.to_owned();
     let project = launch.project.to_owned();
-    let denied = launch.denied.clone();
+    let denied = launch.denied.to_vec();
     let prompt = system_prompt(system);
     smol::unblock(move || {
         let (dir, path) = private_dir(&temp_dir, &project, &denied)?;
@@ -599,6 +599,7 @@ mod tests {
     const LONG_CONTEXT_ID: &str = "claude-haiku-4-5-1m";
     /// A model the fake never runs.
     const OTHER_MODEL: &str = "claude-sonnet-5";
+    const UNKNOWN_TOOL: &str = "unknown";
     /// What the fake's `get_context_usage` reports for its Opus and for every
     /// other model.
     const WIDE_WINDOW: u32 = 1_000_000;
@@ -650,7 +651,7 @@ mod tests {
                 executable: Path::new(SLEEP),
                 env: &[],
                 project: root,
-                denied: Vec::new(),
+                denied: &[],
                 temp_dir: root,
                 limits: &limits,
             },
@@ -1107,11 +1108,18 @@ mod tests {
         let mut turn = Turn::new(&catalog, expect, &plan_usage);
         let (sender, handoffs) = flume::unbounded();
         sender
-            .send(Handoff::Invalid(Error::NotOffered(json!(TOOL))))
+            .send(Handoff::Parked {
+                tool_use_id: Some(MARKER.into()),
+                name: UNKNOWN_TOOL.into(),
+                arguments: json!({}),
+            })
             .unwrap();
         drop(sender);
         let result = smol::block_on(queued_handoffs(&mut turn, &handoffs, Instant::now() + WAIT));
-        assert!(matches!(result, Err(Error::NotOffered(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(Error::NotOffered(ref name)) if name == UNKNOWN_TOOL),
+            "{result:?}"
+        );
     }
 
     /// Only maki can compact or retry the conversation. Held calls must wait until maki stops
@@ -1341,7 +1349,7 @@ mod tests {
                 executable: &fake.executable(),
                 env: &Fake::env(),
                 project: &fake.project(),
-                denied: Vec::new(),
+                denied: &[],
                 temp_dir: &env::temp_dir(),
                 limits: &Limits::new(IDLE),
             },
@@ -1370,7 +1378,7 @@ mod tests {
                 executable: &fake.executable(),
                 env: &Fake::env(),
                 project: &fake.project(),
-                denied: Vec::new(),
+                denied: &[],
                 temp_dir: &env::temp_dir(),
                 limits: &Limits::new(IDLE),
             },

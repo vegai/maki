@@ -140,7 +140,7 @@ impl Fake {
                 executable: &self.executable(),
                 env: &Self::env(),
                 project: &project,
-                denied: Vec::new(),
+                denied: &[],
                 temp_dir: &self.temp_base(),
                 limits: &limits,
             },

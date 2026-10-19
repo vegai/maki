@@ -236,6 +236,7 @@ function M.home_credentials(home, extra, environ)
   end
   relocated(env.GNUPGHOME)
   relocated(env.DOCKER_CONFIG)
+  relocated(env.CLAUDE_CONFIG_DIR)
   for path in (env.KUBECONFIG or ""):gmatch("[^:]+") do
     relocated(path)
   end
@@ -253,7 +254,7 @@ function M.in_checkout(path, spec)
   return spec.git_dir ~= nil and path_utils.within(path, spec.git_dir)
 end
 
-local function deny_rules(extra)
+function M.deny_rules(extra)
   local rules = {}
   for i, pattern in ipairs(assert(path_utils.denied_paths(extra))) do
     rules[i] = "Read(./" .. pattern .. ")"
@@ -263,7 +264,7 @@ end
 
 local function worker_policy(deny_read, worker, confine)
   return {
-    deny = type(deny_read) == "table" and deny_read or deny_rules(deny_read),
+    deny = deny_read,
     sandbox = worker.sandboxed and assert(confine, "a sandboxed worker needs confinement paths") or nil,
   }
 end
@@ -464,7 +465,7 @@ function M.preflight(input, ctx, call, opts)
   if secret_err then
     return nil, secret_err
   end
-  local config_dir, own_config_dir = prepared.config_dir, prepared.own_config_dir
+  local config_dir = prepared.config_dir
   local local_dirs, git_dir = prepared.dirs, prepared.git_dir
 
   -- Keep the version job in Call so cancellation reaps it before the slot is released.
@@ -499,14 +500,13 @@ function M.preflight(input, ctx, call, opts)
   return {
     model = model,
     worker = worker,
-    deny = deny_rules(opts.deny_read),
+    deny = M.deny_rules(opts.deny_read),
     executable = executable,
     cwd = cwd,
     instructions = instructions,
     env = env,
     withheld = withheld,
     config_dir = config_dir,
-    own_config_dir = own_config_dir,
     home_credentials = home_credentials,
     checkout_dirs = local_dirs,
     git_dir = git_dir,

@@ -512,12 +512,7 @@ impl ClaudeCode {
             executable: &self.executable,
             env: &prepared.env,
             project: cwd,
-            denied: prepared
-                .local_dirs
-                .iter()
-                .chain(prepared.git_dir.iter())
-                .cloned()
-                .collect(),
+            denied: &prepared.denied,
             temp_dir: &prepared.temp_dir,
             limits: &self.limits,
         }

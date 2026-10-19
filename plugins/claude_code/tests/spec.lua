@@ -26,6 +26,7 @@ local BUILTIN_PLUGINS = {
 }
 local MISSING = {}
 local READ = launch.WORKERS.read
+local DEFAULT_DENY_RULES = launch.deny_rules("")
 local HOOKS_OFF = { hooks = maki.json.decode("[]"), policy = { allDisabled = true, policyHookCount = 0 } }
 local CONFINE = {
   deny_read = { "/work", "/home/u/.claude", "/artifacts" },
@@ -108,13 +109,13 @@ local function handshake_problem(answers, worker, confine)
   worker = worker or READ
   local responses = {
     account = account_answer(nil, next(worker.reported_modes)),
-    settings = { effective = launch.settings("", worker, confine), sources = maki.json.decode("[]") },
+    settings = { effective = launch.settings(DEFAULT_DENY_RULES, worker, confine), sources = maki.json.decode("[]") },
     hooks = HOOKS_OFF,
   }
   for id, response in pairs(answers) do
     responses[id] = response
   end
-  local handshake = launch.worker_handshake("", worker, confine)
+  local handshake = launch.worker_handshake(DEFAULT_DENY_RULES, worker, confine)
   for index, request in ipairs(launch.HANDSHAKE) do
     local complete, problem = handshake_answer(handshake, request.id, responses[request.id])
     if problem then
@@ -169,7 +170,7 @@ end)
 -- ── claude_launch ──
 
 local function sandbox_problem(sandbox, confine)
-  local expected = launch.settings("", launch.WORKERS.code, confine)
+  local expected = launch.settings(DEFAULT_DENY_RULES, launch.WORKERS.code, confine)
   local effective = table.clone(expected)
   effective.sandbox = sandbox
   return handshake_problem(
@@ -321,7 +322,7 @@ case("argv_for_a_coding_worker_edits_and_runs_without_bypass", function()
   local argv = launch.argv({
     executable = "claude",
     model = "haiku",
-    deny_read = "",
+    deny_read = DEFAULT_DENY_RULES,
     worker = launch.WORKERS.code,
     confine = CONFINE,
   })
@@ -331,7 +332,7 @@ case("argv_for_a_coding_worker_edits_and_runs_without_bypass", function()
   for _, forbidden in ipairs({ "--add-dir", "bypassPermissions", "--dangerously", "--allowedTools" }) do
     eq(joined:find(forbidden, 1, true), nil, "the argv must not contain " .. forbidden)
   end
-  local settings = launch.settings("", launch.WORKERS.code, CONFINE)
+  local settings = launch.settings(DEFAULT_DENY_RULES, launch.WORKERS.code, CONFINE)
   eq(settings.permissions.allow, nil)
   eq(settings.permissions.blockReadsOutsideWorkingDirectories, true)
   eq(
@@ -346,12 +347,13 @@ case("argv_for_a_coding_worker_edits_and_runs_without_bypass", function()
     })
   )
   has(maki.json.encode(settings), '"allowedDomains":[]')
-  eq(launch.settings("", READ).sandbox, nil)
+  eq(launch.settings(DEFAULT_DENY_RULES, READ).sandbox, nil)
 end)
 
 -- Returns the sandbox the flags set, after {edit} changes the merged result.
 local function merged_sandbox(edit)
-  local sandbox = maki.json.decode(maki.json.encode(launch.settings("", launch.WORKERS.code, CONFINE).sandbox))
+  local sandbox =
+    maki.json.decode(maki.json.encode(launch.settings(DEFAULT_DENY_RULES, launch.WORKERS.code, CONFINE).sandbox))
   if edit then
     edit(sandbox)
   end
@@ -465,7 +467,7 @@ end
 case("a_coding_handshake_checks_the_sandbox_and_a_read_one_does_not", function()
   local settings = {
     sources = { { source = "flagSettings", settings = {} } },
-    effective = launch.settings("", READ),
+    effective = launch.settings(DEFAULT_DENY_RULES, READ),
   }
   local hooks = { hooks = maki.json.decode("[]"), policy = { allDisabled = true } }
   eq(handshake_problem({ settings = settings, hooks = hooks }), nil)
@@ -473,12 +475,12 @@ case("a_coding_handshake_checks_the_sandbox_and_a_read_one_does_not", function()
     handshake_problem({ settings = settings, hooks = hooks }, launch.WORKERS.code, CONFINE) or "",
     "outside its sandbox"
   )
-  settings.effective = launch.settings("", launch.WORKERS.code, CONFINE)
+  settings.effective = launch.settings(DEFAULT_DENY_RULES, launch.WORKERS.code, CONFINE)
   eq(handshake_problem({ settings = settings, hooks = hooks }, launch.WORKERS.code, CONFINE), nil)
 end)
 
 local function read_argv()
-  return launch.argv({ executable = "claude", model = "haiku", deny_read = "", worker = READ })
+  return launch.argv({ executable = "claude", model = "haiku", deny_read = DEFAULT_DENY_RULES, worker = READ })
 end
 
 case("argv_for_a_reader_never_widens_its_reach", function()
@@ -491,7 +493,7 @@ end)
 -- The values here are literal rather than taken from the builder, so the
 -- test notices if `claude_launch` drops one of these switches.
 case("settings_switch_off_everything_claude_code_loads_on_its_own", function()
-  local settings = launch.settings("", READ)
+  local settings = launch.settings(DEFAULT_DENY_RULES, READ)
   eq(settings.disableAllHooks, true)
   eq(settings.autoMemoryEnabled, false)
   eq(settings.disableClaudeAiConnectors, true)
@@ -528,7 +530,7 @@ end)
 -- Returns the `get_settings` response when only maki's flags and {policy}
 -- apply, after {edit} changes the merged result.
 local function settings_answer(policy, edit)
-  local flags = maki.json.decode(maki.json.encode(launch.settings("", READ)))
+  local flags = maki.json.decode(maki.json.encode(launch.settings(DEFAULT_DENY_RULES, READ)))
   local sources = { { source = "flagSettings", settings = flags } }
   if policy then
     sources[#sources + 1] = { source = "policySettings", settings = policy }
@@ -804,7 +806,7 @@ end
 -- Configured paths follow the defaults, with spaces and empty entries
 -- dropped and no second ./ added.
 case("settings_deny_the_defaults_and_the_configured_paths", function()
-  local settings = launch.settings(" config/prod.yml , ./certs/** ,, ", READ)
+  local settings = launch.settings(launch.deny_rules(" config/prod.yml , ./certs/** ,, "), READ)
   eq(
     table.concat(settings.permissions.deny, " "),
     "Read(./.env*) Read(./**/.env*) Read(./secrets) Read(./**/secrets) Read(./secrets/**) Read(./**/secrets/**) Read(./config/prod.yml) Read(./certs/**)"
@@ -815,7 +817,7 @@ end)
 
 case("a_complete_clean_handshake_passes", function()
   local answers = { account = account_answer(), settings = settings_answer(), hooks = HOOKS_OFF }
-  local handshake = launch.worker_handshake("", READ)
+  local handshake = launch.worker_handshake(DEFAULT_DENY_RULES, READ)
   for i = #launch.HANDSHAKE, 1, -1 do
     local complete, problem = handshake_answer(handshake, launch.HANDSHAKE[i].id, answers[launch.HANDSHAKE[i].id])
     eq(problem, nil)
@@ -827,7 +829,7 @@ case("a_complete_clean_handshake_passes", function()
 end)
 
 case("a_missing_handshake_answer_is_refused", function()
-  local handshake = launch.worker_handshake("", READ)
+  local handshake = launch.worker_handshake(DEFAULT_DENY_RULES, READ)
   handshake_answer(handshake, "account", account_answer())
   handshake_answer(handshake, "hooks", HOOKS_OFF)
   local complete, problem = handshake:finish()
@@ -841,7 +843,7 @@ for _, c in ipairs({
   { name = "a_refused_answer", id = "settings", subtype = "error", want = "rejected the settings request" },
 }) do
   case("a_worker_handshake_refuses_" .. c.name, function()
-    local handshake = launch.worker_handshake("", READ)
+    local handshake = launch.worker_handshake(DEFAULT_DENY_RULES, READ)
     handshake_answer(handshake, "account", account_answer())
     local complete, problem = handshake_answer(handshake, c.id, {}, c.subtype)
     eq(complete, nil)
@@ -850,7 +852,7 @@ for _, c in ipairs({
 end
 
 case("a_worker_checks_the_account_before_the_policy", function()
-  local handshake = launch.worker_handshake("", READ)
+  local handshake = launch.worker_handshake(DEFAULT_DENY_RULES, READ)
   local pending, problem = handshake_answer(handshake, "account", account_answer({ apiProvider = "other" }))
   eq(pending, false)
   eq(problem, nil)

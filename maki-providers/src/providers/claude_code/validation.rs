@@ -20,7 +20,6 @@ use super::stream::{
 pub const EMPTY_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
 pub const STARTUP_TIMEOUT_SECS: u64 = 60;
 pub const DEFAULT_EXECUTABLE: &str = "claude";
-pub const DEFAULT_CONFIG_DIR: &str = "";
 pub const DEFAULT_MAX_CONCURRENT: usize = 8;
 pub const MIN_MAX_CONCURRENT: usize = 1;
 pub(super) const CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
@@ -189,10 +188,10 @@ pub struct LaunchPreparation {
     pub env: Vec<(String, String)>,
     pub withheld: Vec<String>,
     pub config_dir: PathBuf,
-    pub own_config_dir: Option<PathBuf>,
     pub temp_dir: PathBuf,
     pub local_dirs: Vec<PathBuf>,
     pub git_dir: Option<PathBuf>,
+    pub denied: Vec<PathBuf>,
 }
 
 fn default_temp_dir() -> PathBuf {
@@ -216,9 +215,6 @@ pub(super) fn prepare_launch(
     cwd: &Path,
 ) -> Result<LaunchPreparation, Error> {
     let var = |name| env_value(&vars, name);
-    let own_config_dir = var(CONFIG_DIR_ENV)
-        .filter(|path| !path.is_empty())
-        .map(|path| cwd.join(path));
     let config_dir = login_dir(&vars, configured.as_deref())?;
     let temp_dir = var(TMPDIR_ENV)
         .filter(|path| !path.is_empty())
@@ -236,14 +232,15 @@ pub(super) fn prepare_launch(
     if !conflicts.is_empty() {
         return Err(Error::SkippedSettings(conflicts));
     }
+    let denied = local_dirs.iter().chain(git_dir.iter()).cloned().collect();
     Ok(LaunchPreparation {
         env,
         withheld,
         config_dir,
-        own_config_dir,
         temp_dir,
         local_dirs,
         git_dir,
+        denied,
     })
 }
 
@@ -577,36 +574,13 @@ fn worker_problem(effective: &Value, expected: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CONFIG_DIR_ENV, HOME_ENV, WorkerPaths, WorkerPolicy, prepare_launch, sandbox_problem,
-        worker_problem,
-    };
+    use super::{WorkerPaths, WorkerPolicy, sandbox_problem, worker_problem};
     use serde_json::{Value, json};
-    use std::fs;
-    use tempfile::tempdir;
     use test_case::test_case;
 
     const READ_RULE: &str = "Read(./secrets)";
     const DENIED: &str = "/checkout";
     const OUTSIDE: &str = "/outside";
-
-    #[test]
-    fn an_overridden_relative_login_directory_remains_denied() {
-        let root = tempdir().unwrap();
-        let cwd = root.path().join("project");
-        fs::create_dir(&cwd).unwrap();
-        let prepared = prepare_launch(
-            vec![
-                (HOME_ENV.into(), root.path().display().to_string()),
-                (CONFIG_DIR_ENV.into(), "usual-login".into()),
-            ],
-            Some(root.path().join("selected-login")),
-            &cwd,
-        )
-        .unwrap();
-        assert_eq!(prepared.own_config_dir, Some(cwd.join("usual-login")));
-        assert_eq!(prepared.config_dir, root.path().join("selected-login"));
-    }
 
     fn expected() -> Value {
         WorkerPolicy {
