@@ -42,7 +42,7 @@ pub(crate) struct Launch<'a> {
     pub executable: &'a Path,
     pub env: &'a [(String, String)],
     pub project: &'a Path,
-    pub denied: Vec<PathBuf>,
+    pub denied: &'a [PathBuf],
     pub temp_dir: &'a Path,
     pub limits: &'a Limits,
 }
@@ -116,8 +116,7 @@ async fn unprompted<T>(
     launch: &Launch<'_>,
     work: impl AsyncFnOnce(&mut Group) -> Result<T, Error>,
 ) -> Result<T, Error> {
-    let (dir, dir_path) =
-        private_dir_async(launch.temp_dir, launch.project, &launch.denied).await?;
+    let (dir, dir_path) = private_dir_async(launch.temp_dir, launch.project, launch.denied).await?;
     let mut args = base_args(PROBE_MODEL);
     args.extend([
         MCP_CONFIG_FLAG.to_owned(),
@@ -231,8 +230,7 @@ pub(super) async fn checked_profile(launch: &Launch<'_>) -> Result<String, Error
     if let Some(version) = &check.version {
         return Ok(version.clone());
     }
-    let (dir, dir_path) =
-        private_dir_async(launch.temp_dir, launch.project, &launch.denied).await?;
+    let (dir, dir_path) = private_dir_async(launch.temp_dir, launch.project, launch.denied).await?;
     let output = version(
         launch.executable,
         launch.env,

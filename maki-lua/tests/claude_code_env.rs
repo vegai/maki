@@ -30,27 +30,6 @@ mod support;
 
 use support::environment::EnvVar;
 
-#[test]
-fn the_plugin_schema_uses_the_provider_defaults() {
-    let (_registry, host) = load(Map::new());
-    let schemas = host.plugin_options().unwrap();
-    let schema = schemas.get(TOOL).unwrap();
-    for (name, default) in [
-        ("executable", json!(validation::DEFAULT_EXECUTABLE)),
-        ("config_dir", json!(validation::DEFAULT_CONFIG_DIR)),
-        (
-            "provider_max_concurrent",
-            json!(validation::DEFAULT_MAX_CONCURRENT),
-        ),
-    ] {
-        let option = schema.iter().find(|option| option.name == name).unwrap();
-        assert_eq!(option.default.as_ref(), Some(&default), "{name}");
-        if name == "provider_max_concurrent" {
-            assert_eq!(option.min, Some(validation::MIN_MAX_CONCURRENT as f64));
-        }
-    }
-}
-
 use support::{
     DEADLINE, MINIMUM_VERSION, TOOL, WorkingDir, artifact_listing, commit_all, executable, git,
     listing, load, on_path, tool_reply, use_fixture_user, wait_for_release, wait_until, within,
@@ -114,6 +93,8 @@ const HOME_DENY_PATHS: [&str; 4] = [
     ".claude.json.tmp.42.random",
 ];
 const SECRET_DIR: &str = "credentials";
+const CONFIG_DIR: &str = "CLAUDE_CONFIG_DIR";
+const LOGIN_LINK: &str = "usual-login";
 const XDG_STATE_HOME: &str = "XDG_STATE_HOME";
 const OAUTH_TOKEN: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 const API_KEY: &str = "ANTHROPIC_API_KEY";
@@ -134,6 +115,27 @@ const SWEEP_TRASH: &str = ".trash-old";
 const STALE_AGE: Duration = Duration::from_secs(48 * 60 * 60);
 const NO_STATE_DIR: &str =
     "maki cannot find its state directory as a UTF-8 path for the coding sandbox";
+
+#[test]
+fn the_plugin_schema_uses_the_provider_defaults() {
+    let (_registry, host) = load(Map::new());
+    let schemas = host.plugin_options().unwrap();
+    let schema = schemas.get(TOOL).unwrap();
+    for (name, default) in [
+        ("executable", json!(validation::DEFAULT_EXECUTABLE)),
+        ("config_dir", json!("")),
+        (
+            "provider_max_concurrent",
+            json!(validation::DEFAULT_MAX_CONCURRENT),
+        ),
+    ] {
+        let option = schema.iter().find(|option| option.name == name).unwrap();
+        assert_eq!(option.default.as_ref(), Some(&default), "{name}");
+        if name == "provider_max_concurrent" {
+            assert_eq!(option.min, Some(validation::MIN_MAX_CONCURRENT as f64));
+        }
+    }
+}
 
 /// A test's turn on the process: inside an empty repository, with the
 /// fixture as the user's directories, until it drops.
@@ -532,6 +534,11 @@ fn the_default_artifact_root_hides_all_of_makis_state_but_the_workers_artifact(l
         fs::create_dir_all(link.parent().unwrap()).unwrap();
         symlink(&target, link).unwrap();
     }
+    let usual_login = env::current_dir().unwrap().join(LOGIN_LINK);
+    let login_target = secrets.join(LOGIN_LINK);
+    fs::create_dir(&login_target).unwrap();
+    symlink(&login_target, &usual_login).unwrap();
+    let _login = EnvVar::set(CONFIG_DIR, LOGIN_LINK);
     let _state_home = EnvVar::set(XDG_STATE_HOME, state_home.path());
     let runtime = tempdir().unwrap();
     let agent = home.path().join("agent.sock");
@@ -563,7 +570,14 @@ fn the_default_artifact_root_hides_all_of_makis_state_but_the_workers_artifact(l
         .join(DEFAULT_ARTIFACT_ROOT)
         .canonicalize()
         .unwrap();
-    for hidden in [&state_dir, &root, runtime.path(), &agent] {
+    for hidden in [
+        &state_dir,
+        &root,
+        runtime.path(),
+        &agent,
+        &usual_login,
+        &login_target,
+    ] {
         assert!(
             filesystem["denyRead"]
                 .as_array()

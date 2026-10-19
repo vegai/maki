@@ -1958,7 +1958,7 @@ mod tests {
     #[test_case(parked(Some("toolu_other"), "a") => matches Err(Error::NotInReply(_)) ; "a_call_the_reply_lacks")]
     #[test_case(parked(Some(FIRST_CALL), "changed") => matches Err(Error::CallDiffers(_)) ; "other_arguments")]
     #[test_case(parked(None, "a") => matches Err(Error::NoCallId) ; "no_tool_use_id")]
-    #[test_case(Handoff::Invalid(Error::NotOffered(json!("bash"))) => matches Err(Error::NotOffered(_)) ; "an_invalid_call")]
+    #[test_case(Handoff::Parked { tool_use_id: Some(FIRST_CALL.into()), name: CLAUDE_CODE_TOOL.into(), arguments: json!({}) } => matches Err(Error::NotOffered(_)) ; "an_unknown_tool")]
     fn a_handoff_that_does_not_match_the_reply_stops_the_request(
         handoff: Handoff,
     ) -> Result<Step, Error> {

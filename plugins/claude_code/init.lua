@@ -51,7 +51,7 @@ If a target changed since the snapshot, the import stops before any checkout cha
 local opts = maki.api.register_options(output_limits.extend({
   executable = { default = native.default_executable, desc = "The Claude Code executable." },
   config_dir = {
-    default = native.default_config_dir,
+    default = "",
     desc = "Absolute path of a Claude Code config directory for maki, in place of "
       .. "`$CLAUDE_CONFIG_DIR` or `~/.claude`. Use it to give maki a different Claude login.",
   },
@@ -216,7 +216,6 @@ local function coding_confine(spec, artifact)
       end
     end
   end
-  deny[#deny + 1] = spec.own_config_dir
   table.move(spec.home_credentials, 1, #spec.home_credentials, #deny + 1, deny)
   return { deny_read = deny, allow_read = { artifact.git }, allow_write = { artifact.tmp } }
 end
