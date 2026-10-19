@@ -78,25 +78,19 @@ fn directory(parent: &impl AsFd, name: impl Arg) -> io::Result<File> {
     )?))
 }
 
+fn entry_is(dir: &impl AsFd, name: impl Arg, kind: FileType) -> bool {
+    statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).is_ok_and(|entry| {
+        let found = FileType::from_raw_mode(entry.st_mode);
+        found == kind || found == FileType::Symlink
+    })
+}
+
 fn repository(dir: &impl AsFd) -> bool {
-    statat(dir, HEAD, AtFlags::SYMLINK_NOFOLLOW).is_ok_and(|entry| {
-        matches!(
-            FileType::from_raw_mode(entry.st_mode),
-            FileType::RegularFile | FileType::Symlink
-        )
-    }) && (statat(dir, COMMONDIR, AtFlags::SYMLINK_NOFOLLOW).is_ok_and(|entry| {
-        matches!(
-            FileType::from_raw_mode(entry.st_mode),
-            FileType::RegularFile | FileType::Symlink
-        )
-    }) || REPOSITORY_ENTRIES.iter().any(|name| {
-        statat(dir, *name, AtFlags::SYMLINK_NOFOLLOW).is_ok_and(|entry| {
-            matches!(
-                FileType::from_raw_mode(entry.st_mode),
-                FileType::Directory | FileType::Symlink
-            )
-        })
-    }))
+    entry_is(dir, HEAD, FileType::RegularFile)
+        && (entry_is(dir, COMMONDIR, FileType::RegularFile)
+            || REPOSITORY_ENTRIES
+                .iter()
+                .any(|name| entry_is(dir, *name, FileType::Directory)))
 }
 
 fn move_entry(

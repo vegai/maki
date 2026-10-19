@@ -1,4 +1,4 @@
-use super::super::checks::{self, Profile};
+use super::super::checks;
 use super::super::error::Error;
 use super::super::stream::{
     CONTROL_RESPONSE, Handshake, INITIALIZE, Offered, SUCCESS, Step, control_request, parse_event,
@@ -42,6 +42,7 @@ pub(crate) struct Launch<'a> {
     pub executable: &'a Path,
     pub env: &'a [(String, String)],
     pub project: &'a Path,
+    pub denied: Vec<PathBuf>,
     pub temp_dir: &'a Path,
     pub limits: &'a Limits,
 }
@@ -73,7 +74,7 @@ impl ExecutableIdentity {
     }
 }
 
-static PROFILE_CACHE: LazyLock<Mutex<HashMap<PathBuf, (ExecutableIdentity, Profile)>>> =
+static PROFILE_CACHE: LazyLock<Mutex<HashMap<PathBuf, (ExecutableIdentity, String)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub fn invalidate_profile(executable: &Path) {
@@ -115,7 +116,8 @@ async fn unprompted<T>(
     launch: &Launch<'_>,
     work: impl AsyncFnOnce(&mut Group) -> Result<T, Error>,
 ) -> Result<T, Error> {
-    let (dir, dir_path) = private_dir_async(launch.temp_dir, launch.project).await?;
+    let (dir, dir_path) =
+        private_dir_async(launch.temp_dir, launch.project, &launch.denied).await?;
     let mut args = base_args(PROBE_MODEL);
     args.extend([
         MCP_CONFIG_FLAG.to_owned(),
@@ -191,13 +193,13 @@ pub struct VersionCheck {
 }
 
 impl VersionCheck {
-    fn remember(&self, profile: &Profile) {
+    fn remember(&self, version: &str) {
         PROFILE_CACHE
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(
                 self.executable.clone(),
-                (self.identity.clone(), profile.clone()),
+                (self.identity.clone(), version.to_owned()),
             );
     }
 
@@ -205,7 +207,7 @@ impl VersionCheck {
         let profile =
             checks::profile(output, env::consts::OS).map_err(|error| error.to_string())?;
         self.remember(&profile);
-        Ok(profile.version)
+        Ok(profile)
     }
 }
 
@@ -216,7 +218,7 @@ pub(crate) async fn version_check(executable: &Path) -> Result<VersionCheck, Err
         .unwrap_or_else(PoisonError::into_inner)
         .get(executable)
         .filter(|(saved, _)| *saved == identity)
-        .map(|(_, profile)| profile.version.clone());
+        .map(|(_, version)| version.clone());
     Ok(VersionCheck {
         executable: executable.to_owned(),
         identity,
@@ -224,14 +226,13 @@ pub(crate) async fn version_check(executable: &Path) -> Result<VersionCheck, Err
     })
 }
 
-pub(super) async fn checked_profile(launch: &Launch<'_>) -> Result<Profile, Error> {
+pub(super) async fn checked_profile(launch: &Launch<'_>) -> Result<String, Error> {
     let check = version_check(launch.executable).await?;
     if let Some(version) = &check.version {
-        return Ok(Profile {
-            version: version.clone(),
-        });
+        return Ok(version.clone());
     }
-    let (dir, dir_path) = private_dir_async(launch.temp_dir, launch.project).await?;
+    let (dir, dir_path) =
+        private_dir_async(launch.temp_dir, launch.project, &launch.denied).await?;
     let output = version(
         launch.executable,
         launch.env,

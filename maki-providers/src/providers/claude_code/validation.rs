@@ -19,6 +19,10 @@ use super::stream::{
 
 pub const EMPTY_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
 pub const STARTUP_TIMEOUT_SECS: u64 = 60;
+pub const DEFAULT_EXECUTABLE: &str = "claude";
+pub const DEFAULT_CONFIG_DIR: &str = "";
+pub const DEFAULT_MAX_CONCURRENT: usize = 8;
+pub const MIN_MAX_CONCURRENT: usize = 1;
 pub(super) const CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 pub(super) const HOME_ENV: &str = "HOME";
 const TMPDIR_ENV: &str = "TMPDIR";
@@ -45,6 +49,29 @@ const BASE_ARGS: &[&str] = &[
     "",
     "--strict-mcp-config",
 ];
+
+pub fn shell_secret_problem(env: &HashMap<String, String>) -> Option<String> {
+    for (name, value) in env {
+        let upper = name.to_ascii_uppercase();
+        if upper == super::OAUTH_TOKEN_ENV {
+            return Some(format!(
+                "Claude Code passes {name} to its shell, where a coding worker can read it. Remove the variable and log in with `claude auth login`, or use the read profile."
+            ));
+        }
+        let authority = value
+            .split_once("://")
+            .map_or(value.as_str(), |(_, rest)| rest)
+            .split('/')
+            .next()
+            .unwrap_or_default();
+        if checks::PROXY_ENV.contains(&upper.as_str()) && authority.contains('@') {
+            return Some(format!(
+                "Claude Code passes {name} to its shell, where a coding worker can read the login in its URL. Use a proxy without a login in the URL, or use the read profile."
+            ));
+        }
+    }
+    None
+}
 
 pub fn base_args(model: &str, tools: &str, mode: &str, settings: &str) -> Vec<String> {
     let mut args: Vec<_> = BASE_ARGS.iter().map(|arg| (*arg).to_owned()).collect();
@@ -191,7 +218,7 @@ pub(super) fn prepare_launch(
     let var = |name| env_value(&vars, name);
     let own_config_dir = var(CONFIG_DIR_ENV)
         .filter(|path| !path.is_empty())
-        .map(PathBuf::from);
+        .map(|path| cwd.join(path));
     let config_dir = login_dir(&vars, configured.as_deref())?;
     let temp_dir = var(TMPDIR_ENV)
         .filter(|path| !path.is_empty())
@@ -233,7 +260,7 @@ pub(super) fn login_dir(
     )
 }
 
-pub fn prepared_launch(
+pub fn worker_launch(
     vars: HashMap<String, String>,
     configured: Option<String>,
     cwd: &Path,
@@ -255,20 +282,9 @@ pub async fn private_dir(
     smol::unblock(move || {
         let base = base
             .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or_else(default_temp_dir)
-            .canonicalize()
-            .map_err(|error| error.to_string())?;
-        let inside_checkout = |path: &Path| {
-            path.starts_with(&project) || denied.iter().any(|dir| path.starts_with(dir))
-        };
-        if inside_checkout(&base) {
-            return Err(Error::TempInProject(base).to_string());
-        }
+            .unwrap_or_else(default_temp_dir);
         let (dir, path) =
-            super::run::private_dir(&base, &project).map_err(|error| error.to_string())?;
-        if inside_checkout(&path) || project.starts_with(&path) {
-            return Err(Error::TempInProject(path).to_string());
-        }
+            super::run::private_dir(&base, &project, &denied).map_err(|error| error.to_string())?;
         let name = path.to_str().ok_or(PROBE_PATH_NOT_UTF8)?.to_owned();
         dir.keep();
         Ok(name)
@@ -561,13 +577,36 @@ fn worker_problem(effective: &Value, expected: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{WorkerPaths, WorkerPolicy, sandbox_problem, worker_problem};
+    use super::{
+        CONFIG_DIR_ENV, HOME_ENV, WorkerPaths, WorkerPolicy, prepare_launch, sandbox_problem,
+        worker_problem,
+    };
     use serde_json::{Value, json};
+    use std::fs;
+    use tempfile::tempdir;
     use test_case::test_case;
 
     const READ_RULE: &str = "Read(./secrets)";
     const DENIED: &str = "/checkout";
     const OUTSIDE: &str = "/outside";
+
+    #[test]
+    fn an_overridden_relative_login_directory_remains_denied() {
+        let root = tempdir().unwrap();
+        let cwd = root.path().join("project");
+        fs::create_dir(&cwd).unwrap();
+        let prepared = prepare_launch(
+            vec![
+                (HOME_ENV.into(), root.path().display().to_string()),
+                (CONFIG_DIR_ENV.into(), "usual-login".into()),
+            ],
+            Some(root.path().join("selected-login")),
+            &cwd,
+        )
+        .unwrap();
+        assert_eq!(prepared.own_config_dir, Some(cwd.join("usual-login")));
+        assert_eq!(prepared.config_dir, root.path().join("selected-login"));
+    }
 
     fn expected() -> Value {
         WorkerPolicy {

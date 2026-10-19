@@ -63,6 +63,7 @@ const WRITING: Hold = ("chmod", " ./src/new/");
 const GENERATE: &str = r#"
 local git_utils = require("claude_git")
 local import_scripts = require("claude_import_script")
+local path_utils = require("claude_paths")
 local changes = ({
   edit_and_add = {
     { path = [==[@PATH@]==], status = "M", old_sha = "@OLD@", new_sha = "@NEW@", old_mode = "100644", new_mode = "100644" },
@@ -79,7 +80,19 @@ local changes = ({
     { path = [==[@PATH@]==], status = "M", old_sha = "@OLD@", new_sha = "@OLD@", old_mode = "100755", new_mode = "100644" },
   },
 })["@CHANGES@"]
-maki.fs.write("@OUT@", import_scripts.import_script(changes, "@PROJECT@", "@GIT@", "@ARTIFACT@", "@STAGE@"))
+local staged, lines = {}, { "set -e" }
+for _, change in ipairs(changes) do
+  if change.new_sha and not staged[change.new_sha] then
+    staged[change.new_sha] = true
+    local words = git_utils.shell_environment()
+    for _, word in ipairs(git_utils.git({ "--git-dir=@GIT@", "cat-file", "blob", change.new_sha })) do
+      words[#words + 1] = path_utils.bash_quote(word)
+    end
+    lines[#lines + 1] = table.concat(words, " ") .. " > " .. path_utils.bash_quote("@STAGE@/" .. change.new_sha)
+  end
+end
+lines[#lines + 1] = import_scripts.import_script(changes, "@PROJECT@", "@GIT@", "@ARTIFACT@", "@STAGE@")
+maki.fs.write("@OUT@", table.concat(lines, "\n"))
 maki.fs.write("@LEFTOVERS@", import_scripts.leftovers_script(changes, "@PROJECT@", "@STAGE@", { [==[@MADE@]==] }))
 maki.fs.write("@REVIEW@", git_utils.diff_command({ git = "@GIT@", snapshot = "@PROJECT@", base = "@OLD@", tree = "@NEW@" }))
 "#;
@@ -109,6 +122,7 @@ const PRIVATE_MODE: u32 = 0o600;
 const GROUP_READ_MODE: u32 = 0o640;
 const PUBLIC_READ_MODE: u32 = 0o644;
 const PERMISSION_BITS: u32 = 0o777;
+const SPECIAL_MODE_BITS: u32 = 0o7000;
 const SAME_FOLDER_ADDED: &str = "src/added.rs";
 const TWO_EDITS: &str = "two_edits";
 const COUNTED: &str = "#!/bin/sh\nprintf '%s\\n' '@TOOL@' >> '@LOG@'\nexec '@REAL@' \"$@\"\n";
@@ -202,7 +216,8 @@ impl Import {
             .replace("@GIT@", &git_dir.to_string_lossy())
             .replace("@ARTIFACT@", &artifact.to_string_lossy());
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-        host.load_source("claude_code", &source).unwrap();
+        host.load_bundled_source("claude_code", &source, Default::default())
+            .unwrap();
         let script = fs::read_to_string(&out).unwrap();
         let leftovers = fs::read_to_string(&leftovers).unwrap();
         let held = HELD
@@ -397,6 +412,7 @@ fn a_mode_change_lands_with_the_same_bytes() {
 #[test_case(0o755, "027" ; "public_execute_restricted_umask")]
 #[test_case(0o755, "077" ; "public_execute_private_umask")]
 #[test_case(0o750, "077" ; "group_execute_private_umask")]
+#[test_case(0o4755, "077" ; "special_bits_are_cleared")]
 fn an_import_clears_execute_bits_regardless_of_umask(mode: u32, umask: &str) {
     const EXECUTE_BITS: u32 = 0o111;
     let import = Import::with(STAGING, MODE_CLEARED, TARGET, ADDED);
@@ -410,7 +426,11 @@ fn an_import_clears_execute_bits_regardless_of_umask(mode: u32, umask: &str) {
     assert_eq!(fs::read_to_string(import.target()).unwrap(), ORIGINAL);
     assert_eq!(
         fs::metadata(import.target()).unwrap().permissions().mode() & PERMISSION_BITS,
-        mode & !EXECUTE_BITS,
+        mode & PERMISSION_BITS & !EXECUTE_BITS,
+    );
+    assert_eq!(
+        fs::metadata(import.target()).unwrap().permissions().mode() & SPECIAL_MODE_BITS,
+        0
     );
 }
 

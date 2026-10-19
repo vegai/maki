@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tracing::debug;
 
-use super::checks::{self, HANDSHAKE, InitExpect};
+use super::checks::{self, ACCOUNT_ANSWER, HANDSHAKE, HOOKS_ANSWER, InitExpect, SETTINGS_ANSWER};
 use super::error::{Error, Problem, TOO_MANY_REQUESTS, UNKNOWN_ERROR, shown};
 use super::mcp::Handoff;
 use super::transcript::{BATCH_CALL_TOOL, BATCH_CALLS, BATCH_TOOL, Catalog, USER_ROLE};
@@ -26,9 +26,6 @@ use crate::{
 pub(crate) const INITIALIZE: &str = "initialize";
 pub(crate) const CONTROL_RESPONSE: &str = "control_response";
 pub(crate) const SUCCESS: &str = "success";
-pub(crate) const ACCOUNT_ANSWER: &str = checks::ACCOUNT_ANSWER;
-pub(crate) const SETTINGS_ANSWER: &str = checks::SETTINGS_ANSWER;
-pub(crate) const HOOKS_ANSWER: &str = checks::HOOKS_ANSWER;
 const SYSTEM_EVENT: &str = "system";
 pub(super) const ASSISTANT_EVENT: &str = "assistant";
 const USER_EVENT: &str = "user";
@@ -699,9 +696,6 @@ impl<'a> Turn<'a> {
         self.record(&event);
         let accepted = self.accepted();
         let kind = classify(&event, StreamMode::Provider, accepted)?;
-        if let Some(event) = self.handshake.feed_kind(&event, &kind, self.plan_usage)? {
-            return Ok(event);
-        }
         match kind {
             EventKind::Init => self.init(&event),
             EventKind::Assistant if event[API_ERROR_MARK] == true => {
@@ -724,7 +718,10 @@ impl<'a> Turn<'a> {
             EventKind::ControlResponse
             | EventKind::RateLimit
             | EventKind::Alive
-            | EventKind::System => Err(Error::UnknownEvent(event["type"].clone())),
+            | EventKind::System => self
+                .handshake
+                .feed_kind(&event, &kind, self.plan_usage)
+                .map(|step| step.unwrap_or(Step::Nothing)),
         }
     }
 
@@ -1453,7 +1450,7 @@ mod tests {
         let catalog = catalog();
         let tools = catalog.exposed();
         let expect = InitExpect {
-            profile: &profile,
+            version: &profile,
             model: ASKED,
             cwd: Path::new(CWD),
             server: SERVER,

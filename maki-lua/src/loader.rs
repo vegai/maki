@@ -12,6 +12,7 @@ use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::{ToolRegistry, ToolSource};
 use maki_config::{GatedFile, PluginFileConfig, PluginsConfig, ProjectConfig, RawConfig};
 use maki_providers::plugin::DeclAuthority;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::agent_autocmd::HostEvent;
 use crate::api::keymap::{KeybindTicket, KeymapReader};
@@ -522,25 +523,14 @@ impl PluginHost {
                     plugin: builtin.clone(),
                     source: mlua::Error::runtime("bundled plugin missing init.lua"),
                 })?;
-            let permissions = bundled_permissions(bundled)?;
-            let name: Arc<str> = Arc::from(builtin.as_str());
-            let opts = config
-                .opts
-                .get(builtin.as_str())
-                .cloned()
-                .map(Arc::new)
-                .unwrap_or_default();
-            self.send_load(
-                Arc::clone(&name),
-                vec![LoadChunk::bundled(name.as_ref(), init)],
-                LoadContext {
-                    opts,
-                    // The one load that ships inside the binary, and so the
-                    // one that may declare a provider under a built-in slug.
-                    authority: DeclAuthority::Bundled,
-                    private_api: bundled.private_api,
-                    ..LoadContext::plain(None, permissions)
-                },
+            self.load_bundled_source(
+                builtin,
+                init,
+                config
+                    .opts
+                    .get(builtin.as_str())
+                    .cloned()
+                    .unwrap_or_default(),
             )?;
         }
         Ok(())
@@ -639,6 +629,32 @@ impl PluginHost {
             .map_err(|_| PluginError::HostDead)?;
         reply_rx.recv().map_err(|_| PluginError::HostDead)?;
         Ok(())
+    }
+
+    /// Runs trusted source with a bundled plugin's permissions and private API.
+    /// For Rust embedders and tests. Source from disk uses the manifest-derived loaders.
+    pub fn load_bundled_source(
+        &self,
+        name: &str,
+        source: &str,
+        opts: JsonMap<String, JsonValue>,
+    ) -> Result<(), PluginError> {
+        let bundled = BUNDLED_PLUGINS
+            .iter()
+            .find(|plugin| plugin.name == name)
+            .ok_or_else(|| PluginError::UnknownPlugin {
+                plugin: name.to_owned(),
+            })?;
+        self.send_load(
+            Arc::from(name),
+            vec![LoadChunk::bundled(name, source)],
+            LoadContext {
+                opts: Arc::new(opts),
+                authority: DeclAuthority::Bundled,
+                private_api: bundled.private_api,
+                ..LoadContext::plain(None, bundled_permissions(bundled)?)
+            },
+        )
     }
 
     /// Runs a source with every permission granted, for tests and embedders.

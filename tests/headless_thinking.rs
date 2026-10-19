@@ -2,7 +2,6 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -15,8 +14,11 @@ use maki_storage::StateDir;
 use maki_storage::model::{persist_thinking, read_thinking};
 use maki_storage::sessions::StoredThinking;
 use serde_json::{Value, json};
-use tempfile::{TempDir, tempdir};
 use test_case::test_case;
+
+#[path = "support/isolation.rs"]
+mod isolation;
+use isolation::Isolation;
 
 const MODEL: &str = "thinking-fixture/fixture-model";
 const PROMPT: &str = "Reply briefly.";
@@ -47,7 +49,7 @@ const STREAM: &[Canned] = &[Canned::sse(concat!(
 ))];
 
 struct Fixture {
-    root: TempDir,
+    isolation: Isolation,
     requests: Requests,
 }
 
@@ -55,10 +57,10 @@ impl Fixture {
     fn new(configured: Option<&str>, support: ThinkingSupport) -> Self {
         let (url, requests) = serve(STREAM);
         let fixture = Self {
-            root: tempdir().unwrap(),
+            isolation: Isolation::new(),
             requests,
         };
-        let config = fixture.dir("config/maki");
+        let config = fixture.isolation.dir("config/maki");
         let settings =
             configured.map_or_else(String::new, |value| format!("always_thinking = {value:?}"));
         fs::write(
@@ -87,32 +89,12 @@ models = [{{ id = "fixture-model", max_output_tokens = {OUTPUT_CAP}, supports_th
         fixture
     }
 
-    fn dir(&self, name: &str) -> PathBuf {
-        let path = self.root.path().join(name);
-        fs::create_dir_all(&path).unwrap();
-        path
-    }
-
     fn storage(&self) -> StateDir {
-        StateDir::from_path(self.dir("state/maki"))
+        StateDir::from_path(self.isolation.dir("state/maki"))
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_maki"));
-        command
-            .current_dir(self.dir("project"))
-            .env_clear()
-            .env("HOME", self.dir("home"))
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default());
-        for (variable, name) in [
-            ("XDG_CONFIG_HOME", "config"),
-            ("XDG_STATE_HOME", "state"),
-            ("XDG_DATA_HOME", "data"),
-            ("XDG_CACHE_HOME", "cache"),
-        ] {
-            command.env(variable, self.dir(name));
-        }
-        command
+        self.isolation.command()
     }
 
     fn assert_budget(&self, expected: Option<u64>) {
@@ -148,7 +130,9 @@ impl Process {
         let (tx, events) = flume::unbounded();
         thread::spawn(move || {
             for line in output.lines() {
-                let event = serde_json::from_str(&line.unwrap()).unwrap();
+                let line = line.expect("cannot read a protocol event from maki");
+                let event = serde_json::from_str(&line)
+                    .unwrap_or_else(|error| panic!("invalid protocol event: {error}: {line}"));
                 if tx.send(event).is_err() {
                     break;
                 }
@@ -252,7 +236,7 @@ fn acp_launch_thinking_reaches_the_request(flags: &[&str], budget: Option<u64>) 
     let mut process = Process::start(command);
     process.send(json!({"jsonrpc": "2.0", "id": INITIALIZE_ID, "method": "initialize", "params": {"protocolVersion": 1, "clientCapabilities": {}}}));
     process.response(INITIALIZE_ID);
-    process.send(json!({"jsonrpc": "2.0", "id": NEW_SESSION_ID, "method": "session/new", "params": {"cwd": fixture.dir("project"), "mcpServers": []}}));
+    process.send(json!({"jsonrpc": "2.0", "id": NEW_SESSION_ID, "method": "session/new", "params": {"cwd": fixture.isolation.dir("project"), "mcpServers": []}}));
     let session = process.response(NEW_SESSION_ID);
     process.send(json!({"jsonrpc": "2.0", "id": PROMPT_ID, "method": "session/prompt", "params": {"sessionId": session["sessionId"], "prompt": [{"type": "text", "text": PROMPT}]}}));
     process.response(PROMPT_ID);

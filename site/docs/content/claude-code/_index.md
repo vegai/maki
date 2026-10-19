@@ -112,6 +112,8 @@ Use `git --git-dir=<path>` when you intend to open a bare repository.
 
 The `claude-code` provider runs maki's agent loop on Claude Code models. The `claude_code` plugin enables the provider. Both use the plugin's `executable` and `config_dir`.
 
+Claude Code adds environment and account context to provider turns, including the working directory and your account email. Provider turns keep the session's start directory after `/cd`.
+
 Provider concurrency is configured separately from plugin tool calls. See the [plugin options](/docs/configuration/#plugins). Queued generations show a waiting message, and queued subagents are marked in `/tasks`.
 
 Claude Code lists the models available to your account. The provider uses Anthropic model ids, such as `claude-code/claude-sonnet-5`. A listing uses one request slot and starts up to six short `claude` processes. maki keeps the list for a day. Opening the model picker uses the cached list. `maki models --refresh` or Ctrl+r in the picker reads it again. A failed listing waits five minutes before a retry unless you refresh. Tiers and list prices are the anthropic provider's, as the [providers page](/docs/providers/) lists them.
@@ -136,7 +138,7 @@ All options live under `plugins.claude_code` in [configuration](/docs/configurat
 
 ## Limits
 
-- The plugin and provider run only on Linux. They need Claude Code 2.1.284 or newer. Each call validates the current CLI contract. An unchanged executable reuses its version check.
+- The plugin and provider run only on Linux. They need Claude Code 2.1.284 or newer.
 - maki cannot see how Anthropic bills a call or a turn. Past your plan's limits, Anthropic can bill it as extra usage, which `/usage` shows. The USD value maki shows is the API list price of the tokens.
 - Startup checks have a 60-second limit. The call's `timeout` defaults to 600 seconds and includes snapshot and preparation work. Claude Code tools can run for a long time without output.
 - If your organization policy keeps a hook on, the hook runs once in the empty directory before maki stops the call. The hook's output remains there. The reply names the directory.
@@ -146,6 +148,5 @@ All options live under `plugins.claude_code` in [configuration](/docs/configurat
 - A long task with many tool calls runs several times slower on the provider than in Claude Code itself. Each request starts a new `claude` that reads the conversation as a transcript without the model's earlier thinking. The model needs more turns to reach the same result.
 - When Anthropic's safety classifier stops a provider reply, the turn stops with its explanation. maki does not retry it.
 - In a plugin call Claude uses Claude Code's own tools, so maki's [token economy](/docs/token-economy/) does not apply. Each call starts a fresh `claude`. The prompt must contain all data necessary for the task.
-- A coding worker's shell has no network access. Fetch what it needs in `prepare`, which runs as you, outside the sandbox.
 - The coding sandbox denies shell histories, browser profiles, `~/.ssh`, Git configuration, keyrings, `$SSH_AUTH_SOCK` and `$XDG_RUNTIME_DIR`. Copies of `~/.claude.json*` created during a shell command remain unprotected until the next command. Coding calls reject `enableWeakerNestedSandbox` when enabled.
 - The changes exclude new files that match your `.gitignore`. The reply reports new ignored output by directory. Output already present after `prepare` is omitted from that note. Ignored output stays in the snapshot. Changes also exclude anything the worker writes to a path named `.claude` or `.maki`, including case variants.

@@ -3,7 +3,6 @@
 //!
 //! Only clients on 127.0.0.1 with the request's bearer token can connect.
 
-use std::collections::HashSet;
 use std::io;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -80,7 +79,6 @@ pub(crate) enum Handoff {
 
 struct Shared {
     token: String,
-    tool_names: HashSet<String>,
     tool_list: String,
     handoffs: Sender<Handoff>,
     read_limit: Duration,
@@ -99,7 +97,6 @@ impl Shared {
         Self {
             token,
             tool_list: json!({ "tools": tools }).to_string(),
-            tool_names: tools.into_iter().map(|tool| tool.name).collect(),
             handoffs,
             read_limit,
             authenticated_slots: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
@@ -456,9 +453,6 @@ fn protocol_version(asked: &Value) -> &str {
 fn park(shared: &Shared, params: &Value) -> Reply {
     let name = params["name"].as_str().unwrap_or_default();
     let handoff = match &params["arguments"] {
-        _ if !shared.tool_names.contains(name) => {
-            Handoff::Invalid(Error::NotOffered(params["name"].clone()))
-        }
         Value::Object(_) => Handoff::Parked {
             tool_use_id: params["_meta"][TOOL_USE_ID_META]
                 .as_str()
@@ -813,9 +807,9 @@ mod tests {
         }
     }
 
-    #[test_case(json!({ "name": "bash", "arguments": {} }) => matches Handoff::Invalid(Error::NotOffered(_)) ; "an_unknown_tool")]
+    #[test_case(json!({ "name": "bash", "arguments": {} }) => matches Handoff::Parked { .. } ; "an_unknown_tool")]
     #[test_case(json!({ "name": TOOL, "arguments": "rm -rf /" }) => matches Handoff::Invalid(Error::NotArguments { .. }) ; "arguments_that_are_no_object")]
-    fn an_invalid_call_is_reported_and_still_never_answered(params: Value) -> Handoff {
+    fn tool_calls_are_held_for_turn_validation(params: Value) -> Handoff {
         let call = json!({ "jsonrpc": "2.0", "id": 3, "method": TOOLS_CALL, "params": params });
         let (rest, handoff) = parked(&post(&call, TOKEN));
         assert!(

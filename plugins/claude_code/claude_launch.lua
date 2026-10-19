@@ -11,7 +11,7 @@ local path_utils = require("claude_paths")
 local M = {}
 
 M.MODELS = { "sonnet", "opus", "haiku", "fable" }
-local MODEL_SET = path_utils.set_of(M.MODELS)
+M.MODEL_SET = path_utils.set_of(M.MODELS)
 M.STARTUP_TIMEOUT_SECS = native.startup_timeout_secs
 M.STARTUP_MS = M.STARTUP_TIMEOUT_SECS * jobs.MS_PER_SEC
 M.READ_PROFILE = "read"
@@ -63,11 +63,6 @@ local INSTRUCTIONS_HEADING = "The instructions maki loaded for this task, from t
 -- Claude Code passes its environment to Bash, in the sandbox too (tested on
 -- 2.1.284), and the sandbox cannot drop a variable.
 local SHELL_TOOL = "Bash"
-local SHELL_VISIBLE_LOGIN = "CLAUDE_CODE_OAUTH_TOKEN"
--- A proxy URL can carry a user and a password that Claude Code needs to
--- reach the API, so maki cannot strip them.
-local PROXY_ENV = { HTTP_PROXY = true, HTTPS_PROXY = true }
-
 -- Logins and keys under the home directory that the sandboxed shell cannot
 -- read. Without `CLAUDE_CONFIG_DIR`, Claude Code keeps its login in
 -- `.claude`, and its global state, MCP server `env` included, in
@@ -150,22 +145,7 @@ function M.shell_secret_problem(worker, env)
   if not path_utils.set_of(worker.tools)[SHELL_TOOL] then
     return nil
   end
-  for name, value in pairs(env) do
-    if name:upper() == SHELL_VISIBLE_LOGIN then
-      return "Claude Code passes "
-        .. name
-        .. " to its shell, where a coding worker can read it. Remove the variable and log in with "
-        .. "`claude auth login`, or use the read profile."
-    end
-    local authority = PROXY_ENV[name:upper()] and value:gsub("^%a[%w+.-]*://", ""):match("^[^/]*")
-    if authority and authority:find("@", 1, true) then
-      return "Claude Code passes "
-        .. name
-        .. " to its shell, where a coding worker can read the login in its URL. Use a proxy without a "
-        .. "login in the URL, or use the read profile."
-    end
-  end
-  return nil
+  return native.shell_secret_problem(env)
 end
 
 function M.denied_home_paths(extra)
@@ -283,7 +263,7 @@ end
 
 local function worker_policy(deny_read, worker, confine)
   return {
-    deny = deny_rules(deny_read),
+    deny = type(deny_read) == "table" and deny_read or deny_rules(deny_read),
     sandbox = worker.sandboxed and assert(confine, "a sandboxed worker needs confinement paths") or nil,
   }
 end
@@ -440,20 +420,20 @@ function M.probe(call, spec, argv, env, confine, deny_read)
   end
 end
 
--- Only a coding call has a `plan`.
-function M.preflight(input, ctx, call, opts, plan)
+function M.preflight(input, ctx, call, opts)
   local model = input.model or opts.model
-  if not MODEL_SET[model] then
+  if not M.MODEL_SET[model] then
     return nil, "unknown model " .. tostring(model) .. ", use one of " .. table.concat(M.MODELS, ", ")
   end
   local worker = M.WORKERS[input.profile or M.READ_PROFILE]
   if not worker then
     return nil, "unknown profile " .. tostring(input.profile) .. ", use " .. M.READ_PROFILE .. " or " .. M.CODE_PROFILE
   end
+  local environ = maki.uv.os_environ()
   local home = maki.uv.os_homedir()
   local plan_err, home_credentials
   if worker == M.WORKERS[M.CODE_PROFILE] then
-    home_credentials, plan_err = M.home_credentials(home, opts.deny_read_home, maki.uv.os_environ())
+    home_credentials, plan_err = M.home_credentials(home, opts.deny_read_home, environ)
     if not home_credentials then
       return nil, plan_err
     end
@@ -475,8 +455,7 @@ function M.preflight(input, ctx, call, opts, plan)
   if not instructions then
     return nil, "maki cannot load the instructions of the session: " .. tostring(instructions_err)
   end
-  local prepared, prepare_err =
-    native.prepare_launch(maki.uv.os_environ(), opts.config_dir ~= "" and opts.config_dir or nil, cwd)
+  local prepared, prepare_err = native.prepare_launch(environ, opts.config_dir ~= "" and opts.config_dir or nil, cwd)
   if not prepared then
     return nil, prepare_err
   end
@@ -520,14 +499,14 @@ function M.preflight(input, ctx, call, opts, plan)
   return {
     model = model,
     worker = worker,
-    plan = plan,
+    deny = deny_rules(opts.deny_read),
     executable = executable,
     cwd = cwd,
     instructions = instructions,
     env = env,
     withheld = withheld,
     config_dir = config_dir,
-    own_config_dir = own_config_dir and own_config_dir:sub(1, 1) == "/" and own_config_dir or nil,
+    own_config_dir = own_config_dir,
     home_credentials = home_credentials,
     checkout_dirs = local_dirs,
     git_dir = git_dir,

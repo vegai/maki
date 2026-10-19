@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::cmp::Reverse;
-use std::ops::RangeInclusive;
 
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, LuaString, Result as LuaResult, Table};
@@ -10,40 +9,12 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 use super::util::convert::TableExt;
 use super::util::pair::{Pair, pair, try_pair};
 
-const VARIATION_SELECTORS: &[RangeInclusive<u32>] = &[
-    0x180b..=0x180d,
-    0x180f..=0x180f,
-    0xfe00..=0xfe0f,
-    0xe0100..=0xe01ef,
-];
-
 thread_local! {
     /// `Matcher::new` allocates a score matrix of about 135KB, so building one
     /// per call would make the obvious loop over candidates allocate once per
     /// candidate. Its config is overwritten on every borrow, which is the only
     /// thing that differs between callers.
     static MATCHER: RefCell<Matcher> = RefCell::new(Matcher::new(Config::DEFAULT));
-}
-
-/// Whether a code point has a visible, printable representation.
-/// @param code integer Unicode code point.
-/// @param previous integer? Preceding code point. Variation selectors require a non-ASCII predecessor.
-/// @return (boolean) True for a visible character.
-#[lua_fn]
-fn is_printable(_lua: &Lua, code: u32, previous: Option<u32>) -> LuaResult<bool> {
-    Ok(char::from_u32(code).is_some_and(|character| {
-        if character.is_ascii() {
-            !character.is_control()
-        } else {
-            VARIATION_SELECTORS
-                .iter()
-                .any(|range| range.contains(&code))
-                && previous
-                    .and_then(char::from_u32)
-                    .is_some_and(|base| !base.is_ascii())
-                || format!("a{character}").escape_debug().count() == 2
-        }
-    }))
 }
 
 /// Convert an HTML string to Markdown.
@@ -239,7 +210,7 @@ lua_table! {
     /// local hits = maki.text.fuzzy_list("mrs", names, { limit = 10 })
     /// ```
     "maki.text" => pub(crate) fn create_text_table(), DOCS [
-        is_printable, html_to_markdown, fuzzy, fuzzy_list,
+        html_to_markdown, fuzzy, fuzzy_list,
     ]
 }
 
@@ -249,33 +220,6 @@ mod tests {
     use test_case::test_case;
 
     const PATHS: [&str; 3] = ["maki-ui/src/main.rs", "README.md", "docs/index.html"];
-
-    #[test_case('é', true ; "accented_letter")]
-    #[test_case('\u{301}', true ; "combining_accent")]
-    #[test_case('\u{94d}', true ; "virama")]
-    #[test_case('\u{fe0f}', true ; "emoji_variation_selector")]
-    #[test_case('\u{e0100}', true ; "supplemental_variation_selector")]
-    #[test_case('\u{180b}', true ; "mongolian_variation_selector")]
-    #[test_case('\u{200b}', false ; "zero_width_space")]
-    #[test_case('\u{202e}', false ; "bidi_override")]
-    #[test_case('\u{2028}', false ; "line_separator")]
-    #[test_case('\u{80}', false ; "control")]
-    fn printability_preserves_combining_characters(character: char, expected: bool) {
-        assert_eq!(
-            is_printable(&Lua::new(), u32::from(character), Some(u32::from('字'))).unwrap(),
-            expected
-        );
-    }
-
-    #[test_case(0x180b ; "mongolian")]
-    #[test_case(0x180f ; "fourth_mongolian")]
-    #[test_case(0xfe0f ; "emoji")]
-    #[test_case(0xe0100 ; "supplemental")]
-    fn variation_selectors_need_a_non_ascii_predecessor(code: u32) {
-        for previous in [None, Some(u32::from('n'))] {
-            assert!(!is_printable(&Lua::new(), code, previous).unwrap());
-        }
-    }
 
     fn best(needle: &str) -> Option<&'static str> {
         let pattern = compile(needle);

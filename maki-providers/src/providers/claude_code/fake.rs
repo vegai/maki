@@ -120,18 +120,9 @@ impl Fake {
         model: &str,
         limits: Limits,
     ) -> (Result<StreamResponse, Error>, Vec<ProviderEvent>) {
-        self.send(prompt, model, Thinking::Default, limits).await
-    }
-
-    pub(super) async fn send(
-        &self,
-        prompt: &str,
-        model: &str,
-        thinking: Thinking,
-        limits: Limits,
-    ) -> (Result<StreamResponse, Error>, Vec<ProviderEvent>) {
         let messages = [Message::user(prompt.to_owned())];
-        self.send_messages(&messages, model, thinking, limits).await
+        self.send_messages(&messages, model, Thinking::Default, limits)
+            .await
     }
 
     pub(super) async fn send_messages(
@@ -149,6 +140,7 @@ impl Fake {
                 executable: &self.executable(),
                 env: &Self::env(),
                 project: &project,
+                denied: Vec::new(),
                 temp_dir: &self.temp_base(),
                 limits: &limits,
             },

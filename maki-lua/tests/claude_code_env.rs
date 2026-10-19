@@ -30,6 +30,27 @@ mod support;
 
 use support::environment::EnvVar;
 
+#[test]
+fn the_plugin_schema_uses_the_provider_defaults() {
+    let (_registry, host) = load(Map::new());
+    let schemas = host.plugin_options().unwrap();
+    let schema = schemas.get(TOOL).unwrap();
+    for (name, default) in [
+        ("executable", json!(validation::DEFAULT_EXECUTABLE)),
+        ("config_dir", json!(validation::DEFAULT_CONFIG_DIR)),
+        (
+            "provider_max_concurrent",
+            json!(validation::DEFAULT_MAX_CONCURRENT),
+        ),
+    ] {
+        let option = schema.iter().find(|option| option.name == name).unwrap();
+        assert_eq!(option.default.as_ref(), Some(&default), "{name}");
+        if name == "provider_max_concurrent" {
+            assert_eq!(option.min, Some(validation::MIN_MAX_CONCURRENT as f64));
+        }
+    }
+}
+
 use support::{
     DEADLINE, MINIMUM_VERSION, TOOL, WorkingDir, artifact_listing, commit_all, executable, git,
     listing, load, on_path, tool_reply, use_fixture_user, wait_for_release, wait_until, within,
@@ -239,7 +260,7 @@ fn an_empty_tmpdir_is_unset_for_launch_and_worker_checks() {
     let outside = tempdir().unwrap();
     let claude = fake_claude(outside.path(), VERSION_ONLY);
     let _tmpdir = EnvVar::set(TMPDIR, "");
-    let prepared = validation::prepared_launch(
+    let prepared = validation::worker_launch(
         HashMap::from([(TMPDIR.to_owned(), String::new())]),
         Some(outside.path().to_str().unwrap().to_owned()),
         &env::current_dir().unwrap(),

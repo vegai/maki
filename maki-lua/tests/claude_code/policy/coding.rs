@@ -39,6 +39,7 @@ use super::{
 const LARGE_IMPORT_CHANGES: usize = 1024;
 const IMPORT_TOO_LARGE: &str = "Use `paths` to import smaller groups";
 const AMBIGUOUS_IMPORT_PATH: &str = "matches more than one change";
+const TRACKED_FOLDER_LINK: &str = "is a symlink. Restore a directory before retrying the snapshot";
 
 const CANNOT_LOCK_ARTIFACT: &str = "cannot lock artifact";
 const PREPARE_TIMEOUT_SECS: u64 = 1;
@@ -706,6 +707,20 @@ fn denied_reads(filesystem: &Value) -> Vec<PathBuf> {
         .filter_map(Value::as_str)
         .map(PathBuf::from)
         .collect()
+}
+
+#[test]
+fn a_tracked_folder_replaced_by_a_link_has_an_actionable_error() {
+    let coding = Coding::new();
+    let outside = tempdir().unwrap();
+    let source = coding.project().join("src");
+    let moved = outside.path().join("src");
+    fs::rename(&source, &moved).unwrap();
+    symlink(&moved, &source).unwrap();
+    let (registry, _host) = coding.host(&[]);
+    let error = coding.code(&registry, CODE_EDIT, &[]).unwrap_err();
+    assert!(error.contains(TRACKED_FOLDER_LINK), "{error}");
+    assert!(error.contains(source.to_str().unwrap()), "{error}");
 }
 
 /// A worktree and its primary checkout share git objects. Deny every path that can expose the

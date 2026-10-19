@@ -89,7 +89,7 @@ function Call:start(argv, job_opts, on_exit)
   return id
 end
 
---- {how} has `on_exit(id, code, clock_code)`, `timeout_ms`, and
+--- {how} has `on_exit(id, code, timed_out)`, `timeout_ms`, and
 --- `keep_on_cancel` for a job that a kill could interrupt. The startup limit
 --- applies to such a job unless it has its own.
 function Call:spawn(argv, job_opts, how)
@@ -100,7 +100,7 @@ function Call:spawn(argv, job_opts, how)
   job_opts.timeout_ms = limit
   local id = self:start(argv, job_opts, function(job, code, timed_out)
     if how.on_exit then
-      how.on_exit(job, code, timed_out and 0 or nil)
+      how.on_exit(job, code, timed_out)
     end
   end)
   if not how.keep_on_cancel then
@@ -163,15 +163,15 @@ function Call:run_to_end(argv, job_opts, how, timeout_ms)
     local id = self:spawn(argv, job_opts, {
       keep_on_cancel = how.keep_on_cancel,
       timeout_ms = timeout_ms,
-      on_exit = function(_, exit_code, clock_exit)
-        local result = clock_exit == nil and exit_code or nil
+      on_exit = function(_, exit_code, timed_out)
+        local result = not timed_out and exit_code or nil
         local leftover = how.leftover and how.leftover(lines)
         if leftover then
           self:remove_dir(leftover, function()
-            done(result, clock_exit)
+            done(result, timed_out)
           end)
         else
-          done(result, clock_exit)
+          done(result, timed_out)
         end
       end,
     })

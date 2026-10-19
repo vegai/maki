@@ -60,7 +60,9 @@ use crate::{
 use error::Error;
 use maki_storage::atomic_write;
 use run::{Exchange, Launch, Limits, Listed, Request, Thinking};
-use validation::{CONFIG_DIR_ENV, HOME_ENV};
+use validation::{
+    CONFIG_DIR_ENV, DEFAULT_EXECUTABLE, DEFAULT_MAX_CONCURRENT, HOME_ENV, MIN_MAX_CONCURRENT,
+};
 
 const CLAUDE_CODE: EffortDialect = EffortDialect {
     supported: &[
@@ -93,8 +95,6 @@ const MAX_CONCURRENT_OPTION: &str = "provider_max_concurrent";
 /// The login lives in Claude Code's config directory, so there is no key
 /// variable.
 const NO_KEY_ENV: &str = "";
-const DEFAULT_EXECUTABLE: &str = "claude";
-const DEFAULT_MAX_CONCURRENT: usize = 8;
 const WAITING_FOR_SLOT: &str = "waiting for a Claude Code request slot";
 const MODELS_CACHE_FILE: &str = "claude-code-models.json";
 /// Same as the models.dev catalog, because a listing starts several `claude`
@@ -185,7 +185,7 @@ impl PluginOptions {
             max_concurrent: value(MAX_CONCURRENT_OPTION)
                 .and_then(Value::as_u64)
                 .and_then(|n| usize::try_from(n).ok())
-                .filter(|&n| n > 0),
+                .filter(|&n| n >= MIN_MAX_CONCURRENT),
         }
     }
 }
@@ -454,7 +454,6 @@ fn utf8_vars(vars: impl Iterator<Item = (OsString, OsString)>) -> Vec<(String, S
 
 type Environment = dyn Fn(Option<&[&str]>) -> Vec<(String, String)> + Send + Sync;
 
-#[derive(Clone)]
 struct ClaudeCode {
     executable: PathBuf,
     limits: Limits,
@@ -508,19 +507,17 @@ impl ClaudeCode {
         )
     }
 
-    fn prepare(&self, cwd: &Path, vars: Vec<(String, String)>) -> Result<LaunchPreparation, Error> {
-        let prepared = validation::prepare_launch(vars, self.config_dir.clone(), cwd)?;
-        if !prepared.withheld.is_empty() {
-            info!(withheld = ?prepared.withheld, "claude-code: maki did not give the route variables to Claude Code");
-        }
-        Ok(prepared)
-    }
-
     fn launch<'a>(&'a self, prepared: &'a LaunchPreparation, cwd: &'a Path) -> Launch<'a> {
         Launch {
             executable: &self.executable,
             env: &prepared.env,
             project: cwd,
+            denied: prepared
+                .local_dirs
+                .iter()
+                .chain(prepared.git_dir.iter())
+                .cloned()
+                .collect(),
             temp_dir: &prepared.temp_dir,
             limits: &self.limits,
         }
@@ -531,9 +528,14 @@ impl ClaudeCode {
         cwd: &Path,
         vars: Vec<(String, String)>,
     ) -> Result<LaunchPreparation, Error> {
-        let provider = self.clone();
+        let config_dir = self.config_dir.clone();
         let cwd = cwd.to_owned();
-        smol::unblock(move || provider.prepare(&cwd, vars)).await
+        let prepared =
+            smol::unblock(move || validation::prepare_launch(vars, config_dir, &cwd)).await?;
+        if !prepared.withheld.is_empty() {
+            info!(withheld = ?prepared.withheld, "claude-code: maki did not give the route variables to Claude Code");
+        }
+        Ok(prepared)
     }
 
     /// Model discovery starts up to six processes. Cache successful lists for 24 hours
@@ -552,11 +554,12 @@ impl ClaudeCode {
                     .and_then(|path| saved_models(path, MODELS_CACHE_TTL, &executable, &config_dir))
             })
             .await?;
-            self.remember_windows(&SavedModels {
+            let saved = SavedModels {
                 executable: key.0.clone(),
                 config_dir: key.1.clone(),
                 models: models.clone(),
-            });
+            };
+            self.remember_windows(saved);
             Some(models)
         };
         // The lock waits for any listing in progress, which can wait for a
@@ -588,8 +591,8 @@ impl ClaudeCode {
         listed
     }
 
-    fn remember_windows(&self, saved: &SavedModels) {
-        *self.windows.lock().unwrap_or_else(PoisonError::into_inner) = Some(saved.clone());
+    fn remember_windows(&self, saved: SavedModels) {
+        *self.windows.lock().unwrap_or_else(PoisonError::into_inner) = Some(saved);
     }
 
     /// Load the last list lazily, retaining only this provider's current login and executable.
@@ -628,13 +631,15 @@ impl ClaudeCode {
         let _slot = slots.acquire().await;
         let prepared = self.prepare_async(cwd, vars).await?;
         let usage = self.plan_usage(&prepared.config_dir);
-        let models = run::models(&self.launch(&prepared, cwd), &usage).await?;
+        let models = run::models(&self.launch(&prepared, cwd), &usage)
+            .await
+            .inspect_err(|error| self.invalidate_version_on_error(error))?;
         let saved = SavedModels {
             executable: self.executable.clone(),
             config_dir: prepared.config_dir,
             models,
         };
-        self.remember_windows(&saved);
+        self.remember_windows(saved.clone());
         if let Some(path) = &self.models_cache {
             let path = path.to_owned();
             return Ok(smol::unblock(move || {
@@ -679,11 +684,13 @@ impl ClaudeCode {
             thinking,
         })
         .await
-        .inspect_err(|error| {
-            if error.invalidates_version() {
-                run::invalidate_profile(&self.executable);
-            }
-        })
+        .inspect_err(|error| self.invalidate_version_on_error(error))
+    }
+
+    fn invalidate_version_on_error(&self, error: &Error) {
+        if error.invalidates_version() {
+            run::invalidate_profile(&self.executable);
+        }
     }
 }
 
@@ -1017,7 +1024,7 @@ mod tests {
         let path = keyed_models_path(cache, &saved.executable, &saved.config_dir);
         fs::remove_file(path).unwrap();
         assert_eq!(provider.window_of(DEFAULT_ROW), Some(LONG_CONTEXT_WINDOW));
-        provider.remember_windows(&SavedModels {
+        provider.remember_windows(SavedModels {
             models: vec![listed(DEFAULT_ROW, Some(STANDARD_WINDOW))],
             ..saved
         });
@@ -1160,7 +1167,8 @@ mod tests {
             second.path(),
             vec![listed(DEFAULT_ROW, Some(STANDARD_WINDOW))],
         );
-        let mut other_executable = other_login.clone();
+        assert_eq!(other_login.window_of(DEFAULT_ROW), Some(STANDARD_WINDOW));
+        let mut other_executable = other_login;
         other_executable.executable = second.path().join("another-claude");
         save_models(
             &second.path().join(MODELS_CACHE_FILE),
@@ -1171,7 +1179,6 @@ mod tests {
             },
         );
         assert_eq!(provider.window_of(DEFAULT_ROW), Some(LONG_CONTEXT_WINDOW));
-        assert_eq!(other_login.window_of(DEFAULT_ROW), Some(STANDARD_WINDOW));
         assert_eq!(other_executable.window_of(DEFAULT_ROW), None);
         assert_eq!(
             other_executable.window_of(OLDER_RELEASE),
@@ -1331,8 +1338,9 @@ mod on_the_fake {
 
     /// `TMPDIR` can resolve into the project through a symlink. Refuse that path before a
     /// policy hook can run there.
-    #[test]
-    fn a_temp_dir_that_leads_into_the_project_is_refused() {
+    #[test_case(false ; "repository_root")]
+    #[test_case(true ; "session_subdirectory")]
+    fn a_temp_dir_that_leads_into_the_project_is_refused(subdirectory: bool) {
         let fake = Fake::new("text");
         fs::write(fake.dir.path().join("policy_hook"), "").unwrap();
         let inside = fake.project().join(INSIDE_TEMP);
@@ -1342,7 +1350,14 @@ mod on_the_fake {
         symlink(&inside, &temp).unwrap();
         let model = Model::from_spec(HAIKU_SPEC).unwrap();
 
-        let err = through_the_provider(&fake, &model, &fake.project(), &temp).unwrap_err();
+        fs::create_dir(fake.project().join(".git")).unwrap();
+        let cwd = if subdirectory {
+            fake.project().join("sub")
+        } else {
+            fake.project()
+        };
+        fs::create_dir_all(&cwd).unwrap();
+        let err = through_the_provider(&fake, &model, &cwd, &temp).unwrap_err();
         assert!(matches!(err, Error::TempInProject(_)), "{err}");
         assert!(!fake.dir.path().join("pid").exists(), "Claude Code started");
         assert_eq!(fake.log("hook_ran_in"), "", "a hook ran");
@@ -1430,9 +1445,9 @@ mod on_the_fake {
         let mut provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
         provider.config_dir = Some(PathBuf::from(PLUGIN_LOGIN));
 
-        let prepared = provider
-            .prepare(&fake.project(), (provider.environment)(None))
-            .unwrap();
+        let prepared =
+            smol::block_on(provider.prepare_async(&fake.project(), (provider.environment)(None)))
+                .unwrap();
         let given: Vec<&str> = prepared
             .env
             .iter()
@@ -1458,9 +1473,9 @@ mod on_the_fake {
                 .collect()
         });
 
-        let prepared = provider
-            .prepare(&fake.project(), (provider.environment)(None))
-            .unwrap();
+        let prepared =
+            smol::block_on(provider.prepare_async(&fake.project(), (provider.environment)(None)))
+                .unwrap();
         assert!(
             prepared.env.iter().all(|(name, _)| name != CONFIG_DIR_VAR),
             "{:?}",
@@ -1594,6 +1609,22 @@ mod on_the_fake {
         assert_eq!(fake.log("versions").lines().count(), 1);
 
         let _ = smol::block_on(provider.list(&cwd, ModelListing::Refresh));
+        assert_eq!(fake.log("versions").lines().count(), 2);
+    }
+
+    #[test]
+    fn a_listing_check_failure_invalidates_the_cached_version() {
+        let fake = Fake::new("text");
+        let home = tempdir().unwrap();
+        let provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
+        let list = || smol::block_on(provider.list(&fake.project(), ModelListing::Refresh));
+        list().unwrap();
+        let hook = fake.dir.path().join("policy_hook");
+        fs::write(&hook, "").unwrap();
+        let error = list().unwrap_err();
+        assert!(matches!(error, Error::Check(_)), "{error}");
+        fs::remove_file(hook).unwrap();
+        list().unwrap();
         assert_eq!(fake.log("versions").lines().count(), 2);
     }
 

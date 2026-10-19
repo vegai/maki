@@ -161,7 +161,7 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
         .map_or(asked, |offer| offer.model.as_str());
     let checked = started.elapsed();
     debug!(
-        version = %profile.version,
+        version = %profile,
         checks_ms = millis(checked),
         "claude-code: checks passed"
     );
@@ -179,7 +179,7 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
         turn: Turn::new(
             &catalog,
             InitExpect {
-                profile: &profile,
+                version: &profile,
                 model: runs,
                 cwd: launch.project,
                 server: SERVER,
@@ -203,7 +203,7 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
     let usage = &response.usage;
     info!(
         model = req.model,
-        version = %profile.version,
+        version = %profile,
         checks_ms = millis(checked),
         startup_ms = millis(prompted.duration_since(ran)),
         generation_ms = millis(prompted.elapsed()),
@@ -231,9 +231,10 @@ async fn request_files(
     } } });
     let temp_dir = launch.temp_dir.to_owned();
     let project = launch.project.to_owned();
+    let denied = launch.denied.clone();
     let prompt = system_prompt(system);
     smol::unblock(move || {
-        let (dir, path) = private_dir(&temp_dir, &project)?;
+        let (dir, path) = private_dir(&temp_dir, &project, &denied)?;
         private_file(&path.join(PROMPT_FILE), &prompt)
             .and_then(|()| private_file(&path.join(MCP_FILE), &mcp_config.to_string()))
             .map_err(|source| Error::Io {
@@ -649,6 +650,7 @@ mod tests {
                 executable: Path::new(SLEEP),
                 env: &[],
                 project: root,
+                denied: Vec::new(),
                 temp_dir: root,
                 limits: &limits,
             },
@@ -1095,7 +1097,7 @@ mod tests {
         let tools = catalog.exposed();
         let profile = profile("2.1.284", "linux").unwrap();
         let expect = InitExpect {
-            profile: &profile,
+            version: &profile,
             model: ALIAS,
             cwd: Path::new(ANY_CWD),
             server: SERVER,
@@ -1192,8 +1194,8 @@ mod tests {
         off: &str,
     ) {
         let fake = Fake::new("text");
-        smol::block_on(fake.send(
-            &format!("find {MARKER}"),
+        smol::block_on(fake.send_messages(
+            &[Message::user(format!("find {MARKER}"))],
             ALIAS,
             thinking,
             limits(STARTUP, IDLE, HANDOFF, EXIT_LIMIT),
@@ -1339,6 +1341,7 @@ mod tests {
                 executable: &fake.executable(),
                 env: &Fake::env(),
                 project: &fake.project(),
+                denied: Vec::new(),
                 temp_dir: &env::temp_dir(),
                 limits: &Limits::new(IDLE),
             },
@@ -1367,6 +1370,7 @@ mod tests {
                 executable: &fake.executable(),
                 env: &Fake::env(),
                 project: &fake.project(),
+                denied: Vec::new(),
                 temp_dir: &env::temp_dir(),
                 limits: &Limits::new(IDLE),
             },

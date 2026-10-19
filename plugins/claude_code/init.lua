@@ -1,3 +1,4 @@
+local native = require("maki.claude_code.internal")
 -- Send the task only after the probe and worker pass the handshake.
 --
 -- Managed hooks can run at startup. Run the probe in an empty directory so a rejected hook
@@ -48,9 +49,9 @@ local import_description = [[Apply a claude_code artifact's changes to the check
 If a target changed since the snapshot, the import stops before any checkout change. A later conflict can stop import partway. The error lists applied changes. A retry preserves earlier backups and applies changes that remain safe. Use `paths` to select files.]]
 
 local opts = maki.api.register_options(output_limits.extend({
-  executable = { default = "claude", desc = "The Claude Code executable." },
+  executable = { default = native.default_executable, desc = "The Claude Code executable." },
   config_dir = {
-    default = "",
+    default = native.default_config_dir,
     desc = "Absolute path of a Claude Code config directory for maki, in place of "
       .. "`$CLAUDE_CONFIG_DIR` or `~/.claude`. Use it to give maki a different Claude login.",
   },
@@ -61,8 +62,8 @@ local opts = maki.api.register_options(output_limits.extend({
     desc = "The maximum number of claude_code tool calls running at the same time.",
   },
   provider_max_concurrent = {
-    default = 8,
-    min = 1,
+    default = native.default_provider_max_concurrent,
+    min = native.min_provider_max_concurrent,
     desc = "The maximum number of concurrent claude-code provider generations, including subagents. "
       .. "Independent of max_concurrent. Model listing also takes one slot. Queued generations show a waiting status. Changes to this limit apply to new requests. Active and already queued requests keep their previous limit.",
   },
@@ -118,11 +119,7 @@ if opts.timeout_secs > launch.MAX_TIMEOUT_SECS then
   error("the maximum value of the `timeout_secs` option is " .. launch.MAX_TIMEOUT_SECS)
 end
 
-local valid_model = {}
-for _, model in ipairs(MODELS) do
-  valid_model[model] = true
-end
-if not valid_model[opts.model] then
+if not launch.MODEL_SET[opts.model] then
   error("the `model` option must be one of " .. table.concat(MODELS, ", ") .. ", not " .. tostring(opts.model))
 end
 if opts.config_dir ~= "" and opts.config_dir:sub(1, 1) ~= "/" then
@@ -277,8 +274,8 @@ local function change_report(call, artifact, project)
   return table.concat(lines, "\n")
 end
 
-local function open_artifact(call, spec)
-  local root, root_err = snapshot.resolve_root(spec.plan.root, spec)
+local function open_artifact(call, spec, root)
+  local root, root_err = snapshot.resolve_root(root, spec)
   if not root then
     return nil, "maki cannot make a coding artifact: " .. root_err
   end
@@ -301,7 +298,7 @@ local function run(input, ctx, call, timeout_secs)
       return refuse(plan_err)
     end
   end
-  local spec, spec_err = launch.preflight(input, ctx, call, opts, plan)
+  local spec, spec_err = launch.preflight(input, ctx, call, opts)
   if not spec then
     return refuse(spec_err)
   end
@@ -310,9 +307,9 @@ local function run(input, ctx, call, timeout_secs)
   -- first.
   local artifact, confine
   local env = spec.env
-  if spec.plan then
+  if plan then
     local artifact_err
-    artifact, artifact_err = open_artifact(call, spec)
+    artifact, artifact_err = open_artifact(call, spec, plan.root)
     if not artifact then
       return refuse(artifact_err)
     end
@@ -328,11 +325,11 @@ local function run(input, ctx, call, timeout_secs)
   local argv = launch.argv({
     executable = spec.executable,
     model = spec.model,
-    deny_read = opts.deny_read,
+    deny_read = spec.deny,
     worker = spec.worker,
     confine = confine,
   })
-  local probe_problem = launch.probe(call, spec, argv, env, confine, opts.deny_read)
+  local probe_problem = launch.probe(call, spec, argv, env, confine, spec.deny)
   if probe_problem then
     return refuse(probe_problem)
   end
@@ -343,7 +340,7 @@ local function run(input, ctx, call, timeout_secs)
     return claude:build(claude:start(argv, spec.cwd, env, input.prompt))
   end
   claude.artifact = artifact
-  local fill_err = fill_snapshot(call, claude.view, spec.plan, artifact, spec.cwd, env)
+  local fill_err = fill_snapshot(call, claude.view, plan, artifact, spec.cwd, env)
   if fill_err then
     return refuse(fill_err)
   end
