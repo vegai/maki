@@ -1106,7 +1106,7 @@ mod tests {
     #[test_case(JobEvent::Stderr(CALLBACK_LINE.into()), 3 ; "stderr")]
     #[test_case(JobEvent::Exit(0, false), 4 ; "normal_exit")]
     #[test_case(JobEvent::Exit(1, true), 4 ; "timeout_exit")]
-    fn output_callbacks_keep_three_arguments(event: JobEvent, count: usize) {
+    fn job_callbacks_keep_their_argument_counts(event: JobEvent, count: usize) {
         let lua = Lua::new();
         let callback = lua
             .load("return function(...) args = table.pack(...) end")

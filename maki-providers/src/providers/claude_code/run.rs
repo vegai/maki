@@ -8,7 +8,7 @@ pub(crate) use self::launch::{Launch, models};
 use self::launch::{MCP_CONFIG_FLAG, base_args, checked_profile, command, probe};
 pub use self::launch::{VersionCheck, invalidate_profile};
 pub(super) use self::private_files::private_dir;
-use self::private_files::private_file;
+use self::private_files::{PrivateDir, private_file};
 pub(super) use self::supervision::within;
 use self::supervision::{
     Group, Next, SHUTDOWN_GRACE, next, send, send_handshake, stdout_lines, supervised, unreadable,
@@ -30,7 +30,7 @@ use serde_json::{Value, json};
 use std::env;
 use std::ffi::OsString;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -138,45 +138,21 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
         Some(_) => format!("{asked}{LONG_CONTEXT_NAME}"),
         None => asked.to_owned(),
     };
-    let setup = async {
-        let (handoff_tx, handoffs) = flume::unbounded();
-        let server = mcp::serve(token()?, tools, handoff_tx, MCP_READ)
-            .await
-            .map_err(|source| Error::Io {
-                what: "start the handoff server",
-                source,
-            })?;
-        let mcp_config = json!({ "mcpServers": { SERVER: {
-        "type": "http",
-        "url": server.url(),
-        "headers": { "Authorization": server.authorization() },
-        "timeout": HELD_CALL_TIMEOUT_MS,
-    } } });
-        let temp_dir = launch.temp_dir.to_owned();
-        let project = launch.project.to_owned();
-        let prompt = system_prompt(req.exchange.system);
-        let (dir, prompt_file, mcp_file) = smol::unblock(move || {
-            let (dir, dir_path) = private_dir(&temp_dir, &project)?;
-            let prompt_file = dir_path.join(PROMPT_FILE);
-            let mcp_file = dir_path.join(MCP_FILE);
-            private_file(&prompt_file, &prompt)
-                .and_then(|()| private_file(&mcp_file, &mcp_config.to_string()))
-                .map_err(|source| Error::Io {
-                    what: "write the request files",
-                    source,
-                })?;
-            Ok::<_, Error>((dir, prompt_file, mcp_file))
-        })
-        .await?;
-        Ok::<_, Error>((dir, prompt_file, mcp_file, server, handoffs))
-    };
+    let (handoff_tx, handoffs) = flume::unbounded();
+    let server = mcp::serve(token()?, tools, handoff_tx, MCP_READ)
+        .await
+        .map_err(|source| Error::Io {
+            what: "start the handoff server",
+            source,
+        })?;
     let checks = async {
         let profile = checked_profile(launch).await?;
         let offered = probe(launch, req.plan_usage).await?;
         Ok::<_, Error>((profile, offered))
     };
-    let ((profile, offered), (dir, prompt_file, mcp_file, server, handoffs)) =
-        futures::future::try_join(checks, setup).await?;
+    let ((profile, offered), (dir, dir_path)) =
+        futures::future::try_join(checks, request_files(launch, req.exchange.system, &server))
+            .await?;
     // An alias such as `sonnet` runs whatever model the account answer maps
     // it to.
     let runs = offered
@@ -192,7 +168,12 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
     // Keep the server outside the request future so process cleanup finishes first. Held
     // calls must retain their connection until Claude Code stops.
     let mut server = Some(server);
-    let (args, env) = run_args(&req, &model_arg, &mcp_file, &prompt_file);
+    let (args, env) = run_args(
+        &req,
+        &model_arg,
+        &dir_path.join(MCP_FILE),
+        &dir_path.join(PROMPT_FILE),
+    );
     let tools = catalog.exposed();
     let run = Run {
         turn: Turn::new(
@@ -235,6 +216,33 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
         "claude-code: request done"
     );
     Ok(response)
+}
+
+async fn request_files(
+    launch: &Launch<'_>,
+    system: &str,
+    server: &mcp::Server,
+) -> Result<(PrivateDir, PathBuf), Error> {
+    let mcp_config = json!({ "mcpServers": { SERVER: {
+        "type": "http",
+        "url": server.url(),
+        "headers": { "Authorization": server.authorization() },
+        "timeout": HELD_CALL_TIMEOUT_MS,
+    } } });
+    let temp_dir = launch.temp_dir.to_owned();
+    let project = launch.project.to_owned();
+    let prompt = system_prompt(system);
+    smol::unblock(move || {
+        let (dir, path) = private_dir(&temp_dir, &project)?;
+        private_file(&path.join(PROMPT_FILE), &prompt)
+            .and_then(|()| private_file(&path.join(MCP_FILE), &mcp_config.to_string()))
+            .map_err(|source| Error::Io {
+                what: "write the request files",
+                source,
+            })?;
+        Ok((dir, path))
+    })
+    .await
 }
 
 fn failed(error: Error, accepted: bool, trace: &str) -> Error {

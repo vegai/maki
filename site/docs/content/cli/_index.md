@@ -66,6 +66,8 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--permission-mode <MODE>` | SDK: `default`, `acceptEdits`, `plan`, or `bypassPermissions` |
 | `--include-partial-messages` | Stream partial deltas in SDK mode |
 
+Thinking flags applied when resuming a TUI session are saved in that session. A later resume without a flag keeps the level. The global `/thinking` default is unchanged.
+
 ### Tool name lists
 
 `--allowed-tools` / `--disallowed-tools` accept built-in, plugin and MCP tool names. PascalCase becomes snake_case (`CodeExecution` becomes `code_execution`). Names with underscores, dots or hyphens keep their spelling and case. Use the exact name for plugin sub-tools, such as `multiedit` or `edit_lines`.

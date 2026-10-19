@@ -36,8 +36,8 @@ pub(super) fn shown(value: &Value) -> String {
 
 #[derive(Debug, Error)]
 pub(crate) enum Error {
-    #[error("maki cannot process Claude Code JSON: {0}")]
-    Json(#[from] serde_json::Error),
+    #[error("maki cannot serialize Claude Code JSON: {0}")]
+    Encode(#[source] serde_json::Error),
     #[error("the serialized Claude Code conversation is not UTF-8: {0}")]
     ConversationUtf8(#[from] FromUtf8Error),
     #[error(transparent)]

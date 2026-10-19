@@ -38,6 +38,7 @@ use super::{
 
 const LARGE_IMPORT_CHANGES: usize = 1024;
 const IMPORT_TOO_LARGE: &str = "Use `paths` to import smaller groups";
+const AMBIGUOUS_IMPORT_PATH: &str = "matches more than one change";
 
 const CANNOT_LOCK_ARTIFACT: &str = "cannot lock artifact";
 const PREPARE_TIMEOUT_SECS: u64 = 1;
@@ -1504,7 +1505,7 @@ fn an_import_refuses_a_link_swapped_in_during_approval(swapped: &str) {
 #[test_case(true ; "partial_resolution_failure")]
 fn an_unsafe_link_prepare_makes_is_dropped(fail_batch: bool) {
     let coding = Coding::new();
-    if fail_batch {
+    let _path = fail_batch.then(|| {
         let realpath = on_path("realpath");
         executable(
             coding.fake.dir.path(),
@@ -1514,14 +1515,8 @@ fn an_unsafe_link_prepare_makes_is_dropped(fail_batch: bool) {
                 realpath.display()
             ),
         );
-        let path = env::join_paths(
-            [coding.fake.dir.path().to_owned()]
-                .into_iter()
-                .chain(env::split_paths(&env::var_os("PATH").unwrap())),
-        )
-        .unwrap();
-        environment::set("PATH", path);
-    }
+        environment::EnvVar::prepend_path(coding.fake.dir.path())
+    });
     let prepare = format!("ln -s {OUTSIDE_TARGET} {PREPARED_LINK}");
     let (reg, _host) = coding.host(&[("prepare", json!(prepare))]);
     let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
@@ -1562,13 +1557,7 @@ fn escaping_links_are_checked_in_batches() {
             realpath.display()
         ),
     );
-    let path = env::join_paths(
-        [tools.path().to_owned()]
-            .into_iter()
-            .chain(env::split_paths(&env::var_os("PATH").unwrap())),
-    )
-    .unwrap();
-    environment::set("PATH", path);
+    let _path = environment::EnvVar::prepend_path(tools.path());
     let prepare = format!(
         "i=0; while [ \"$i\" -lt {LINK_COUNT} ]; do ln -s lib.rs src/link_$i; i=$((i + 1)); done; ln -s {OUTSIDE_TARGET} {PREPARED_LINK}"
     );
@@ -1590,19 +1579,17 @@ fn escaping_links_are_checked_in_batches() {
 }
 
 #[test]
-fn displayed_paths_select_the_intended_change_when_escapes_overlap() {
+fn ambiguous_import_paths_are_refused_and_unique_display_names_still_work() {
     const NEWLINE_PATH: &str = "src/a\nb";
     const BACKSLASH_PATH: &str = "src/a\\012b";
     const DISPLAYED_NEWLINE: &str = "src/a\\012b";
     const DISPLAYED_BACKSLASH: &str = "src/a\\\\012b";
     let (coding, reg, _host, id) = Coding::coded("code_ambiguous");
-    coding
+    let error = coding
         .import(&reg, json!({ "id": id, "paths": [DISPLAYED_NEWLINE] }))
-        .unwrap();
-    assert_eq!(
-        fs::read_to_string(coding.project().join(NEWLINE_PATH)).unwrap(),
-        "newline\n"
-    );
+        .unwrap_err();
+    assert!(error.contains(AMBIGUOUS_IMPORT_PATH), "{error}");
+    assert!(!coding.project().join(NEWLINE_PATH).exists());
     assert!(!coding.project().join(BACKSLASH_PATH).exists());
     coding
         .import(&reg, json!({ "id": id, "paths": [DISPLAYED_BACKSLASH] }))
@@ -1610,6 +1597,12 @@ fn displayed_paths_select_the_intended_change_when_escapes_overlap() {
     assert_eq!(
         fs::read_to_string(coding.project().join(BACKSLASH_PATH)).unwrap(),
         "backslash\n"
+    );
+    assert!(!coding.project().join(NEWLINE_PATH).exists());
+    coding.import(&reg, json!({ "id": id })).unwrap();
+    assert_eq!(
+        fs::read_to_string(coding.project().join(NEWLINE_PATH)).unwrap(),
+        "newline\n"
     );
 }
 

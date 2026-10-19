@@ -674,6 +674,8 @@ impl Model {
         self.thinking_override == Some(ThinkingSupport::Required)
     }
 
+    /// Vision support, most specific first: per-model override, discovery,
+    /// [`ModelSources`], the family default.
     pub fn supports_vision(&self) -> bool {
         if let Some(vision) = self.supports_vision_override {
             return vision;

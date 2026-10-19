@@ -84,7 +84,7 @@ claude_code = { enabled = true, config_dir = "/home/me/.claude-maki" },
 checkout --snapshot--> artifact --claude -p--> changes --claude_code_import--> checkout
 ```
 
-1. maki snapshots the session directory, including uncommitted edits to tracked files. Use `include` to add untracked paths. The snapshot excludes `.env*`, `secrets`, `deny_read` paths, agent configuration, sparse-checkout omissions, submodules, untracked nested repositories and external links. The reply names skipped repositories. A secret under another name, such as a tracked `.npmrc`, must be added to `deny_read`.
+1. maki snapshots the session directory, including uncommitted edits to tracked files. Use `include` to add untracked paths. The snapshot excludes `.env*`, `secrets`, `deny_read` paths, agent configuration, sparse-checkout omissions, submodules, untracked nested repositories and external links. The reply names skipped repositories. A change during the copy stops the call. A secret under another name, such as a tracked `.npmrc`, must be added to `deny_read`.
 
 2. maki copies untracked `dependencies`, such as `node_modules`, then runs your `prepare` command. Recreate Python virtual environments in `prepare`. Untracked dependency files remain outside the import. Tracked dependency files remain editable and importable. Preparation changes become the worker baseline, even if the command fails or times out.
 
@@ -147,4 +147,5 @@ All options live under `plugins.claude_code` in [configuration](/docs/configurat
 - When Anthropic's safety classifier stops a provider reply, the turn stops with its explanation. maki does not retry it.
 - In a plugin call Claude uses Claude Code's own tools, so maki's [token economy](/docs/token-economy/) does not apply. Each call starts a fresh `claude`. The prompt must contain all data necessary for the task.
 - A coding worker's shell has no network access. Fetch what it needs in `prepare`, which runs as you, outside the sandbox.
+- The coding sandbox denies shell histories, browser profiles, `~/.ssh`, Git configuration, keyrings, `$SSH_AUTH_SOCK` and `$XDG_RUNTIME_DIR`. Copies of `~/.claude.json*` created during a shell command remain unprotected until the next command. Coding calls reject `enableWeakerNestedSandbox` when enabled.
 - The changes exclude new files that match your `.gitignore`. The reply reports new ignored output by directory. Output already present after `prepare` is omitted from that note. Ignored output stays in the snapshot. Changes also exclude anything the worker writes to a path named `.claude` or `.maki`, including case variants.

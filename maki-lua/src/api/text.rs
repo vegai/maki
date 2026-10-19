@@ -26,9 +26,10 @@ thread_local! {
 
 /// Whether a code point has a visible, printable representation.
 /// @param code integer Unicode code point.
+/// @param previous integer? Preceding code point. Variation selectors require a non-ASCII predecessor.
 /// @return (boolean) True for a visible character.
 #[lua_fn]
-fn is_printable(_lua: &Lua, code: u32) -> LuaResult<bool> {
+fn is_printable(_lua: &Lua, code: u32, previous: Option<u32>) -> LuaResult<bool> {
     Ok(char::from_u32(code).is_some_and(|character| {
         if character.is_ascii() {
             !character.is_control()
@@ -36,6 +37,9 @@ fn is_printable(_lua: &Lua, code: u32) -> LuaResult<bool> {
             VARIATION_SELECTORS
                 .iter()
                 .any(|range| range.contains(&code))
+                && previous
+                    .and_then(char::from_u32)
+                    .is_some_and(|base| !base.is_ascii())
                 || format!("a{character}").escape_debug().count() == 2
         }
     }))
@@ -257,9 +261,19 @@ mod tests {
     #[test_case('\u{80}', false ; "control")]
     fn printability_preserves_combining_characters(character: char, expected: bool) {
         assert_eq!(
-            is_printable(&Lua::new(), u32::from(character)).unwrap(),
+            is_printable(&Lua::new(), u32::from(character), Some(u32::from('字'))).unwrap(),
             expected
         );
+    }
+
+    #[test_case(0x180b ; "mongolian")]
+    #[test_case(0x180f ; "fourth_mongolian")]
+    #[test_case(0xfe0f ; "emoji")]
+    #[test_case(0xe0100 ; "supplemental")]
+    fn variation_selectors_need_a_non_ascii_predecessor(code: u32) {
+        for previous in [None, Some(u32::from('n'))] {
+            assert!(!is_printable(&Lua::new(), code, previous).unwrap());
+        }
     }
 
     fn best(needle: &str) -> Option<&'static str> {

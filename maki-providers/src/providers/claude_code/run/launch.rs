@@ -303,8 +303,8 @@ async fn windows(launch: &Launch<'_>, models: &[String]) -> Result<Vec<Option<u3
 }
 
 /// Sends `request` and waits for its answer. Requests go one at a time,
-/// because Claude Code can answer a later request first. Other events pass
-/// discovery protocol checks before the wait continues.
+/// because Claude Code can answer a later request first. Other lines must
+/// parse as JSON before the wait continues.
 async fn ask(
     stdin: &mut Option<ChildStdin>,
     lines: &mut (impl Stream<Item = io::Result<String>> + Unpin),

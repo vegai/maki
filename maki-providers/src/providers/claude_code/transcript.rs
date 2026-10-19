@@ -97,8 +97,8 @@ impl Catalog {
             let Some(name) = tool["name"].as_str() else {
                 return Err(Error::NamelessTool(tool.clone()));
             };
-            let server = server_name(name);
-            let exposed = format!("{EXPOSED_PREFIX}{server}");
+            let exposed = exposed_name(name);
+            let server = exposed[EXPOSED_PREFIX.len()..].to_owned();
             if catalog.to_maki.insert(exposed, name.to_owned()).is_some() {
                 return Err(Error::SharedName(server));
             }
@@ -163,7 +163,7 @@ struct TranscriptEntry<'a> {
 
 fn push_line(out: &mut Vec<u8>, value: &impl Serialize) -> Result<(), Error> {
     out.push(b'\n');
-    serde_json::to_writer(out, value).map_err(Error::from)
+    serde_json::to_writer(out, value).map_err(Error::Encode)
 }
 
 fn expose_input(name: &str, input: &mut Value) {

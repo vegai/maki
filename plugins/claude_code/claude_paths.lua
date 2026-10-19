@@ -177,9 +177,9 @@ function M.escape_invisible(text, shell)
   if not utf8.len(text) then
     return text
   end
-  local parts, previous = {}, 1
+  local parts, previous, previous_code = {}, 1, nil
   for offset, code in utf8.codes(text) do
-    if not maki.text.is_printable(code) then
+    if not maki.text.is_printable(code, previous_code) then
       parts[#parts + 1] = text:sub(previous, offset - 1)
       local following = utf8.offset(text, 2, offset) or #text + 1
       if shell then
@@ -192,6 +192,7 @@ function M.escape_invisible(text, shell)
       end
       previous = following
     end
+    previous_code = code
   end
   parts[#parts + 1] = text:sub(previous)
   return table.concat(parts)

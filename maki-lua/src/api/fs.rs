@@ -142,17 +142,24 @@ async fn try_lock(_lua: Lua, path: String) -> LuaResult<Pair<FileLock>> {
     let lock_path = path.clone();
     let result = smol::unblock(move || {
         let mut options = File::options();
-        options.read(true).write(true).create(true).truncate(false);
+        options.read(true).write(true).create_new(true);
         #[cfg(unix)]
         options
             .mode(PRIVATE_FILE_MODE)
             .custom_flags(OFlags::NOFOLLOW.bits() as i32);
-        let file = options.open(lock_path)?;
-        FileLock::try_lock(file)
+        let (file, created) = match options.open(&lock_path) {
+            Ok(file) => (file, true),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                (options.create_new(false).open(lock_path)?, false)
+            }
+            Err(error) => return Err(error),
+        };
+        Ok((FileLock::try_lock(file)?, created))
     })
     .await;
-    touched(path, result.is_ok()).await;
-    Ok(pair(result))
+    let (lock, created) = try_pair!(result);
+    touched(path, created).await;
+    Ok((Some(lock), None))
 }
 
 pub(crate) fn expand_tilde(path: &str) -> PathBuf {
@@ -770,8 +777,7 @@ fn descend(mut base: PathBuf, component: &Component<'_>) -> PathBuf {
     base
 }
 
-/// Passes {result} through, telling the file index that {path} came or went
-/// when it says the call worked.
+/// Tells the file index that {path} came or went after a successful mutation.
 ///
 /// The write and edit tools are the reason the tree moves while maki runs,
 /// and the index is otherwise the tree as it was up to twenty seconds ago:
