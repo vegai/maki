@@ -192,7 +192,7 @@ function M.escape_invisible(text, shell)
       end
       previous = following
     end
-    previous_code = code
+    previous_code = maki.text.is_printable(code) and code or nil
   end
   parts[#parts + 1] = text:sub(previous)
   return table.concat(parts)
