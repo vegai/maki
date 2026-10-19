@@ -5130,23 +5130,6 @@ local hits = maki.text.fuzzy_list("mrs", names, { limit = 10 })
 
 ---
 
-### `maki.text.is_printable()` {#maki-text-is_printable}
-
-```lua
-maki.text.is_printable({code}, {previous?})
-```
-
-Whether a code point has a visible, printable representation.
-
-**Parameters:**
-
-- `{code}` (`integer`) Unicode code point.
-- `{previous?}` (`integer?`) Preceding code point. Variation selectors require a non-ASCII predecessor.
-
-**Returns:** (`boolean`) True for a visible character.
-
----
-
 ### `maki.text.html_to_markdown()` {#maki-text-html_to_markdown}
 
 ```lua

@@ -39,6 +39,7 @@ pub(crate) const HANDSHAKE: &[HandshakeStep] = &[
 const NO_PROXY: &str = "NO_PROXY";
 const LOOPBACK: &str = "127.0.0.1";
 const ESSENTIAL_TRAFFIC_ONLY: (&str, &str) = ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+pub(super) const PROXY_ENV: &[&str] = &["HTTP_PROXY", "HTTPS_PROXY"];
 const PASSED_ENV: &[&str] = &[
     "PATH",
     "HOME",
@@ -49,8 +50,8 @@ const PASSED_ENV: &[&str] = &[
     "TERM",
     "TMPDIR",
     "TZ",
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
+    PROXY_ENV[0],
+    PROXY_ENV[1],
     NO_PROXY,
     "NODE_EXTRA_CA_CERTS",
     "SSL_CERT_FILE",
@@ -171,11 +172,6 @@ pub(crate) struct HandshakeStep {
     pub subtype: &'static str,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct Profile {
-    pub version: String,
-}
-
 fn version_parts(version: &str) -> Option<[u64; 3]> {
     let mut parts = version.split('.').map(|part| {
         part.bytes()
@@ -198,7 +194,7 @@ pub(super) fn require_system(os: &str) -> Result<(), Error> {
 }
 
 /// A first word that is not `major.minor.patch` stops the request.
-pub(crate) fn profile(output: &str, os: &str) -> Result<Profile, Error> {
+pub(crate) fn profile(output: &str, os: &str) -> Result<String, Error> {
     let version = output.split_whitespace().next().unwrap_or_default();
     let parts = version_parts(version).ok_or_else(|| Error::UnknownVersion(output.to_owned()))?;
     let minimum = MINIMUM_VERSION;
@@ -209,9 +205,7 @@ pub(crate) fn profile(output: &str, os: &str) -> Result<Profile, Error> {
         });
     }
     require_system(os)?;
-    Ok(Profile {
-        version: version.to_owned(),
-    })
+    Ok(version.to_owned())
 }
 
 fn passed(name: &str) -> bool {
@@ -580,7 +574,7 @@ pub(super) fn policy_problem_in(
 }
 
 pub(crate) struct InitExpect<'a> {
-    pub profile: &'a Profile,
+    pub version: &'a str,
     /// The model, or a dated snapshot of it.
     pub model: &'a str,
     pub cwd: &'a Path,
@@ -612,7 +606,7 @@ pub(super) fn plugins_problem(plugins: &Value) -> Option<Problem> {
 pub(crate) fn init_problem(event: &Value, expect: &InitExpect<'_>) -> Option<Problem> {
     init_problem_in(
         event,
-        &expect.profile.version,
+        expect.version,
         expect.cwd,
         expect.tools,
         &[DEFAULT_MODE.to_owned()],
@@ -689,15 +683,15 @@ mod tests {
     use test_case::test_case;
 
     use super::super::error::{Error, Problem};
-    use super::super::stream::{ACCOUNT_ANSWER, HOOKS_ANSWER, SETTINGS_ANSWER};
     #[cfg(unix)]
     use super::NOT_A_FILE;
     use super::{
-        COMMONDIR_FILE, CONNECTED, DEFAULT_MODE, ESSENTIAL_TRAFFIC_ONLY, FLAG_SOURCE, GIT_ENTRY,
-        HANDSHAKE, InitExpect, MAX_GIT_PATH_BYTES, MAX_SETTINGS_BYTES, NO_KEY_SOURCE,
-        NOT_AN_OBJECT, POLICY_SOURCE, SETTINGS_TOO_LARGE, UNREADABLE_FILE, account_problem,
-        config_dir, file_conflicts, init_problem, launch_env, local_settings_dirs, plugins_problem,
-        policy_problem, profile, settings_conflicts,
+        ACCOUNT_ANSWER, COMMONDIR_FILE, CONNECTED, DEFAULT_MODE, ESSENTIAL_TRAFFIC_ONLY,
+        FLAG_SOURCE, GIT_ENTRY, HANDSHAKE, HOOKS_ANSWER, InitExpect, MAX_GIT_PATH_BYTES,
+        MAX_SETTINGS_BYTES, NO_KEY_SOURCE, NOT_AN_OBJECT, POLICY_SOURCE, SETTINGS_ANSWER,
+        SETTINGS_TOO_LARGE, UNREADABLE_FILE, account_problem, config_dir, file_conflicts,
+        init_problem, launch_env, local_settings_dirs, plugins_problem, policy_problem, profile,
+        settings_conflicts,
     };
 
     const VERSION: &str = "2.1.284";
@@ -814,7 +808,7 @@ mod tests {
     #[test_case("2.1.284", "darwin" => matches Err(Error::UnsupportedSystem { .. }) ; "unsupported_macos")]
     #[test_case("2.1.284", "Windows_NT" => matches Err(Error::UnsupportedSystem { .. }) ; "unsupported_windows")]
     fn versions_meet_the_launch_requirements(output: &str, system: &str) -> Result<String, Error> {
-        profile(output, system).map(|profile| profile.version)
+        profile(output, system)
     }
 
     #[test_case("PATH" => (true, false) ; "passed_path")]
@@ -1107,7 +1101,7 @@ mod tests {
         let profile = profile(VERSION, LINUX).unwrap();
         let tools: HashSet<String> = [TOOL.to_owned(), OTHER_TOOL.to_owned()].into();
         let expect = InitExpect {
-            profile: &profile,
+            version: &profile,
             model: MODEL,
             cwd: Path::new(CWD),
             server: SERVER,

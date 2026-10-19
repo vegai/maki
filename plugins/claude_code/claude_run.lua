@@ -71,7 +71,7 @@ function Run.new(ctx, call, spec, confine, timeout_secs, opts)
     spec = spec,
     timeout_secs = timeout_secs,
     route = CHECKING:format(spec.cli.version),
-    handshake = launch.worker_handshake(opts.deny_read, spec.worker, confine),
+    handshake = launch.worker_handshake(spec.deny, spec.worker, confine),
     stderr_tail = {},
     has_progress = false,
     -- Claude Code sends init after it reads the prompt. An earlier init means it bypassed the

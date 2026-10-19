@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Error as IoError, ErrorKind};
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 use maki_lua_macro::{lua_fn, lua_table};
@@ -10,7 +11,8 @@ use maki_providers::claude_code::validation::{
 #[cfg(unix)]
 use maki_providers::claude_code::{blobs, snapshot};
 use mlua::{
-    Lua, LuaSerdeExt, Result as LuaResult, Table, UserData, UserDataMethods, Value as LuaValue,
+    Lua, LuaSerdeExt, LuaString, Result as LuaResult, Table, UserData, UserDataMethods,
+    Value as LuaValue,
 };
 use serde_json::Value;
 
@@ -23,6 +25,13 @@ pub(crate) const MODULE: &str = "maki.claude_code.internal";
 #[cfg(test)]
 pub(crate) const PLUGIN: &str = "claude_code";
 const HOME_STATE_PREFIX: &str = ".claude.json";
+const BMP_LIMIT: u32 = 0xffff;
+const VARIATION_SELECTORS: &[RangeInclusive<u32>] = &[
+    0x180b..=0x180d,
+    0x180f..=0x180f,
+    0xfe00..=0xfe0f,
+    0xe0100..=0xe01ef,
+];
 
 pub(crate) fn create_private_module(
     lua: &Lua,
@@ -31,7 +40,70 @@ pub(crate) fn create_private_module(
     let table = create_claude_code_table(lua, perms)?;
     table.set("lock_busy", LOCK_BUSY)?;
     table.set("startup_timeout_secs", validation::STARTUP_TIMEOUT_SECS)?;
+    table.set("default_executable", validation::DEFAULT_EXECUTABLE)?;
+    table.set("default_config_dir", validation::DEFAULT_CONFIG_DIR)?;
+    table.set(
+        "default_provider_max_concurrent",
+        validation::DEFAULT_MAX_CONCURRENT,
+    )?;
+    table.set(
+        "min_provider_max_concurrent",
+        validation::MIN_MAX_CONCURRENT,
+    )?;
     Ok((MODULE, table))
+}
+
+fn is_printable(character: char, previous: Option<char>) -> bool {
+    if character.is_ascii() {
+        !character.is_control()
+    } else {
+        VARIATION_SELECTORS
+            .iter()
+            .any(|range| range.contains(&u32::from(character)))
+            && previous.is_some_and(|base| !base.is_ascii())
+            || format!("a{character}").escape_debug().count() == 2
+    }
+}
+
+/// Escape invisible path characters while preserving visible Unicode sequences.
+/// @param text string Path or shell-quoted path.
+/// @param shell boolean? Emit byte escapes for a Bash command.
+/// @return (string) Escaped text, or unchanged invalid UTF-8 bytes.
+#[lua_fn]
+fn escape_invisible(lua: &Lua, text: LuaString, shell: Option<bool>) -> LuaResult<LuaString> {
+    let Ok(value) = text.to_str() else {
+        return Ok(text);
+    };
+    let mut escaped = String::with_capacity(value.len());
+    let mut previous = None;
+    for character in value.chars() {
+        if is_printable(character, previous) {
+            escaped.push(character);
+        } else if shell == Some(true) {
+            escaped.push_str("'$'");
+            for byte in character.encode_utf8(&mut [0; 4]).bytes() {
+                escaped.push_str(&format!("\\{byte:03o}"));
+            }
+            escaped.push_str("''");
+        } else {
+            let code = u32::from(character);
+            escaped.push_str(&if code <= BMP_LIMIT {
+                format!("\\u{code:04x}")
+            } else {
+                format!("\\U{code:08x}")
+            });
+        }
+        previous = is_printable(character, None).then_some(character);
+    }
+    lua.create_string(escaped)
+}
+
+/// Report credentials that a coding worker could read from its shell environment.
+/// @param env table Child environment.
+/// @return (string?) Reason to refuse the coding call.
+#[lua_fn]
+fn shell_secret_problem(_lua: &Lua, env: HashMap<String, String>) -> LuaResult<Option<String>> {
+    Ok(validation::shell_secret_problem(&env))
 }
 
 /// Resolve the checkout's Git directory for the shared import lock.
@@ -174,7 +246,7 @@ async fn prepare_launch(
     cwd: String,
 ) -> LuaResult<Pair<Table>> {
     let prepared = try_pair!(
-        smol::unblock(move || validation::prepared_launch(environ, configured, Path::new(&cwd)))
+        smol::unblock(move || validation::worker_launch(environ, configured, Path::new(&cwd)))
             .await
     );
     let result = lua.create_table()?;
@@ -380,7 +452,7 @@ lua_table! {
     /// Private helpers for the bundled Claude Code plugin. JSON inputs retain
     /// the distinction between null, objects and arrays.
     "maki.claude_code.internal" => pub(crate) fn create_claude_code_table(perms: &PluginPermissions), DOCS [
-        handshake, worker_handshake, base_args, worker_settings, empty_mcp_config, prepare_launch(perms), private_dir(perms), home_state_files(perms),
+        shell_secret_problem, escape_invisible, handshake, worker_handshake, base_args, worker_settings, empty_mcp_config, prepare_launch(perms), private_dir(perms), home_state_files(perms),
         init_problem,
         classify, version_check(perms), invalidate_version, sanitize_git(perms), project_git_dir(perms), unpack_blobs(perms),
     ]
@@ -396,13 +468,37 @@ mod tests {
     use tempfile::tempdir;
     use test_case::test_case;
 
-    use super::create_claude_code_table;
+    use super::{create_claude_code_table, is_printable};
     use crate::api::util::convert::json_to_lua;
     use crate::plugin_permissions::PluginPermissions;
     use maki_providers::claude_code::validation::GIT_ENTRY;
 
     const LINKED: &str = "linked";
     const NESTED: &str = "src";
+
+    #[test_case('é', true ; "accented_letter")]
+    #[test_case('\u{301}', true ; "combining_accent")]
+    #[test_case('\u{94d}', true ; "virama")]
+    #[test_case('\u{fe0f}', true ; "emoji_variation_selector")]
+    #[test_case('\u{e0100}', true ; "supplemental_variation_selector")]
+    #[test_case('\u{180b}', true ; "mongolian_variation_selector")]
+    #[test_case('\u{200b}', false ; "zero_width_space")]
+    #[test_case('\u{202e}', false ; "bidi_override")]
+    #[test_case('\u{2028}', false ; "line_separator")]
+    #[test_case('\u{80}', false ; "control")]
+    fn printability_preserves_combining_characters(character: char, expected: bool) {
+        assert_eq!(is_printable(character, Some('字')), expected);
+    }
+
+    #[test_case(0x180b ; "mongolian")]
+    #[test_case(0x180f ; "fourth_mongolian")]
+    #[test_case(0xfe0f ; "emoji")]
+    #[test_case(0xe0100 ; "supplemental")]
+    fn variation_selectors_need_a_non_ascii_predecessor(code: u32) {
+        for previous in [None, Some('n')] {
+            assert!(!is_printable(char::from_u32(code).unwrap(), previous));
+        }
+    }
 
     #[test]
     fn malformed_worker_json_returns_errors_without_throwing() {

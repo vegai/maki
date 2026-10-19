@@ -1,3 +1,4 @@
+local native = require("maki.claude_code.internal")
 local M = {}
 
 M.ABSOLUTE_PATH = " must be relative to the project"
@@ -173,30 +174,7 @@ function M.bash_quote(text)
   return M.escape_invisible(quoted, true)
 end
 
-function M.escape_invisible(text, shell)
-  if not utf8.len(text) then
-    return text
-  end
-  local parts, previous, previous_code = {}, 1, nil
-  for offset, code in utf8.codes(text) do
-    if not maki.text.is_printable(code, previous_code) then
-      parts[#parts + 1] = text:sub(previous, offset - 1)
-      local following = utf8.offset(text, 2, offset) or #text + 1
-      if shell then
-        local escaped = text:sub(offset, following - 1):gsub(".", function(byte)
-          return string.format("\\%03o", byte:byte())
-        end)
-        parts[#parts + 1] = "'$'" .. escaped .. "''"
-      else
-        parts[#parts + 1] = string.format(code <= 0xffff and "\\u%04x" or "\\U%08x", code)
-      end
-      previous = following
-    end
-    previous_code = maki.text.is_printable(code) and code or nil
-  end
-  parts[#parts + 1] = text:sub(previous)
-  return table.concat(parts)
-end
+M.escape_invisible = native.escape_invisible
 
 --- Terminal control bytes can execute commands. Escape them and non-UTF-8 path bytes before
 --- display.

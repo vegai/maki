@@ -71,15 +71,26 @@ pub(super) fn private_file(path: &Path, content: &str) -> io::Result<()> {
 pub(in crate::providers::claude_code) fn private_dir(
     base: &Path,
     project: &Path,
+    denied: &[PathBuf],
 ) -> Result<(PrivateDir, PathBuf), Error> {
+    let inside_checkout =
+        |path: &Path| path.starts_with(project) || denied.iter().any(|dir| path.starts_with(dir));
+    let base = base.canonicalize().map_err(|source| Error::Path {
+        what: "resolve the temporary directory",
+        path: base.to_owned(),
+        source,
+    })?;
+    if inside_checkout(&base) {
+        return Err(Error::TempInProject(base));
+    }
     #[cfg(target_os = "linux")]
-    sweep_once(base);
+    sweep_once(&base);
     let prefix = dir_prefix();
     let mut builder = tempfile::Builder::new();
     builder.prefix(&prefix);
     #[cfg(unix)]
     builder.permissions(Permissions::from_mode(PRIVATE_DIR_MODE));
-    let dir = builder.tempdir_in(base).map_err(|source| Error::Path {
+    let dir = builder.tempdir_in(&base).map_err(|source| Error::Path {
         what: "make a private directory in",
         path: base.to_owned(),
         source,
@@ -89,7 +100,7 @@ pub(in crate::providers::claude_code) fn private_dir(
         path: dir.path().to_owned(),
         source,
     })?;
-    if path.starts_with(project) {
+    if inside_checkout(&path) || project.starts_with(&path) {
         return Err(Error::TempInProject(path));
     }
     Ok((PrivateDir(Some(dir)), path))
@@ -98,10 +109,12 @@ pub(in crate::providers::claude_code) fn private_dir(
 pub(super) async fn private_dir_async(
     base: &Path,
     project: &Path,
+    denied: &[PathBuf],
 ) -> Result<(PrivateDir, PathBuf), Error> {
     let base = base.to_owned();
     let project = project.to_owned();
-    smol::unblock(move || private_dir(&base, &project)).await
+    let denied = denied.to_vec();
+    smol::unblock(move || private_dir(&base, &project, &denied)).await
 }
 
 /// Include the pid namespace in the directory name. A later maki process can then identify

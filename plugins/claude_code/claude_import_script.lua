@@ -42,7 +42,7 @@ declare -A temp_of=() temp_dirs=() temp_modes=() modes=()
 declare -a executable=() regular_files=()
 trap 'rm -rf -- "$stage" "${temp_dirs[@]}"' EXIT
 staged() {
-  [ -f "$stage/$1" ] && [ ! -L "$stage/$1" ] || { g cat-file blob "$1" > "$stage/$1" || gone "$1"; }
+  [ -f "$stage/$1" ] && [ ! -L "$stage/$1" ] || gone "$1"
 }
 fresh=$(printf '%o' $((0666 & ~0$(umask))))
 new() {
@@ -67,7 +67,7 @@ permissions() {
     for temp in "${!temp_modes[@]}"; do
       [ "${temp_modes[$temp]}" != "$mode" ] || files+=("$temp")
     done
-    printf '%s\0' "${files[@]}" | xargs -0 chmod "$mode" --
+    printf '%s\0' "${files[@]}" | xargs -0 chmod "$(printf '%o' $((0$mode & 0777)))" --
   done
   [ "${#executable[@]}" = 0 ] || printf '%s\0' "${executable[@]}" | xargs -0 chmod +x --
   [ "${#regular_files[@]}" = 0 ] || printf '%s\0' "${regular_files[@]}" | xargs -0 chmod a-x --
@@ -99,7 +99,7 @@ function M.receipt_path(artifact, stage)
   return artifact .. "/receipt." .. stage:match("[^/]+$")
 end
 
---- The command stages blobs, then validates the checkout before any write.
+--- Validates pre-staged blobs and the checkout before any write.
 --- Relative paths stay in {project} even if its name becomes a link.
 --- Hard links preserve writes through open descriptors. Renamed originals
 --- also preserve atomic editor saves that replace those inodes. New files

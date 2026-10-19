@@ -405,6 +405,18 @@ local function consistency_problem(call, artifact, spec)
   end
   local paths = git_utils.listed_paths(changed)
   if #paths > 0 then
+    for _, path in ipairs(paths) do
+      local parent = spec.cwd
+      for part in path:gmatch("([^/]+)/") do
+        parent = maki.fs.joinpath(parent, part)
+        local meta = maki.fs.metadata(parent, false)
+        if meta and meta.is_symlink then
+          return "the tracked folder "
+            .. path_utils.printable(parent)
+            .. " is a symlink. Restore a directory before retrying the snapshot."
+        end
+      end
+    end
     return "the checkout changed during the snapshot: "
       .. M.shown(paths)
       .. ". Try again after these edits are complete."

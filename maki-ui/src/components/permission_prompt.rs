@@ -297,35 +297,18 @@ impl PermissionPrompt {
                 }
             };
         }
-        match key.code {
-            KeyCode::Char('y') => Some(PermissionAnswer::AllowOnce),
-            KeyCode::Char('n') => {
-                *state = PromptState::DenyEditing;
-                self.scroll = ModalScroll::new();
-                None
-            }
-            KeyCode::Char('a') => {
-                *state = PromptState::ConfirmAllowAlwaysProject;
-                None
-            }
-            KeyCode::Char('A') => {
-                *state = PromptState::ConfirmAllowAlwaysGlobal;
-                None
-            }
-            KeyCode::Char('d') => {
-                *state = PromptState::ConfirmDenyAlwaysProject;
-                None
-            }
-            KeyCode::Char('D') => {
-                *state = PromptState::ConfirmDenyAlwaysGlobal;
-                None
-            }
-            KeyCode::Char('s') => {
-                *state = PromptState::ConfirmAllowSession;
-                None
-            }
-            _ => None,
-        }
+        self.state = match key.code {
+            KeyCode::Char('y') => return Some(PermissionAnswer::AllowOnce),
+            KeyCode::Char('n') => PromptState::DenyEditing,
+            KeyCode::Char('a') => PromptState::ConfirmAllowAlwaysProject,
+            KeyCode::Char('A') => PromptState::ConfirmAllowAlwaysGlobal,
+            KeyCode::Char('d') => PromptState::ConfirmDenyAlwaysProject,
+            KeyCode::Char('D') => PromptState::ConfirmDenyAlwaysGlobal,
+            KeyCode::Char('s') => PromptState::ConfirmAllowSession,
+            _ => return None,
+        };
+        self.scroll = ModalScroll::new();
+        None
     }
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
@@ -517,15 +500,17 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        CONFIRM_ALLOW_PROJECT_HINTS, CONFIRM_ALLOW_PROJECT_SESSION_HINTS,
-        CONFIRM_DENY_PROJECT_HINTS, CONFIRM_DENY_PROJECT_SESSION_HINTS, Overlay, PermissionPrompt,
-        PromptState, QUEUED_NOTICE, SCROLL_TITLE, UNTRUSTED_DURABLE_ANSWER, UNTRUSTED_NOTICE,
+        CONFIRM_ALLOW_ALL_HINTS, CONFIRM_ALLOW_PROJECT_HINTS, CONFIRM_ALLOW_PROJECT_SESSION_HINTS,
+        CONFIRM_DENY_ALL_HINTS, CONFIRM_DENY_PROJECT_HINTS, CONFIRM_DENY_PROJECT_SESSION_HINTS,
+        CONFIRM_SESSION_HINTS, Overlay, PermissionPrompt, PromptState, QUEUED_NOTICE, SCROLL_TITLE,
+        UNTRUSTED_DURABLE_ANSWER, UNTRUSTED_NOTICE,
     };
 
     const MAIN_ID: &str = "id";
     const SUB_ID: &str = "id-2";
     const SUB_AGENT: &str = "sub-2";
     const VIEW_HEIGHT: u16 = 12;
+    const VIEW_WIDTH: u16 = 80;
     const LONG_COMMAND_LINES: usize = 60;
     const LONG_COMMAND: &str = "echo long_command";
     const GUIDANCE: &str = "Read the script first";
@@ -709,7 +694,7 @@ mod tests {
                 None,
             );
         }
-        assert!(draw(&mut prompt, 80).contains(SCROLL_TITLE));
+        assert!(draw(&mut prompt, VIEW_WIDTH).contains(SCROLL_TITLE));
         prompt.handle_key(binding::SCROLL_BOTTOM.to_key_event());
         assert!(prompt.scroll.offset() > 0);
         if cancelled {
@@ -719,7 +704,7 @@ mod tests {
         }
         assert_eq!(prompt.queue.front().unwrap().id, MAIN_ID);
         assert_eq!(prompt.scroll.offset(), 0);
-        assert!(draw(&mut prompt, 80).contains(CLIPPED_CONTENT));
+        assert!(draw(&mut prompt, VIEW_WIDTH).contains(CLIPPED_CONTENT));
     }
 
     #[test]
@@ -733,12 +718,12 @@ mod tests {
             true,
             None,
         );
-        draw(&mut prompt, 80);
+        draw(&mut prompt, VIEW_WIDTH);
         prompt.handle_key(key(KeyCode::Char('n')));
-        assert!(draw(&mut prompt, 80).contains("guide"));
+        assert!(draw(&mut prompt, VIEW_WIDTH).contains("guide"));
         prompt.handle_paste(GUIDANCE);
         prompt.handle_key(key(KeyCode::PageUp));
-        assert!(draw(&mut prompt, 80).contains(CLIPPED_CONTENT));
+        assert!(draw(&mut prompt, VIEW_WIDTH).contains(CLIPPED_CONTENT));
         assert_eq!(prompt.state, PromptState::DenyEditing);
         assert_eq!(
             answer(&mut prompt, key(KeyCode::Enter)),
@@ -934,5 +919,25 @@ mod tests {
                 .then(|| text.trim_start()[WHY_LABEL.len()..].trim().to_owned())
         });
         assert_eq!(why_row.as_deref(), reason);
+    }
+    #[test_case('a', CONFIRM_ALLOW_PROJECT_HINTS[0].1 ; "allow_project")]
+    #[test_case('A', CONFIRM_ALLOW_ALL_HINTS[0].1 ; "allow_global")]
+    #[test_case('d', CONFIRM_DENY_PROJECT_HINTS[0].1 ; "deny_project")]
+    #[test_case('D', CONFIRM_DENY_ALL_HINTS[0].1 ; "deny_global")]
+    #[test_case('s', CONFIRM_SESSION_HINTS[0].1 ; "allow_session")]
+    fn a_long_prompt_shows_the_confirmation_before_accepting_an_answer(pressed: char, hint: &str) {
+        let mut prompt = PermissionPrompt::new();
+        prompt.push(
+            MAIN_ID.into(),
+            ToolKey::native("bash"),
+            vec![vec![LONG_COMMAND; LONG_COMMAND_LINES].join("\n")],
+            None,
+            true,
+            None,
+        );
+        draw(&mut prompt, VIEW_WIDTH);
+        assert_eq!(answer(&mut prompt, key(KeyCode::Char(pressed))), None);
+        let shown = draw(&mut prompt, VIEW_WIDTH);
+        assert!(shown.contains(hint), "confirmation is hidden: {shown}");
     }
 }
