@@ -3,7 +3,6 @@
 use std::io;
 use std::path::PathBuf;
 use std::process::ExitStatus;
-use std::string::FromUtf8Error;
 use std::time::Duration;
 
 use serde_json::{Value, error::Category};
@@ -38,8 +37,6 @@ pub(super) fn shown(value: &Value) -> String {
 pub(crate) enum Error {
     #[error("maki cannot serialize Claude Code JSON: {0}")]
     Encode(#[source] serde_json::Error),
-    #[error("the serialized Claude Code conversation is not UTF-8: {0}")]
-    ConversationUtf8(#[from] FromUtf8Error),
     #[error(transparent)]
     Check(#[from] Problem),
     #[error("Claude Code ran {ran:?} for {asked}, which organization policy can cause")]

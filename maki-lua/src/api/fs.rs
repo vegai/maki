@@ -88,18 +88,6 @@ async fn mkdtemp(_lua: Lua, template: String) -> LuaResult<Pair<String>> {
     Ok((Some(directory), None))
 }
 
-/// Remove an empty directory.
-/// @param path string Directory to remove.
-/// @return (boolean?, string?) True on success, or nil and the error.
-#[lua_fn(guard = FsWrite)]
-async fn rmdir(_lua: Lua, path: String) -> LuaResult<Pair<bool>> {
-    let path = try_pair!(make_absolute(&path));
-    let removed = path.clone();
-    let result = smol::unblock(move || fs::remove_dir(path)).await;
-    touched(removed, result.is_ok()).await;
-    Ok(pair(result.map(|()| true)))
-}
-
 /// Rename a file or directory.
 /// @param path string Existing path.
 /// @param new_path string Destination path.
@@ -139,7 +127,7 @@ impl UserData for FileLock {
 
 /// Try to hold an exclusive file lock. Closing or dropping the handle releases it.
 /// @param path string Lock file, created privately if absent. Symlinks are refused on Unix.
-/// @return (userdata?, string?) Lock with close(), or nil and the error if locking fails.
+/// @return (userdata?, string?) Lock with close(), nil and "lock is held" if busy, or nil and an I/O error.
 #[lua_fn(guard = FsWrite)]
 async fn try_lock(_lua: Lua, path: String) -> LuaResult<Pair<FileLock>> {
     let path = try_pair!(make_absolute(&path));
@@ -1371,7 +1359,7 @@ lua_table! {
     /// if err then return end
     /// ```
     "maki.fs" => pub(crate) fn create_fs_table(perms: &PluginPermissions, plugin: Arc<str>), DOCS [
-        read(perms), read_bytes(perms), metadata(perms), realpath(perms), mkdtemp(perms), rmdir(perms), rename(perms), dirname, basename,
+        read(perms), read_bytes(perms), metadata(perms), realpath(perms), mkdtemp(perms), rename(perms), dirname, basename,
         joinpath, normalize, abspath, parents, root(perms), relpath, ext,
         dir(perms), try_lock(perms), write(perms), append(perms), atomic_write(perms), rm(perms), mkdir(perms),
         glob(perms), grep(perms), fuzzy_files(perms, plugin),
@@ -3285,7 +3273,7 @@ mod tests {
     }
 
     #[test_case(false ; "mkdtemp")]
-    #[test_case(true ; "rmdir")]
+    #[test_case(true ; "rm")]
     fn directory_mutations_refresh_the_index(remove: bool) {
         let root = TempDir::new().unwrap();
         let path = root
@@ -3300,7 +3288,7 @@ mod tests {
 
         let lua = Lua::new();
         let operation: Function = fs_table(&lua)
-            .get(if remove { "rmdir" } else { "mkdtemp" })
+            .get(if remove { "rm" } else { "mkdtemp" })
             .unwrap();
         let (value, error): (Value, Option<String>) =
             smol::block_on(operation.call_async(path.to_str().unwrap())).unwrap();

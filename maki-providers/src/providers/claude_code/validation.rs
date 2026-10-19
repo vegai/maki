@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::{Path, PathBuf, absolute};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -219,10 +219,20 @@ pub(super) fn prepare_launch(
     let temp_dir = var(TMPDIR_ENV)
         .filter(|path| !path.is_empty())
         .map_or_else(default_temp_dir, PathBuf::from);
+    let temp_dir = absolute(&temp_dir).map_err(|source| Error::Path {
+        what: "resolve the temporary directory",
+        path: temp_dir,
+        source,
+    })?;
     let (mut env, withheld) = checks::launch_env(vars);
     env.retain(|(name, value)| {
         ![CONFIG_DIR_ENV, TMPDIR_ENV].contains(&name.as_str()) || !value.is_empty()
     });
+    for (name, value) in &mut env {
+        if name == TMPDIR_ENV {
+            *value = temp_dir.display().to_string();
+        }
+    }
     if configured.is_some() {
         env.retain(|(name, _)| name != CONFIG_DIR_ENV);
         env.push((CONFIG_DIR_ENV.to_owned(), config_dir.display().to_string()));
@@ -574,13 +584,40 @@ fn worker_problem(effective: &Value, expected: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{WorkerPaths, WorkerPolicy, sandbox_problem, worker_problem};
+    use super::{
+        TMPDIR_ENV, WorkerPaths, WorkerPolicy, prepare_launch, sandbox_problem, worker_problem,
+    };
     use serde_json::{Value, json};
+    use std::env;
+    use std::fs;
+    use tempfile::tempdir;
     use test_case::test_case;
 
     const READ_RULE: &str = "Read(./secrets)";
     const DENIED: &str = "/checkout";
     const OUTSIDE: &str = "/outside";
+    const RELATIVE_TEMP: &str = "relative-temp";
+
+    #[test]
+    fn a_relative_tmpdir_is_absolute_in_the_child_environment() {
+        let root = tempdir().unwrap();
+        let cwd = root.path().join("project");
+        fs::create_dir(&cwd).unwrap();
+        let prepared = prepare_launch(
+            vec![(TMPDIR_ENV.into(), RELATIVE_TEMP.into())],
+            Some(root.path().join("login")),
+            &cwd,
+        )
+        .unwrap();
+        let expected = env::current_dir().unwrap().join(RELATIVE_TEMP);
+        assert_eq!(prepared.temp_dir, expected);
+        let (_, given) = prepared
+            .env
+            .iter()
+            .find(|(name, _)| name == TMPDIR_ENV)
+            .unwrap();
+        assert_eq!(given, expected.to_str().unwrap());
+    }
 
     fn expected() -> Value {
         WorkerPolicy {

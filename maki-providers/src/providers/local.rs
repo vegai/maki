@@ -1,4 +1,3 @@
-use crate::provider::ModelListing;
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
@@ -11,7 +10,7 @@ use tracing::warn;
 use maki_config::providers::{Protocol, ProvidersConfig};
 
 use crate::model::Model;
-use crate::provider::{BoxFuture, Provider, RequestScope};
+use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use crate::types::ThinkingFallback;
 use crate::{AgentError, Effort, Message, ProviderEvent, RequestOptions, StreamResponse};
 

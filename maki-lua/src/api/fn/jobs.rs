@@ -214,8 +214,7 @@ struct JobMeta {
     /// nothing ever reaches the tail there and an empty tail is no evidence
     /// the job stayed quiet.
     dropped_output: bool,
-    /// The wait thread sets this under the signal lock before it updates `exit_code`. See
-    /// [`reap`].
+    /// Coordinates reaping, signals, timeouts and stdin errors across the job's threads.
     reap_state: Arc<Mutex<ReapState>>,
     deadline: Option<smol::Task<()>>,
     exit_code: Option<i32>,
@@ -327,6 +326,10 @@ impl JobStore {
             on_stderr,
             on_exit,
         } = spec;
+        #[cfg(not(target_os = "linux"))]
+        if guard {
+            return Err(GUARD_UNSUPPORTED.into());
+        }
         let cwd = cwd.as_deref().map(expand_tilde);
         if let Some(dir) = &cwd
             && !dir.is_dir()
@@ -390,10 +393,6 @@ impl JobStore {
         } else {
             None
         };
-        #[cfg(not(target_os = "linux"))]
-        if guard {
-            return Err(GUARD_UNSUPPORTED.into());
-        }
         let mut child = command.spawn().map_err(|e| e.to_string())?;
         let pid = child.id();
         let (stdin_pipe, stdout_pipe, stderr_pipe) =
@@ -444,6 +443,7 @@ impl JobStore {
                 let Some(child) = unwatched.0.take() else {
                     return;
                 };
+                #[cfg(target_os = "linux")]
                 if guard {
                     kill_group_once_leader_exits(pid);
                 }
@@ -829,7 +829,7 @@ impl JobStore {
 
     fn kill_all(&self) {
         for job in self.jobs.values() {
-            kill_job(job);
+            kill_unreaped(job.pid, &job.reap_state, false);
         }
     }
 }
@@ -928,8 +928,8 @@ fn spawn_stdin_writer(
     Ok(tx)
 }
 
-/// Shared by the wait thread and every kill, under one lock that a kill holds
-/// from its state check to its signal.
+/// Shared process state. Kills hold the lock from the reap check to the signal, and the
+/// writer records stdin failures under the same lock.
 #[derive(Default)]
 struct ReapState {
     reaped: bool,
@@ -979,17 +979,12 @@ fn reap(mut child: Child, state: &Mutex<ReapState>) -> i32 {
 /// A descendant that closed its output keeps no reader open, so it can
 /// outlive the leader unseen. Only this thread reaps the leader, and has not
 /// yet, so the group is still the right target.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn kill_group_once_leader_exits(pid: u32) {
     if process::wait_without_reaping(pid) {
         process::kill_group(pid);
     }
 }
-
-/// Windows jobs have no process group to kill this way, so a job there stops
-/// only with its own process.
-#[cfg(not(unix))]
-fn kill_group_once_leader_exits(_pid: u32) {}
 
 /// Without a wait thread, this guard must kill the group and reap the child. The unreaped pid
 /// still identifies the group.

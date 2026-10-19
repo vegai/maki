@@ -150,9 +150,9 @@ pub(super) async fn probe(
                 Next::Line(Some(Ok(line))) => {
                     let event = parse_event(&line)?;
                     match handshake.feed(&event, plan_usage, false)? {
-                        Some(Step::Ready) => passed = true,
-                        Some(Step::Nothing | Step::Alive) => {}
-                        Some(_) | None => return Err(Error::UncheckedStart),
+                        Step::Ready => passed = true,
+                        Step::Nothing | Step::Alive => {}
+                        _ => return Err(Error::UncheckedStart),
                     }
                 }
                 Next::Line(Some(Err(source))) => return Err(unreadable(source)),

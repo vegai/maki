@@ -460,7 +460,7 @@ impl Handshake {
         event: &Value,
         plan_usage: &Mutex<Option<ProviderUsage>>,
         accepted: bool,
-    ) -> Result<Option<Step>, Error> {
+    ) -> Result<Step, Error> {
         let kind = classify(event, StreamMode::Provider, accepted)?;
         self.feed_kind(event, &kind, plan_usage)
     }
@@ -470,8 +470,8 @@ impl Handshake {
         event: &Value,
         kind: &EventKind,
         plan_usage: &Mutex<Option<ProviderUsage>>,
-    ) -> Result<Option<Step>, Error> {
-        Ok(Some(match kind {
+    ) -> Result<Step, Error> {
+        Ok(match kind {
             EventKind::ControlResponse => {
                 if self.answer(&event["response"])? {
                     Step::Ready
@@ -487,8 +487,8 @@ impl Handshake {
             }
             EventKind::Alive => Step::Alive,
             EventKind::System => Step::Nothing,
-            _ => return Ok(None),
-        }))
+            _ => return Err(Error::UncheckedStart),
+        })
     }
 
     pub(crate) fn answer(&mut self, response: &Value) -> Result<bool, Error> {
@@ -590,11 +590,6 @@ impl<'a> Turn<'a> {
             lost: None,
             trace: VecDeque::with_capacity(TRACE_LEN),
         }
-    }
-
-    #[cfg(test)]
-    pub fn offered(&self) -> Vec<Offered> {
-        self.handshake.offered()
     }
 
     pub fn prompted(&mut self) {
@@ -718,10 +713,7 @@ impl<'a> Turn<'a> {
             EventKind::ControlResponse
             | EventKind::RateLimit
             | EventKind::Alive
-            | EventKind::System => self
-                .handshake
-                .feed_kind(&event, &kind, self.plan_usage)
-                .map(|step| step.unwrap_or(Step::Nothing)),
+            | EventKind::System => self.handshake.feed_kind(&event, &kind, self.plan_usage),
         }
     }
 
@@ -1166,13 +1158,6 @@ fn continuation(event: &Value) -> bool {
             .is_some_and(|blocks| blocks.iter().all(|block| block["type"] == TEXT_BLOCK))
 }
 
-/// Each block becomes a separate message. Claude Code omits messages that contain only blank
-/// text or a placeholder.
-#[cfg(test)]
-fn dropped_by_claude_code(text: &str) -> bool {
-    StreamedText::new(text).dropped()
-}
-
 /// JavaScript's `trim`, which Claude Code's filter uses. Unlike Rust's, it
 /// trims U+FEFF and keeps U+0085.
 fn js_trim(text: &str) -> &str {
@@ -1234,8 +1219,8 @@ mod tests {
         ACCOUNT_ANSWER, API_ERROR_MARK, BATCH_CALL_TOOL, BATCH_CALLS, BATCH_TOOL, EXTRA_USAGE,
         EXTRA_USAGE_IN_USE, HOOKS_ANSWER, INPUT_REJECTED, MAX_TOKENS_STOP, MAX_TURNS_ERROR,
         NO_SUCH_TOOL, PLAN_REJECTED, RATE_LIMITED, REFUSAL_STOP, RESULT_EVENT, SETTINGS_ANSWER,
-        SHOWN_LINE_CHARS, SUCCESS, Step, StreamMode, TOOL_RESULT, TOOL_USE_STOP, Turn,
-        WINDOW_FULL_STOP, classify, dropped_by_claude_code, usage_of, user_message,
+        SHOWN_LINE_CHARS, SUCCESS, Step, StreamMode, StreamedText, TOOL_RESULT, TOOL_USE_STOP,
+        Turn, WINDOW_FULL_STOP, classify, usage_of, user_message,
     };
     use crate::{ContentBlock, StopReason, StreamResponse};
 
@@ -2120,7 +2105,7 @@ mod tests {
     #[test_case("\u{feff}\n" => true ; "a_byte_order_mark")]
     #[test_case("\u{85}" => false ; "a_next_line_character")]
     fn claude_code_trims_like_javascript(text: &str) -> bool {
-        dropped_by_claude_code(text)
+        StreamedText::new(text).dropped()
     }
 
     /// maki needs every count of the reply, and takes the output count only
@@ -2272,7 +2257,8 @@ mod tests {
             for line in handshake() {
                 turn.feed(&line).unwrap();
             }
-            turn.offered()
+            turn.handshake
+                .offered()
                 .into_iter()
                 .map(|offer| (offer.name, offer.model))
                 .collect()

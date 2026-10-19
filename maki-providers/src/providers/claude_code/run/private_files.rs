@@ -25,6 +25,8 @@ pub(super) const DIR_PREFIX: &str = "maki-claude-code.";
 pub(super) const OWNER_SEPARATOR: char = '-';
 #[cfg(target_os = "linux")]
 const PID_NAMESPACE: &str = "/proc/self/ns/pid";
+#[cfg(target_os = "linux")]
+const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
 #[cfg(unix)]
 const PRIVATE_FILE_MODE: u32 = 0o600;
 #[cfg(unix)]
@@ -117,19 +119,20 @@ pub(super) async fn private_dir_async(
     smol::unblock(move || private_dir(&base, &project, &denied)).await
 }
 
-/// Include the pid namespace in the directory name. A later maki process can then identify
-/// dead owners with pids scoped to their own namespace.
+/// Scope owners to this boot and pid namespace, including on shared temporary filesystems.
 fn dir_prefix() -> String {
     #[cfg(target_os = "linux")]
-    if let Some(namespace) = pid_namespace() {
+    if let Some(namespace) = owner_namespace() {
         return format!("{DIR_PREFIX}{namespace}{OWNER_SEPARATOR}{}.", process::id());
     }
     DIR_PREFIX.to_owned()
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn pid_namespace() -> Option<u64> {
-    fs::metadata(PID_NAMESPACE).ok().map(|meta| meta.ino())
+pub(super) fn owner_namespace() -> Option<String> {
+    let namespace = fs::metadata(PID_NAMESPACE).ok()?.ino();
+    let boot = fs::read_to_string(BOOT_ID).ok()?;
+    Some(format!("{}-{namespace}", boot.trim()))
 }
 
 /// Artifact cleanup can take a long time. Run it outside the async threads and scan each
@@ -148,10 +151,10 @@ fn sweep_once(base: &Path) {
 
 /// Removes the private directories in `base` whose maki is gone. A signal
 /// can kill maki before the directory's destructor runs. Only the user's own
-/// directories from this pid namespace go, and a link is never followed.
+/// directories from this boot and pid namespace go, and a link is never followed.
 #[cfg(target_os = "linux")]
 pub(super) fn sweep_dead_owners(base: &Path) {
-    let (Ok(entries), Some(namespace)) = (fs::read_dir(base), pid_namespace()) else {
+    let (Ok(entries), Some(namespace)) = (fs::read_dir(base), owner_namespace()) else {
         return;
     };
     let uid = getuid().as_raw();
@@ -161,8 +164,8 @@ pub(super) fn sweep_dead_owners(base: &Path) {
             .to_str()
             .and_then(|name| name.strip_prefix(DIR_PREFIX))
             .and_then(|rest| rest.split_once('.'))
-            .and_then(|(owner, _)| owner.split_once(OWNER_SEPARATOR))
-            .filter(|(owner_namespace, _)| owner_namespace.parse() == Ok(namespace))
+            .and_then(|(owner, _)| owner.rsplit_once(OWNER_SEPARATOR))
+            .filter(|(owner_namespace, _)| *owner_namespace == namespace)
             .and_then(|(_, pid)| pid.parse().ok())
             .and_then(Pid::from_raw)
         else {

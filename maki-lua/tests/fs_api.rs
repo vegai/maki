@@ -16,11 +16,11 @@ const NATIVE_DIRECTORIES: &str = r#"
 local dir = assert(maki.fs.mkdtemp(@TEMPLATE@))
 assert(maki.fs.realpath(dir) == dir)
 assert(maki.fs.write(maki.fs.joinpath(dir, "kept"), "data"))
-local removed, err = maki.fs.rmdir(dir)
+local removed, err = maki.fs.rm(dir)
 assert(removed == nil and err ~= nil)
 assert(maki.fs.read(maki.fs.joinpath(dir, "kept")) == "data")
 assert(maki.fs.rm(maki.fs.joinpath(dir, "kept")))
-assert(maki.fs.rmdir(dir))
+assert(maki.fs.rm(dir))
 "#;
 
 fn setup() -> PluginHost {

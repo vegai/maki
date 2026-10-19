@@ -1,4 +1,3 @@
-use crate::provider::ModelListing;
 use std::env;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
@@ -15,7 +14,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use crate::model::Model;
-use crate::provider::{BoxFuture, Provider, RequestScope};
+use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::shared;

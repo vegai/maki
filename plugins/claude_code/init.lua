@@ -1,9 +1,9 @@
-local native = require("maki.claude_code.internal")
 -- Send the task only after the probe and worker pass the handshake.
 --
 -- Managed hooks can run at startup. Run the probe in an empty directory so a rejected hook
 -- cannot write to the project.
 
+local native = require("maki.claude_code.internal")
 local output_limits = require("maki.output_limits")
 local truncate = require("maki.truncate")
 local jobs = require("claude_jobs")
@@ -359,8 +359,8 @@ local function run(input, ctx, call, timeout_secs)
   -- The report identifies the artifact necessary for import. Shorten the reply first so
   -- output limits cannot remove the report.
   local report_lines = select(2, report:gsub("\n", "")) + 1
-  local answer_lines = math.max(claude.max_lines - report_lines - 1, 1)
-  local answer_bytes = math.max(claude.max_bytes - #report - 2, 1)
+  local answer_lines = claude.max_lines and math.max(claude.max_lines - report_lines - 1, 1)
+  local answer_bytes = claude.max_bytes and math.max(claude.max_bytes - #report - 2, 1)
   outcome.llm_output = truncate(outcome.shown, answer_lines, answer_bytes) .. "\n\n" .. report
   outcome.shown = outcome.shown .. "\n\n" .. report
   return claude:build(outcome)

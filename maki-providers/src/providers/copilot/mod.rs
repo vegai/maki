@@ -1,4 +1,3 @@
-use crate::provider::ModelListing;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,7 +14,7 @@ use super::openai::responses;
 use super::openai_compat;
 use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing, ModelTier, lookup_entry};
 use crate::model_registry;
-use crate::provider::{BoxFuture, Provider, RequestScope};
+use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use crate::providers::{ResolvedAuth, Timeouts};
 use crate::spec::{AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec};
 use crate::{

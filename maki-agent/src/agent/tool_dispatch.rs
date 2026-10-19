@@ -455,14 +455,17 @@ fn resolve<'a>(ctx: &'a ToolContext, name: &'a str) -> Resolved<'a> {
 }
 
 fn offered(ctx: &ToolContext, name: &str, route: &Route<'_>) -> bool {
-    let audience = match route {
-        Route::Native(entry) => entry.tool.audience(),
-        Route::Local(tool) => tool.audience,
-        Route::Mcp(_, qualified) => return ctx.tool_filter.matches_external(qualified),
-        Route::ToolSearch(_) => return ctx.tool_filter.matches_external(name),
-    };
-    ctx.tool_filter
-        .admits(name, audience, ctx.audience, Some(&ctx.local_tools))
+    match route {
+        Route::Native(entry) => {
+            ctx.tool_filter
+                .admits(name, entry.tool.audience(), ctx.audience, None)
+        }
+        Route::Local(tool) => ctx
+            .tool_filter
+            .admits_local(name, tool.audience, ctx.audience),
+        Route::Mcp(_, qualified) => ctx.tool_filter.matches_external(qualified),
+        Route::ToolSearch(_) => ctx.tool_filter.matches_external(name),
+    }
 }
 
 /// One callable name, as [`resolve`] would route it.

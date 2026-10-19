@@ -1,4 +1,3 @@
-use crate::provider::ModelListing;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -20,7 +19,7 @@ use super::openai_compat::{DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiC
 use super::{KeyRotation, ResolvedAuth, Timeouts};
 use crate::model::{Model, ModelInfo, ThinkingSupport};
 use crate::model_registry;
-use crate::provider::{BoxFuture, Provider, RequestScope};
+use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use crate::spec::ProviderSpec;
 use crate::types::{EffortDialect, ThinkingFallback, dialect, merge_body};
 use crate::{

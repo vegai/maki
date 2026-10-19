@@ -70,7 +70,7 @@ Thinking flags applied when resuming a TUI session are saved in that session. A 
 
 ### Tool name lists
 
-`--allowed-tools` / `--disallowed-tools` accept built-in, plugin and MCP tool names. PascalCase becomes snake_case (`CodeExecution` becomes `code_execution`). Names with underscores, dots or hyphens keep their spelling and case. Use the exact name for plugin sub-tools, such as `multiedit` or `edit_lines`.
+`--allowed-tools` / `--disallowed-tools` accept built-in, plugin and MCP tool names. Claude Code names map to maki names (`WebFetch` becomes `webfetch`, and `MultiEdit` becomes `multiedit`). Other PascalCase names become snake_case (`CodeExecution` becomes `code_execution`). Names with underscores, dots or hyphens keep their spelling and case. Use the exact name for plugin sub-tools such as `edit_lines`.
 
 Maki retains qualified MCP names even if their tools have not loaded yet. An allow list that matches no loaded tool and contains no qualified MCP name stops startup with an error. This lets a filter apply to an MCP tool that connects later. After plugins load, Maki warns about other unmatched names. Check the spelling if the tool should already be loaded. A name that never loads has no effect. Filters control both the advertised tools and dispatch, including calls through `batch`, `code_execution` and `maki.agent.call_tool`.
 

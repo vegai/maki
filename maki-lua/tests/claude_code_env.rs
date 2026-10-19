@@ -321,10 +321,10 @@ fn a_call_does_not_wait_for_the_sweep() {
         "the call waited for the sweep"
     );
     fs::write(&never, "").unwrap();
-    assert!(wait_until(DEADLINE, || !artifacts
-        .path()
-        .join(SWEEP_TRASH)
-        .exists()));
+    assert!(
+        wait_until(DEADLINE, || !artifacts.path().join(SWEEP_TRASH).exists()),
+        "the released artifact sweep did not finish"
+    );
 }
 
 /// From a subdirectory, the project is still the whole checkout, so a

@@ -170,18 +170,20 @@ impl ToolFilter {
         caller: ToolAudience,
         local_tools: Option<&LocalTools>,
     ) -> bool {
-        let local = local_tools.and_then(|tools| tools.get(name));
-        local
-            .map_or(audience, |tool| tool.audience)
-            .contains(caller)
-            && self.matches_where(
-                |candidate| candidate == name,
-                if local.is_some() {
-                    ToolLocation::Local
-                } else {
-                    ToolLocation::Registry
-                },
-            )
+        if let Some(tool) = local_tools.and_then(|tools| tools.get(name)) {
+            return self.admits_local(name, tool.audience, caller);
+        }
+        audience.contains(caller) && self.matches(name)
+    }
+
+    pub(crate) fn admits_local(
+        &self,
+        name: &str,
+        audience: ToolAudience,
+        caller: ToolAudience,
+    ) -> bool {
+        audience.contains(caller)
+            && self.matches_where(|candidate| candidate == name, ToolLocation::Local)
     }
 
     pub fn matches_external(&self, name: &str) -> bool {

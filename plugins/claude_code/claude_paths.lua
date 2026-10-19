@@ -82,7 +82,7 @@ function M.denied_paths(extra)
   end
   local extra_patterns, problem = M.comma_list(extra, function(pattern)
     pattern = pattern:gsub("^%./", "")
-    if pattern:sub(1, 1) == "/" or (("/" .. pattern .. "/"):find("/../", 1, true)) or pattern:find(")", 1, true) then
+    if pattern:sub(1, 1) == "/" or M.climbs(pattern) or pattern:find(")", 1, true) then
       return nil, pattern .. " must be relative to the project, without `..` or `)`"
     end
     return pattern

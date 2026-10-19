@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 
 use maki_agent::cancel::CancelToken;
 use maki_agent::permissions::{PermissionAnswer, PermissionManager, TaggedAnswer};
-use maki_agent::tools::{ToolContext, ToolRegistry};
+use maki_agent::tools::{ToolContext, ToolOutputMode, ToolRegistry};
 use maki_agent::{AgentEvent, EventSender};
 use maki_config::{PermissionsConfig, ProjectConfig};
 use maki_lua::PluginHost;
@@ -40,6 +40,10 @@ const LARGE_IMPORT_CHANGES: usize = 1024;
 const IMPORT_TOO_LARGE: &str = "Use `paths` to import smaller groups";
 const AMBIGUOUS_IMPORT_PATH: &str = "matches more than one change";
 const TRACKED_FOLDER_LINK: &str = "is a symlink. Restore a directory before retrying the snapshot";
+const RETYPED_FILE: &str = "utils";
+const RETYPED_CHILD: &str = "utils/mod.rs";
+const SYMLINKED_DEPENDENCY: &str = "vendor/node_modules";
+const SYMLINKED_DEPENDENCY_NOTE: &str = "is under the symlink";
 
 const CANNOT_LOCK_ARTIFACT: &str = "cannot lock artifact";
 const PREPARE_TIMEOUT_SECS: u64 = 1;
@@ -723,6 +727,59 @@ fn a_tracked_folder_replaced_by_a_link_has_an_actionable_error() {
     assert!(error.contains(source.to_str().unwrap()), "{error}");
 }
 
+#[test_case(false, false ; "empty_directory")]
+#[test_case(true, false ; "directory_with_untracked_files")]
+#[test_case(true, true ; "directory_with_included_files")]
+fn a_tracked_file_can_be_replaced_by_a_directory(populated: bool, include: bool) {
+    let coding = Coding::new();
+    let project = coding.project();
+    write(&project.join(RETYPED_FILE), BASE_LIB);
+    commit_all(&project);
+    fs::remove_file(project.join(RETYPED_FILE)).unwrap();
+    fs::create_dir(project.join(RETYPED_FILE)).unwrap();
+    if populated {
+        write(&project.join(RETYPED_CHILD), BASE_LIB);
+    }
+    let (registry, _host) = coding.host(&[]);
+    let include = if include { &[RETYPED_FILE][..] } else { &[] };
+    let reply = coding.code(&registry, CODE_EDIT, include).unwrap();
+    let snapshot = coding.artifact(&artifact_id(&reply)).join(SNAPSHOT_DIR);
+    assert!(!snapshot.join(RETYPED_FILE).is_file());
+    assert_eq!(snapshot.join(RETYPED_CHILD).exists(), !include.is_empty());
+}
+
+#[test]
+fn a_coding_call_preserves_its_artifact_in_full_output_mode() {
+    let coding = Coding::new();
+    let (registry, _host) = coding.host(&[]);
+    let mut ctx = coding.ctx(&registry);
+    ctx.output_mode = ToolOutputMode::Full;
+    let reply = run_tool(
+        &registry,
+        &ctx,
+        TOOL,
+        json!({ "prompt": CODE_EDIT, "model": MODEL_ALIAS, "profile": CODE_PROFILE }),
+    )
+    .unwrap();
+    assert!(coding.artifact(&artifact_id(&reply)).is_dir(), "{reply}");
+    assert!(reply.contains(IMPORTED_LIB), "{reply}");
+}
+
+#[test]
+fn a_dependency_under_a_tracked_symlink_is_not_reported_as_copied() {
+    let coding = Coding::new();
+    let outside = tempdir().unwrap();
+    write(&outside.path().join(DEPENDENCY), DEPENDENCY_CONTENT);
+    symlink(outside.path(), coding.project().join("vendor")).unwrap();
+    commit_all(&coding.project());
+    let (registry, _host) = coding.host(&[("dependencies", json!(SYMLINKED_DEPENDENCY))]);
+    let reply = coding.code(&registry, CODE_EDIT, &[]).unwrap();
+    assert!(reply.contains(SYMLINKED_DEPENDENCY_NOTE), "{reply}");
+    assert!(reply.contains(SYMLINKED_DEPENDENCY), "{reply}");
+    let snapshot = coding.artifact(&artifact_id(&reply)).join(SNAPSHOT_DIR);
+    assert!(!snapshot.join(SYMLINKED_DEPENDENCY).exists());
+}
+
 /// A worktree and its primary checkout share git objects. Deny every path that can expose the
 /// original project.
 #[test_case(true ; "from_a_worktree")]
@@ -1200,12 +1257,11 @@ fn a_cancelled_import_leaves_the_checkout_as_it_was() {
     let coding = Coding::new();
     let held = coding.artifacts.path().join(IMPORT_HELD);
     let pipe = coding.artifacts.path().join(IMPORT_RELEASE);
+    let output = Command::new("mkfifo").arg(&pipe).output().unwrap();
     assert!(
-        Command::new("mkfifo")
-            .arg(&pipe)
-            .status()
-            .unwrap()
-            .success()
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
     let prefix = HOLD_IMPORT
         .replace("@HELD@", held.to_str().unwrap())
