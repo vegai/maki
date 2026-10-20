@@ -198,11 +198,10 @@ local function coding_confine(spec, artifact)
   if not state_dir then
     return nil, NO_STATE_DIR
   end
-  local deny = table.clone(spec.checkout_dirs)
+  local deny = table.clone(spec.denied)
   deny[#deny + 1] = spec.config_dir
   deny[#deny + 1] = maki.fs.dirname(artifact.dir)
   -- Optional paths can be nil. Use explicit inserts so later paths remain in the list.
-  deny[#deny + 1] = spec.git_dir
   deny[#deny + 1] = state_dir
   deny[#deny + 1] = maki.env.config_dir()
   deny[#deny + 1] = maki.env.logs_dir()

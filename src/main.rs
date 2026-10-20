@@ -1,6 +1,6 @@
 mod cli;
 mod cmd;
-mod headless;
+mod headless_startup;
 mod notice;
 mod print;
 mod project_trust;

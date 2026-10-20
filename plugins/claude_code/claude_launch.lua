@@ -250,12 +250,12 @@ end
 --- Returns true if {path} is in the checkout of {spec}, which reaches past
 --- the session's directory when that is a subdirectory or a worktree.
 function M.in_checkout(path, spec)
-  for _, dir in ipairs(spec.checkout_dirs) do
+  for _, dir in ipairs(spec.denied) do
     if path_utils.within(path, dir) then
       return true
     end
   end
-  return spec.git_dir ~= nil and path_utils.within(path, spec.git_dir)
+  return false
 end
 
 function M.deny_rules(extra)
@@ -466,7 +466,6 @@ function M.preflight(input, ctx, call, opts)
     return nil, secret_err
   end
   local config_dir = prepared.config_dir
-  local local_dirs, git_dir = prepared.dirs, prepared.git_dir
 
   -- Keep the version job in Call so cancellation reaps it before the slot is released.
   local check, version_err = native.version_check(executable)
@@ -508,9 +507,7 @@ function M.preflight(input, ctx, call, opts)
     withheld = withheld,
     config_dir = config_dir,
     home_credentials = home_credentials,
-    checkout_dirs = local_dirs,
     denied = prepared.denied,
-    git_dir = git_dir,
     cli = cli,
   }
 end

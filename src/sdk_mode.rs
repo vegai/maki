@@ -563,7 +563,7 @@ pub fn run(params: SdkParams) -> Result<()> {
             tool_names,
         },
         thinking,
-    ) = crate::headless::startup(&handle.ready, initial_model, defaults.thinking);
+    ) = crate::headless_startup::startup(&handle.ready, initial_model, defaults.thinking);
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
     let writer_thread = std::thread::spawn(move || {

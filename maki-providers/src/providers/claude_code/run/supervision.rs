@@ -374,12 +374,12 @@ pub(super) async fn send(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::error::Error;
     use futures_lite::io::Cursor;
     use test_case::test_case;
 
     use super::{
-        MAX_EVENT_BYTES, STDERR_LINE_BYTES, TRUNCATED_LINE, event_line, stderr_line, unreadable,
+        Error, MAX_EVENT_BYTES, STDERR_LINE_BYTES, TRUNCATED_LINE, event_line, stderr_line,
+        unreadable,
     };
 
     const NEXT_LINE: &str = "next";
@@ -431,16 +431,21 @@ mod tests {
 
 #[cfg(all(test, target_os = "linux"))]
 mod process_tests {
-    use super::super::super::fake::Fake;
-    use super::super::launch::command;
-    use super::Group;
-    use rustix::process::{Pid, Signal, kill_process};
     use std::env;
     use std::os::unix::process::ExitStatusExt;
     use std::path::Path;
+
+    use rustix::process::{Pid, Signal, kill_process};
     use test_case::test_case;
+
+    use crate::providers::claude_code::fake::Fake;
+
+    use super::super::launch::command;
+    use super::Group;
+
     const SLEEP: &str = "/bin/sleep";
     const LONG_SLEEP_SECS: &str = "60";
+
     /// Marking the leader reaped must prevent signalling a pid that may identify another group.
     #[test_case(false ; "sigkill")]
     #[test_case(true ; "sigterm")]

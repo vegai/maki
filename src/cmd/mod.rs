@@ -8,7 +8,7 @@ use std::env;
 use std::sync::Arc;
 
 use color_eyre::Result;
-use color_eyre::eyre::Context;
+use color_eyre::eyre::{Context, bail};
 
 use maki_agent::tools::ToolRegistry;
 use maki_config::project::{self, TrustMode};
@@ -211,7 +211,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         && !acp
         && (cli.thinking.is_some() || cli.effort.is_some() || cli.max_thinking_tokens.is_some())
     {
-        color_eyre::eyre::bail!("thinking flags apply only to TUI, --print, SDK and ACP sessions");
+        bail!("thinking flags apply only to TUI, --print, SDK and ACP sessions");
     }
     let thinking = acp.then(|| cli.thinking_override()).flatten();
     // `--trust` is a grant for this process, so every entry point under it
