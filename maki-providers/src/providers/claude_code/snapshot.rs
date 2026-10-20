@@ -32,6 +32,7 @@ pub struct SnapshotMetadata {
     pub git_metadata: Vec<String>,
     pub repositories: Vec<String>,
     pub private_files: usize,
+    pub symlinks: Vec<PathBuf>,
 }
 
 fn private_copy(parent: &impl AsFd, name: impl Arg + Copy) -> io::Result<()> {
@@ -285,6 +286,9 @@ pub fn sanitize_snapshot(
             return Ok(Visit::Skip);
         }
         let kind = FileType::from_raw_mode(metadata.st_mode);
+        if kind == FileType::Symlink {
+            relocated.symlinks.push(path.to_path_buf());
+        }
         if kind == FileType::RegularFile && metadata.st_nlink > 1 {
             private_copy(parent, name)?;
             relocated.private_files += 1;
@@ -316,7 +320,7 @@ mod tests {
     use std::fs::{self, File, Permissions};
     use std::io;
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use tempfile::tempdir;
     use test_case::test_case;
@@ -408,12 +412,9 @@ mod tests {
             pointer
         );
         assert_eq!(fs::read_dir(&quarantine).unwrap().count(), 1);
-        assert!(
-            sanitize_snapshot(&snapshot, &quarantine, &git)
-                .unwrap()
-                .git_metadata
-                .is_empty()
-        );
+        let metadata = sanitize_snapshot(&snapshot, &quarantine, &git).unwrap();
+        assert!(metadata.git_metadata.is_empty());
+        assert!(metadata.symlinks.is_empty());
         assert_eq!(fs::read_dir(&quarantine).unwrap().count(), 1);
     }
 
@@ -431,12 +432,9 @@ mod tests {
         fs::write(&target, &pointer).unwrap();
         symlink(&target, snapshot.join(GIT_ENTRY)).unwrap();
         symlink(&outside, snapshot.join("linked")).unwrap();
-        assert!(
-            sanitize_snapshot(&snapshot, &quarantine, &git)
-                .unwrap()
-                .git_metadata
-                .is_empty()
-        );
+        let metadata = sanitize_snapshot(&snapshot, &quarantine, &git).unwrap();
+        assert!(metadata.git_metadata.is_empty());
+        assert_eq!(metadata.symlinks, [PathBuf::from("linked")]);
         assert_eq!(fs::read_to_string(&target).unwrap(), pointer);
         assert!(
             fs::symlink_metadata(snapshot.join(GIT_ENTRY))

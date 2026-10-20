@@ -1660,6 +1660,28 @@ fn an_unsafe_link_prepare_makes_is_dropped(fail_batch: bool) {
 }
 
 #[test]
+fn preparation_can_remove_links_with_non_utf8_names() {
+    const NAME: &[u8] = b"latin\xff.link";
+    const SHOWN: &str = "latin\\377.link";
+    let coding = Coding::new();
+    let prepare = format!("ln -s {OUTSIDE_TARGET} \"$(printf 'latin\\377.link')\"");
+    let (registry, _host) = coding.host(&[("prepare", json!(prepare))]);
+    let reply = coding.code(&registry, CODE_EDIT, &[]).unwrap();
+    assert!(
+        reply.contains(LINKS_LEFT_OUT) && reply.contains(SHOWN),
+        "{reply}"
+    );
+    assert!(
+        fs::symlink_metadata(
+            coding
+                .snapshot(&artifact_id(&reply))
+                .join(OsStr::from_bytes(NAME))
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn escaping_links_are_checked_in_batches() {
     const LINK_COUNT: usize = 256;
     const MAX_REALPATH_CALLS: usize = 2;

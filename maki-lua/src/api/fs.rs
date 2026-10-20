@@ -55,9 +55,11 @@ pub(super) fn path_text(path: PathBuf) -> IoResult<String> {
 /// @return (string?, string?) Physical path, or nil and the error.
 #[lua_fn(guard = FsRead)]
 async fn realpath(_lua: Lua, path: String) -> LuaResult<Pair<String>> {
-    Ok(pair(
-        smol::unblock(move || fs::canonicalize(expand_tilde(&path)).and_then(path_text)).await,
-    ))
+    Ok(pair(canonical_path(expand_tilde(&path)).await))
+}
+
+pub(super) async fn canonical_path(path: PathBuf) -> IoResult<String> {
+    smol::unblock(move || fs::canonicalize(path).and_then(path_text)).await
 }
 
 /// Create a private temporary directory. The caller owns its cleanup.

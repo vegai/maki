@@ -403,7 +403,7 @@ fn same_secret(given: &[u8], expected: &[u8]) -> bool {
 fn answer(shared: &Shared, body: &[u8]) -> Reply {
     // A batch could hide a call in an array, so only one message at a time
     // is accepted.
-    let Ok(message @ Value::Object(_)) = serde_json::from_slice::<Value>(body) else {
+    let Ok(mut message @ Value::Object(_)) = serde_json::from_slice::<Value>(body) else {
         return plain(BAD_REQUEST);
     };
     let Some(method) = message["method"].as_str() else {
@@ -426,7 +426,7 @@ fn answer(shared: &Shared, body: &[u8]) -> Reply {
         }),
         TOOLS_LIST => return rpc_success(id, &shared.tool_list),
         PING => json!({}),
-        TOOLS_CALL => return park(shared, &message["params"]),
+        TOOLS_CALL => return park(shared, message["params"].take()),
         _ => return rpc_error(id, METHOD_NOT_FOUND, METHOD_NOT_FOUND_MESSAGE),
     };
     rpc_success(id, &result.to_string())
@@ -450,20 +450,21 @@ fn protocol_version(asked: &Value) -> &str {
 
 /// Invalid calls are held too, because any answer, even an error, would let
 /// Claude Code continue without maki.
-fn park(shared: &Shared, params: &Value) -> Reply {
-    let name = params["name"].as_str().unwrap_or_default();
-    let handoff = match &params["arguments"] {
-        Value::Object(_) => Handoff::Parked {
+fn park(shared: &Shared, mut params: Value) -> Reply {
+    let name = params["name"].as_str().unwrap_or_default().to_owned();
+    let handoff = match params
+        .get_mut("arguments")
+        .map(Value::take)
+        .unwrap_or_default()
+    {
+        arguments @ Value::Object(_) => Handoff::Parked {
             tool_use_id: params["_meta"][TOOL_USE_ID_META]
                 .as_str()
                 .map(str::to_owned),
-            name: name.to_owned(),
-            arguments: params["arguments"].clone(),
+            name,
+            arguments,
         },
-        other => Handoff::Invalid(Error::NotArguments {
-            name: name.to_owned(),
-            input: other.clone(),
-        }),
+        other => Handoff::Invalid(Error::NotArguments { name, input: other }),
     };
     let _ = shared.handoffs.send(handoff);
     Reply::Park
@@ -809,6 +810,8 @@ mod tests {
 
     #[test_case(json!({ "name": "bash", "arguments": {} }) => matches Handoff::Parked { .. } ; "an_unknown_tool")]
     #[test_case(json!({ "name": TOOL, "arguments": "rm -rf /" }) => matches Handoff::Invalid(Error::NotArguments { .. }) ; "arguments_that_are_no_object")]
+    #[test_case(json!(42) => matches Handoff::Invalid(Error::NotArguments { .. }) ; "scalar_params")]
+    #[test_case(json!([]) => matches Handoff::Invalid(Error::NotArguments { .. }) ; "array_params")]
     fn tool_calls_are_held_for_turn_validation(params: Value) -> Handoff {
         let call = json!({ "jsonrpc": "2.0", "id": 3, "method": TOOLS_CALL, "params": params });
         let (rest, handoff) = parked(&post(&call, TOKEN));

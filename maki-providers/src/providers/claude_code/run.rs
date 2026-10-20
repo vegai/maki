@@ -18,7 +18,7 @@ use super::error::Error;
 use super::mcp::{self, Handoff};
 use super::stream::{Step, Turn, Wait, user_message};
 use super::transcript::{Catalog, SERVER, system_prompt, transcript};
-use super::validation::STARTUP_TIMEOUT_SECS;
+use super::validation::{STARTUP_TIMEOUT_SECS, resolved_model};
 use crate::providers::anthropic::shared::{long_context_window, strip_long_context};
 use crate::{Message, ProviderEvent, ProviderUsage, StreamResponse};
 use base64::Engine;
@@ -153,10 +153,10 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
             .await?;
     // An alias such as `sonnet` runs whatever model the account answer maps
     // it to.
-    let runs = offered
-        .iter()
-        .find(|offer| offer.name == asked)
-        .map_or(asked, |offer| offer.model.as_str());
+    let runs = resolved_model(offered.account(), asked)
+        .unwrap_or(asked)
+        .to_owned();
+    drop(offered);
     let checked = started.elapsed();
     debug!(
         version = %profile,
@@ -178,9 +178,8 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
             &catalog,
             InitExpect {
                 version: &profile,
-                model: runs,
+                model: &runs,
                 cwd: launch.project,
-                server: SERVER,
                 tools: &tools,
             },
             req.plan_usage,
@@ -446,7 +445,7 @@ async fn stop_and_drain(
         Err(Error::ExitLate) => {
             group.kill();
             warn!("claude-code: output stayed open after a complete reply; stopping the CLI");
-            deadline = Instant::now() + limits.exit;
+            deadline = Instant::now() + limits.exit.min(SHUTDOWN_GRACE);
             match drain(turn, lines, handoffs, deadline, true).await {
                 Err(Error::ExitLate) => {
                     warn!("claude-code: output stayed open after the kill; keeping the reply")
@@ -1097,7 +1096,6 @@ mod tests {
             version: &profile,
             model: ALIAS,
             cwd: Path::new(ANY_CWD),
-            server: SERVER,
             tools: &tools,
         };
         let plan_usage = Mutex::default();

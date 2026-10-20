@@ -50,7 +50,7 @@ local function refresh_hint()
   maki.async.run(function()
     local n = 0
     for _, task in ipairs(maki.task.list() or {}) do
-      if task.status == "working" or task.status == "queued" then
+      if Rows.running(task) then
         n = n + 1
       end
     end

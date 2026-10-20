@@ -72,6 +72,8 @@ Thinking flags applied when resuming a TUI session are saved in that session. A 
 
 `--allowed-tools` / `--disallowed-tools` accept built-in, plugin and MCP tool names. Claude Code names map to maki names (`WebFetch` becomes `webfetch`, and `MultiEdit` becomes `multiedit`). Other PascalCase names become snake_case (`CodeExecution` becomes `code_execution`). Names with underscores, dots or hyphens keep their spelling and case. Use the exact name for plugin sub-tools such as `edit_lines`.
 
+MCP names accept `server.tool`, `server__tool` and Claude Code's `mcp__server__tool` spelling. Use the dotted form for a server named `mcp` when its tool name contains `__`.
+
 Maki retains qualified MCP names even if their tools have not loaded yet. An allow list that matches no loaded tool and contains no qualified MCP name stops startup with an error. This lets a filter apply to an MCP tool that connects later. After plugins load, Maki warns about other unmatched names. Check the spelling if the tool should already be loaded. A name that never loads has no effect. Filters control both the advertised tools and dispatch, including calls through `batch`, `code_execution` and `maki.agent.call_tool`.
 
 Allow lists apply to built-in, plugin and MCP tools. Session-local tools, such as a task's `structured_output` and ACP client tools, remain available under an allow list. Deny lists and audience limits still apply to these local tools.

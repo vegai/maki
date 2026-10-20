@@ -620,12 +620,6 @@ mod tests {
             run_id_before + 2,
             "each respawn must bump run_id exactly once"
         );
-        assert_eq!(
-            app.queue.text_messages(),
-            [RESTORED_TEXT],
-            "the restored item lands in the new queue exactly once"
-        );
-
         pre_gen1_sender
             .send(AgentEvent::TextDelta {
                 text: PROBE_TEXT.into(),
@@ -644,11 +638,13 @@ mod tests {
                 AgentEvent::QueueItemConsumed { ref text, .. } => {
                     assert_eq!(text, RESTORED_TEXT);
                     assert_eq!(envelope.run_id, app.run_id);
+                    assert!(!consumed_seen, "the restored item must be consumed once");
                     consumed_seen = true;
                 }
                 _ => {}
             }
         }
+        assert!(app.queue.text_messages().is_empty());
     }
 
     /// If the seeded empty snapshot ever outlived `spawn`, the next checkpoint

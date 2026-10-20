@@ -22,7 +22,7 @@ use crate::cli::{Cli, TOOL_ARGUMENT_PATTERNS_UNSUPPORTED, is_tool_argument_patte
 use crate::provider_scripts;
 use crate::resume::{self, Resolved};
 use crate::setup;
-use maki_agent::mcp::{is_qualified_name, is_wire_name};
+use maki_agent::mcp::{TOOL_SEARCH_TOOL_NAME, is_qualified_name, is_wire_name};
 
 const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
@@ -31,8 +31,12 @@ const POLICY_GRANT_NOTICE: &str = "folder trusted by trust.paths pattern";
 const NO_ALLOWED_TOOLS: &str = "--allowed-tools matches no loaded tools or qualified MCP names";
 
 fn tool_filter_warnings(cli: &Cli, registry: &ToolRegistry, startup: bool) -> Result<Vec<String>> {
-    let known =
-        |name: &str| registry.get(name).is_some() || is_wire_name(name) || is_qualified_name(name);
+    let known = |name: &str| {
+        name == TOOL_SEARCH_TOOL_NAME
+            || registry.get(name).is_some()
+            || is_wire_name(name)
+            || is_qualified_name(name)
+    };
     if startup && !cli.allowed_tools.is_empty() && !cli.allowed_tools.iter().any(|name| known(name))
     {
         return Err(eyre!(
@@ -651,6 +655,8 @@ mod tests {
 
     #[test_case("srv.probe", true ; "qualified_mcp_tool")]
     #[test_case("srv__probe", true ; "wire_mcp_tool")]
+    #[test_case("mcp__srv__probe", true ; "claude_mcp_tool")]
+    #[test_case(TOOL_SEARCH_TOOL_NAME, true ; "tool_search")]
     #[test_case("unloaded_tool", false ; "unknown_registry_tool")]
     fn tool_filter_warnings_accept_mcp_names(name: &str, accepted: bool) {
         let cli = Cli::parse_from(["maki", "--disallowed-tools", name]);
@@ -666,6 +672,8 @@ mod tests {
     #[test_case("unloaded_tool", false ; "unknown_plugin_name")]
     #[test_case("srv.probe", true ; "qualified_mcp")]
     #[test_case("srv__probe", true ; "wire_mcp")]
+    #[test_case("mcp__srv__probe", true ; "claude_mcp")]
+    #[test_case(TOOL_SEARCH_TOOL_NAME, true ; "tool_search")]
     fn empty_allow_lists_fail_unless_an_mcp_tool_can_load_later(name: &str, accepted: bool) {
         let cli = Cli::parse_from(["maki", "--allowed-tools", name]);
         let result = tool_filter_warnings(&cli, &ToolRegistry::new(), true);

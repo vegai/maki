@@ -16,6 +16,7 @@ use serde_json::{Map, Value};
 
 use super::OAUTH_TOKEN_ENV;
 use super::error::{Error, Problem};
+use super::transcript::SERVER;
 
 pub(crate) const MINIMUM_VERSION: [u64; 3] = [2, 1, 284];
 const SYSTEMS: &[&str] = &["linux"];
@@ -578,7 +579,6 @@ pub(crate) struct InitExpect<'a> {
     /// The model, or a dated snapshot of it.
     pub model: &'a str,
     pub cwd: &'a Path,
-    pub server: &'a str,
     pub tools: &'a HashSet<String>,
 }
 
@@ -610,7 +610,7 @@ pub(crate) fn init_problem(event: &Value, expect: &InitExpect<'_>) -> Option<Pro
         expect.cwd,
         expect.tools,
         &[DEFAULT_MODE.to_owned()],
-        Some(expect.server),
+        Some(SERVER),
     )
 }
 
@@ -1104,7 +1104,6 @@ mod tests {
             version: &profile,
             model: MODEL,
             cwd: Path::new(CWD),
-            server: SERVER,
             tools: &tools,
         };
         init_problem(&event, &expect)

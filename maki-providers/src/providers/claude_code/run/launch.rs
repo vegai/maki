@@ -1,7 +1,7 @@
 use super::super::checks;
 use super::super::error::Error;
 use super::super::stream::{
-    CONTROL_RESPONSE, Handshake, INITIALIZE, Offered, SUCCESS, Step, control_request, parse_event,
+    CONTROL_RESPONSE, Handshake, INITIALIZE, SUCCESS, Step, control_request, parse_event,
 };
 use super::super::transcript::SERVER;
 use super::super::validation;
@@ -136,7 +136,7 @@ async fn unprompted<T>(
 pub(super) async fn probe(
     launch: &Launch<'_>,
     plan_usage: &Mutex<Option<ProviderUsage>>,
-) -> Result<Vec<Offered>, Error> {
+) -> Result<Handshake, Error> {
     unprompted(launch, async |group| {
         let mut stdin = group.child.stdin.take();
         let mut lines = stdout_lines(group.child.stdout.take())?;
@@ -169,7 +169,7 @@ pub(super) async fn probe(
         if !passed {
             return Err(Error::ChecksUnanswered);
         }
-        Ok(handshake.offered())
+        Ok(handshake)
     })
     .await
 }
@@ -254,8 +254,8 @@ pub(crate) async fn models(
     let offered = probe(launch, plan_usage).await?;
     let mut seen = HashSet::new();
     let ids: Vec<_> = offered
-        .into_iter()
-        .map(|offer| offer.model)
+        .offered()
+        .map(|(_, model)| model.to_owned())
         .filter(|id| seen.insert(id.clone()))
         .collect();
     let chunk_size = ids.len().div_ceil(WINDOW_PROCESSES).max(1);

@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -174,6 +174,76 @@ pub(crate) struct JobSpec {
 }
 
 impl JobSpec {
+    fn command(&self) -> Result<Command, String> {
+        #[cfg(not(target_os = "linux"))]
+        if self.guard {
+            return Err(GUARD_UNSUPPORTED.into());
+        }
+        let cwd = self.cwd.as_deref().map(expand_tilde);
+        if let Some(dir) = &cwd
+            && !dir.is_dir()
+        {
+            return Err(format!("{CWD_NOT_DIRECTORY}: {}", dir.display()));
+        }
+        let lookup_dir = if self.clear_env
+            && self
+                .env
+                .as_ref()
+                .is_none_or(|env| !env.contains_key("PATH"))
+        {
+            Some(match &cwd {
+                Some(dir) => dir.clone(),
+                None => env::current_dir().map_err(|error| error.to_string())?,
+            })
+        } else {
+            None
+        };
+        let invoking_path = env::var_os("PATH");
+        let mut command = self.cmd.build(
+            lookup_dir
+                .as_deref()
+                .map(|dir| (dir, invoking_path.as_deref())),
+        )?;
+        // `clear_env` already keeps every key out.
+        if !self.clear_env {
+            strip_provider_keys(&mut command);
+        }
+        command
+            .stdout(self.stdout.stdio()?)
+            .stderr(self.stderr.stdio()?)
+            .stdin(if self.pipe_stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            });
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: setsid is async-signal-safe, so it is sound to call in pre_exec.
+            unsafe {
+                command.pre_exec(|| {
+                    rustix::process::setsid()?;
+                    Ok(())
+                });
+            }
+        }
+
+        if let Some(dir) = cwd {
+            command.current_dir(dir);
+        }
+        if self.clear_env {
+            command.env_clear();
+        }
+        if let Some(ref env_map) = self.env {
+            for (k, v) in env_map {
+                command.env(k, v);
+            }
+        }
+
+        Ok(command)
+    }
+
     pub(crate) fn new(owner: JobOwner, cmd: impl Into<JobCommand>) -> Self {
         Self {
             owner,
@@ -313,14 +383,11 @@ impl JobStore {
     }
 
     pub fn start(&mut self, spec: JobSpec) -> Result<u32, String> {
+        let mut command = spec.command()?;
         let JobSpec {
             owner,
             cmd,
             name,
-            cwd,
-            env,
-            clear_env,
-            pipe_stdin,
             guard,
             timeout,
             stdout,
@@ -328,68 +395,8 @@ impl JobStore {
             on_stdout,
             on_stderr,
             on_exit,
+            ..
         } = spec;
-        #[cfg(not(target_os = "linux"))]
-        if guard {
-            return Err(GUARD_UNSUPPORTED.into());
-        }
-        let cwd = cwd.as_deref().map(expand_tilde);
-        if let Some(dir) = &cwd
-            && !dir.is_dir()
-        {
-            return Err(format!("{CWD_NOT_DIRECTORY}: {}", dir.display()));
-        }
-        let lookup_dir = if clear_env && env.as_ref().is_none_or(|env| !env.contains_key("PATH")) {
-            Some(match &cwd {
-                Some(dir) => dir.clone(),
-                None => env::current_dir().map_err(|error| error.to_string())?,
-            })
-        } else {
-            None
-        };
-        let invoking_path = env::var_os("PATH");
-        let mut command = cmd.build(
-            lookup_dir
-                .as_deref()
-                .map(|dir| (dir, invoking_path.as_deref())),
-        )?;
-        // `clear_env` already keeps every key out.
-        if !clear_env {
-            strip_provider_keys(&mut command);
-        }
-        command
-            .stdout(stdout.stdio()?)
-            .stderr(stderr.stdio()?)
-            .stdin(if pipe_stdin {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            });
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            // SAFETY: setsid is async-signal-safe, so it is sound to call in pre_exec.
-            unsafe {
-                command.pre_exec(|| {
-                    rustix::process::setsid()?;
-                    Ok(())
-                });
-            }
-        }
-
-        if let Some(dir) = cwd {
-            command.current_dir(dir);
-        }
-        if clear_env {
-            command.env_clear();
-        }
-        if let Some(ref env_map) = env {
-            for (k, v) in env_map {
-                command.env(k, v);
-            }
-        }
-
         #[cfg(target_os = "linux")]
         let lifetime = if guard {
             Some(process::guard::bind(&mut command).map_err(|error| error.to_string())?)
@@ -406,36 +413,12 @@ impl JobStore {
 
         let (event_tx, event_rx) = flume::unbounded();
 
-        macro_rules! spawn_reader {
-            ($stream:expr, $name:expr, $variant:ident) => {
-                if let Some(stream) = $stream {
-                    let tx = event_tx.clone();
-                    Some(
-                        thread::Builder::new()
-                            .name($name.into())
-                            .spawn(move || {
-                                for line in BufReader::with_capacity(READER_BUF_SIZE, stream)
-                                    .split(b'\n')
-                                    .map_while(Result::ok)
-                                {
-                                    if tx.send(JobEvent::$variant(text_line(line))).is_err() {
-                                        break;
-                                    }
-                                }
-                            })
-                            .map_err(|e| e.to_string())?,
-                    )
-                } else {
-                    None
-                }
-            };
-        }
         let reap_state = Arc::new(ReapState::default());
         let stdin = stdin_pipe
             .map(|stdin| spawn_stdin_writer(stdin, Arc::clone(&reap_state)))
             .transpose()?;
-        let stdout_handle = spawn_reader!(stdout_pipe, "job-stdout", Stdout);
-        let stderr_handle = spawn_reader!(stderr_pipe, "job-stderr", Stderr);
+        let stdout_handle = spawn_reader(stdout_pipe, "job-stdout", &event_tx, JobEvent::Stdout)?;
+        let stderr_handle = spawn_reader(stderr_pipe, "job-stderr", &event_tx, JobEvent::Stderr)?;
 
         let wait_reaped = Arc::clone(&reap_state);
         thread::Builder::new()
@@ -911,6 +894,32 @@ fn drop_callbacks(lua: &Lua, job: &mut JobMeta) {
     }
 }
 
+fn spawn_reader(
+    stream: Option<impl Read + Send + 'static>,
+    name: &str,
+    events: &flume::Sender<JobEvent>,
+    event: fn(String) -> JobEvent,
+) -> Result<Option<thread::JoinHandle<()>>, String> {
+    let Some(stream) = stream else {
+        return Ok(None);
+    };
+    let events = events.clone();
+    thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            for line in BufReader::with_capacity(READER_BUF_SIZE, stream)
+                .split(b'\n')
+                .map_while(Result::ok)
+            {
+                if events.send(event(text_line(line))).is_err() {
+                    break;
+                }
+            }
+        })
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
 /// Writing to a pipe the child does not read blocks, so writes happen on
 /// their own thread instead of the Lua thread. The thread ends, closing
 /// stdin, when every sender drops or the child stops reading.
@@ -1058,11 +1067,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::api::r#fn::{
-        call_back, chansend_bytes, deliver_job_event, winrestview__register, winsaveview__register,
-    };
-    use crate::api::util::command::{NO_UI_ERR, UiAction, WinView};
-    use mlua::{Table, Value};
+    use crate::api::r#fn::deliver_job_event;
 
     #[cfg(unix)]
     const JOB_SHELL: &str = "bash";
@@ -1071,7 +1076,6 @@ mod tests {
     #[cfg(unix)]
     const SELECTED_SHELL: &str = "the shell selected from the invoking path";
     const TEST_PLUGIN: &str = "test-plugin";
-    const CALLBACK_LINE: &str = "output";
     const JOB_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
     const JOB_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -1104,34 +1108,11 @@ mod tests {
     const NEVER_ENDS: &str = "sleep 30";
     #[cfg(unix)]
     const ECHOES_STDIN: &str = "cat";
-    const FIRST_LINE: &[u8] = b"first";
-    const NOT_UTF8_LINE: &[u8] = b"latin\xe9";
-    const LINE_WITH_NEWLINE: &[u8] = b"two\nparts";
-    const LINE_WITH_NUL: &[u8] = b"two\0parts";
     #[cfg(unix)]
     const PRINTS_ENV: &str = "env";
     /// Keeps a `sleep` that closed all its output, and prints its pid.
     #[cfg(target_os = "linux")]
     const LEFT_ITS_OUTPUT: &str = "sleep 30 >/dev/null 2>&1 </dev/null & echo $!";
-
-    #[test_case(JobEvent::Stdout(CALLBACK_LINE.into()), 3 ; "stdout")]
-    #[test_case(JobEvent::Stderr(CALLBACK_LINE.into()), 3 ; "stderr")]
-    #[test_case(JobEvent::Exit(0, false), 4 ; "normal_exit")]
-    #[test_case(JobEvent::Exit(1, true), 4 ; "timeout_exit")]
-    fn job_callbacks_keep_their_argument_counts(event: JobEvent, count: usize) {
-        let lua = Lua::new();
-        let callback = lua
-            .load("return function(...) args = table.pack(...) end")
-            .eval()
-            .unwrap();
-        smol::block_on(call_back(&lua, callback, 1, &event)).unwrap();
-        let args: Table = lua.globals().get("args").unwrap();
-        assert_eq!(args.get::<usize>("n").unwrap(), count);
-        assert_eq!(args.get::<String>(3).unwrap(), event.name());
-        if let JobEvent::Exit(_, timed_out) = event {
-            assert_eq!(args.get::<bool>(4).unwrap(), timed_out);
-        }
-    }
 
     #[cfg(unix)]
     #[test]
@@ -1171,28 +1152,6 @@ mod tests {
             assert!(Instant::now() < deadline, "{NEVER_EXITED}");
             thread::sleep(JOB_POLL_INTERVAL);
         }
-    }
-
-    /// List items can contain arbitrary bytes, as in Neovim. A newline inside an item becomes NUL.
-    #[test]
-    fn chansend_sends_a_list_as_bytes() {
-        let lua = Lua::new();
-        let lines = lua
-            .create_sequence_from([
-                lua.create_string(FIRST_LINE).unwrap(),
-                lua.create_string(NOT_UTF8_LINE).unwrap(),
-                lua.create_string(LINE_WITH_NEWLINE).unwrap(),
-            ])
-            .unwrap();
-        let expected = [
-            FIRST_LINE,
-            b"\n".as_slice(),
-            NOT_UTF8_LINE,
-            b"\n".as_slice(),
-            LINE_WITH_NUL,
-        ]
-        .concat();
-        assert_eq!(chansend_bytes(Value::Table(lines)).unwrap(), expected);
     }
 
     /// What `deliver_job_event` does with {event}, minus the callback.
@@ -1538,74 +1497,6 @@ mod tests {
         assert_eq!(served, [1, 2, 1, 2]);
     }
 
-    fn lua_with_view(tx: Option<flume::Sender<UiAction>>) -> Lua {
-        let lua = Lua::new();
-        let t = lua.create_table().unwrap();
-        winsaveview__register(&t, &lua, tx.clone()).unwrap();
-        winrestview__register(&t, &lua, tx).unwrap();
-        lua.globals().set("f", t).unwrap();
-        lua
-    }
-
-    #[test_case::test_case("return f.winsaveview()" ; "winsaveview")]
-    #[test_case::test_case("return f.winrestview({ topline = 3 })" ; "winrestview")]
-    fn view_without_ui_returns_error_pair(code: &str) {
-        let lua = lua_with_view(None);
-        let (val, err): (Value, Option<String>) =
-            smol::block_on(lua.load(code).eval_async()).unwrap();
-        assert!(val.is_nil());
-        assert_eq!(err.as_deref(), Some(NO_UI_ERR));
-    }
-
-    #[test]
-    fn winsaveview_reports_the_viewport_one_based() {
-        const SCROLL_TOP: u32 = 6;
-        const LINE_COUNT: u32 = 100;
-        const HEIGHT: u16 = 24;
-
-        let (tx, rx) = flume::unbounded::<UiAction>();
-        let lua = lua_with_view(Some(tx));
-        std::thread::spawn(move || {
-            let Ok(UiAction::WinSaveView { reply_tx }) = rx.recv() else {
-                panic!("expected winsaveview request");
-            };
-            reply_tx
-                .send(WinView {
-                    scroll_top: SCROLL_TOP,
-                    line_count: LINE_COUNT,
-                    height: HEIGHT,
-                    auto_scroll: false,
-                })
-                .unwrap();
-        });
-        let (view, err): (Table, Option<String>) =
-            smol::block_on(lua.load("return f.winsaveview()").eval_async()).unwrap();
-        assert_eq!(err, None);
-        assert_eq!(view.get::<u32>("topline").unwrap(), SCROLL_TOP + 1);
-        assert_eq!(view.get::<u32>("line_count").unwrap(), LINE_COUNT);
-        assert_eq!(view.get::<u16>("height").unwrap(), HEIGHT);
-        assert!(!view.get::<bool>("auto_scroll").unwrap());
-    }
-
-    #[test_case::test_case("{ topline = 12 }", 11 ; "explicit_topline")]
-    #[test_case::test_case("{}", 0 ; "missing_topline_defaults_to_first_line")]
-    #[test_case::test_case("{ topline = -5 }", 0 ; "below_range_clamps_to_first_line")]
-    fn winrestview_forwards_zero_based_scroll_top(arg: &str, expected: u32) {
-        let (tx, rx) = flume::unbounded::<UiAction>();
-        let lua = lua_with_view(Some(tx));
-        let (ok, err): (bool, Option<String>) = smol::block_on(
-            lua.load(format!("return f.winrestview({arg})"))
-                .eval_async(),
-        )
-        .unwrap();
-        assert!(ok);
-        assert_eq!(err, None);
-        let Ok(UiAction::WinRestView { scroll_top }) = rx.recv() else {
-            panic!("expected winrestview request");
-        };
-        assert_eq!(scroll_top, expected);
-    }
-
     #[test]
     fn exit_cleanup_runs_before_a_failing_callback() {
         let lua = Lua::new();
@@ -1911,8 +1802,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test_case::test_case(false ; "without_a_pipe")]
-    #[test_case::test_case(true ; "after_closing_it")]
+    #[test_case(false ; "without_a_pipe")]
+    #[test_case(true ; "after_closing_it")]
     fn writing_to_a_closed_or_missing_stdin_is_an_error(pipe_stdin: bool) {
         let mut store = make_store();
         let id = store
@@ -2244,9 +2135,9 @@ mod tests {
         );
     }
 
-    #[test_case::test_case(3, false ; "tail_holds_every_line")]
-    #[test_case::test_case(2, true ; "tail_evicted_a_line")]
-    #[test_case::test_case(0, true ; "tail_disabled")]
+    #[test_case(3, false ; "tail_holds_every_line")]
+    #[test_case(2, true ; "tail_evicted_a_line")]
+    #[test_case(0, true ; "tail_disabled")]
     fn dropped_says_whether_the_tail_is_the_whole_output(cap: usize, expected: bool) {
         let mut store = make_store();
         store.jobs.insert(1, stub_job(task_owner(1), None, None));

@@ -35,14 +35,14 @@ local CONFINE = {
   allow_write = { "/artifacts/a1/tmp" },
 }
 
-local function local_settings_dirs(cwd)
+local function launch_denied_dirs(cwd)
   local home = t.mktmpdir("cc_launch_home")
   local paths, err = native.prepare_launch({ HOME = home }, nil, cwd)
   t.rmtree(home)
   if not paths then
     return nil, err
   end
-  return paths.dirs, nil, paths.git_dir
+  return paths.denied
 end
 
 local function init_event(overrides)
@@ -696,9 +696,9 @@ end
 
 -- Temporary directories can belong to a repository. Use a nonexistent path to exercise the
 -- walk to the filesystem root.
-case("local_settings_dirs_outside_a_repository", function()
+case("launch_denied_dirs_outside_a_repository", function()
   local cwd = "/no-such-dir-for-the-claude-code-spec/work"
-  local dirs, err = local_settings_dirs(cwd)
+  local dirs, err = launch_denied_dirs(cwd)
   eq(err, nil)
   eq(table.concat(dirs, "|"), cwd)
 end)
@@ -744,7 +744,7 @@ for _, c in ipairs({
     git_dir = "super/.git/modules/sub",
   },
 }) do
-  case("local_settings_dirs_" .. c.name, function()
+  case("launch_denied_dirs_" .. c.name, function()
     local root = t.mktmpdir("cc_layout")
     for _, dir in ipairs(c.dirs) do
       maki.fs.mkdir(maki.fs.joinpath(root, dir), { parents = true })
@@ -752,15 +752,17 @@ for _, c in ipairs({
     for path, content in pairs(c.files) do
       write_file(maki.fs.joinpath(root, path), (content:gsub("@ROOT@", root)))
     end
-    local dirs, err, git_dir = local_settings_dirs(maki.fs.joinpath(root, c.cwd))
+    local dirs, err = launch_denied_dirs(maki.fs.joinpath(root, c.cwd))
     t.rmtree(root)
     eq(err, nil)
     local want = {}
     for i, rel in ipairs(c.want) do
       want[i] = maki.fs.joinpath(root, rel)
     end
+    if c.git_dir then
+      want[#want + 1] = maki.fs.joinpath(root, c.git_dir)
+    end
     eq(table.concat(dirs, "|"), table.concat(want, "|"))
-    eq(git_dir, c.git_dir and maki.fs.joinpath(root, c.git_dir))
   end)
 end
 
@@ -780,7 +782,7 @@ for _, c in ipairs({
     git = "gitdir: ../main/.git/worktrees/wt\\n",
   },
 }) do
-  case("local_settings_dirs_refuse_" .. c.name, function()
+  case("launch_denied_dirs_refuse_" .. c.name, function()
     local root = t.mktmpdir("cc_layout")
     for _, dir in ipairs(c.dirs) do
       maki.fs.mkdir(maki.fs.joinpath(root, dir), { parents = true })
@@ -796,7 +798,7 @@ for _, c in ipairs({
     local result, wait_err = maki.fn.jobwait(job, JOB_WAIT_MS)
     eq(wait_err, nil)
     eq(result and result.exit_code, 0, "the fixture job must finish successfully")
-    local dirs, err = local_settings_dirs(maki.fs.joinpath(root, "wt"))
+    local dirs, err = launch_denied_dirs(maki.fs.joinpath(root, "wt"))
     t.rmtree(root)
     eq(dirs, nil)
     has(err, maki.fs.joinpath(root, "wt/.git"))

@@ -15,6 +15,10 @@ local function alive(status)
   return status == "working" or status == "idle" or status == "queued"
 end
 
+function M.running(task)
+  return alive(task.status)
+end
+
 -- The main chat comes first and has no status. The subagents follow, live
 -- ones above finished ones so a long job never gets buried under the ones
 -- that already returned. Within a section, newest first (`tasks` comes in
@@ -29,7 +33,7 @@ function M.build(tasks, query)
     if ListPicker.matches(task.name, words) then
       if not task.status then
         main = task
-      elseif alive(task.status) then
+      elseif M.running(task) then
         running[#running + 1] = task
       else
         finished[#finished + 1] = task
@@ -54,7 +58,7 @@ end
 -- itself, and dropping a live task would orphan its transcript. The host has
 -- the final say. This check only decides which rows ask "are you sure".
 function M.deletable(task)
-  return task.status ~= nil and not alive(task.status)
+  return task.status ~= nil and not M.running(task)
 end
 
 -- Position of {id} among {rows}, or nil. The selection is kept as an id and

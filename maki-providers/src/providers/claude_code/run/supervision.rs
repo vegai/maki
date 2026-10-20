@@ -63,6 +63,22 @@ pub(super) struct Group {
     _lifetime: UnixStream,
 }
 
+enum LeaderExit {
+    Exited,
+    WaitFailed,
+    TimedOut,
+}
+
+impl From<Option<bool>> for LeaderExit {
+    fn from(exited: Option<bool>) -> Self {
+        match exited {
+            Some(true) => Self::Exited,
+            Some(false) => Self::WaitFailed,
+            None => Self::TimedOut,
+        }
+    }
+}
+
 impl Group {
     pub(super) async fn spawn(command: process::Command) -> Result<Self, Error> {
         smol::unblock(move || spawn_piped(command))
@@ -99,7 +115,7 @@ impl Group {
     /// group.
     pub(super) async fn wait(&mut self, deadline: Instant) -> Result<ExitStatus, Error> {
         let exited = self.exited_by(deadline).await;
-        if exited != Some(false) {
+        if !matches!(exited, LeaderExit::WaitFailed) {
             self.kill();
         }
         // The status future may reap even if its caller stops waiting. Disable further
@@ -108,7 +124,7 @@ impl Group {
         let status = within(Instant::now() + SHUTDOWN_GRACE, self.child.status())
             .await
             .ok_or(Error::ReapLate)?;
-        if exited.is_none() {
+        if matches!(exited, LeaderExit::TimedOut) {
             return Err(Error::ExitLate);
         }
         status.map_err(|source| Error::Io {
@@ -119,17 +135,20 @@ impl Group {
 
     /// Does not reap the leader.
     #[cfg(unix)]
-    async fn exited_by(&self, deadline: Instant) -> Option<bool> {
+    async fn exited_by(&self, deadline: Instant) -> LeaderExit {
         let pid = self.child.id();
-        within(deadline, smol::unblock(move || wait_without_reaping(pid))).await
+        within(deadline, smol::unblock(move || wait_without_reaping(pid)))
+            .await
+            .into()
     }
 
     /// The open process handle keeps the pid for this process.
     #[cfg(not(unix))]
-    async fn exited_by(&mut self, deadline: Instant) -> Option<bool> {
+    async fn exited_by(&mut self, deadline: Instant) -> LeaderExit {
         within(deadline, self.child.status())
             .await
             .map(|status| status.is_ok())
+            .into()
     }
 }
 
