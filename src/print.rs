@@ -239,7 +239,7 @@ pub fn run(params: PrintParams) -> Result<()> {
     } = handle;
     let start = Instant::now();
     let (Ready { model, tool_names }, thinking) =
-        crate::headless::startup(&ready, model, defaults.thinking);
+        crate::headless_startup::startup(&ready, model, defaults.thinking);
 
     let mut verbose_out = match format {
         OutputFormat::StreamJson => Some(VerboseOutput::StreamJson),

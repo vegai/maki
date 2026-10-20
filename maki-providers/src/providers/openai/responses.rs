@@ -239,7 +239,7 @@ async fn post_responses(
         .configure_request(
             Request::builder()
                 .method("POST")
-                .uri(format!("{}{RESPONSES_PATH}", base))
+                .uri(format!("{base}{RESPONSES_PATH}"))
                 .header("content-type", "application/json")
                 .header("user-agent", super::super::user_agent()),
         )

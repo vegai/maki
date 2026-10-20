@@ -1066,37 +1066,6 @@ fn agent_api_value_failures_return_err_pairs() {
     assert_eq!(out, "prompt_err tools_err model_err");
 }
 
-#[test]
-fn system_prompt_and_context_load_the_sessions_instructions() {
-    const TOOL: &str = "session_instructions";
-    let project = tempfile::tempdir().unwrap();
-    std::fs::write(project.path().join("AGENTS.md"), INSTRUCTION_CONTENT).unwrap();
-    let reg = fresh_registry();
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let source = format!(
-        r#"maki.api.register_tool({{
-            name = "{TOOL}", description = "session instructions", schema = {MINIMAL_SCHEMA},
-            handler = function(_, ctx)
-                local prompt = assert(maki.agent.system_prompt(ctx, {{ prompt_id = "system", instructions = true }}))
-                local instructions = assert(ctx:instructions())
-                assert(prompt:find(instructions, 1, true))
-                return prompt
-            end,
-        }})"#
-    );
-    host.load_source(TOOL, &source).unwrap();
-    let mut ctx = maki_agent::tools::test_support::stub_ctx_in(project.path(), None, None);
-    ctx.registry = Arc::clone(&reg);
-    let invocation = reg.get(TOOL).unwrap().tool.parse(&json!({})).unwrap();
-    let output = smol::block_on(invocation.execute(&ctx)).output.unwrap();
-    let ToolOutput::Plain(text) = output else {
-        panic!("unexpected output: {output:?}")
-    };
-    let text = text.text;
-    assert!(text.contains(INSTRUCTION_CONTENT), "{text}");
-    assert!(text.contains(project.path().to_str().unwrap()), "{text}");
-}
-
 /// `spec` must win over `tier` when both are given, proving the task plugin's
 /// `model` field (forwarded as `spec`) takes precedence over `model_tier`.
 #[test]

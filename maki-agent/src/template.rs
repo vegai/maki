@@ -14,10 +14,6 @@ pub fn env_vars() -> Vars {
     let cwd = env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| ".".into());
-    env_vars_at(cwd)
-}
-
-pub fn env_vars_at(cwd: impl Into<String>) -> Vars {
     let date = Zoned::now().strftime("%Y-%m-%d").to_string();
     Vars::new()
         .set("{environment}", ENVIRONMENT)
