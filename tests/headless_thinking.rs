@@ -19,7 +19,11 @@ use wait_timeout::ChildExt;
 
 #[path = "support/isolation.rs"]
 mod isolation;
+#[path = "support/wire.rs"]
+#[allow(dead_code)]
+mod wire;
 use isolation::Isolation;
+use wire::{INIT, RESULT, STREAM_FORMAT, SYSTEM};
 
 const MODEL: &str = "thinking-fixture/fixture-model";
 const PROMPT: &str = "Reply briefly.";
@@ -37,10 +41,6 @@ const INVALID_EFFORT: &str = "invalid value 'turbo' for '--effort <EFFORT>'";
 const INVALID_BUDGET: &str = "invalid value '-1' for '--max-thinking-tokens <MAX_THINKING_TOKENS>'";
 const BUDGET_RANGE: &str = "not in 0..=4294967295";
 const PROTOCOL_TIMEOUT: Duration = Duration::from_secs(30);
-const STREAM_FORMAT: &str = "stream-json";
-const SYSTEM: &str = "system";
-const INIT: &str = "init";
-const RESULT: &str = "result";
 const INITIALIZE_ID: u64 = 1;
 const NEW_SESSION_ID: u64 = 2;
 const PROMPT_ID: u64 = 3;
@@ -267,5 +267,18 @@ fn invalid_launch_thinking_exits_before_a_provider_request(flags: &[&str], expec
         assert!(stderr.contains(BUDGET_RANGE), "{stderr}");
     }
     assert!(output.stdout.is_empty());
+    assert!(fixture.requests.lock().unwrap().is_empty());
+}
+
+#[test_case(&["models", "--thinking", "low"] ; "thinking")]
+#[test_case(&["models", "--effort", "high"] ; "effort")]
+#[test_case(&["models", "--max-thinking-tokens", "0"] ; "budget")]
+fn thinking_flags_require_a_session(flags: &[&str]) {
+    const EXPECTED: &str = "thinking flags apply only to TUI, --print, SDK and ACP sessions";
+    let fixture = Fixture::new(None, Yes);
+    let output = fixture.command().args(flags).output().unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains(EXPECTED), "{stderr}");
     assert!(fixture.requests.lock().unwrap().is_empty());
 }

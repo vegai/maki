@@ -18,29 +18,9 @@ M.IMPORT_DISPLACED = "displaced"
 M.STAGE_TEMPLATE = "stage.XXXXXX"
 local OWNER_EXECUTE_BITS = "[xs]"
 
---- `ipairs` skips object entries. Require a JSON array so an object cannot bypass list validation.
-function M.is_list(value)
-  if type(value) ~= "table" then
-    return false
-  end
-  if next(value) == nil and getmetatable(value) == nil then
-    return false
-  end
-  local count = 0
-  for _ in pairs(value) do
-    count = count + 1
-  end
-  for key in pairs(value) do
-    if type(key) ~= "number" or key % 1 ~= 0 or key < 1 or key > count then
-      return false
-    end
-  end
-  return true
-end
-
 function M.set_of(list)
   local set = {}
-  for _, item in ipairs(M.is_list(list) and list or {}) do
+  for _, item in ipairs(list) do
     set[item] = true
   end
   return set

@@ -147,7 +147,7 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         include_dir!("$CARGO_MANIFEST_DIR/../plugins/completion"),
     ),
     BundledPlugin {
-        name: "claude_code",
+        name: maki_providers::claude_code::PLUGIN,
         private_api: Some(crate::api::claude_code::create_private_module),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/claude_code"),
     },
@@ -1374,8 +1374,11 @@ mod tests {
     fn claude_code_bundled_spec(source: &str) {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.send_load(
-            Arc::from(crate::api::claude_code::PLUGIN),
-            vec![LoadChunk::bundled(crate::api::claude_code::PLUGIN, source)],
+            Arc::from(maki_providers::claude_code::PLUGIN),
+            vec![LoadChunk::bundled(
+                maki_providers::claude_code::PLUGIN,
+                source,
+            )],
             LoadContext {
                 authority: DeclAuthority::Bundled,
                 private_api: Some(crate::api::claude_code::create_private_module),

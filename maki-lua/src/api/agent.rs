@@ -338,7 +338,9 @@ async fn system_prompt(
     ctx: mlua::UserDataRef<LuaCtx>,
     opts: Table,
 ) -> LuaResult<Pair<String>> {
-    let slots = Arc::clone(&try_pair!(dispatch_ctx(&ctx, "system_prompt")).prompt_slots);
+    let agent = try_pair!(dispatch_ctx(&ctx, "system_prompt"));
+    let slots = Arc::clone(&agent.prompt_slots);
+    let cwd = agent.permissions.cwd().to_string_lossy().into_owned();
     // Nothing may hold the ctx borrow across the wait: a cancel hook firing
     // meanwhile needs `ctx:finish`, which takes it mutably.
     drop(ctx);
@@ -350,11 +352,10 @@ async fn system_prompt(
         other => return Ok(err_pair(format!("unknown prompt_id: {other}"))),
     };
 
-    let vars = maki_agent::template::env_vars();
+    let vars = maki_agent::template::env_vars_at(cwd.clone());
     let instructions_val: LuaValue = opts.get("instructions")?;
     let instructions = match instructions_val {
         LuaValue::Boolean(true) => {
-            let cwd = vars.apply("{cwd}").into_owned();
             smol::unblock(move || maki_agent::agent::load_instruction_text(&cwd)).await
         }
         LuaValue::Boolean(false) | LuaValue::Nil => String::new(),

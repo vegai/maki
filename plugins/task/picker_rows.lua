@@ -88,7 +88,7 @@ end
 -- itself, and dropping a running task would orphan its transcript. The host
 -- has the final say. This check only decides which rows ask "are you sure".
 function M.deletable(task)
-  return task.status ~= nil and task.status ~= "working"
+  return task.status ~= nil and task.status ~= "working" and task.status ~= "queued"
 end
 
 -- Position of {id} among {rows}, or nil. The selection is kept as an id and

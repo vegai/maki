@@ -363,7 +363,7 @@ impl<'a> Hook<'a> {
 /// answer, so a name can never be reported as one thing and run as another.
 enum Route<'a> {
     Local(&'a LocalTool),
-    Native(RegisteredTool),
+    Native(Cow<'a, RegisteredTool>),
     ToolSearch(&'a McpSession),
     Mcp(&'a McpSession, Arc<str>),
 }
@@ -416,7 +416,7 @@ fn resolve<'a>(ctx: &'a ToolContext, name: &'a str) -> Resolved<'a> {
     let route = if let Some(local) = ctx.local_tools.get(name) {
         Some(Route::Local(local))
     } else if let Some(entry) = ctx.registry.get(name) {
-        Some(Route::Native(entry))
+        Some(Route::Native(Cow::Owned(entry)))
     } else if let Some(mcp) = ctx.mcp.as_ref() {
         match mcp.resolve(name) {
             Some(qualified) => Some(Route::Mcp(mcp, qualified)),
@@ -498,7 +498,7 @@ pub fn callable(ctx: &ToolContext) -> Vec<Callable> {
     }
     for entry in ctx.registry.iter().iter() {
         let audience = entry.tool.audience();
-        if !claim(entry.name(), Route::Native(entry.clone())) {
+        if !claim(entry.name(), Route::Native(Cow::Borrowed(entry))) {
             continue;
         }
         out.push(entry_of(
@@ -594,7 +594,9 @@ async fn run_inner(
     }
     match route {
         Route::Local(local) => run_local_tool(&local.handler, id, name, input, ctx, origin).await,
-        Route::Native(entry) => run_native_tool(entry, id, name, input, ctx, origin, ask).await,
+        Route::Native(entry) => {
+            run_native_tool(entry.into_owned(), id, name, input, ctx, origin, ask).await
+        }
         Route::ToolSearch(mcp) => run_tool_search(mcp, id, input, ctx, origin),
         Route::Mcp(mcp, qualified) => {
             execute_mcp_tool(ctx, mcp, &id, qualified, input, origin, ask).await

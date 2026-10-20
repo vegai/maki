@@ -206,7 +206,14 @@ fn cli_stack(
 }
 
 pub fn dispatch(cli: Cli) -> Result<()> {
-    let thinking = cli.thinking_override();
+    let acp = matches!(cli.command, Some(Command::Acp { .. }));
+    if cli.command.is_some()
+        && !acp
+        && (cli.thinking.is_some() || cli.effort.is_some() || cli.max_thinking_tokens.is_some())
+    {
+        color_eyre::eyre::bail!("thinking flags apply only to TUI, --print, SDK and ACP sessions");
+    }
+    let thinking = acp.then(|| cli.thinking_override()).flatten();
     // `--trust` is a grant for this process, so every entry point under it
     // reads the same shared project config the TUI would.
     let trust_mode = if cli.trust {

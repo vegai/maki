@@ -26,14 +26,15 @@ use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
 use maki_lua::{EventHandle, SessionEndReason};
 use maki_providers::model::Model;
-use maki_providers::{ThinkingConfig, TokenUsage, add_cost};
+use maki_providers::{TokenUsage, add_cost};
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::notice::{NOTIFICATION, ProviderNotice, system_event};
+use crate::notice::{NOTIFICATION, ProviderNotice};
+use crate::wire::system_event;
 
 const SESSION_LINE_PREFIX: &str = "session: ";
 
@@ -237,10 +238,8 @@ pub fn run(params: PrintParams) -> Result<()> {
         task,
     } = handle;
     let start = Instant::now();
-    let Ready { model, tool_names } = smol::block_on(ready.recv_async()).unwrap_or(Ready {
-        model,
-        tool_names: Vec::new(),
-    });
+    let (Ready { model, tool_names }, thinking) =
+        crate::headless::startup(&ready, model, defaults.thinking);
 
     let mut verbose_out = match format {
         OutputFormat::StreamJson => Some(VerboseOutput::StreamJson),
@@ -256,9 +255,7 @@ pub fn run(params: PrintParams) -> Result<()> {
             session_id: &session_id,
             tools: &tool_names,
             model: &model.id,
-            thinking: ThinkingConfig::from(defaults.thinking)
-                .clamped(&model)
-                .to_string(),
+            thinking,
         })?,
         // Text mode never says which session it wrote, and a later `-r`
         // needs it. On stderr so a pipe reading the answer is unaffected.
@@ -470,7 +467,7 @@ fn dropped_prompt<'a>(event: &'a AgentEvent, parent_tool_use_id: Option<&str>) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maki_providers::TokenUsage;
+    use maki_providers::{ThinkingConfig, TokenUsage};
     use test_case::test_case;
 
     const DROP_REASON: &str = "blocked by a plugin";

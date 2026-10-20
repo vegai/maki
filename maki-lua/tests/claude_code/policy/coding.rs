@@ -727,25 +727,68 @@ fn a_tracked_folder_replaced_by_a_link_has_an_actionable_error() {
     assert!(error.contains(source.to_str().unwrap()), "{error}");
 }
 
-#[test_case(false, false ; "empty_directory")]
-#[test_case(true, false ; "directory_with_untracked_files")]
-#[test_case(true, true ; "directory_with_included_files")]
-fn a_tracked_file_can_be_replaced_by_a_directory(populated: bool, include: bool) {
+#[test_case(false, false, false ; "empty_directory_at_root")]
+#[test_case(true, false, false ; "untracked_files_at_root")]
+#[test_case(true, true, false ; "included_files_at_root")]
+#[test_case(false, false, true ; "empty_directory_in_subdirectory")]
+#[test_case(true, false, true ; "untracked_files_in_subdirectory")]
+#[test_case(true, true, true ; "included_files_in_subdirectory")]
+fn a_tracked_file_can_be_replaced_by_a_directory(
+    populated: bool,
+    include: bool,
+    subdirectory: bool,
+) {
     let coding = Coding::new();
     let project = coding.project();
-    write(&project.join(RETYPED_FILE), BASE_LIB);
+    let session = if subdirectory {
+        project.join("src")
+    } else {
+        project.clone()
+    };
+    write(&session.join(RETYPED_FILE), BASE_LIB);
     commit_all(&project);
-    fs::remove_file(project.join(RETYPED_FILE)).unwrap();
-    fs::create_dir(project.join(RETYPED_FILE)).unwrap();
+    fs::remove_file(session.join(RETYPED_FILE)).unwrap();
+    fs::create_dir(session.join(RETYPED_FILE)).unwrap();
     if populated {
-        write(&project.join(RETYPED_CHILD), BASE_LIB);
+        write(&session.join(RETYPED_CHILD), BASE_LIB);
     }
     let (registry, _host) = coding.host(&[]);
     let include = if include { &[RETYPED_FILE][..] } else { &[] };
-    let reply = coding.code(&registry, CODE_EDIT, include).unwrap();
+    let mut ctx = ctx_in(&session, None, None);
+    ctx.registry = Arc::clone(&registry);
+    let reply = run_tool(&registry, &ctx, TOOL, json!({ "prompt": CODE_EDIT, "model": MODEL_ALIAS, "profile": CODE_PROFILE, "include": include })).unwrap();
     let snapshot = coding.artifact(&artifact_id(&reply)).join(SNAPSHOT_DIR);
     assert!(!snapshot.join(RETYPED_FILE).is_file());
     assert_eq!(snapshot.join(RETYPED_CHILD).exists(), !include.is_empty());
+}
+
+#[test_case(false ; "root_session")]
+#[test_case(true ; "subdirectory_session")]
+fn uncommitted_deletions_stay_out_of_the_snapshot(subdirectory: bool) {
+    let coding = Coding::new();
+    let project = coding.project();
+    fs::remove_file(project.join(DELETED_FILE)).unwrap();
+    let session = if subdirectory {
+        project.join("src")
+    } else {
+        project.clone()
+    };
+    let (registry, _host) = coding.host(&[]);
+    let mut ctx = ctx_in(&session, None, None);
+    ctx.registry = Arc::clone(&registry);
+    let reply = run_tool(
+        &registry,
+        &ctx,
+        TOOL,
+        json!({ "prompt": CODE_EDIT, "model": MODEL_ALIAS, "profile": CODE_PROFILE }),
+    )
+    .unwrap();
+    let snapshot = coding.artifact(&artifact_id(&reply)).join(SNAPSHOT_DIR);
+    assert!(
+        !snapshot
+            .join(if subdirectory { "old.rs" } else { DELETED_FILE })
+            .exists()
+    );
 }
 
 #[test]
@@ -1591,6 +1634,11 @@ fn an_unsafe_link_prepare_makes_is_dropped(fail_batch: bool) {
     let prepare = format!("ln -s {OUTSIDE_TARGET} {PREPARED_LINK}");
     let (reg, _host) = coding.host(&[("prepare", json!(prepare))]);
     let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
+    let prompt = coding.fake.log("prompt");
+    assert!(
+        prompt.contains(LINKS_LEFT_OUT) && prompt.contains(PREPARED_LINK),
+        "{prompt}"
+    );
 
     let snapshot = coding
         .artifacts
@@ -1937,14 +1985,28 @@ fn dependency_exclusions_do_not_depend_on_copying(prepared: bool) {
 
 /// Dependency paths stay outside the import. Python virtual environment scripts contain
 /// absolute paths, so preparation must recreate them.
-#[test]
-fn dependencies_come_along_but_never_as_changes() {
+#[test_case(false ; "root_session")]
+#[test_case(true ; "subdirectory_session")]
+fn dependencies_come_along_but_never_as_changes(subdir: bool) {
     let coding = Coding::new();
     let project = coding.project();
-    write(&project.join(DEPENDENCY), DEPENDENCY_CONTENT);
-    write(&project.join(".venv/pyvenv.cfg"), "home = /usr/bin\n");
+    let session = if subdir {
+        project.join("src")
+    } else {
+        project.clone()
+    };
+    write(&session.join(DEPENDENCY), DEPENDENCY_CONTENT);
+    write(&session.join(".venv/pyvenv.cfg"), "home = /usr/bin\n");
     let (reg, _host) = coding.host(&[("dependencies", json!(DEPENDENCIES_WITH_A_VENV))]);
-    let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
+    let mut ctx = ctx_in(&session, None, None);
+    ctx.registry = Arc::clone(&reg);
+    let reply = run_tool(
+        &reg,
+        &ctx,
+        TOOL,
+        json!({ "prompt": CODE_EDIT, "model": MODEL_ALIAS, "profile": CODE_PROFILE }),
+    )
+    .unwrap();
 
     let listing = coding.fake.log("snapshot_listing");
     assert!(
@@ -1963,7 +2025,7 @@ fn dependencies_come_along_but_never_as_changes() {
         "a dependency shows as a change: {reply}"
     );
     assert_eq!(
-        fs::read_to_string(project.join(DEPENDENCY)).unwrap(),
+        fs::read_to_string(session.join(DEPENDENCY)).unwrap(),
         DEPENDENCY_CONTENT
     );
 }

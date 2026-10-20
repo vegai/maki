@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process;
 #[cfg(target_os = "linux")]
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use tempfile::TempDir;
 #[cfg(target_os = "linux")]
 use tracing::{debug, warn};
@@ -102,7 +102,7 @@ pub(in crate::providers::claude_code) fn private_dir(
         path: dir.path().to_owned(),
         source,
     })?;
-    if inside_checkout(&path) || project.starts_with(&path) {
+    if inside_checkout(&path) {
         return Err(Error::TempInProject(path));
     }
     Ok((PrivateDir(Some(dir)), path))
@@ -129,10 +129,15 @@ fn dir_prefix() -> String {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn owner_namespace() -> Option<String> {
-    let namespace = fs::metadata(PID_NAMESPACE).ok()?.ino();
-    let boot = fs::read_to_string(BOOT_ID).ok()?;
-    Some(format!("{}-{namespace}", boot.trim()))
+pub(super) fn owner_namespace() -> Option<&'static str> {
+    static OWNER: OnceLock<Option<String>> = OnceLock::new();
+    OWNER
+        .get_or_init(|| {
+            let namespace = fs::metadata(PID_NAMESPACE).ok()?.ino();
+            let boot = fs::read_to_string(BOOT_ID).ok()?;
+            Some(format!("{}-{namespace}", boot.trim()))
+        })
+        .as_deref()
 }
 
 /// Artifact cleanup can take a long time. Run it outside the async threads and scan each

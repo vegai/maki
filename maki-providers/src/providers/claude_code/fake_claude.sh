@@ -99,7 +99,7 @@ got=
 while IFS= read -r msg; do
   id=$(printf '%s' "$msg" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
   case "$msg" in
-    *'"subtype":"initialize"'*) reply "$id" '{"current_permission_mode":"default","account":{"apiProvider":"firstParty","subscriptionType":"Claude Pro"},"models":[{"value":"default","resolvedModel":"claude-opus-5-5"},{"value":"opus","resolvedModel":"claude-opus-5-5"},{"value":"haiku","resolvedModel":"claude-haiku-4-5-20251001"}]}' ;;
+    *'"subtype":"initialize"'*) if [ -e "$dir/logged_out" ]; then reply "$id" '{"current_permission_mode":"default","account":null}'; else reply "$id" '{"current_permission_mode":"default","account":{"apiProvider":"firstParty","subscriptionType":"Claude Pro"},"models":[{"value":"default","resolvedModel":"claude-opus-5-5"},{"value":"opus","resolvedModel":"claude-opus-5-5"},{"value":"haiku","resolvedModel":"claude-haiku-4-5-20251001"}]}'; fi ;;
     *'"subtype":"get_settings"'*) reply "$id" "{\"effective\":$flags,\"sources\":[{\"source\":\"flagSettings\",\"settings\":$flags}]}" ;;
     *'"subtype":"set_model"'*) model=$(printf '%s' "$msg" | sed -n 's/.*"model":"\([^"]*\)".*/\1/p'); reply "$id" '{}' ;;
     *'"subtype":"get_context_usage"'*)

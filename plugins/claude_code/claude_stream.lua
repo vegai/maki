@@ -31,11 +31,7 @@ local PLAN_LIMITS_USED = "plan limits used: "
 local EXTRA_USAGE = "extra usage on"
 
 local function init_problem(line, expect)
-  local modes = {}
-  for mode in pairs(expect.permission_modes) do
-    modes[#modes + 1] = mode
-  end
-  return native.init_problem(line, expect.cli.version, expect.cwd, expect.tools, modes)
+  return native.init_problem(line, expect.cli.version, expect.cwd, expect.tools, expect.permission_modes)
 end
 
 local function count(n)

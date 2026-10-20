@@ -88,9 +88,13 @@ pub fn internal_tool_name(wire: &str) -> String {
 }
 
 pub(crate) fn same_tool_name(name: &str, candidate: &str) -> bool {
-    name == candidate
-        || internal_tool_name(candidate) == name
-        || internal_tool_name(name) == candidate
+    let same_parts = |qualified: &str, wire: &str| {
+        qualified
+            .split_once(SEPARATOR)
+            .zip(wire.split_once(WIRE_SEPARATOR))
+            .is_some_and(|(qualified, wire)| qualified == wire)
+    };
+    name == candidate || same_parts(name, candidate) || same_parts(candidate, name)
 }
 
 /// Shaped like an MCP tool's wire name, whether or not a server publishes it.
@@ -362,6 +366,7 @@ enum Arrival {
 pub struct McpSession {
     handle: McpHandle,
     loaded: Arc<Mutex<HashSet<Arc<str>>>>,
+    unadvertised: Arc<Mutex<HashSet<Arc<str>>>>,
 }
 
 impl std::ops::Deref for McpSession {
@@ -391,6 +396,7 @@ impl McpSession {
         Self {
             handle,
             loaded: Arc::new(Mutex::new(loaded)),
+            unadvertised: Arc::default(),
         }
     }
 
@@ -447,12 +453,17 @@ impl McpSession {
         let defer =
             filter.matches_external(TOOL_SEARCH_TOOL_NAME) && self.deferring(&idx, deferral);
         if arrival == Arrival::Late && deferral == ToolDeferral::Native && !defer {
+            let mut reported = self
+                .unadvertised
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             let omitted: Vec<_> = idx
                 .descriptors
                 .iter()
                 .filter(|tool| {
                     !existing.contains(tool.wire_name())
                         && filter.matches_external(&tool.qualified_name)
+                        && reported.insert(Arc::clone(&tool.qualified_name))
                 })
                 .map(|tool| tool.qualified_name.as_ref())
                 .collect();
@@ -1775,6 +1786,11 @@ mod tests {
         publish(&inner, &session.index, &session.snapshot);
         session.append_late_tools(&mut tools, ToolDeferral::Native, &filter);
         assert_eq!(tools, initial);
+        assert_eq!(session.unadvertised.lock().unwrap().len(), 1);
+        session.append_late_tools(&mut tools, ToolDeferral::Native, &filter);
+        assert_eq!(tools, initial);
+        assert_eq!(session.unadvertised.lock().unwrap().len(), 1);
+        assert!(session.fresh().unadvertised.lock().unwrap().is_empty());
     }
 
     /// It runs before every request, and a name sent twice is a 400, so a

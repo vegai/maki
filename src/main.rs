@@ -1,5 +1,6 @@
 mod cli;
 mod cmd;
+mod headless;
 mod notice;
 mod print;
 mod project_trust;
@@ -9,6 +10,7 @@ mod sdk_mode;
 mod setup;
 mod tool_names;
 mod update;
+mod wire;
 
 use std::time::Duration;
 

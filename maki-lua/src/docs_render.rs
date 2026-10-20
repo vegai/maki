@@ -108,7 +108,8 @@ plugin.toml     permission grants for every Lua file in the dir
 Nothing under `lua/` loads on its own. A module name is its path under `lua/`
 without the extension: `lua/browser.lua` is `require("browser")`,
 `lua/acme/tools.lua` is `require("acme.tools")`. `require` is sandboxed to
-that directory, you cannot reach files outside it.
+that directory, you cannot reach files outside it. Plugin environments omit
+`getfenv` and `setfenv` so a plugin cannot inspect or replace another environment.
 
 ## Creating a plugin
 

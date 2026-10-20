@@ -833,7 +833,7 @@ name the session now running or focused. What each event adds:
 - `"SessionTitleChanged"`: `data.title` and `data.focused` (boolean),
   when the title changes (rename or auto-generation).
 - `"TaskStatusChanged"`: `data.id`, `data.name`, and `data.status`
-  (`"working"`, `"done"`, or `"error"`), when a subagent starts or
+  (`"queued"`, `"working"`, `"done"`, or `"error"`), when a subagent starts or
   changes status. A task that comes back from disk already finished
   stays quiet, so reloading a session does not replay old tasks.
 - `"TaskFocusChanged"`: `data.id`, the task now on screen (`"main"` or a
@@ -2386,7 +2386,7 @@ Requires the `run` [plugin permission](#plugin-permissions).
 - `{job_id}` (`integer`) Job id returned by `jobstart`.
 
 **Returns:** (`table|nil`, `string|nil`) `{ id, command, name, pid, session, status,
-  exit_code, elapsed_secs, stdout_lines, stderr_lines }`, or nil and
+  exit_code, timed_out, elapsed_secs, stdout_lines, stderr_lines }`, or nil and
   an error. `status` is `"running"` or `"exited"`.
 
 **Example:**
@@ -2415,7 +2415,7 @@ Requires the `run` [plugin permission](#plugin-permissions).
 - `{session?}` (`string?`) Session id filter.
 
 **Returns:** (`table`) array of `{ id, command, name, pid, session, status,
-  exit_code, elapsed_secs }`.
+  exit_code, timed_out, elapsed_secs }`.
 
 **Example:**
 

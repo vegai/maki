@@ -51,7 +51,7 @@ Dev builds skip debug info for deps and vendored C (our crates keep it); to debu
 Rust workspace, key crates in root dir:
 
 - maki-ui: Uses ratatui for an interactive UI (elm like architecture)
-- maki-providers: Integration with LLM providers via APIs (e.g. Anthropic, Z.AI, xAI)
+- maki-providers: Integration with LLM providers via APIs and local processes (e.g. Anthropic, Z.AI, xAI)
 - maki-agent: An async agent loop that runs on smol
 - maki-interpreter: code_execution tool implementation using pydantic/monty (a minimal python sandbox)
 - maki-storage: Persistent state across runs (e.g. sessions, auth)
@@ -59,7 +59,7 @@ Rust workspace, key crates in root dir:
 - maki-lua: Lua plugin system (API mirrored from neovim for plugin compatibility), built-in plugins in ./plugins dir
 - maki-acp: ACP ndjson stdio server
 
-Built-in lua plugins in ./plugins: index (return a compact skeleton of a source file using tree-sitter), bash, glob, question, skill, memory, webfetch, websearch, todo_write, read, write, edit, task, code_execution (python sandbox), batch.
+Built-in lua plugins in ./plugins: index (return a compact skeleton of a source file using tree-sitter), bash, glob, question, skill, memory, webfetch, websearch, todo_write, read, write, edit, task, code_execution (python sandbox), batch, claude_code.
 
 Invariant: requests are append-only. Never rebuild `system`/`tools` or edit earlier messages mid-session: it voids the prompt cache everywhere and invalidates (or 400s) Anthropic thinking blocks bound to the prefix. Use a context update (`context_update` in `maki-agent/src/agent/frame.rs`) or an announced new frame. Contract tests: `assert_append_only` in `maki-agent/src/agent/run.rs`.
 

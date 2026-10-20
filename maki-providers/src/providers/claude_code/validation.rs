@@ -17,6 +17,10 @@ use super::stream::{
     count,
 };
 
+pub use super::checks::{GIT_ENTRY, git_directory};
+pub use super::run::{VersionCheck, invalidate_profile as invalidate_version};
+use super::stream::usage_of as plan_usage;
+
 pub const EMPTY_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
 pub const STARTUP_TIMEOUT_SECS: u64 = 60;
 pub const DEFAULT_EXECUTABLE: &str = "claude";
@@ -28,10 +32,21 @@ const TMPDIR_ENV: &str = "TMPDIR";
 #[cfg(unix)]
 const UNIX_TEMP_DIR: &str = "/tmp";
 const PROBE_PATH_NOT_UTF8: &str = "probe path is not valid UTF-8";
-
-pub use super::checks::{GIT_ENTRY, git_directory};
-pub use super::run::{VersionCheck, invalidate_profile as invalidate_version};
-pub use super::stream::usage_of as plan_usage;
+const PERMISSIONS: &str = "permissions";
+const BLOCK_OUTSIDE: &str = "blockReadsOutsideWorkingDirectories";
+const DENY: &str = "deny";
+const SANDBOX: &str = "sandbox";
+const ENABLED: &str = "enabled";
+const FAIL_IF_UNAVAILABLE: &str = "failIfUnavailable";
+const AUTO_ALLOW_BASH: &str = "autoAllowBashIfSandboxed";
+const ALLOW_UNSANDBOXED: &str = "allowUnsandboxedCommands";
+const NETWORK: &str = "network";
+const ALLOWED_DOMAINS: &str = "allowedDomains";
+const STRICT_ALLOWLIST: &str = "strictAllowlist";
+const FILESYSTEM: &str = "filesystem";
+const DENY_READ: &str = "denyRead";
+const ALLOW_READ: &str = "allowRead";
+const ALLOW_WRITE: &str = "allowWrite";
 
 const BASE_ARGS: &[&str] = &[
     "--print",
@@ -112,21 +127,21 @@ struct WorkerPaths {
 impl WorkerPolicy {
     pub fn settings(&self) -> Value {
         let mut settings = base_settings();
-        settings["permissions"] = json!({
-            "blockReadsOutsideWorkingDirectories": true,
-            "deny": self.deny,
+        settings[PERMISSIONS] = json!({
+            (BLOCK_OUTSIDE): true,
+            (DENY): self.deny,
         });
         if let Some(paths) = &self.sandbox {
-            settings["sandbox"] = json!({
-                "enabled": true,
-                "failIfUnavailable": true,
-                "autoAllowBashIfSandboxed": true,
-                "allowUnsandboxedCommands": false,
-                "network": { "allowedDomains": [], "strictAllowlist": true },
-                "filesystem": {
-                    "denyRead": paths.deny_read,
-                    "allowRead": paths.allow_read,
-                    "allowWrite": paths.allow_write,
+            settings[SANDBOX] = json!({
+                (ENABLED): true,
+                (FAIL_IF_UNAVAILABLE): true,
+                (AUTO_ALLOW_BASH): true,
+                (ALLOW_UNSANDBOXED): false,
+                (NETWORK): { (ALLOWED_DOMAINS): [], (STRICT_ALLOWLIST): true },
+                (FILESYSTEM): {
+                    (DENY_READ): paths.deny_read,
+                    (ALLOW_READ): paths.allow_read,
+                    (ALLOW_WRITE): paths.allow_write,
                 },
             });
         }
@@ -238,7 +253,8 @@ pub(super) fn prepare_launch(
         env.push((CONFIG_DIR_ENV.to_owned(), config_dir.display().to_string()));
     }
     let (local_dirs, git_dir) = checks::local_settings_dirs(cwd)?;
-    let conflicts = file_conflicts(&config_dir, cwd, &local_dirs);
+    let conflicts =
+        checks::file_conflicts(&checks::skipped_settings(&config_dir, cwd, &local_dirs));
     if !conflicts.is_empty() {
         return Err(Error::SkippedSettings(conflicts));
     }
@@ -374,7 +390,7 @@ pub fn classify(
     })
 }
 
-pub fn usage_counts(usage: &Value) -> Value {
+fn usage_counts(usage: &Value) -> Value {
     json!({
         "input_tokens": count(usage, "input_tokens"),
         "cache_read_input_tokens": count(usage, "cache_read_input_tokens"),
@@ -404,12 +420,8 @@ pub fn checkout_root(cwd: &Path) -> Result<PathBuf, String> {
     checks::checkout_root(&cwd).map_err(|error| error.to_string())
 }
 
-fn file_conflicts(config_dir: &Path, cwd: &Path, local_dirs: &[PathBuf]) -> Vec<String> {
-    checks::file_conflicts(&checks::skipped_settings(config_dir, cwd, local_dirs))
-}
-
 pub fn subscription_type(account: &Value) -> Option<String> {
-    account["account"]["subscriptionType"]
+    account[checks::ACCOUNT][checks::SUBSCRIPTION_TYPE]
         .as_str()
         .map(str::to_owned)
 }
@@ -445,17 +457,17 @@ fn sandbox_problem(sandbox: &Value, expected: &Value) -> Option<String> {
         None => return Some(outside.to_owned()),
     };
     let safe_keys = [
-        "enabled",
-        "failIfUnavailable",
-        "autoAllowBashIfSandboxed",
-        "allowUnsandboxedCommands",
+        ENABLED,
+        FAIL_IF_UNAVAILABLE,
+        AUTO_ALLOW_BASH,
+        ALLOW_UNSANDBOXED,
         "excludedCommands",
         "enableWeakerNestedSandbox",
-        "network",
-        "filesystem",
+        NETWORK,
+        FILESYSTEM,
     ];
     if sandbox.keys().any(|key| !safe_keys.contains(&key.as_str()))
-        || ["enabled", "failIfUnavailable", "allowUnsandboxedCommands"]
+        || [ENABLED, FAIL_IF_UNAVAILABLE, ALLOW_UNSANDBOXED]
             .iter()
             .any(|key| sandbox.get(*key) != expected.get(*key))
         || !empty_array(sandbox.get("excludedCommands"))
@@ -465,13 +477,13 @@ fn sandbox_problem(sandbox: &Value, expected: &Value) -> Option<String> {
     {
         return Some(outside.to_owned());
     }
-    let network = match sandbox.get("network").and_then(Value::as_object) {
+    let network = match sandbox.get(NETWORK).and_then(Value::as_object) {
         Some(network) => network,
         None => return Some(network_error.to_owned()),
     };
     let network_keys = [
-        "strictAllowlist",
-        "allowedDomains",
+        STRICT_ALLOWLIST,
+        ALLOWED_DOMAINS,
         "allowAllUnixSockets",
         "allowUnixSockets",
         "allowLocalBinding",
@@ -480,10 +492,10 @@ fn sandbox_problem(sandbox: &Value, expected: &Value) -> Option<String> {
     if network
         .keys()
         .any(|key| !network_keys.contains(&key.as_str()))
-        || network.get("strictAllowlist") != expected["network"].get("strictAllowlist")
+        || network.get(STRICT_ALLOWLIST) != expected[NETWORK].get(STRICT_ALLOWLIST)
         || foreign_path(
-            network.get("allowedDomains"),
-            &expected["network"]["allowedDomains"],
+            network.get(ALLOWED_DOMAINS),
+            &expected[NETWORK][ALLOWED_DOMAINS],
         )
         .is_some()
         || !empty_array(network.get("allowUnixSockets"))
@@ -496,17 +508,11 @@ fn sandbox_problem(sandbox: &Value, expected: &Value) -> Option<String> {
     {
         return Some(network_error.to_owned());
     }
-    let filesystem = match sandbox.get("filesystem").and_then(Value::as_object) {
+    let filesystem = match sandbox.get(FILESYSTEM).and_then(Value::as_object) {
         Some(filesystem) => filesystem,
         None => return Some(read_error.to_owned()),
     };
-    let filesystem_keys = [
-        "disabled",
-        "allowRead",
-        "denyRead",
-        "allowWrite",
-        "denyWrite",
-    ];
+    let filesystem_keys = ["disabled", ALLOW_READ, DENY_READ, ALLOW_WRITE, "denyWrite"];
     if filesystem
         .keys()
         .any(|key| !filesystem_keys.contains(&key.as_str()))
@@ -516,15 +522,15 @@ fn sandbox_problem(sandbox: &Value, expected: &Value) -> Option<String> {
     {
         return Some(read_error.to_owned());
     }
-    let expected = &expected["filesystem"];
-    if let Some(path) = foreign_path(filesystem.get("allowRead"), &expected["allowRead"]) {
+    let expected = &expected[FILESYSTEM];
+    if let Some(path) = foreign_path(filesystem.get(ALLOW_READ), &expected[ALLOW_READ]) {
         return Some(format!(
             "Claude Code's sandbox lets shell commands read {path}"
         ));
     }
-    for path in expected["denyRead"].as_array().into_iter().flatten() {
+    for path in expected[DENY_READ].as_array().into_iter().flatten() {
         if !filesystem
-            .get("denyRead")
+            .get(DENY_READ)
             .and_then(Value::as_array)
             .is_some_and(|denied| denied.contains(path))
         {
@@ -534,7 +540,7 @@ fn sandbox_problem(sandbox: &Value, expected: &Value) -> Option<String> {
             ));
         }
     }
-    foreign_path(filesystem.get("allowWrite"), &expected["allowWrite"])
+    foreign_path(filesystem.get(ALLOW_WRITE), &expected[ALLOW_WRITE])
         .map(|path| format!("Claude Code's sandbox lets shell commands write to {path}"))
 }
 
@@ -542,10 +548,8 @@ fn worker_problem(effective: &Value, expected: &Value) -> Option<String> {
     if !effective.is_object() {
         return Some("Claude Code does not report effective settings".to_owned());
     }
-    let permissions = &effective["permissions"];
-    if permissions["blockReadsOutsideWorkingDirectories"]
-        != expected["permissions"]["blockReadsOutsideWorkingDirectories"]
-    {
+    let permissions = &effective[PERMISSIONS];
+    if permissions[BLOCK_OUTSIDE] != expected[PERMISSIONS][BLOCK_OUTSIDE] {
         return Some("Claude Code does not block reads outside the project".to_owned());
     }
     if !empty_array(permissions.get("additionalDirectories")) {
@@ -562,12 +566,8 @@ fn worker_problem(effective: &Value, expected: &Value) -> Option<String> {
         );
         return Some(format!("Claude Code can also read {shown}"));
     }
-    for rule in expected["permissions"]["deny"]
-        .as_array()
-        .into_iter()
-        .flatten()
-    {
-        if !permissions["deny"]
+    for rule in expected[PERMISSIONS][DENY].as_array().into_iter().flatten() {
+        if !permissions[DENY]
             .as_array()
             .is_some_and(|denied| denied.contains(rule))
         {
@@ -578,14 +578,15 @@ fn worker_problem(effective: &Value, expected: &Value) -> Option<String> {
         }
     }
     expected
-        .get("sandbox")
-        .and_then(|sandbox| sandbox_problem(&effective["sandbox"], sandbox))
+        .get(SANDBOX)
+        .and_then(|sandbox| sandbox_problem(&effective[SANDBOX], sandbox))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        TMPDIR_ENV, WorkerPaths, WorkerPolicy, prepare_launch, sandbox_problem, worker_problem,
+        PERMISSIONS, SANDBOX, TMPDIR_ENV, WorkerPaths, WorkerPolicy, prepare_launch,
+        sandbox_problem, worker_problem,
     };
     use serde_json::{Value, json};
     use std::env;
@@ -643,7 +644,7 @@ mod tests {
     #[test_case("/unknownEscape", json!(true) ; "unknown_sandbox_setting")]
     fn effective_sandbox_rejects_nulls_and_unknown_escape_settings(path: &str, value: Value) {
         let expected = expected();
-        let mut sandbox = expected["sandbox"].clone();
+        let mut sandbox = expected[SANDBOX].clone();
         let (parent, key) = path.rsplit_once('/').unwrap();
         sandbox
             .pointer_mut(parent)
@@ -651,14 +652,14 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .insert(key.to_owned(), value);
-        assert!(sandbox_problem(&sandbox, &expected["sandbox"]).is_some());
+        assert!(sandbox_problem(&sandbox, &expected[SANDBOX]).is_some());
     }
 
     #[test]
     fn null_additional_directories_are_not_an_empty_list() {
         let expected = expected();
         let mut effective = expected.clone();
-        effective["permissions"]["additionalDirectories"] = json!([null]);
+        effective[PERMISSIONS]["additionalDirectories"] = json!([null]);
         assert!(worker_problem(&effective, &expected).is_some());
     }
 }

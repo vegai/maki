@@ -961,6 +961,37 @@ fn agent_api_value_failures_return_err_pairs() {
     assert_eq!(out, "prompt_err tools_err model_err");
 }
 
+#[test]
+fn system_prompt_and_context_load_the_sessions_instructions() {
+    const TOOL: &str = "session_instructions";
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("AGENTS.md"), INSTRUCTION_CONTENT).unwrap();
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let source = format!(
+        r#"maki.api.register_tool({{
+            name = "{TOOL}", description = "session instructions", schema = {MINIMAL_SCHEMA},
+            handler = function(_, ctx)
+                local prompt = assert(maki.agent.system_prompt(ctx, {{ prompt_id = "system", instructions = true }}))
+                local instructions = assert(ctx:instructions())
+                assert(prompt:find(instructions, 1, true))
+                return prompt
+            end,
+        }})"#
+    );
+    host.load_source(TOOL, &source).unwrap();
+    let mut ctx = maki_agent::tools::test_support::stub_ctx_in(project.path(), None, None);
+    ctx.registry = Arc::clone(&reg);
+    let invocation = reg.get(TOOL).unwrap().tool.parse(&json!({})).unwrap();
+    let output = smol::block_on(invocation.execute(&ctx)).output.unwrap();
+    let ToolOutput::Plain(text) = output else {
+        panic!("unexpected output: {output:?}")
+    };
+    let text = text.text;
+    assert!(text.contains(INSTRUCTION_CONTENT), "{text}");
+    assert!(text.contains(project.path().to_str().unwrap()), "{text}");
+}
+
 /// `spec` must win over `tier` when both are given, proving the task plugin's
 /// `model` field (forwarded as `spec`) takes precedence over `model_tier`.
 #[test]
@@ -3029,13 +3060,15 @@ maki.api.register_tool({{
         return table.concat({{
             tostring(first.timed_out), tostring(second.timed_out),
             tostring(original), tostring(replay),
+            tostring(assert(maki.fn.jobinfo(id)).timed_out),
+            tostring(assert(maki.fn.joblist("{session}"))[1].timed_out),
         }}, ":")
     end,
 }})
 "#
     );
     host.load_source("deadline", &source).unwrap();
-    let expected = [timed_out; 4].map(|expired| expired.to_string()).join(":");
+    let expected = [timed_out; 6].map(|expired| expired.to_string()).join(":");
     assert_eq!(
         exec_tool(&reg, "wait_timeout", json!({})).unwrap(),
         expected
@@ -3064,6 +3097,26 @@ fn job_input_it_cannot_take_is_refused(call: &str, expected: &str) {
 
     assert!(result.starts_with("false"), "got: {result}");
     assert!(result.contains(expected), "got: {result}");
+}
+
+#[test_case("false" ; "boolean_env")]
+#[test_case(r#"{ SECRET = {} }"# ; "table_value")]
+#[test_case(r#"{ SECRET = false }"# ; "boolean_value")]
+fn malformed_job_environments_are_refused(env: &str) {
+    const TOOL: &str = "bad_job_env";
+    let mut perms = PluginPermissions::denied();
+    perms.set(maki_lua::Permission::Run, true);
+    let source = perm_tool_src(
+        TOOL,
+        &format!(
+            r#"local ok = pcall(maki.fn.jobstart, "true", {{ clear_env = true, env = {env} }})
+        return tostring(ok)"#,
+        ),
+    );
+    assert_eq!(
+        exec_tool_with_perms(perms, &source, TOOL, json!({})).unwrap(),
+        "false"
+    );
 }
 
 /// `run` on its own is enough to start a job, but pointing a stream at a path

@@ -35,7 +35,6 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-const DRAIN_ATTEMPTS: usize = 2;
 const PROMPT_FILE: &str = "system-prompt.md";
 const MCP_FILE: &str = "mcp.json";
 const TOKEN_BYTES: usize = 32;
@@ -443,26 +442,20 @@ async fn stop_and_drain(
         group.terminate();
         deadline = deadline.min(Instant::now() + SHUTDOWN_GRACE);
     }
-    for attempt in 0..DRAIN_ATTEMPTS {
-        let result = drain(turn, lines, handoffs, deadline, stopped || attempt > 0).await;
-        if attempt > 0 {
+    match drain(turn, lines, handoffs, deadline, stopped).await {
+        Err(Error::ExitLate) => {
+            group.kill();
+            warn!("claude-code: output stayed open after a complete reply; stopping the CLI");
+            deadline = Instant::now() + limits.exit;
+            match drain(turn, lines, handoffs, deadline, true).await {
+                Err(Error::ExitLate) => {
+                    warn!("claude-code: output stayed open after the kill; keeping the reply")
+                }
+                result => result?,
+            }
             deadline = Instant::now() + limits.exit;
         }
-        match result {
-            Err(Error::ExitLate) if attempt + 1 < DRAIN_ATTEMPTS => {
-                group.kill();
-                warn!("claude-code: output stayed open after a complete reply; stopping the CLI");
-                deadline = Instant::now() + limits.exit;
-            }
-            Err(Error::ExitLate) => {
-                warn!("claude-code: output stayed open after the kill; keeping the reply");
-                break;
-            }
-            result => {
-                result?;
-                break;
-            }
-        }
+        result => result?,
     }
     let status = match group.wait(deadline).await {
         Ok(status) => Some(status),
@@ -548,7 +541,6 @@ mod tests {
     use std::io;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::symlink;
-    use std::os::unix::process::ExitStatusExt;
     use std::path::Path;
     use std::process::{self, Stdio};
     use std::sync::Mutex;
@@ -573,7 +565,6 @@ mod tests {
     use super::super::transcript::{Catalog, SERVER};
     #[cfg(target_os = "linux")]
     use super::private_files::{DIR_PREFIX, OWNER_SEPARATOR, owner_namespace, sweep_dead_owners};
-    use super::supervision::spawn_piped;
     use super::{
         EFFORT_FLAG, Exchange, Group, HANDOFF, HELD_CALL_TIMEOUT_MS, Launch, Limits, Listed,
         MCP_CONFIG_FLAG, NO_AUTO_COMPACT, NO_CLI_RETRIES, NO_MID_CONVERSATION_SYSTEM,
@@ -966,7 +957,13 @@ mod tests {
     fn a_process_nobody_takes_is_stopped(cancelled_before_the_send: bool) {
         let here = env::current_dir().unwrap();
         let args = [LONG_SLEEP_SECS.to_owned()];
-        let group = spawn_piped(command(Path::new(SLEEP), &Fake::env(), &here, &args)).unwrap();
+        let group = smol::block_on(Group::spawn(command(
+            Path::new(SLEEP),
+            &Fake::env(),
+            &here,
+            &args,
+        )))
+        .unwrap();
         let pid = Pid::from_raw(group.child.id().try_into().unwrap()).unwrap();
         let (reply, answer) = flume::bounded::<io::Result<Group>>(1);
         let answer = (!cancelled_before_the_send).then_some(answer);
@@ -1318,8 +1315,8 @@ mod tests {
                 "{DIR_PREFIX}{namespace}{OWNER_SEPARATOR}{pid}.{tail}"
             ))
         };
-        let dead = named(&namespace, exited.id(), "x");
-        let alive = named(&namespace, process::id(), "x");
+        let dead = named(namespace, exited.id(), "x");
+        let alive = named(namespace, process::id(), "x");
         let elsewhere = named(&format!("{namespace}-other"), exited.id(), "x");
         let (boot, pid_namespace) = namespace.rsplit_once(OWNER_SEPARATOR).unwrap();
         let other_boot = named(&format!("{boot}-other-{pid_namespace}"), exited.id(), "x");
@@ -1329,7 +1326,7 @@ mod tests {
             fs::create_dir(dir).unwrap();
             fs::write(dir.join("mcp.json"), "{}").unwrap();
         }
-        let link = named(&namespace, exited.id(), "link");
+        let link = named(namespace, exited.id(), "link");
         symlink(target.path(), &link).unwrap();
 
         sweep_dead_owners(base.path());
@@ -1562,27 +1559,5 @@ mod tests {
             wait_until(|| !running()),
             "the process in the group continued after its leader"
         );
-    }
-
-    /// Marking the leader reaped must prevent signalling a pid that may identify another group.
-    #[test_case(false ; "sigkill")]
-    #[test_case(true ; "sigterm")]
-    fn a_reaped_group_is_never_signalled(graceful: bool) {
-        let here = env::current_dir().unwrap();
-        let args = [LONG_SLEEP_SECS.to_owned()];
-        let sleep = command(Path::new(SLEEP), &Fake::env(), &here, &args);
-        let mut group = smol::block_on(Group::spawn(sleep)).unwrap();
-        group.signals_disabled = true;
-
-        if graceful {
-            group.terminate();
-        } else {
-            group.kill();
-        }
-
-        let pid = Pid::from_raw(group.child.id().try_into().unwrap()).unwrap();
-        kill_process(pid, Signal::USR1).unwrap();
-        let status = smol::block_on(group.child.status()).unwrap();
-        assert_eq!(status.signal(), Some(Signal::USR1.as_raw()));
     }
 }

@@ -14,14 +14,19 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::Value;
 use test_case::test_case;
+use wait_timeout::ChildExt;
 
 #[path = "support/isolation.rs"]
 mod isolation;
+#[path = "support/wire.rs"]
+#[allow(dead_code)]
+mod wire;
 use isolation::Isolation;
+use wire::{INIT, JSON_FORMAT, RESULT, STREAM_FORMAT, SYSTEM};
 
 const GLOSSARY: &str = "glossary.txt";
 /// Only the glossary contains this value. A reply with it establishes that the subagent
@@ -36,7 +41,6 @@ Then tell if the command ran, and give the text that the subagent found, without
 const DENIED: &str = "denied";
 const MODEL: &str = "claude-code/claude-haiku-4-5";
 const RUN_LIMIT: Duration = Duration::from_secs(300);
-const POLL: Duration = Duration::from_millis(100);
 /// The global `init.lua` with the plugin on and @OPTIONS@ beside `enabled`.
 const PLUGIN_ON: &str = "maki.setup({ plugins = { claude_code = { enabled = true@OPTIONS@ } } })\n";
 /// A `claude` older than any version maki runs, so the provider stops at the
@@ -51,7 +55,6 @@ const CLAUDE_CONFIG_ENV: &str = "CLAUDE_CONFIG_DIR";
 const PATH: &str = "PATH";
 const CLAUDE_TOOL: &str = "claude_code";
 const IMPORT_TOOL: &str = "claude_code_import";
-const STREAM_FORMAT: &str = "stream-json";
 const REVIEW_INIT: &str = r#"maki.setup({ plugins = {
   claude_code = { enabled = true, executable = "@EXECUTABLE@" },
   bash = { enabled = false }, write = { enabled = false }, edit = { enabled = false },
@@ -111,7 +114,7 @@ impl Run {
     fn result(&self) -> &Value {
         self.events
             .iter()
-            .rfind(|event| event["type"] == "result")
+            .rfind(|event| event["type"] == RESULT)
             .expect("the run printed no result")
     }
 
@@ -195,18 +198,11 @@ fn finish(mut command: Command) -> Output {
         let _ = stderr.read_to_string(&mut text);
         text
     });
-    let deadline = Instant::now() + RUN_LIMIT;
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("maki did not complete in {RUN_LIMIT:?}");
-        }
-        thread::sleep(POLL);
-    };
+    let status = child.wait_timeout(RUN_LIMIT).unwrap().unwrap_or_else(|| {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("maki did not complete in {RUN_LIMIT:?}");
+    });
     Output {
         status,
         stdout: out.join().unwrap(),
@@ -284,7 +280,7 @@ fn the_provider_is_on_with_the_plugin(plugin: bool, want: &str) {
     }
     let caller_path = env::var_os(PATH).unwrap_or_default();
     let path = env::join_paths(iter::once(bin).chain(env::split_paths(&caller_path))).unwrap();
-    let mut command = fixture.maki(MODEL, PROMPT, "json");
+    let mut command = fixture.maki(MODEL, PROMPT, JSON_FORMAT);
     command.env(PATH, path);
     let Output { stdout, stderr, .. } = finish(command);
     let stderr = String::from_utf8(stderr).unwrap();
@@ -297,7 +293,7 @@ fn the_provider_is_on_with_the_plugin(plugin: bool, want: &str) {
     let result: Value =
         serde_json::from_slice(&stdout).unwrap_or_else(|_| panic!("there is no result: {stderr}"));
     assert_eq!(result["is_error"], true, "{result}");
-    let reason = result["result"].as_str().unwrap_or_default();
+    let reason = result[RESULT].as_str().unwrap_or_default();
     assert!(reason.contains(want), "got: {reason}");
 }
 
@@ -338,7 +334,7 @@ fn cli_filters_plugin_tools_in_the_init_event(
         .collect();
     let init = events
         .iter()
-        .find(|event| event["type"] == "system" && event["subtype"] == "init")
+        .find(|event| event["type"] == SYSTEM && event["subtype"] == INIT)
         .unwrap_or_else(|| panic!("no init event: {events:?}\n{stderr}"));
     let mut tools: Vec<&str> = init["tools"]
         .as_array()

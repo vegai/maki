@@ -239,6 +239,10 @@ impl Error {
     }
 
     pub(crate) fn invalidates_version(&self) -> bool {
+        self.is_version_error() || matches!(self.cause(), Self::Check(_))
+    }
+
+    pub(crate) fn is_version_error(&self) -> bool {
         matches!(
             self.cause(),
             Self::UnknownVersion(_)
@@ -246,7 +250,6 @@ impl Error {
                 | Self::NoVersion
                 | Self::VersionFailed(_)
                 | Self::UnreadableVersion(_)
-                | Self::Check(_)
         )
     }
     /// Returns the text when the API rejects a conversation that is larger

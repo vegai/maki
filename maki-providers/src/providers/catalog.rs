@@ -1077,15 +1077,15 @@ pub(crate) fn free_model_if_available(slug: &str, model_id: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::provider::ModelListing;
     use std::collections::HashMap;
 
     use super::schema::{CatalogCost, CatalogIndex, CatalogLimits, CatalogModel, CatalogProvider};
     use std::sync::Arc;
 
     use super::{
-        Authentication, CatalogData, CatalogMeta, EndpointType, ProviderData, ProviderQuirks,
-        SessionRef, StateDir, available_if_warm, determine_catalog_format, parse_model, quirks_for,
+        Authentication, CatalogData, CatalogMeta, EndpointType, ModelListing, ProviderData,
+        ProviderQuirks, SessionRef, StateDir, available_if_warm, determine_catalog_format,
+        parse_model, quirks_for,
     };
     use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
     use crate::provider::{Provider, RequestScope};

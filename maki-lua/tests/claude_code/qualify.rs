@@ -32,6 +32,9 @@ const CLAUDE: &str = "claude";
 const OUTSIDE_DIR: &str = "outside";
 const PROJECT_DIR: &str = "proj";
 const HOME_DIR: &str = "home";
+const HOME_ENV: &str = "HOME";
+const HOME_FILE: &str = "home-visibility.txt";
+const HOME_CONTENT: &str = "HOME-VISIBILITY-7c2b";
 const OTHER_REPO_DIR: &str = "other";
 /// Denied by the plugin's `deny_read` option rather than a default rule.
 const CUSTOM_DENIED: &str = "config/private.yml";
@@ -161,6 +164,7 @@ give an error. Show each output:
 10. Bash: ln -s @PROJECT@/notes.md linked.md
 11. Write the file linked.md that contains the word linked, with the Write tool
 12. Bash: cat @LATER@
+13. Bash: cat '@HOME_FILE@'
 Then reply with one line that tells the calls that had no errors.";
 const NOTES: &str = "notes.md";
 const NOTES_BEFORE: &str = "This is a draft.\n";
@@ -677,6 +681,10 @@ fn live_reads_are_refused_and_instructions_stay_out() {
 #[test]
 #[ignore = "runs the installed claude CLI on the subscription of the caller"]
 fn live_a_coding_worker_changes_only_its_snapshot() {
+    let home = env::var_os(HOME_ENV).expect("the qualification needs HOME");
+    let home_fixture = tempdir_in(home).unwrap();
+    let home_file = home_fixture.path().canonicalize().unwrap().join(HOME_FILE);
+    fs::write(&home_file, HOME_CONTENT).unwrap();
     let fixture_dir = tempdir().unwrap();
     let root = fixture_dir.path().canonicalize().unwrap();
     let project = root.join(PROJECT_DIR);
@@ -713,6 +721,7 @@ fn live_a_coding_worker_changes_only_its_snapshot() {
     let prompt = CODE_PROMPT
         .replace("@OUTSIDE@", &outside.to_string_lossy())
         .replace("@PROJECT@", &project.to_string_lossy())
+        .replace("@HOME_FILE@", &home_file.to_string_lossy())
         .replace("@LATER@", &later.to_string_lossy());
     let input = json!({ "prompt": prompt, "model": LIVE_MODEL, "profile": "code" });
     let reply =
@@ -788,6 +797,10 @@ fn live_a_coding_worker_changes_only_its_snapshot() {
                 run.output
             );
         }
+    }
+    for run in shell(HOME_FILE) {
+        assert!(!run.succeeded(), "home was visible: {}", run.output);
+        assert!(!run.output.contains(HOME_CONTENT), "{}", run.output);
     }
     shell(MASKED_WRITE);
     shell(LINKED_FILE);
