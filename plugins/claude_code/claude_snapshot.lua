@@ -95,7 +95,8 @@ local function checkout_git(call, spec, args)
 end
 
 local function list_files(call, spec, mode, pathspecs)
-  local args = mode == "-d" and { "diff-files", "--name-only", "--diff-filter=D", "--" } or { "ls-files", mode, "--" }
+  local args = mode == "-d" and { "diff-files", "--relative", "--name-only", "--diff-filter=D", "--" }
+    or { "ls-files", mode, "--" }
   if mode == "-s" then
     table.insert(args, 2, "-t")
   end
@@ -179,19 +180,22 @@ function M.disk_blobs(call, env, cwd, paths, keep_on_cancel, timeout_ms)
   return maki.split(out, "\n")
 end
 
-local function symlinked_parent(cwd, path)
+local function symlinked_parent(cwd, path, checked)
   local parent = cwd
   for part in path:gmatch("([^/]+)/") do
     parent = maki.fs.joinpath(parent, part)
-    local meta = maki.fs.metadata(parent, false)
-    if meta and meta.is_symlink then
+    if checked[parent] == nil then
+      local meta = maki.fs.metadata(parent, false)
+      checked[parent] = meta and meta.is_symlink or false
+    end
+    if checked[parent] then
       return parent
     end
   end
 end
 
-local function tracked_parent_problem(cwd, path)
-  local parent = symlinked_parent(cwd, path)
+local function tracked_parent_problem(cwd, path, checked)
+  local parent = symlinked_parent(cwd, path, checked)
   if parent then
     return "the tracked folder "
       .. path_utils.printable(parent)
@@ -210,9 +214,9 @@ local function snapshot_paths(call, artifact, spec)
   if not deleted then
     return nil, deleted_err
   end
-  local seen = {}
+  local seen, checked = {}, {}
   for _, path in ipairs(git_utils.listed_paths(deleted)) do
-    local problem = tracked_parent_problem(spec.cwd, path)
+    local problem = tracked_parent_problem(spec.cwd, path, checked)
     if problem then
       return nil, problem
     end
@@ -269,7 +273,7 @@ end
 -- The project's exclusions apply, because the worker's shell can read the
 -- whole copy.
 local function copy_dependencies(call, artifact, spec, paths)
-  local copied, tracked_folders = {}, {}
+  local copied, tracked_folders, checked = {}, {}, {}
   for _, path in ipairs(paths) do
     tracked_folders[path] = true
     for slash in path:gmatch("()/") do
@@ -279,7 +283,7 @@ local function copy_dependencies(call, artifact, spec, paths)
   for _, dir in ipairs(spec.dependencies) do
     local source = maki.fs.joinpath(spec.cwd, dir)
     local target = maki.fs.joinpath(artifact.snapshot, dir)
-    local parent = symlinked_parent(spec.cwd, dir)
+    local parent = symlinked_parent(spec.cwd, dir, checked)
     local meta = maki.fs.metadata(source, false)
     if parent then
       artifact.notes[#artifact.notes + 1] = "the dependency "
@@ -436,8 +440,9 @@ local function consistency_problem(call, artifact, spec)
   end
   local paths = git_utils.listed_paths(changed)
   if #paths > 0 then
+    local checked = {}
     for _, path in ipairs(paths) do
-      local problem = tracked_parent_problem(spec.cwd, path)
+      local problem = tracked_parent_problem(spec.cwd, path, checked)
       if problem then
         return problem
       end

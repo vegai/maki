@@ -58,7 +58,7 @@ pub(in crate::providers::claude_code) async fn within<T>(
 /// Kills the group on drop until reaping starts.
 pub(super) struct Group {
     pub(super) child: Child,
-    pub(super) signals_disabled: bool,
+    signals_disabled: bool,
     #[cfg(target_os = "linux")]
     _lifetime: UnixStream,
 }
@@ -139,7 +139,7 @@ impl Drop for Group {
     }
 }
 
-pub(super) fn spawn_piped(command: process::Command) -> io::Result<Group> {
+fn spawn_piped(command: process::Command) -> io::Result<Group> {
     #[cfg(target_os = "linux")]
     let mut command = command;
     #[cfg(target_os = "linux")]
@@ -426,5 +426,40 @@ mod tests {
             );
             assert!(stderr_line(&mut reader).await.unwrap().is_none());
         });
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod process_tests {
+    use super::super::super::fake::Fake;
+    use super::super::launch::command;
+    use super::Group;
+    use rustix::process::{Pid, Signal, kill_process};
+    use std::env;
+    use std::os::unix::process::ExitStatusExt;
+    use std::path::Path;
+    use test_case::test_case;
+    const SLEEP: &str = "/bin/sleep";
+    const LONG_SLEEP_SECS: &str = "60";
+    /// Marking the leader reaped must prevent signalling a pid that may identify another group.
+    #[test_case(false ; "sigkill")]
+    #[test_case(true ; "sigterm")]
+    fn a_reaped_group_is_never_signalled(graceful: bool) {
+        let here = env::current_dir().unwrap();
+        let args = [LONG_SLEEP_SECS.to_owned()];
+        let sleep = command(Path::new(SLEEP), &Fake::env(), &here, &args);
+        let mut group = smol::block_on(Group::spawn(sleep)).unwrap();
+        group.signals_disabled = true;
+
+        if graceful {
+            group.terminate();
+        } else {
+            group.kill();
+        }
+
+        let pid = Pid::from_raw(group.child.id().try_into().unwrap()).unwrap();
+        kill_process(pid, Signal::USR1).unwrap();
+        let status = smol::block_on(group.child.status()).unwrap();
+        assert_eq!(status.signal(), Some(Signal::USR1.as_raw()));
     }
 }

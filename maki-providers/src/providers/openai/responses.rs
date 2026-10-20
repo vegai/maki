@@ -201,9 +201,13 @@ pub(crate) async fn do_stream(
     auth: &ResolvedAuth,
     stream_timeout: Duration,
 ) -> Result<StreamResponse, AgentError> {
-    let base = auth.base_url.as_deref().ok_or_else(|| AgentError::Config {
-        message: "Responses API requires a base_url in auth".into(),
-    })?;
+    let base = auth
+        .base_url
+        .as_deref()
+        .ok_or_else(|| AgentError::Config {
+            message: "Responses API requires a base_url in auth".into(),
+        })?
+        .trim_end_matches('/');
     let mut body = Cow::Borrowed(body);
     if summary_rejected(base) && has_summary(&body) {
         strip_summary(body.to_mut());
@@ -235,7 +239,7 @@ async fn post_responses(
         .configure_request(
             Request::builder()
                 .method("POST")
-                .uri(format!("{base}{RESPONSES_PATH}"))
+                .uri(format!("{}{RESPONSES_PATH}", base))
                 .header("content-type", "application/json")
                 .header("user-agent", super::super::user_agent()),
         )
@@ -621,7 +625,7 @@ mod tests {
     use serde_json::json;
     use test_case::test_case;
 
-    use crate::test_support::sse_event;
+    use crate::test_support::{Canned, serve, sse_event};
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
     const OVERLOAD_MESSAGE: &str = "Our servers are currently overloaded. Please try again later.";
@@ -630,6 +634,33 @@ mod tests {
     const TOOL_NAME: &str = "word_count";
     const TOOL_DESCRIPTION: &str = "Count words.";
     const TOOL_MUST_SURVIVE: &str = "a tool without a schema still belongs in the request";
+    const RESPONSE_PATH: &str = "/v1/responses";
+    const RESPONSE: &[Canned] = &[Canned::sse(concat!(
+        "event: response.completed\n",
+        "data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n"
+    ))];
+
+    #[test_case(false ; "without_trailing_slash")]
+    #[test_case(true ; "with_trailing_slash")]
+    fn responses_normalizes_the_base_url(trailing_slash: bool) {
+        let (mut base, requests) = serve(RESPONSE);
+        if trailing_slash {
+            base.push('/');
+        }
+        let auth = ResolvedAuth::for_test(Some(base), Vec::new());
+        let model = crate::Model::from_spec("openai/gpt-6").unwrap();
+        let (events, _) = flume::unbounded();
+        smol::block_on(do_stream(
+            &HttpClient::new().unwrap(),
+            &model,
+            &json!({}),
+            &events,
+            &auth,
+            TEST_STREAM_TIMEOUT,
+        ))
+        .unwrap();
+        assert_eq!(requests.lock().unwrap()[0].path, RESPONSE_PATH);
+    }
 
     #[test]
     fn strip_summary_keeps_effort() {

@@ -141,10 +141,10 @@ const GITDIR_PREFIX: &str = "gitdir:";
 const COMMONDIR_FILE: &str = "commondir";
 
 // The fields of Claude Code's answers and init event that the checks read.
-const ACCOUNT: &str = "account";
+pub(super) const ACCOUNT: &str = "account";
 const API_KEY_SOURCE: &str = "apiKeySource";
 const API_PROVIDER: &str = "apiProvider";
-const SUBSCRIPTION_TYPE: &str = "subscriptionType";
+pub(super) const SUBSCRIPTION_TYPE: &str = "subscriptionType";
 const START_MODE: &str = "current_permission_mode";
 const VERSION: &str = "claude_code_version";
 const RUN_MODE: &str = "permissionMode";

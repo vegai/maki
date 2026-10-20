@@ -30,7 +30,7 @@ use maki_agent::{
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
 use maki_providers::model::Model;
-use maki_providers::{ImageSource, StopReason, ThinkingConfig, Timeouts, TokenUsage, add_cost};
+use maki_providers::{ImageSource, StopReason, Timeouts, TokenUsage, add_cost};
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
@@ -39,8 +39,9 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::cli::Cli;
-use crate::notice::{NOTIFICATION, ProviderNotice, system_event, wire_uuid};
+use crate::notice::{NOTIFICATION, ProviderNotice};
 use crate::tool_names::maki_to_claude_tool_name;
+use crate::wire::{system_event, wire_uuid};
 
 const NOTICE_SUBTYPE: &str = "notice";
 
@@ -387,7 +388,7 @@ impl SdkWriter {
             .map_err(|_| eyre!("stdout writer closed"))
     }
 
-    fn emit_system(&self, subtype: &'static str, extra: Value) -> Result<()> {
+    fn emit_system(&self, subtype: &'static str, extra: impl Serialize) -> Result<()> {
         self.write(&system_event(&self.session_id, subtype, extra))
     }
 
@@ -558,13 +559,13 @@ pub fn run(params: SdkParams) -> Result<()> {
         project_config,
         local_tools: Default::default(),
     });
-    let Ready {
-        model: startup_model,
-        tool_names,
-    } = smol::block_on(handle.ready.recv_async()).unwrap_or(Ready {
-        model: initial_model,
-        tool_names: Vec::new(),
-    });
+    let (
+        Ready {
+            model: startup_model,
+            tool_names,
+        },
+        thinking,
+    ) = crate::headless::startup(&handle.ready, initial_model, defaults.thinking);
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
     let writer_thread = std::thread::spawn(move || {
@@ -590,7 +591,7 @@ pub fn run(params: SdkParams) -> Result<()> {
             "cwd": working_dir,
             "tools": tools,
             "model": startup_model.id,
-            "thinking": ThinkingConfig::from(defaults.thinking).clamped(&startup_model).to_string(),
+            "thinking": thinking,
             "permissionMode": permission_mode.as_str(),
             "apiKeySource": "none",
             "mcp_servers": [],
@@ -1054,10 +1055,7 @@ impl EventPump {
             AgentEvent::ProviderWaiting { message } => {
                 self.writer.emit_system(
                     NOTIFICATION,
-                    serde_json::to_value(ProviderNotice::new(
-                        message.as_deref(),
-                        parent_tool_use_id.as_deref(),
-                    ))?,
+                    ProviderNotice::new(message.as_deref(), parent_tool_use_id.as_deref()),
                 )?;
             }
             AgentEvent::Retry {

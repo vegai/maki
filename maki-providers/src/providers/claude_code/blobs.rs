@@ -17,10 +17,11 @@ pub fn unpack(batch: &Path, stage: &Path, hashes: &[String]) -> io::Result<()> {
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )?);
-    if !input.metadata()?.is_file() {
+    let metadata = input.metadata()?;
+    if !metadata.is_file() {
         return Err(io::Error::other(INVALID_BATCH));
     }
-    let mut remaining = input.metadata()?.len();
+    let mut remaining = metadata.len();
     let mut input = BufReader::new(input);
     for hash in hashes {
         if !OBJECT_ID_LENGTHS.contains(&hash.len())

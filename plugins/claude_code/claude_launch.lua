@@ -37,14 +37,14 @@ M.WORKERS = {
   read = {
     tools = { "Read", "Glob", "Grep" },
     permission_mode = "manual",
-    reported_modes = { default = true, manual = true },
+    reported_modes = { "default", "manual" },
     sandboxed = false,
     contract = READ_CONTRACT,
   },
   code = {
     tools = { "Read", "Glob", "Grep", "Edit", "Write", "Bash" },
     permission_mode = "acceptEdits",
-    reported_modes = { acceptEdits = true },
+    reported_modes = { "acceptEdits" },
     sandboxed = true,
     contract = CODE_CONTRACT,
   },
@@ -55,9 +55,9 @@ M.MIN_TIMEOUT_SECS = 30
 M.MAX_TIMEOUT_SECS = 1800
 -- The process that runs the task answers these requests, so the answers
 -- cover every settings source it merged, managed policy included.
-M.HANDSHAKE = native.handshake()
+M.HANDSHAKE = native.handshake
 
-local EMPTY_MCP_CONFIG = native.empty_mcp_config()
+local EMPTY_MCP_CONFIG = native.empty_mcp_config
 local INSTRUCTIONS_HEADING = "The instructions maki loaded for this task, from the project and the user:"
 
 -- Claude Code passes its environment to Bash, in the sandbox too (tested on
@@ -128,15 +128,6 @@ local HOME_CREDENTIALS = {
 
 M.NO_HOME = "maki cannot find your home directory, so it cannot keep the coding worker's shell away from "
   .. "the logins and keys there. Set HOME, or use the read profile."
-
-local function sorted_keys(t)
-  local keys = {}
-  for key in pairs(t) do
-    keys[#keys + 1] = key
-  end
-  table.sort(keys)
-  return keys
-end
 
 --- Returns why {worker} cannot run with {env}: its shell could read the
 --- login token, or a proxy URL with a user or password in it. Names compare
@@ -283,7 +274,7 @@ local function worker_policy(deny_read, worker, confine)
 end
 
 function M.worker_handshake(deny_read, worker, confine)
-  return native.worker_handshake(sorted_keys(worker.reported_modes), worker_policy(deny_read, worker, confine))
+  return native.worker_handshake(worker.reported_modes, worker_policy(deny_read, worker, confine))
 end
 
 --- `--setting-sources ""` drops the user's hooks, permissions and MCP
@@ -358,11 +349,7 @@ function M.checked_step(stream, line, handshake)
 end
 
 local function probe_dir(env, spec)
-  local denied = { unpack(spec.checkout_dirs) }
-  if spec.git_dir then
-    denied[#denied + 1] = spec.git_dir
-  end
-  return native.private_dir(env.TMPDIR, spec.cwd, denied)
+  return native.private_dir(env.TMPDIR, spec.cwd, spec.denied)
 end
 
 function M.job_opts(cwd, env, stderr_tail)
@@ -488,7 +475,7 @@ function M.preflight(input, ctx, call, opts)
   end
   local version = check:version()
   if not version then
-    local dir, dir_err = probe_dir(env, { cwd = cwd, checkout_dirs = local_dirs, git_dir = git_dir })
+    local dir, dir_err = probe_dir(env, { cwd = cwd, denied = prepared.denied })
     if not dir then
       return nil, dir_err
     end
@@ -522,6 +509,7 @@ function M.preflight(input, ctx, call, opts)
     config_dir = config_dir,
     home_credentials = home_credentials,
     checkout_dirs = local_dirs,
+    denied = prepared.denied,
     git_dir = git_dir,
     cli = cli,
   }

@@ -6,6 +6,7 @@ use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -32,6 +33,8 @@ const NO_STDIN_ERR: &str = "job: stdin is not an open pipe";
 const STDOUT_STREAM: &str = "stdout";
 const STDERR_STREAM: &str = "stderr";
 const EXIT_EVENT: &str = "exit";
+const STDIN_EXITED: u8 = 1;
+const STDIN_FAILED: u8 = 2;
 
 const CWD_NOT_DIRECTORY: &str = "cwd is not a directory";
 
@@ -215,7 +218,7 @@ struct JobMeta {
     /// the job stayed quiet.
     dropped_output: bool,
     /// Coordinates reaping, signals, timeouts and stdin errors across the job's threads.
-    reap_state: Arc<Mutex<ReapState>>,
+    reap_state: Arc<ReapState>,
     deadline: Option<smol::Task<()>>,
     exit_code: Option<i32>,
     /// Recorded at exit so elapsed time stops counting once the process is gone.
@@ -427,7 +430,7 @@ impl JobStore {
                 }
             };
         }
-        let reap_state = Arc::new(Mutex::new(ReapState::default()));
+        let reap_state = Arc::new(ReapState::default());
         let stdin = stdin_pipe
             .map(|stdin| spawn_stdin_writer(stdin, Arc::clone(&reap_state)))
             .transpose()?;
@@ -458,7 +461,7 @@ impl JobStore {
                     let _ = h.join();
                 }
                 let code = reap(child, &wait_reaped);
-                let timed_out = ReapState::lock(&wait_reaped).timed_out;
+                let timed_out = wait_reaped.timed_out.load(Ordering::Acquire);
                 let _ = event_tx.send(JobEvent::Exit(code, timed_out));
             })
             .map_err(|e| e.to_string())?;
@@ -691,7 +694,7 @@ impl JobStore {
         if matches!(updates.on_exit, CallbackUpdate::Set(_)) {
             job.replay_exit = job
                 .exit_code
-                .map(|code| (code, ReapState::lock(&job.reap_state).timed_out));
+                .map(|code| (code, job.reap_state.timed_out.load(Ordering::Acquire)));
         }
         updates.on_stdout.apply(lua, &mut job.on_stdout);
         updates.on_stderr.apply(lua, &mut job.on_stderr);
@@ -775,11 +778,13 @@ impl JobStore {
             .as_ref()
             .ok_or(NO_STDIN_ERR)?
             .send(data)
-            .map_err(|_| match ReapState::lock(&job.reap_state).stdin_error {
-                Some(ErrorKind::BrokenPipe | ErrorKind::ConnectionReset) => JOB_EXITED_ERR,
-                Some(_) => STDIN_WRITE_ERR,
-                None => NO_STDIN_ERR,
-            })?;
+            .map_err(
+                |_| match job.reap_state.stdin_error.load(Ordering::Acquire) {
+                    STDIN_EXITED => JOB_EXITED_ERR,
+                    STDIN_FAILED => STDIN_WRITE_ERR,
+                    _ => NO_STDIN_ERR,
+                },
+            )?;
         Ok(len)
     }
 
@@ -868,7 +873,7 @@ impl JobSnapshot {
                 .elapsed_secs
                 .unwrap_or_else(|| job.started.elapsed().as_secs()),
             exit_code: job.exit_code,
-            timed_out: ReapState::lock(&job.reap_state).timed_out,
+            timed_out: job.reap_state.timed_out.load(Ordering::Acquire),
             stdout_lines: if tails {
                 job.stdout_tail.iter().cloned().collect()
             } else {
@@ -911,7 +916,7 @@ fn drop_callbacks(lua: &Lua, job: &mut JobMeta) {
 /// stdin, when every sender drops or the child stops reading.
 fn spawn_stdin_writer(
     mut stdin: ChildStdin,
-    state: Arc<Mutex<ReapState>>,
+    state: Arc<ReapState>,
 ) -> Result<flume::Sender<Vec<u8>>, String> {
     let (tx, rx) = flume::unbounded::<Vec<u8>>();
     thread::Builder::new()
@@ -919,7 +924,17 @@ fn spawn_stdin_writer(
         .spawn(move || {
             for chunk in rx {
                 if let Err(error) = stdin.write_all(&chunk) {
-                    ReapState::lock(&state).stdin_error = Some(error.kind());
+                    state.stdin_error.store(
+                        if matches!(
+                            error.kind(),
+                            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
+                        ) {
+                            STDIN_EXITED
+                        } else {
+                            STDIN_FAILED
+                        },
+                        Ordering::Release,
+                    );
                     break;
                 }
             }
@@ -928,19 +943,19 @@ fn spawn_stdin_writer(
     Ok(tx)
 }
 
-/// Shared process state. Kills hold the lock from the reap check to the signal, and the
-/// writer records stdin failures under the same lock.
+/// The reap lock protects pid ownership through each signal. Status reads stay independent
+/// so a slow platform kill cannot block the Lua thread.
 #[derive(Default)]
 struct ReapState {
-    reaped: bool,
-    timed_out: bool,
-    stdin_error: Option<ErrorKind>,
+    reaped: Mutex<bool>,
+    timed_out: AtomicBool,
+    stdin_error: AtomicU8,
 }
 
 impl ReapState {
     /// A panic elsewhere must not block a reap or a kill.
-    fn lock(state: &Mutex<Self>) -> MutexGuard<'_, Self> {
-        state.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock(state: &Self) -> MutexGuard<'_, bool> {
+        state.reaped.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -948,13 +963,13 @@ impl ReapState {
 /// kill can hit a freed pid. The wait itself is outside the lock, so a kill
 /// never waits on the child. Until the reap no other process can get the
 /// pid: the zombie keeps it on Unix, the open process handle on Windows.
-fn reap(mut child: Child, state: &Mutex<ReapState>) -> i32 {
+fn reap(mut child: Child, state: &ReapState) -> i32 {
     let lock = || ReapState::lock(state);
     #[cfg(unix)]
     let status = if process::wait_without_reaping(child.id()) {
         let mut state = lock();
         let status = child.wait();
-        state.reaped = true;
+        *state = true;
         status
     } else {
         // With no exit to wait for, the reap waits by itself, outside the
@@ -963,14 +978,14 @@ fn reap(mut child: Child, state: &Mutex<ReapState>) -> i32 {
             pid = child.id(),
             "maki cannot wait for the job without reaping it, so a stop cannot kill it"
         );
-        lock().reaped = true;
+        *lock() = true;
         child.wait()
     };
     #[cfg(not(unix))]
     let status = child.wait();
     #[cfg(not(unix))]
     {
-        lock().reaped = true;
+        *lock() = true;
     }
     drop(child);
     status.map_or(-1, |status| status.code().unwrap_or(-1))
@@ -1001,10 +1016,12 @@ impl Drop for Unwatched {
 
 /// A reaped pid can identify another process. Hold the lock until the signal completes so
 /// [`reap`] cannot release the pid first.
-fn kill_unreaped(pid: u32, state: &Mutex<ReapState>, timed_out: bool) {
-    let mut state = ReapState::lock(state);
-    if !state.reaped {
-        state.timed_out |= timed_out;
+fn kill_unreaped(pid: u32, state: &ReapState, timed_out: bool) {
+    let reaped = ReapState::lock(state);
+    if !*reaped {
+        if timed_out {
+            state.timed_out.store(true, Ordering::Release);
+        }
         process::kill_group(pid);
     }
 }
@@ -1127,7 +1144,7 @@ mod tests {
         loop {
             if let JobEvent::Exit(_, timed_out) = receiver.recv_timeout(JOB_EXIT_TIMEOUT).unwrap() {
                 assert!(timed_out);
-                assert!(ReapState::lock(&store.jobs[&id].reap_state).reaped);
+                assert!(*ReapState::lock(&store.jobs[&id].reap_state));
                 break;
             }
         }
@@ -1225,12 +1242,28 @@ mod tests {
             stderr_tail: VecDeque::new(),
             tail_cap: DEFAULT_TAIL,
             dropped_output: false,
-            reap_state: Arc::new(Mutex::new(ReapState::default())),
+            reap_state: Arc::new(ReapState::default()),
             deadline: None,
             exit_code: None,
             elapsed_secs: None,
             replay_exit: None,
         }
+    }
+
+    #[test]
+    fn job_status_does_not_wait_for_process_tree_termination() {
+        let job = stub_job(task_owner(1), None, None);
+        let state = Arc::clone(&job.reap_state);
+        let killing = ReapState::lock(&state);
+        state.timed_out.store(true, Ordering::Release);
+        let (sent, received) = flume::bounded(1);
+        let reader = thread::spawn(move || {
+            sent.send(JobSnapshot::from_job(1, &job, true)).unwrap();
+        });
+        let snapshot = received.recv_timeout(JOB_EXIT_TIMEOUT);
+        drop(killing);
+        reader.join().unwrap();
+        assert!(snapshot.unwrap().timed_out);
     }
 
     fn start_echo(store: &mut JobStore) -> u32 {
@@ -1969,7 +2002,7 @@ mod tests {
             ))
             .unwrap();
         let (pid, reaped) = (store.jobs[&id].pid, Arc::clone(&store.jobs[&id].reap_state));
-        let kill_in_progress = reaped.lock().unwrap();
+        let kill_in_progress = ReapState::lock(&reaped);
         fs::write(&go, "").unwrap();
         let zombie = || {
             fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
@@ -2125,7 +2158,10 @@ mod tests {
         let lua = Lua::new();
         let mut store = make_store();
         exited_session_job(&lua, &mut store, CODE);
-        ReapState::lock(&store.jobs[&1].reap_state).timed_out = timed_out;
+        store.jobs[&1]
+            .reap_state
+            .timed_out
+            .store(timed_out, Ordering::Release);
         let at_exit = store.jobs[&1].elapsed_secs;
 
         assert!(store.attach(&lua, 1, None, TEST_PLUGIN, exit_updates(&lua)));
@@ -2344,7 +2380,7 @@ mod tests {
             store.record_event(id, &event);
         }
         assert!(
-            store.jobs[&id].reap_state.lock().unwrap().reaped,
+            *ReapState::lock(&store.jobs[&id].reap_state),
             "{EXIT_WITHOUT_REAP}"
         );
         deliver(&mut store, &lua, id, &JobEvent::Exit(0, false));

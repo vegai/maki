@@ -24,8 +24,6 @@ use crate::api::util::pair::{Pair, pair, try_pair};
 use crate::plugin_permissions::PluginPermissions;
 
 pub(crate) const MODULE: &str = "maki.claude_code.internal";
-#[cfg(test)]
-pub(crate) const PLUGIN: &str = "claude_code";
 const HOME_STATE_PREFIX: &str = ".claude.json";
 const BMP_LIMIT: u32 = 0xffff;
 const MAX_UTF8_BYTES: usize = 4;
@@ -42,6 +40,8 @@ pub(crate) fn create_private_module(
 ) -> LuaResult<(&'static str, Table)> {
     let table = create_claude_code_table(lua, perms)?;
     table.set("lock_busy", LOCK_BUSY)?;
+    table.set("handshake", json_to_lua(lua, &validation::handshake())?)?;
+    table.set("empty_mcp_config", validation::EMPTY_MCP_CONFIG)?;
     table.set("startup_timeout_secs", validation::STARTUP_TIMEOUT_SECS)?;
     table.set("default_executable", validation::DEFAULT_EXECUTABLE)?;
     table.set(
@@ -178,13 +178,6 @@ async fn home_state_files(_lua: Lua, home: String) -> LuaResult<Pair<Vec<String>
     ))
 }
 
-/// The control requests each worker must answer before its prompt.
-/// @return (table) Requests in handshake order.
-#[lua_fn]
-fn handshake(lua: &Lua) -> LuaResult<LuaValue> {
-    json_to_lua(lua, &validation::handshake())
-}
-
 struct WorkerHandshake(NativeHandshake);
 
 impl UserData for WorkerHandshake {
@@ -260,6 +253,16 @@ async fn prepare_launch(
     let result = lua.create_table()?;
     result.set("env", lua.create_table_from(prepared.env)?)?;
     result.set("withheld", prepared.withheld)?;
+    result.set(
+        "denied",
+        try_pair!(
+            prepared
+                .denied
+                .into_iter()
+                .map(path_text)
+                .collect::<Result<Vec<_>, _>>()
+        ),
+    )?;
     result.set("config_dir", try_pair!(path_text(prepared.config_dir)))?;
     result.set(
         "dirs",
@@ -276,13 +279,6 @@ async fn prepare_launch(
         try_pair!(prepared.git_dir.map(path_text).transpose()),
     )?;
     Ok((Some(result), None))
-}
-
-/// Empty MCP configuration shared with the subscription provider.
-/// @return (string) Serialized empty MCP configuration.
-#[lua_fn]
-fn empty_mcp_config(_lua: &Lua) -> LuaResult<&'static str> {
-    Ok(validation::EMPTY_MCP_CONFIG)
 }
 
 fn json(text: &str) -> Result<Value, serde_json::Error> {
@@ -456,7 +452,7 @@ lua_table! {
     /// Private helpers for the bundled Claude Code plugin. JSON inputs retain
     /// the distinction between null, objects and arrays.
     "maki.claude_code.internal" => pub(crate) fn create_claude_code_table(perms: &PluginPermissions), DOCS [
-        shell_secret_problem, escape_invisible, handshake, worker_handshake, base_args, worker_settings, empty_mcp_config, prepare_launch(perms), private_dir(perms), home_state_files(perms),
+        shell_secret_problem, escape_invisible, worker_handshake, base_args, worker_settings, prepare_launch(perms), private_dir(perms), home_state_files(perms),
         init_problem,
         classify, version_check(perms), invalidate_version, sanitize_git(perms), project_git_dir(perms), unpack_blobs(perms),
     ]

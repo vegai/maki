@@ -3,7 +3,9 @@ use std::process::ExitStatus;
 use std::time::Duration;
 
 #[cfg(unix)]
-use rustix::process::{Pid, WaitOptions, waitpid};
+use maki_providers::process::group_of as unix_pid;
+#[cfg(unix)]
+use rustix::process::{WaitOptions, waitpid};
 use smol::process::Child;
 
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -89,11 +91,6 @@ impl ChildGuard {
             let _ = child.try_status();
         }
     }
-}
-
-#[cfg(unix)]
-fn unix_pid(pid: u32) -> Option<Pid> {
-    i32::try_from(pid).ok().and_then(Pid::from_raw)
 }
 
 impl Drop for ChildGuard {

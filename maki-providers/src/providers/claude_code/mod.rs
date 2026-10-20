@@ -457,9 +457,9 @@ struct ClaudeCode {
     executable: PathBuf,
     limits: Limits,
     /// maki's environment, read afresh for each request.
-    environment: Arc<Environment>,
+    environment: Box<Environment>,
     models_cache: Option<PathBuf>,
-    windows: Arc<Mutex<Option<SavedModels>>>,
+    windows: Mutex<Option<SavedModels>>,
     /// Takes precedence over `$CLAUDE_CONFIG_DIR`.
     config_dir: Option<PathBuf>,
 }
@@ -476,7 +476,7 @@ impl ClaudeCode {
         Ok(Self {
             executable,
             limits: Limits::new(timeouts.stream),
-            environment: Arc::new(|names| match names {
+            environment: Box::new(|names| match names {
                 None => utf8_vars(env::vars_os()),
                 Some(names) => names
                     .iter()
@@ -484,7 +484,7 @@ impl ClaudeCode {
                     .collect(),
             }),
             models_cache: models_cache_path(),
-            windows: Arc::default(),
+            windows: Mutex::default(),
             config_dir: options.config_dir.clone(),
         })
     }
@@ -580,7 +580,7 @@ impl ClaudeCode {
         let listed = self.ask_models(cwd, vars).await;
         match &listed {
             Ok(_) => failures.remove(&key),
-            Err(error) if !error.invalidates_version() => {
+            Err(error) if !error.is_version_error() => {
                 failures.insert(key, (Instant::now(), error.to_string()))
             }
             Err(_) => failures.remove(&key),
@@ -618,7 +618,7 @@ impl ClaudeCode {
             .window
     }
 
-    /// The listing takes one slot, like a request.
+    /// A listing holds one slot and probes context windows with up to four child processes at once.
     async fn ask_models(
         &self,
         cwd: &Path,
@@ -1272,7 +1272,7 @@ mod on_the_fake {
     use std::iter;
     use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use std::sync::Mutex;
     use std::time::{Duration, SystemTime};
 
     use futures_lite::{FutureExt, future};
@@ -1378,14 +1378,14 @@ mod on_the_fake {
         ClaudeCode {
             executable: fake.executable(),
             limits: Limits::new(IDLE),
-            environment: Arc::new(move |names| {
+            environment: Box::new(move |names| {
                 vars.iter()
                     .filter(|(name, _)| names.is_none_or(|names| names.contains(&name.as_str())))
                     .cloned()
                     .collect()
             }),
             models_cache,
-            windows: Arc::default(),
+            windows: Mutex::default(),
             config_dir: None,
         }
     }
@@ -1464,7 +1464,7 @@ mod on_the_fake {
         let mut provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
         let mut vars = (provider.environment)(None);
         vars.push((CONFIG_DIR_VAR.to_owned(), String::new()));
-        provider.environment = Arc::new(move |names| {
+        provider.environment = Box::new(move |names| {
             vars.iter()
                 .filter(|(name, _)| names.is_none_or(|names| names.contains(&name.as_str())))
                 .cloned()
@@ -1632,7 +1632,7 @@ mod on_the_fake {
         let fake = Fake::new("text");
         let home = tempdir().unwrap();
         let provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
-        let list = || smol::block_on(provider.list(&fake.project(), ModelListing::Cached));
+        let list = || smol::block_on(provider.list(&fake.project(), ModelListing::Refresh));
         list().unwrap();
         let hook = fake.dir.path().join("policy_hook");
         fs::write(&hook, "").unwrap();
@@ -1640,6 +1640,29 @@ mod on_the_fake {
         assert!(matches!(error, Error::Check(_)), "{error}");
         fs::remove_file(hook).unwrap();
         list().unwrap();
+        assert_eq!(fake.log("versions").lines().count(), 2);
+    }
+
+    #[test_case("policy_hook" ; "policy")]
+    #[test_case("logged_out" ; "login")]
+    fn failed_account_or_policy_checks_are_cached_until_refresh(marker: &str) {
+        let fake = Fake::new("text");
+        let home = tempdir().unwrap();
+        let provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
+        let path = fake.dir.path().join(marker);
+        fs::write(&path, "").unwrap();
+        let cwd = fake.project();
+        let error = smol::block_on(provider.list(&cwd, ModelListing::Cached)).unwrap_err();
+        assert!(matches!(error, Error::Check(_)), "{error}");
+        fs::remove_file(path).unwrap();
+        let again = smol::block_on(provider.list(&cwd, ModelListing::Cached)).unwrap_err();
+        assert!(matches!(again, Error::ListedRecently { .. }), "{again}");
+        assert_eq!(fake.log("versions").lines().count(), 1);
+        assert!(
+            !smol::block_on(provider.list(&cwd, ModelListing::Refresh))
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(fake.log("versions").lines().count(), 2);
     }
 

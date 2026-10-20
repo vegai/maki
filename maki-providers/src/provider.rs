@@ -136,14 +136,16 @@ struct UnconfiguredProvider;
 const STATIC_FALLBACK: &str = "using static fallback";
 const NO_FALLBACK: &str = "there is no model list";
 
-/// A provider that uses another provider's model table has no curated rows of its own.
-fn failed_listing(spec: &ProviderSpec, error: &AgentError) -> ModelBatch {
-    let models: Vec<String> = spec
-        .listed_rows()
+fn curated_specs(spec: &ProviderSpec) -> impl Iterator<Item = String> + '_ {
+    spec.listed_rows()
         .iter()
         .flat_map(|entry| entry.prefixes.iter())
-        .map(|prefix| format!("{}/{prefix}", spec.slug))
-        .collect();
+        .map(move |prefix| format!("{}/{prefix}", spec.slug))
+}
+
+/// Report a listing failure and retain any curated fallback model specs.
+fn failed_listing(spec: &ProviderSpec, error: &AgentError) -> ModelBatch {
+    let models: Vec<String> = curated_specs(spec).collect();
     let fallback = if models.is_empty() {
         NO_FALLBACK
     } else {
@@ -214,12 +216,7 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
     let mut specs: Vec<String> = ProviderRegistry::all()
         .into_iter()
         .filter(|m| provider_available_offline(m.slug))
-        .flat_map(|m| {
-            m.listed_rows()
-                .iter()
-                .flat_map(|entry| entry.prefixes.iter())
-                .map(move |p| format!("{}/{}", m.slug, p))
-        })
+        .flat_map(curated_specs)
         .collect();
     for spec in custom::declared_model_specs() {
         if !specs.contains(&spec) {

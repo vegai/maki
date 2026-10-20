@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -147,10 +148,7 @@ fn jobstart(
 
     if let Some(ref opts) = opts {
         spec.cwd = opts.opt("cwd").ok().flatten();
-        spec.env = opts
-            .get::<Table>("env")
-            .ok()
-            .map(|t| t.pairs::<String, String>().filter_map(Result::ok).collect());
+        spec.env = opts.opt::<HashMap<String, String>>("env")?;
         spec.clear_env = opts.get::<Option<bool>>("clear_env")?.unwrap_or(false);
         spec.guard = opts.get::<Option<bool>>("guard")?.unwrap_or(false);
         spec.timeout = opts
@@ -311,7 +309,7 @@ fn parse_scope(lua: &Lua, plugin: &Arc<str>, scope: Value) -> LuaResult<JobOwner
 ///
 /// @param job_id integer Job id returned by `jobstart`.
 /// @return (table|nil, string|nil) `{ id, command, name, pid, session, status,
-///   exit_code, elapsed_secs, stdout_lines, stderr_lines }`, or nil and
+///   exit_code, timed_out, elapsed_secs, stdout_lines, stderr_lines }`, or nil and
 ///   an error. `status` is `"running"` or `"exited"`.
 /// @example
 /// local info = maki.fn.jobinfo(id)
@@ -388,7 +386,7 @@ fn callback_update(lua: &Lua, opts: &Table, key: &str) -> LuaResult<CallbackUpda
 ///
 /// @param session string? Session id filter.
 /// @return (table) array of `{ id, command, name, pid, session, status,
-///   exit_code, elapsed_secs }`.
+///   exit_code, timed_out, elapsed_secs }`.
 /// @example
 /// local jobs = maki.fn.joblist(maki.session.current())
 #[lua_fn(guard = Run)]
@@ -426,6 +424,7 @@ fn snapshot_table(lua: &Lua, snap: &JobSnapshot, tails: bool) -> LuaResult<Table
         },
     )?;
     row.set("exit_code", snap.exit_code)?;
+    row.set("timed_out", snap.timed_out)?;
     if tails {
         let stdout = lua.create_table()?;
         for (i, line) in snap.stdout_lines.iter().enumerate() {

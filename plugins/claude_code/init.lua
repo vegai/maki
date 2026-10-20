@@ -84,7 +84,7 @@ local opts = maki.api.register_options(output_limits.extend({
   deny_read_home = {
     default = "",
     desc = "Extra home-relative files or directories the coding shell cannot read, comma-separated. "
-      .. "Common credential stores are denied by default. Other home files remain readable.",
+      .. "Common credential stores are denied by default. Claude Code also hides home paths outside the snapshot.",
   },
   dependencies = {
     default = "",
@@ -94,7 +94,7 @@ local opts = maki.api.register_options(output_limits.extend({
   prepare = {
     default = "",
     desc = "Shell command to run in each coding snapshot before Claude starts, for example "
-      .. "`npm ci` or `python -m venv .venv && .venv/bin/pip install -e .`. It runs as you, outside the "
+      .. "`npm ci` or `python3 -m venv --copies .venv && .venv/bin/pip install -e .`. It runs as you, outside the "
       .. "sandbox and with network access, so the worker can use what it fetches.",
   },
   prepare_timeout_secs = {
@@ -349,6 +349,9 @@ local function run(input, ctx, call, timeout_secs)
   end
   if artifact.unsettled then
     task = task .. "\n\n" .. UNSETTLED:format(artifact.unsettled)
+  end
+  for _, note in ipairs(artifact.notes) do
+    task = task .. "\n\nnote: " .. note
   end
   local outcome = claude:start(argv, artifact.snapshot, env, task)
   if not claude.prompted then

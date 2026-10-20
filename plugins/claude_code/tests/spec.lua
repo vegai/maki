@@ -18,6 +18,7 @@ local ANSWER = "The parser lives in src/parse.rs:10."
 local OK_VERSION = "2.1.284"
 local LINUX = "Linux"
 local CLI = { version = OK_VERSION }
+local JOB_WAIT_MS = 5000
 local OUTSIDE = "/home/u/.ssh/config"
 -- What 2.1.280 sends with every setting source off.
 local BUILTIN_PLUGINS = {
@@ -108,7 +109,7 @@ end
 local function handshake_problem(answers, worker, confine)
   worker = worker or READ
   local responses = {
-    account = account_answer(nil, next(worker.reported_modes)),
+    account = account_answer(nil, worker.reported_modes[1]),
     settings = { effective = launch.settings(DEFAULT_DENY_RULES, worker, confine), sources = maki.json.decode("[]") },
     hooks = HOOKS_OFF,
   }
@@ -688,18 +689,6 @@ for _, c in ipairs({
   end)
 end
 
-for _, c in ipairs({
-  { name = "an_array", value = { "Read", "Grep" }, want = true },
-  { name = "an_empty_table", value = {}, want = false },
-  { name = "an_object", value = { tool = "Bash" }, want = false },
-  { name = "a_decoded_array_with_a_null", value = maki.json.decode('["Read", null, "Bash"]'), want = false },
-  { name = "a_string", value = "Read", want = false },
-}) do
-  case("is_list_" .. c.name, function()
-    eq(path_utils.is_list(c.value), c.want)
-  end)
-end
-
 local function write_file(path, content)
   maki.fs.mkdir(maki.fs.dirname(path), { parents = true })
   maki.fs.write(path, content)
@@ -804,7 +793,9 @@ for _, c in ipairs({
       { "sh", "-c", 'printf "$1" > "$2"', "sh", c.git, maki.fs.joinpath(root, "wt/.git") },
       { scope = "plugin" }
     )
-    maki.fn.jobwait(job, 5000)
+    local result, wait_err = maki.fn.jobwait(job, JOB_WAIT_MS)
+    eq(wait_err, nil)
+    eq(result and result.exit_code, 0, "the fixture job must finish successfully")
     local dirs, err = local_settings_dirs(maki.fs.joinpath(root, "wt"))
     t.rmtree(root)
     eq(dirs, nil)

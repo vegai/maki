@@ -249,6 +249,7 @@ while IFS= read -r msg; do
     *'"type":"user"'*) printf '%s\n' "$msg" > "$dir/prompt"; scenario=$(printf '%s' "$msg" | sed -n 's/.*"\(content\|text\)":"\([^"]*\)".*/\2/p'); break ;;
   esac
 done
+scenario=${scenario%%\\n*}
 if [ -z "$scenario" ] && [ -e "$dir/@PROBE_RUNS@" ]; then init none; answer; fi
 if [ -z "$scenario" ] && [ -e "$dir/probe_exit" ]; then echo "probe gave up" >&2; exit "$(cat "$dir/probe_exit")"; fi
 [ -n "$scenario" ] || exit 0

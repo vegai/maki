@@ -133,14 +133,14 @@ pub(crate) fn fingerprint(context: &RunContext, mcp: Option<&McpSession>, model:
     let mut hasher = Sha256::new();
     hasher.update(context.tools.definitions().to_string());
     hasher.update([0]);
-    if let Some(filter) = context.tools.filter().cache_key() {
-        hasher.update(filter.to_string());
-        hasher.update([0]);
-    }
     hasher.update(&context.authored);
     if mcp.is_some() {
         hasher.update([0]);
         hasher.update(format!("{:?}", ToolDeferral::for_model(model)));
+        if let Some(filter) = context.tools.filter().cache_key() {
+            hasher.update([0]);
+            hasher.update(filter.to_string());
+        }
     }
     hasher.finalize()[..FINGERPRINT_BYTES]
         .iter()
@@ -148,7 +148,7 @@ pub(crate) fn fingerprint(context: &RunContext, mcp: Option<&McpSession>, model:
         .collect()
 }
 
-pub fn request_tools<'t>(
+pub(crate) fn request_tools<'t>(
     tools: &'t RequestTools,
     mcp: Option<&McpSession>,
     deferral: ToolDeferral,
@@ -451,24 +451,27 @@ mod tests {
         );
     }
 
-    #[test]
-    fn changed_policy_rebuilds_a_restored_frame_with_the_same_base_tools() {
+    #[test_case(false ; "native_exclusions_are_already_in_definitions")]
+    #[test_case(true ; "external_exclusions_change_the_frame")]
+    fn changed_policy_rebuilds_a_restored_frame_with_the_same_base_tools(with_mcp: bool) {
         let model = model(NATIVE_MODEL);
         let mcp = stub_session(&[(MCP_TOOL, "Probe")]);
+        let mcp = with_mcp.then_some(&mcp);
         let mut history = History::new(Vec::new());
         let initial = context(BASE_TOOL, "");
         let base_tools = initial.tools.definitions().clone();
         assert_eq!(
-            fit_frame(&mut history, initial, Some(&mcp), &model),
+            fit_frame(&mut history, initial, mcp, &model),
             FrameFit::Built
         );
-        assert!(
+        assert_eq!(
             history
                 .live_frame()
                 .unwrap()
                 .wire
                 .to_string()
-                .contains(MCP_WIRE)
+                .contains(MCP_WIRE),
+            with_mcp
         );
 
         let mut restored = History::new(Vec::new()).with_frame(history.frame().cloned());
@@ -488,8 +491,12 @@ mod tests {
         );
         assert_eq!(restricted.tools.definitions(), &base_tools);
         assert_eq!(
-            fit_frame(&mut restored, restricted, Some(&mcp), &model),
-            FrameFit::Rebuilt
+            fit_frame(&mut restored, restricted, mcp, &model),
+            if with_mcp {
+                FrameFit::Rebuilt
+            } else {
+                FrameFit::Kept
+            }
         );
         assert!(
             !restored

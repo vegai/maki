@@ -31,7 +31,6 @@ pub(super) const ASSISTANT_EVENT: &str = "assistant";
 const USER_EVENT: &str = "user";
 pub(super) const RESULT_EVENT: &str = "result";
 const MAX_TURNS_ERROR: &str = "error_max_turns";
-const ERROR_PREFIX: &str = "error";
 const STREAM_EVENT: &str = "stream_event";
 const UNKNOWN_EVENT_KIND: &str = "?";
 const CONTROL_REQUEST: &str = "control_request";
@@ -184,12 +183,7 @@ pub(crate) fn classify(
         _ => return Err(Error::UnknownEvent(event["type"].clone())),
     };
     if !accepted {
-        if kind == EventKind::Result
-            && (event["is_error"] == true
-                || event["subtype"]
-                    .as_str()
-                    .is_some_and(|kind| kind.starts_with(ERROR_PREFIX)))
-        {
+        if kind == EventKind::Result && failed_result(event) {
             if mode == StreamMode::Provider {
                 return Err(Error::Failed(result_message(event)));
             }
@@ -289,7 +283,7 @@ pub(crate) struct Turn<'a> {
     blocks: Vec<ContentBlock>,
     usage: Usage,
     stop_reason: Option<String>,
-    result: bool,
+    received_result: bool,
     parked: Vec<Parked>,
     /// Claude Code answered a call itself because the call broke its schema.
     /// maki runs the call anyway, it fails the same way, and the model gets
@@ -583,7 +577,7 @@ impl<'a> Turn<'a> {
             blocks: Vec::new(),
             usage: Usage::default(),
             stop_reason: None,
-            result: false,
+            received_result: false,
             parked: Vec::new(),
             rejected: false,
             refusal: None,
@@ -619,7 +613,7 @@ impl<'a> Turn<'a> {
 
     /// Only the result is missing.
     pub fn awaits_result(&self) -> bool {
-        self.is_complete() && !self.result && !self.calls_tools()
+        self.is_complete() && !self.received_result && !self.calls_tools()
     }
 
     /// The stream has given every usage count, the final output count
@@ -662,7 +656,7 @@ impl<'a> Turn<'a> {
             .join(" ")
     }
 
-    fn record(&mut self, event: &Value) {
+    fn record_event(&mut self, event: &Value) {
         let kind = match (event["type"].as_str(), event["subtype"].as_str()) {
             (Some(STREAM_EVENT), _) => event["event"]["type"].as_str().unwrap_or(STREAM_EVENT),
             (Some(kind), _) => kind,
@@ -688,7 +682,7 @@ impl<'a> Turn<'a> {
     /// ignored until the reply is complete.
     pub fn feed(&mut self, line: &str) -> Result<Step, Error> {
         let event = parse_event(line)?;
-        self.record(&event);
+        self.record_event(&event);
         let accepted = self.accepted();
         let kind = classify(&event, StreamMode::Provider, accepted)?;
         match kind {
@@ -709,7 +703,7 @@ impl<'a> Turn<'a> {
                 self.settle()
             }
             EventKind::User => Err(Error::AnsweredItself(answered(&event["message"]))),
-            EventKind::Result => self.result(&event),
+            EventKind::Result => self.finish_result(&event),
             EventKind::ControlResponse
             | EventKind::RateLimit
             | EventKind::Alive
@@ -897,7 +891,7 @@ impl<'a> Turn<'a> {
         Ok(Step::Nothing)
     }
 
-    fn result(&mut self, event: &Value) -> Result<Step, Error> {
+    fn finish_result(&mut self, event: &Value) -> Result<Step, Error> {
         if let Some(refusal) = self.refusal.take() {
             return Err(self.refused(refusal, status_of(&event["api_error_status"])));
         }
@@ -925,7 +919,7 @@ impl<'a> Turn<'a> {
         if let Some(lost) = self.lost.take() {
             return Err(lost);
         }
-        self.result = true;
+        self.received_result = true;
         self.settle()
     }
 
@@ -1018,7 +1012,7 @@ impl<'a> Turn<'a> {
             if stop_reason == TOOL_USE_STOP {
                 return Err(Error::NoCallsToRun);
             }
-            return Ok(if self.result || self.truncated() {
+            return Ok(if self.received_result || self.truncated() {
                 Step::Done
             } else {
                 Step::Nothing
@@ -1217,10 +1211,10 @@ mod tests {
     use super::super::transcript::Catalog;
     use super::{
         ACCOUNT_ANSWER, API_ERROR_MARK, BATCH_CALL_TOOL, BATCH_CALLS, BATCH_TOOL, EXTRA_USAGE,
-        EXTRA_USAGE_IN_USE, HOOKS_ANSWER, INPUT_REJECTED, MAX_TOKENS_STOP, MAX_TURNS_ERROR,
-        NO_SUCH_TOOL, PLAN_REJECTED, RATE_LIMITED, REFUSAL_STOP, RESULT_EVENT, SETTINGS_ANSWER,
-        SHOWN_LINE_CHARS, SUCCESS, Step, StreamMode, StreamedText, TOOL_RESULT, TOOL_USE_STOP,
-        Turn, WINDOW_FULL_STOP, classify, usage_of, user_message,
+        EXTRA_USAGE_IN_USE, EventKind, HOOKS_ANSWER, INPUT_REJECTED, MAX_TOKENS_STOP,
+        MAX_TURNS_ERROR, NO_SUCH_TOOL, PLAN_REJECTED, RATE_LIMITED, REFUSAL_STOP, RESULT_EVENT,
+        SETTINGS_ANSWER, SHOWN_LINE_CHARS, SUCCESS, Step, StreamMode, StreamedText, TOOL_RESULT,
+        TOOL_USE_STOP, Turn, WINDOW_FULL_STOP, classify, result_failure, usage_of, user_message,
     };
     use crate::{ContentBlock, StopReason, StreamResponse};
 
@@ -1980,14 +1974,17 @@ mod tests {
 
     #[test_case(json!({}) ; "missing_subtype")]
     #[test_case(json!({ "subtype": "unknown" }) ; "unknown_subtype")]
-    fn an_unknown_result_before_init_does_not_bypass_startup_checks(mut event: Value) {
+    fn an_unknown_result_before_init_is_a_failure(mut event: Value) {
         event["type"] = json!(RESULT_EVENT);
-        for mode in [StreamMode::Provider, StreamMode::Worker] {
-            assert!(matches!(
-                classify(&event, mode, false),
-                Err(Error::UncheckedStart)
-            ));
-        }
+        assert!(matches!(
+            classify(&event, StreamMode::Provider, false),
+            Err(Error::Failed(_))
+        ));
+        assert!(matches!(
+            classify(&event, StreamMode::Worker, false),
+            Ok(EventKind::Result)
+        ));
+        assert!(result_failure(&event).is_some());
     }
 
     /// A text reply that ends at its result.
