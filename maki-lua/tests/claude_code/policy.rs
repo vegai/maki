@@ -17,14 +17,14 @@ use maki_agent::tools::test_support::stub_ctx_in;
 use maki_agent::tools::{ToolContext, ToolRegistry};
 use maki_agent::{AgentEvent, Envelope, EventSender, ToolOutput, ToolOutputLines};
 use maki_lua::{MAX_INFLIGHT_TOOLS, PluginHost, RestoreItem, RestoreReason};
-use maki_providers::claude_code::validation::STARTUP_TIMEOUT_SECS;
 use serde_json::{Map, Value, json};
 use tempfile::{TempDir, tempdir};
 use test_case::test_case;
 
 use super::support::{
     DEADLINE, FIXTURE_GLOBAL_RULE, LEFT_BEHIND, MINIMUM_VERSION, PROJECT_RULE, TOOL, WorkingDir,
-    executable, group_gone, load, running, tool_reply, try_load, wait_until, within,
+    executable, group_gone, load, running, tool_reply, try_load, use_fixture_user, wait_until,
+    within,
 };
 
 mod coding;
@@ -135,7 +135,7 @@ const CANCEL_MARKER: &str = "[cancelled by user";
 const USAGE_PROGRESS: &str = "Read src/usage.rs";
 const TOOL_USE_ID: &str = "toolu_ask";
 /// The smallest `timeout` a call takes.
-const RUN_TIMEOUT_SECS: u64 = 30;
+const TEST_TIMEOUT_SECS: u64 = 10;
 const SPENT_BEFORE_CANCEL: &[&str] = &["7 in", "2.0k cache read", "300 cache write", "out unknown"];
 const WAITING: &str = "Wait for a free Claude Code slot";
 const FIRST_ID: &str = "toolu_first";
@@ -477,6 +477,19 @@ impl FakeClaude {
         load(self.opts(max_concurrent))
     }
 
+    fn host_with_short_deadlines(&self) -> (Arc<ToolRegistry>, PluginHost) {
+        use_fixture_user();
+        let registry = Arc::new(ToolRegistry::new());
+        let host = PluginHost::new(Arc::clone(&registry)).unwrap();
+        let source = format!(
+            "local launch = require(\"claude_launch\")\nlaunch.STARTUP_TIMEOUT_SECS = {TEST_TIMEOUT_SECS}\nlaunch.STARTUP_MS = {TEST_TIMEOUT_SECS} * 1000\nlaunch.MIN_TIMEOUT_SECS = {TEST_TIMEOUT_SECS}\n{}",
+            include_str!("../../../plugins/claude_code/init.lua"),
+        );
+        host.load_bundled_source(TOOL, &source, self.opts(ONE_SLOT))
+            .unwrap();
+        (registry, host)
+    }
+
     fn ask(&self, prompt: &str) -> Result<String, String> {
         let (reg, _host) = self.host(ONE_SLOT);
         smol::block_on(within_deadline(call(&reg, &self.ctx(None, None), prompt)))
@@ -800,12 +813,12 @@ fn a_settings_file_must_be_a_json_object(text: &str, refused: Option<&str>) {
 #[test]
 fn a_run_past_its_timeout_is_killed_and_frees_its_slot() {
     let fake = FakeClaude::new();
-    let (reg, _host) = fake.host(ONE_SLOT);
+    let (reg, _host) = fake.host_with_short_deadlines();
     let ctx = fake.ctx(None, None);
     let input =
-        json!({ "prompt": USAGE_THEN_HANG, "model": MODEL_ALIAS, "timeout": RUN_TIMEOUT_SECS });
+        json!({ "prompt": USAGE_THEN_HANG, "model": MODEL_ALIAS, "timeout": TEST_TIMEOUT_SECS });
     let err = smol::block_on(within_deadline(tool_reply(&reg, &ctx, TOOL, input))).unwrap_err();
-    assert_mentions(&err, &[&format!("timed out after {RUN_TIMEOUT_SECS}s")]);
+    assert_mentions(&err, &[&format!("timed out after {TEST_TIMEOUT_SECS}s")]);
     assert_mentions(&err, SPENT_BEFORE_CANCEL);
     assert!(
         group_gone(fake.pid(), DEADLINE),
@@ -909,7 +922,7 @@ fn a_stopped_run_keeps_what_it_spent() {
 #[test]
 fn the_startup_limit_holds_with_every_slot_taken() {
     let fake = FakeClaude::new();
-    let (reg, host) = fake.host(ONE_SLOT);
+    let (reg, host) = fake.host_with_short_deadlines();
     let slot_holder = SLOT_HOLDER.replace("@HANG_MS@", &(HANG_SECS * 1000).to_string());
     host.load_source(SLOT_HOLDER_TOOL, &slot_holder).unwrap();
     let markers = tempdir().unwrap();
@@ -950,7 +963,7 @@ fn the_startup_limit_holds_with_every_slot_taken() {
         holder.join().unwrap();
     }
     let err = result.unwrap_err();
-    let expected = format!("{NO_INIT_STOP}{} s", STARTUP_TIMEOUT_SECS);
+    let expected = format!("{NO_INIT_STOP}{} s", TEST_TIMEOUT_SECS);
     assert!(err.contains(&expected), "got: {err}");
     assert!(
         group_gone(fake.pid(), DEADLINE),

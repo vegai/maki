@@ -204,8 +204,6 @@ pub struct LaunchPreparation {
     pub withheld: Vec<String>,
     pub config_dir: PathBuf,
     pub temp_dir: PathBuf,
-    pub local_dirs: Vec<PathBuf>,
-    pub git_dir: Option<PathBuf>,
     pub denied: Vec<PathBuf>,
 }
 
@@ -264,8 +262,6 @@ pub(super) fn prepare_launch(
         withheld,
         config_dir,
         temp_dir,
-        local_dirs,
-        git_dir,
         denied,
     })
 }
@@ -399,14 +395,13 @@ fn usage_counts(usage: &Value) -> Value {
     })
 }
 
-pub fn resolved_model(account: &Value, requested: &str) -> Option<String> {
+pub fn resolved_model<'a>(account: &'a Value, requested: &str) -> Option<&'a str> {
     account["models"]
         .as_array()?
         .iter()
         .find(|offer| offer["value"] == requested)?["resolvedModel"]
         .as_str()
         .filter(|model| !model.is_empty())
-        .map(str::to_owned)
 }
 
 pub async fn version_check(executable: &Path) -> Result<VersionCheck, String> {

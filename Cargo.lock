@@ -3274,6 +3274,7 @@ dependencies = [
  "inventory",
  "isahc",
  "jiff",
+ "jsonrepair",
  "keyring",
  "libc",
  "maki-config",

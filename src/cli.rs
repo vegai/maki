@@ -8,6 +8,8 @@ use crate::print::OutputFormat;
 
 const SDK_THINKING_ENABLED: &str = "enabled";
 const SDK_THINKING_DISABLED: &str = "disabled";
+const CLAUDE_MCP_PREFIX: &str = "mcp__";
+const MCP_SEPARATOR: &str = "__";
 pub(crate) const TOOL_ARGUMENT_PATTERNS_UNSUPPORTED: &str =
     "tool argument patterns are not supported; use tool names";
 
@@ -395,6 +397,13 @@ pub enum AuthAction {
 }
 
 pub fn normalize_tool_name(name: &str) -> String {
+    let name = name
+        .strip_prefix(CLAUDE_MCP_PREFIX)
+        .filter(|name| {
+            name.split_once(MCP_SEPARATOR)
+                .is_some_and(|(server, tool)| !server.is_empty() && !tool.is_empty())
+        })
+        .unwrap_or(name);
     let local = crate::tool_names::claude_to_maki_tool_name(name);
     if local != name {
         return local.to_owned();
@@ -499,6 +508,10 @@ mod tests {
     #[test_case("ClaudeCode", "claude_code"; "plugin_pascal_case")]
     #[test_case("claude_code_import", "claude_code_import"; "plugin_passthrough")]
     #[test_case("srv__GetDocs", "srv__GetDocs"; "mcp_wire_case_is_preserved")]
+    #[test_case("mcp__srv__GetDocs", "srv__GetDocs"; "claude_mcp_wire_spelling")]
+    #[test_case("mcp__srv__tool__part", "srv__tool__part"; "claude_mcp_tool_underscores")]
+    #[test_case("mcp.GetDocs", "mcp.GetDocs"; "literal_mcp_server")]
+    #[test_case("mcp__tool", "mcp__tool"; "wire_mcp_server")]
     #[test_case("srv.GetDocs", "srv.GetDocs"; "mcp_qualified_case_is_preserved")]
     #[test_case("NonExistentTool", "non_existent_tool"; "a_tool_can_register_later")]
     #[test_case("MultiEdit", "multiedit"; "sdk_alias")]

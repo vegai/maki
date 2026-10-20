@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use flume::Receiver;
+use flume::{Receiver, Sender};
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_providers::Timeouts;
 use maki_providers::model::Model;
@@ -128,6 +128,24 @@ impl ContextSpec {
         }
     }
 
+    async fn start_provider(
+        &self,
+        model: &mut Model,
+        timeouts: Timeouts,
+        event_tx: &EventSender,
+        ready: &Sender<Ready>,
+        mcp: Option<&McpSession>,
+        workflow: bool,
+    ) -> Option<Arc<dyn Provider>> {
+        let provider = connect(model, timeouts, event_tx).await;
+        let tools = self.render(model, workflow).tools;
+        let _ = ready.send(Ready {
+            model: model.clone(),
+            tool_names: advertised_tool_names(&tools, mcp),
+        });
+        provider
+    }
+
     fn render(&self, model: &Model, workflow: bool) -> RunContext {
         let tools = RequestTools::build(
             ToolRegistry::global(),
@@ -197,12 +215,16 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
     let (ready_tx, ready_rx) = flume::bounded(1);
     let task = smol::spawn(run_session(guard, params.mcp_handle.clone(), async move {
         let mut model = params.model;
-        let provider = connect(&mut model, params.timeouts, &event_tx).await;
-        let tools = spec.render(&model, params.defaults.workflow).tools;
-        let _ = ready_tx.send(Ready {
-            model: model.clone(),
-            tool_names: advertised_tool_names(&tools, mcp.as_ref()),
-        });
+        let provider = spec
+            .start_provider(
+                &mut model,
+                params.timeouts,
+                &event_tx,
+                &ready_tx,
+                mcp.as_ref(),
+                params.defaults.workflow,
+            )
+            .await;
         let Some(provider) = provider else {
             return;
         };
@@ -363,12 +385,16 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     let (ready_tx, ready_rx) = flume::bounded(1);
     let task = smol::spawn(run_session(guard, params.mcp_handle.clone(), async move {
         let mut model = params.model;
-        let provider = connect(&mut model, params.timeouts, &base_tx).await;
-        let tools = spec.render(&model, params.defaults.workflow).tools;
-        let _ = ready_tx.send(Ready {
-            model: model.clone(),
-            tool_names: advertised_tool_names(&tools, mcp.as_ref()),
-        });
+        let provider = spec
+            .start_provider(
+                &mut model,
+                params.timeouts,
+                &base_tx,
+                &ready_tx,
+                mcp.as_ref(),
+                params.defaults.workflow,
+            )
+            .await;
         let Some(mut provider) = provider else {
             return;
         };

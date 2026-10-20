@@ -13,10 +13,11 @@ use mlua::{
     LuaSerdeExt, MultiValue, Result as LuaResult, UserData, UserDataMethods, Value as LuaValue,
 };
 
+use crate::api::fs::canonical_path;
 use crate::api::tool::ToolCallReply;
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::json_to_lua;
-use crate::api::util::pair::{Pair, err_pair};
+use crate::api::util::pair::{Pair, pair, try_pair};
 use crate::plugin_permissions::{Permission, PluginPermissions, denied_error};
 use crate::runtime::{RestoreReason, active_task, lock_cell};
 
@@ -305,13 +306,7 @@ impl UserData for LuaCtx {
             this.require(Permission::FsRead)?;
             let cwd = agent.permissions.cwd().to_owned();
             drop(this);
-            Ok(match smol::fs::canonicalize(cwd).await {
-                Ok(dir) => match dir.into_os_string().into_string() {
-                    Ok(dir) => (Some(dir), None),
-                    Err(_) => err_pair("cwd: path is not UTF-8"),
-                },
-                Err(e) => err_pair(format!("cwd: {e}")),
-            })
+            Ok(pair(canonical_path(cwd).await))
         });
 
         // The instructions maki's prompt loads for the calling session's
@@ -323,13 +318,12 @@ impl UserData for LuaCtx {
                 return Ok(this.cap_err_pair("instructions"));
             };
             this.require(Permission::FsRead)?;
-            let Some(cwd) = agent.permissions.cwd().to_str().map(str::to_owned) else {
-                return Ok(err_pair("instructions: path is not UTF-8"));
-            };
+            let cwd = agent.permissions.cwd().to_owned();
             // Nothing here may hold the ctx borrow across the wait, because a
             // cancel hook running during the wait needs `ctx:finish`, which
             // borrows the ctx mutably.
             drop(this);
+            let cwd = try_pair!(canonical_path(cwd).await);
             let text = smol::unblock(move || maki_agent::agent::load_instruction_text(&cwd)).await;
             Ok((Some(text), None))
         });

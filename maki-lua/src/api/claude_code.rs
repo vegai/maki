@@ -3,6 +3,8 @@ use std::fmt::Write;
 use std::fs;
 use std::io::{Error as IoError, ErrorKind};
 use std::ops::RangeInclusive;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::str::from_utf8;
 
@@ -190,7 +192,7 @@ impl UserData for WorkerHandshake {
             Ok(pair(this.0.finish().map(|()| true)))
         });
         methods.add_method("resolved_model", |_, this, requested: String| {
-            Ok(validation::resolved_model(this.0.account(), &requested))
+            Ok(validation::resolved_model(this.0.account(), &requested).map(str::to_owned))
         });
         methods.add_method("subscription_type", |_, this, ()| {
             Ok(validation::subscription_type(this.0.account()))
@@ -264,20 +266,6 @@ async fn prepare_launch(
         ),
     )?;
     result.set("config_dir", try_pair!(path_text(prepared.config_dir)))?;
-    result.set(
-        "dirs",
-        try_pair!(
-            prepared
-                .local_dirs
-                .into_iter()
-                .map(path_text)
-                .collect::<Result<Vec<_>, _>>()
-        ),
-    )?;
-    result.set(
-        "git_dir",
-        try_pair!(prepared.git_dir.map(path_text).transpose()),
-    )?;
     Ok((Some(result), None))
 }
 
@@ -374,6 +362,12 @@ async fn sanitize_git(
                 result.set("git_metadata", paths.git_metadata)?;
                 result.set("repositories", paths.repositories)?;
                 result.set("private_files", paths.private_files)?;
+                let symlinks = paths
+                    .symlinks
+                    .iter()
+                    .map(|path| lua.create_string(path.as_os_str().as_bytes()))
+                    .collect::<LuaResult<Vec<_>>>()?;
+                result.set("symlinks", lua.create_sequence_from(symlinks)?)?;
                 Ok((Some(result), None))
             }
             Err(error) => Ok((None, Some(error.to_string()))),

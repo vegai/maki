@@ -30,7 +30,7 @@ local KNOWN_MODES = {
   [git_utils.GITLINK_MODE] = true,
 }
 -- The snapshot copies neither, and Claude Code config can add hooks.
-local NEVER_COLLECTED = { [".git"] = true, [".claude"] = true, [".maki"] = true }
+local NEVER_COLLECTED = path_utils.set_of(git_utils.NEVER_COLLECTED)
 local OBJECT_ID_LENGTHS = { [40] = true, [64] = true }
 function M.repository_path(path, repositories)
   for repository in pairs(repositories or {}) do

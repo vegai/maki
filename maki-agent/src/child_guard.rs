@@ -3,7 +3,7 @@ use std::process::ExitStatus;
 use std::time::Duration;
 
 #[cfg(unix)]
-use maki_providers::process::group_of as unix_pid;
+use maki_providers::process::{group_of, kill_group};
 #[cfg(unix)]
 use rustix::process::{WaitOptions, waitpid};
 use smol::process::Child;
@@ -61,7 +61,7 @@ impl ChildGuard {
     #[cfg(unix)]
     fn signal_kill(&self) {
         if self.child.is_some() {
-            maki_providers::process::kill_group(self.pid);
+            kill_group(self.pid);
         }
     }
 
@@ -79,7 +79,7 @@ impl ChildGuard {
     #[cfg(unix)]
     fn reap_nonblocking(&mut self) {
         if self.child.take().is_some()
-            && let Some(pid) = unix_pid(self.pid)
+            && let Some(pid) = group_of(self.pid)
         {
             let _ = waitpid(Some(pid), WaitOptions::NOHANG);
         }
@@ -111,7 +111,7 @@ mod tests {
 
     use rustix::process::{setsid, test_kill_process};
 
-    use super::{ChildGuard, unix_pid};
+    use super::{ChildGuard, group_of};
 
     fn spawn_sleep() -> Child {
         let mut std_cmd = std::process::Command::new("sleep");
@@ -127,7 +127,7 @@ mod tests {
     }
 
     fn is_alive(pid: u32) -> bool {
-        unix_pid(pid).is_some_and(|pid| test_kill_process(pid).is_ok())
+        group_of(pid).is_some_and(|pid| test_kill_process(pid).is_ok())
     }
 
     fn wait_for_death(pid: u32) {

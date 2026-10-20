@@ -60,8 +60,16 @@ M.REGULAR_MODE = "100644"
 M.ADDED = "A"
 M.DELETED = "D"
 M.TYPE_CHANGED = "T"
-local ALSO_EXCLUDED = { ".claude", "**/.claude", ".maki", "**/.maki" }
-M.UNCOLLECTED_RULE = ".[cC][lL][aA][uU][dD][eE]\n.[mM][aA][kK][iI]\n"
+M.NEVER_COLLECTED = { ".git", ".claude", ".maki" }
+local ALSO_EXCLUDED, uncollected = {}, {}
+for _, name in ipairs(M.NEVER_COLLECTED) do
+  ALSO_EXCLUDED[#ALSO_EXCLUDED + 1] = name
+  ALSO_EXCLUDED[#ALSO_EXCLUDED + 1] = "**/" .. name
+  uncollected[#uncollected + 1] = name:gsub("%a", function(char)
+    return "[" .. char:lower() .. char:upper() .. "]"
+  end) .. "\n"
+end
+M.UNCOLLECTED_RULE = table.concat(uncollected)
 
 function M.git(args)
   local argv = { "git" }

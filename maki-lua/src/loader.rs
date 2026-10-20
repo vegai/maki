@@ -629,7 +629,7 @@ impl PluginHost {
     }
 
     /// Runs trusted source with a bundled plugin's permissions and private API.
-    /// For Rust embedders and tests. Source from disk uses the manifest-derived loaders.
+    /// Used by builtins, Rust embedders and tests. Source from disk uses the manifest-derived loaders.
     pub fn load_bundled_source(
         &self,
         name: &str,
@@ -1373,19 +1373,8 @@ mod tests {
     #[test_case(include_str!("../../plugins/claude_code/tests/jobs.lua") ; "job_spec")]
     fn claude_code_bundled_spec(source: &str) {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-        host.send_load(
-            Arc::from(maki_providers::claude_code::PLUGIN),
-            vec![LoadChunk::bundled(
-                maki_providers::claude_code::PLUGIN,
-                source,
-            )],
-            LoadContext {
-                authority: DeclAuthority::Bundled,
-                private_api: Some(crate::api::claude_code::create_private_module),
-                ..LoadContext::plain(None, PluginPermissions::trusted())
-            },
-        )
-        .unwrap();
+        host.load_bundled_source(maki_providers::claude_code::PLUGIN, source, JsonMap::new())
+            .unwrap();
     }
 
     #[test]

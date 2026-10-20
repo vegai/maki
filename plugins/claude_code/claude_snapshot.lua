@@ -5,6 +5,7 @@ local native = require("maki.claude_code.internal")
 -- stops it.
 
 local launch = require("claude_launch")
+local jobs = require("claude_jobs")
 local workspace = require("claude_workspace")
 local git_utils = require("claude_git")
 local path_utils = require("claude_paths")
@@ -347,21 +348,24 @@ end
 
 -- A link out of the snapshot could lead the worker into the checkout or
 -- anywhere else.
-local function drop_escaping_links(call, artifact, env)
+local function drop_escaping_links(call, artifact, symlinks)
+  if #symlinks == 0 then
+    return {}
+  end
+  local paths = {}
+  for _, link in ipairs(symlinks) do
+    paths[#paths + 1] = artifact.snapshot .. "/" .. link
+  end
   local out, err = call:run_quick({
-    "find",
-    artifact.snapshot,
-    "-type",
-    "l",
-    "-exec",
+    "xargs",
+    "-0",
+    "-r",
     "bash",
     "-c",
     DROP_ESCAPING_LINKS,
     "bash",
     artifact.snapshot,
-    "{}",
-    "+",
-  }, { env = env, timeout_ms = artifact.timeout_ms })
+  }, { env = artifact.git_env, timeout_ms = artifact.timeout_ms, stdin = table.concat(paths, "\0") .. "\0" })
   if not out then
     return nil, err
   end
@@ -394,15 +398,15 @@ local function commit_base(call, artifact, paths, dependencies)
   local _, mkdir_err = maki.fs.mkdir(info)
   local _, attributes_err = maki.fs.write(maki.fs.joinpath(info, "attributes"), git_utils.RAW_ATTRIBUTES)
   local _, exclude_err = maki.fs.write(maki.fs.joinpath(info, "exclude"), table.concat(exclude))
-  local link_err = M.sanitize(artifact)
+  local link_err, dropped = M.sanitize(artifact, call)
   local setup_err = mkdir_err or attributes_err or exclude_err or link_err
   if setup_err then
     return "maki cannot make the repository of the snapshot: " .. setup_err
   end
-  if artifact.repositories then
+  if artifact.repositories or next(dropped) then
     local kept = {}
     for _, path in ipairs(paths) do
-      if not workspace.repository_path(path, artifact.repositories) then
+      if not dropped[path] and not workspace.repository_path(path, artifact.repositories) then
         kept[#kept + 1] = path
       end
     end
@@ -506,17 +510,7 @@ function M.fill(call, artifact, spec)
     artifact.notes[#artifact.notes + 1] = "dependencies changed during the copy, so they may mix two versions: "
       .. artifact.unsettled
   end
-  local dropped, links_err = drop_escaping_links(call, artifact, spec.env)
-  if not dropped then
-    return links_err
-  end
-  local kept = {}
-  for _, path in ipairs(paths) do
-    if not dropped[path] then
-      kept[#kept + 1] = path
-    end
-  end
-  return commit_base(call, artifact, kept, spec.dependencies) or consistency_problem(call, artifact, spec)
+  return commit_base(call, artifact, paths, spec.dependencies) or consistency_problem(call, artifact, spec)
 end
 
 local function remove_artifact(call, dir, released)
@@ -671,7 +665,10 @@ end
 
 -- Git traverses nested repositories during ordinary status commands. Keep their metadata
 -- outside the work tree, without discarding the worker's files or repository objects.
-function M.sanitize(artifact)
+function M.sanitize(artifact, call)
+  if call and call.stopped then
+    return jobs.CANCELLED
+  end
   local quarantine = maki.fs.joinpath(artifact.dir, QUARANTINE_DIR)
   local paths, err = native.sanitize_git(artifact.snapshot, quarantine, artifact.git)
   if not paths then
@@ -699,6 +696,10 @@ function M.sanitize(artifact)
     artifact.notes[#artifact.notes + 1] = "maki made private copies of "
       .. paths.private_files
       .. " hard-linked files in the snapshot"
+  end
+  if call then
+    local dropped, link_err = drop_escaping_links(call, artifact, paths.symlinks)
+    return link_err, dropped
   end
 end
 
@@ -737,7 +738,7 @@ end
 -- Preparation changes become the worker baseline. The checkout lacks these
 -- changes, so files the worker changes again cannot be imported.
 local function commit_prepared(call, artifact)
-  local metadata_err = M.sanitize(artifact)
+  local metadata_err = M.sanitize(artifact, call)
   if metadata_err then
     return metadata_err
   end
@@ -775,10 +776,6 @@ function M.prepare(call, artifact, command, env, timeout_ms)
     timeout_ms = timeout_ms,
   })
   artifact.prepare_err = err
-  local dropped, links_err = drop_escaping_links(call, artifact, env)
-  if not dropped then
-    return links_err
-  end
   return commit_prepared(call, artifact)
 end
 

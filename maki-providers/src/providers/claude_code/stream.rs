@@ -8,6 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
+use jsonrepair::{Options as RepairOptions, loads as repair_loads};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tracing::debug;
@@ -343,12 +344,6 @@ impl StreamedText {
     }
 }
 
-/// A name `--model` accepts, and the model it runs.
-pub(crate) struct Offered {
-    pub name: String,
-    pub model: String,
-}
-
 fn answered(message: &Value) -> String {
     line_preview(&message_text(message))
 }
@@ -434,19 +429,12 @@ pub(crate) struct Handshake {
 }
 
 impl Handshake {
-    pub fn offered(&self) -> Vec<Offered> {
-        self.answers
-            .get(ACCOUNT_ANSWER)
-            .and_then(|account| account["models"].as_array())
+    pub fn offered(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.account()["models"]
+            .as_array()
             .into_iter()
             .flatten()
-            .filter_map(|offer| {
-                Some(Offered {
-                    name: offer["value"].as_str()?.to_owned(),
-                    model: offer["resolvedModel"].as_str()?.to_owned(),
-                })
-            })
-            .collect()
+            .filter_map(|offer| Some((offer["value"].as_str()?, offer["resolvedModel"].as_str()?)))
     }
 
     pub(crate) fn feed(
@@ -1119,7 +1107,9 @@ impl<'a> Turn<'a> {
 /// runs them by its own names. An unknown name stays, so maki reports it.
 fn unexpose_batch(catalog: &Catalog, input: &mut Value) {
     if let Some(Value::String(encoded)) = input.get(BATCH_CALLS)
-        && let Ok(Value::Array(calls)) = serde_json::from_str(encoded)
+        && let Some(Value::Array(calls)) = serde_json::from_str(encoded)
+            .ok()
+            .or_else(|| repair_loads(encoded, &RepairOptions::default()).ok())
     {
         input[BATCH_CALLS] = Value::Array(calls);
     }
@@ -1432,7 +1422,6 @@ mod tests {
             version: &profile,
             model: ASKED,
             cwd: Path::new(CWD),
-            server: SERVER,
             tools: &tools,
         };
         let plan_usage = Mutex::default();
@@ -1902,10 +1891,21 @@ mod tests {
         check_batch_names(inner, expected, true);
     }
 
+    #[test_case(r#"[{"tool":"mcp__maki__read","parameters":{"path":"a"}}]}]}"# ; "extra_closing_delimiters")]
+    #[test_case("[{\"tool\":\"mcp__maki__read\",\"parameters\":{\"path\":\"a\"}}]\n</invoke>\n" ; "invoke_suffix")]
+    #[test_case(r#"[{"tool":"mcp__maki__read" "parameters":{"path":"a"}}]"# ; "missing_comma")]
+    fn repaired_batches_translate_exposed_tool_names(encoded: &str) {
+        check_batch_input(json!({ BATCH_CALLS: encoded }), TOOL);
+    }
+
     fn check_batch_names(inner: &str, expected: &str, encoded: bool) {
         let calls = json!([{ BATCH_CALL_TOOL: inner, "parameters": { "path": "a" } }]);
         let input =
             json!({ BATCH_CALLS: if encoded { Value::String(calls.to_string()) } else { calls } });
+        check_batch_input(input, expected);
+    }
+
+    fn check_batch_input(input: Value, expected: &str) {
         let call =
             json!({ "type": "tool_use", "id": FIRST_CALL, "name": EXPOSED_BATCH, "input": input });
         let handoff = Handoff::Parked {
@@ -2256,8 +2256,7 @@ mod tests {
             }
             turn.handshake
                 .offered()
-                .into_iter()
-                .map(|offer| (offer.name, offer.model))
+                .map(|(name, model)| (name.to_owned(), model.to_owned()))
                 .collect()
         });
         let want = [("default", OPUS), ("opus", OPUS), ("haiku", RAN)]

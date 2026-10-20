@@ -806,3 +806,129 @@ lua_table! {
         winsaveview(tx), winrestview(tx),
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use mlua::{Lua, Table, Value};
+    use test_case::test_case;
+
+    use super::{
+        JobEvent, call_back, chansend_bytes, winrestview__register, winsaveview__register,
+    };
+    use crate::api::util::command::{NO_UI_ERR, UiAction, WinView};
+
+    const CALLBACK_LINE: &str = "output";
+    const FIRST_LINE: &[u8] = b"first";
+    const NOT_UTF8_LINE: &[u8] = b"latin\xe9";
+    const LINE_WITH_NEWLINE: &[u8] = b"two\nparts";
+    const LINE_WITH_NUL: &[u8] = b"two\0parts";
+
+    #[test_case(JobEvent::Stdout(CALLBACK_LINE.into()), 3 ; "stdout")]
+    #[test_case(JobEvent::Stderr(CALLBACK_LINE.into()), 3 ; "stderr")]
+    #[test_case(JobEvent::Exit(0, false), 4 ; "normal_exit")]
+    #[test_case(JobEvent::Exit(1, true), 4 ; "timeout_exit")]
+    fn job_callbacks_keep_their_argument_counts(event: JobEvent, count: usize) {
+        let lua = Lua::new();
+        let callback = lua
+            .load("return function(...) args = table.pack(...) end")
+            .eval()
+            .unwrap();
+        smol::block_on(call_back(&lua, callback, 1, &event)).unwrap();
+        let args: Table = lua.globals().get("args").unwrap();
+        assert_eq!(args.get::<usize>("n").unwrap(), count);
+        assert_eq!(args.get::<String>(3).unwrap(), event.name());
+        if let JobEvent::Exit(_, timed_out) = event {
+            assert_eq!(args.get::<bool>(4).unwrap(), timed_out);
+        }
+    }
+
+    /// List items can contain arbitrary bytes, as in Neovim. A newline inside an item becomes NUL.
+    #[test]
+    fn chansend_sends_a_list_as_bytes() {
+        let lua = Lua::new();
+        let lines = lua
+            .create_sequence_from([
+                lua.create_string(FIRST_LINE).unwrap(),
+                lua.create_string(NOT_UTF8_LINE).unwrap(),
+                lua.create_string(LINE_WITH_NEWLINE).unwrap(),
+            ])
+            .unwrap();
+        let expected = [
+            FIRST_LINE,
+            b"\n".as_slice(),
+            NOT_UTF8_LINE,
+            b"\n".as_slice(),
+            LINE_WITH_NUL,
+        ]
+        .concat();
+        assert_eq!(chansend_bytes(Value::Table(lines)).unwrap(), expected);
+    }
+
+    fn lua_with_view(tx: Option<flume::Sender<UiAction>>) -> Lua {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        winsaveview__register(&t, &lua, tx.clone()).unwrap();
+        winrestview__register(&t, &lua, tx).unwrap();
+        lua.globals().set("f", t).unwrap();
+        lua
+    }
+
+    #[test_case("return f.winsaveview()" ; "winsaveview")]
+    #[test_case("return f.winrestview({ topline = 3 })" ; "winrestview")]
+    fn view_without_ui_returns_error_pair(code: &str) {
+        let lua = lua_with_view(None);
+        let (val, err): (Value, Option<String>) =
+            smol::block_on(lua.load(code).eval_async()).unwrap();
+        assert!(val.is_nil());
+        assert_eq!(err.as_deref(), Some(NO_UI_ERR));
+    }
+
+    #[test]
+    fn winsaveview_reports_the_viewport_one_based() {
+        const SCROLL_TOP: u32 = 6;
+        const LINE_COUNT: u32 = 100;
+        const HEIGHT: u16 = 24;
+
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        let lua = lua_with_view(Some(tx));
+        std::thread::spawn(move || {
+            let Ok(UiAction::WinSaveView { reply_tx }) = rx.recv() else {
+                panic!("expected winsaveview request");
+            };
+            reply_tx
+                .send(WinView {
+                    scroll_top: SCROLL_TOP,
+                    line_count: LINE_COUNT,
+                    height: HEIGHT,
+                    auto_scroll: false,
+                })
+                .unwrap();
+        });
+        let (view, err): (Table, Option<String>) =
+            smol::block_on(lua.load("return f.winsaveview()").eval_async()).unwrap();
+        assert_eq!(err, None);
+        assert_eq!(view.get::<u32>("topline").unwrap(), SCROLL_TOP + 1);
+        assert_eq!(view.get::<u32>("line_count").unwrap(), LINE_COUNT);
+        assert_eq!(view.get::<u16>("height").unwrap(), HEIGHT);
+        assert!(!view.get::<bool>("auto_scroll").unwrap());
+    }
+
+    #[test_case("{ topline = 12 }", 11 ; "explicit_topline")]
+    #[test_case("{}", 0 ; "missing_topline_defaults_to_first_line")]
+    #[test_case("{ topline = -5 }", 0 ; "below_range_clamps_to_first_line")]
+    fn winrestview_forwards_zero_based_scroll_top(arg: &str, expected: u32) {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        let lua = lua_with_view(Some(tx));
+        let (ok, err): (bool, Option<String>) = smol::block_on(
+            lua.load(format!("return f.winrestview({arg})"))
+                .eval_async(),
+        )
+        .unwrap();
+        assert!(ok);
+        assert_eq!(err, None);
+        let Ok(UiAction::WinRestView { scroll_top }) = rx.recv() else {
+            panic!("expected winrestview request");
+        };
+        assert_eq!(scroll_top, expected);
+    }
+}
