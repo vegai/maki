@@ -198,11 +198,10 @@ pub(super) fn require_system(os: &str) -> Result<(), Error> {
 pub(crate) fn profile(output: &str, os: &str) -> Result<String, Error> {
     let version = output.split_whitespace().next().unwrap_or_default();
     let parts = version_parts(version).ok_or_else(|| Error::UnknownVersion(output.to_owned()))?;
-    let minimum = MINIMUM_VERSION;
-    if parts < minimum {
+    if parts < MINIMUM_VERSION {
         return Err(Error::TooOld {
             version: version.to_owned(),
-            oldest: minimum.map(|part| part.to_string()).join("."),
+            oldest: MINIMUM_VERSION.map(|part| part.to_string()).join("."),
         });
     }
     require_system(os)?;
@@ -688,10 +687,10 @@ mod tests {
     use super::{
         ACCOUNT_ANSWER, COMMONDIR_FILE, CONNECTED, DEFAULT_MODE, ESSENTIAL_TRAFFIC_ONLY,
         FLAG_SOURCE, GIT_ENTRY, HANDSHAKE, HOOKS_ANSWER, InitExpect, MAX_GIT_PATH_BYTES,
-        MAX_SETTINGS_BYTES, NO_KEY_SOURCE, NOT_AN_OBJECT, POLICY_SOURCE, SETTINGS_ANSWER,
-        SETTINGS_TOO_LARGE, UNREADABLE_FILE, account_problem, config_dir, file_conflicts,
-        init_problem, launch_env, local_settings_dirs, plugins_problem, policy_problem, profile,
-        settings_conflicts,
+        MAX_SETTINGS_BYTES, MINIMUM_VERSION, NO_KEY_SOURCE, NOT_AN_OBJECT, POLICY_SOURCE,
+        SETTINGS_ANSWER, SETTINGS_TOO_LARGE, UNREADABLE_FILE, account_problem, config_dir,
+        file_conflicts, init_problem, launch_env, local_settings_dirs, plugins_problem,
+        policy_problem, profile, settings_conflicts,
     };
 
     const VERSION: &str = "2.1.284";
@@ -794,7 +793,6 @@ mod tests {
         assert_eq!(settings, [ESSENTIAL_TRAFFIC_ONLY.1]);
     }
 
-    #[test_case("2.1.284 (Claude Code)", "linux" => matches Ok(version) if version == "2.1.284" ; "minimum_version")]
     #[test_case("2.1.285 (Claude Code)", "Linux" => matches Ok(version) if version == "2.1.285" ; "newer_patch_case_insensitive_platform")]
     #[test_case("  2.1.1000", "linux" => matches Ok(version) if version == "2.1.1000" ; "leading_whitespace")]
     #[test_case("3.0.0", "linux" => matches Ok(version) if version == "3.0.0" ; "new_major_version")]
@@ -809,6 +807,13 @@ mod tests {
     #[test_case("2.1.284", "Windows_NT" => matches Err(Error::UnsupportedSystem { .. }) ; "unsupported_windows")]
     fn versions_meet_the_launch_requirements(output: &str, system: &str) -> Result<String, Error> {
         profile(output, system)
+    }
+
+    #[test]
+    fn the_minimum_version_is_supported() {
+        let version = MINIMUM_VERSION.map(|part| part.to_string()).join(".");
+        let output = format!("{version} (Claude Code)");
+        assert_eq!(profile(&output, "linux").unwrap(), version);
     }
 
     #[test_case("PATH" => (true, false) ; "passed_path")]

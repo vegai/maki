@@ -1,10 +1,10 @@
 use super::super::checks;
 use super::super::error::Error;
+use super::super::settings;
 use super::super::stream::{
     CONTROL_RESPONSE, Handshake, INITIALIZE, SUCCESS, Step, control_request, parse_event,
 };
 use super::super::transcript::SERVER;
-use super::super::validation;
 use super::private_files::private_dir_async;
 use super::supervision::{
     Group, Next, next, send, send_handshake, stdout_lines, supervised, unreadable,
@@ -85,10 +85,10 @@ pub fn invalidate_profile(executable: &Path) {
 }
 
 pub(super) fn base_args(model: &str) -> Vec<String> {
-    let mut settings = validation::base_settings();
+    let mut settings = settings::base_settings();
     settings[checks::AUTO_COMPACT] = json!(false);
     settings["permissions"] = json!({ "allow": [format!("mcp__{SERVER}")] });
-    let mut args = validation::base_args(model, "", checks::DEFAULT_MODE, &settings.to_string());
+    let mut args = settings::base_args(model, "", checks::DEFAULT_MODE, &settings.to_string());
     args.extend([PARTIAL_MESSAGES_FLAG, "--max-turns", "1"].map(str::to_owned));
     args
 }
@@ -120,7 +120,7 @@ async fn unprompted<T>(
     let mut args = base_args(PROBE_MODEL);
     args.extend([
         MCP_CONFIG_FLAG.to_owned(),
-        validation::EMPTY_MCP_CONFIG.to_owned(),
+        settings::EMPTY_MCP_CONFIG.to_owned(),
     ]);
     let result = supervised(
         command(launch.executable, launch.env, &dir_path, &args),
@@ -254,8 +254,8 @@ pub(crate) async fn models(
     let offered = probe(launch, plan_usage).await?;
     let mut seen = HashSet::new();
     let ids: Vec<_> = offered
-        .offered()
-        .map(|(_, model)| model.to_owned())
+        .models()
+        .map(str::to_owned)
         .filter(|id| seen.insert(id.clone()))
         .collect();
     let chunk_size = ids.len().div_ceil(WINDOW_PROCESSES).max(1);

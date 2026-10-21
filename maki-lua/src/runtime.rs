@@ -2289,14 +2289,9 @@ async fn run_work_fn(
         .unwrap_or_else(|msg| Err(mlua::Error::runtime(msg)))
 }
 
-/// Fire a `maki.defer_fn` callback: sleep, then run the Function once.
-///
-/// The detached scope gives the callback a task of its own, outliving the
-/// one that scheduled it, and pumps job events so a `maki.system` started in
-/// the callback still gets its `on_stdout` and `on_exit`.
-///
-/// Timer callbacks have their own bounded budget so they can cancel jobs even when every
-/// tool slot is occupied. Running callbacks still hold the reload barrier.
+/// Timer callbacks use a separate bounded gate so occupied tool slots cannot block
+/// cancellation. Running callbacks hold the reload barrier and pump job events in
+/// a detached scope that outlives the scheduling task.
 fn spawn_deferred_callback(
     lua: &Lua,
     ex: &Rc<smol::LocalExecutor<'_>>,
@@ -2313,7 +2308,7 @@ fn spawn_deferred_callback(
         let _guard = timer_gate.admit(None).await;
         // Only now stop advertising the timer as pending: up to here a
         // `clear_plugin` can still flip the flag we read below, and from here
-        // on the drain barrier waits for the guard instead.
+        // on the drain barrier waits for the hold instead.
         if let Some(queue) = lua.app_data_ref::<DeferQueue>() {
             queue.forget(&cb.cancel);
         }

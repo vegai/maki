@@ -9,8 +9,10 @@ use std::fs;
 use std::fs::Permissions;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process;

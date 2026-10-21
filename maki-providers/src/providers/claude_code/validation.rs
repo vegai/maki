@@ -19,10 +19,10 @@ use super::stream::{
 
 pub use super::checks::{GIT_ENTRY, git_directory};
 pub use super::run::{VersionCheck, invalidate_profile as invalidate_version};
+use super::settings::base_settings;
+pub use super::settings::{EMPTY_MCP_CONFIG, STARTUP_TIMEOUT_SECS, base_args};
 use super::stream::usage_of as plan_usage;
 
-pub const EMPTY_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
-pub const STARTUP_TIMEOUT_SECS: u64 = 60;
 pub const DEFAULT_EXECUTABLE: &str = "claude";
 pub const DEFAULT_MAX_CONCURRENT: usize = 8;
 pub const MIN_MAX_CONCURRENT: usize = 1;
@@ -48,22 +48,6 @@ const DENY_READ: &str = "denyRead";
 const ALLOW_READ: &str = "allowRead";
 const ALLOW_WRITE: &str = "allowWrite";
 
-const BASE_ARGS: &[&str] = &[
-    "--print",
-    "--input-format",
-    "stream-json",
-    "--output-format",
-    "stream-json",
-    "--verbose",
-    "--no-session-persistence",
-    "--restricted",
-    "--permission-prompts",
-    "none",
-    "--setting-sources",
-    "",
-    "--strict-mcp-config",
-];
-
 pub fn shell_secret_problem(env: &HashMap<String, String>) -> Option<String> {
     for (name, value) in env {
         let upper = name.to_ascii_uppercase();
@@ -85,28 +69,6 @@ pub fn shell_secret_problem(env: &HashMap<String, String>) -> Option<String> {
         }
     }
     None
-}
-
-pub fn base_args(model: &str, tools: &str, mode: &str, settings: &str) -> Vec<String> {
-    let mut args: Vec<_> = BASE_ARGS.iter().map(|arg| (*arg).to_owned()).collect();
-    args.extend(
-        [
-            "--model",
-            model,
-            "--tools",
-            tools,
-            "--permission-mode",
-            mode,
-            "--settings",
-            settings,
-        ]
-        .map(str::to_owned),
-    );
-    args
-}
-
-pub(crate) fn base_settings() -> Value {
-    json!({ "disableAllHooks": true, "autoMemoryEnabled": false, "claudeMdExcludes": ["**"], "disableClaudeAiConnectors": true })
 }
 
 #[derive(Deserialize)]
@@ -196,6 +158,10 @@ impl WorkerHandshake {
 
     pub fn account(&self) -> &Value {
         self.answers.account()
+    }
+
+    pub fn resolved_model(&self, requested: &str) -> Option<&str> {
+        self.answers.resolved_model(requested)
     }
 }
 
@@ -393,15 +359,6 @@ fn usage_counts(usage: &Value) -> Value {
         "cache_creation_input_tokens": count(usage, "cache_creation_input_tokens"),
         "output_tokens": count(usage, "output_tokens"),
     })
-}
-
-pub fn resolved_model<'a>(account: &'a Value, requested: &str) -> Option<&'a str> {
-    account["models"]
-        .as_array()?
-        .iter()
-        .find(|offer| offer["value"] == requested)?["resolvedModel"]
-        .as_str()
-        .filter(|model| !model.is_empty())
 }
 
 pub async fn version_check(executable: &Path) -> Result<VersionCheck, String> {

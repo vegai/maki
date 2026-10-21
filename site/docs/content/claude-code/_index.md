@@ -7,7 +7,7 @@ group = "Guides"
 
 # Claude Code
 
-Claude Code is Anthropic's CLI, and you can use it with a Claude subscription. The `claude_code` plugin gives tasks to the installed `claude` CLI and returns its reply to the maki agent. Claude runs on your subscription login, and the main agent can use any model from any provider. Claude receives only the task text, without the main agent's conversation.
+Claude Code is Anthropic's CLI, and you can use it with a Claude subscription. The `claude_code` plugin gives tasks to the installed `claude` CLI and returns its reply to the maki agent. Claude runs on your subscription login, and the main agent can use any model from any provider. Claude receives the task text and the instructions maki loaded, without the main agent's conversation.
 
 A task runs in one of two profiles:
 

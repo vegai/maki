@@ -134,7 +134,6 @@ const LATE_CRASH_REPORT: &[&str] = &["code 3", "after its result", "boom"];
 const CANCEL_MARKER: &str = "[cancelled by user";
 const USAGE_PROGRESS: &str = "Read src/usage.rs";
 const TOOL_USE_ID: &str = "toolu_ask";
-/// The smallest `timeout` a call takes.
 const TEST_TIMEOUT_SECS: u64 = 10;
 const SPENT_BEFORE_CANCEL: &[&str] = &["7 in", "2.0k cache read", "300 cache write", "out unknown"];
 const WAITING: &str = "Wait for a free Claude Code slot";
@@ -482,7 +481,7 @@ impl FakeClaude {
         let registry = Arc::new(ToolRegistry::new());
         let host = PluginHost::new(Arc::clone(&registry)).unwrap();
         let source = format!(
-            "local launch = require(\"claude_launch\")\nlaunch.STARTUP_TIMEOUT_SECS = {TEST_TIMEOUT_SECS}\nlaunch.STARTUP_MS = {TEST_TIMEOUT_SECS} * 1000\nlaunch.MIN_TIMEOUT_SECS = {TEST_TIMEOUT_SECS}\n{}",
+            "local launch = require(\"claude_launch\")\nlaunch.STARTUP_TIMEOUT_SECS = {TEST_TIMEOUT_SECS}\nlaunch.STARTUP_MS = {TEST_TIMEOUT_SECS} * require(\"claude_jobs\").MS_PER_SEC\nlaunch.MIN_TIMEOUT_SECS = {TEST_TIMEOUT_SECS}\n{}",
             include_str!("../../../plugins/claude_code/init.lua"),
         );
         host.load_bundled_source(TOOL, &source, self.opts(ONE_SLOT))

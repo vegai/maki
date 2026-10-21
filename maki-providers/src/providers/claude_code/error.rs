@@ -288,8 +288,9 @@ impl Error {
                 let status = status.unwrap_or(SERVER_ERROR);
                 is_temporary_status(status).then_some((status, *delay))
             }
-            Self::NoCallsToRun | Self::StoppedFor(_) => Some((SERVER_ERROR, None)),
-            Self::Interrupted(_) => Some((SERVER_ERROR, None)),
+            Self::NoCallsToRun | Self::StoppedFor(_) | Self::Interrupted(_) => {
+                Some((SERVER_ERROR, None))
+            }
             _ => None,
         }
     }

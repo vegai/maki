@@ -270,12 +270,9 @@ pub async fn fetch_all_models(
                     let mut specs: Vec<String> =
                         models.iter().map(|m| format!("{slug}/{}", m.id)).collect();
                     set_known_models(slug, models);
-                    for entry in spec.listed_rows() {
-                        for prefix in &entry.prefixes {
-                            let spec = format!("{slug}/{prefix}");
-                            if !specs.contains(&spec) {
-                                specs.push(spec);
-                            }
+                    for curated in curated_specs(spec) {
+                        if !specs.contains(&curated) {
+                            specs.push(curated);
                         }
                     }
                     ModelBatch {

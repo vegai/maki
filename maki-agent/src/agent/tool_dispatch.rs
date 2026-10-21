@@ -363,7 +363,7 @@ impl<'a> Hook<'a> {
 /// answer, so a name can never be reported as one thing and run as another.
 enum Route<'a> {
     Local(&'a LocalTool),
-    Native(Cow<'a, RegisteredTool>),
+    Native(RegisteredTool),
     ToolSearch(&'a McpSession),
     Mcp(&'a McpSession, Arc<str>),
 }
@@ -416,7 +416,7 @@ fn resolve<'a>(ctx: &'a ToolContext, name: &'a str) -> Resolved<'a> {
     let route = if let Some(local) = ctx.local_tools.get(name) {
         Some(Route::Local(local))
     } else if let Some(entry) = ctx.registry.get(name) {
-        Some(Route::Native(Cow::Owned(entry)))
+        Some(Route::Native(entry))
     } else if let Some(mcp) = ctx.mcp.as_ref() {
         match mcp.resolve(name) {
             Some(qualified) => Some(Route::Mcp(mcp, qualified)),
@@ -431,16 +431,18 @@ fn resolve<'a>(ctx: &'a ToolContext, name: &'a str) -> Resolved<'a> {
 
 fn offered(ctx: &ToolContext, name: &str, route: &Route<'_>) -> bool {
     match route {
-        Route::Native(entry) => {
-            ctx.tool_filter
-                .admits(name, entry.tool.audience(), ctx.audience, None)
-        }
+        Route::Native(entry) => offered_native(ctx, name, entry),
         Route::Local(tool) => ctx
             .tool_filter
             .admits_local(name, tool.audience, ctx.audience),
         Route::Mcp(_, qualified) => ctx.tool_filter.matches_external(qualified),
         Route::ToolSearch(_) => ctx.tool_filter.matches_external(name),
     }
+}
+
+fn offered_native(ctx: &ToolContext, name: &str, entry: &RegisteredTool) -> bool {
+    ctx.tool_filter
+        .admits(name, entry.tool.audience(), ctx.audience, None)
 }
 
 /// One callable name, as [`resolve`] would route it.
@@ -477,9 +479,9 @@ pub fn callable(ctx: &ToolContext) -> Vec<Callable> {
     // A name belongs to the first source dispatch would reach, claimed before
     // any filter runs: a registry tool this audience may not call still owns its
     // name, or MCP would publish a way around it.
-    let mut claim = |name: &str, route: Route<'_>| {
+    let mut claim = |name: &str, offered: bool| {
         let first = claimed.insert(name.to_owned());
-        first && offered(ctx, name, &route)
+        first && offered
     };
     let entry_of = |name: &str, source, audience, schema| Callable {
         name: name.to_owned(),
@@ -492,13 +494,13 @@ pub fn callable(ctx: &ToolContext) -> Vec<Callable> {
     let mut local: Vec<(&String, &LocalTool)> = ctx.local_tools.iter().collect();
     local.sort_by(|a, b| a.0.cmp(b.0));
     for (name, tool) in local {
-        if claim(name, Route::Local(tool)) {
+        if claim(name, offered(ctx, name, &Route::Local(tool))) {
             out.push(entry_of(name, SOURCE_LOCAL, tool.audience, None));
         }
     }
     for entry in ctx.registry.iter().iter() {
         let audience = entry.tool.audience();
-        if !claim(entry.name(), Route::Native(Cow::Borrowed(entry))) {
+        if !claim(entry.name(), offered_native(ctx, entry.name(), entry)) {
             continue;
         }
         out.push(entry_of(
@@ -522,7 +524,7 @@ pub fn callable(ctx: &ToolContext) -> Vec<Callable> {
             } else {
                 continue;
             };
-            if claim(&name, route) {
+            if claim(&name, offered(ctx, &name, &route)) {
                 out.push(entry_of(&name, SOURCE_MCP, ToolAudience::all(), None));
             }
         }
@@ -594,9 +596,7 @@ async fn run_inner(
     }
     match route {
         Route::Local(local) => run_local_tool(&local.handler, id, name, input, ctx, origin).await,
-        Route::Native(entry) => {
-            run_native_tool(entry.into_owned(), id, name, input, ctx, origin, ask).await
-        }
+        Route::Native(entry) => run_native_tool(entry, id, name, input, ctx, origin, ask).await,
         Route::ToolSearch(mcp) => run_tool_search(mcp, id, input, ctx, origin),
         Route::Mcp(mcp, qualified) => {
             execute_mcp_tool(ctx, mcp, &id, qualified, input, origin, ask).await

@@ -35,7 +35,6 @@ use maki_storage::id::{MakiId, SessionRef};
 #[cfg(unix)]
 use rustix::process::{Pid, test_kill_process_group};
 use serde_json::{Value, json};
-#[cfg(unix)]
 use test_case::test_case;
 
 const BUILTIN_COMMANDS: &[&str] = &["/sessions", "/rename", "/tasks"];
@@ -3068,17 +3067,26 @@ fn job_input_it_cannot_take_is_refused(call: &str, expected: &str) {
     assert!(result.contains(expected), "got: {result}");
 }
 
-#[test_case("false" ; "boolean_env")]
-#[test_case(r#"{ SECRET = {} }"# ; "table_value")]
-#[test_case(r#"{ SECRET = false }"# ; "boolean_value")]
-fn malformed_job_environments_are_refused(env: &str) {
-    const TOOL: &str = "bad_job_env";
+#[test_case("{ env = false }" ; "boolean_env")]
+#[test_case("{ env = { SECRET = {} } }" ; "table_value")]
+#[test_case("{ env = { SECRET = false } }" ; "boolean_value")]
+#[test_case("{ cwd = false }" ; "boolean_cwd")]
+#[test_case("{ cwd = {} }" ; "table_cwd")]
+#[test_case("{ tail = false }" ; "boolean_tail")]
+#[test_case("{ tail = {} }" ; "table_tail")]
+#[test_case("{ tail = -1 }" ; "negative_tail")]
+#[test_case("{ tail = 1.5 }" ; "fractional_tail")]
+#[test_case("{ on_stdout = false }" ; "boolean_stdout_callback")]
+#[test_case("{ on_stderr = {} }" ; "table_stderr_callback")]
+#[test_case("{ on_exit = 42 }" ; "numeric_exit_callback")]
+fn malformed_job_options_are_refused(opts: &str) {
+    const TOOL: &str = "bad_job_options";
     let mut perms = PluginPermissions::denied();
     perms.set(maki_lua::Permission::Run, true);
     let source = perm_tool_src(
         TOOL,
         &format!(
-            r#"local ok = pcall(maki.fn.jobstart, "true", {{ clear_env = true, env = {env} }})
+            r#"local ok = pcall(maki.fn.jobstart, "true", {opts})
         return tostring(ok)"#,
         ),
     );

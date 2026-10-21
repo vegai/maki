@@ -262,6 +262,14 @@ impl LuaCtx {
             Err(denied_error(permission))
         }
     }
+
+    fn read_cwd(&self, method: &str) -> LuaResult<Result<PathBuf, String>> {
+        let Some(agent) = self.agent() else {
+            return Ok(Err(self.cap_err(method)));
+        };
+        self.require(Permission::FsRead)?;
+        Ok(Ok(agent.permissions.cwd().to_owned()))
+    }
 }
 
 impl UserData for LuaCtx {
@@ -300,11 +308,7 @@ impl UserData for LuaCtx {
         // checkout, where `maki.uv.cwd()` names the wrong project. Needs
         // `fs_read`, like `maki.uv.cwd()`.
         methods.add_async_method("cwd", |_, this, ()| async move {
-            let Some(agent) = this.agent() else {
-                return Ok(this.cap_err_pair("cwd"));
-            };
-            this.require(Permission::FsRead)?;
-            let cwd = agent.permissions.cwd().to_owned();
+            let cwd = try_pair!(this.read_cwd("cwd")?);
             drop(this);
             Ok(pair(canonical_path(cwd).await))
         });
@@ -314,11 +318,7 @@ impl UserData for LuaCtx {
         // tool that hands a task to an agent that loads no instructions
         // itself. Needs `fs_read`.
         methods.add_async_method("instructions", |_, this, ()| async move {
-            let Some(agent) = this.agent() else {
-                return Ok(this.cap_err_pair("instructions"));
-            };
-            this.require(Permission::FsRead)?;
-            let cwd = agent.permissions.cwd().to_owned();
+            let cwd = try_pair!(this.read_cwd("instructions")?);
             // Nothing here may hold the ctx borrow across the wait, because a
             // cancel hook running during the wait needs `ctx:finish`, which
             // borrows the ctx mutably.
