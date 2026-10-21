@@ -505,7 +505,14 @@ fn provider_failure_is_nonzero_and_persists_an_error_outside_the_transcript() {
         &fixture.storage(),
     )
     .unwrap();
-    assert_eq!(stored.errors(), &[result[RESULT].as_str().unwrap()]);
+    assert_eq!(
+        stored
+            .errors()
+            .iter()
+            .map(|error| error.message.as_str())
+            .collect::<Vec<_>>(),
+        &[result[RESULT].as_str().unwrap()]
+    );
     assert!(stored.messages().iter().all(|message| {
         message
             .first_text_content()

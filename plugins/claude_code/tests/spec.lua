@@ -135,7 +135,6 @@ for _, code in ipairs({ 0x80, 0x9b, 0x2028, 0x2029, 0x200b, 0x202e, 0xfeff }) do
     local path = "visible" .. utf8.char(code) .. "path"
     local escaped = path_utils.printable(path)
     has(escaped, string.format("\\u%04x", code))
-    eq(path_utils.escape_invisible("normal-é"), "normal-é")
   end)
 end
 
@@ -1319,11 +1318,11 @@ case("an_exclude_rule_matches_its_dir_literally", function()
 end)
 
 case("a_quoted_path_reads_back_byte_for_byte", function()
-  eq(git_utils.unquote("plain/name.rs"), "plain/name.rs")
-  eq(git_utils.unquote('"new\\nline"'), "new\nline")
-  eq(git_utils.unquote('"q\\"uote\\\\"'), 'q"uote\\')
-  eq(git_utils.unquote('"\\303\\244.txt"'), "\195\164.txt")
-  eq(git_utils.unquote('"\\\\303"'), "\\303")
+  eq(git_utils.listed_paths("plain/name.rs")[1], "plain/name.rs")
+  eq(git_utils.listed_paths('"new\\nline"')[1], "new\nline")
+  eq(git_utils.listed_paths('"q\\"uote\\\\"')[1], 'q"uote\\')
+  eq(git_utils.listed_paths('"\\303\\244.txt"')[1], "\195\164.txt")
+  eq(git_utils.listed_paths('"\\\\303"')[1], "\\303")
 end)
 
 case("paths_for_hash_object_are_quoted_whole", function()

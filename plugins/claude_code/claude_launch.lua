@@ -427,13 +427,7 @@ end
 
 function M.preflight(input, ctx, call, opts)
   local model = input.model or opts.model
-  if not M.MODEL_SET[model] then
-    return nil, "unknown model " .. tostring(model) .. ", use one of " .. table.concat(M.MODELS, ", ")
-  end
   local worker = M.WORKERS[input.profile or M.READ_PROFILE]
-  if not worker then
-    return nil, "unknown profile " .. tostring(input.profile) .. ", use " .. M.READ_PROFILE .. " or " .. M.CODE_PROFILE
-  end
   local environ = maki.uv.os_environ()
   local home = maki.uv.os_homedir()
   local plan_err, home_credentials
@@ -490,7 +484,7 @@ function M.preflight(input, ctx, call, opts)
       end,
     })
     if not output then
-      -- Remove the probe directory on every failure, including a spawn with no exit callback.
+      -- A failed spawn has no exit callback to remove the directory.
       call:remove_dir(dir)
       return nil, output_err
     end

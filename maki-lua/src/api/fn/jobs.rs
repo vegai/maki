@@ -767,13 +767,13 @@ impl JobStore {
             .as_ref()
             .ok_or(NO_STDIN_ERR)?
             .send(data)
-            .map_err(
-                |_| match job.reap_state.stdin_error.load(Ordering::Acquire) {
-                    STDIN_EXITED => JOB_EXITED_ERR,
-                    STDIN_FAILED => STDIN_WRITE_ERR,
-                    _ => NO_STDIN_ERR,
-                },
-            )?;
+            .map_err(|_| {
+                if job.reap_state.stdin_error.load(Ordering::Acquire) == STDIN_EXITED {
+                    JOB_EXITED_ERR
+                } else {
+                    STDIN_WRITE_ERR
+                }
+            })?;
         Ok(len)
     }
 

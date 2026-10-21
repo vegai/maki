@@ -124,7 +124,7 @@ async fn unprompted<T>(
     ]);
     let result = supervised(
         command(launch.executable, launch.env, &dir_path, &args),
-        async |group| work(group).await,
+        work,
     )
     .await;
     dir.close().await;
@@ -335,11 +335,11 @@ async fn ask(
 async fn version(
     executable: &Path,
     env: &[(String, String)],
-    temp_dir: &Path,
+    cwd: &Path,
     startup: Duration,
 ) -> Result<String, Error> {
     let args = [VERSION_FLAG.to_owned()];
-    supervised(command(executable, env, temp_dir, &args), async |group| {
+    supervised(command(executable, env, cwd, &args), async |group| {
         drop(group.child.stdin.take());
         let mut lines = stdout_lines(group.child.stdout.take())?;
         let deadline = Instant::now() + startup;

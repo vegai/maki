@@ -10,6 +10,7 @@ use thiserror::Error;
 
 const INVALID_REQUEST: &str = "invalid_request";
 pub(crate) const TOO_MANY_REQUESTS: u16 = 429;
+pub(super) const RATE_LIMITED: &str = "rate_limit";
 const SERVER_ERROR: u16 = 500;
 const OVERLOADED: u16 = 529;
 pub(super) const UNKNOWN_ERROR: &str = "unknown";
@@ -17,7 +18,7 @@ const STREAM_IDLE_TIMEOUT: &str = "Stream idle timeout";
 /// Kinds of Claude Code API error messages that a later attempt can fix,
 /// with the status assumed when the message carries none.
 const TEMPORARY_KINDS: &[(&str, u16)] = &[
-    ("rate_limit", TOO_MANY_REQUESTS),
+    (RATE_LIMITED, TOO_MANY_REQUESTS),
     ("overloaded", OVERLOADED),
     ("server_error", SERVER_ERROR),
 ];
@@ -35,6 +36,10 @@ pub(super) fn shown(value: &Value) -> String {
 
 #[derive(Debug, Error)]
 pub(crate) enum Error {
+    #[error(
+        "all Claude Code request slots are busy; retry model discovery after a request finishes"
+    )]
+    ListingBusy,
     #[error("maki cannot serialize Claude Code JSON: {0}")]
     Encode(#[source] serde_json::Error),
     #[error(transparent)]

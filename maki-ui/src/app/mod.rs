@@ -1834,13 +1834,12 @@ impl App {
                     }
                 }
                 ChatEventResult::Error(message) => {
-                    Arc::make_mut(&mut self.state.session).record_error(message.clone());
+                    let displayed = cap_error_text(&message);
+                    Arc::make_mut(&mut self.state.session).record_error(displayed.clone());
                     self.status = Status::error(message.clone());
                     self.status_bar.clear_flash();
-                    self.main_chat().push(DisplayMessage::new(
-                        DisplayRole::Error,
-                        cap_error_text(&message),
-                    ));
+                    self.main_chat()
+                        .push(DisplayMessage::new(DisplayRole::Error, displayed));
                     self.subagent_answers.clear();
                     self.terminalize_turn(&message);
                     self.recoverable_queue = self.queue.text_messages();

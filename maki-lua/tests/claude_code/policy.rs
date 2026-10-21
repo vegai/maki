@@ -10,6 +10,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use flume::Receiver;
 use maki_agent::cancel::CancelToken;
@@ -491,7 +492,7 @@ impl FakeClaude {
 
     fn ask(&self, prompt: &str) -> Result<String, String> {
         let (reg, _host) = self.host(ONE_SLOT);
-        smol::block_on(within_deadline(call(&reg, &self.ctx(None, None), prompt)))
+        smol::block_on(within(DEADLINE, call(&reg, &self.ctx(None, None), prompt)))
     }
 
     fn ctx(&self, events: Option<&EventSender>, tool_use_id: Option<&str>) -> ToolContext {
@@ -544,11 +545,6 @@ fn restored(prompt: &str, state: Option<Value>, clicks: Vec<usize>) -> RestoreIt
         session_id: None,
         reason: RestoreReason::default(),
     }
-}
-
-/// A lost permit or reply must fail the test so the suite can continue.
-async fn within_deadline<T>(fut: impl Future<Output = T>) -> T {
-    within(DEADLINE, fut).await
 }
 
 fn assert_mentions(text: &str, parts: &[&str]) {
@@ -816,14 +812,14 @@ fn a_run_past_its_timeout_is_killed_and_frees_its_slot() {
     let ctx = fake.ctx(None, None);
     let input =
         json!({ "prompt": USAGE_THEN_HANG, "model": MODEL_ALIAS, "timeout": TEST_TIMEOUT_SECS });
-    let err = smol::block_on(within_deadline(tool_reply(&reg, &ctx, TOOL, input))).unwrap_err();
+    let err = smol::block_on(within(DEADLINE, tool_reply(&reg, &ctx, TOOL, input))).unwrap_err();
     assert_mentions(&err, &[&format!("timed out after {TEST_TIMEOUT_SECS}s")]);
     assert_mentions(&err, SPENT_BEFORE_CANCEL);
     assert!(
         group_gone(fake.pid(), DEADLINE),
         "no process of the timed-out run must stay"
     );
-    let next = smol::block_on(within_deadline(call(&reg, &ctx, ANSWERS)));
+    let next = smol::block_on(within(DEADLINE, call(&reg, &ctx, ANSWERS)));
     assert!(next.is_ok(), "{next:?}");
 }
 
@@ -838,7 +834,7 @@ fn the_view_claims_a_clean_route_only_after_init_passes(scenario: &str, claimed:
     let (tx, rx) = flume::unbounded::<Envelope>();
     let events = EventSender::new(tx, 0);
     let ctx = fake.ctx(Some(&events), Some(TOOL_USE_ID));
-    let _ = smol::block_on(within_deadline(call(&reg, &ctx, scenario)));
+    let _ = smol::block_on(within(DEADLINE, call(&reg, &ctx, scenario)));
     let view = rx
         .drain()
         .filter_map(|env| match env.event {
@@ -879,7 +875,7 @@ fn cached_versions_do_not_skip_current_policy_checks() {
     let fake = FakeClaude::new();
     let (reg, _host) = fake.host(ONE_SLOT);
     let ctx = fake.ctx(None, None);
-    let ask = || smol::block_on(within_deadline(call(&reg, &ctx, ANSWERS)));
+    let ask = || smol::block_on(within(DEADLINE, call(&reg, &ctx, ANSWERS)));
     assert_eq!(ask().unwrap(), ANSWER);
     assert_eq!(ask().unwrap(), ANSWER);
     assert_eq!(
@@ -922,7 +918,10 @@ fn a_stopped_run_keeps_what_it_spent() {
 fn the_startup_limit_holds_with_every_slot_taken() {
     let fake = FakeClaude::new();
     let (reg, host) = fake.host_with_short_deadlines();
-    let slot_holder = SLOT_HOLDER.replace("@HANG_MS@", &(HANG_SECS * 1000).to_string());
+    let slot_holder = SLOT_HOLDER.replace(
+        "@HANG_MS@",
+        &Duration::from_secs(HANG_SECS).as_millis().to_string(),
+    );
     host.load_source(SLOT_HOLDER_TOOL, &slot_holder).unwrap();
     let markers = tempdir().unwrap();
     let holders: Vec<_> = (1..MAX_INFLIGHT_TOOLS)
@@ -950,7 +949,7 @@ fn the_startup_limit_holds_with_every_slot_taken() {
         "the calls that hold slots did not get them"
     );
     let ctx = fake.ctx(None, None);
-    let result = smol::block_on(within_deadline(call(&reg, &ctx, NO_INIT)));
+    let result = smol::block_on(within(DEADLINE, call(&reg, &ctx, NO_INIT)));
     let held: Vec<_> = holders
         .into_iter()
         .map(|(trigger, held)| {
@@ -1004,7 +1003,7 @@ fn a_cancelled_run_keeps_what_it_spent() {
         trigger.cancel();
     });
 
-    let err = smol::block_on(within_deadline(call(&reg, &ctx, scenario))).unwrap_err();
+    let err = smol::block_on(within(DEADLINE, call(&reg, &ctx, scenario))).unwrap_err();
     canceller.join().unwrap();
     assert!(err.contains(CANCEL_MARKER), "got: {err}");
     assert_mentions(&err, spent);
@@ -1038,12 +1037,13 @@ fn a_cancelled_call_lets_go_only_once_its_processes_end(
     let next = fake.ctx(Some(&events), Some(SECOND_ID));
 
     let (first, second) = thread::scope(|scope| {
-        let first = scope.spawn(|| smol::block_on(within_deadline(call(&reg, &cancelled, prompt))));
+        let first =
+            scope.spawn(|| smol::block_on(within(DEADLINE, call(&reg, &cancelled, prompt))));
         assert!(
             wait_until(DEADLINE, || fake.path(busy).exists()),
             "the call did not start its work"
         );
-        let second = scope.spawn(|| smol::block_on(within_deadline(call(&reg, &next, ANSWERS))));
+        let second = scope.spawn(|| smol::block_on(within(DEADLINE, call(&reg, &next, ANSWERS))));
         if let Err(views) = wait_for_view_line(&rx, WAITING) {
             panic!("the next call did not show that it waits, and the views were {views:?}");
         }
@@ -1085,7 +1085,7 @@ fn every_way_a_call_ends_gives_its_slot_back() {
     let fake = FakeClaude::new();
     let (reg, _host) = fake.host(ONE_SLOT);
     let ctx = fake.ctx(None, None);
-    let ask = |prompt| smol::block_on(within_deadline(call(&reg, &ctx, prompt)));
+    let ask = |prompt| smol::block_on(within(DEADLINE, call(&reg, &ctx, prompt)));
 
     move_to_an_older_version(&fake);
     let refused = ask(ANSWERS).unwrap_err();
@@ -1111,7 +1111,7 @@ fn a_finished_answer_expands_in_place() {
     let (tx, events) = flume::unbounded::<Envelope>();
     let ctx = fake.ctx(Some(&EventSender::new(tx, 0)), Some(TOOL_USE_ID));
     assert_eq!(
-        smol::block_on(within_deadline(call(&reg, &ctx, LONG_ANSWERS))).unwrap(),
+        smol::block_on(within(DEADLINE, call(&reg, &ctx, LONG_ANSWERS))).unwrap(),
         LONG_ANSWER
     );
     let view = events
@@ -1165,11 +1165,10 @@ fn a_newer_version_runs() {
     let fake = FakeClaude::new();
     fake.answer_version(NEWER_VERSION);
     let (reg, _host) = fake.host(ONE_SLOT);
-    let output = smol::block_on(within_deadline(execute(
-        &reg,
-        &fake.ctx(None, None),
-        ANSWERS,
-    )))
+    let output = smol::block_on(within(
+        DEADLINE,
+        execute(&reg, &fake.ctx(None, None), ANSWERS),
+    ))
     .unwrap();
 
     let header = saved_header(&output);
@@ -1185,11 +1184,10 @@ fn a_newer_version_runs() {
 fn a_restored_answer_rebuilds_its_header() {
     let fake = FakeClaude::new();
     let (reg, host) = fake.host(ONE_SLOT);
-    let output = smol::block_on(within_deadline(execute(
-        &reg,
-        &fake.ctx(None, None),
-        ANSWERS,
-    )))
+    let output = smol::block_on(within(
+        DEADLINE,
+        execute(&reg, &fake.ctx(None, None), ANSWERS),
+    ))
     .unwrap();
     let state = output.state().cloned();
     let header = saved_header(&output);
@@ -1259,7 +1257,7 @@ fn a_relative_executable_is_found_from_every_directory() {
     let mut opts = fake.opts(ONE_SLOT);
     opts.insert("executable".into(), json!(RELATIVE_EXECUTABLE));
     let (reg, _host) = load(opts);
-    let answer = smol::block_on(within_deadline(call(&reg, &fake.ctx(None, None), ANSWERS)));
+    let answer = smol::block_on(within(DEADLINE, call(&reg, &fake.ctx(None, None), ANSWERS)));
     assert_eq!(answer.unwrap(), ANSWER);
 }
 
@@ -1285,7 +1283,7 @@ fn a_session_in_another_checkout_is_served_there(setup: fn(&Path), want: Result<
     setup(&session_dir);
     let (reg, _host) = fake.host(ONE_SLOT);
     let ctx = stub_ctx_in(&session_dir, None, None);
-    let result = smol::block_on(within_deadline(call(&reg, &ctx, ANSWERS)));
+    let result = smol::block_on(within(DEADLINE, call(&reg, &ctx, ANSWERS)));
 
     let started: Vec<PathBuf> = fake.log("started_in").lines().map(PathBuf::from).collect();
     assert!(

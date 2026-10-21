@@ -53,6 +53,9 @@ const NON_SESSION_STEMS: [&str; 2] = [CWD_INDEX_STEM, SCAN_CACHE_STEM];
 pub const SAVE_FAILED: &str = "maki: failed to save session ";
 const DEFAULT_TITLE: &str = "New session";
 const MAX_TITLE_LEN: usize = 60;
+const MAX_RECORDED_ERRORS: usize = 256;
+const MAX_ERROR_BYTES: usize = 16 * 1024;
+const ERROR_TRUNCATED: &str = "…";
 const EPOCH_CHANGED: &str = "messages were rewritten";
 const FILE_CHANGED_UNDERNEATH: &str = "file changed underneath";
 const CURSOR_AHEAD: &str = "cursor ahead of session";
@@ -419,6 +422,15 @@ impl<M> Default for HistorySnapshot<M> {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecordedError {
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_count: Option<usize>,
+}
+
 /// The conversation collections are private so every change goes through a
 /// mutator that classifies itself: `revision` says "this needs writing",
 /// `epoch` says "append cursors into the log are void". The other fields stay
@@ -440,7 +452,7 @@ pub struct Session<M, U, T> {
     pub model: String,
     messages: Arc<Vec<M>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    errors: Vec<String>,
+    errors: Vec<RecordedError>,
     pub token_usage: U,
     #[serde(default = "HashMap::new")]
     tool_outputs: HashMap<String, Arc<T>>,
@@ -742,7 +754,10 @@ enum LogRecord<M, U, T> {
     #[serde(rename = "msg")]
     Msg { d: M },
     #[serde(rename = "error")]
-    Error { message: String },
+    Error {
+        #[serde(flatten)]
+        d: RecordedError,
+    },
     #[serde(rename = "out")]
     Out { id: String, d: T },
     #[serde(rename = "sub_msg")]
@@ -1028,21 +1043,14 @@ impl SessionLog {
         self.ensure_appendable(session)?;
 
         let mut buf = Vec::new();
-        let mut new_msg_count = self.saved_msg_count;
         let mut new_tool_ids = Vec::new();
 
-        for message in &session.errors[self.saved_error_count..] {
-            append_record(
-                &mut buf,
-                &LogRecord::<&M, &U, &T>::Error {
-                    message: message.clone(),
-                },
-            )?;
-        }
-        for msg in &session.messages[self.saved_msg_count..] {
-            append_record(&mut buf, &LogRecord::<&M, &U, &T>::Msg { d: msg })?;
-            new_msg_count += 1;
-        }
+        append_messages_and_errors(
+            &mut buf,
+            session,
+            self.saved_msg_count,
+            self.saved_error_count,
+        )?;
 
         for (id, output) in &session.tool_outputs {
             if !self.saved_tool_ids.contains(id) {
@@ -1099,7 +1107,7 @@ impl SessionLog {
 
         self.saved_len += buf.len() as u64;
         self.appends += 1;
-        self.saved_msg_count = new_msg_count;
+        self.saved_msg_count = session.messages.len();
         self.saved_error_count = session.errors.len();
         self.saved_tool_ids.extend(new_tool_ids);
         for (sub_id, count) in new_sub_counts {
@@ -1241,17 +1249,7 @@ where
             created_at: session.created_at,
         },
     )?;
-    for message in &session.errors {
-        append_record(
-            &mut buf,
-            &LogRecord::<&M, &U, &T>::Error {
-                message: message.clone(),
-            },
-        )?;
-    }
-    for msg in session.messages.iter() {
-        append_record(&mut buf, &LogRecord::<&M, &U, &T>::Msg { d: msg })?;
-    }
+    append_messages_and_errors(&mut buf, session, 0, 0)?;
     for (id, output) in &session.tool_outputs {
         append_record(
             &mut buf,
@@ -1277,6 +1275,26 @@ where
     }
     buf.extend_from_slice(&meta_record(session)?);
     file.write_all(&buf).map_err(StorageError::from)?;
+    Ok(())
+}
+
+fn append_messages_and_errors<M: Serialize, U: Serialize, T: Serialize>(
+    buf: &mut Vec<u8>,
+    session: &Session<M, U, T>,
+    first_message: usize,
+    first_error: usize,
+) -> Result<(), SessionError> {
+    let mut errors = session.errors[first_error..].iter().peekable();
+    for index in first_message..=session.messages.len() {
+        while let Some(error) = errors.next_if(|error| {
+            index == session.messages.len() || error.message_count.unwrap_or(0) <= index
+        }) {
+            append_record(buf, &LogRecord::<&M, &U, &T>::Error { d: error.clone() })?;
+        }
+        if let Some(message) = session.messages.get(index) {
+            append_record(buf, &LogRecord::<&M, &U, &T>::Msg { d: message })?;
+        }
+    }
     Ok(())
 }
 
@@ -1382,7 +1400,7 @@ where
                 got_header = true;
             }
             LogRecord::Msg { d } => messages.push(d),
-            LogRecord::Error { message } => errors.push(message),
+            LogRecord::Error { d } => errors.push(d),
             LogRecord::Out { id: out_id, d } => {
                 tool_outputs.insert(out_id, Arc::new(d));
             }
@@ -1860,12 +1878,25 @@ where
         }
     }
 
-    pub fn errors(&self) -> &[String] {
+    pub fn errors(&self) -> &[RecordedError] {
         &self.errors
     }
 
-    pub fn record_error(&mut self, message: String) {
-        self.errors.push(message);
+    pub fn record_error(&mut self, mut message: String) {
+        if message.len() > MAX_ERROR_BYTES {
+            message.truncate(message.floor_char_boundary(MAX_ERROR_BYTES - ERROR_TRUNCATED.len()));
+            message.push_str(ERROR_TRUNCATED);
+        }
+        if self.errors.len() >= MAX_RECORDED_ERRORS {
+            self.errors
+                .drain(..self.errors.len() - MAX_RECORDED_ERRORS / 2);
+            self.rewrite();
+        }
+        self.errors.push(RecordedError {
+            message,
+            timestamp: Some(now_epoch()),
+            message_count: Some(self.messages.len()),
+        });
         self.touch();
     }
 
@@ -2371,10 +2402,11 @@ mod tests {
     #[cfg(unix)]
     use super::canonical_key;
     use super::{
-        ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DEFAULT_TITLE, LOG_BLOATED,
-        MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR, StoredSubagent,
-        TAIL_BUF, generate_title, json_path, jsonl_path, load_cwd_index, lock_path, locks_dir,
-        next_epoch, update_cwd_index, write_full_session,
+        ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DEFAULT_TITLE,
+        ERROR_TRUNCATED, LOG_BLOATED, MAX_APPENDS, MAX_ERROR_BYTES, MAX_RECORDED_ERRORS,
+        MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR, StoredSubagent, TAIL_BUF,
+        generate_title, json_path, jsonl_path, load_cwd_index, lock_path, locks_dir, next_epoch,
+        update_cwd_index, write_full_session,
     };
     use super::{
         HistorySnapshot, LOG_FORMAT_VERSION, NEWER_LOG_FORMAT, OLDEST_LOG_FORMAT_VERSION,
@@ -2398,6 +2430,8 @@ mod tests {
     const LEGACY_HEX_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
     const SONNET_COST: f64 = 0.42;
     const HAIKU_COST: f64 = 0.08;
+    const FIRST_FAILURE: &str = "first provider failure";
+    const SECOND_FAILURE: &str = "second provider failure";
     const TAMPERED_TITLE: &str = "tampered cached title";
     const LOCK_WHILE_HELD: &str = "a held claim is a lock file another process can see";
     const NO_ORPHAN_LOCK: &str = "an id with no transcript must not leave a lock behind";
@@ -2528,6 +2562,95 @@ mod tests {
         let mut outputs: Vec<_> = session.tool_outputs().keys().cloned().collect();
         outputs.sort();
         assert_eq!(outputs, ["monitor-tool", "sub-tool", "task-live"]);
+    }
+
+    #[test_case(false ; "append")]
+    #[test_case(true ; "rewrite")]
+    fn recorded_errors_keep_their_time_and_transcript_position(rewrite: bool) {
+        let root = TempDir::new().unwrap();
+        let dir = root.path();
+        let mut session: TestSession = Session::new("model", "/project");
+        session.push_message(user_message("first"));
+        let claim = claim_for(dir, &session);
+        let mut log = SessionLog::rewrite(dir, &claim, &session).unwrap();
+        session.record_error(FIRST_FAILURE.into());
+        session.push_message(user_message("second"));
+        session.record_error(SECOND_FAILURE.into());
+        if rewrite {
+            SessionLog::rewrite(dir, &claim, &session).unwrap();
+        } else {
+            log.append(&claim, &session).unwrap();
+        }
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_eq!(loaded.errors(), session.errors());
+        assert_eq!(loaded.errors()[0].message_count, Some(1));
+        assert_eq!(loaded.errors()[1].message_count, Some(2));
+        assert!(
+            loaded
+                .errors()
+                .iter()
+                .all(|error| error.timestamp.is_some())
+        );
+        let records: Vec<Value> = fs::read_to_string(jsonl_path(dir, session.id))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let tags: Vec<_> = records
+            .iter()
+            .map(|record| record["t"].as_str().unwrap())
+            .filter(|tag| matches!(*tag, "msg" | "error"))
+            .collect();
+        assert_eq!(tags, ["msg", "error", "msg", "error"]);
+    }
+
+    #[test]
+    fn legacy_errors_without_metadata_still_load() {
+        let root = TempDir::new().unwrap();
+        let dir = root.path();
+        let mut session: TestSession = Session::new("model", "/project");
+        session.record_error(FIRST_FAILURE.into());
+        SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
+        let path = jsonl_path(dir, session.id);
+        let records: Vec<String> = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let mut record: Value = serde_json::from_str(line).unwrap();
+                if record["t"] == "error" {
+                    record.as_object_mut().unwrap().remove("timestamp");
+                    record.as_object_mut().unwrap().remove("message_count");
+                }
+                record.to_string()
+            })
+            .collect();
+        fs::write(path, records.join("\n") + "\n").unwrap();
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_eq!(loaded.errors()[0].message, FIRST_FAILURE);
+        assert_eq!(loaded.errors()[0].timestamp, None);
+        assert_eq!(loaded.errors()[0].message_count, None);
+    }
+
+    #[test]
+    fn recorded_errors_have_bounded_retention_and_utf8_safe_text() {
+        let root = TempDir::new().unwrap();
+        let dir = root.path();
+        let mut session: TestSession = Session::new("model", "/project");
+        let claim = claim_for(dir, &session);
+        for _ in 0..MAX_RECORDED_ERRORS {
+            session.record_error(FIRST_FAILURE.into());
+        }
+        claim.persist(&session).unwrap();
+        let epoch = session.rewrites;
+        session.record_error("é".repeat(MAX_ERROR_BYTES));
+        assert!(session.rewrites > epoch);
+        assert!(session.errors().len() <= MAX_RECORDED_ERRORS);
+        let message = &session.errors().last().unwrap().message;
+        assert!(message.len() <= MAX_ERROR_BYTES);
+        assert!(message.ends_with(ERROR_TRUNCATED));
+        claim.persist(&session).unwrap();
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_eq!(loaded.errors(), session.errors());
     }
 
     #[test]

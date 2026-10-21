@@ -14,9 +14,9 @@ use serde_json::{Value, json};
 use tracing::debug;
 
 use super::checks::{self, ACCOUNT_ANSWER, HANDSHAKE, HOOKS_ANSWER, InitExpect, SETTINGS_ANSWER};
-use super::error::{Error, Problem, TOO_MANY_REQUESTS, UNKNOWN_ERROR, shown};
+use super::error::{Error, Problem, RATE_LIMITED, TOO_MANY_REQUESTS, UNKNOWN_ERROR, shown};
 use super::mcp::Handoff;
-use super::transcript::{BATCH_CALL_TOOL, BATCH_CALLS, BATCH_TOOL, Catalog, USER_ROLE};
+use super::transcript::{BATCH_CALL_TOOL, BATCH_CALLS, BATCH_TOOL, Catalog, SERVER, USER_ROLE};
 use crate::model::is_same_model;
 use crate::providers::anthropic::{LABEL_SESSION, LABEL_WEEK_ALL};
 use crate::{
@@ -73,7 +73,6 @@ const WINDOW_FULL_STOP: &str = "model_context_window_exceeded";
 const CUT_STOPS: [&str; 2] = [MAX_TOKENS_STOP, WINDOW_FULL_STOP];
 const TOOL_RESULT: &str = "tool_result";
 pub(super) const API_ERROR_MARK: &str = "is_api_error_message";
-const RATE_LIMITED: &str = "rate_limit";
 /// The plan status of a `rate_limit_event` once the plan's limit is used up.
 const PLAN_REJECTED: &str = "rejected";
 /// As 2.1.280 words it.
@@ -85,7 +84,7 @@ const REJECTIONS: [&str; 2] = [INPUT_REJECTED, NO_SUCH_TOOL];
 const SHOWN_LINE_CHARS: usize = 80;
 /// How many event kinds the trace keeps for a failed request's log.
 const TRACE_LEN: usize = 32;
-pub(super) const UNNAMED_HOOK: &str = "startup";
+const UNNAMED_HOOK: &str = "startup";
 const NO_MESSAGE: &str = "no message";
 /// The Anthropic provider's names for the same windows.
 const WINDOW_LABELS: [(&str, &str); 2] =
@@ -490,7 +489,10 @@ impl Handshake {
         if !self.record(response)? {
             return Ok(false);
         }
-        self.check(checks::account_problem, checks::policy_problem)?;
+        self.check(
+            |account| checks::account_problem(account, &[checks::DEFAULT_MODE.to_owned()]),
+            |settings, hooks| checks::policy_problem(settings, hooks, true),
+        )?;
         Ok(true)
     }
 
@@ -716,7 +718,14 @@ impl<'a> Turn<'a> {
         if self.phase == Phase::Checking {
             return Err(Error::UncheckedStart);
         }
-        if let Some(problem) = checks::init_problem(event, &self.expect) {
+        if let Some(problem) = checks::init_problem(
+            event,
+            self.expect.version,
+            self.expect.cwd,
+            self.expect.tools,
+            &[checks::DEFAULT_MODE.to_owned()],
+            Some(SERVER),
+        ) {
             return Err(Error::Check(problem));
         }
         if self.phase == Phase::PromptSent {
@@ -1146,7 +1155,7 @@ struct Refusal {
     status: Option<u16>,
 }
 
-pub(super) fn status_of(status: &Value) -> Option<u16> {
+fn status_of(status: &Value) -> Option<u16> {
     status.as_u64().and_then(|s| u16::try_from(s).ok())
 }
 

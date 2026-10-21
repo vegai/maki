@@ -155,7 +155,7 @@ function M.diff_command(artifact)
   return table.concat(words, " ")
 end
 
-function M.unquote(field)
+local function unquote(field)
   if field:sub(1, 1) ~= '"' then
     return field
   end
@@ -193,7 +193,7 @@ end
 function M.listed_paths(output)
   local paths = {}
   for line in (output or ""):gmatch("[^\n]+") do
-    paths[#paths + 1] = M.unquote(line)
+    paths[#paths + 1] = unquote(line)
   end
   return paths
 end
@@ -212,7 +212,7 @@ local function staged_entries(output)
   for line in (output or ""):gmatch("[^\n]+") do
     local tag, mode, sha, path = line:match("^([%a%?]?) ?(%d+) (%x+) %d+\t(.*)$")
     if mode and tag ~= "S" then
-      entries[#entries + 1] = { mode = mode, sha = sha, path = M.unquote(path) }
+      entries[#entries + 1] = { mode = mode, sha = sha, path = unquote(path) }
     end
   end
   return entries
@@ -241,7 +241,7 @@ function M.parse_raw_diff(output)
     local old_mode, new_mode, old_sha, new_sha, status, path = line:match("^:(%d+) (%d+) (%x+) (%x+) (%a)%d*\t(.*)$")
     if old_mode then
       changes[#changes + 1] = {
-        path = M.unquote(path),
+        path = unquote(path),
         status = status,
         old_mode = old_mode,
         new_mode = new_mode,
@@ -258,7 +258,7 @@ function M.binary_paths(output)
   for line in (output or ""):gmatch("[^\n]+") do
     local path = line:match("^%-\t%-\t(.*)$")
     if path then
-      binary[M.unquote(path)] = true
+      binary[unquote(path)] = true
     end
   end
   return binary

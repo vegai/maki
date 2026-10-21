@@ -230,12 +230,9 @@ impl SessionTurn<'_> {
 
     pub fn record_error(&mut self, message: String) {
         self.track.history.mark_unsaved();
-        self.track
-            .store
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .session
-            .record_error(message);
+        let mut store = self.track.store.lock().unwrap_or_else(PoisonError::into_inner);
+        store.session.set_history(&self.track.history.snapshot());
+        store.session.record_error(message);
     }
 
     pub fn run_params(
@@ -524,7 +521,14 @@ mod tests {
         drop(turn);
         let stored = load(&tmp);
         assert_eq!(stored.messages().len(), 2);
-        assert_eq!(stored.errors(), &[OBSERVATION]);
+        assert_eq!(
+            stored
+                .errors()
+                .iter()
+                .map(|error| error.message.as_str())
+                .collect::<Vec<_>>(),
+            &[OBSERVATION]
+        );
         assert!(
             fs::read_to_string(path)
                 .unwrap()

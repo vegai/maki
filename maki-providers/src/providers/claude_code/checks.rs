@@ -16,7 +16,6 @@ use serde_json::{Map, Value};
 
 use super::OAUTH_TOKEN_ENV;
 use super::error::{Error, Problem};
-use super::transcript::SERVER;
 
 pub(crate) const MINIMUM_VERSION: [u64; 3] = [2, 1, 284];
 const SYSTEMS: &[&str] = &["linux"];
@@ -173,6 +172,10 @@ pub(crate) struct HandshakeStep {
     pub subtype: &'static str,
 }
 
+fn minimum_version() -> String {
+    MINIMUM_VERSION.map(|part| part.to_string()).join(".")
+}
+
 fn version_parts(version: &str) -> Option<[u64; 3]> {
     let mut parts = version.split('.').map(|part| {
         part.bytes()
@@ -201,7 +204,7 @@ pub(crate) fn profile(output: &str, os: &str) -> Result<String, Error> {
     if parts < MINIMUM_VERSION {
         return Err(Error::TooOld {
             version: version.to_owned(),
-            oldest: MINIMUM_VERSION.map(|part| part.to_string()).join("."),
+            oldest: minimum_version(),
         });
     }
     require_system(os)?;
@@ -410,8 +413,7 @@ fn settings_conflicts(settings: &Value) -> Vec<String> {
             .filter(|name| routes_login(&name.to_ascii_uppercase()))
             .collect();
         names.sort();
-        let env_key = ENV_KEY;
-        keys.extend(names.into_iter().map(|name| format!("{env_key}.{name}")));
+        keys.extend(names.into_iter().map(|name| format!("{ENV_KEY}.{name}")));
     }
     keys
 }
@@ -462,13 +464,8 @@ pub(crate) fn file_conflicts(paths: &[PathBuf]) -> Vec<String> {
     found
 }
 
-/// `None` only for a claude.ai subscription login without an API key, in the
-/// default permission mode.
-pub(crate) fn account_problem(init: &Value) -> Option<Problem> {
-    account_problem_in(init, &[DEFAULT_MODE.to_owned()])
-}
-
-pub(super) fn account_problem_in(init: &Value, modes: &[String]) -> Option<Problem> {
+/// Requires a claude.ai subscription without an API key and an allowed permission mode.
+pub(super) fn account_problem(init: &Value, modes: &[String]) -> Option<Problem> {
     let Some(account) = init.get(ACCOUNT).filter(|a| a.is_object()) else {
         return Some(Problem::NoLogin);
     };
@@ -514,20 +511,15 @@ fn policy_key_problem(entries: &Map<String, Value>) -> Option<String> {
                 .into_iter()
                 .find(|sub| !HARMLESS_POLICY_PERMISSIONS.contains(&sub.as_str()))
             {
-                return Some(format!("{}.{sub}", PERMISSIONS_KEY));
+                return Some(format!("{PERMISSIONS_KEY}.{sub}"));
             }
         }
     }
     None
 }
 
-/// `None` only when just maki's flags and safe managed keys apply, every
-/// setting is valid, and compaction and every hook are off.
-pub(crate) fn policy_problem(settings: &Value, hooks: &Value) -> Option<Problem> {
-    policy_problem_in(settings, hooks, true)
-}
-
-pub(super) fn policy_problem_in(
+/// Rejects foreign settings and active hooks. Provider turns also own compaction.
+pub(super) fn policy_problem(
     settings: &Value,
     hooks: &Value,
     owns_history: bool,
@@ -588,32 +580,20 @@ pub(super) fn plugins_problem(plugins: &Value) -> Option<Problem> {
     let Some(plugins) = plugins.as_array() else {
         return Some(Problem::NoPlugins);
     };
-    let marker = BUILTIN_PLUGIN_MARKER;
     plugins
         .iter()
         .find(|plugin| {
-            plugin[PLUGIN_PATH] != marker
+            plugin[PLUGIN_PATH] != BUILTIN_PLUGIN_MARKER
                 || plugin[SOURCE]
                     .as_str()
-                    .and_then(|source| source.strip_suffix(marker))
+                    .and_then(|source| source.strip_suffix(BUILTIN_PLUGIN_MARKER))
                     .is_none_or(|name| !name.ends_with('@'))
         })
         .map(|plugin| Problem::Plugin(plugin[SOURCE].clone()))
 }
 
 /// The API key, mode, tool catalog and handoff connection must all satisfy the route checks.
-pub(crate) fn init_problem(event: &Value, expect: &InitExpect<'_>) -> Option<Problem> {
-    init_problem_in(
-        event,
-        expect.version,
-        expect.cwd,
-        expect.tools,
-        &[DEFAULT_MODE.to_owned()],
-        Some(SERVER),
-    )
-}
-
-pub(super) fn init_problem_in(
+pub(super) fn init_problem(
     event: &Value,
     version: &str,
     cwd: &Path,
@@ -687,9 +667,9 @@ mod tests {
     use super::{
         ACCOUNT_ANSWER, COMMONDIR_FILE, CONNECTED, DEFAULT_MODE, ESSENTIAL_TRAFFIC_ONLY,
         FLAG_SOURCE, GIT_ENTRY, HANDSHAKE, HOOKS_ANSWER, InitExpect, MAX_GIT_PATH_BYTES,
-        MAX_SETTINGS_BYTES, MINIMUM_VERSION, NO_KEY_SOURCE, NOT_AN_OBJECT, POLICY_SOURCE,
-        SETTINGS_ANSWER, SETTINGS_TOO_LARGE, UNREADABLE_FILE, account_problem, config_dir,
-        file_conflicts, init_problem, launch_env, local_settings_dirs, plugins_problem,
+        MAX_SETTINGS_BYTES, NO_KEY_SOURCE, NOT_AN_OBJECT, POLICY_SOURCE, SETTINGS_ANSWER,
+        SETTINGS_TOO_LARGE, UNREADABLE_FILE, account_problem, config_dir, file_conflicts,
+        init_problem, launch_env, local_settings_dirs, minimum_version, plugins_problem,
         policy_problem, profile, settings_conflicts,
     };
 
@@ -816,10 +796,6 @@ mod tests {
         assert_eq!(profile(&output, "linux").unwrap(), version);
     }
 
-    fn minimum_version() -> String {
-        MINIMUM_VERSION.map(|part| part.to_string()).join(".")
-    }
-
     #[test_case("PATH" => (true, false) ; "passed_path")]
     #[test_case("https_proxy" => (true, false) ; "passed_https_proxy")]
     #[test_case("LC_ALL" => (true, false) ; "passed_lc_all")]
@@ -874,7 +850,7 @@ mod tests {
     #[test_case(json!({"permissions":null}) => matches Some(Problem::Policy(_)) ; "null_permissions")]
     #[test_case(json!({"permissions":[]}) => matches Some(Problem::Policy(_)) ; "array_permissions")]
     fn managed_policy_cannot_restore_tools_or_routes(value: Value) -> Option<Problem> {
-        policy_problem(&settings_with(Some(value), None), &hooks_off())
+        policy_problem(&settings_with(Some(value), None), &hooks_off(), true)
     }
 
     #[test_case(json!({"current_permission_mode":"default","account":{"apiProvider":"firstParty","subscriptionType":"Claude Pro"}}) => matches None ; "subscription_login")]
@@ -886,7 +862,7 @@ mod tests {
     #[test_case(json!({"current_permission_mode":"default","account":{"apiProvider":"bedrock","subscriptionType":"Claude Pro"}}) => matches Some(Problem::OtherProvider(_)) ; "cloud_provider")]
     #[test_case(json!({"current_permission_mode":"bypassPermissions","account":{"apiProvider":"firstParty","subscriptionType":"Claude Pro"}}) => matches Some(Problem::StartMode(_)) ; "bypass_permission_mode")]
     fn accounts_use_a_subscription_route(value: Value) -> Option<Problem> {
-        account_problem(&value)
+        account_problem(&value, &[DEFAULT_MODE.to_owned()])
     }
 
     #[test_case(json!([]) => matches None ; "empty_plugin_list")]
@@ -913,7 +889,7 @@ mod tests {
     #[test_case(json!({"policy":{"allDisabled":true}}) => matches Some(Problem::NoHooks) ; "missing_hooks")]
     #[test_case(json!(null) => matches Some(Problem::NoHooks) ; "null_hooks_response")]
     fn hooks_are_disabled(value: Value) -> Option<Problem> {
-        policy_problem(&settings_with(None, None), &value)
+        policy_problem(&settings_with(None, None), &value, true)
     }
 
     #[test]
@@ -1074,7 +1050,7 @@ mod tests {
         settings: Value,
         hooks: Value,
     ) -> Option<Problem> {
-        policy_problem(&settings, &hooks)
+        policy_problem(&settings, &hooks, true)
     }
 
     fn init(edit: impl FnOnce(&mut Value)) -> Value {
@@ -1115,7 +1091,14 @@ mod tests {
             cwd: Path::new(CWD),
             tools: &tools,
         };
-        init_problem(&event, &expect)
+        init_problem(
+            &event,
+            expect.version,
+            expect.cwd,
+            expect.tools,
+            &[DEFAULT_MODE.to_owned()],
+            Some(SERVER),
+        )
     }
 
     /// The decoder keys the answers on these ids, in the order the requests go

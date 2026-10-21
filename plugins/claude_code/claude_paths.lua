@@ -17,6 +17,7 @@ M.IMPORT_DISPLACED = "displaced"
 -- A unique stage keeps retries from removing another attempt's files.
 M.STAGE_TEMPLATE = "stage.XXXXXX"
 local OWNER_EXECUTE_BITS = "[xs]"
+local SHOWN_PATHS = 10
 
 function M.set_of(list)
   local set = {}
@@ -151,23 +152,29 @@ function M.bash_quote(text)
   local quoted = M.shell_quote(text):gsub("%c", function(char)
     return string.format("'$'\\%03o''", char:byte())
   end)
-  return M.escape_invisible(quoted, true)
+  return native.escape_invisible(quoted, true)
 end
-
-M.escape_invisible = native.escape_invisible
 
 --- Terminal control bytes can execute commands. Escape them and non-UTF-8 path bytes before
 --- display.
 function M.printable(path)
   path = path:gsub("\\", "\\\\")
   return (
-    M.escape_invisible(
+    native.escape_invisible(
       path:gsub(utf8.len(path) and "%c" or "[%c\128-\255]", function(char)
         return string.format("\\%03o", char:byte())
       end),
       false
     )
   )
+end
+
+function M.shown(paths)
+  local listed, more = M.first(paths, SHOWN_PATHS)
+  for i, path in ipairs(listed) do
+    listed[i] = M.printable(path)
+  end
+  return table.concat(listed, ", ") .. (more > 0 and " and " .. more .. " more" or "")
 end
 
 function M.first_non_utf8(paths)

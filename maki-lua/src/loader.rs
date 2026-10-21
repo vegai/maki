@@ -523,8 +523,8 @@ impl PluginHost {
                     plugin: builtin.clone(),
                     source: mlua::Error::runtime("bundled plugin missing init.lua"),
                 })?;
-            self.load_bundled_source(
-                builtin,
+            self.load_bundled(
+                bundled,
                 init,
                 config
                     .opts
@@ -645,6 +645,16 @@ impl PluginHost {
             .ok_or_else(|| PluginError::UnknownPlugin {
                 plugin: name.to_owned(),
             })?;
+        self.load_bundled(bundled, source, opts)
+    }
+
+    fn load_bundled(
+        &self,
+        bundled: &BundledPlugin,
+        source: &str,
+        opts: JsonMap<String, JsonValue>,
+    ) -> Result<(), PluginError> {
+        let name = bundled.name;
         self.send_load(
             Arc::from(name),
             vec![LoadChunk::bundled(name, source)],

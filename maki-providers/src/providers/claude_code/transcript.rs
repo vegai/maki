@@ -62,6 +62,7 @@ fn server_name(name: &str) -> String {
     }
     let hash: String = Sha256::digest(name.as_bytes())
         .iter()
+        .take(HASH_HEX_DIGITS.div_ceil(2))
         .map(|byte| format!("{byte:02x}"))
         .collect();
     let room = MAX_EXPOSED_NAME - EXPOSED_PREFIX.len() - HASH_HEX_DIGITS - 1;

@@ -131,15 +131,15 @@ impl ContextSpec {
     }
 
     fn ready(&self, model: &Model, workflow: bool, mcp: Option<&McpSession>) -> Ready {
-        let tools = self.render(model, workflow).tools;
+        let tools = self.tools(model, workflow);
         Ready {
             model: model.clone(),
             tool_names: advertised_tool_names(&tools, mcp),
         }
     }
 
-    fn render(&self, model: &Model, workflow: bool) -> RunContext {
-        let tools = RequestTools::build(
+    fn tools(&self, model: &Model, workflow: bool) -> RequestTools {
+        RequestTools::build(
             ToolRegistry::global(),
             &self.local_tools,
             &self.vars,
@@ -148,7 +148,11 @@ impl ContextSpec {
             &self.excluded_tools,
             workflow,
             self.mcp,
-        );
+        )
+    }
+
+    fn render(&self, model: &Model, workflow: bool) -> RunContext {
+        let tools = self.tools(model, workflow);
         let mut context = match &self.system_override {
             Some(system) => {
                 RunContext::fixed(system.clone(), tools).with_prompt_policy(&self.slots)

@@ -30,10 +30,6 @@ local UNREADABLE_DENIAL = "a denial that maki cannot read"
 local PLAN_LIMITS_USED = "plan limits used: "
 local EXTRA_USAGE = "extra usage on"
 
-local function init_problem(line, expect)
-  return native.init_problem(line, expect.cli.version, expect.cwd, expect.tools, expect.permission_modes)
-end
-
 local function count(n)
   if n >= THOUSAND then
     return string.format("%.1fk", n / THOUSAND)
@@ -48,7 +44,7 @@ function Stream.new(expect)
       cwd = expect.cwd,
       tools = expect.worker.tools,
       permission_modes = expect.worker.reported_modes,
-      cli = expect.cli,
+      version = expect.cli.version,
     },
     accepted = false,
     model_checked = false,
@@ -94,6 +90,7 @@ end
 ---   `{ lines = {...} }`  status lines for the view
 function Stream:feed(line)
   local classified, problem = native.classify(line, {
+    init = self.expect,
     accepted = self.accepted,
     model = self.model,
     model_checked = self.model_checked,
@@ -107,7 +104,11 @@ function Stream:feed(line)
     self.usage_by_message[ev.message.id] = classified.usage
   end
   if classified.problem then
-    return { stop = classified.problem }
+    local init = ev.type == SYSTEM and ev.subtype == INIT
+    if init then
+      self.accepted = false
+    end
+    return { stop = classified.problem, init = init and ev or nil }
   end
   if ev.type == CONTROL_RESPONSE and type(ev.response) == "table" then
     return { control = line }
@@ -117,11 +118,6 @@ function Stream:feed(line)
     return nil
   end
   if ev.type == SYSTEM and ev.subtype == INIT then
-    local problem = init_problem(line, self.expect)
-    if problem then
-      self.accepted = false
-      return { stop = problem, init = ev }
-    end
     self.accepted = true
     return { init = ev }
   end
