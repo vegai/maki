@@ -12,7 +12,7 @@ use rustix::process::{Pid, Signal, kill_process, test_kill_process_group};
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
 
-pub(super) use super::WAIT;
+use super::WAIT;
 use super::error::Error;
 use super::run::{Exchange, Launch, Limits, Request, Thinking, request};
 use crate::{Message, ProviderEvent, ProviderUsage, StreamResponse};

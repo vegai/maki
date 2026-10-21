@@ -98,9 +98,7 @@ function Call:spawn(argv, job_opts, how)
   end
   local limit = how.timeout_ms or how.keep_on_cancel and self.startup_ms or nil
   job_opts.timeout_ms = limit
-  local id = self:start(argv, job_opts, function(job, code, timed_out)
-    how.on_exit(job, code, timed_out)
-  end)
+  local id = self:start(argv, job_opts, how.on_exit)
   if not how.keep_on_cancel then
     self.stoppable[#self.stoppable + 1] = id
   end

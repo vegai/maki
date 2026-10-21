@@ -803,17 +803,21 @@ mod tests {
     #[test_case("Update available", "linux" => matches Err(Error::UnknownVersion(_)) ; "update_notice")]
     #[test_case("claude: not found", "linux" => matches Err(Error::UnknownVersion(_)) ; "missing_executable")]
     #[test_case("", "linux" => matches Err(Error::UnknownVersion(_)) ; "empty_version")]
-    #[test_case("2.1.284", "darwin" => matches Err(Error::UnsupportedSystem { .. }) ; "unsupported_macos")]
-    #[test_case("2.1.284", "Windows_NT" => matches Err(Error::UnsupportedSystem { .. }) ; "unsupported_windows")]
+    #[test_case(&minimum_version(), "darwin" => matches Err(Error::UnsupportedSystem { .. }) ; "unsupported_macos")]
+    #[test_case(&minimum_version(), "Windows_NT" => matches Err(Error::UnsupportedSystem { .. }) ; "unsupported_windows")]
     fn versions_meet_the_launch_requirements(output: &str, system: &str) -> Result<String, Error> {
         profile(output, system)
     }
 
     #[test]
     fn the_minimum_version_is_supported() {
-        let version = MINIMUM_VERSION.map(|part| part.to_string()).join(".");
+        let version = minimum_version();
         let output = format!("{version} (Claude Code)");
         assert_eq!(profile(&output, "linux").unwrap(), version);
+    }
+
+    fn minimum_version() -> String {
+        MINIMUM_VERSION.map(|part| part.to_string()).join(".")
     }
 
     #[test_case("PATH" => (true, false) ; "passed_path")]
