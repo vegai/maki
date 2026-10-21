@@ -1,3 +1,4 @@
+use maki_agent::DoneReason;
 use maki_storage::id::SessionRef;
 use serde::Serialize;
 use uuid::Uuid;
@@ -30,4 +31,12 @@ pub fn system_event<T: Serialize>(
 #[allow(clippy::disallowed_methods)]
 pub fn wire_uuid() -> String {
     Uuid::now_v7().to_string()
+}
+
+pub fn failure_subtype(reason: DoneReason) -> Option<&'static str> {
+    match reason {
+        DoneReason::MaxTurns => Some("error_max_turns"),
+        DoneReason::Cancelled | DoneReason::Dropped => Some("error_during_execution"),
+        DoneReason::EndTurn | DoneReason::MaxTokens | DoneReason::Compact => None,
+    }
 }

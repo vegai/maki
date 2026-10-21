@@ -627,6 +627,13 @@ mod tests {
     /// Prints the pid of a `sleep` that closed all its standard streams.
     const LINGERING_MEMBER: &str = "sleep 30 </dev/null >/dev/null 2>&1 & echo $!";
 
+    fn into_cause(error: Error) -> Error {
+        match error {
+            Error::WithStderr { error, .. } | Error::WithExit { error, .. } => into_cause(*error),
+            error => error,
+        }
+    }
+
     #[test]
     fn request_file_arguments_preserve_non_utf8_paths() {
         const RAW_DIRECTORY: &[u8] = b"/tmp/private-\xff";
@@ -868,7 +875,7 @@ mod tests {
             fake.group_gone(),
             "a stopped run must not continue after its request"
         );
-        match result.unwrap_err().into_cause() {
+        match into_cause(result.unwrap_err()) {
             Error::Interrupted(error) => *error,
             error => error,
         }
@@ -914,7 +921,7 @@ mod tests {
     fn a_truncated_line_before_stop_is_diagnosed_and_retryable() {
         let fake = Fake::new("truncated_line");
         let (result, _) = smol::block_on(fake.request());
-        let error = result.unwrap_err().into_cause();
+        let error = into_cause(result.unwrap_err());
         assert!(error.temporary().is_some());
         let Error::Interrupted(error) = error else {
             panic!("{error:?}")
@@ -1059,7 +1066,7 @@ mod tests {
             "a run that hangs must not continue after its request"
         );
         let error = result.unwrap_err();
-        match error.into_cause() {
+        match into_cause(error) {
             Error::Interrupted(error) => *error,
             error => error,
         }

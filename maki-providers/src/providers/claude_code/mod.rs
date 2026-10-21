@@ -476,8 +476,6 @@ impl ClaudeCode {
                 "Claude Code ({name}) is not installed, or it is not on PATH"
             ))
         })?;
-        validation::prepare_launch(utf8_vars(env::vars_os()), options.config_dir.clone(), &cwd)
-            .map_err(config_error)?;
         Ok(Self {
             executable,
             limits: Limits::new(timeouts.stream),

@@ -131,20 +131,20 @@ async fn project_git_dir(_lua: Lua, project: String) -> LuaResult<Pair<String>> 
 }
 
 /// Create an owned probe directory outside every checkout alias and Git directory.
-/// @param base string? Temporary directory, or the process default.
+/// @param base string Prepared temporary directory.
 /// @param project string Session directory.
 /// @param denied table Checkout aliases and Git directories.
 /// @return (string?, string?) Created directory, or nil and the error. The caller owns cleanup.
 #[lua_fn(guard = FsWrite)]
 async fn private_dir(
     _lua: Lua,
-    base: Option<String>,
+    base: String,
     project: String,
     denied: Vec<String>,
 ) -> LuaResult<Pair<String>> {
     Ok(pair(
         validation::private_dir(
-            base.map(PathBuf::from),
+            PathBuf::from(base),
             PathBuf::from(project),
             denied.into_iter().map(PathBuf::from).collect(),
         )

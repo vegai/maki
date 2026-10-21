@@ -1,8 +1,13 @@
 //! Shared launch validation for the provider and the Lua worker.
 
+#[cfg(unix)]
+use rustix::process::geteuid;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
+use std::fs::{self, DirBuilder};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf, absolute};
 
 use serde::Deserialize;
@@ -32,6 +37,12 @@ const RUNTIME_DIR_ENV: &str = "XDG_RUNTIME_DIR";
 const CACHE_HOME_ENV: &str = "XDG_CACHE_HOME";
 #[cfg(unix)]
 const FALLBACK_TEMP_DIR: &str = "/var/tmp";
+const DEFAULT_CACHE_DIR: &str = ".cache";
+#[cfg(unix)]
+const PRIVATE_MODE_MASK: u32 = 0o777;
+const SCRATCH_DIRECTORY: &str = "maki/claude-code";
+#[cfg(unix)]
+const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const TMPDIR_ENV: &str = "TMPDIR";
 #[cfg(unix)]
 const UNIX_TEMP_DIR: &str = "/tmp";
@@ -207,12 +218,24 @@ pub(super) fn prepare_launch(
         path: temp_dir,
         source,
     })?;
-    let fallback_dirs = [var(RUNTIME_DIR_ENV), var(CACHE_HOME_ENV), var(HOME_ENV)]
-        .into_iter()
-        .flatten()
-        .filter(|p| !p.is_empty())
+    let cache = var(CACHE_HOME_ENV)
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .collect::<Vec<_>>();
+        .or_else(|| {
+            var(HOME_ENV)
+                .filter(|value| !value.is_empty())
+                .map(|home| PathBuf::from(home).join(DEFAULT_CACHE_DIR))
+        });
+    let fallback_dirs = [
+        var(RUNTIME_DIR_ENV)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .map(|root| root.join(SCRATCH_DIRECTORY)),
+        cache.map(|root| root.join(SCRATCH_DIRECTORY)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
     let (mut env, withheld) = checks::launch_env(vars);
     env.retain(|(name, value)| name != CONFIG_DIR_ENV || !value.is_empty());
     if configured.is_some() {
@@ -244,19 +267,48 @@ fn scratch_base(
     denied: &[PathBuf],
     fallbacks: Vec<PathBuf>,
 ) -> Result<PathBuf, Error> {
-    let candidates = [preferred.to_owned()].into_iter().chain(fallbacks);
+    let outside =
+        |path: &Path| !path.starts_with(cwd) && !denied.iter().any(|dir| path.starts_with(dir));
+    if let Ok(base) = preferred.canonicalize()
+        && base.is_dir()
+        && outside(&base)
+    {
+        return Ok(base);
+    }
     #[cfg(unix)]
-    let candidates = candidates.chain([PathBuf::from(FALLBACK_TEMP_DIR)]);
-    for candidate in candidates {
-        let Ok(base) = candidate.canonicalize() else {
+    let fallbacks = fallbacks
+        .into_iter()
+        .chain([PathBuf::from(FALLBACK_TEMP_DIR)
+            .join(format!("maki-claude-code-{}", geteuid().as_raw()))]);
+    for path in fallbacks {
+        let Some(ancestor) = path.ancestors().find_map(|dir| dir.canonicalize().ok()) else {
             continue;
         };
-        if base.is_dir()
-            && !base.starts_with(cwd)
-            && !denied.iter().any(|dir| base.starts_with(dir))
-            && let Ok(probe) = tempfile::tempdir_in(&base)
+        if !outside(&ancestor) {
+            continue;
+        }
+        let mut builder = DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        builder.mode(PRIVATE_DIRECTORY_MODE);
+        if builder.create(&path).is_err() {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        #[cfg(unix)]
+        if metadata.uid() != geteuid().as_raw()
+            || metadata.permissions().mode() & PRIVATE_MODE_MASK != PRIVATE_DIRECTORY_MODE
         {
-            drop(probe);
+            continue;
+        }
+        if let Ok(base) = path.canonicalize()
+            && outside(&base)
+        {
             return Ok(base);
         }
     }
@@ -291,14 +343,11 @@ pub fn worker_launch(
 
 /// Make a worker probe directory with the provider's ownership tag and checkout checks.
 pub async fn private_dir(
-    base: Option<PathBuf>,
+    base: PathBuf,
     project: PathBuf,
     denied: Vec<PathBuf>,
 ) -> Result<String, String> {
     smol::unblock(move || {
-        let base = base
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or_else(default_temp_dir);
         let (dir, path) =
             super::run::private_dir(&base, &project, &denied).map_err(|error| error.to_string())?;
         let name = path.to_str().ok_or(PROBE_PATH_NOT_UTF8)?.to_owned();

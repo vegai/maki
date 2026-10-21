@@ -26,6 +26,7 @@ use maki_agent::{
     McpSession, RunContext, RunContextBuilder, RunLedger, SessionEvents, SubagentInbox,
     SubagentInfo, ToolDoneEvent, UNAVAILABLE_RESULT, event_stream,
 };
+use maki_config::AgentConfig;
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
 use maki_providers::provider;
@@ -1004,7 +1005,11 @@ async fn session(
         params: AgentParams {
             provider,
             model,
-            config: agent_ctx.config.clone(),
+            config: AgentConfig {
+                max_turns: None,
+                final_answer: false,
+                ..agent_ctx.config.clone()
+            },
             tool_output_lines: maki_config::ToolOutputLines::default(),
             permissions: Arc::clone(&agent_ctx.permissions),
             session_id: agent_ctx.session_id.clone(),

@@ -34,6 +34,7 @@ const REPLY: &str = "done";
 const SAVED_THINKING: &str = "max";
 const OUTPUT_CAP: u32 = 128_000;
 const LOW_BUDGET: u64 = 12_800;
+const MAX_BUDGET: u64 = 64_000;
 const HIGH_BUDGET: u64 = 38_400;
 const XHIGH_BUDGET: u64 = 51_200;
 const MINIMAL_BUDGET: u64 = 6_400;
@@ -251,12 +252,13 @@ fn headless_thinking_reaches_the_request_and_init(
     fixture.assert_budget(budget);
 }
 
+#[test_case(&[], Some(MAX_BUDGET) ; "saved_acp_default")]
 #[test_case(&["--thinking", "xhigh"], Some(XHIGH_BUDGET) ; "thinking")]
 #[test_case(&["--effort", "high"], Some(HIGH_BUDGET) ; "effort")]
 #[test_case(&["--max-thinking-tokens", "2048"], Some(EXPLICIT_BUDGET) ; "budget")]
 #[test_case(&["--max-thinking-tokens", "0"], None ; "zero_budget")]
 fn acp_launch_thinking_reaches_the_request(flags: &[&str], budget: Option<u64>) {
-    let fixture = Fixture::new(Some("low"), Yes);
+    let fixture = Fixture::new(None, Yes);
     let mut command = fixture.command();
     command.args(["acp", "--model", MODEL]).args(flags);
     let mut process = Process::start(command);
@@ -309,7 +311,7 @@ const TOOL_REPLY: &str = concat!(
 );
 const TOOL_STREAM: &[Canned] = &[Canned::sse(TOOL_REPLY)];
 const MAX_TURNS_ERROR: &str = "error_max_turns";
-const INTERRUPTED: &str = "error_interrupted";
+const INTERRUPTED: &str = "error_during_execution";
 
 #[test_case(false ; "print")]
 #[test_case(true ; "sdk")]
@@ -375,11 +377,12 @@ fn read_http_request(stream: &TcpStream) {
     reader.read_exact(&mut body).unwrap();
 }
 
-#[test_case(Signal::TERM, false ; "sigterm")]
-#[test_case(Signal::INT, false ; "sigint")]
-#[test_case(Signal::KILL, false ; "sigkill_keeps_checkpoint")]
-#[test_case(Signal::TERM, true ; "sdk_sigterm")]
-fn interrupted_print_leaves_a_resumable_prefix(signal: Signal, sdk: bool) {
+#[test_case(Some(Signal::TERM), false ; "sigterm")]
+#[test_case(Some(Signal::INT), false ; "sigint")]
+#[test_case(Some(Signal::KILL), false ; "sigkill_keeps_checkpoint")]
+#[test_case(Some(Signal::TERM), true ; "sdk_sigterm")]
+#[test_case(None, true ; "sdk_control_interrupt_exits_successfully")]
+fn interrupted_print_leaves_a_resumable_prefix(signal: Option<Signal>, sdk: bool) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
     let (waiting_tx, waiting_rx) = flume::bounded(1);
@@ -417,17 +420,21 @@ fn interrupted_print_leaves_a_resumable_prefix(signal: Signal, sdk: bool) {
             .flat_map(|message| &message.content)
             .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
     );
-    kill_process(
-        Pid::from_raw(process.child.id().try_into().unwrap()).unwrap(),
-        signal,
-    )
-    .unwrap();
-    if signal != Signal::KILL {
+    if let Some(signal) = signal {
+        kill_process(
+            Pid::from_raw(process.child.id().try_into().unwrap()).unwrap(),
+            signal,
+        )
+        .unwrap();
+    } else {
+        process.send(json!({"type":"control_request", "request_id":"fixture-interrupt", "request":{"subtype":"interrupt"}}));
+    }
+    if signal != Some(Signal::KILL) {
         let result = process.until(|event| event["type"] == RESULT);
         assert_eq!(result["subtype"], INTERRUPTED, "{result}");
         assert_eq!(result["is_error"], true);
     }
-    process.finish_status(false);
+    process.finish_status(signal.is_none());
     let resumed = StoredSession::load(id, &fixture.storage()).unwrap();
     let saved: Vec<Value> = stored
         .messages()

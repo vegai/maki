@@ -451,7 +451,14 @@ impl<'h> Agent<'h> {
                 return Ok(DoneReason::MaxTurns);
             }
             self.try_auto_compact().await?;
-            if self.final_answer_turn() {
+            if self.final_answer_turn()
+                && self
+                    .history
+                    .as_slice()
+                    .last()
+                    .and_then(Message::first_text_content)
+                    != Some(FINAL_ANSWER_NOTE)
+            {
                 self.history
                     .push(Message::synthetic(FINAL_ANSWER_NOTE.to_owned()));
             }
@@ -3441,9 +3448,10 @@ mod tests {
         }
     }
 
-    #[test_case(false, true, UNBOUND_RECOVER_MSG ; "drops_thinking_and_retries")]
-    #[test_case(true, false, UNBOUND_GIVE_UP_MSG ; "nothing_left_to_drop_surfaces_the_error")]
-    fn unbound_thinking_recovery(always: bool, expected: bool, message: &str) {
+    #[test_case(false, true, UNBOUND_RECOVER_MSG, false ; "drops_thinking_and_retries")]
+    #[test_case(true, false, UNBOUND_GIVE_UP_MSG, false ; "nothing_left_to_drop_surfaces_the_error")]
+    #[test_case(false, true, UNBOUND_RECOVER_MSG, true ; "final_answer_note_is_not_duplicated_on_retry")]
+    fn unbound_thinking_recovery(always: bool, expected: bool, message: &str, bounded: bool) {
         smol::block_on(async {
             let mut history = History::new(vec![
                 Message::user("go".into()),
@@ -3464,10 +3472,24 @@ mod tests {
             let (mut agent, event_rx) =
                 make_agent(UnboundThinkingProvider { always }, &mut history);
 
+            if bounded {
+                agent.config.max_turns = Some(1);
+                agent.config.final_answer = true;
+            }
             let recovered = agent.run(default_input()).await.is_ok();
             drop(agent);
 
             assert_eq!(recovered, expected, "{message}");
+            if bounded {
+                assert_eq!(
+                    history
+                        .as_slice()
+                        .iter()
+                        .filter(|message| message.first_text_content() == Some(FINAL_ANSWER_NOTE))
+                        .count(),
+                    1
+                );
+            }
             assert!(
                 history
                     .as_slice()

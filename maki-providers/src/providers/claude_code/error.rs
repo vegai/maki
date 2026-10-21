@@ -227,11 +227,10 @@ pub(crate) enum Error {
     #[error("an image reached the transcript, which holds only text")]
     Image,
 
-    #[error("{error}; claude {status} ({context})")]
+    #[error("{error}; claude {status}")]
     WithExit {
         error: Box<Error>,
         status: ExitStatus,
-        context: &'static str,
     },
 
     /// Any error above, with the last lines Claude Code printed on stderr.
@@ -244,14 +243,6 @@ impl Error {
         match self {
             Self::WithStderr { error, .. } | Self::WithExit { error, .. } => error.cause(),
             _ => self,
-        }
-    }
-
-    #[cfg(all(test, target_os = "linux"))]
-    pub(crate) fn into_cause(self) -> Self {
-        match self {
-            Self::WithStderr { error, .. } | Self::WithExit { error, .. } => error.into_cause(),
-            error => error,
         }
     }
 

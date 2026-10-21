@@ -125,7 +125,11 @@ impl Group {
         let status = within(Instant::now() + SHUTDOWN_GRACE, self.child.status())
             .await
             .ok_or(Error::ReapLate)?;
-        self.exit_status = status.as_ref().ok().copied();
+        self.exit_status = if matches!(exited, LeaderExit::Exited) {
+            status.as_ref().ok().copied()
+        } else {
+            None
+        };
         if matches!(exited, LeaderExit::TimedOut) {
             return Err(Error::ExitLate);
         }
@@ -224,19 +228,17 @@ pub(super) async fn supervised<T>(
         Err(error) => {
             let error = match group.exit_status {
                 Some(status)
-                    if !matches!(
-                        error.cause(),
-                        Error::VersionFailed(_) | Error::ExitedEarly(_) | Error::ExitedInChecks(_)
-                    ) =>
+                    if !shutdown_requested
+                        && !matches!(
+                            error.cause(),
+                            Error::VersionFailed(_)
+                                | Error::ExitedEarly(_)
+                                | Error::ExitedInChecks(_)
+                        ) =>
                 {
                     Error::WithExit {
                         error: Box::new(error),
                         status,
-                        context: if shutdown_requested {
-                            "after maki requested shutdown"
-                        } else {
-                            "exited"
-                        },
                     }
                 }
                 _ => error,
@@ -481,6 +483,7 @@ mod process_tests {
     use std::process::Command;
     use std::time::Instant;
 
+    use futures_lite::io::{AsyncBufReadExt, BufReader};
     use rustix::process::{Pid, Signal, kill_process};
     use test_case::test_case;
 
@@ -497,22 +500,48 @@ mod process_tests {
     const FAIL_COMMAND: &str = "printf 'diagnostic stderr\\n' >&2; exit 7";
     const FAIL_CODE: i32 = 7;
 
-    #[test]
-    fn protocol_errors_keep_the_process_status_and_stderr() {
+    #[test_case(false, false ; "natural_exit_has_status")]
+    #[test_case(true, false ; "requested_shutdown_has_no_status")]
+    #[test_case(true, true ; "deadline_kill_has_no_status")]
+    fn protocol_errors_keep_only_natural_process_status(shutdown: bool, deadline: bool) {
         let mut command = Command::new("/bin/sh");
-        command.args(["-c", FAIL_COMMAND]);
+        command.args([
+            "-c",
+            if shutdown {
+                "printf 'diagnostic stderr\\n' >&2; printf 'ready\\n'; read reply"
+            } else {
+                FAIL_COMMAND
+            },
+        ]);
         let error = smol::block_on(supervised::<()>(command, async |group| {
-            let status = group.wait(Instant::now() + SHUTDOWN_GRACE).await?;
-            assert_eq!(status.code(), Some(FAIL_CODE));
+            if shutdown {
+                let mut line = String::new();
+                BufReader::new(group.child.stdout.as_mut().unwrap())
+                    .read_line(&mut line)
+                    .await
+                    .unwrap();
+                if deadline {
+                    assert!(group.wait(Instant::now()).await.is_err());
+                }
+            } else {
+                let status = group.wait(Instant::now() + SHUTDOWN_GRACE).await?;
+                assert_eq!(status.code(), Some(FAIL_CODE));
+            }
             Err(Error::Failed(PROCESS_ERROR.into()))
         }))
         .unwrap_err();
         let text = error.to_string();
         assert!(text.contains(PROCESS_ERROR), "{text}");
         assert!(text.contains(PROCESS_STDERR), "{text}");
-        assert!(
-            matches!(&error, Error::WithStderr { error, .. } if matches!(**error, Error::WithExit { status, .. } if status.code() == Some(FAIL_CODE)))
-        );
+        if shutdown {
+            assert!(
+                matches!(&error, Error::WithStderr { error, .. } if matches!(**error, Error::Failed(_)))
+            );
+        } else {
+            assert!(
+                matches!(&error, Error::WithStderr { error, .. } if matches!(**error, Error::WithExit { status, .. } if status.code() == Some(FAIL_CODE)))
+            );
+        }
         assert!(matches!(error.cause(), Error::Failed(message) if message == PROCESS_ERROR));
     }
 

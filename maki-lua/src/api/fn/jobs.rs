@@ -186,11 +186,15 @@ impl JobSpec {
             return Err(format!("{CWD_NOT_DIRECTORY}: {}", dir.display()));
         }
         let lookup_dir = if self.clear_env
-            && self
-                .env
-                .as_ref()
-                .is_none_or(|env| !env.contains_key("PATH"))
-        {
+            && self.env.as_ref().is_none_or(|env| {
+                !env.keys().any(|name| {
+                    if cfg!(windows) {
+                        name.eq_ignore_ascii_case("PATH")
+                    } else {
+                        name == "PATH"
+                    }
+                })
+            }) {
             Some(match &cwd {
                 Some(dir) => dir.clone(),
                 None => env::current_dir().map_err(|error| error.to_string())?,
@@ -735,9 +739,10 @@ impl JobStore {
     }
 
     pub fn kill(&mut self, job_id: u32, task_id: Option<u64>, plugin: &str) {
-        if let Some(job) = self.jobs.get(&job_id)
+        if let Some(job) = self.jobs.get_mut(&job_id)
             && job.can_access(task_id, plugin)
         {
+            job.deadline = None;
             kill_job(job);
         }
     }
@@ -1356,14 +1361,19 @@ mod tests {
         let lua = Lua::new();
         let mut store = make_store();
         let id = store
-            .start(JobSpec::new(task_owner(1), "sleep 30"))
+            .start(JobSpec {
+                timeout: Some(JOB_EXIT_TIMEOUT),
+                ..JobSpec::new(task_owner(1), "sleep 30")
+            })
             .unwrap();
         let pid = store.jobs[&id].pid;
 
         store.kill(id, Some(2), TEST_PLUGIN);
         assert!(group_alive(pid));
+        assert!(store.jobs[&id].deadline.is_some());
 
         store.kill(id, Some(1), TEST_PLUGIN);
+        assert!(store.jobs[&id].deadline.is_none());
         assert!(wait_for_group_exit(pid));
         store.finish(&lua, id);
     }
@@ -1824,6 +1834,22 @@ mod tests {
             store.close_stdin(id, Some(1), TEST_PLUGIN),
             Err(NO_STDIN_ERR)
         );
+    }
+
+    #[cfg(windows)]
+    #[test_case("PATH")]
+    #[test_case("Path")]
+    #[test_case("path")]
+    fn explicit_windows_path_is_case_insensitive(name: &str) {
+        const PROGRAM: &str = "maki-uninstalled-test-helper.exe";
+        let command = JobSpec {
+            clear_env: true,
+            env: Some(HashMap::from([(name.to_owned(), String::new())])),
+            ..JobSpec::new(task_owner(1), JobCommand::Argv(vec![PROGRAM.into()]))
+        }
+        .command()
+        .unwrap();
+        assert_eq!(command.get_program(), PROGRAM);
     }
 
     #[cfg(unix)]

@@ -316,6 +316,7 @@ mod tests {
         COMMONDIR, CONFIG, DEPTH_EXCEEDED, GIT_ENTRY, HEAD, MAX_DEPTH, MAX_FAILURES,
         QUARANTINE_ENTRY, Visit, quarantine_entry, sanitize_snapshot, walk,
     };
+    use rustix::process::geteuid;
     use std::env;
     use std::fs::{self, File, Permissions};
     use std::io;
@@ -602,6 +603,9 @@ mod tests {
 
     #[test]
     fn unreadable_directories_do_not_leave_other_git_metadata_in_the_snapshot() {
+        if geteuid().is_root() {
+            return;
+        }
         let dir = tempdir().unwrap();
         let snapshot = dir.path().join("snapshot");
         let quarantine = dir.path().join("quarantine");

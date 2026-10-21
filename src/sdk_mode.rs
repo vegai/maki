@@ -24,7 +24,7 @@ use maki_agent::prompt::ResolvedPrompts;
 use maki_agent::session::Resumed;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
-    AgentConfig, AgentEvent, AgentInput, AgentMode, CancelToken, Envelope, InputSource,
+    AgentConfig, AgentEvent, AgentInput, AgentMode, CancelToken, DoneReason, Envelope, InputSource,
     PermissionsConfig, SessionEndReason, SessionEvents, SteerKind,
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
@@ -984,8 +984,7 @@ impl EventPump {
         usage: TokenUsage,
     ) -> Result<()> {
         let duration_ms = {
-            let mut shared = self.shared.lock().unwrap();
-            shared.failed |= failure.is_some();
+            let shared = self.shared.lock().unwrap();
             shared.turn_start.elapsed().as_millis()
         };
         // Zero on an unpriced model, which is what its turns reported too.
@@ -1172,12 +1171,16 @@ impl EventPump {
                 if parent_tool_use_id.is_some() {
                     return Ok(());
                 }
-                let failure = crate::print::failure_subtype(*reason);
+                if *reason == DoneReason::MaxTurns {
+                    self.shared.lock().unwrap().failed = true;
+                }
+                let failure = crate::wire::failure_subtype(*reason);
                 let result = mem::take(&mut self.result_text);
                 self.emit_turn_result(failure, result, *num_turns, *usage)?;
             }
             AgentEvent::Error { message, .. } => {
                 if parent_tool_use_id.is_none() {
+                    self.shared.lock().unwrap().failed = true;
                     self.emit_turn_result(
                         Some("error_during_execution"),
                         message.clone(),
@@ -1217,7 +1220,7 @@ fn map_tool_names_in_content(content: &Value) -> Value {
 mod tests {
     use crate::tool_names::claude_to_maki_tool_name;
     use flume::Receiver;
-    use maki_agent::{DoneReason, SubagentInfo};
+    use maki_agent::SubagentInfo;
     use maki_config::ToolKey;
     use test_case::test_case;
 

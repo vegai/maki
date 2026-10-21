@@ -229,6 +229,7 @@ impl SessionTurn<'_> {
     }
 
     pub fn record_error(&mut self, message: String) {
+        self.track.history.mark_unsaved();
         self.track
             .store
             .lock()
@@ -282,16 +283,20 @@ impl Drop for SessionTurn<'_> {
 pub(crate) struct SessionCheckpoint(Arc<Mutex<SessionStore>>);
 
 impl SessionCheckpoint {
-    pub(crate) async fn persist(&self, snapshot: HistorySnapshot, context_size: u32) {
+    pub(crate) async fn persist(&self, snapshot: HistorySnapshot, context_size: u32) -> bool {
         let store = Arc::clone(&self.0);
         smol::unblock(move || {
             let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Err(error) = store.record_turn(&snapshot, context_size) {
-                warn!(%error, session_id = %store.session.id, "failed to checkpoint session");
-                eprintln!("{SAVE_FAILED}{}: {error}", store.session.id);
+            match store.record_turn(&snapshot, context_size) {
+                Ok(()) => true,
+                Err(error) => {
+                    warn!(%error, session_id = %store.session.id, "failed to checkpoint session");
+                    eprintln!("{SAVE_FAILED}{}: {error}", store.session.id);
+                    false
+                }
             }
         })
-        .await;
+        .await
     }
 }
 
@@ -507,6 +512,9 @@ mod tests {
             .join(SESSIONS_DIR)
             .join(format!("{}.jsonl", session_id()));
         let prefix = fs::read(&path).unwrap();
+        assert!(!params.history.has_unsaved());
+        smol::block_on(params.history.checkpoint(CONTEXT_SIZE));
+        assert_eq!(fs::read(&path).unwrap(), prefix);
         params
             .history
             .push(Message::observation(OBSERVATION.into()));

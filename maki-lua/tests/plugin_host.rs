@@ -3172,33 +3172,37 @@ fn job_input_it_cannot_take_is_refused(call: &str, expected: &str) {
     assert!(result.contains(expected), "got: {result}");
 }
 
-#[test_case("{ env = false }" ; "boolean_env")]
-#[test_case("{ env = { SECRET = {} } }" ; "table_value")]
-#[test_case("{ env = { SECRET = false } }" ; "boolean_value")]
-#[test_case("{ cwd = false }" ; "boolean_cwd")]
-#[test_case("{ cwd = {} }" ; "table_cwd")]
-#[test_case("{ tail = false }" ; "boolean_tail")]
-#[test_case("{ tail = {} }" ; "table_tail")]
-#[test_case("{ tail = -1 }" ; "negative_tail")]
-#[test_case("{ tail = 1.5 }" ; "fractional_tail")]
-#[test_case("{ on_stdout = false }" ; "boolean_stdout_callback")]
-#[test_case("{ on_stderr = {} }" ; "table_stderr_callback")]
-#[test_case("{ on_exit = 42 }" ; "numeric_exit_callback")]
-fn malformed_job_options_are_refused(opts: &str) {
+#[test_case("{ env = false }", Some("boolean") ; "boolean_env")]
+#[test_case("{ env = { SECRET = {} } }", Some("table") ; "table_value")]
+#[test_case("{ env = { SECRET = false } }", Some("boolean") ; "boolean_value")]
+#[test_case("{ cwd = false }", Some("boolean") ; "boolean_cwd")]
+#[test_case("{ cwd = {} }", Some("table") ; "table_cwd")]
+#[test_case("{ tail = false }", Some("boolean") ; "boolean_tail")]
+#[test_case("{ tail = {} }", Some("table") ; "table_tail")]
+#[test_case("{ tail = -1 }", Some("out of range") ; "negative_tail")]
+#[test_case("{ tail = 1.5 }", Some("out of range") ; "fractional_tail")]
+#[test_case("{ on_stdout = false }", Some("boolean") ; "boolean_stdout_callback")]
+#[test_case("{ on_stderr = {} }", Some("table") ; "table_stderr_callback")]
+#[test_case("{ on_exit = 42 }", Some("function") ; "numeric_exit_callback")]
+#[test_case("{ env = {}, tail = 0, on_exit = function() end }", None ; "valid_options")]
+fn malformed_job_options_are_refused(opts: &str, expected: Option<&str>) {
     const TOOL: &str = "bad_job_options";
     let mut perms = PluginPermissions::denied();
     perms.set(maki_lua::Permission::Run, true);
     let source = perm_tool_src(
         TOOL,
         &format!(
-            r#"local ok = pcall(maki.fn.jobstart, "true", {opts})
-        return tostring(ok)"#,
+            r#"local ok, err = pcall(function() return assert(maki.fn.jobstart("true", {opts})) end)
+        return tostring(ok) .. ":" .. tostring(err)"#,
         ),
     );
-    assert_eq!(
-        exec_tool_with_perms(perms, &source, TOOL, json!({})).unwrap(),
-        "false"
-    );
+    let result = exec_tool_with_perms(perms, &source, TOOL, json!({})).unwrap();
+    if let Some(expected) = expected {
+        assert!(result.starts_with("false:"), "{result}");
+        assert!(result.contains(expected), "{result}");
+    } else {
+        assert!(result.starts_with("true:"), "{result}");
+    }
 }
 
 /// `run` on its own is enough to start a job, but pointing a stream at a path
@@ -8354,15 +8358,21 @@ fn tool_result_text(request: &[Message]) -> &str {
 /// Plan mode used to reach background sessions as is. The plan prompt landed in
 /// a monitor's history, and the plan file was the one file it could write
 /// without asking. We aim at the plan file because that was the hole.
-#[test]
-fn background_session_never_plans_and_cannot_write_while_the_chat_does() {
+#[test_case(false ; "ordinary_parent")]
+#[test_case(true ; "capped_parent_does_not_cap_child")]
+fn background_session_never_plans_and_cannot_write_while_the_chat_does(capped: bool) {
     let dir = tempfile::TempDir::new().unwrap();
     let plan = dir.path().join(PLAN_FILE);
     let reg = Arc::clone(ToolRegistry::global_arc());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let session = MakiId::generate();
     let mailbox = SessionMailbox::register(session);
-    let seed = mailbox.publish_seed(stub_seed(session));
+    let mut seed = stub_seed(session);
+    if capped {
+        seed.config.max_turns = Some(1);
+        seed.config.final_answer = true;
+    }
+    let seed = mailbox.publish_seed(seed);
     let requests = CallOnce::install(
         &seed,
         SCRIBBLE_TOOL,
