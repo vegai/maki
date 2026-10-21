@@ -59,6 +59,7 @@ pub(in crate::providers::claude_code) async fn within<T>(
 pub(super) struct Group {
     pub(super) child: Child,
     signals_disabled: bool,
+    signalled: bool,
     exit_status: Option<ExitStatus>,
     #[cfg(target_os = "linux")]
     _lifetime: UnixStream,
@@ -91,16 +92,18 @@ impl Group {
     }
 
     /// Only while the unreaped leader's pid still names the group.
-    pub(super) fn kill(&self) {
+    pub(super) fn kill(&mut self) {
         if !self.signals_disabled {
+            self.signalled = true;
             kill_group(self.child.id());
         }
     }
 
-    pub(super) fn terminate(&self) {
+    pub(super) fn terminate(&mut self) {
         if self.signals_disabled {
             return;
         }
+        self.signalled = true;
         #[cfg(unix)]
         if let Some(pid) = pid_of(self.child.id())
             && let Err(error) = kill_process(pid, Signal::TERM)
@@ -116,6 +119,7 @@ impl Group {
     /// group.
     pub(super) async fn wait(&mut self, deadline: Instant) -> Result<ExitStatus, Error> {
         let exited = self.exited_by(deadline).await;
+        let natural_exit = matches!(exited, LeaderExit::Exited) && !self.signalled;
         if !matches!(exited, LeaderExit::WaitFailed) {
             self.kill();
         }
@@ -125,7 +129,7 @@ impl Group {
         let status = within(Instant::now() + SHUTDOWN_GRACE, self.child.status())
             .await
             .ok_or(Error::ReapLate)?;
-        self.exit_status = if matches!(exited, LeaderExit::Exited) {
+        self.exit_status = if natural_exit {
             status.as_ref().ok().copied()
         } else {
             None
@@ -177,6 +181,7 @@ fn spawn_piped(command: process::Command) -> io::Result<Group> {
     Ok(Group {
         child,
         signals_disabled: false,
+        signalled: false,
         exit_status: None,
         #[cfg(target_os = "linux")]
         _lifetime: lifetime,
@@ -212,8 +217,7 @@ pub(super) async fn supervised<T>(
     debug!(pid = group.child.id(), "claude-code: process started");
     let stderr = watch_stderr(&mut group.child);
     let result = work(&mut group).await;
-    let shutdown_requested = !group.signals_disabled;
-    if shutdown_requested {
+    if !group.signals_disabled {
         drop(group.child.stdin.take());
         group.terminate();
         if matches!(
@@ -228,13 +232,10 @@ pub(super) async fn supervised<T>(
         Err(error) => {
             let error = match group.exit_status {
                 Some(status)
-                    if !shutdown_requested
-                        && !matches!(
-                            error.cause(),
-                            Error::VersionFailed(_)
-                                | Error::ExitedEarly(_)
-                                | Error::ExitedInChecks(_)
-                        ) =>
+                    if !matches!(
+                        error.cause(),
+                        Error::VersionFailed(_) | Error::ExitedEarly(_) | Error::ExitedInChecks(_)
+                    ) =>
                 {
                     Error::WithExit {
                         error: Box::new(error),
@@ -543,6 +544,32 @@ mod process_tests {
             );
         }
         assert!(matches!(error.cause(), Error::Failed(message) if message == PROCESS_ERROR));
+    }
+
+    #[test_case(false ; "sigkill")]
+    #[test_case(true ; "sigterm")]
+    fn errors_after_an_explicit_stop_omit_process_status(graceful: bool) {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf 'ready\n'; read reply"]);
+        let error = smol::block_on(supervised::<()>(command, async |group| {
+            let mut line = String::new();
+            BufReader::new(group.child.stdout.as_mut().unwrap())
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            if graceful {
+                group.terminate();
+            } else {
+                group.kill();
+            }
+            group.wait(Instant::now() + SHUTDOWN_GRACE).await?;
+            Err(Error::Failed(PROCESS_ERROR.into()))
+        }))
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::Failed(ref message) if message == PROCESS_ERROR),
+            "{error:?}"
+        );
     }
 
     /// Marking the leader reaped must prevent signalling a pid that may identify another group.

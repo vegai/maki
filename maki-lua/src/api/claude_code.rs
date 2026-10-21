@@ -379,7 +379,7 @@ async fn unpack_blobs(
 
 /// Classify a worker event with the provider's protocol rules before conversion to Lua.
 /// @param line string Raw stream-json event.
-/// @param mode table Accepted-init and expected-model state.
+/// @param mode table Accepted-init and expected-model state. Init events require mode.init with cwd, cli and worker.
 /// @return (table?, string?) Event and normalized usage, or nil and the protocol error.
 #[lua_fn]
 fn classify(lua: &Lua, line: String, mode: Table) -> LuaResult<Pair<Table>> {
@@ -396,10 +396,11 @@ fn classify(lua: &Lua, line: String, mode: Table) -> LuaResult<Pair<Table>> {
         && event["subtype"] == INIT_EVENT
     {
         let expect: Table = mode.get("init")?;
-        let version: String = expect.get("version")?;
+        let version: String = expect.get::<Table>("cli")?.get("version")?;
         let cwd: String = expect.get("cwd")?;
-        let tools: Vec<String> = expect.get("tools")?;
-        let modes: Vec<String> = expect.get("permission_modes")?;
+        let worker: Table = expect.get("worker")?;
+        let tools: Vec<String> = worker.get("tools")?;
+        let modes: Vec<String> = worker.get("reported_modes")?;
         classified.problem = validation::init_problem(
             event,
             &version,

@@ -570,6 +570,9 @@ impl ClaudeCode {
         {
             return Ok(models);
         }
+        if listing == ModelListing::Refresh && slots().try_acquire().is_none() {
+            return Err(Error::ListingBusy);
+        }
         let mut failures = FAILED_LISTINGS.lock().await;
         if listing == ModelListing::Cached {
             if let Some(models) = saved().await {
@@ -584,7 +587,7 @@ impl ClaudeCode {
                 });
             }
         }
-        let listed = self.ask_models(cwd, vars).await;
+        let listed = self.ask_models(cwd, vars, listing).await;
         match &listed {
             Ok(_) => failures.remove(&key),
             Err(error) if !error.is_version_error() && !matches!(error, Error::ListingBusy) => {
@@ -635,9 +638,13 @@ impl ClaudeCode {
         &self,
         cwd: &Path,
         vars: Vec<(String, String)>,
+        listing: ModelListing,
     ) -> Result<Vec<Listed>, Error> {
         let slots = slots();
-        let _slot = slots.try_acquire().ok_or(Error::ListingBusy)?;
+        let _slot = match listing {
+            ModelListing::Cached => slots.acquire().await,
+            ModelListing::Refresh => slots.try_acquire().ok_or(Error::ListingBusy)?,
+        };
         let prepared = self.prepare_async(cwd, vars).await?;
         let usage = self.plan_usage(&prepared.config_dir);
         let models = run::models(&self.launch(&prepared, cwd), &usage)
@@ -1286,9 +1293,11 @@ mod on_the_fake {
     use std::iter;
     use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
+    use std::pin::pin;
     use std::sync::Mutex;
     use std::time::{Duration, SystemTime};
 
+    use futures_lite::future::poll_once;
     use futures_lite::{FutureExt, future};
     use serde_json::{Value, json};
     use smol::Timer;
@@ -1607,6 +1616,50 @@ mod on_the_fake {
                     .unwrap()
                     .is_empty()
             );
+        });
+    }
+
+    #[test_case(false ; "no_saved_list")]
+    #[test_case(true ; "expired_memory_list")]
+    fn a_cached_listing_waits_for_a_busy_slot(stale: bool) {
+        let fake = Fake::new("text");
+        let home = tempdir().unwrap();
+        let provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
+        if stale {
+            provider.remember_windows(
+                SavedModels {
+                    executable: fake.executable(),
+                    config_dir: home.path().join(CLAUDE_DIR),
+                    models: vec![Listed {
+                        id: SAVED_MODEL.to_owned(),
+                        window: None,
+                    }],
+                },
+                SystemTime::now() - STALE_LIST,
+            );
+        }
+        smol::block_on(async {
+            let slots = slots();
+            let held: Vec<_> = iter::from_fn(|| slots.try_acquire_arc()).collect();
+            let cwd = fake.project();
+            let mut listed = pin!(provider.list(&cwd, ModelListing::Cached));
+            assert!(poll_once(&mut listed).await.is_none());
+            assert!(fake.log("calls").is_empty());
+            let mut refresh = pin!(provider.list(&cwd, ModelListing::Refresh));
+            assert!(matches!(
+                poll_once(&mut refresh).await,
+                Some(Err(Error::ListingBusy))
+            ));
+            drop(held);
+            let models = listed
+                .or(async {
+                    Timer::after(WAIT).await;
+                    panic!("a cached listing did not resume after a slot was released")
+                })
+                .await
+                .unwrap();
+            assert!(!models.is_empty());
+            assert!(models.iter().all(|model| model.id != SAVED_MODEL));
         });
     }
 
