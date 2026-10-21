@@ -40,12 +40,7 @@ end
 --- {expect}: `cwd`, `cli`, `worker`.
 function Stream.new(expect)
   return setmetatable({
-    expect = {
-      cwd = expect.cwd,
-      tools = expect.worker.tools,
-      permission_modes = expect.worker.reported_modes,
-      version = expect.cli.version,
-    },
+    expect = expect,
     accepted = false,
     model_checked = false,
     usage_by_message = {},

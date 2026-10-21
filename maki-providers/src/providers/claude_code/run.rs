@@ -1088,6 +1088,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_context_overflow_omits_makis_own_kill_status() {
+        let fake = Fake::new("context_overflow");
+        let error = smol::block_on(fake.request()).0.unwrap_err();
+        assert!(
+            matches!(&error, Error::ContextOverflow)
+                || matches!(&error, Error::WithStderr { error, .. } if matches!(**error, Error::ContextOverflow)),
+            "{error:?}"
+        );
+        assert!(fake.group_gone());
+    }
+
     fn limits(startup: Duration, idle: Duration, handoff: Duration, exit: Duration) -> Limits {
         Limits {
             startup,

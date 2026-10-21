@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf, absolute};
 use rustix::process::geteuid;
 use serde::Deserialize;
 use serde_json::{Value, json};
+#[cfg(unix)]
+use tracing::debug;
 
 use crate::ProviderUsage;
 
@@ -304,6 +306,7 @@ fn scratch_base(
         if metadata.uid() != geteuid().as_raw()
             || metadata.permissions().mode() & PRIVATE_MODE_MASK != PRIVATE_DIRECTORY_MODE
         {
+            debug!(path = %path.display(), uid = metadata.uid(), mode = metadata.permissions().mode() & PRIVATE_MODE_MASK, "claude-code: skipping scratch fallback with unsafe ownership or permissions");
             continue;
         }
         if let Ok(base) = path.canonicalize()

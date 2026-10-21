@@ -438,6 +438,7 @@ impl<'h> Agent<'h> {
                     .history
                     .as_slice()
                     .last()
+                    .filter(|message| message.display_text.as_deref() == Some(""))
                     .and_then(Message::first_text_content)
                     != Some(FINAL_ANSWER_NOTE)
             {
@@ -1712,6 +1713,30 @@ mod tests {
                     .iter()
                     .any(|message| message.first_text_content() == Some(FINAL_ANSWER_NOTE))
             );
+        });
+    }
+
+    #[test]
+    fn user_text_matching_the_final_answer_note_still_gets_the_note() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+            let (mut agent, _events) = make_agent(provider, &mut history);
+            agent.config.max_turns = Some(1);
+            agent.config.final_answer = true;
+            let input = AgentInput {
+                message: FINAL_ANSWER_NOTE.into(),
+                ..default_input()
+            };
+            assert_eq!(agent.run(input).await.unwrap(), DoneReason::EndTurn);
+            drop(agent);
+            let notes: Vec<_> = history
+                .as_slice()
+                .iter()
+                .filter(|message| message.first_text_content() == Some(FINAL_ANSWER_NOTE))
+                .map(|message| message.display_text.as_deref())
+                .collect();
+            assert_eq!(notes, [None, Some("")]);
         });
     }
 

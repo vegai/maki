@@ -312,6 +312,7 @@ const TOOL_REPLY: &str = concat!(
 const TOOL_STREAM: &[Canned] = &[Canned::sse(TOOL_REPLY)];
 const MAX_TURNS_ERROR: &str = "error_max_turns";
 const INTERRUPTED: &str = "error_during_execution";
+const CANCELLED: &str = "cancelled";
 
 #[test_case(false ; "print")]
 #[test_case(true ; "sdk")]
@@ -432,6 +433,9 @@ fn interrupted_print_leaves_a_resumable_prefix(signal: Option<Signal>, sdk: bool
     if signal != Some(Signal::KILL) {
         let result = process.until(|event| event["type"] == RESULT);
         assert_eq!(result["subtype"], INTERRUPTED, "{result}");
+        if !sdk {
+            assert_eq!(result["stop_reason"], CANCELLED, "{result}");
+        }
         assert_eq!(result["is_error"], true);
     }
     process.finish_status(signal.is_none());
