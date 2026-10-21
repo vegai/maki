@@ -1285,9 +1285,9 @@ mod on_the_fake {
     use test_case::test_case;
 
     use super::error::Error;
-    use super::fake::{Fake, HAIKU, IDLE, MARKER, OPUS, SYSTEM, VERSION_ERROR, WAIT, tools};
+    use super::fake::{Fake, HAIKU, IDLE, MARKER, OPUS, SYSTEM, VERSION_ERROR, tools};
     use super::run::{Limits, Listed, Thinking};
-    use super::{ClaudeCode, Exchange, keyed_models_path, slots};
+    use super::{ClaudeCode, Exchange, WAIT, keyed_models_path, slots};
     use crate::provider::{ModelListing, Provider};
     use crate::{Message, Model, ProviderUsage, StreamResponse};
 

@@ -2,10 +2,10 @@ use std::path::PathBuf;
 
 use clap::builder::{PossibleValuesParser, StringValueParser, TypedValueParser};
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
+use maki_agent::mcp::WIRE_SEPARATOR;
 use maki_storage::sessions::{Effort, StoredThinking, ThinkingParseError};
 
 use crate::print::OutputFormat;
-use maki_agent::mcp::WIRE_SEPARATOR;
 
 const SDK_THINKING_ENABLED: &str = "enabled";
 const SDK_THINKING_DISABLED: &str = "disabled";

@@ -551,11 +551,12 @@ mod tests {
     use tempfile::tempdir;
     use test_case::test_case;
 
+    use super::super::WAIT;
     use super::super::checks::{InitExpect, profile};
     use super::super::error::Error;
     use super::super::fake::{
         ALIAS, EXIT_LIMIT, Fake, HAIKU, IDLE, MARKER, OPUS, POLL, TEMP_BASE, TOOL, VERSION_ERROR,
-        WAIT, wait_until,
+        wait_until,
     };
     use super::super::mcp::Handoff;
     use super::super::stream::Turn;
