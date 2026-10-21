@@ -28,6 +28,10 @@ pub const DEFAULT_MAX_CONCURRENT: usize = 8;
 pub const MIN_MAX_CONCURRENT: usize = 1;
 pub(super) const CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 pub(super) const HOME_ENV: &str = "HOME";
+const RUNTIME_DIR_ENV: &str = "XDG_RUNTIME_DIR";
+const CACHE_HOME_ENV: &str = "XDG_CACHE_HOME";
+#[cfg(unix)]
+const FALLBACK_TEMP_DIR: &str = "/var/tmp";
 const TMPDIR_ENV: &str = "TMPDIR";
 #[cfg(unix)]
 const UNIX_TEMP_DIR: &str = "/tmp";
@@ -203,15 +207,14 @@ pub(super) fn prepare_launch(
         path: temp_dir,
         source,
     })?;
+    let fallback_dirs = [var(RUNTIME_DIR_ENV), var(CACHE_HOME_ENV), var(HOME_ENV)]
+        .into_iter()
+        .flatten()
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
     let (mut env, withheld) = checks::launch_env(vars);
-    env.retain(|(name, value)| {
-        ![CONFIG_DIR_ENV, TMPDIR_ENV].contains(&name.as_str()) || !value.is_empty()
-    });
-    for (name, value) in &mut env {
-        if name == TMPDIR_ENV {
-            *value = temp_dir.display().to_string();
-        }
-    }
+    env.retain(|(name, value)| name != CONFIG_DIR_ENV || !value.is_empty());
     if configured.is_some() {
         env.retain(|(name, _)| name != CONFIG_DIR_ENV);
         env.push((CONFIG_DIR_ENV.to_owned(), config_dir.display().to_string()));
@@ -222,7 +225,10 @@ pub(super) fn prepare_launch(
     if !conflicts.is_empty() {
         return Err(Error::SkippedSettings(conflicts));
     }
-    let denied = local_dirs.iter().chain(git_dir.iter()).cloned().collect();
+    let denied: Vec<PathBuf> = local_dirs.iter().chain(git_dir.iter()).cloned().collect();
+    let temp_dir = scratch_base(&temp_dir, cwd, &denied, fallback_dirs)?;
+    env.retain(|(name, _)| name != TMPDIR_ENV);
+    env.push((TMPDIR_ENV.to_owned(), temp_dir.display().to_string()));
     Ok(LaunchPreparation {
         env,
         withheld,
@@ -230,6 +236,31 @@ pub(super) fn prepare_launch(
         temp_dir,
         denied,
     })
+}
+
+fn scratch_base(
+    preferred: &Path,
+    cwd: &Path,
+    denied: &[PathBuf],
+    fallbacks: Vec<PathBuf>,
+) -> Result<PathBuf, Error> {
+    let candidates = [preferred.to_owned()].into_iter().chain(fallbacks);
+    #[cfg(unix)]
+    let candidates = candidates.chain([PathBuf::from(FALLBACK_TEMP_DIR)]);
+    for candidate in candidates {
+        let Ok(base) = candidate.canonicalize() else {
+            continue;
+        };
+        if base.is_dir()
+            && !base.starts_with(cwd)
+            && !denied.iter().any(|dir| base.starts_with(dir))
+            && let Ok(probe) = tempfile::tempdir_in(&base)
+        {
+            drop(probe);
+            return Ok(base);
+        }
+    }
+    Err(Error::NoScratch(preferred.to_owned()))
 }
 
 pub(super) fn login_dir(
@@ -556,13 +587,18 @@ mod tests {
         let root = tempdir().unwrap();
         let cwd = root.path().join("project");
         fs::create_dir(&cwd).unwrap();
+        let relative = tempfile::Builder::new()
+            .prefix(RELATIVE_TEMP)
+            .tempdir_in(env::current_dir().unwrap())
+            .unwrap();
+        let name = relative.path().file_name().unwrap().to_str().unwrap();
         let prepared = prepare_launch(
-            vec![(TMPDIR_ENV.into(), RELATIVE_TEMP.into())],
+            vec![(TMPDIR_ENV.into(), name.into())],
             Some(root.path().join("login")),
             &cwd,
         )
         .unwrap();
-        let expected = env::current_dir().unwrap().join(RELATIVE_TEMP);
+        let expected = relative.path().canonicalize().unwrap();
         assert_eq!(prepared.temp_dir, expected);
         let (_, given) = prepared
             .env

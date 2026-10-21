@@ -11,7 +11,7 @@ use tracing::warn;
 
 use super::frame::LiveFrame;
 use crate::mcp::{McpSession, ToolDeferral};
-use crate::session::SessionHeader;
+use crate::session::{SessionCheckpoint, SessionHeader};
 
 const CANCEL_MARKER: &str = "[Cancelled by user]";
 pub const UNAVAILABLE_RESULT: &str = "[Tool result not available]";
@@ -85,6 +85,7 @@ pub struct History {
     /// disagree and so a new run can never inherit the last one's epoch.
     snapshot: HistorySnapshot,
     mirror: Option<SharedMessages>,
+    checkpoint: Option<SessionCheckpoint>,
     /// Set by every change and cleared only once a save lands, so a failed
     /// write is retried by the next turn instead of lost. [`Self::restored`]
     /// leaves it clear: its repair alone is not worth rewriting the file for.
@@ -100,8 +101,24 @@ impl History {
         Self {
             snapshot: HistorySnapshot::new(messages),
             mirror: None,
+            checkpoint: None,
             unsaved: false,
             live: None,
+        }
+    }
+
+    pub(crate) fn with_checkpoint(mut self, checkpoint: SessionCheckpoint) -> Self {
+        self.checkpoint = Some(checkpoint);
+        self
+    }
+
+    pub(crate) async fn checkpoint(&self, context_size: u32) {
+        if self.unsaved
+            && let Some(checkpoint) = &self.checkpoint
+        {
+            checkpoint
+                .persist(self.snapshot.clone(), context_size)
+                .await;
         }
     }
 
@@ -109,6 +126,10 @@ impl History {
     pub fn with_frame(mut self, frame: Option<Arc<StoredFrame>>) -> Self {
         self.snapshot.frame = frame;
         self
+    }
+
+    pub(crate) fn snapshot(&self) -> HistorySnapshot {
+        self.snapshot.clone()
     }
 
     pub fn frame(&self) -> Option<&Arc<StoredFrame>> {

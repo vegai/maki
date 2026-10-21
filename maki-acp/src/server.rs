@@ -25,8 +25,8 @@ use maki_agent::session::{Resumed, StoredSession};
 use maki_agent::tools::{LocalTool, LocalTools, QUESTION_TOOL_NAME, ToolAudience, local_tool};
 use maki_agent::types::AgentEvent;
 use maki_agent::{
-    AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource, InputSource, SessionEndReason,
-    SessionEvents,
+    AgentInput, AgentMode, CancelToken, Envelope, ImageMediaType, ImageSource, InputSource,
+    SessionEndReason, SessionEvents,
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults, TrustConfig};
@@ -425,6 +425,7 @@ fn start_session(
     let project_trusted = project_config.is_trusted();
     let permissions_config = maki_config::load_permissions(&project_config);
     let (handle, events) = headless::spawn_interactive(InteractiveParams {
+        shutdown: CancelToken::none(),
         model: params.model.clone(),
         config: params.config.clone(),
         permissions_config,

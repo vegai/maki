@@ -8,6 +8,7 @@ mod provider_scripts;
 mod resume;
 mod sdk_mode;
 mod setup;
+mod shutdown;
 mod tool_names;
 mod update;
 mod wire;

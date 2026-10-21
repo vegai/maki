@@ -60,6 +60,8 @@ pub(crate) enum Error {
     SkippedSettings(Vec<String>),
     #[error("the temporary directory {} is in the project. Set TMPDIR to a different directory.", .0.display())]
     TempInProject(PathBuf),
+    #[error("maki cannot create a private scratch directory outside the project (requested {}). Set TMPDIR to an existing writable directory outside the project.", .0.display())]
+    NoScratch(PathBuf),
     #[error("maki cannot {what} {}: {source}", .path.display())]
     Path {
         what: &'static str,
@@ -225,6 +227,13 @@ pub(crate) enum Error {
     #[error("an image reached the transcript, which holds only text")]
     Image,
 
+    #[error("{error}; claude {status} ({context})")]
+    WithExit {
+        error: Box<Error>,
+        status: ExitStatus,
+        context: &'static str,
+    },
+
     /// Any error above, with the last lines Claude Code printed on stderr.
     #[error("{error}:\n{stderr}")]
     WithStderr { error: Box<Error>, stderr: String },
@@ -233,8 +242,16 @@ pub(crate) enum Error {
 impl Error {
     pub(crate) fn cause(&self) -> &Self {
         match self {
-            Self::WithStderr { error, .. } => error.cause(),
+            Self::WithStderr { error, .. } | Self::WithExit { error, .. } => error.cause(),
             _ => self,
+        }
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn into_cause(self) -> Self {
+        match self {
+            Self::WithStderr { error, .. } | Self::WithExit { error, .. } => error.into_cause(),
+            error => error,
         }
     }
 

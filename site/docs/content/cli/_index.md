@@ -31,7 +31,8 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--verbose`, `--output-format` | no | yes | stream only |
 | `--system-prompt`, `--append-system-prompt` | no | no | yes |
 | `--session-id`, `--fork-session` | yes | yes | yes |
-| `--max-turns` | no | no | yes |
+| `--max-turns`, `--final-answer` | yes | yes | yes |
+| `--dry-run` | no | yes | no |
 | `--permission-mode` | no | no | yes |
 | `--include-partial-messages` | no | no | yes |
 
@@ -60,7 +61,9 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--disallowed-tools <LIST>` | Comma-separated deny list |
 | `--session-id <ID>` | Write this run under a chosen id. Errors if a session already exists under it, unless `-r` / `-c` is continuing that same session |
 | `--fork-session` | Copy the resumed session's history under a new id, leaving the original untouched. See [Sessions](/docs/headless/#sessions) |
-| `--max-turns <N>` | Cap agent turns (SDK) |
+| `--max-turns <N>` | Cap model turns. See [bounded runs](/docs/headless/#bounded-runs-and-recovery) |
+| `--final-answer` | Ask for a final report on the last allowed turn and prevent further tool execution. Requires `--max-turns` |
+| `--dry-run` | With `-p`, print effective startup metadata without inference |
 | `--system-prompt <TEXT>` | Replace the system prompt (SDK only) |
 | `--append-system-prompt <TEXT>` | Append to the built-in system prompt (SDK only) |
 | `--permission-mode <MODE>` | SDK: `default`, `acceptEdits`, `plan`, or `bypassPermissions` |

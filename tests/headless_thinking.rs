@@ -1,18 +1,21 @@
 #![cfg(target_os = "linux")]
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
 use flume::Receiver;
-use maki_providers::ThinkingSupport;
+use maki_agent::session::StoredSession;
 use maki_providers::ThinkingSupport::{No, Required, Yes};
 use maki_providers::test_support::{Canned, Requests, serve};
+use maki_providers::{ContentBlock, ThinkingSupport};
 use maki_storage::StateDir;
 use maki_storage::model::{persist_thinking, read_thinking};
 use maki_storage::sessions::StoredThinking;
+use rustix::process::{Pid, Signal, kill_process};
 use serde_json::{Value, json};
 use test_case::test_case;
 use wait_timeout::ChildExt;
@@ -30,7 +33,7 @@ const PROMPT: &str = "Reply briefly.";
 const REPLY: &str = "done";
 const SAVED_THINKING: &str = "max";
 const OUTPUT_CAP: u32 = 128_000;
-const MAX_BUDGET: u64 = 64_000;
+const LOW_BUDGET: u64 = 12_800;
 const HIGH_BUDGET: u64 = 38_400;
 const XHIGH_BUDGET: u64 = 51_200;
 const MINIMAL_BUDGET: u64 = 6_400;
@@ -61,6 +64,15 @@ struct Fixture {
 impl Fixture {
     fn new(configured: Option<&str>, support: ThinkingSupport) -> Self {
         let (url, requests) = serve(STREAM);
+        Self::at(configured, support, url, requests)
+    }
+
+    fn at(
+        configured: Option<&str>,
+        support: ThinkingSupport,
+        url: String,
+        requests: Requests,
+    ) -> Self {
         let fixture = Self {
             isolation: Isolation::new(),
             requests,
@@ -169,13 +181,17 @@ impl Process {
     }
 
     fn finish(&mut self) {
+        self.finish_status(true);
+    }
+
+    fn finish_status(&mut self, success: bool) {
         self.child.stdin.take();
         let status = self
             .child
             .wait_timeout(PROTOCOL_TIMEOUT)
             .unwrap()
             .unwrap_or_else(|| panic!("maki did not exit in {PROTOCOL_TIMEOUT:?}"));
-        assert!(status.success(), "{status}");
+        assert_eq!(status.success(), success, "{status}");
     }
 }
 
@@ -192,7 +208,7 @@ impl Drop for Process {
 #[test_case(false, Some("high"), &["--max-thinking-tokens", "0"], Yes, "off", None ; "print_zero_budget")]
 #[test_case(false, Some("high"), &["--thinking", "off"], Yes, "off", None ; "explicit_off")]
 #[test_case(false, Some("xhigh"), &[], Yes, "xhigh", Some(XHIGH_BUDGET) ; "configured_fallback")]
-#[test_case(false, None, &[], Yes, "max", Some(MAX_BUDGET) ; "saved_fallback")]
+#[test_case(false, None, &[], Yes, "low", Some(LOW_BUDGET) ; "headless_default_ignores_tui_state")]
 #[test_case(false, None, &["--thinking", "max"], No, "off", None ; "unsupported_model_is_reported_as_off")]
 #[test_case(false, None, &["--thinking", "off"], Required, "minimal", Some(MINIMAL_BUDGET) ; "required_thinking_is_reported_as_minimal")]
 #[test_case(true, Some("low"), &["--thinking", "xhigh"], Yes, "xhigh", Some(XHIGH_BUDGET) ; "sdk_thinking")]
@@ -281,4 +297,211 @@ fn thinking_flags_require_a_session(flags: &[&str]) {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains(EXPECTED), "{stderr}");
     assert!(fixture.requests.lock().unwrap().is_empty());
+}
+
+const TOOL_REPLY: &str = concat!(
+    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call1\",\"name\":\"glob\",\"input\":{}}}\n\n",
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"pattern\\\":\\\"*.txt\\\"}\"}}\n\n",
+    "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n",
+    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+);
+const TOOL_STREAM: &[Canned] = &[Canned::sse(TOOL_REPLY)];
+const MAX_TURNS_ERROR: &str = "error_max_turns";
+const INTERRUPTED: &str = "error_interrupted";
+
+#[test_case(false ; "print")]
+#[test_case(true ; "sdk")]
+fn max_turns_limits_requests_and_returns_a_failure(sdk: bool) {
+    let (url, requests) = serve(TOOL_STREAM);
+    let fixture = Fixture::at(None, Yes, url, requests);
+    let mut command = fixture.command();
+    command.args([
+        "-p",
+        "--model",
+        MODEL,
+        "--max-turns",
+        "1",
+        "--output-format",
+        STREAM_FORMAT,
+    ]);
+    if sdk {
+        command.args(["--input-format", STREAM_FORMAT]);
+    } else {
+        command.arg(PROMPT);
+    }
+    let mut process = Process::start(command);
+    if sdk {
+        process.send(json!({"type":"user", "message":{"role":"user", "content":PROMPT}}));
+    }
+    let result = process.until(|event| event["type"] == RESULT);
+    assert_eq!(result["subtype"], MAX_TURNS_ERROR, "{result}");
+    assert_eq!(result["is_error"], true);
+    assert_eq!(result["num_turns"], 1);
+    process.finish_status(false);
+    assert_eq!(fixture.requests.lock().unwrap().len(), 1);
+    let session = StoredSession::load(
+        result["session_id"].as_str().unwrap().parse().unwrap(),
+        &fixture.storage(),
+    )
+    .unwrap();
+    assert!(
+        session
+            .messages()
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+    );
+}
+
+fn read_http_request(stream: &TcpStream) {
+    stream.set_read_timeout(Some(PROTOCOL_TIMEOUT)).unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut size = 0;
+    loop {
+        let mut line = String::new();
+        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+        if line == "\r\n" {
+            break;
+        }
+        if let Some((key, value)) = line.split_once(':')
+            && key.eq_ignore_ascii_case("content-length")
+        {
+            size = value.trim().parse().unwrap();
+        }
+    }
+    let mut body = vec![0; size];
+    reader.read_exact(&mut body).unwrap();
+}
+
+#[test_case(Signal::TERM, false ; "sigterm")]
+#[test_case(Signal::INT, false ; "sigint")]
+#[test_case(Signal::KILL, false ; "sigkill_keeps_checkpoint")]
+#[test_case(Signal::TERM, true ; "sdk_sigterm")]
+fn interrupted_print_leaves_a_resumable_prefix(signal: Signal, sdk: bool) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let (waiting_tx, waiting_rx) = flume::bounded(1);
+    let (release_tx, release_rx) = flume::bounded::<()>(1);
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_http_request(&stream);
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{TOOL_REPLY}", TOOL_REPLY.len()).unwrap();
+        drop(stream);
+        let (stream, _) = listener.accept().unwrap();
+        read_http_request(&stream);
+        waiting_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(PROTOCOL_TIMEOUT);
+    });
+    let fixture = Fixture::at(None, Yes, url, Requests::default());
+    let mut command = fixture.command();
+    command.args(["-p", "--model", MODEL, "--output-format", STREAM_FORMAT]);
+    if sdk {
+        command.args(["--input-format", STREAM_FORMAT]);
+    } else {
+        command.arg(PROMPT);
+    }
+    let mut process = Process::start(command);
+    let init = process.until(|event| event["subtype"] == INIT);
+    if sdk {
+        process.send(json!({"type":"user", "message":{"role":"user", "content":PROMPT}}));
+    }
+    waiting_rx.recv_timeout(PROTOCOL_TIMEOUT).unwrap();
+    let id = init["session_id"].as_str().unwrap().parse().unwrap();
+    let stored = StoredSession::load(id, &fixture.storage()).unwrap();
+    assert!(
+        stored
+            .messages()
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+    );
+    kill_process(
+        Pid::from_raw(process.child.id().try_into().unwrap()).unwrap(),
+        signal,
+    )
+    .unwrap();
+    if signal != Signal::KILL {
+        let result = process.until(|event| event["type"] == RESULT);
+        assert_eq!(result["subtype"], INTERRUPTED, "{result}");
+        assert_eq!(result["is_error"], true);
+    }
+    process.finish_status(false);
+    let resumed = StoredSession::load(id, &fixture.storage()).unwrap();
+    let saved: Vec<Value> = stored
+        .messages()
+        .iter()
+        .map(|message| serde_json::to_value(message).unwrap())
+        .collect();
+    let restored: Vec<Value> = resumed
+        .messages()
+        .iter()
+        .map(|message| serde_json::to_value(message).unwrap())
+        .collect();
+    assert!(restored.starts_with(&saved));
+    drop(release_tx);
+    server.join().unwrap();
+    let output = fixture
+        .command()
+        .args([
+            "-p",
+            "-r",
+            &id.to_string(),
+            "--max-turns",
+            "0",
+            "--output-format",
+            STREAM_FORMAT,
+            PROMPT,
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let events: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        events.last().unwrap()["subtype"],
+        MAX_TURNS_ERROR,
+        "{events:?}"
+    );
+}
+
+const PROVIDER_FAILURE: &str = "fixture request failed";
+const ERROR_STREAM: &[Canned] = &[Canned::json(
+    400,
+    r#"{"error":{"type":"invalid_request_error","message":"fixture request failed"}}"#,
+)];
+
+#[test]
+fn provider_failure_is_nonzero_and_persists_an_error_outside_the_transcript() {
+    let (url, requests) = serve(ERROR_STREAM);
+    let fixture = Fixture::at(None, Yes, url, requests);
+    let mut command = fixture.command();
+    command.args([
+        "-p",
+        "--model",
+        MODEL,
+        "--output-format",
+        STREAM_FORMAT,
+        PROMPT,
+    ]);
+    let mut process = Process::start(command);
+    let result = process.until(|event| event["type"] == RESULT);
+    assert_eq!(result["is_error"], true);
+    assert!(result[RESULT].as_str().unwrap().contains(PROVIDER_FAILURE));
+    process.finish_status(false);
+    let stored = StoredSession::load(
+        result["session_id"].as_str().unwrap().parse().unwrap(),
+        &fixture.storage(),
+    )
+    .unwrap();
+    assert_eq!(stored.errors(), &[result[RESULT].as_str().unwrap()]);
+    assert!(stored.messages().iter().all(|message| {
+        message
+            .first_text_content()
+            .is_none_or(|text| !text.contains(PROVIDER_FAILURE))
+    }));
 }

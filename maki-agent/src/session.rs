@@ -1,6 +1,6 @@
 //! The one vocabulary every driver uses to talk about a persisted session.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use arc_swap::ArcSwap;
 use maki_providers::{ContextGauge, Message, TokenUsage};
@@ -8,7 +8,7 @@ use maki_storage::StateDir;
 use maki_storage::frame::StoredFrame;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::sessions::{
-    SAVE_FAILED, Session, SessionClaim, SessionError, StoredMode, StoredThinking,
+    SAVE_FAILED, SESSIONS_DIR, Session, SessionClaim, SessionError, StoredMode, StoredThinking,
 };
 use thiserror::Error;
 use tracing::warn;
@@ -154,7 +154,7 @@ impl Resumed {
 pub struct SessionTrack {
     history: History,
     gauge: ContextGauge,
-    store: SessionStore,
+    store: Arc<Mutex<SessionStore>>,
 }
 
 impl SessionTrack {
@@ -172,11 +172,13 @@ impl SessionTrack {
         let mirror: SharedMessages = Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
         let store = SessionStore::open(storage, claim, resumed.session, cwd);
         publish_live_session(resumed.id.id(), &mirror, &store.header);
+        let store = Arc::new(Mutex::new(store));
         Self {
-            store,
+            store: Arc::clone(&store),
             history: History::restored(resumed.history)
                 .with_frame(resumed.frame)
-                .with_mirror(mirror),
+                .with_mirror(mirror)
+                .with_checkpoint(SessionCheckpoint(store)),
             gauge: ContextGauge::restored(resumed.context_size),
         }
     }
@@ -194,7 +196,8 @@ impl SessionTrack {
     /// turn really runs under, so readers and the saved file never report a
     /// mode the driver switched away from.
     pub fn turn(&mut self, model_spec: String, input: &AgentInput) -> SessionTurn<'_> {
-        let session = &mut self.store.session;
+        let mut store = self.store.lock().unwrap_or_else(PoisonError::into_inner);
+        let session = &mut store.session;
         session.set_model(model_spec);
         session.meta.mode = Some(match input.mode {
             AgentMode::Build => StoredMode::Build,
@@ -203,7 +206,8 @@ impl SessionTrack {
         session.meta.thinking = Some(input.thinking.into());
         session.meta.fast = input.fast;
         session.meta.workflow = input.workflow;
-        self.store.publish_header(true);
+        store.publish_header(true);
+        drop(store);
         SessionTurn {
             track: self,
             ledger: Arc::default(),
@@ -222,6 +226,15 @@ impl SessionTurn<'_> {
     /// usage when it ends, so the agent must be built with this one.
     pub fn ledger(&self) -> Arc<RunLedger> {
         Arc::clone(&self.ledger)
+    }
+
+    pub fn record_error(&mut self, message: String) {
+        self.track
+            .store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .session
+            .record_error(message);
     }
 
     pub fn run_params(
@@ -249,9 +262,10 @@ impl Drop for SessionTurn<'_> {
             gauge,
             store,
         } = &mut *self.track;
+        let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
         store.session.token_usage += self.ledger.totals().usage;
         if history.has_unsaved() {
-            match store.record_turn(history.as_slice(), history.frame(), gauge.size()) {
+            match store.record_turn(&history.snapshot(), gauge.size()) {
                 Ok(()) => history.mark_saved(),
                 // Only headless runs save through here (the TUI has its own
                 // writer), so printing cannot tear a drawn frame.
@@ -262,6 +276,22 @@ impl Drop for SessionTurn<'_> {
             }
         }
         store.publish_header(false);
+    }
+}
+
+pub(crate) struct SessionCheckpoint(Arc<Mutex<SessionStore>>);
+
+impl SessionCheckpoint {
+    pub(crate) async fn persist(&self, snapshot: HistorySnapshot, context_size: u32) {
+        let store = Arc::clone(&self.0);
+        smol::unblock(move || {
+            let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Err(error) = store.record_turn(&snapshot, context_size) {
+                warn!(%error, session_id = %store.session.id, "failed to checkpoint session");
+                eprintln!("{SAVE_FAILED}{}: {error}", store.session.id);
+            }
+        })
+        .await;
     }
 }
 
@@ -311,23 +341,23 @@ impl SessionStore {
     /// down to nothing from replacing the copy it was restored from.
     fn record_turn(
         &mut self,
-        messages: &[Message],
-        frame: Option<&Arc<StoredFrame>>,
+        snapshot: &HistorySnapshot,
         context_size: u32,
     ) -> Result<(), SessionError> {
-        if messages.is_empty() {
+        if snapshot.messages.is_empty() {
             return Ok(());
         }
-        self.session.replace_messages(messages.to_vec());
-        self.session.set_frame(frame.cloned());
+        self.session.set_history(snapshot);
         self.session.meta.context_size = context_size;
         self.session.update_title_if_default();
-        self.session.save(&self.claim, &self.dir)
+        self.dir.ensure_subdir(SESSIONS_DIR)?;
+        self.claim.persist(&self.session)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
 
     use maki_providers::{ContentBlock, Role};
@@ -458,6 +488,40 @@ mod tests {
         push_turn(track, spec, |params| {
             params.history.push(Message::user(text.into()))
         });
+    }
+
+    #[test]
+    fn checkpoints_are_readable_before_the_turn_ends_and_append_once() {
+        let tmp = TempDir::new().unwrap();
+        let mut track = track_on(&tmp);
+        let mut turn = track.turn(MODEL_SPEC.to_owned(), &input(AgentMode::Build));
+        let params = turn.run_params(
+            EventSender::new(flume::unbounded().0, 0),
+            Arc::new(|_, _| RunContext::fixed(String::new(), RequestTools::default())),
+        );
+        params.history.push(Message::user(PROMPT.into()));
+        smol::block_on(params.history.checkpoint(CONTEXT_SIZE));
+        assert_eq!(load(&tmp).messages().len(), 1);
+        let path = tmp
+            .path()
+            .join(SESSIONS_DIR)
+            .join(format!("{}.jsonl", session_id()));
+        let prefix = fs::read(&path).unwrap();
+        params
+            .history
+            .push(Message::observation(OBSERVATION.into()));
+        smol::block_on(params.history.checkpoint(CONTEXT_SIZE));
+        assert!(fs::read(&path).unwrap().starts_with(&prefix));
+        turn.record_error(OBSERVATION.into());
+        drop(turn);
+        let stored = load(&tmp);
+        assert_eq!(stored.messages().len(), 2);
+        assert_eq!(stored.errors(), &[OBSERVATION]);
+        assert!(
+            fs::read_to_string(path)
+                .unwrap()
+                .contains("\"t\":\"error\"")
+        );
     }
 
     /// A run killed before its first turn has to leave nothing behind, neither

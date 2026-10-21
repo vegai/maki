@@ -41,6 +41,7 @@ open = { workspace = true }
 unicode-width = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
+async-signal = { workspace = true }
 rustix = { workspace = true }
 
 [dev-dependencies]
@@ -143,6 +144,7 @@ smol = "2"
 arc-swap = "1"
 bitflags = "2"
 event-listener = "5"
+async-signal = "0.2"
 futures-lite = "2"
 futures = "0.3"
 isahc = { version = "2.0", default-features = false, features = ["text-decoding", "static-curl", "rustls-tls", "http2"] }

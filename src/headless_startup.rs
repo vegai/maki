@@ -1,19 +1,29 @@
+use color_eyre::Result;
+use color_eyre::eyre::eyre;
 use flume::Receiver;
 use maki_agent::headless::Ready;
-use maki_providers::{Model, ThinkingConfig};
+use maki_agent::{AgentEvent, SessionEvents};
+use maki_providers::ThinkingConfig;
 use maki_storage::sessions::StoredThinking;
 
 pub fn startup(
     receiver: &Receiver<Ready>,
-    model: Model,
+    events: &mut SessionEvents,
     thinking: Option<StoredThinking>,
-) -> (Ready, String) {
-    let ready = smol::block_on(receiver.recv_async()).unwrap_or(Ready {
-        model,
-        tool_names: Vec::new(),
-    });
+) -> Result<(Ready, String)> {
+    let ready = match smol::block_on(receiver.recv_async()) {
+        Ok(ready) => ready,
+        Err(_) => {
+            while let Some(envelope) = smol::block_on(events.next()) {
+                if let AgentEvent::Error { message, .. } = envelope.event {
+                    return Err(eyre!(message));
+                }
+            }
+            return Err(eyre!("provider startup ended before it was ready"));
+        }
+    };
     let thinking = ThinkingConfig::from(thinking)
         .clamped(&ready.model)
         .to_string();
-    (ready, thinking)
+    Ok((ready, thinking))
 }

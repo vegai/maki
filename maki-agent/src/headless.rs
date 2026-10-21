@@ -16,7 +16,7 @@ use smol::lock::Mutex;
 use tracing::error;
 
 use crate::agent::{self, RunContext, RunContextBuilder};
-use crate::cancel::{CancelMap, CancelToken};
+use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedPrompts;
 use crate::session::{Resumed, SessionTrack};
@@ -51,6 +51,7 @@ async fn connect(
 }
 
 pub struct HeadlessParams {
+    pub dry_run: bool,
     pub model: Model,
     pub config: AgentConfig,
     pub permissions_config: PermissionsConfig,
@@ -83,6 +84,7 @@ pub struct Ready {
 }
 
 pub struct HeadlessHandle {
+    pub cancel: CancelTrigger,
     pub ready: Receiver<Ready>,
     pub session_id: SessionRef,
     pub cwd: String,
@@ -204,14 +206,18 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
     let defaults = params.defaults;
     let working_dir_path = params.initial_wd.clone();
     let task_working_dir = working_dir.clone();
+    let (cancel, token) = CancelToken::new();
     let (ready_tx, ready_rx) = flume::bounded(1);
     let task = smol::spawn(run_session(guard, params.mcp_handle.clone(), async move {
         let mut model = params.model;
         let provider = connect(&mut model, params.timeouts, &event_tx).await;
-        let _ = ready_tx.send(spec.ready(&model, params.defaults.workflow, mcp.as_ref()));
         let Some(provider) = provider else {
             return;
         };
+        let _ = ready_tx.send(spec.ready(&model, params.defaults.workflow, mcp.as_ref()));
+        if params.dry_run {
+            return;
+        }
         let context = spec.builder();
         let mut track = SessionTrack::open(
             params.resumed,
@@ -258,6 +264,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
             },
             turn.run_params(event_tx, context),
         )
+        .with_cancel(token)
         .with_loaded_instructions(instructions.loaded)
         .with_mcp(mcp);
 
@@ -265,12 +272,14 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
         drop(agent);
 
         if let Err(e) = result {
+            turn.record_error(e.to_string());
             error!(error = %e, "agent error");
             let _ = error_tx.send(AgentEvent::error(&e));
         }
     }));
     (
         HeadlessHandle {
+            cancel,
             ready: ready_rx,
             session_id: session_ref,
             cwd: working_dir,
@@ -281,6 +290,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
 }
 
 pub struct InteractiveParams {
+    pub shutdown: CancelToken,
     pub model: Model,
     pub config: AgentConfig,
     pub permissions_config: PermissionsConfig,
@@ -369,21 +379,22 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     let task = smol::spawn(run_session(guard, params.mcp_handle.clone(), async move {
         let mut model = params.model;
         let provider = connect(&mut model, params.timeouts, &base_tx).await;
-        let _ = ready_tx.send(spec.ready(&model, params.defaults.workflow, mcp.as_ref()));
         let Some(mut provider) = provider else {
             return;
         };
+        let _ = ready_tx.send(spec.ready(&model, params.defaults.workflow, mcp.as_ref()));
         let context = spec.builder();
         let mut track =
             SessionTrack::open(params.resumed, params.claim, params.storage, &working_dir);
         let mut run_id: u64 = 0;
 
-        while let Ok(input) = input_rx.recv_async().await {
+        while let Ok(Ok(input)) = params.shutdown.race(input_rx.recv_async()).await {
             let (trigger, cancel) = CancelToken::new();
             let cancel_task = smol::spawn({
                 let cancel_rx = cancel_rx.clone();
+                let shutdown = params.shutdown.clone();
                 async move {
-                    if cancel_rx.recv_async().await.is_ok() {
+                    if !matches!(shutdown.race(cancel_rx.recv_async()).await, Ok(Err(_))) {
                         trigger.cancel();
                     }
                 }
@@ -452,6 +463,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             cancel_task.cancel().await;
 
             if let Err(ref e) = result {
+                turn.record_error(e.to_string());
                 error!(error = %e, "agent error");
                 let _ = error_tx.send(AgentEvent::error(e));
             }

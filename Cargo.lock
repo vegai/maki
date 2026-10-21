@@ -3165,6 +3165,7 @@ name = "maki"
 version = "0.6.5"
 dependencies = [
  "async-compat",
+ "async-signal",
  "clap",
  "color-eyre",
  "flume",

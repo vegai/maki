@@ -439,6 +439,8 @@ pub struct Session<M, U, T> {
     pub cwd: String,
     pub model: String,
     messages: Arc<Vec<M>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    errors: Vec<String>,
     pub token_usage: U,
     #[serde(default = "HashMap::new")]
     tool_outputs: HashMap<String, Arc<T>>,
@@ -739,6 +741,8 @@ enum LogRecord<M, U, T> {
     },
     #[serde(rename = "msg")]
     Msg { d: M },
+    #[serde(rename = "error")]
+    Error { message: String },
     #[serde(rename = "out")]
     Out { id: String, d: T },
     #[serde(rename = "sub_msg")]
@@ -773,6 +777,7 @@ pub struct SessionLog {
     /// truncated, deleted or wrote it, and an append would corrupt it.
     saved_len: u64,
     saved_msg_count: usize,
+    saved_error_count: usize,
     appends: usize,
     saved_tool_ids: HashSet<String>,
     saved_sub_msg_counts: HashMap<String, usize>,
@@ -1026,6 +1031,14 @@ impl SessionLog {
         let mut new_msg_count = self.saved_msg_count;
         let mut new_tool_ids = Vec::new();
 
+        for message in &session.errors[self.saved_error_count..] {
+            append_record(
+                &mut buf,
+                &LogRecord::<&M, &U, &T>::Error {
+                    message: message.clone(),
+                },
+            )?;
+        }
         for msg in &session.messages[self.saved_msg_count..] {
             append_record(&mut buf, &LogRecord::<&M, &U, &T>::Msg { d: msg })?;
             new_msg_count += 1;
@@ -1087,6 +1100,7 @@ impl SessionLog {
         self.saved_len += buf.len() as u64;
         self.appends += 1;
         self.saved_msg_count = new_msg_count;
+        self.saved_error_count = session.errors.len();
         self.saved_tool_ids.extend(new_tool_ids);
         for (sub_id, count) in new_sub_counts {
             self.saved_sub_msg_counts.insert(sub_id, count);
@@ -1113,6 +1127,7 @@ impl SessionLog {
             saved_rewrites: session.rewrites,
             saved_len,
             saved_msg_count: session.messages.len(),
+            saved_error_count: session.errors.len(),
             appends: 0,
             saved_tool_ids: session.tool_outputs.keys().cloned().collect(),
             saved_sub_msg_counts: sub_msg_snapshot(&session.subagent_messages),
@@ -1156,7 +1171,8 @@ impl SessionLog {
     }
 
     fn cursor_ahead<M, U, T>(&self, session: &Session<M, U, T>) -> bool {
-        self.saved_msg_count > session.messages.len()
+        self.saved_error_count > session.errors.len()
+            || self.saved_msg_count > session.messages.len()
             || self
                 .saved_tool_ids
                 .iter()
@@ -1225,6 +1241,14 @@ where
             created_at: session.created_at,
         },
     )?;
+    for message in &session.errors {
+        append_record(
+            &mut buf,
+            &LogRecord::<&M, &U, &T>::Error {
+                message: message.clone(),
+            },
+        )?;
+    }
     for msg in session.messages.iter() {
         append_record(&mut buf, &LogRecord::<&M, &U, &T>::Msg { d: msg })?;
     }
@@ -1303,6 +1327,7 @@ where
     let mut cwd = String::new();
     let mut created_at = 0u64;
     let mut messages: Vec<M> = Vec::new();
+    let mut errors = Vec::new();
     let mut tool_outputs = HashMap::new();
     let mut subagent_messages: HashMap<String, Vec<M>> = HashMap::new();
     let mut title = DEFAULT_TITLE.to_string();
@@ -1357,6 +1382,7 @@ where
                 got_header = true;
             }
             LogRecord::Msg { d } => messages.push(d),
+            LogRecord::Error { message } => errors.push(message),
             LogRecord::Out { id: out_id, d } => {
                 tool_outputs.insert(out_id, Arc::new(d));
             }
@@ -1396,6 +1422,7 @@ where
         cwd,
         model,
         messages: Arc::new(messages),
+        errors,
         token_usage,
         tool_outputs,
         subagent_messages: subagent_messages
@@ -1813,6 +1840,7 @@ where
             cwd: cwd.into(),
             model: model.into(),
             messages: Arc::default(),
+            errors: Vec::new(),
             token_usage: U::default(),
             tool_outputs: HashMap::new(),
             subagent_messages: HashMap::new(),
@@ -1830,6 +1858,15 @@ where
             epoch: next_epoch(),
             rewrites: 0,
         }
+    }
+
+    pub fn errors(&self) -> &[String] {
+        &self.errors
+    }
+
+    pub fn record_error(&mut self, message: String) {
+        self.errors.push(message);
+        self.touch();
     }
 
     pub fn messages(&self) -> &[M] {
@@ -1968,7 +2005,7 @@ where
 
     /// Adopting a producer's snapshot inherits its run token, so the log's
     /// cursors survive exactly when the snapshot was an append.
-    fn set_history(&mut self, snapshot: &HistorySnapshot<M>) {
+    pub fn set_history(&mut self, snapshot: &HistorySnapshot<M>) {
         self.messages = Arc::clone(&snapshot.messages);
         self.frame = snapshot.frame.clone();
         self.epoch = snapshot.epoch;

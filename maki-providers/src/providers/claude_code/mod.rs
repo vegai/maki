@@ -476,6 +476,8 @@ impl ClaudeCode {
                 "Claude Code ({name}) is not installed, or it is not on PATH"
             ))
         })?;
+        validation::prepare_launch(utf8_vars(env::vars_os()), options.config_dir.clone(), &cwd)
+            .map_err(config_error)?;
         Ok(Self {
             executable,
             limits: Limits::new(timeouts.stream),
@@ -1284,7 +1286,7 @@ mod on_the_fake {
     use tempfile::tempdir;
     use test_case::test_case;
 
-    use super::error::Error;
+    use super::error::{Error, Problem};
     use super::fake::{Fake, HAIKU, IDLE, MARKER, OPUS, SYSTEM, VERSION_ERROR, tools};
     use super::run::{Limits, Listed, Thinking};
     use super::{ClaudeCode, Exchange, WAIT, keyed_models_path, slots};
@@ -1337,13 +1339,16 @@ mod on_the_fake {
         through_the_provider(&fake, &model, &linked, &env::temp_dir()).unwrap();
     }
 
-    /// `TMPDIR` can resolve into the project through a symlink. Refuse that path before a
-    /// policy hook can run there.
-    #[test_case(false ; "repository_root")]
-    #[test_case(true ; "session_subdirectory")]
-    fn a_temp_dir_that_leads_into_the_project_is_refused(subdirectory: bool) {
+    /// A linked TMPDIR must not run policy hooks from the checkout.
+    #[test_case(false, false ; "repository_root")]
+    #[test_case(true, false ; "session_subdirectory")]
+    #[test_case(false, true ; "repository_policy_hook")]
+    #[test_case(true, true ; "subdirectory_policy_hook")]
+    fn a_temp_dir_that_leads_into_the_project_uses_a_safe_fallback(subdirectory: bool, hook: bool) {
         let fake = Fake::new("text");
-        fs::write(fake.dir.path().join("policy_hook"), "").unwrap();
+        if hook {
+            fs::write(fake.dir.path().join("policy_hook"), "").unwrap();
+        }
         let inside = fake.project().join(INSIDE_TEMP);
         fs::create_dir(&inside).unwrap();
         let links = tempdir().unwrap();
@@ -1358,10 +1363,20 @@ mod on_the_fake {
             fake.project()
         };
         fs::create_dir_all(&cwd).unwrap();
-        let err = through_the_provider(&fake, &model, &cwd, &temp).unwrap_err();
-        assert!(matches!(err, Error::TempInProject(_)), "{err}");
-        assert!(!fake.dir.path().join("pid").exists(), "Claude Code started");
-        assert_eq!(fake.log("hook_ran_in"), "", "a hook ran");
+        let result = through_the_provider(&fake, &model, &cwd, &temp);
+        if hook {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error.cause(), Error::Check(Problem::Hook(_))),
+                "{error}"
+            );
+        } else {
+            result.unwrap();
+        }
+        assert!(fs::read_dir(&inside).unwrap().next().is_none());
+        for hook_cwd in fake.log("hook_ran_in").lines() {
+            assert!(!Path::new(hook_cwd).starts_with(fake.project()));
+        }
     }
 
     /// Returns the provider as maki builds it, on the fake, with `home` and
@@ -1640,7 +1655,7 @@ mod on_the_fake {
         let hook = fake.dir.path().join("policy_hook");
         fs::write(&hook, "").unwrap();
         let error = list().unwrap_err();
-        assert!(matches!(error, Error::Check(_)), "{error}");
+        assert!(matches!(error.cause(), Error::Check(_)), "{error}");
         fs::remove_file(hook).unwrap();
         list().unwrap();
         assert_eq!(fake.log("versions").lines().count(), 2);
@@ -1656,7 +1671,7 @@ mod on_the_fake {
         fs::write(&path, "").unwrap();
         let cwd = fake.project();
         let error = smol::block_on(provider.list(&cwd, ModelListing::Cached)).unwrap_err();
-        assert!(matches!(error, Error::Check(_)), "{error}");
+        assert!(matches!(error.cause(), Error::Check(_)), "{error}");
         fs::remove_file(path).unwrap();
         let again = smol::block_on(provider.list(&cwd, ModelListing::Cached)).unwrap_err();
         assert!(matches!(again, Error::ListedRecently { .. }), "{again}");

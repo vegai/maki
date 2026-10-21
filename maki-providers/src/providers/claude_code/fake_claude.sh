@@ -4,6 +4,7 @@ echo $$ > "$dir/pid"
 version=$(cat "$dir/version" 2>/dev/null || echo "2.1.284 (Claude Code)")
 if [ "$1" = --version ]; then
   echo version >> "$dir/versions"
+  if [ -e "$dir/version_abort" ]; then ulimit -c 0; kill -ABRT "$$"; fi
   if [ -e "$dir/version_error" ]; then cat "$dir/version_error" >&2; exit 1; fi
   echo "$version"; exit 0
 fi

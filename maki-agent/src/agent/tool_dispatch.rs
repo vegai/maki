@@ -1112,6 +1112,7 @@ pub(super) async fn process_tool_calls(
     history: &mut super::history::History,
     event_tx: &crate::EventSender,
     ctx: &ToolContext,
+    context_size: u32,
 ) -> Result<(), AgentError> {
     let tool_uses: Vec<(String, String, Value)> = response
         .message
@@ -1120,6 +1121,7 @@ pub(super) async fn process_tool_calls(
         .collect();
 
     history.push(response.message);
+    history.checkpoint(context_size).await;
 
     let mut immediate_errors: Vec<ToolDoneEvent> = Vec::new();
     let mut runnable: Vec<(String, String, Value)> = Vec::new();
