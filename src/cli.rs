@@ -61,6 +61,10 @@ pub struct Cli {
     #[arg(short, long)]
     pub print: bool,
 
+    /// Print effective startup metadata without inference (requires --print)
+    #[arg(long, requires = "print", conflicts_with = "input_format")]
+    pub dry_run: bool,
+
     /// Attach an image to the prompt in --print mode as vision content (repeatable)
     #[arg(long = "image", value_name = "PATH")]
     pub images: Vec<PathBuf>,
@@ -155,6 +159,10 @@ pub struct Cli {
     /// Maximum number of agent turns
     #[arg(long)]
     pub max_turns: Option<u32>,
+
+    /// Ask for a final text answer on the last allowed turn and prevent further tool execution
+    #[arg(long, requires = "max_turns")]
+    pub final_answer: bool,
 
     /// System prompt override
     #[arg(long)]

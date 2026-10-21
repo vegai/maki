@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use color_eyre::Result;
-use color_eyre::eyre::{Context, eyre};
+use color_eyre::eyre::{Context, bail, eyre};
 use flume::Sender;
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams, Ready};
 use maki_agent::mcp;
@@ -24,7 +24,7 @@ use maki_agent::prompt::ResolvedSlots;
 use maki_agent::session::Resumed;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
-    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, InputSource,
+    AgentConfig, AgentEvent, AgentInput, AgentMode, CancelToken, Envelope, InputSource,
     PermissionsConfig, SessionEndReason, SessionEvents, SteerKind,
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
@@ -500,6 +500,7 @@ struct Shared {
     model: Model,
     permission_mode: PermissionMode,
     turn_start: Instant,
+    failed: bool,
     permissions: Permissions,
 }
 
@@ -524,6 +525,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     if let Some(max) = cli.max_turns {
         config.max_turns = Some(max);
     }
+    config.final_answer = cli.final_answer;
     let permission_mode = PermissionMode::resolve(cli.permission_mode.as_deref(), cli.yolo);
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
@@ -535,8 +537,10 @@ pub fn run(params: SdkParams) -> Result<()> {
         eprintln!("MCP config error: {mcp_config_errors}");
     }
 
-    let initial_model = model.clone();
-    let (handle, events) = headless::spawn_interactive(InteractiveParams {
+    let (trigger, shutdown) = CancelToken::new();
+    let _signals = crate::shutdown::watch(trigger).context("watch termination signals")?;
+    let (handle, mut events) = headless::spawn_interactive(InteractiveParams {
+        shutdown: shutdown.clone(),
         model,
         config,
         permissions_config,
@@ -563,7 +567,7 @@ pub fn run(params: SdkParams) -> Result<()> {
             tool_names,
         },
         thinking,
-    ) = crate::headless_startup::startup(&handle.ready, initial_model, defaults.thinking);
+    ) = crate::headless_startup::startup(&handle.ready, &mut events, defaults.thinking)?;
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
     let writer_thread = std::thread::spawn(move || {
@@ -602,6 +606,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         model: startup_model.clone(),
         permission_mode,
         turn_start: Instant::now(),
+        failed: false,
         permissions: Permissions::new(handle.answer_tx.clone()),
     }));
 
@@ -636,7 +641,15 @@ pub fn run(params: SdkParams) -> Result<()> {
     }
     .spawn(events);
 
-    for line in io::stdin().lock().lines() {
+    let (line_tx, line_rx) = flume::bounded(1);
+    std::thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            if line_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    while let Ok(Ok(line)) = smol::block_on(shutdown.race(line_rx.recv_async())) {
         let line = line.context("read stdin")?;
         if line.is_empty() {
             continue;
@@ -722,6 +735,9 @@ pub fn run(params: SdkParams) -> Result<()> {
     // flight has to stop asking now: an unanswerable request parks the agent,
     // and a parked agent never ends the event stream the pump waits on.
     shared.lock().unwrap().permissions.close();
+    if shutdown.is_cancelled() {
+        shared.lock().unwrap().failed = true;
+    }
 
     let InteractiveHandle {
         input_tx,
@@ -742,6 +758,9 @@ pub fn run(params: SdkParams) -> Result<()> {
     lua_handle.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
     drop(writer);
     let _ = writer_thread.join();
+    if shared.lock().unwrap().failed {
+        bail!("one or more SDK turns failed");
+    }
     Ok(())
 }
 
@@ -957,21 +976,21 @@ impl EventPump {
 
     fn emit_turn_result(
         &mut self,
-        is_error: bool,
+        failure: Option<&'static str>,
         result: String,
         num_turns: u32,
         usage: TokenUsage,
     ) -> Result<()> {
-        let duration_ms = self.shared.lock().unwrap().turn_start.elapsed().as_millis();
+        let duration_ms = {
+            let mut shared = self.shared.lock().unwrap();
+            shared.failed |= failure.is_some();
+            shared.turn_start.elapsed().as_millis()
+        };
         // Zero on an unpriced model, which is what its turns reported too.
         let total_cost_usd = self.cost.unwrap_or_default();
         self.writer.emit(WireInner::Result(ResultPayload {
-            subtype: if is_error {
-                "error_during_execution"
-            } else {
-                "success"
-            },
-            is_error,
+            subtype: failure.unwrap_or("success"),
+            is_error: failure.is_some(),
             duration_ms,
             duration_api_ms: duration_ms,
             num_turns,
@@ -1142,20 +1161,22 @@ impl EventPump {
                 reason,
                 ..
             } => {
-                // An interrupted run leaves a partial answer and a dropped one
-                // never ran, so neither is a success.
-                let is_error = match reason {
-                    DoneReason::Cancelled | DoneReason::Dropped => true,
-                    DoneReason::EndTurn
-                    | DoneReason::MaxTokens
-                    | DoneReason::MaxTurns
-                    | DoneReason::Compact => false,
-                };
+                if parent_tool_use_id.is_some() {
+                    return Ok(());
+                }
+                let failure = crate::print::failure_subtype(*reason);
                 let result = mem::take(&mut self.result_text);
-                self.emit_turn_result(is_error, result, *num_turns, *usage)?;
+                self.emit_turn_result(failure, result, *num_turns, *usage)?;
             }
             AgentEvent::Error { message, .. } => {
-                self.emit_turn_result(true, message.clone(), 0, TokenUsage::default())?;
+                if parent_tool_use_id.is_none() {
+                    self.emit_turn_result(
+                        Some("error_during_execution"),
+                        message.clone(),
+                        0,
+                        TokenUsage::default(),
+                    )?;
+                }
             }
         }
         Ok(())
@@ -1188,6 +1209,7 @@ fn map_tool_names_in_content(content: &Value) -> Value {
 mod tests {
     use crate::tool_names::claude_to_maki_tool_name;
     use flume::Receiver;
+    use maki_agent::DoneReason;
     use maki_config::ToolKey;
     use test_case::test_case;
 
@@ -1595,6 +1617,7 @@ mod tests {
                 model: Model::from_spec(TEST_MODEL_SPEC).unwrap(),
                 permission_mode,
                 turn_start: Instant::now(),
+                failed: false,
                 permissions: Permissions::new(answer_tx),
             })),
             include_partial_messages: false,

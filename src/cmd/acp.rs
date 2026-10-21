@@ -63,7 +63,7 @@ pub fn run(
 
     let (model, warning) = setup::resolve_model(model_arg.as_deref(), &config.provider, &storage)?;
     super::report_warnings(Vec::from_iter(warning));
-    setup::resolve_thinking(&mut config.session_defaults, &storage, thinking);
+    setup::resolve_headless_thinking(&mut config.session_defaults, thinking);
 
     setup::init_logging(&config.storage);
     setup::init_telemetry(&config.telemetry);

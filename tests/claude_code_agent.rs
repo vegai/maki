@@ -210,6 +210,63 @@ fn finish(mut command: Command) -> Output {
     }
 }
 
+#[test]
+fn dry_run_uses_provider_capabilities_and_filters_without_starting_claude() {
+    let fixture = Fixture::new();
+    let claude = stand_in(&fixture.isolation.dir("bin"));
+    let init = REVIEW_INIT.replace("@EXECUTABLE@", &claude.to_string_lossy());
+    fs::write(fixture.isolation.dir("config/maki").join("init.lua"), init).unwrap();
+    let mut command = fixture.maki(MODEL, PROMPT, STREAM_FORMAT);
+    command.args([
+        "--dry-run",
+        "--disallowed-tools",
+        "claude_code,claude_code_import",
+    ]);
+    let output = finish(command);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let init: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(init["subtype"], INIT);
+    assert_eq!(init["thinking"], "low");
+    let mut tools: Vec<_> = init["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|name| name.as_str().unwrap())
+        .collect();
+    tools.sort_unstable();
+    assert_eq!(tools, REVIEW_TOOLS);
+    assert!(!claude.with_extension(RAN_EXTENSION).exists());
+    let sessions = fixture.isolation.dir("state/maki").join("sessions");
+    assert!(
+        !sessions.exists()
+            || !fs::read_dir(sessions).unwrap().any(|entry| entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "jsonl"))
+    );
+}
+
+#[test]
+fn unavailable_scratch_fails_before_init_and_does_not_start_claude() {
+    let fixture = Fixture::new();
+    let claude = stand_in(&fixture.isolation.dir("bin"));
+    fixture.enable_plugin(Some(&claude));
+    let mut command = fixture.maki(MODEL, PROMPT, STREAM_FORMAT);
+    command.current_dir("/");
+    let output = finish(command);
+    assert!(!output.status.success());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["type"], RESULT);
+    assert_eq!(result["is_error"], true);
+    assert!(result[RESULT].as_str().unwrap().contains("Set TMPDIR"));
+    assert!(!claude.with_extension(RAN_EXTENSION).exists());
+}
+
 fn named<'a>(run: &'a Run, name: &str, parent: Option<&str>) -> Option<&'a Value> {
     run.calls()
         .find(|(under, call)| *under == parent && call["name"] == name)

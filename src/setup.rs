@@ -14,7 +14,7 @@ use maki_providers::{AgentError, Timeouts, custom, plugin};
 use maki_storage::StateDir;
 use maki_storage::log::RotatingFileWriter;
 use maki_storage::model::{read_model, read_thinking};
-use maki_storage::sessions::StoredThinking;
+use maki_storage::sessions::{Effort, StoredThinking};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
@@ -118,6 +118,13 @@ pub fn resolve_thinking(
     defaults.thinking = explicit
         .or(defaults.thinking)
         .or_else(|| read_thinking(storage));
+}
+
+/// Headless launches have a stable default independent of the TUI's state.
+pub fn resolve_headless_thinking(defaults: &mut SessionDefaults, explicit: Option<StoredThinking>) {
+    defaults.thinking = explicit
+        .or(defaults.thinking)
+        .or(Some(StoredThinking::Effort { level: Effort::Low }));
 }
 
 /// An unknown slug may just mean the models.dev catalog has not been loaded

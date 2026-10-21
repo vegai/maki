@@ -80,9 +80,7 @@ const EDIT_DEPENDENCY: &str = "echo edited >> node_modules/pkg/index.js";
 const DEPENDENCY_UNSETTLED: &str = "dependencies changed during the copy";
 const WORKER_TOLD_UNSETTLED: &str = "Some dependencies changed while maki copied them";
 const CHANGED_DURING_COPY: &str = "the checkout changed during the snapshot: ";
-const INSIDE_PROJECT: &str = "is in the project";
 /// How the refusal names `TMPDIR`, before any file is made there.
-const TEMP_DIR: &str = "the temporary directory";
 const TMPDIR: &str = "TMPDIR";
 const HOME: &str = "HOME";
 const HOME_LINK: &str = "linked-home";
@@ -230,12 +228,11 @@ fn ask_with(reg: &ToolRegistry, ctx: &ToolContext, input: Value) -> Result<Strin
     smol::block_on(within(DEADLINE, tool_reply(reg, ctx, TOOL, input)))
 }
 
-/// A `TMPDIR` that leads into the project, directly or through a symlink
-/// from outside it, is refused before any file is made there. The fake
-/// answers only `--version`, so no probe can run, even after an error.
+/// An overlapping TMPDIR uses a scratch base outside the checkout. The
+/// version-only fake then fails at the protocol check, without touching the project.
 #[test_case(false ; "direct_path")]
 #[test_case(true ; "symlink_alias")]
-fn a_temp_dir_that_leads_into_the_project_is_refused(linked: bool) {
+fn a_temp_dir_that_leads_into_the_project_uses_a_safe_fallback(linked: bool) {
     let _scenario = Scenario::enter();
     let project = env::current_dir().unwrap().canonicalize().unwrap();
     let outside = tempdir().unwrap();
@@ -248,7 +245,14 @@ fn a_temp_dir_that_leads_into_the_project_is_refused(linked: bool) {
     let _tmpdir = EnvVar::set(TMPDIR, tmpdir);
     let (reg, _host) = fake_host(&claude, outside.path());
     let err = ask(&reg, &session_ctx()).unwrap_err();
-    assert!(err.contains(INSIDE_PROJECT), "got: {err}");
+    assert!(err.contains(NO_EVENT_STOP), "got: {err}");
+    let prepared = validation::worker_launch(
+        HashMap::from([(TMPDIR.to_owned(), tmpdir.to_string_lossy().into_owned())]),
+        Some(outside.path().to_string_lossy().into_owned()),
+        &project,
+    )
+    .unwrap();
+    assert!(!prepared.temp_dir.starts_with(&project));
     assert_eq!(
         listing(&project),
         before,
@@ -257,7 +261,7 @@ fn a_temp_dir_that_leads_into_the_project_is_refused(linked: bool) {
 }
 
 #[test]
-fn an_empty_tmpdir_is_unset_for_launch_and_worker_checks() {
+fn an_empty_tmpdir_uses_a_safe_default_for_launch_and_worker_checks() {
     let _scenario = Scenario::enter();
     let outside = tempdir().unwrap();
     let claude = fake_claude(outside.path(), VERSION_ONLY);
@@ -269,7 +273,12 @@ fn an_empty_tmpdir_is_unset_for_launch_and_worker_checks() {
     )
     .unwrap();
     assert!(prepared.temp_dir.is_absolute());
-    assert!(prepared.env.iter().all(|(name, _)| name != TMPDIR));
+    assert!(
+        prepared
+            .env
+            .iter()
+            .any(|(name, value)| name == TMPDIR && Path::new(value) == prepared.temp_dir)
+    );
 
     let (reg, _host) = fake_host(&claude, outside.path());
     let error = ask(&reg, &session_ctx()).unwrap_err();
@@ -327,10 +336,10 @@ fn a_call_does_not_wait_for_the_sweep() {
     );
 }
 
-/// From a subdirectory, the project is still the whole checkout, so a
-/// `TMPDIR` elsewhere in it is refused too.
+/// A scratch base must be outside the whole checkout, including siblings
+/// of the session directory.
 #[test]
-fn a_temp_dir_elsewhere_in_the_checkout_is_refused() {
+fn a_temp_dir_elsewhere_in_the_checkout_uses_a_safe_fallback() {
     let _scenario = Scenario::enter();
     let project = env::current_dir().unwrap().canonicalize().unwrap();
     let sub = project.join("sub");
@@ -343,8 +352,14 @@ fn a_temp_dir_elsewhere_in_the_checkout_is_refused() {
 
     let (reg, _host) = fake_host(&claude, outside.path());
     let err = ask(&reg, &stub_ctx_in(&sub, None, None)).unwrap_err();
-    let refused = format!("{TEMP_DIR} {} {INSIDE_PROJECT}", elsewhere.display());
-    assert!(err.contains(&refused), "got: {err}");
+    assert!(err.contains(NO_EVENT_STOP), "got: {err}");
+    let prepared = validation::worker_launch(
+        HashMap::from([(TMPDIR.to_owned(), elsewhere.to_string_lossy().into_owned())]),
+        Some(outside.path().to_string_lossy().into_owned()),
+        &sub,
+    )
+    .unwrap();
+    assert!(!prepared.temp_dir.starts_with(&project));
     assert!(
         listing(&elsewhere).is_empty(),
         "maki must make no file there"

@@ -151,6 +151,8 @@ fn load_config(
             .disabled_tools
             .extend(cli.disallowed_tools.iter().cloned());
     }
+    config.agent.max_turns = cli.max_turns;
+    config.agent.final_answer = cli.final_answer;
     config.validate()?;
     Ok(config)
 }
@@ -224,11 +226,15 @@ fn build_stack(
     )?);
     let commands = discover_commands(cli.no_commands, launch.cwd);
 
-    setup::resolve_thinking(
-        &mut config.session_defaults,
-        launch.storage,
-        cli.thinking_override(),
-    );
+    if cli.print {
+        setup::resolve_headless_thinking(&mut config.session_defaults, cli.thinking_override());
+    } else {
+        setup::resolve_thinking(
+            &mut config.session_defaults,
+            launch.storage,
+            cli.thinking_override(),
+        );
+    }
     let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, launch.storage);
     let (model, needs_login) = match (model_result, fallback_model) {
         (Ok((m, warning)), _) => {
@@ -472,6 +478,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         let (resumed, claim) = resolved.into_resumed();
         let timeouts = stack.timeouts();
         crate::print::run(crate::print::PrintParams {
+            dry_run: cli.dry_run,
             model: stack.model,
             prompt: cli.initial_prompt,
             image_paths: cli.images,

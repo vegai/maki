@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use clap::ValueEnum;
 use color_eyre::Result;
-use color_eyre::eyre::{Context, eyre};
+use color_eyre::eyre::{Context, bail, eyre};
 use maki_agent::headless::{self, HeadlessHandle, HeadlessParams, Ready};
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::session::Resumed;
@@ -147,6 +147,7 @@ impl VerboseOutput {
 }
 
 pub struct PrintParams {
+    pub dry_run: bool,
     pub model: Model,
     pub prompt: Option<String>,
     pub image_paths: Vec<PathBuf>,
@@ -171,6 +172,7 @@ pub struct PrintParams {
 
 pub fn run(params: PrintParams) -> Result<()> {
     let PrintParams {
+        dry_run,
         model,
         prompt,
         image_paths,
@@ -191,6 +193,7 @@ pub fn run(params: PrintParams) -> Result<()> {
 
     let prompt = match prompt {
         Some(p) => p,
+        None if dry_run => String::new(),
         None => {
             let mut buf = String::new();
             io::stdin().read_to_string(&mut buf).context("read stdin")?;
@@ -212,7 +215,8 @@ pub fn run(params: PrintParams) -> Result<()> {
     }
 
     let (handle, mut events) = maki_agent::headless::spawn(HeadlessParams {
-        model: model.clone(),
+        dry_run,
+        model,
         config,
         permissions_config,
         timeouts,
@@ -232,20 +236,61 @@ pub fn run(params: PrintParams) -> Result<()> {
     });
 
     let HeadlessHandle {
+        cancel,
         ready,
         session_id,
         cwd,
         task,
     } = handle;
+    let _signals = crate::shutdown::watch(cancel).context("watch termination signals")?;
     let start = Instant::now();
     let (Ready { model, tool_names }, thinking) =
-        crate::headless_startup::startup(&ready, model, defaults.thinking);
+        match crate::headless_startup::startup(&ready, &mut events, defaults.thinking) {
+            Ok(started) => started,
+            Err(error) => {
+                smol::block_on(headless::await_shutdown(task));
+                write_result(
+                    format,
+                    None,
+                    PrintResult {
+                        result_type: "result",
+                        subtype: "error_during_execution",
+                        is_error: true,
+                        duration_ms: start.elapsed().as_millis(),
+                        num_turns: 0,
+                        result: error.to_string(),
+                        stop_reason: None,
+                        session_id,
+                        total_cost_usd: 0.0,
+                        usage: TokenUsage::default(),
+                    },
+                )?;
+                return Err(error);
+            }
+        };
 
     let mut verbose_out = match format {
         OutputFormat::StreamJson => Some(VerboseOutput::StreamJson),
         _ if verbose => Some(VerboseOutput::Json(Vec::new())),
         _ => None,
     };
+
+    if dry_run {
+        smol::block_on(headless::await_shutdown(task));
+        println!(
+            "{}",
+            serde_json::to_string(&InitEvent {
+                event_type: "system",
+                subtype: "init",
+                cwd: &cwd,
+                session_id: &session_id,
+                tools: &tool_names,
+                model: &model.id,
+                thinking
+            })?
+        );
+        return Ok(());
+    }
 
     match &mut verbose_out {
         Some(out) => out.emit(&InitEvent {
@@ -400,19 +445,24 @@ pub fn run(params: PrintParams) -> Result<()> {
                 cost: dcost,
                 ..
             } => {
+                if parent_tool_use_id.is_some() {
+                    continue;
+                }
                 num_turns = *turns;
                 usage = *u;
                 // The agent's own ledger also counts compaction spend, which
                 // summing the turns misses.
                 cost = (*dcost).or(cost);
                 stop_reason = Some(*reason);
+                is_error |= failure_subtype(*reason).is_some();
                 break;
             }
-            AgentEvent::Error { message, .. } => {
+            AgentEvent::Error { message, .. } if parent_tool_use_id.is_none() => {
                 is_error = true;
                 result_text = message.clone();
                 break;
             }
+            AgentEvent::Error { .. } => {}
         }
     }
     smol::block_on(headless::await_shutdown(task));
@@ -422,34 +472,61 @@ pub fn run(params: PrintParams) -> Result<()> {
     // Zero on an unpriced model, which is what its turns reported too.
     let total_cost_usd = cost.unwrap_or_default();
 
-    match format {
-        OutputFormat::Text => {
-            print!("{result_text}");
-        }
-        OutputFormat::Json | OutputFormat::StreamJson => {
-            let result = PrintResult {
-                result_type: "result",
-                subtype: if is_error { "error" } else { "success" },
-                is_error,
-                duration_ms,
-                num_turns,
-                result: result_text,
-                stop_reason,
-                session_id,
-                total_cost_usd,
-                usage,
-            };
-            match verbose_out {
-                Some(VerboseOutput::Json(mut events)) => {
-                    events.push(serde_json::to_value(&result)?);
-                    println!("{}", serde_json::to_string(&events)?);
-                }
-                _ => println!("{}", serde_json::to_string(&result)?),
-            }
-        }
-    }
+    let subtype = stop_reason
+        .and_then(failure_subtype)
+        .unwrap_or(if is_error {
+            "error_during_execution"
+        } else {
+            "success"
+        });
+    write_result(
+        format,
+        verbose_out,
+        PrintResult {
+            result_type: "result",
+            subtype,
+            is_error,
+            duration_ms,
+            num_turns,
+            result: result_text,
+            stop_reason,
+            session_id,
+            total_cost_usd,
+            usage,
+        },
+    )?;
 
+    if is_error {
+        bail!("headless run ended with {subtype}");
+    }
     Ok(())
+}
+
+fn write_result(
+    format: OutputFormat,
+    verbose_out: Option<VerboseOutput>,
+    result: PrintResult,
+) -> Result<()> {
+    match format {
+        OutputFormat::Text => print!("{}", result.result),
+        OutputFormat::Json | OutputFormat::StreamJson => match verbose_out {
+            Some(VerboseOutput::Json(mut events)) => {
+                events.push(serde_json::to_value(&result)?);
+                println!("{}", serde_json::to_string(&events)?);
+            }
+            _ => println!("{}", serde_json::to_string(&result)?),
+        },
+    }
+    Ok(())
+}
+
+pub(crate) fn failure_subtype(reason: DoneReason) -> Option<&'static str> {
+    match reason {
+        DoneReason::MaxTurns => Some("error_max_turns"),
+        DoneReason::Cancelled => Some("error_interrupted"),
+        DoneReason::Dropped => Some("error_prompt_dropped"),
+        DoneReason::EndTurn | DoneReason::MaxTokens | DoneReason::Compact => None,
+    }
 }
 
 /// Nothing reached the model, so the reason is the only answer there is. A

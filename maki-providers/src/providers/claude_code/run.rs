@@ -538,6 +538,7 @@ mod tests {
     use std::io;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::symlink;
+    use std::os::unix::process::ExitStatusExt;
     use std::path::Path;
     use std::process::{self, Stdio};
     use std::sync::Mutex;
@@ -867,7 +868,7 @@ mod tests {
             fake.group_gone(),
             "a stopped run must not continue after its request"
         );
-        match result.unwrap_err() {
+        match result.unwrap_err().into_cause() {
             Error::Interrupted(error) => *error,
             error => error,
         }
@@ -900,7 +901,10 @@ mod tests {
         let error = result.unwrap_err();
         assert_eq!(error.temporary().is_some(), retryable, "{error:?}");
         if !retryable {
-            assert!(matches!(error, Error::BlockCount { .. }), "{error:?}");
+            assert!(
+                matches!(error.cause(), Error::BlockCount { .. }),
+                "{error:?}"
+            );
         }
         assert!(fake.group_gone());
         assert!(fake.leader_reaped());
@@ -910,7 +914,7 @@ mod tests {
     fn a_truncated_line_before_stop_is_diagnosed_and_retryable() {
         let fake = Fake::new("truncated_line");
         let (result, _) = smol::block_on(fake.request());
-        let error = result.unwrap_err();
+        let error = result.unwrap_err().into_cause();
         assert!(error.temporary().is_some());
         let Error::Interrupted(error) = error else {
             panic!("{error:?}")
@@ -941,7 +945,10 @@ mod tests {
             limits(STARTUP, IDLE, HANDOFF, SHORT_EXIT),
         ));
         assert!(
-            matches!(result, Err(Error::ApiRefused { .. })),
+            matches!(
+                result.as_ref().map_err(Error::cause),
+                Err(Error::ApiRefused { .. })
+            ),
             "{result:?}"
         );
         assert!(fake.group_gone());
@@ -1027,7 +1034,7 @@ mod tests {
             limits(UNREAD_STARTUP, IDLE, HANDOFF, EXIT_LIMIT),
         ));
         let err = result.unwrap_err();
-        assert!(matches!(err, Error::InputNotTaken), "{err}");
+        assert!(matches!(err.cause(), Error::InputNotTaken), "{err}");
         assert!(
             fake.group_gone(),
             "a run that hangs must not continue after its request"
@@ -1052,7 +1059,7 @@ mod tests {
             "a run that hangs must not continue after its request"
         );
         let error = result.unwrap_err();
-        match error {
+        match error.into_cause() {
             Error::Interrupted(error) => *error,
             error => error,
         }
@@ -1151,6 +1158,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_aborted_version_check_names_the_command_and_signal() {
+        let fake = Fake::new("text");
+        fs::write(fake.dir.path().join("version_abort"), "").unwrap();
+        let error = smol::block_on(fake.request()).0.unwrap_err();
+        assert!(
+            matches!(error.cause(), Error::VersionFailed(status) if status.signal() == Some(rustix::process::Signal::ABORT.as_raw()))
+        );
+        assert!(error.to_string().contains("claude --version"), "{error}");
+    }
+
     /// An unreadable version line and a missing one give different errors.
     #[test]
     fn an_unreadable_version_line_is_named() {
@@ -1158,11 +1176,7 @@ mod tests {
         fs::write(fake.dir.path().join("version"), NOT_UTF8_VERSION).unwrap();
         let err = smol::block_on(fake.request()).0.unwrap_err();
         let unreadable = |error: &Error| matches!(error, Error::UnreadableVersion(source) if source.kind() == io::ErrorKind::InvalidData);
-        assert!(
-            unreadable(&err)
-                || matches!(&err, Error::WithStderr { error, .. } if unreadable(error)),
-            "{err:?}"
-        );
+        assert!(unreadable(err.cause()), "{err:?}");
     }
 
     /// Output that ends early while the process lingers, and a process that
@@ -1176,7 +1190,7 @@ mod tests {
             limits(STARTUP, IDLE, HANDOFF, SHORT_EXIT),
         ));
         assert!(
-            matches!(result, Err(Error::Interrupted(ref error)) if matches!(**error, Error::WentQuiet)),
+            matches!(result.as_ref().map_err(Error::cause), Err(Error::Interrupted(error)) if matches!(**error, Error::WentQuiet)),
             "{result:?}"
         );
     }
@@ -1354,7 +1368,10 @@ mod tests {
             fake.log("stdin_prompt").is_empty(),
             "a probe sends no prompt"
         );
-        assert!(matches!(result, Err(Error::UncheckedStart)));
+        assert!(matches!(
+            result.as_ref().map_err(Error::cause),
+            Err(Error::UncheckedStart)
+        ));
     }
 
     /// The models come from the account answer, each once, by the id it runs
@@ -1439,7 +1456,10 @@ mod tests {
         ));
 
         assert!(
-            matches!(result, Err(Error::OtherModel { .. })),
+            matches!(
+                result.as_ref().map_err(Error::cause),
+                Err(Error::OtherModel { .. })
+            ),
             "{result:?}"
         );
     }
@@ -1454,7 +1474,7 @@ mod tests {
         let starts = fake.log("calls").lines().count();
         let err = smol::block_on(fake.request()).0.unwrap_err();
 
-        assert!(matches!(err, Error::Check(_)), "{err}");
+        assert!(matches!(err.cause(), Error::Check(_)), "{err}");
         let ran_in = fake.log("hook_ran_in");
         assert!(
             !ran_in.is_empty(),

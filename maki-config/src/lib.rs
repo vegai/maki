@@ -365,7 +365,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         default: ConfigValue::Str("none"),
         min: None,
         env: None,
-        description: "Set the thinking level of every new session: true/\"adaptive\", false/\"off\", \"minimal\" to \"max\", or a token budget. A launch thinking flag overrides this. Unset, new sessions start at the last `/thinking` level",
+        description: "Set the thinking level of every new session: true/\"adaptive\", false/\"off\", \"minimal\" to \"max\", or a token budget. A launch thinking flag overrides this. Unset, TUI sessions start at the last `/thinking` level and headless, SDK and ACP sessions use low",
     },
 ];
 
@@ -1492,6 +1492,9 @@ pub struct AgentConfig {
     #[config(skip, default = "None")]
     pub max_turns: Option<u32>,
 
+    #[config(skip, default = false)]
+    pub final_answer: bool,
+
     #[config(skip, default = "Vec::new()")]
     pub allowed_tools: Vec<String>,
 
@@ -1517,6 +1520,7 @@ impl AgentConfig {
             rtk: file.rtk.unwrap_or(true),
             shell: file.shell.unwrap_or_default(),
             max_turns: None,
+            final_answer: false,
             allowed_tools: Vec::new(),
             disabled_tools: Vec::new(),
         }

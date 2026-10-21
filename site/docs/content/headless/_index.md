@@ -45,15 +45,61 @@ token budget wins, followed by a positive `--max-thinking-tokens`,
 `--effort`, then other `--thinking` settings. Invalid values fail before a
 provider starts.
 
-The launch flag overrides `always_thinking` in config, which overrides the
-last level saved by `/thinking` in the TUI. This saved-level fallback also
-applies to SDK and ACP runs. A launch override does not change that saved level.
+The launch flag overrides `always_thinking` in config. Without either,
+headless, SDK and ACP runs use `low`, independent of the last TUI level.
+A launch override does not change the TUI default. The TUI still uses its
+saved `/thinking` level when neither flags nor config specify one.
 
 The `system/init` event in `stream-json` output, SDK output, and verbose JSON
 includes Maki's `thinking` extension as a string. It reports the setting after the selected
 model's capability checks: an unsupported model reports `"off"`, and a model
 that requires thinking raises `"off"` to `"minimal"`. Providers translate
 effort levels and token budgets into their own API parameters.
+
+## Bounded runs and recovery
+
+`--max-turns N` caps model turns in plain `-p` and SDK mode. A tool-call
+response counts as one turn, regardless of how many tools it calls. A run
+that needs another turn after the cap saves its session, emits a result with
+`is_error: true` and subtype `error_max_turns`, and exits nonzero.
+
+Add `--final-answer` to ask for a report on the last allowed turn:
+
+```bash
+maki -p --max-turns 8 --final-answer --thinking low \
+  --output-format stream-json "Review the change and report partial findings if time runs out."
+```
+
+The last turn receives a final-answer instruction. Tools stay in the request
+schema to preserve the prompt cache, but further tool calls cannot execute.
+If the model calls a tool instead of answering, the result is still
+`error_max_turns`.
+
+On Unix, SIGTERM and SIGINT cancel plain `-p` and SDK runs, save the session, emit
+`error_interrupted`, and exit nonzero. Session checkpoints land before
+provider requests, before tool execution, and after each completed turn.
+SIGKILL cannot emit a result, but leaves the last checkpoint resumable with
+`maki -p -r ID`. Text streamed during an unfinished request can be lost on
+SIGKILL. Provider errors are stored as separate `error` records in the session
+log, outside the conversation sent to the model.
+
+Every error result makes plain `-p` exit nonzero. SDK mode exits nonzero if
+any turn failed, once its input closes.
+
+## Inspect a launch
+
+`--dry-run` prints one `system/init` JSON event with the effective model,
+thinking level and tool names, then exits without inference or a saved
+session:
+
+```bash
+maki -p --dry-run -m claude-code/claude-sonnet-5 \
+  --disallowed-tools claude_code,claude_code_import
+```
+
+It loads the same configuration, plugins and MCP tools as a normal launch.
+Provider capability checks still apply, including image-tool exclusions.
+It does not start the Claude CLI or make a model request.
 
 ## Output Formats
 

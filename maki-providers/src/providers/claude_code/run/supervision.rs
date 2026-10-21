@@ -59,6 +59,7 @@ pub(in crate::providers::claude_code) async fn within<T>(
 pub(super) struct Group {
     pub(super) child: Child,
     signals_disabled: bool,
+    exit_status: Option<ExitStatus>,
     #[cfg(target_os = "linux")]
     _lifetime: UnixStream,
 }
@@ -124,6 +125,7 @@ impl Group {
         let status = within(Instant::now() + SHUTDOWN_GRACE, self.child.status())
             .await
             .ok_or(Error::ReapLate)?;
+        self.exit_status = status.as_ref().ok().copied();
         if matches!(exited, LeaderExit::TimedOut) {
             return Err(Error::ExitLate);
         }
@@ -171,6 +173,7 @@ fn spawn_piped(command: process::Command) -> io::Result<Group> {
     Ok(Group {
         child,
         signals_disabled: false,
+        exit_status: None,
         #[cfg(target_os = "linux")]
         _lifetime: lifetime,
     })
@@ -205,7 +208,8 @@ pub(super) async fn supervised<T>(
     debug!(pid = group.child.id(), "claude-code: process started");
     let stderr = watch_stderr(&mut group.child);
     let result = work(&mut group).await;
-    if !group.signals_disabled {
+    let shutdown_requested = !group.signals_disabled;
+    if shutdown_requested {
         drop(group.child.stdin.take());
         group.terminate();
         if matches!(
@@ -217,7 +221,28 @@ pub(super) async fn supervised<T>(
     }
     match result {
         Ok(value) => Ok(value),
-        Err(error) => Err(stderr.explain(error).await),
+        Err(error) => {
+            let error = match group.exit_status {
+                Some(status)
+                    if !matches!(
+                        error.cause(),
+                        Error::VersionFailed(_) | Error::ExitedEarly(_) | Error::ExitedInChecks(_)
+                    ) =>
+                {
+                    Error::WithExit {
+                        error: Box::new(error),
+                        status,
+                        context: if shutdown_requested {
+                            "after maki requested shutdown"
+                        } else {
+                            "exited"
+                        },
+                    }
+                }
+                _ => error,
+            };
+            Err(stderr.explain(error).await)
+        }
     }
 }
 
@@ -453,6 +478,8 @@ mod process_tests {
     use std::env;
     use std::os::unix::process::ExitStatusExt;
     use std::path::Path;
+    use std::process::Command;
+    use std::time::Instant;
 
     use rustix::process::{Pid, Signal, kill_process};
     use test_case::test_case;
@@ -460,10 +487,34 @@ mod process_tests {
     use crate::providers::claude_code::fake::Fake;
 
     use super::super::launch::command;
-    use super::Group;
+    use super::{Error, Group, SHUTDOWN_GRACE, supervised};
 
     const SLEEP: &str = "/bin/sleep";
     const LONG_SLEEP_SECS: &str = "60";
+
+    const PROCESS_ERROR: &str = "protocol failure";
+    const PROCESS_STDERR: &str = "diagnostic stderr";
+    const FAIL_COMMAND: &str = "printf 'diagnostic stderr\\n' >&2; exit 7";
+    const FAIL_CODE: i32 = 7;
+
+    #[test]
+    fn protocol_errors_keep_the_process_status_and_stderr() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", FAIL_COMMAND]);
+        let error = smol::block_on(supervised::<()>(command, async |group| {
+            let status = group.wait(Instant::now() + SHUTDOWN_GRACE).await?;
+            assert_eq!(status.code(), Some(FAIL_CODE));
+            Err(Error::Failed(PROCESS_ERROR.into()))
+        }))
+        .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains(PROCESS_ERROR), "{text}");
+        assert!(text.contains(PROCESS_STDERR), "{text}");
+        assert!(
+            matches!(&error, Error::WithStderr { error, .. } if matches!(**error, Error::WithExit { status, .. } if status.code() == Some(FAIL_CODE)))
+        );
+        assert!(matches!(error.cause(), Error::Failed(message) if message == PROCESS_ERROR));
+    }
 
     /// Marking the leader reaped must prevent signalling a pid that may identify another group.
     #[test_case(false ; "sigkill")]

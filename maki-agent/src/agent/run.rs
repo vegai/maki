@@ -57,6 +57,8 @@ const INTERRUPT_NOTE: &str =
 /// the user would pay for every turn of it. So `agent.stop` gets this many in
 /// a row, and the count starts over whenever the user speaks.
 const MAX_STOP_CONTINUATIONS: u32 = 3;
+const FINAL_TOOLS_DENIED: &str = "The turn limit was reached. No further tools can run.";
+const FINAL_ANSWER_NOTE: &str = "This is your last allowed turn. Return your final answer now, including partial findings and any remaining work. No more tools can run.";
 const FIELD_TEXT: &str = "text";
 const STOP_FINISHED: &str = "finished";
 const STOP_MAX_TOKENS: &str = "max_tokens";
@@ -413,6 +415,14 @@ impl<'h> Agent<'h> {
             .is_some_and(|max| self.num_turns >= max)
     }
 
+    fn final_answer_turn(&self) -> bool {
+        self.config.final_answer
+            && self
+                .config
+                .max_turns
+                .is_some_and(|max| self.num_turns.saturating_add(1) == max)
+    }
+
     async fn run_loop(&mut self) -> Result<DoneReason, AgentError> {
         loop {
             // Ahead of `try_auto_compact`: a switch landing after the check
@@ -423,7 +433,13 @@ impl<'h> Agent<'h> {
                 return Ok(DoneReason::MaxTurns);
             }
             self.try_auto_compact().await?;
-            match self.turn().await? {
+            if self.final_answer_turn() {
+                self.history
+                    .push(Message::synthetic(FINAL_ANSWER_NOTE.to_owned()));
+            }
+            let outcome = self.turn().await;
+            self.history.checkpoint(self.gauge.size()).await;
+            match outcome? {
                 TurnOutcome::Continue => {}
                 TurnOutcome::Done(reason) => return Ok(reason),
             }
@@ -530,6 +546,7 @@ impl<'h> Agent<'h> {
             return Err(AgentError::Cancelled);
         }
         self.prepare_request()?;
+        self.history.checkpoint(self.gauge.size()).await;
         let Some((system, tools)) = self.history.request_prefix() else {
             return Err(no_frame());
         };
@@ -605,6 +622,12 @@ impl<'h> Agent<'h> {
 
         // The gauge already took the provider's own count inside the stream.
         self.emit_turn_complete(&response)?;
+
+        if has_tools && self.config.final_answer && self.turns_exhausted() {
+            self.history.push(response.message);
+            self.history.close_dangling_tool_calls(FINAL_TOOLS_DENIED);
+            return Ok(TurnOutcome::Done(DoneReason::MaxTurns));
+        }
 
         if has_tools {
             let history_len_before = self.history.len();
@@ -922,6 +945,7 @@ impl<'h> Agent<'h> {
             self.history,
             &self.event_tx,
             &ctx,
+            self.gauge.size(),
         )
         .await
     }
@@ -1640,6 +1664,48 @@ mod tests {
             matches!(&result, ContentBlock::ToolResult { loaded_tools, .. } if loaded_tools == &["srv__fetch_issue"]),
             "got: {result:?}"
         );
+    }
+
+    #[test_case(false ; "model_answers")]
+    #[test_case(true ; "model_still_calls_a_tool")]
+    fn final_answer_turn_preserves_the_prefix_and_executes_no_tools(calls_tool: bool) {
+        smol::block_on(async {
+            let final_response = if calls_tool {
+                tool_call_response("glob", "last")
+            } else {
+                text_response(StopReason::EndTurn)
+            };
+            let mut history = History::new(Vec::new());
+            let provider =
+                MockProvider::new(vec![tool_call_response("glob", "first"), final_response]);
+            let requests = Arc::clone(&provider.requests);
+            let (mut agent, events) = make_agent(provider, &mut history);
+            agent.config.max_turns = Some(2);
+            agent.config.final_answer = true;
+            let reason = agent.run(default_input()).await.unwrap();
+            assert_eq!(
+                reason,
+                if calls_tool {
+                    DoneReason::MaxTurns
+                } else {
+                    DoneReason::EndTurn
+                }
+            );
+            drop(agent);
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_append_only(&requests[0], &requests[1]);
+            let events = drain_events(&events);
+            assert!(!events.iter().any(
+                |event| matches!(&event.event, AgentEvent::ToolStart(call) if call.id == "last")
+            ));
+            assert!(
+                history
+                    .as_slice()
+                    .iter()
+                    .any(|message| message.first_text_content() == Some(FINAL_ANSWER_NOTE))
+            );
+        });
     }
 
     fn small_context_model(context_window: u32, max_output_tokens: u32) -> Model {
