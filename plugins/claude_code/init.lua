@@ -199,20 +199,24 @@ local function coding_confine(spec, artifact)
     return nil, NO_STATE_DIR
   end
   local deny = table.clone(spec.denied)
-  deny[#deny + 1] = spec.config_dir
-  deny[#deny + 1] = maki.fs.dirname(artifact.dir)
-  -- Optional paths can be nil. Use explicit inserts so later paths remain in the list.
-  deny[#deny + 1] = state_dir
-  deny[#deny + 1] = maki.env.config_dir()
-  deny[#deny + 1] = maki.env.logs_dir()
-  for _, name in ipairs({ "XDG_RUNTIME_DIR", "SSH_AUTH_SOCK" }) do
-    local path = maki.uv.os_getenv(name)
-    if path and path:sub(1, 1) == "/" then
+  local function hide(path)
+    if path then
       deny[#deny + 1] = path
       local resolved = maki.fs.realpath(path)
       if resolved and resolved ~= path then
         deny[#deny + 1] = resolved
       end
+    end
+  end
+  hide(spec.config_dir)
+  hide(maki.fs.dirname(artifact.dir))
+  hide(state_dir)
+  hide(maki.env.config_dir())
+  hide(maki.env.logs_dir())
+  for _, name in ipairs({ "XDG_RUNTIME_DIR", "SSH_AUTH_SOCK" }) do
+    local path = maki.uv.os_getenv(name)
+    if path and path:sub(1, 1) == "/" then
+      hide(path)
     end
   end
   table.move(spec.home_credentials, 1, #spec.home_credentials, #deny + 1, deny)
@@ -351,7 +355,6 @@ local function run(input, ctx, call, timeout_secs)
     return claude:build(outcome)
   end
   local report = change_report(call, artifact, spec.cwd)
-  call.artifact = nil
   -- The report identifies the artifact necessary for import. Shorten the reply first so
   -- output limits cannot remove the report.
   local report_lines = select(2, report:gsub("\n", "")) + 1

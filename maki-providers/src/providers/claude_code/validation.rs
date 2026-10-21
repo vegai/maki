@@ -1,7 +1,5 @@
 //! Shared launch validation for the provider and the Lua worker.
 
-#[cfg(unix)]
-use rustix::process::geteuid;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
@@ -10,6 +8,8 @@ use std::fs::{self, DirBuilder};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf, absolute};
 
+#[cfg(unix)]
+use rustix::process::geteuid;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -160,9 +160,9 @@ impl WorkerHandshake {
     pub fn finish(&self) -> Result<(), String> {
         self.answers
             .check(
-                |account| checks::account_problem_in(account, &self.modes),
+                |account| checks::account_problem(account, &self.modes),
                 |settings, hooks| {
-                    checks::policy_problem_in(settings, hooks, false).or_else(|| {
+                    checks::policy_problem(settings, hooks, false).or_else(|| {
                         worker_problem(&settings["effective"], &self.policy.settings())
                             .map(Problem::WorkerPolicy)
                     })
@@ -171,8 +171,8 @@ impl WorkerHandshake {
             .map_err(|error| error.to_string())
     }
 
-    pub fn account(&self) -> &Value {
-        self.answers.account()
+    pub fn subscription_type(&self) -> Option<&str> {
+        self.answers.account()[checks::ACCOUNT][checks::SUBSCRIPTION_TYPE].as_str()
     }
 
     pub fn resolved_model(&self, requested: &str) -> Option<&str> {
@@ -364,7 +364,7 @@ pub fn init_problem(
     tools: HashSet<String>,
     modes: &[String],
 ) -> Option<String> {
-    checks::init_problem_in(event, version, cwd, &tools, modes, None)
+    checks::init_problem(event, version, cwd, &tools, modes, None)
         .map(|problem| problem.to_string())
 }
 
@@ -450,12 +450,6 @@ pub async fn version_check(executable: &Path) -> Result<VersionCheck, String> {
 pub fn checkout_root(cwd: &Path) -> Result<PathBuf, String> {
     let cwd = cwd.canonicalize().map_err(|error| error.to_string())?;
     checks::checkout_root(&cwd).map_err(|error| error.to_string())
-}
-
-pub fn subscription_type(account: &Value) -> Option<String> {
-    account[checks::ACCOUNT][checks::SUBSCRIPTION_TYPE]
-        .as_str()
-        .map(str::to_owned)
 }
 
 fn empty_array(value: Option<&Value>) -> bool {

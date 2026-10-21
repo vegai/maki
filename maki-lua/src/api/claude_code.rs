@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::fs;
 use std::io::{Error as IoError, ErrorKind};
@@ -29,6 +29,8 @@ pub(crate) const MODULE: &str = "maki.claude_code.internal";
 const HOME_STATE_PREFIX: &str = ".claude.json";
 const BMP_LIMIT: u32 = 0xffff;
 const MAX_UTF8_BYTES: usize = 4;
+const SYSTEM_EVENT: &str = "system";
+const INIT_EVENT: &str = "init";
 const VARIATION_SELECTORS: &[RangeInclusive<u32>] = &[
     0x180b..=0x180d,
     0x180f..=0x180f,
@@ -185,7 +187,7 @@ struct WorkerHandshake(NativeHandshake);
 impl UserData for WorkerHandshake {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method_mut("answer", |_, this, line: String| {
-            let event = try_pair!(json(&line));
+            let event = try_pair!(serde_json::from_str::<Value>(&line));
             Ok(pair(this.0.answer(&event["response"])))
         });
         methods.add_method("finish", |_, this, ()| {
@@ -195,7 +197,7 @@ impl UserData for WorkerHandshake {
             Ok(this.0.resolved_model(&requested).map(str::to_owned))
         });
         methods.add_method("subscription_type", |_, this, ()| {
-            Ok(validation::subscription_type(this.0.account()))
+            Ok(this.0.subscription_type().map(str::to_owned))
         });
     }
 }
@@ -267,39 +269,6 @@ async fn prepare_launch(
     )?;
     result.set("config_dir", try_pair!(path_text(prepared.config_dir)))?;
     Ok((Some(result), None))
-}
-
-fn json(text: &str) -> Result<Value, serde_json::Error> {
-    serde_json::from_str(text)
-}
-
-/// Check the worker catalog, login route and directory before accepting output.
-/// @param event string JSON init event.
-/// @param version string Validated version.
-/// @param cwd string Expected directory.
-/// @param tools table Allowed tool names.
-/// @param modes table Allowed permission modes.
-/// @return (string?) Reason the init is unsafe, or nil.
-#[lua_fn]
-fn init_problem(
-    _lua: &Lua,
-    event: String,
-    version: String,
-    cwd: String,
-    tools: Vec<String>,
-    modes: Vec<String>,
-) -> LuaResult<Option<String>> {
-    let event = match json(&event) {
-        Ok(event) => event,
-        Err(error) => return Ok(Some(error.to_string())),
-    };
-    Ok(validation::init_problem(
-        &event,
-        &version,
-        Path::new(&cwd),
-        tools.into_iter().collect::<HashSet<_>>(),
-        &modes,
-    ))
 }
 
 struct VersionCheck(validation::VersionCheck);
@@ -415,13 +384,30 @@ async fn unpack_blobs(
 #[lua_fn]
 fn classify(lua: &Lua, line: String, mode: Table) -> LuaResult<Pair<Table>> {
     let model: Option<String> = mode.get("model")?;
-    let classified = try_pair!(validation::classify(
+    let mut classified = try_pair!(validation::classify(
         &line,
         mode.get::<Option<bool>>("accepted")?.unwrap_or(false),
         model.as_deref(),
         mode.get::<Option<bool>>("model_checked")?.unwrap_or(false),
     ));
     let event = &classified.event;
+    if classified.problem.is_none()
+        && event["type"] == SYSTEM_EVENT
+        && event["subtype"] == INIT_EVENT
+    {
+        let expect: Table = mode.get("init")?;
+        let version: String = expect.get("version")?;
+        let cwd: String = expect.get("cwd")?;
+        let tools: Vec<String> = expect.get("tools")?;
+        let modes: Vec<String> = expect.get("permission_modes")?;
+        classified.problem = validation::init_problem(
+            event,
+            &version,
+            Path::new(&cwd),
+            tools.into_iter().collect(),
+            &modes,
+        );
+    }
     let result = lua.create_table()?;
     result.set("event", json_to_lua(lua, event)?)?;
     result.set("model_checked", classified.model_checked)?;
@@ -441,7 +427,6 @@ lua_table! {
     /// the distinction between null, objects and arrays.
     "maki.claude_code.internal" => pub(crate) fn create_claude_code_table(perms: &PluginPermissions), DOCS [
         shell_secret_problem, escape_invisible, worker_handshake, base_args, worker_settings, prepare_launch(perms), private_dir(perms), home_state_files(perms),
-        init_problem,
         classify, version_check(perms), invalidate_version, sanitize_git(perms), project_git_dir(perms), unpack_blobs(perms),
     ]
 }
@@ -451,7 +436,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
 
-    use mlua::{AnyUserData, Function, Lua, ObjectLike, Value as LuaValue};
+    use mlua::{AnyUserData, Function, Lua, ObjectLike, Table, Value as LuaValue};
     use serde_json::{Value, json};
     use tempfile::tempdir;
     use test_case::test_case;
@@ -512,17 +497,12 @@ mod tests {
             handshake.call_method("answer", INVALID_JSON).unwrap();
         assert_eq!(complete, None);
         assert_eq!(error, Some(expected.clone()));
-        let init: Function = table.get("init_problem").unwrap();
-        let error: Option<String> = init
-            .call((
-                INVALID_JSON,
-                "2.1.284",
-                "/",
-                Vec::<String>::new(),
-                Vec::<String>::new(),
-            ))
+        let classify: Function = table.get("classify").unwrap();
+        let (event, error): (Option<Table>, Option<String>) = classify
+            .call((INVALID_JSON, lua.create_table().unwrap()))
             .unwrap();
-        assert_eq!(error, Some(expected));
+        assert!(event.is_none());
+        assert!(error.unwrap().contains(&expected));
     }
 
     #[test_case(false ; "direct_denied_directory")]

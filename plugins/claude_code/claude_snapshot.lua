@@ -14,7 +14,7 @@ local M = {}
 
 local TRASH_PREFIX = ".trash-"
 local SWEEP_LOCK = ".sweep.lock"
-M.CANNOT_SWEEP = "claude_code: maki cannot lock artifact cleanup in "
+M.CANNOT_SWEEP = jobs.ERROR_PREFIX .. "maki cannot lock artifact cleanup in "
 local SWEEP_CONTENTS = [[
 set -e
 cd -P -- "$1"
@@ -36,7 +36,6 @@ local COPY_STARTED = "copy-started"
 -- sweep removes only folders with this marker.
 local OWNER_MARKER = ".maki-claude-code-artifact"
 local VENV_MARKER = "pyvenv.cfg"
-local SHOWN_PATHS = 10
 local C_LOCALE = "C"
 -- What `cp --reflink=always` reports when the filesystem cannot clone:
 -- EOPNOTSUPP, EXDEV and EINVAL.
@@ -77,14 +76,6 @@ done
 -- so names such as `-delete` cannot become `find` expressions.
 local CHANGED_SINCE = [[find "./$1" -cnewer "$2" -print | LC_ALL=C tr -c '\n[:print:]' '?']]
 
-function M.shown(paths)
-  local listed, more = path_utils.first(paths, SHOWN_PATHS)
-  for i, path in ipairs(listed) do
-    listed[i] = path_utils.printable(path)
-  end
-  return table.concat(listed, ", ") .. (more > 0 and " and " .. more .. " more" or "")
-end
-
 local function from_hex(line)
   return (line:gsub("%x%x", function(pair)
     return string.char(tonumber(pair, 16))
@@ -95,12 +86,7 @@ local function checkout_git(call, spec, args)
   return call:run_quick(git_utils.git(args), { env = spec.env, cwd = spec.cwd })
 end
 
-local function list_files(call, spec, mode, pathspecs)
-  local args = mode == "-d" and { "diff-files", "--relative", "--name-only", "--diff-filter=D", "--" }
-    or { "ls-files", mode, "--" }
-  if mode == "-s" then
-    table.insert(args, 2, "-t")
-  end
+local function list_files(call, spec, args, pathspecs)
   for _, pathspec in ipairs(pathspecs) do
     args[#args + 1] = pathspec
   end
@@ -164,23 +150,6 @@ local function commit_snapshot(call, artifact, message)
   return snapshot_git(call, artifact, { "rev-parse", "HEAD" })
 end
 
-function M.disk_blobs(call, env, cwd, paths, keep_on_cancel, timeout_ms)
-  if #paths == 0 then
-    return {}
-  end
-  local out, err = call:run_quick(git_utils.git({ "hash-object", "--no-filters", "--stdin-paths" }), {
-    env = env,
-    cwd = cwd,
-    stdin = git_utils.quoted_lines(paths),
-    keep_on_cancel = keep_on_cancel,
-    timeout_ms = timeout_ms,
-  })
-  if not out then
-    return nil, err
-  end
-  return maki.split(out, "\n")
-end
-
 local function symlinked_parent(cwd, path, checked)
   local parent = cwd
   for part in path:gmatch("([^/]+)/") do
@@ -207,11 +176,16 @@ end
 -- Returns the tracked files as they are on disk, plus the untracked files
 -- under {spec.include}. Submodules are left out, with a note in {artifact}.
 local function snapshot_paths(call, artifact, spec)
-  local tracked, tracked_err = list_files(call, spec, "-s", { "." })
+  local tracked, tracked_err = list_files(call, spec, { "ls-files", "-t", "-s", "--" }, { "." })
   if not tracked then
     return nil, tracked_err
   end
-  local deleted, deleted_err = list_files(call, spec, "-d", { "." })
+  local deleted, deleted_err = list_files(
+    call,
+    spec,
+    { "diff-files", "--relative", "--name-only", "--diff-filter=D", "--" },
+    { "." }
+  )
   if not deleted then
     return nil, deleted_err
   end
@@ -242,14 +216,14 @@ local function snapshot_paths(call, artifact, spec)
       end
       specs[#specs + 1] = ":(literal)" .. path
     end
-    local untracked, untracked_err = list_files(call, spec, "-o", specs)
+    local untracked, untracked_err = list_files(call, spec, { "ls-files", "-o", "--" }, specs)
     if not untracked then
       return nil, untracked_err
     end
     local included, repositories = git_utils.untracked_paths(untracked)
     if #repositories > 0 then
       artifact.notes[#artifact.notes + 1] = "maki did not copy the repositories under include: "
-        .. M.shown(repositories)
+        .. path_utils.shown(repositories)
     end
     for _, path in ipairs(included) do
       local dependency = false
@@ -266,7 +240,7 @@ local function snapshot_paths(call, artifact, spec)
     return nil, NON_UTF8_PATH:format(path_utils.printable(unusual))
   end
   if #submodules > 0 then
-    artifact.notes[#artifact.notes + 1] = SUBMODULES_LEFT_OUT .. M.shown(submodules)
+    artifact.notes[#artifact.notes + 1] = SUBMODULES_LEFT_OUT .. path_utils.shown(submodules)
   end
   return paths, nil, files
 end
@@ -306,7 +280,7 @@ local function copy_dependencies(call, artifact, spec, paths)
         .. " is a Python virtual environment, and its scripts hard-code its path in the checkout, so maki did not "
         .. "copy it. Recreate it with the `prepare` command."
     else
-      local listed, list_err = list_files(call, spec, "-o", { ":(literal)" .. dir })
+      local listed, list_err = list_files(call, spec, { "ls-files", "-o", "--" }, { ":(literal)" .. dir })
       if not listed then
         return nil, "maki cannot list the dependency " .. dir .. ": " .. list_err
       end
@@ -338,7 +312,7 @@ local function copy_dependencies(call, artifact, spec, paths)
         artifact.notes[#artifact.notes + 1] = "maki did not copy the repositories in the dependency "
           .. dir
           .. ": "
-          .. M.shown(nested)
+          .. path_utils.shown(nested)
       end
       copied[#copied + 1] = dir
     end
@@ -364,7 +338,12 @@ local function drop_escaping_links(call, artifact, symlinks)
     DROP_ESCAPING_LINKS,
     "bash",
     artifact.snapshot,
-  }, { env = artifact.git_env, timeout_ms = artifact.timeout_ms, stdin = table.concat(paths, "\0") .. "\0" })
+  }, {
+    env = artifact.git_env,
+    timeout_ms = artifact.timeout_ms,
+    stdin = table.concat(paths, "\0") .. "\0",
+    display = "remove external snapshot symlinks",
+  })
   if not out then
     return nil, err
   end
@@ -375,7 +354,8 @@ local function drop_escaping_links(call, artifact, symlinks)
     names[#names + 1] = path
   end
   if #names > 0 then
-    artifact.notes[#artifact.notes + 1] = "maki removed external symlinks from the snapshot: " .. M.shown(names)
+    artifact.notes[#artifact.notes + 1] = "maki removed external symlinks from the snapshot: "
+      .. path_utils.shown(names)
   end
   return dropped
 end
@@ -458,7 +438,7 @@ local function consistency_problem(call, artifact, spec)
       end
     end
     return "the checkout changed during the snapshot: "
-      .. M.shown(paths)
+      .. path_utils.shown(paths)
       .. ". Try again after these edits are complete."
   end
   return nil
@@ -512,7 +492,7 @@ function M.fill(call, artifact, spec)
     return unsettled_err
   end
   if #unsettled > 0 then
-    artifact.unsettled = M.shown(unsettled)
+    artifact.unsettled = path_utils.shown(unsettled)
     artifact.notes[#artifact.notes + 1] = "dependencies changed during the copy, so they may mix two versions: "
       .. artifact.unsettled
   end
@@ -679,7 +659,7 @@ function M.sanitize(artifact)
   end
   if #paths.git_metadata > 0 then
     artifact.notes[#artifact.notes + 1] = "maki preserved the Git metadata for "
-      .. M.shown(paths.git_metadata)
+      .. path_utils.shown(paths.git_metadata)
       .. " in "
       .. quarantine
       .. ". Their ordinary files remain in the snapshot."
@@ -690,7 +670,7 @@ function M.sanitize(artifact)
       artifact.repositories[path] = true
     end
     artifact.notes[#artifact.notes + 1] = "maki quarantined the embedded repository metadata for "
-      .. M.shown(paths.repositories)
+      .. path_utils.shown(paths.repositories)
       .. " in "
       .. quarantine
       .. ". Apply these changes manually."
@@ -765,7 +745,7 @@ local function commit_prepared(call, artifact)
   end
   local paths = git_utils.listed_paths(changed)
   if #paths > 0 then
-    artifact.notes[#artifact.notes + 1] = PREPARED:format(M.shown(paths))
+    artifact.notes[#artifact.notes + 1] = PREPARED:format(path_utils.shown(paths))
   end
   artifact.base = prepared
 end
@@ -805,7 +785,7 @@ function M.collect(call, artifact, project)
   end
   if #unrecorded > 0 then
     artifact.notes[#artifact.notes + 1] = "gitignored output stays in the snapshot and is outside the import: "
-      .. M.shown(unrecorded)
+      .. path_utils.shown(unrecorded)
   end
   local tree, tree_err = snapshot_git(call, artifact, { "write-tree" })
   if not tree then
@@ -834,7 +814,7 @@ function M.collect(call, artifact, project)
       or workspace.kind(change, binary)
   end
   if #unnamed > 0 then
-    artifact.notes[#artifact.notes + 1] = NOT_UTF8_CHANGES:format(M.shown(unnamed), artifact.snapshot)
+    artifact.notes[#artifact.notes + 1] = NOT_UTF8_CHANGES:format(path_utils.shown(unnamed), artifact.snapshot)
   end
   local manifest = {
     version = workspace.MANIFEST_VERSION,

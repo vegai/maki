@@ -38,6 +38,23 @@ local function owner_executes(call, cwd, paths, keep_on_cancel, timeout_ms)
   return executes
 end
 
+local function disk_blobs(call, env, cwd, paths, keep_on_cancel, timeout_ms)
+  if #paths == 0 then
+    return {}
+  end
+  local out, err = call:run_quick(git_utils.git({ "hash-object", "--no-filters", "--stdin-paths" }), {
+    env = env,
+    cwd = cwd,
+    stdin = git_utils.quoted_lines(paths),
+    keep_on_cancel = keep_on_cancel,
+    timeout_ms = timeout_ms,
+  })
+  if not out then
+    return nil, err
+  end
+  return maki.split(out, "\n")
+end
+
 -- Maps each path to its `file_state`, false when missing, or a note when it
 -- is not a regular file. Hashes use the object format of {artifact}'s
 -- repository, which can differ from the checkout's.
@@ -58,7 +75,7 @@ local function checkout_state(call, artifact, changes, keep_on_cancel)
       state[change.path] = "not a file"
     end
   end
-  local blobs, err = snapshot.disk_blobs(call, git_env, project, files, keep_on_cancel, timeout_ms)
+  local blobs, err = disk_blobs(call, git_env, project, files, keep_on_cancel, timeout_ms)
   if not blobs then
     return nil, err
   end
@@ -182,7 +199,7 @@ local function check_import(call, artifact, todo)
   local conflicts = workspace.conflicts(todo, current)
   if #conflicts > 0 then
     return "maki imported no changes: these files changed in the checkout after the snapshot: "
-      .. snapshot.shown(conflicts)
+      .. path_utils.shown(conflicts)
       .. ". Merge them manually from "
       .. maki.fs.joinpath(artifact.dir, path_utils.SNAPSHOT_DIR)
       .. ", or import the remaining changes with `paths`."
@@ -293,7 +310,7 @@ local function apply_import(ctx, call, artifact, todo)
     for i, change in ipairs(todo) do
       paths[i] = change.path
     end
-    return nil, err .. "\nmaki cannot read the checkout (" .. now_err .. "). Examine " .. snapshot.shown(paths) .. "."
+    return nil, err .. "\nmaki cannot read the checkout (" .. now_err .. "). Examine " .. path_utils.shown(paths) .. "."
   end
   local written = maki.split(maki.fs.read(receipt) or "", "\0")
   maki.fs.rm(receipt)
@@ -417,9 +434,9 @@ end
 --- {missed}, other notes for the user, and why it stopped.
 function M.stopped_partway(applied, missed, notes, failure)
   return "the import stopped before it completed. It applied "
-    .. snapshot.shown(applied)
+    .. path_utils.shown(applied)
     .. ", and not "
-    .. snapshot.shown(missed)
+    .. path_utils.shown(missed)
     .. "."
     .. notes
     .. "\n"

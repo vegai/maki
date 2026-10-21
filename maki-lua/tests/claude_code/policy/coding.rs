@@ -26,14 +26,13 @@ use test_case::test_case;
 use super::super::support::{
     ARTIFACT_LINE, BASH_SRC, DEADLINE, IMPORT_TOOL, LEFT_BEHIND, NOTHING_IMPORTED, ORIGINALS,
     PWNED, SNAPSHOT_DIR, TOOL, WRITE_SRC, artifact_listing, commit_all, contents, environment,
-    executable, git, listing, load, mode_bits_hold, on_path, tool_reply, try_load, wait_until,
-    write,
+    executable, git, listing, load, mode_bits_hold, on_path, tool_reply, try_load,
+    use_fixture_user, wait_until, write,
 };
 use super::{
     ANSWERS, CODE_CLAUDE_CONFIG, CODE_EDIT, CODE_HANG, CODE_HOSTILE, CODE_LONG, CODE_PROFILE,
     CODE_RETYPE, FakeClaude, HOOK_SENTINEL, HOOKS_FILE, HOOKS_OFF, HOSTILE_NAME, MODEL_ALIAS,
-    NO_ANSWER_IN_TIME, ONE_SLOT, STOPPED_EXIT, WORKING, add_a_managed_hook, ctx_in,
-    within_deadline,
+    NO_ANSWER_IN_TIME, ONE_SLOT, STOPPED_EXIT, WORKING, add_a_managed_hook, ctx_in, within,
 };
 
 const LARGE_IMPORT_CHANGES: usize = 1024;
@@ -447,7 +446,7 @@ fn run_tool(
     tool: &str,
     input: Value,
 ) -> Result<String, String> {
-    smol::block_on(within_deadline(tool_reply(reg, ctx, tool, input)))
+    smol::block_on(within(DEADLINE, tool_reply(reg, ctx, tool, input)))
 }
 
 /// Returns every import temporary file in or under `dir`.
@@ -711,6 +710,24 @@ fn denied_reads(filesystem: &Value) -> Vec<PathBuf> {
         .filter_map(Value::as_str)
         .map(PathBuf::from)
         .collect()
+}
+
+#[test_case("XDG_STATE_HOME" ; "state_directory")]
+#[test_case("XDG_CONFIG_HOME" ; "config_directory")]
+fn coding_sandboxes_hide_resolved_maki_directories(variable: &str) {
+    use_fixture_user();
+    let coding = Coding::new();
+    let root = tempdir().unwrap();
+    let target = root.path().join("resolved");
+    let alias = root.path().join("alias");
+    fs::create_dir_all(target.join("maki")).unwrap();
+    symlink(&target, &alias).unwrap();
+    environment::set(variable, &alias);
+    let (registry, _host) = coding.host(&[]);
+    coding.code(&registry, CODE_EDIT, &[]).unwrap();
+    let denied = denied_reads(&sandbox_filesystem(&coding.fake));
+    assert!(denied.contains(&alias.join("maki")), "{denied:?}");
+    assert!(denied.contains(&target.join("maki")), "{denied:?}");
 }
 
 #[test]

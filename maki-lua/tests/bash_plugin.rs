@@ -4,7 +4,6 @@
 #![cfg(unix)]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use maki_agent::AgentMode;
 use maki_agent::ToolOutput;
@@ -19,10 +18,9 @@ use test_case::test_case;
 #[allow(dead_code)]
 mod support;
 
-use support::{BASH_SRC, environment, executable, within};
+use support::{BASH_SRC, DEADLINE, environment, executable, within};
 
 const BASH_TOOL: &str = "bash";
-const DEADLINE: Duration = Duration::from_secs(60);
 /// A fake `rtk` that rewrites every command into one printing @REWRITTEN@.
 const REWRITING_RTK: &str =
     "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\necho 'echo @REWRITTEN@'\n";

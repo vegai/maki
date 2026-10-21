@@ -529,9 +529,10 @@ struct BackgroundModels {
     warn_tx: flume::Sender<String>,
     models_rx: flume::Receiver<()>,
     models_tx: flume::Sender<()>,
-    task: Task<()>,
+    fetch: ModelFetch,
 }
 
+#[derive(Default)]
 struct ModelFetch {
     task: Option<Task<()>>,
     pending: Option<ModelListing>,
@@ -540,12 +541,7 @@ struct ModelFetch {
 impl ModelFetch {
     fn request(&mut self, listing: ModelListing, start: impl FnOnce(ModelListing) -> Task<()>) {
         if self.task.is_some() {
-            self.pending = Some(match (self.pending, listing) {
-                (Some(ModelListing::Refresh), _) | (_, ModelListing::Refresh) => {
-                    ModelListing::Refresh
-                }
-                _ => ModelListing::Cached,
-            });
+            self.pending = Some(self.pending.unwrap_or(listing).max(listing));
         } else {
             self.task = Some(start(listing));
         }
@@ -596,20 +592,23 @@ fn spawn_model_fetch(policy: Arc<ModelPolicy>) -> BackgroundModels {
     let available: Arc<ArcSwapOption<ModelList>> = Arc::new(ArcSwapOption::empty());
     let (warn_tx, warn_rx) = flume::unbounded::<String>();
     let (models_tx, models_rx) = flume::bounded::<()>(1);
-    let task = fetch_models(
-        Arc::clone(&available),
-        policy,
-        warn_tx.clone(),
-        models_tx.clone(),
-        ModelListing::Cached,
-    );
+    let mut fetch = ModelFetch::default();
+    fetch.request(ModelListing::Cached, |listing| {
+        fetch_models(
+            Arc::clone(&available),
+            policy,
+            warn_tx.clone(),
+            models_tx.clone(),
+            listing,
+        )
+    });
     BackgroundModels {
         available,
         warn_rx,
         warn_tx,
         models_rx,
         models_tx,
-        task,
+        fetch,
     }
 }
 
@@ -762,10 +761,7 @@ impl<'t> EventLoop<'t> {
             pack_tx,
             pack_rx,
             pack_running: false,
-            model_fetch: ModelFetch {
-                task: Some(bg.task),
-                pending: None,
-            },
+            model_fetch: bg.fetch,
         })
     }
 

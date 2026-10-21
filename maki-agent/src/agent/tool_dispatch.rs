@@ -479,10 +479,6 @@ pub fn callable(ctx: &ToolContext) -> Vec<Callable> {
     // A name belongs to the first source dispatch would reach, claimed before
     // any filter runs: a registry tool this audience may not call still owns its
     // name, or MCP would publish a way around it.
-    let mut claim = |name: &str, offered: bool| {
-        let first = claimed.insert(name.to_owned());
-        first && offered
-    };
     let entry_of = |name: &str, source, audience, schema| Callable {
         name: name.to_owned(),
         alias: None,
@@ -494,13 +490,13 @@ pub fn callable(ctx: &ToolContext) -> Vec<Callable> {
     let mut local: Vec<(&String, &LocalTool)> = ctx.local_tools.iter().collect();
     local.sort_by(|a, b| a.0.cmp(b.0));
     for (name, tool) in local {
-        if claim(name, offered(ctx, name, &Route::Local(tool))) {
+        if claimed.insert(name.to_owned()) && offered(ctx, name, &Route::Local(tool)) {
             out.push(entry_of(name, SOURCE_LOCAL, tool.audience, None));
         }
     }
     for entry in ctx.registry.iter().iter() {
         let audience = entry.tool.audience();
-        if !claim(entry.name(), offered_native(ctx, entry.name(), entry)) {
+        if !claimed.insert(entry.name().to_owned()) || !offered_native(ctx, entry.name(), entry) {
             continue;
         }
         out.push(entry_of(
@@ -524,7 +520,7 @@ pub fn callable(ctx: &ToolContext) -> Vec<Callable> {
             } else {
                 continue;
             };
-            if claim(&name, offered(ctx, &name, &route)) {
+            if claimed.insert(name.clone()) && offered(ctx, &name, &route) {
                 out.push(entry_of(&name, SOURCE_MCP, ToolAudience::all(), None));
             }
         }

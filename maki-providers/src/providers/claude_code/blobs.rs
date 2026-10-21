@@ -17,11 +17,9 @@ pub fn unpack(batch: &Path, stage: &Path, hashes: &[String]) -> io::Result<()> {
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )?);
-    let metadata = input.metadata()?;
-    if !metadata.is_file() {
+    if !input.metadata()?.is_file() {
         return Err(io::Error::other(INVALID_BATCH));
     }
-    let mut remaining = metadata.len();
     let mut input = BufReader::new(input);
     for hash in hashes {
         if !OBJECT_ID_LENGTHS.contains(&hash.len())
@@ -44,11 +42,6 @@ pub fn unpack(batch: &Path, stage: &Path, hashes: &[String]) -> io::Result<()> {
                     "{INVALID_BATCH}: unexpected header {header_text:?} for {hash}"
                 ))
             })?;
-        remaining = remaining
-            .checked_sub(header.len() as u64)
-            .and_then(|remaining| remaining.checked_sub(size))
-            .and_then(|remaining| remaining.checked_sub(1))
-            .ok_or_else(|| io::Error::other(INVALID_BATCH))?;
         let mut output = File::from(openat(
             &stage,
             hash.as_str(),
@@ -64,7 +57,7 @@ pub fn unpack(batch: &Path, stage: &Path, hashes: &[String]) -> io::Result<()> {
             return Err(io::Error::other(INVALID_BATCH));
         }
     }
-    if remaining != 0 || !input.fill_buf()?.is_empty() {
+    if !input.fill_buf()?.is_empty() {
         return Err(io::Error::other(INVALID_BATCH));
     }
     Ok(())

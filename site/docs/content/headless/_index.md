@@ -138,8 +138,11 @@ run can resume it with `-c` or `-r <id>`. `text` output prints `session: <id>`
 on stderr to keep stdout clean for pipes. `json` and `stream-json` return it as
 `session_id`.
 
-Maki saves at the end of each turn, so a run that dies before its first turn
-stores nothing. If a save fails, for example on a full disk, Maki prints
+Maki checkpoints the transcript during a turn and saves when the turn ends.
+An empty run stores nothing. Provider errors are stored separately from model
+messages, with a timestamp and transcript position. The session keeps up to
+256 recent errors, each limited to 16 KiB. If a save fails, for example on a full
+disk, Maki prints
 `maki: failed to save session <id>` on stderr. The exit code ignores save
 failures, so check stderr before a script resumes with `-c`.
 

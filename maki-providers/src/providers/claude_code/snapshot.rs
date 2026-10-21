@@ -154,9 +154,7 @@ fn restore_pointer(root: &File, quarantine: &Path, git: &Path) -> io::Result<()>
                 .take(expected.len() as u64 + 1)
                 .read_to_end(&mut content)?;
             if content == expected.as_bytes() {
-                if metadata.nlink() > 1 {
-                    private_copy(root, GIT_ENTRY)?;
-                }
+                private_copy(root, GIT_ENTRY)?;
                 return Ok(());
             }
         }
