@@ -7,7 +7,7 @@ use super::super::stream::control_request;
 use crate::process::guard;
 use crate::process::kill_group;
 #[cfg(unix)]
-use crate::process::{group_of, wait_without_reaping};
+use crate::process::{pid_of, wait_without_reaping};
 use flume::Receiver;
 use futures_lite::future;
 use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -101,7 +101,7 @@ impl Group {
             return;
         }
         #[cfg(unix)]
-        if let Some(pid) = group_of(self.child.id())
+        if let Some(pid) = pid_of(self.child.id())
             && let Err(error) = kill_process(pid, Signal::TERM)
             && error != Errno::SRCH
         {

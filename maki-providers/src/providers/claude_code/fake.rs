@@ -12,6 +12,7 @@ use rustix::process::{Pid, Signal, kill_process, test_kill_process_group};
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
 
+pub(super) use super::WAIT;
 use super::error::Error;
 use super::run::{Exchange, Launch, Limits, Request, Thinking, request};
 use crate::{Message, ProviderEvent, ProviderUsage, StreamResponse};
@@ -23,9 +24,6 @@ pub(super) const IDLE: Duration = Duration::from_secs(10);
 /// Generous for a loaded machine. Only a test that waits out the whole
 /// limit uses the short one.
 pub(super) const EXIT_LIMIT: Duration = Duration::from_secs(30);
-/// Only a failed test reaches this deadline. Allow several seconds for child startup on a
-/// loaded machine.
-pub(super) const WAIT: Duration = Duration::from_secs(30);
 pub(super) const TEMP_BASE: &str = "tmp";
 const PROC: &str = "/proc";
 pub(super) const POLL: Duration = Duration::from_millis(10);

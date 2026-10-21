@@ -77,7 +77,7 @@ fn runnable(path: &Path) -> bool {
 
 /// A child started as a group leader has its pid as the group id.
 #[cfg(unix)]
-pub fn group_of(pid: u32) -> Option<Pid> {
+pub fn pid_of(pid: u32) -> Option<Pid> {
     i32::try_from(pid).ok().and_then(Pid::from_raw)
 }
 
@@ -85,7 +85,7 @@ pub fn group_of(pid: u32) -> Option<Pid> {
 /// group. Return false if the wait fails.
 #[cfg(unix)]
 pub fn wait_without_reaping(pid: u32) -> bool {
-    let Some(pid) = group_of(pid) else {
+    let Some(pid) = pid_of(pid) else {
         return false;
     };
     loop {
@@ -103,7 +103,7 @@ pub fn wait_without_reaping(pid: u32) -> bool {
 /// is reaped, because the kernel can hand a reaped pid to another group.
 pub fn kill_group(pid: u32) {
     #[cfg(unix)]
-    if let Some(group) = group_of(pid)
+    if let Some(group) = pid_of(pid)
         && let Err(err) = kill_process_group(group, Signal::KILL)
         && err != Errno::SRCH
     {

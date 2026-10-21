@@ -13,7 +13,7 @@ use rustix::fs::{
 use rustix::path::Arg;
 
 use super::DIRECTORY_FLAGS;
-use super::validation::GIT_ENTRY;
+use super::checks::GIT_ENTRY;
 
 const MAX_DEPTH: usize = 64;
 const DEPTH_EXCEEDED: &str = "snapshot exceeds";

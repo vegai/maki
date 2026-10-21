@@ -266,23 +266,23 @@ function M.deny_rules(extra)
   return rules
 end
 
-local function worker_policy(deny_read, worker, confine)
+local function worker_policy(spec)
   return {
-    deny = deny_read,
-    sandbox = worker.sandboxed and assert(confine, "a sandboxed worker needs confinement paths") or nil,
+    deny = spec.deny,
+    sandbox = spec.worker.sandboxed and assert(spec.confine, "a sandboxed worker needs confinement paths") or nil,
   }
 end
 
-function M.worker_handshake(deny_read, worker, confine)
-  return native.worker_handshake(worker.reported_modes, worker_policy(deny_read, worker, confine))
+function M.worker_handshake(spec)
+  return native.worker_handshake(spec.worker.reported_modes, worker_policy(spec))
 end
 
 --- `--setting-sources ""` drops the user's hooks, permissions and MCP
 --- servers, and these settings turn off what Claude Code loads on its own. A
---- {worker} that runs commands gets the sandbox with {confine}'s absolute
+--- Workers that run commands use the sandbox with {spec.confine}'s absolute
 --- paths, and Bash runs only inside it.
-function M.settings(deny_read, worker, confine)
-  return native.worker_settings(worker_policy(deny_read, worker, confine))
+function M.settings(spec)
+  return native.worker_settings(worker_policy(spec))
 end
 
 --- Returns how many whole seconds a call can run: {requested} or
@@ -299,6 +299,14 @@ function M.control_request(request)
   }) .. "\n"
 end
 
+function M.handshake_input()
+  local requests = {}
+  for _, request in ipairs(M.HANDSHAKE) do
+    requests[#requests + 1] = M.control_request(request)
+  end
+  return table.concat(requests)
+end
+
 --- Sent on stdin, so the process list never shows the task.
 --- {instructions} come first, because Claude Code loads none by itself.
 function M.user_message(prompt, instructions)
@@ -312,7 +320,7 @@ function M.user_message(prompt, instructions)
   return maki.json.encode({ type = "user", message = { role = "user", content = content } }) .. "\n"
 end
 
---- {spec} has the executable, model, deny_read and worker, plus `confine`
+--- {spec} has the executable, model, deny and worker, plus `confine`
 --- for a sandboxed worker.
 function M.argv(spec)
   local worker = spec.worker
@@ -320,7 +328,7 @@ function M.argv(spec)
     spec.model,
     table.concat(worker.tools, ","),
     worker.permission_mode,
-    maki.json.encode(M.settings(spec.deny_read, worker, spec.confine))
+    maki.json.encode(M.settings(spec))
   )
   table.insert(args, 1, spec.executable)
   local extra = {
@@ -369,13 +377,13 @@ end
 --
 -- Keep the probe outside a coding artifact. Refusal removes that artifact, but a managed
 -- hook's output must remain available.
-function M.probe(call, spec, argv, env, confine, deny_read)
+function M.probe(call, spec, argv, env)
   local dir, dir_err = probe_dir(spec.env, spec)
   if not dir then
     return dir_err
   end
   local stream = Stream.new({ cwd = dir, worker = spec.worker, cli = spec.cli })
-  local handshake = M.worker_handshake(deny_read, spec.worker, confine)
+  local handshake = M.worker_handshake(spec)
   local problem, stderr_tail = nil, {}
   local ok, code, _, run_error = pcall(call.run_to_end, call, argv, M.job_opts(dir, env, stderr_tail), {
     leftover = function()
@@ -392,11 +400,7 @@ function M.probe(call, spec, argv, env, confine, deny_read)
       end
     end,
     started = function(id)
-      local requests = {}
-      for _, request in ipairs(M.HANDSHAKE) do
-        requests[#requests + 1] = M.control_request(request)
-      end
-      return jobs.feed_stdin(id, table.concat(requests))
+      return jobs.feed_stdin(id, M.handshake_input())
     end,
   }, M.STARTUP_MS)
   if not ok then

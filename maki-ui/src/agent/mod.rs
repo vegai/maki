@@ -308,6 +308,7 @@ mod tests {
     const SHORT_TIMEOUT: Duration = Duration::from_millis(50);
     const PROBE_TEXT: &str = "probe-through-old-sender";
     const RESTORED_TEXT: &str = "restored-queued-message";
+    const DUPLICATE_CONSUMPTION: &str = "the restored item must be consumed once";
     const RESUMED_HISTORY_TEXT: &str = "resumed-conversation";
     const MODEL_A: &str = "model-a";
     const MODEL_B: &str = "model-b";
@@ -638,12 +639,20 @@ mod tests {
                 AgentEvent::QueueItemConsumed { ref text, .. } => {
                     assert_eq!(text, RESTORED_TEXT);
                     assert_eq!(envelope.run_id, app.run_id);
-                    assert!(!consumed_seen, "the restored item must be consumed once");
+                    assert!(!consumed_seen, "{DUPLICATE_CONSUMPTION}");
                     consumed_seen = true;
                 }
                 _ => {}
             }
         }
+        smol::block_on(handles.task.cancel());
+        assert!(
+            !handles
+                .agent_rx
+                .try_iter()
+                .any(|envelope| matches!(envelope.event, AgentEvent::QueueItemConsumed { .. })),
+            "{DUPLICATE_CONSUMPTION}"
+        );
         assert!(app.queue.text_messages().is_empty());
     }
 

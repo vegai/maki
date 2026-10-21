@@ -147,7 +147,7 @@ fn jobstart(
     let mut tail = None;
 
     if let Some(ref opts) = opts {
-        spec.cwd = opts.opt("cwd").ok().flatten();
+        spec.cwd = opts.opt("cwd")?;
         spec.env = opts.opt::<HashMap<String, String>>("env")?;
         spec.clear_env = opts.get::<Option<bool>>("clear_env")?.unwrap_or(false);
         spec.guard = opts.get::<Option<bool>>("guard")?.unwrap_or(false);
@@ -165,7 +165,7 @@ fn jobstart(
         spec.on_exit = callback_key(lua, opts, "on_exit")?;
         spec.stdout = parse_redirect(opts, "stdout", spec.on_stdout.is_some(), fs_write)?;
         spec.stderr = parse_redirect(opts, "stderr", spec.on_stderr.is_some(), fs_write)?;
-        tail = opts.opt("tail").ok().flatten();
+        tail = opts.opt("tail")?;
         if let Some(n) = tail
             && n > MAX_TAIL_LINES
         {
@@ -234,8 +234,7 @@ fn parse_redirect(
 }
 
 fn callback_key(lua: &Lua, opts: &Table, key: &str) -> LuaResult<Option<RegistryKey>> {
-    opts.get::<Function>(key)
-        .ok()
+    opts.get::<Option<Function>>(key)?
         .map(|f| lua.create_registry_value(f))
         .transpose()
 }

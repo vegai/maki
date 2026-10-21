@@ -503,7 +503,6 @@ mod tests {
     use std::io;
     use std::net::{Ipv4Addr, Shutdown};
     use std::sync::Arc;
-    use std::time::Duration;
 
     use flume::Receiver;
     use futures_lite::FutureExt;
@@ -514,6 +513,7 @@ mod tests {
     use smol::net::{TcpListener, TcpStream};
     use test_case::test_case;
 
+    use super::super::WAIT;
     use super::super::error::Error;
     use super::{
         ACCEPTED, BAD_REQUEST, CONTENT_TOO_LARGE, ENDPOINT, HEADERS_TOO_LARGE, Handoff, INITIALIZE,
@@ -528,8 +528,6 @@ mod tests {
     const UNKNOWN_VERSION: &str = "2099-01-01";
     const TOOL: &str = "read";
     const TOOL_USE_ID: &str = "toolu_1";
-    /// A failed handoff must fail the test so the suite can continue.
-    const WAIT: Duration = Duration::from_secs(30);
     /// A body length the request announces but never sends.
     const BODY_NEVER_SENT: usize = 1000;
 

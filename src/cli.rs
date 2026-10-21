@@ -5,11 +5,11 @@ use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use maki_storage::sessions::{Effort, StoredThinking, ThinkingParseError};
 
 use crate::print::OutputFormat;
+use maki_agent::mcp::WIRE_SEPARATOR;
 
 const SDK_THINKING_ENABLED: &str = "enabled";
 const SDK_THINKING_DISABLED: &str = "disabled";
 const CLAUDE_MCP_PREFIX: &str = "mcp__";
-const MCP_SEPARATOR: &str = "__";
 pub(crate) const TOOL_ARGUMENT_PATTERNS_UNSUPPORTED: &str =
     "tool argument patterns are not supported; use tool names";
 
@@ -412,7 +412,7 @@ pub fn normalize_tool_name(name: &str) -> String {
     let name = name
         .strip_prefix(CLAUDE_MCP_PREFIX)
         .filter(|name| {
-            name.split_once(MCP_SEPARATOR)
+            name.split_once(WIRE_SEPARATOR)
                 .is_some_and(|(server, tool)| !server.is_empty() && !tool.is_empty())
         })
         .unwrap_or(name);

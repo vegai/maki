@@ -192,7 +192,7 @@ impl UserData for WorkerHandshake {
             Ok(pair(this.0.finish().map(|()| true)))
         });
         methods.add_method("resolved_model", |_, this, requested: String| {
-            Ok(validation::resolved_model(this.0.account(), &requested).map(str::to_owned))
+            Ok(this.0.resolved_model(&requested).map(str::to_owned))
         });
         methods.add_method("subscription_type", |_, this, ()| {
             Ok(validation::subscription_type(this.0.account()))
@@ -431,13 +431,7 @@ fn classify(lua: &Lua, line: String, mode: Table) -> LuaResult<Pair<Table>> {
         result.set("usage", json_to_lua(lua, usage)?)?;
     }
     if let Some(rate_limit) = &classified.rate_limit {
-        result.set(
-            "rate_limit",
-            json_to_lua(
-                lua,
-                &serde_json::to_value(rate_limit).map_err(mlua::Error::external)?,
-            )?,
-        )?;
+        result.set("rate_limit", lua.to_value(rate_limit)?)?;
     }
     Ok((Some(result), None))
 }

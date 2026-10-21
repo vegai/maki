@@ -303,7 +303,7 @@ local function run(input, ctx, call, timeout_secs)
   -- The sandbox settings contain the artifact's paths, and the probe checks
   -- the same settings and environment as the run, so the artifact comes
   -- first.
-  local artifact, confine
+  local artifact
   local env = spec.env
   if plan then
     local artifact_err
@@ -313,26 +313,20 @@ local function run(input, ctx, call, timeout_secs)
     end
     call.artifact = artifact
     local confine_err
-    confine, confine_err = coding_confine(spec, artifact)
-    if not confine then
+    spec.confine, confine_err = coding_confine(spec, artifact)
+    if not spec.confine then
       return refuse(confine_err)
     end
     env = table.clone(spec.env)
     env.TMPDIR = artifact.tmp
   end
-  local argv = launch.argv({
-    executable = spec.executable,
-    model = spec.model,
-    deny_read = spec.deny,
-    worker = spec.worker,
-    confine = confine,
-  })
-  local probe_problem = launch.probe(call, spec, argv, env, confine, spec.deny)
+  local argv = launch.argv(spec)
+  local probe_problem = launch.probe(call, spec, argv, env)
   if probe_problem then
     return refuse(probe_problem)
   end
 
-  local claude = Run.new(ctx, call, spec, confine, timeout_secs, opts)
+  local claude = Run.new(ctx, call, spec, timeout_secs, opts)
   if not artifact then
     claude.view:append({ { STARTING, "dim" } })
     return claude:build(claude:start(argv, spec.cwd, env, input.prompt))

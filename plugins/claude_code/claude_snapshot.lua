@@ -359,7 +359,6 @@ local function drop_escaping_links(call, artifact, symlinks)
   local out, err = call:run_quick({
     "xargs",
     "-0",
-    "-r",
     "bash",
     "-c",
     DROP_ESCAPING_LINKS,
@@ -398,10 +397,17 @@ local function commit_base(call, artifact, paths, dependencies)
   local _, mkdir_err = maki.fs.mkdir(info)
   local _, attributes_err = maki.fs.write(maki.fs.joinpath(info, "attributes"), git_utils.RAW_ATTRIBUTES)
   local _, exclude_err = maki.fs.write(maki.fs.joinpath(info, "exclude"), table.concat(exclude))
-  local link_err, dropped = M.sanitize(artifact, call)
-  local setup_err = mkdir_err or attributes_err or exclude_err or link_err
+  if call.stopped then
+    return jobs.CANCELLED
+  end
+  local symlinks, metadata_err = M.sanitize(artifact)
+  local setup_err = mkdir_err or attributes_err or exclude_err or metadata_err
   if setup_err then
     return "maki cannot make the repository of the snapshot: " .. setup_err
+  end
+  local dropped, link_err = drop_escaping_links(call, artifact, symlinks)
+  if not dropped then
+    return link_err
   end
   if artifact.repositories or next(dropped) then
     local kept = {}
@@ -665,14 +671,11 @@ end
 
 -- Git traverses nested repositories during ordinary status commands. Keep their metadata
 -- outside the work tree, without discarding the worker's files or repository objects.
-function M.sanitize(artifact, call)
-  if call and call.stopped then
-    return jobs.CANCELLED
-  end
+function M.sanitize(artifact)
   local quarantine = maki.fs.joinpath(artifact.dir, QUARANTINE_DIR)
   local paths, err = native.sanitize_git(artifact.snapshot, quarantine, artifact.git)
   if not paths then
-    return err
+    return nil, err
   end
   if #paths.git_metadata > 0 then
     artifact.notes[#artifact.notes + 1] = "maki preserved the Git metadata for "
@@ -697,10 +700,7 @@ function M.sanitize(artifact, call)
       .. paths.private_files
       .. " hard-linked files in the snapshot"
   end
-  if call then
-    local dropped, link_err = drop_escaping_links(call, artifact, paths.symlinks)
-    return link_err, dropped
-  end
+  return paths.symlinks
 end
 
 local function stage_changes(call, artifact)
@@ -738,9 +738,16 @@ end
 -- Preparation changes become the worker baseline. The checkout lacks these
 -- changes, so files the worker changes again cannot be imported.
 local function commit_prepared(call, artifact)
-  local metadata_err = M.sanitize(artifact, call)
-  if metadata_err then
+  if call.stopped then
+    return jobs.CANCELLED
+  end
+  local symlinks, metadata_err = M.sanitize(artifact)
+  if not symlinks then
     return metadata_err
+  end
+  local dropped, link_err = drop_escaping_links(call, artifact, symlinks)
+  if not dropped then
+    return link_err
   end
   local ignored, add_err = stage_changes(call, artifact)
   if not ignored then
@@ -782,7 +789,7 @@ end
 -- Sanitation moves metadata before restoring the trusted root pointer, so a worker link
 -- cannot redirect the write.
 function M.collect(call, artifact, project)
-  local metadata_err = M.sanitize(artifact)
+  local _, metadata_err = M.sanitize(artifact)
   if metadata_err then
     return nil, metadata_err
   end

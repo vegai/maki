@@ -429,12 +429,25 @@ pub(crate) struct Handshake {
 }
 
 impl Handshake {
-    pub fn offered(&self) -> impl Iterator<Item = (&str, &str)> {
+    fn offered(&self) -> impl Iterator<Item = (&str, &str)> {
         self.account()["models"]
             .as_array()
             .into_iter()
             .flatten()
-            .filter_map(|offer| Some((offer["value"].as_str()?, offer["resolvedModel"].as_str()?)))
+            .filter_map(|offer| {
+                let name = offer["value"].as_str()?;
+                let model = offer["resolvedModel"].as_str()?;
+                (!name.is_empty() && !model.is_empty()).then_some((name, model))
+            })
+    }
+
+    pub fn models(&self) -> impl Iterator<Item = &str> {
+        self.offered().map(|(_, model)| model)
+    }
+
+    pub fn resolved_model(&self, requested: &str) -> Option<&str> {
+        self.offered()
+            .find_map(|(name, model)| (name == requested).then_some(model))
     }
 
     pub(crate) fn feed(
@@ -591,7 +604,7 @@ impl<'a> Turn<'a> {
     }
 
     /// Only a held call is missing.
-    pub fn awaits_handoff(&self) -> bool {
+    fn awaits_handoff(&self) -> bool {
         self.is_complete() && self.calls_tools() && self.parked.is_empty() && !self.rejected
     }
 
@@ -1107,9 +1120,13 @@ impl<'a> Turn<'a> {
 /// runs them by its own names. An unknown name stays, so maki reports it.
 fn unexpose_batch(catalog: &Catalog, input: &mut Value) {
     if let Some(Value::String(encoded)) = input.get(BATCH_CALLS)
-        && let Some(Value::Array(calls)) = serde_json::from_str(encoded)
-            .ok()
-            .or_else(|| repair_loads(encoded, &RepairOptions::default()).ok())
+        && matches!(encoded.trim().as_bytes().first(), Some(b'[' | b'{'))
+        && let Some(Value::Array(calls)) = serde_json::from_str(encoded).ok().or_else(|| {
+            repair_loads(encoded, &RepairOptions::default())
+                .ok()
+                .filter(Value::is_array)
+                .inspect(|_| debug!(input = %line_preview(encoded), "repaired malformed JSON"))
+        })
     {
         input[BATCH_CALLS] = Value::Array(calls);
     }
@@ -1201,10 +1218,11 @@ mod tests {
     use super::super::transcript::Catalog;
     use super::{
         ACCOUNT_ANSWER, API_ERROR_MARK, BATCH_CALL_TOOL, BATCH_CALLS, BATCH_TOOL, EXTRA_USAGE,
-        EXTRA_USAGE_IN_USE, EventKind, HOOKS_ANSWER, INPUT_REJECTED, MAX_TOKENS_STOP,
+        EXTRA_USAGE_IN_USE, EventKind, HOOKS_ANSWER, Handshake, INPUT_REJECTED, MAX_TOKENS_STOP,
         MAX_TURNS_ERROR, NO_SUCH_TOOL, PLAN_REJECTED, RATE_LIMITED, REFUSAL_STOP, RESULT_EVENT,
         SETTINGS_ANSWER, SHOWN_LINE_CHARS, SUCCESS, Step, StreamMode, StreamedText, TOOL_RESULT,
-        TOOL_USE_STOP, Turn, WINDOW_FULL_STOP, classify, result_failure, usage_of, user_message,
+        TOOL_USE_STOP, Turn, WINDOW_FULL_STOP, classify, result_failure, unexpose_batch, usage_of,
+        user_message,
     };
     use crate::{ContentBlock, StopReason, StreamResponse};
 
@@ -1898,6 +1916,15 @@ mod tests {
         check_batch_input(json!({ BATCH_CALLS: encoded }), TOOL);
     }
 
+    #[test_case("/* calls */" ; "block_comment")]
+    #[test_case("// calls\n" ; "line_comment")]
+    fn batch_repair_requires_a_json_container_prefix(prefix: &str) {
+        let encoded = format!("{prefix}{}", json!([{ BATCH_CALL_TOOL: EXPOSED }]));
+        let mut input = json!({ BATCH_CALLS: encoded });
+        unexpose_batch(&catalog(), &mut input);
+        assert_eq!(input[BATCH_CALLS], encoded);
+    }
+
     fn check_batch_names(inner: &str, expected: &str, encoded: bool) {
         let calls = json!([{ BATCH_CALL_TOOL: inner, "parameters": { "path": "a" } }]);
         let input =
@@ -2262,5 +2289,31 @@ mod tests {
         let want = [("default", OPUS), ("opus", OPUS), ("haiku", RAN)]
             .map(|(name, model)| (name.to_owned(), model.to_owned()));
         assert_eq!(offered, want);
+    }
+
+    #[test_case(json!("opus"), json!(OPUS), Some(OPUS) ; "resolved_alias")]
+    #[test_case(json!("opus"), json!(""), None ; "empty_model")]
+    #[test_case(json!("opus"), Value::Null, None ; "missing_model")]
+    #[test_case(json!("opus"), json!(42), None ; "non_string_model")]
+    #[test_case(json!(""), json!(OPUS), None ; "empty_alias")]
+    #[test_case(Value::Null, json!(OPUS), None ; "missing_alias")]
+    fn listing_and_alias_resolution_accept_the_same_models(
+        name: Value,
+        model: Value,
+        expected: Option<&str>,
+    ) {
+        let handshake = Handshake {
+            answers: [(
+                ACCOUNT_ANSWER.into(),
+                json!({ "models": [{ "value": name, "resolvedModel": model }] }),
+            )]
+            .into(),
+            ..Handshake::default()
+        };
+        assert_eq!(
+            handshake.models().collect::<Vec<_>>(),
+            expected.into_iter().collect::<Vec<_>>()
+        );
+        assert_eq!(handshake.resolved_model("opus"), expected);
     }
 }

@@ -14,6 +14,7 @@ mod fake;
 mod live;
 mod mcp;
 mod run;
+mod settings;
 #[cfg(unix)]
 pub mod snapshot;
 mod stream;
@@ -84,6 +85,8 @@ const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::CLOEXEC);
 const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 const DISPLAY_NAME: &str = "Claude Code (experimental)";
+#[cfg(test)]
+const WAIT: Duration = Duration::from_secs(30);
 pub const PLUGIN: &str = "claude_code";
 const PLUGIN_OFF: &str =
     "enable the claude_code plugin in init.lua: `plugins = { claude_code = { enabled = true } }`";

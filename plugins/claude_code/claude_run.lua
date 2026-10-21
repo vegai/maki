@@ -64,14 +64,14 @@ end
 local Run = {}
 Run.__index = Run
 
-function Run.new(ctx, call, spec, confine, timeout_secs, opts)
+function Run.new(ctx, call, spec, timeout_secs, opts)
   local self = setmetatable({
     ctx = ctx,
     call = call,
     spec = spec,
     timeout_secs = timeout_secs,
     route = CHECKING:format(spec.cli.version),
-    handshake = launch.worker_handshake(spec.deny, spec.worker, confine),
+    handshake = launch.worker_handshake(spec),
     stderr_tail = {},
     has_progress = false,
     -- Claude Code sends init after it reads the prompt. An earlier init means it bypassed the
@@ -225,7 +225,7 @@ end
 function Run:on_exit(code)
   if self.finished then
     if self.artifact and self.prompted then
-      local problem = snapshot.sanitize(self.artifact)
+      local _, problem = snapshot.sanitize(self.artifact)
       if problem then
         maki.notify(ERROR_PREFIX .. "maki could not secure the retained snapshot: " .. problem, "error")
       end
@@ -293,11 +293,7 @@ function Run:start(argv, cwd, env, task)
   -- handshake is sent from inside the wait.
   return maki.async.await(1, function(done)
     self.resolve = done
-    for _, request in ipairs(launch.HANDSHAKE) do
-      if not self:send(launch.control_request(request)) then
-        return
-      end
-    end
+    self:send(launch.handshake_input())
   end)
 end
 

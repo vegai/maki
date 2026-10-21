@@ -26,14 +26,14 @@ function M.set_of(list)
   return set
 end
 
-function M.trim(text)
+local function trim(text)
   return text:match("^%s*(.-)%s*$")
 end
 
 function M.comma_list(option, validate)
   local values = {}
   for value in (option or ""):gmatch("[^,]+") do
-    value = M.trim(value)
+    value = trim(value)
     if value ~= "" then
       local normalized, problem = validate(value)
       if not normalized then

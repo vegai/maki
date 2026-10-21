@@ -31,12 +31,8 @@ const POLICY_GRANT_NOTICE: &str = "folder trusted by trust.paths pattern";
 const NO_ALLOWED_TOOLS: &str = "--allowed-tools matches no loaded tools or qualified MCP names";
 
 fn tool_filter_warnings(cli: &Cli, registry: &ToolRegistry, startup: bool) -> Result<Vec<String>> {
-    let known = |name: &str| {
-        name == TOOL_SEARCH_TOOL_NAME
-            || registry.get(name).is_some()
-            || is_wire_name(name)
-            || is_qualified_name(name)
-    };
+    let known =
+        |name: &str| registry.get(name).is_some() || is_wire_name(name) || is_qualified_name(name);
     if startup && !cli.allowed_tools.is_empty() && !cli.allowed_tools.iter().any(|name| known(name))
     {
         return Err(eyre!(
@@ -58,10 +54,9 @@ fn tool_filter_warnings(cli: &Cli, registry: &ToolRegistry, startup: bool) -> Re
         ("--allowed-tools", &cli.allowed_tools),
         ("--disallowed-tools", &cli.disallowed_tools),
     ] {
-        for name in names
-            .iter()
-            .filter(|name| !known(name) && !is_tool_argument_pattern(name))
-        {
+        for name in names.iter().filter(|name| {
+            *name != TOOL_SEARCH_TOOL_NAME && !known(name) && !is_tool_argument_pattern(name)
+        }) {
             let mut warning = format!("no loaded tool matches '{name}' in {flag}.");
             let suggestion = name.replace('-', "_");
             if suggestion != *name && registry.get(&suggestion).is_some() {
@@ -673,7 +668,9 @@ mod tests {
     #[test_case("srv.probe", true ; "qualified_mcp")]
     #[test_case("srv__probe", true ; "wire_mcp")]
     #[test_case("mcp__srv__probe", true ; "claude_mcp")]
-    #[test_case(TOOL_SEARCH_TOOL_NAME, true ; "tool_search")]
+    #[test_case(TOOL_SEARCH_TOOL_NAME, false ; "tool_search_alone")]
+    #[test_case("tool_search,unloaded_tool", false ; "tool_search_with_unknown_tool")]
+    #[test_case("tool_search,srv.probe", true ; "tool_search_with_mcp_tool")]
     fn empty_allow_lists_fail_unless_an_mcp_tool_can_load_later(name: &str, accepted: bool) {
         let cli = Cli::parse_from(["maki", "--allowed-tools", name]);
         let result = tool_filter_warnings(&cli, &ToolRegistry::new(), true);
@@ -681,7 +678,7 @@ mod tests {
         if !accepted {
             assert_eq!(
                 result.unwrap_err().to_string(),
-                format!("{NO_ALLOWED_TOOLS}: {name}")
+                format!("{NO_ALLOWED_TOOLS}: {}", cli.allowed_tools.join(", "))
             );
         }
     }

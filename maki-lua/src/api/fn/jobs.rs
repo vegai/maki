@@ -388,6 +388,7 @@ impl JobStore {
             owner,
             cmd,
             name,
+            #[cfg(target_os = "linux")]
             guard,
             timeout,
             stdout,

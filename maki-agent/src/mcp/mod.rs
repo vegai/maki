@@ -49,7 +49,7 @@ use crate::tools::{CallOrigin, ToolFilter};
 use crate::types::TextOutput;
 
 const SEPARATOR: &str = ".";
-const WIRE_SEPARATOR: &str = "__";
+pub const WIRE_SEPARATOR: &str = "__";
 pub const UNKNOWN_MCP: &str = "unknown_mcp";
 pub const TOOL_SEARCH_TOOL_NAME: &str = "tool_search";
 /// Below this many deferrable tools, a search round-trip plus its

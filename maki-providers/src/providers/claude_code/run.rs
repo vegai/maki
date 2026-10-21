@@ -16,9 +16,9 @@ use self::supervision::{
 use super::checks::{InitExpect, require_system};
 use super::error::Error;
 use super::mcp::{self, Handoff};
+use super::settings::STARTUP_TIMEOUT_SECS;
 use super::stream::{Step, Turn, Wait, user_message};
 use super::transcript::{Catalog, SERVER, system_prompt, transcript};
-use super::validation::{STARTUP_TIMEOUT_SECS, resolved_model};
 use crate::providers::anthropic::shared::{long_context_window, strip_long_context};
 use crate::{Message, ProviderEvent, ProviderUsage, StreamResponse};
 use base64::Engine;
@@ -153,10 +153,7 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
             .await?;
     // An alias such as `sonnet` runs whatever model the account answer maps
     // it to.
-    let runs = resolved_model(offered.account(), asked)
-        .unwrap_or(asked)
-        .to_owned();
-    drop(offered);
+    let runs = offered.resolved_model(asked).unwrap_or(asked);
     let checked = started.elapsed();
     debug!(
         version = %profile,
@@ -178,7 +175,7 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
             &catalog,
             InitExpect {
                 version: &profile,
-                model: &runs,
+                model: runs,
                 cwd: launch.project,
                 tools: &tools,
             },
@@ -437,6 +434,7 @@ async fn stop_and_drain(
     let mut deadline = Instant::now() + limits.exit;
     if turn.truncated() {
         group.kill();
+        deadline = deadline.min(Instant::now() + SHUTDOWN_GRACE);
     } else if stopped {
         group.terminate();
         deadline = deadline.min(Instant::now() + SHUTDOWN_GRACE);
@@ -452,7 +450,7 @@ async fn stop_and_drain(
                 }
                 result => result?,
             }
-            deadline = Instant::now() + limits.exit;
+            deadline = Instant::now() + limits.exit.min(SHUTDOWN_GRACE);
         }
         result => result?,
     }
