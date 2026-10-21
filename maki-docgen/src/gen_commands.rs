@@ -83,7 +83,7 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(
         out,
-        "- **`/thinking`**: extended thinking. Bare, or `Alt+T`, it opens a picker that shows what each level costs in tokens. With an argument it sets the level directly: `off`, `adaptive`, `minimal` to `max`, or a token budget. New TUI sessions start at the last level you set. Headless, SDK and ACP runs use `low` by default. `always_thinking` overrides these defaults, and `--thinking` / `--effort` or `--max-thinking-tokens` overrides config for one launch."
+        "- **`/thinking`**: extended thinking. Bare, or `Alt+T`, it opens a picker that shows what each level costs in tokens. With an argument it sets the level directly: `off`, `adaptive`, `minimal` to `max`, or a token budget. New TUI and ACP sessions start at the last level you set. Headless and SDK runs use `low` by default. `always_thinking` overrides these defaults, and `--thinking` / `--effort` or `--max-thinking-tokens` overrides config for one launch."
     )
     .unwrap();
     writeln!(

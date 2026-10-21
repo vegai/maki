@@ -135,8 +135,9 @@ the original request prefix.
 Provider startup uses a private scratch directory outside the project and
 its denied paths. Starting Claude inside the checkout could run project
 settings or hooks before maki checks them. If `TMPDIR` resolves into a
-denied path, maki tries existing runtime, cache and home directories, then
-`/var/tmp`. If none is suitable, set `TMPDIR` to an existing directory
+denied path or does not exist, maki uses an owned 0700 directory under
+`XDG_RUNTIME_DIR`, the cache directory, or `/var/tmp`. Existing `TMPDIR` paths outside the denied directories are used as supplied.
+If the request cannot write there, it returns a filesystem error. If none is suitable, set `TMPDIR` to an existing directory
 outside the project. A project below `/tmp` is allowed when `/tmp` itself
 is outside the detected checkout.
 
@@ -144,7 +145,7 @@ Under bubblewrap, provide `/dev` and `/proc`, for example with
 `--dev /dev --proc /proc`. Some Claude Code and Bun versions abort without
 them. A failed version probe names `claude --version` and its exit status
 or signal. Provider failures also include available stderr and process
-status. A status after maki requested shutdown is labelled as such.
+status. The exit status is attached when Claude exits before maki requests shutdown.
 
 Claude Code's own tools are off. When the model calls a tool, maki stops Claude Code and runs the call with its own tools and your permission rules. It sends the results with the next request. Claude Code's own retries are off too.
 

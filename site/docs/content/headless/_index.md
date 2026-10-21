@@ -46,7 +46,8 @@ token budget wins, followed by a positive `--max-thinking-tokens`,
 provider starts.
 
 The launch flag overrides `always_thinking` in config. Without either,
-headless, SDK and ACP runs use `low`, independent of the last TUI level.
+headless and SDK runs use `low`, independent of the last TUI level. ACP
+keeps the saved TUI level when flags and config specify no level.
 A launch override does not change the TUI default. The TUI still uses its
 saved `/thinking` level when neither flags nor config specify one.
 
@@ -58,10 +59,11 @@ effort levels and token budgets into their own API parameters.
 
 ## Bounded runs and recovery
 
-`--max-turns N` caps model turns in plain `-p` and SDK mode. A tool-call
-response counts as one turn, regardless of how many tools it calls. A run
-that needs another turn after the cap saves its session, emits a result with
-`is_error: true` and subtype `error_max_turns`, and exits nonzero.
+`--max-turns N` caps the main agent's model turns in the TUI, plain `-p` and
+SDK mode. Subagents do not inherit this cap or `--final-answer`. A tool-call
+response counts as one turn, regardless of how many tools it calls. In plain
+`-p` and SDK mode, a run that needs another turn after the cap saves its
+session, emits `is_error: true` with subtype `error_max_turns`, and exits nonzero.
 
 Add `--final-answer` to ask for a report on the last allowed turn:
 
@@ -75,8 +77,11 @@ schema to preserve the prompt cache, but further tool calls cannot execute.
 If the model calls a tool instead of answering, the result is still
 `error_max_turns`.
 
-On Unix, SIGTERM and SIGINT cancel plain `-p` and SDK runs, save the session, emit
-`error_interrupted`, and exit nonzero. Session checkpoints land before
+On Unix, SIGTERM and SIGINT cancel active plain `-p` and SDK runs and save
+the session. The result subtype is `error_during_execution`, with
+`stop_reason: "cancelled"` in plain `-p`, and the process exits nonzero.
+A second signal forces exit with status `128 + signal`, leaving the last
+checkpoint. Session checkpoints land before
 provider requests, before tool execution, and after each completed turn.
 SIGKILL cannot emit a result, but leaves the last checkpoint resumable with
 `maki -p -r ID`. Text streamed during an unfinished request can be lost on
@@ -84,7 +89,9 @@ SIGKILL. Provider errors are stored as separate `error` records in the session
 log, outside the conversation sent to the model.
 
 Every error result makes plain `-p` exit nonzero. SDK mode exits nonzero if
-any turn failed, once its input closes.
+a provider error or turn limit occurred, once its input closes. A client
+`interrupt` control request ends the current turn with
+`error_during_execution` and keeps the SDK process usable.
 
 ## Inspect a launch
 
@@ -97,7 +104,8 @@ maki -p --dry-run -m claude-code/claude-sonnet-5 \
   --disallowed-tools claude_code,claude_code_import
 ```
 
-It loads the same configuration, plugins and MCP tools as a normal launch.
+Output is always JSON. The command loads the same configuration and plugins
+as a normal launch and starts the configured MCP servers to read their tools.
 Provider capability checks still apply, including image-tool exclusions.
 It does not start the Claude CLI or make a model request.
 

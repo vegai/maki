@@ -365,7 +365,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         default: ConfigValue::Str("none"),
         min: None,
         env: None,
-        description: "Set the thinking level of every new session: true/\"adaptive\", false/\"off\", \"minimal\" to \"max\", or a token budget. A launch thinking flag overrides this. Unset, TUI sessions start at the last `/thinking` level and headless, SDK and ACP sessions use low",
+        description: "Set the thinking level of every new session: true/\"adaptive\", false/\"off\", \"minimal\" to \"max\", or a token budget. A launch thinking flag overrides this. Unset, TUI and ACP sessions start at the last `/thinking` level and headless and SDK sessions use low",
     },
 ];
 

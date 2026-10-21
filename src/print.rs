@@ -34,7 +34,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::notice::{NOTIFICATION, ProviderNotice};
-use crate::wire::system_event;
+use crate::wire::{failure_subtype, system_event};
 
 const SESSION_LINE_PREFIX: &str = "session: ";
 
@@ -72,6 +72,23 @@ struct PrintResult {
     session_id: SessionRef,
     total_cost_usd: f64,
     usage: TokenUsage,
+}
+
+impl PrintResult {
+    fn error(session_id: SessionRef, duration_ms: u128, result: String) -> Self {
+        Self {
+            result_type: "result",
+            subtype: "error_during_execution",
+            is_error: true,
+            duration_ms,
+            num_turns: 0,
+            result,
+            stop_reason: None,
+            session_id,
+            total_cost_usd: 0.0,
+            usage: TokenUsage::default(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -244,36 +261,31 @@ pub fn run(params: PrintParams) -> Result<()> {
     } = handle;
     let _signals = crate::shutdown::watch(cancel).context("watch termination signals")?;
     let start = Instant::now();
-    let (Ready { model, tool_names }, thinking) =
-        match crate::headless_startup::startup(&ready, &mut events, defaults.thinking) {
-            Ok(started) => started,
-            Err(error) => {
-                smol::block_on(headless::await_shutdown(task));
-                write_result(
-                    format,
-                    None,
-                    PrintResult {
-                        result_type: "result",
-                        subtype: "error_during_execution",
-                        is_error: true,
-                        duration_ms: start.elapsed().as_millis(),
-                        num_turns: 0,
-                        result: error.to_string(),
-                        stop_reason: None,
-                        session_id,
-                        total_cost_usd: 0.0,
-                        usage: TokenUsage::default(),
-                    },
-                )?;
-                return Err(error);
-            }
-        };
-
     let mut verbose_out = match format {
         OutputFormat::StreamJson => Some(VerboseOutput::StreamJson),
         _ if verbose => Some(VerboseOutput::Json(Vec::new())),
         _ => None,
     };
+
+    let (Ready { model, tool_names }, thinking) =
+        match crate::headless_startup::startup(&ready, &mut events, defaults.thinking) {
+            Ok(started) => started,
+            Err(error) => {
+                smol::block_on(headless::await_shutdown(task));
+                if !matches!(format, OutputFormat::Text) {
+                    write_result(
+                        format,
+                        verbose_out,
+                        PrintResult::error(
+                            session_id,
+                            start.elapsed().as_millis(),
+                            error.to_string(),
+                        ),
+                    )?;
+                }
+                return Err(error);
+            }
+        };
 
     if dry_run {
         smol::block_on(headless::await_shutdown(task));
@@ -518,15 +530,6 @@ fn write_result(
         },
     }
     Ok(())
-}
-
-pub(crate) fn failure_subtype(reason: DoneReason) -> Option<&'static str> {
-    match reason {
-        DoneReason::MaxTurns => Some("error_max_turns"),
-        DoneReason::Cancelled => Some("error_interrupted"),
-        DoneReason::Dropped => Some("error_prompt_dropped"),
-        DoneReason::EndTurn | DoneReason::MaxTokens | DoneReason::Compact => None,
-    }
 }
 
 /// Nothing reached the model, so the reason is the only answer there is. A

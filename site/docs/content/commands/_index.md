@@ -45,7 +45,7 @@ Sessions run concurrently. `/new` starts a fresh session while the old one keeps
 ## Modes and toggles
 
 - **`/yolo`**: skip permission prompts for this session (deny rules still apply). The toggle survives a resume, and `--yolo` only sets the starting value. Config: `always_yolo = true`.
-- **`/thinking`**: extended thinking. Bare, or `Alt+T`, it opens a picker that shows what each level costs in tokens. With an argument it sets the level directly: `off`, `adaptive`, `minimal` to `max`, or a token budget. New TUI sessions start at the last level you set. Headless, SDK and ACP runs use `low` by default. `always_thinking` overrides these defaults, and `--thinking` / `--effort` or `--max-thinking-tokens` overrides config for one launch.
+- **`/thinking`**: extended thinking. Bare, or `Alt+T`, it opens a picker that shows what each level costs in tokens. With an argument it sets the level directly: `off`, `adaptive`, `minimal` to `max`, or a token budget. New TUI and ACP sessions start at the last level you set. Headless and SDK runs use `low` by default. `always_thinking` overrides these defaults, and `--thinking` / `--effort` or `--max-thinking-tokens` overrides config for one launch.
 - **`/fast`**: faster responses on Anthropic Opus, and on eligible Codex models when you sign in with a ChatGPT subscription. OpenAI API keys and every other model ignore it. Config: `always_fast = true`.
 - **`/workflow`**: let `code_execution` call the `task` tool (and other workflow-only tools) from inside the Python sandbox. Config: `always_workflow = true`.
 - **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only).

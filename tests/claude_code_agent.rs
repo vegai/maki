@@ -252,7 +252,7 @@ fn dry_run_uses_provider_capabilities_and_filters_without_starting_claude() {
 }
 
 #[test]
-fn unavailable_scratch_fails_before_init_and_does_not_start_claude() {
+fn unavailable_scratch_fails_per_request_without_starting_claude() {
     let fixture = Fixture::new();
     let claude = stand_in(&fixture.isolation.dir("bin"));
     fixture.enable_plugin(Some(&claude));
@@ -260,11 +260,80 @@ fn unavailable_scratch_fails_before_init_and_does_not_start_claude() {
     command.current_dir("/");
     let output = finish(command);
     assert!(!output.status.success());
-    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let events: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events[0]["subtype"], INIT);
+    let result = events.last().unwrap();
     assert_eq!(result["type"], RESULT);
     assert_eq!(result["is_error"], true);
     assert!(result[RESULT].as_str().unwrap().contains("Set TMPDIR"));
     assert!(!claude.with_extension(RAN_EXTENSION).exists());
+}
+
+#[test]
+fn request_policy_does_not_prevent_provider_creation_or_dry_run() {
+    let fixture = Fixture::new();
+    let claude = stand_in(&fixture.isolation.dir("bin"));
+    fixture.enable_plugin(Some(&claude));
+    fs::write(
+        fixture
+            .isolation
+            .dir("project/.claude")
+            .join("settings.json"),
+        r#"{"apiKeyHelper":"secret-command"}"#,
+    )
+    .unwrap();
+    let mut command = fixture.maki(MODEL, PROMPT, STREAM_FORMAT);
+    command.arg("--dry-run");
+    let output = finish(command);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let init: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(init["subtype"], INIT);
+    assert!(!claude.with_extension(RAN_EXTENSION).exists());
+    let output = finish(fixture.maki(MODEL, PROMPT, STREAM_FORMAT));
+    assert!(!output.status.success());
+    let events: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events[0]["subtype"], INIT);
+    assert_eq!(events.last().unwrap()["is_error"], true);
+    assert!(!claude.with_extension(RAN_EXTENSION).exists());
+}
+
+#[test_case(JSON_FORMAT, false ; "json_object")]
+#[test_case(JSON_FORMAT, true ; "verbose_json_array")]
+#[test_case("text", false ; "text_uses_stderr_only")]
+fn startup_errors_keep_the_output_format(format: &str, verbose: bool) {
+    let fixture = Fixture::new();
+    let mut command = fixture.maki(MODEL, PROMPT, format);
+    if verbose {
+        command.arg("--verbose");
+    }
+    let output = finish(command);
+    assert!(!output.status.success());
+    if format == "text" {
+        assert!(output.stdout.is_empty());
+    } else {
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let result = if verbose {
+            assert_eq!(value.as_array().unwrap().len(), 1);
+            &value[0]
+        } else {
+            &value
+        };
+        assert_eq!(result["type"], RESULT);
+        assert_eq!(result["is_error"], true);
+    }
+    assert!(String::from_utf8_lossy(&output.stderr).contains(PLUGIN_OFF));
 }
 
 fn named<'a>(run: &'a Run, name: &str, parent: Option<&str>) -> Option<&'a Value> {

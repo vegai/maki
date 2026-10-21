@@ -73,13 +73,14 @@ impl History {
         self
     }
 
-    pub(crate) async fn checkpoint(&self, context_size: u32) {
+    pub(crate) async fn checkpoint(&mut self, context_size: u32) {
         if self.unsaved
             && let Some(checkpoint) = &self.checkpoint
-        {
-            checkpoint
+            && checkpoint
                 .persist(self.snapshot.clone(), context_size)
-                .await;
+                .await
+        {
+            self.mark_saved();
         }
     }
 
@@ -166,6 +167,10 @@ impl History {
 
     pub fn has_unsaved(&self) -> bool {
         self.unsaved
+    }
+
+    pub(crate) fn mark_unsaved(&mut self) {
+        self.unsaved = true;
     }
 
     pub fn mark_saved(&mut self) {
