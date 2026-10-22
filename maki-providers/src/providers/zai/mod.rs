@@ -3,13 +3,12 @@ use std::sync::{Arc, Mutex};
 
 use flume::Sender;
 use maki_config::providers::{Protocol, ProviderPlan};
-use maki_storage::id::SessionRef;
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::warn;
 
 use crate::model::{Model, ModelFamily, ThinkingSupport};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use crate::providers::aperture::NO_PATH_PREFIX;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::spec::{
@@ -72,14 +71,16 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     api_key_env: ENV_VAR,
     family: ModelFamily::Glm,
     supports_thinking: false,
+    supports_deferred_tools: false,
     accepts_arbitrary_models: false,
     fallback_max_output: Some(16_000),
     fallback_context_window: 128_000,
     models_toml: include_str!("../../../models/zai.toml"),
+    models_of: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
-        with_auth: create_with_auth,
+        with_auth: Some(create_with_auth),
     }),
     aperture: Some(ApertureRoute {
         path_prefix: NO_PATH_PREFIX,
@@ -222,13 +223,15 @@ impl Provider for Zai {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
             let mut buf = String::new();
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let mut body = self.compat.build_body(model, messages, system, tools);
+            let mut body =
+                self.compat
+                    .build_body(model, messages, system, tools, opts.thinking, auth.top_p);
             if model.supports_thinking() {
                 opts.thinking
                     .apply_reasoning_effort(&mut body, &dialect::GLM, model);
@@ -251,7 +254,10 @@ impl Provider for Zai {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
             self.compat.do_list_models(&auth).await
@@ -281,7 +287,6 @@ impl Provider for Zai {
 }
 
 /// `glm-5.3` -> `(5, 3)`, `glm-5.3-flash` -> `(5, 3)`, `glm-5-code` -> `(5, 0)`.
-/// Same trick as `claude_version`.
 fn glm_version(model_id: &str) -> Option<(u32, u32)> {
     let mut parts = model_id.strip_prefix("glm-")?.split(['-', '.']);
     let major = parts.next()?.parse().ok()?;

@@ -691,6 +691,7 @@ mod tests {
     const DEBOUNCE_HELD_OFF: Duration = Duration::from_secs(60);
     const NEVER_CONVERGED: &str = "picker never rebuilt its matches from later ticks";
     const NEVER_CLOSED: &str = "picker never closed on an empty walk";
+    const NEVER_IDLE: &str = "picker never went idle after its last match";
     const QUERY_ANSWERED: &str = "an uncancelled query answers";
     const NOT_A_TIE: &str = "the fixture was supposed to score the same for every path";
 
@@ -975,6 +976,14 @@ mod tests {
         // that changed nothing.
         let _ = tick_until(&mut picker, |s| !s.matching && s.matches.len() == 1)
             .expect(NEVER_CONVERGED);
+
+        // The matches can land while the worker is still winding down, and
+        // until it does the picker keeps asking to be polled.
+        let deadline = Instant::now() + CONVERGE_TIMEOUT;
+        while picker.cadence() != Cadence::IDLE {
+            assert!(Instant::now() < deadline, "{NEVER_IDLE}");
+            std::thread::yield_now();
+        }
 
         assert_eq!(picker.tick(), (Dirty::NO, None), "{QUIET}");
         assert_eq!(picker.cadence(), Cadence::IDLE);

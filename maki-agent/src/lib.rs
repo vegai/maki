@@ -11,12 +11,13 @@ pub use file_index::{
     invalidate_for, on_walk_end, resolved_index,
 };
 pub mod headless;
-pub mod mailbox;
+pub mod live_session;
 pub mod mcp;
 pub use mcp::config::{McpConfigError, McpConfigErrors, McpServerInfo, McpServerStatus};
 pub use mcp::protocol::PromptRole;
 pub use mcp::{
     McpCommand, McpHandle, McpPromptArg, McpPromptInfo, McpSession, McpSnapshot, McpSnapshotReader,
+    ToolDeferral,
 };
 pub mod inbox;
 pub mod session;
@@ -28,7 +29,7 @@ pub use agent::{
     close_dangling_tool_calls, find_subdirectory_instructions, is_instruction_file,
 };
 pub use cancel::{CancelMap, CancelToken, CancelTrigger};
-pub use mailbox::{MailboxError, SessionMailbox};
+pub use live_session::{AgentSeed, MailboxError, SessionMailbox};
 pub use maki_config::{AgentConfig, PermissionsConfig, SessionDefaults, ToolOutputLines};
 pub mod command;
 pub mod diff;
@@ -135,9 +136,9 @@ pub struct AgentInput {
 }
 
 impl AgentInput {
-    /// What a host with no toggle UI sends. `-p`, the SDK and ACP know nothing
-    /// about the toggles beyond what config says, so they all build their input
-    /// here and a knob added to [`SessionDefaults`] reaches every one of them.
+    /// What a host with no toggle UI sends. `-p`, the SDK and ACP build their
+    /// input from resolved launch defaults here, so a knob added to
+    /// [`SessionDefaults`] reaches every one of them.
     pub fn from_defaults(
         message: String,
         mode: AgentMode,

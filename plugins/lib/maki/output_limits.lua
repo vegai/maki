@@ -22,9 +22,18 @@ function M.extend(spec)
 end
 
 --- Returns max_lines, max_bytes: tool override when set, agent-wide otherwise.
+--- Both nil in full mode.
 function M.resolve(opts, ctx)
+  if ctx:output_mode() == "full" then
+    return nil, nil
+  end
   return opts.max_output_lines or ctx:config("max_output_lines", DEFAULT_MAX_OUTPUT_LINES),
     opts.max_output_bytes or ctx:config("max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES)
+end
+
+--- opts.max_line_bytes, or 0 (no limit) in full mode.
+function M.line_bytes(opts, ctx)
+  return ctx:output_mode() == "full" and 0 or opts.max_line_bytes
 end
 
 --- Last {n} lines of {text}, or all of it when it has fewer. Newlines separate

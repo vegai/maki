@@ -128,6 +128,7 @@ local description = [[Execute Python in a sandbox where every tool is an async f
 Use for chained/dependent tool calls and filtering/processing results, e.g. filtering web tool output. **DRAMATICALLY** cheaper than sequential tool calls!
 
 - All tools are async and return strings: `result = await read(path='file.txt', offset=1, limit=0)`. Parse output yourself.
+- Tool results are complete. Only what you print/return is capped.
 - Concurrency: `a, b = await gather(read(path='a.py', offset=1, limit=0), grep(pattern='x'))`. Pass calls directly, never wrapped in `async def`.
 - Available libs: re, asyncio, sys, os, json. No other imports, no classes, no network access. `open()` works on text files.
 - Fresh sandbox each run: no state persists between executions.
@@ -359,7 +360,7 @@ local function handler(input, ctx)
       schemas[bind] = t.schema or {}
       tools[bind] = function(tool_input)
         if t.workflow_only then
-          return maki.agent.call_tool(ctx, name, tool_input, {})
+          return maki.agent.call_tool(ctx, name, tool_input)
         end
         -- The script clock stops while a tool call is awaited, so an explicit
         -- longer timeout on the call has to win over the script budget.
@@ -394,7 +395,7 @@ local function handler(input, ctx)
     -- The run is already paid for, so point a script that reached for
     -- `asyncio.gather` at the wrapper that would have kept its other results.
     local hint = input.code:find(ASYNCIO_GATHER, 1, true) and GATHER_HINT or ""
-    return { llm_output = err .. hint, is_error = true, body = buf }
+    return { llm_output = truncate(err .. hint, max_lines, max_bytes), is_error = true, body = buf }
   end
 
   local output = result.stdout or ""

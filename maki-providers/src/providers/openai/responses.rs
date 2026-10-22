@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::model::Model;
+use crate::providers::endpoint;
 use crate::providers::openai_compat::tool_parameters;
 use crate::providers::{ResolvedAuth, sse_error_status};
 use crate::types::EffortDialect;
@@ -168,14 +169,17 @@ fn init_summary_rejected() -> &'static Mutex<HashSet<String>> {
 }
 
 fn summary_rejected(base: &str) -> bool {
-    init_summary_rejected().lock().unwrap().contains(base)
+    init_summary_rejected()
+        .lock()
+        .unwrap()
+        .contains(base.trim_end_matches('/'))
 }
 
 fn reject_summary(base: &str) {
     init_summary_rejected()
         .lock()
         .unwrap()
-        .insert(base.to_owned());
+        .insert(base.trim_end_matches('/').to_owned());
 }
 
 fn has_summary(body: &Value) -> bool {
@@ -232,7 +236,7 @@ async fn post_responses(
         .configure_request(
             Request::builder()
                 .method("POST")
-                .uri(format!("{base}{RESPONSES_PATH}"))
+                .uri(endpoint(base, RESPONSES_PATH))
                 .header("content-type", "application/json")
                 .header("user-agent", super::super::user_agent()),
         )
@@ -588,6 +592,7 @@ pub(crate) async fn parse_sse(
         },
         usage,
         stop_reason,
+        ..Default::default()
     })
 }
 
@@ -615,6 +620,8 @@ mod tests {
     use serde_json::json;
     use test_case::test_case;
 
+    use crate::test_support::{Canned, serve};
+
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
     const OVERLOAD_MESSAGE: &str = "Our servers are currently overloaded. Please try again later.";
     const BAD_REQUEST_MESSAGE: &str = "Invalid value for 'model'";
@@ -622,6 +629,33 @@ mod tests {
     const TOOL_NAME: &str = "word_count";
     const TOOL_DESCRIPTION: &str = "Count words.";
     const TOOL_MUST_SURVIVE: &str = "a tool without a schema still belongs in the request";
+    const RESPONSE_PATH: &str = "/v1/responses";
+    const RESPONSE: &[Canned] = &[Canned::sse(concat!(
+        "event: response.completed\n",
+        "data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n"
+    ))];
+
+    #[test_case(false ; "without_trailing_slash")]
+    #[test_case(true ; "with_trailing_slash")]
+    fn responses_normalizes_the_base_url(trailing_slash: bool) {
+        let (mut base, requests) = serve(RESPONSE);
+        if trailing_slash {
+            base.push('/');
+        }
+        let auth = ResolvedAuth::for_test(Some(base), Vec::new());
+        let model = crate::Model::from_spec("openai/gpt-6").unwrap();
+        let (events, _) = flume::unbounded();
+        smol::block_on(do_stream(
+            &HttpClient::new().unwrap(),
+            &model,
+            &json!({}),
+            &events,
+            &auth,
+            TEST_STREAM_TIMEOUT,
+        ))
+        .unwrap();
+        assert_eq!(requests.lock().unwrap()[0].path, RESPONSE_PATH);
+    }
 
     #[test]
     fn strip_summary_keeps_effort() {
@@ -632,12 +666,16 @@ mod tests {
         assert_eq!(body, json!({"reasoning": {"effort": "high"}}));
     }
 
-    #[test]
-    fn summary_memo_records_rejection_once() {
-        let base = "https://summary-memo.test/v1";
-        assert!(!summary_rejected(base));
-        reject_summary(base);
-        assert!(summary_rejected(base));
+    #[test_case("" ; "canonical")]
+    #[test_case("/" ; "trailing_slash")]
+    #[test_case("///" ; "multiple_trailing_slashes")]
+    fn summary_memo_normalizes_endpoint_aliases(suffix: &str) {
+        let base = format!("https://summary-memo-{}.test/v1", suffix.len());
+        let alias = format!("{base}{suffix}");
+        assert!(!summary_rejected(&base));
+        reject_summary(&alias);
+        assert!(summary_rejected(&base));
+        assert!(summary_rejected(&format!("{base}/")));
     }
 
     #[test]
@@ -815,11 +853,7 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "tc_1".to_string(),
-                    content: "file.txt".to_string(),
-                    is_error: false,
-                }],
+                content: vec![ContentBlock::tool_result("tc_1", "file.txt", false)],
                 ..Default::default()
             },
         ];

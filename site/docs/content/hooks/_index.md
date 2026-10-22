@@ -62,6 +62,7 @@ already done, so `reason` only replaces the text the model reads.
 | `tool_id` | id of the call, empty for nested calls |
 | `tool_kind` | kind the tool declares, like `read`, `edit`, or `execute`. `nil` if it declares none. |
 | `origin` | `"model"`, or `"nested"` when `batch`, `code_execution`, or `maki.agent.call_tool` made the call |
+| `output_mode` | `"compact"` when the result goes to the model, `"full"` when code such as `code_execution` made the call and needs the complete text |
 | `session_id` | session of the call. A subagent's calls arrive as `"model"` under its own session. |
 | `deadline_ms` | milliseconds left before the layer is dropped |
 | `input` | `output` only: the input the call ran with, after every input layer |
@@ -98,12 +99,19 @@ end)
 ### Trimming output
 
 An output layer runs before the output becomes part of the conversation, so what
-it drops is never paid for again:
+it drops is never paid for again.
+
+Calls from code pass through output layers too, with `ctx.output_mode` set to
+`"full"`. Leave that text whole so the script can parse it. Redact secrets in
+both modes:
 
 ```lua
 local MAX = 200
 
 maki.api.set_slot("tool.bash.output", function(prev, out, ctx)
+  if ctx.output_mode == "full" then
+    return prev(out, ctx)
+  end
   local lines = {}
   for line in out.text:gmatch("[^\n]+") do
     if not line:match("^%s*Compiling ") then
@@ -341,8 +349,12 @@ maki.api.set_slot("completion.sources", function(prev, sources)
     trigger = "#",
     name = "issues",
     complete = function(query, ctx)
-      local out = maki.fn.jobwait(maki.fn.jobstart({ "gh", "issue", "list", "--search", query }))
+      local id = maki.fn.jobstart({ "gh", "issue", "list", "--search", query })
+      local out = id and maki.fn.jobwait(id)
       local items = {}
+      if not out then
+        return items
+      end
       for num, title in out.stdout:gmatch("(%d+)%s+%S+%s+([^\t]+)") do
         table.insert(items, { text = "#" .. num, label = "#" .. num .. " " .. title })
       end

@@ -12,6 +12,7 @@ use crate::components::split_layout::MIN_CHAT_ROWS;
 use crate::components::{ExitRequest, buffer_text, key, test_model};
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{RowPos, SelectableZone, SelectionState, SelectionZone};
+use crate::theme;
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use maki_agent::permissions::{PermissionAnswer, PermissionManager};
@@ -28,15 +29,18 @@ use maki_lua::{
     WinCommand, WinEvent,
 };
 use maki_providers::{
-    ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, TokenUsage,
+    ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, ThinkingSupport,
+    TokenUsage,
 };
 use maki_storage::id::MakiId;
-use maki_storage::sessions::{SessionClaim, SessionMeta, StoredMode, StoredThinking};
+use maki_storage::model::read_thinking;
+use maki_storage::sessions::{
+    SessionClaim, SessionMeta, StoredMode, StoredThinking, StoredTokenUsage,
+};
 use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::Modifier;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -86,8 +90,8 @@ const WAIT_AHEAD: Duration = Duration::from_secs(60);
 const WALK_TIMEOUT: Duration = Duration::from_secs(5);
 const CURSOR_STAYS_HIDDEN: &str = "the hardware cursor must never be shown";
 const CURSOR_ON_SCREEN: &str = "the reported cursor must be on screen";
-const CURSOR_ON_REVERSED_CELL: &str = "the focused input box owns a reversed cursor cell";
-const OVERLAY_TAKES_THE_CURSOR: &str = "an overlay unfocuses the input box, so no cell is reversed";
+const CURSOR_ON_STYLED_CELL: &str = "the focused input box owns a cell painted as the cursor";
+const OVERLAY_TAKES_THE_CURSOR: &str = "an overlay unfocuses the input box, so no cell is a cursor";
 /// Stands in for a size the provider measured, baseline included.
 const MEASURED_CONTEXT: u32 = 100_000;
 const TEST_MODEL_SPEC: &str = "test-model";
@@ -97,6 +101,8 @@ const PERMISSIONS_CWD: &str = "/tmp";
 /// doubles as the window the gauge is allowed to land in.
 const SMALL_HISTORY: u32 = 1_000;
 const AGENT_ERROR_MSG: &str = "boom";
+const HELP_COMMAND: &str = "/help";
+const MAIN_DRAFT: &str = "for main";
 const MULTIBYTE_ERROR_CHAR: &str = "é";
 const TRUST: &str = "/trust";
 const GATED_INIT_SOURCE: &str = "-- shipped by the project";
@@ -212,7 +218,7 @@ fn app_without_splash() -> App {
 
 /// Hands back the slot providers publish their model lists into, since the app
 /// keeps no handle to it once the picker owns it.
-fn app_with_model_slot() -> (App, Arc<ArcSwapOption<Vec<String>>>) {
+fn app_with_model_slot() -> (App, Arc<ArcSwapOption<ModelList>>) {
     let models = Arc::new(ArcSwapOption::empty());
     let mut app = test_app();
     app.model_picker = ModelPicker::new(Arc::clone(&models));
@@ -445,7 +451,7 @@ fn ctrl_c_quits_when_input_empty() {
 }
 
 #[test_case(done(), ExitRequest::Success ; "done_exits_success")]
-#[test_case(AgentEvent::Error { message: "boom".into() }, ExitRequest::Error ; "error_exits_error")]
+#[test_case(AgentEvent::Error { message: "boom".into(), auth: false }, ExitRequest::Error ; "error_exits_error")]
 fn exit_on_done_flag_triggers_exit(event: AgentEvent, expected: ExitRequest) {
     let mut app = test_app();
     app.exit_on_done = true;
@@ -672,7 +678,10 @@ fn queue_item_consumed_marks_agent_streaming() {
 fn agent_error_lands_in_chat(message: String, expected: String) {
     let mut app = test_app();
     app.run_id = 1;
-    app.update(agent_msg(AgentEvent::Error { message }));
+    app.update(agent_msg(AgentEvent::Error {
+        message,
+        auth: false,
+    }));
     assert_eq!(app.chats[0].last_message_role(), Some(&DisplayRole::Error));
     assert_eq!(app.chats[0].last_message_text(), expected);
 }
@@ -749,6 +758,10 @@ fn app_with_queued_message() -> App {
     app
 }
 
+fn palette_open(app: &mut App) -> bool {
+    app.command_palette.is_active(&app.input_box.buffer)
+}
+
 fn type_and_submit(app: &mut App, text: &str) -> Vec<Action> {
     for c in text.chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
@@ -764,6 +777,7 @@ pub(crate) fn cancel_app(app: &mut App) {
 pub(crate) fn error_app(app: &mut App) {
     app.update(agent_msg(AgentEvent::Error {
         message: AGENT_ERROR_MSG.into(),
+        auth: false,
     }));
 }
 
@@ -789,10 +803,10 @@ fn typing_filters_palette() {
     let mut app = test_app();
     type_slash(&mut app);
     app.update(Msg::Key(key(KeyCode::Char('n'))));
-    assert!(app.command_palette.is_active());
+    assert!(palette_open(&mut app));
 
     app.update(Msg::Key(key(KeyCode::Char('z'))));
-    assert!(!app.command_palette.is_active());
+    assert!(!palette_open(&mut app));
 }
 
 #[test]
@@ -802,17 +816,17 @@ fn enter_executes_new_command() {
     app.update(Msg::Key(key(KeyCode::Char('n'))));
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(matches!(&actions[0], Action::RestartAgent(h) if h.is_empty()));
-    assert!(!app.command_palette.is_active());
+    assert!(!palette_open(&mut app));
 }
 
 #[test]
 fn ctrl_c_closes_palette() {
     let mut app = test_app();
     type_slash(&mut app);
-    assert!(app.command_palette.is_active());
+    assert!(palette_open(&mut app));
 
     app.update(Msg::Key(kb::QUIT.to_key_event()));
-    assert!(!app.command_palette.is_active());
+    assert!(!palette_open(&mut app));
 }
 
 /// Plugins that only watch read the prompt here, instead of wrapping
@@ -1617,7 +1631,7 @@ fn tool_lifecycle_events_name_the_session_and_tool() {
 fn tab_in_palette_completes_command() {
     let mut app = test_app();
     type_slash(&mut app);
-    assert!(app.command_palette.is_active());
+    assert!(palette_open(&mut app));
 
     app.update(Msg::Key(key(KeyCode::Tab)));
     let val = app.input_box.buffer.value();
@@ -1972,6 +1986,32 @@ fn turn_complete_accumulates_usage_by_model() {
     assert_eq!(sub.output, 75);
 }
 
+const BACKGROUND_MODEL: &str = "background-model";
+const BACKGROUND_USAGE: StoredTokenUsage = StoredTokenUsage {
+    input: 300,
+    output: 40,
+    cache_creation: 0,
+    cache_read: 0,
+    cost: Some(0.011),
+    subsidised_list_cost: None,
+};
+
+#[test]
+fn background_usage_bills_only_the_tab_showing_its_session() {
+    let mut app = test_app();
+
+    app.add_background_usage(MakiId::generate(), BACKGROUND_MODEL, BACKGROUND_USAGE);
+    app.add_background_usage(app.state.session.id, BACKGROUND_MODEL, BACKGROUND_USAGE);
+
+    assert_eq!(app.state.cost, BACKGROUND_USAGE.cost);
+    assert_eq!(app.chats[0].cost, BACKGROUND_USAGE.cost);
+    assert_eq!(app.state.token_usage, TokenUsage::from(BACKGROUND_USAGE));
+    assert_eq!(
+        app.state.session.usage_by_model().get(BACKGROUND_MODEL),
+        Some(&BACKGROUND_USAGE)
+    );
+}
+
 #[test]
 fn cancel_resets_all_chats_and_indices() {
     let mut app = app_with_subagent();
@@ -2211,7 +2251,7 @@ fn page_keys_scroll_the_transcript_by_one_page() {
     let backend = ratatui::backend::TestBackend::new(area.width, area.bottom());
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal
-        .draw(|frame| app.active_chat().view(frame, area, false, true))
+        .draw(|frame| app.active_chat().view(frame, area, false, true, &[]))
         .unwrap();
     let down = app.active_chat().win_view();
     assert_eq!(
@@ -2311,7 +2351,7 @@ fn app_with_transcript(zone: Rect) -> App {
     let backend = ratatui::backend::TestBackend::new(zone.width, zone.bottom());
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal
-        .draw(|frame| app.active_chat().view(frame, zone, false, true))
+        .draw(|frame| app.active_chat().view(frame, zone, false, true, &[]))
         .unwrap();
     app
 }
@@ -2491,7 +2531,10 @@ fn model_list_arriving_in_the_background_owes_a_frame() {
     assert!(app.model_picker.is_open());
 
     assert_owes_one_frame(&mut app, || {
-        models.store(Some(Arc::new(vec![LATE_MODEL_SPEC.into()])));
+        models.store(Some(Arc::new(ModelList {
+            specs: vec![LATE_MODEL_SPEC.into()],
+            loading: false,
+        })));
     });
 }
 
@@ -2557,7 +2600,7 @@ fn rendered(app: &mut App) -> String {
 
 /// The event loop parks the terminal cursor on whatever `view` reports, so an
 /// IME anchors its preedit text there. The report has to be the very cell the
-/// input box reversed for its software cursor, and the hardware cursor has to
+/// input box painted for its software cursor, and the hardware cursor has to
 /// stay hidden: shown, it would invert that cell back to plain text.
 #[test]
 fn view_reports_the_reversed_input_cell_and_hides_the_hardware_cursor() {
@@ -2577,13 +2620,13 @@ fn view_reports_the_reversed_input_cell_and_hides_the_hardware_cursor() {
                 .buffer()
                 .cell(pos)
                 .expect(CURSOR_ON_SCREEN);
-            (pos, cell.modifier.contains(Modifier::REVERSED))
+            (pos, theme::is_caret_cell(cell))
         })
     };
 
     assert!(
         matches!(draw(&mut app), Some((_, true))),
-        "{CURSOR_ON_REVERSED_CELL}"
+        "{CURSOR_ON_STYLED_CELL}"
     );
 
     app.update(Msg::Key(kb::HELP.to_key_event()));
@@ -4536,7 +4579,7 @@ fn streaming_app_with_history() -> App {
 /// next frame's checkpoint syncs the mirror whatever event arrived.
 #[test_case(done() ; "stale_done")]
 #[test_case(
-    AgentEvent::Error { message: "timeout".into() } ; "stale_error"
+    AgentEvent::Error { message: "timeout".into(), auth: false } ; "stale_error"
 )]
 fn checkpoint_after_cancel_persists_the_cancelled_turn(event: AgentEvent) {
     let mut app = streaming_app_with_history();
@@ -4632,6 +4675,7 @@ fn parent_error_refreshes_picker_and_persists_only_completed_children() {
 
     app.update(agent_msg(AgentEvent::Error {
         message: "boom".into(),
+        auth: false,
     }));
 
     app.checkpoint();
@@ -4716,6 +4760,7 @@ fn active_shell_survives_agent_error_while_agent_and_child_tools_fail() {
 
     app.update(agent_msg(AgentEvent::Error {
         message: "provider overloaded".into(),
+        auth: false,
     }));
 
     assert_eq!(app.chats[0].in_progress_count(), 1);
@@ -4770,6 +4815,7 @@ fn error_event_matching_run_id_saves_session_and_queued_messages() {
 
     app.update(agent_msg(AgentEvent::Error {
         message: "boom".into(),
+        auth: false,
     }));
     app.checkpoint();
 
@@ -4790,6 +4836,7 @@ fn flush_restored_queue_drops_recovery_snapshot() {
     app.queue_and_notify(queued_msg("next"));
     app.update(agent_msg(AgentEvent::Error {
         message: "boom".into(),
+        auth: false,
     }));
     app.checkpoint();
     assert_eq!(app.state.session.meta.queued_messages, ["next"]);
@@ -5302,7 +5349,7 @@ fn the_command_palette_outranks_the_keys_a_popup_claimed() {
 
     type_slash(&mut app);
     app.update(Msg::Key(key(KeyCode::Char('n'))));
-    assert!(app.command_palette.is_active(), "the palette is up");
+    assert!(palette_open(&mut app), "the palette is up");
 
     app.update(Msg::Key(key(KeyCode::Tab)));
     assert!(
@@ -5767,11 +5814,58 @@ fn model_state_carries_the_thinking_ladder() {
 #[test]
 fn set_thinking_clamps_to_what_the_model_will_run() {
     let mut app = test_app();
-    app.state.model.thinking_override = Some(maki_providers::ThinkingSupport::Required);
+    app.state.model.thinking_override = Some(ThinkingSupport::Required);
 
     let lifted = ThinkingConfig::Effort(Effort::Minimal);
     assert_eq!(app.set_thinking("off").unwrap(), lifted);
     assert_eq!(app.state.thinking, lifted);
+}
+
+#[test_case("off", ThinkingConfig::Off)]
+#[test_case("low", ThinkingConfig::Effort(Effort::Low))]
+fn explicit_thinking_choice_replaces_pending_level(input: &str, expected: ThinkingConfig) {
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    app.set_thinking("high").unwrap();
+    let mut model = app.state.model.clone();
+    model.thinking_override = Some(ThinkingSupport::No);
+    app.state.update_model(&model);
+    assert_eq!(app.state.thinking, ThinkingConfig::Off);
+
+    model.thinking_override = Some(ThinkingSupport::Yes);
+    app.state.model = model.clone();
+    assert_eq!(app.set_thinking(input).unwrap(), expected);
+    app.state.update_model(&model);
+    app.checkpoint();
+
+    assert_eq!(app.state.thinking, expected);
+    assert_eq!(app.state.session.meta.thinking, Some(expected.into()));
+    assert_eq!(read_thinking(&app.storage), Some(expected.into()));
+}
+
+#[test_case(StoredThinking::Adaptive)]
+#[test_case(StoredThinking::Effort { level: Effort::High })]
+#[test_case(StoredThinking::Budget { tokens: 8192 })]
+fn checkpoint_preserves_thinking_until_discovery_finishes(stored: StoredThinking) {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    let mut model = test_model();
+    model.thinking_override = Some(ThinkingSupport::No);
+    let mut session = AppSession::new(TEST_MODEL_SPEC, TEST_CWD);
+    session.meta.thinking = Some(stored);
+    session.push_message(Message::user(RESUMED_PROMPT.into()));
+    app.apply_loaded_session(OpenSession::claimed(session, &dir), &model);
+    assert_eq!(app.state.thinking, ThinkingConfig::Off);
+
+    app.checkpoint();
+    assert_eq!(app.state.session.meta.thinking, Some(stored));
+    assert_eq!(app.blank_session().session.meta.thinking, Some(stored));
+    let id = app.state.session.id;
+    drain_writer(app, writer);
+
+    let session = AppSession::load(id, &dir).unwrap();
+    assert_eq!(session.meta.thinking, Some(stored));
+    model.thinking_override = Some(ThinkingSupport::Yes);
+    let state = SessionState::from_session(OpenSession::claimed(session, &dir), &model, &dir);
+    assert_eq!(state.thinking, ThinkingConfig::from(stored));
 }
 
 /// A plugin redraws its badge from the payload alone, and only when the model
@@ -6170,7 +6264,7 @@ fn set_thinking_keeps_state_on_rejected_input(supported: bool, input: &str, expe
     let mut app = test_app();
     app.set_thinking("high").unwrap();
     if !supported {
-        app.state.model.thinking_override = Some(maki_providers::ThinkingSupport::No);
+        app.state.model.thinking_override = Some(ThinkingSupport::No);
     }
 
     assert_eq!(app.set_thinking(input).unwrap_err(), expected);
@@ -6224,6 +6318,7 @@ fn agent_error_creates_synthetic_tool_done_with_message() {
     let error_msg = "Provider is overloaded";
     app.update(agent_msg(AgentEvent::Error {
         message: error_msg.into(),
+        auth: false,
     }));
 
     assert_eq!(app.main_chat().in_progress_count(), 0);
@@ -6620,6 +6715,45 @@ fn submit_in_subagent_chat_queues_for_that_subagent() {
     assert!(app.input_box.is_empty());
 }
 
+#[test_case(HELP_COMMAND, |_, app| app.help_modal.is_open() ; "slash_command")]
+#[test_case("!ls", |actions, _| matches!(actions, [Action::ShellCommand { .. }]) ; "shell")]
+fn command_in_subagent_chat_runs_in_main_chat(input: &str, ran: fn(&[Action], &App) -> bool) {
+    let (mut app, inbox) = app_with_subagent_inbox();
+    app.chats[MAIN_CHAT].draft.text = MAIN_DRAFT.into();
+
+    let actions = type_and_submit(&mut app, input);
+
+    assert!(ran(&actions, &app));
+    assert_eq!(inbox.len(), 0);
+    assert_eq!(app.active_chat, MAIN_CHAT);
+    assert_eq!(app.input_box.buffer.value(), MAIN_DRAFT);
+    assert!(app.chats[1].draft.text.is_empty());
+}
+
+#[test]
+fn exit_in_subagent_chat_quits() {
+    let (mut app, inbox) = app_with_subagent_inbox();
+    let actions = type_and_submit(&mut app, EXIT_WORD);
+    assert!(matches!(actions.as_slice(), [Action::ManualExit]));
+    assert_eq!(inbox.len(), 0);
+}
+
+/// These change the text without a keypress, and `Enter` must still act on
+/// what the box shows.
+#[test_case(false, |app| app.input_box.set_input(HELP_COMMAND.into()), true ; "set_directly_opens_it")]
+#[test_case(true, |app| app.input_box.set_input(MAIN_DRAFT.into()), false ; "replaced_directly_closes_it")]
+#[test_case(true, |app| { app.run_builtin(BuiltinAction::PrevChat); }, false ; "chat_switch_closes_it")]
+fn enter_acts_on_what_the_box_shows(open_first: bool, change: fn(&mut App), runs_command: bool) {
+    let (mut app, _inbox) = app_with_subagent_inbox();
+    if open_first {
+        app.update(Msg::Paste(HELP_COMMAND.into()));
+        assert!(palette_open(&mut app));
+    }
+    change(&mut app);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.help_modal.is_open(), runs_command);
+}
+
 /// The subagent's loop reports the pickup like the main one does, and the
 /// bubble lands in the chat the message was typed in.
 #[test]
@@ -6712,6 +6846,28 @@ fn draft_stays_with_the_chat_it_was_typed_in() {
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert_eq!(inbox.texts(), ["for sub"]);
     assert!(app.queue.is_empty());
+}
+
+/// The box holds whichever chat is in front, and the session saved the box,
+/// so the main draft went missing from it and a subagent's took its place.
+#[test]
+fn the_session_keeps_the_main_draft_while_a_subagent_chat_is_in_front() {
+    const MAIN_DRAFT: &str = "for main";
+    const SUB_DRAFT: &str = "for sub";
+    let (mut app, _inbox) = app_with_subagent_inbox();
+    app.run_builtin(BuiltinAction::PrevChat);
+    app.update(Msg::Paste(MAIN_DRAFT.into()));
+    app.run_builtin(BuiltinAction::NextChat);
+    app.update(Msg::Paste(SUB_DRAFT.into()));
+
+    app.checkpoint();
+    assert_eq!(
+        app.state.session.meta.input_draft.as_deref(),
+        Some(MAIN_DRAFT)
+    );
+
+    app.reset_ui_chrome();
+    assert_eq!(app.input_box.buffer.value(), MAIN_DRAFT);
 }
 
 #[test]
@@ -6902,11 +7058,7 @@ fn tool_use_msg(id: &str) -> Message {
 fn tool_result_msg(id: &str, text: &str) -> Message {
     Message {
         role: Role::User,
-        content: vec![ContentBlock::ToolResult {
-            tool_use_id: id.into(),
-            content: text.into(),
-            is_error: false,
-        }],
+        content: vec![ContentBlock::tool_result(id, text, false)],
         display_text: Some(String::new()),
         ..Default::default()
     }
@@ -7463,11 +7615,14 @@ fn run_builtin_file_picker_opens_modal() {
 }
 
 #[test]
-fn run_builtin_model_picker_opens_and_refreshes() {
+fn run_builtin_model_picker_opens_cached_models() {
     let mut app = test_app();
     let actions = app.run_builtin(BuiltinAction::ModelPicker);
     assert!(app.model_picker.is_open());
-    assert!(matches!(&actions[..], [Action::RefreshModels]));
+    assert!(matches!(
+        &actions[..],
+        [Action::RefreshModels(ModelListing::Cached)]
+    ));
 }
 
 #[test]
@@ -7480,5 +7635,20 @@ fn alt_m_opens_model_picker() {
         state: crossterm::event::KeyEventState::NONE,
     };
     app.update(Msg::Key(key));
+    assert!(app.model_picker.is_open());
+}
+
+#[test]
+fn model_picker_refresh_requires_an_explicit_key() {
+    let mut app = test_app();
+    app.run_builtin(BuiltinAction::ModelPicker);
+    let actions = app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Char('r'),
+        KeyModifiers::CONTROL,
+    )));
+    assert!(matches!(
+        &actions[..],
+        [Action::RefreshModels(ModelListing::Refresh)]
+    ));
     assert!(app.model_picker.is_open());
 }

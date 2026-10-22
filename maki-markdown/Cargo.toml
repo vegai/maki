@@ -17,3 +17,6 @@ unicode-width = { workspace = true }
 syntect = { workspace = true }
 test-case = { workspace = true }
 fastrand = { workspace = true }
+
+[lints]
+workspace = true

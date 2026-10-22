@@ -12,7 +12,7 @@ use tracing::{debug, error, warn};
 
 use crate::AgentError;
 use crate::providers::oauth_loopback::{self, LoginMethod, Loopback};
-use crate::providers::{ResolvedAuth, refreshed_tokens, urlenc};
+use crate::providers::{ResolvedAuth, urlenc};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const PROVIDER: &str = super::SLUG;
@@ -258,9 +258,8 @@ pub(crate) fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentE
         .header("content-type", "application/x-www-form-urlencoded")
         .body(form_body.into_bytes())?;
 
-    let mut resp = client.send(request).map_err(|e| AgentError::Config {
-        message: format!("OpenAI token refresh: {e}"),
-    })?;
+    // A transport error, not `Config`: only the token endpoint's answer may clear the tokens.
+    let mut resp = client.send(request)?;
 
     if resp.status().as_u16() != 200 {
         let body_text = resp.text().unwrap_or_else(|_| "unknown error".into());
@@ -292,32 +291,20 @@ pub(crate) fn is_oauth(dir: &StateDir) -> bool {
     load_tokens(dir, PROVIDER).is_some()
 }
 
-pub fn resolve(dir: &StateDir) -> Result<ResolvedAuth, AgentError> {
+pub fn resolve(dir: &StateDir) -> Result<(ResolvedAuth, Option<OAuthTokens>), AgentError> {
     if let Some(tokens) = load_tokens(dir, PROVIDER) {
-        if !tokens.is_expired() {
-            debug!("using OpenAI OAuth authentication");
-            return build_oauth_resolved(&tokens);
-        }
-        match refreshed_tokens(dir, PROVIDER, None, refresh_tokens) {
-            Ok(fresh) => {
-                debug!("using OpenAI OAuth authentication (refreshed)");
-                return build_oauth_resolved(&fresh);
-            }
-            Err(e) => {
-                warn!(error = %e, "OpenAI OAuth refresh failed, clearing stale tokens");
-                delete_tokens(dir, PROVIDER).ok();
-            }
-        }
+        debug!("using OpenAI OAuth authentication");
+        return Ok((build_oauth_resolved(&tokens)?, Some(tokens)));
     }
 
     if let Ok(key) = env::var("OPENAI_API_KEY") {
         debug!("using OpenAI API key authentication");
-        return ResolvedAuth::bearer(PROVIDER, &key);
+        return Ok((ResolvedAuth::bearer(PROVIDER, &key)?, None));
     }
 
     if let Some(creds) = maki_storage::auth::load_provider_credentials(dir, PROVIDER) {
         debug!("using OpenAI saved API key");
-        return ResolvedAuth::bearer(PROVIDER, &creds.api_key);
+        return Ok((ResolvedAuth::bearer(PROVIDER, &creds.api_key)?, None));
     }
 
     Err(AgentError::Config {

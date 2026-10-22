@@ -262,6 +262,7 @@ impl App {
         shared.push(QueueItem::Compact(Compaction {
             run_id: self.run_id,
             instructions,
+            workflow: self.state.workflow,
         }));
     }
 

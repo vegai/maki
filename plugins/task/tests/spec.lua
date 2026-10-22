@@ -11,6 +11,7 @@ local BENCH = { id = "toolu_03", name = "benchmark", status = "error", focused =
 local DEPLOY = { id = "toolu_04", name = "deploy", status = "working", focused = false }
 local AUDIT = { id = "toolu_05", name = "audit", status = "working", focused = false }
 local RESEARCH_DONE = { id = RESEARCH.id, name = RESEARCH.name, status = "done", focused = false }
+local QUEUED = { id = "toolu_06", name = "queued", status = "queued", focused = false }
 
 case("maki_agent_has_expected_functions", function()
   assert(type(maki.agent) == "table", "maki.agent must be a table")
@@ -60,10 +61,16 @@ end
 
 case("main_is_pinned_first_and_running_beats_finished", function()
   local built = Rows.build({ MAIN, RESEARCH, BUILD, BENCH, DEPLOY }, "")
-  eq(ids(built.rows), "main,toolu_01,toolu_04,toolu_02,toolu_03")
+  eq(ids(built.rows), "main,toolu_04,toolu_01,toolu_03,toolu_02", "newest first within a section")
   eq(sections(built.rows), "2:Running,4:Finished", "main has no header and each section opens once")
   eq(built.sections.running, 2)
   eq(built.sections.finished, 2)
+end)
+
+case("queued_tasks_stay_in_the_running_section", function()
+  local built = Rows.build({ MAIN, BUILD, QUEUED }, "")
+  eq(ids(built.rows), "main,toolu_06,toolu_02")
+  eq(sections(built.rows), "2:Running,3:Finished")
 end)
 
 -- The worst case for a cursor kept as a position: the first running task
@@ -71,16 +78,16 @@ end)
 -- a row. The selection is an id, so it has to follow the task.
 case("a_task_that_finishes_moves_sections_and_stays_addressable", function()
   local before = Rows.build({ MAIN, RESEARCH, DEPLOY, AUDIT, BUILD }, "")
-  eq(ids(before.rows), table.concat({ MAIN.id, RESEARCH.id, DEPLOY.id, AUDIT.id, BUILD.id }, ","))
+  eq(ids(before.rows), table.concat({ MAIN.id, AUDIT.id, DEPLOY.id, RESEARCH.id, BUILD.id }, ","))
   eq(sections(before.rows), "2:Running,5:Finished")
-  eq(Rows.index_of(before.rows, RESEARCH.id), 2)
+  eq(Rows.index_of(before.rows, RESEARCH.id), 4)
 
   local after = Rows.build({ MAIN, RESEARCH_DONE, DEPLOY, AUDIT, BUILD }, "")
   eq(sections(after.rows), "2:Running,4:Finished")
-  eq(Rows.index_of(after.rows, DEPLOY.id), 2)
-  eq(Rows.index_of(after.rows, AUDIT.id), 3)
-  eq(Rows.index_of(after.rows, RESEARCH.id), 4)
-  eq(Rows.index_of(after.rows, BUILD.id), 5)
+  eq(Rows.index_of(after.rows, AUDIT.id), 2)
+  eq(Rows.index_of(after.rows, DEPLOY.id), 3)
+  eq(Rows.index_of(after.rows, BUILD.id), 4)
+  eq(Rows.index_of(after.rows, RESEARCH.id), 5)
 end)
 
 -- `rebuild` resolves the cursor through `index_of(rows, board.sel_id)`, and
@@ -105,7 +112,7 @@ case("a_filter_that_empties_a_section_zeroes_its_count_and_header", function()
   local all = { MAIN, RESEARCH, BUILD, BENCH, DEPLOY }
 
   local finished_only = Rows.build(all, "b")
-  eq(ids(finished_only.rows), BUILD.id .. "," .. BENCH.id)
+  eq(ids(finished_only.rows), BENCH.id .. "," .. BUILD.id)
   eq(sections(finished_only.rows), "1:Finished", "no running row means no Running header")
   eq(finished_only.sections.running, 0)
   eq(finished_only.sections.finished, 2)
@@ -122,6 +129,44 @@ case("a_filter_that_empties_a_section_zeroes_its_count_and_header", function()
   eq(#nothing.rows, 0)
   eq(nothing.sections.running, 0)
   eq(nothing.sections.finished, 0)
+end)
+
+case("only_finished_subagents_are_deletable", function()
+  eq(Rows.deletable(MAIN), false, "the main chat has no status and stays")
+  eq(Rows.deletable(RESEARCH), false, "a running task stays")
+  eq(Rows.deletable(QUEUED), false, "a queued task stays")
+  eq(Rows.deletable(BUILD), true, "a done task goes")
+  eq(Rows.deletable(BENCH), true, "an errored task still counts as finished")
+end)
+
+case("background_rows_show_status_elapsed_and_cost", function()
+  local now = 10000
+  local entries = {
+    { name = "ci-monitor", plugin = "ci", status = "working", started_at = now - 125, cost = 0.0123 },
+    { name = "lint-watch", plugin = "lint", status = "idle", started_at = now + 5 },
+    { name = "nightly", plugin = "ci", status = "idle", started_at = now - 7300 },
+  }
+  local rows = Rows.background(entries, "", now)
+  eq(#rows, 3)
+  eq(rows[1].detail, "working · 2m · $0.012")
+  eq(rows[2].detail, "idle · <1m", "no price means no cost, and clock skew reads as fresh")
+  eq(rows[3].detail, "idle · 2h")
+  local filtered = Rows.background(entries, "lint", now)
+  eq(#filtered, 1)
+  eq(filtered[1].name, "lint-watch")
+end)
+
+case("background_signature_moves_only_when_the_drawn_text_does", function()
+  local function signature(status, age)
+    local entry = { name = "ci-monitor", plugin = "ci", status = status, started_at = 0 }
+    return select(2, Rows.background(status and { entry } or {}, "", age))
+  end
+  local before = signature("working", 125)
+  eq(signature("working", 155), before, "2m still reads 2m")
+  eq(signature("working", 5), signature("working", 59), "the first minute never ticks")
+  assert(signature("working", 185) ~= before, "2m turns 3m")
+  assert(signature("idle", 125) ~= before, "a status change")
+  assert(signature(nil, 125) ~= before, "the last session leaves")
 end)
 
 th.report()

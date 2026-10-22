@@ -20,10 +20,8 @@ local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed
 - Call in parallel when reading multiple files.
 - Avoid tiny repeated slices - read a larger window if you need more context.]]
 
-local DEFAULT_MAX_OUTPUT_LINES = 2000
-
 local opts = maki.api.register_options({
-  max_line_bytes = { default = 500, min = 80, desc = "Truncate lines longer than this many bytes." },
+  max_line_bytes = { default = 500, min = 80, desc = "Truncate lines the model sees at this many bytes." },
   max_output_lines = output_limits.specs.max_output_lines,
 })
 
@@ -94,9 +92,12 @@ local function read_file(path, offset, limit, ctx)
   local total_lines = #all_lines
 
   local start = math.max(math.floor(offset), 1)
-  local default_max = opts.max_output_lines or ctx:config("max_output_lines", DEFAULT_MAX_OUTPUT_LINES)
-  local max_lines = limit == 0 and default_max or math.min(limit, default_max)
-  local max_line_bytes = opts.max_line_bytes
+  local max_output_lines = output_limits.resolve(opts, ctx)
+  local max_lines = limit == 0 and total_lines or limit
+  if max_output_lines then
+    max_lines = math.min(max_lines, max_output_lines)
+  end
+  local max_line_bytes = output_limits.line_bytes(opts, ctx)
 
   local lines = {}
   for i = start, math.min(start + max_lines - 1, total_lines) do

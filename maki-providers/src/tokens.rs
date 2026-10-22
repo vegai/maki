@@ -6,7 +6,7 @@
 
 use serde_json::Value;
 
-use crate::types::{ContentBlock, Message};
+use crate::types::{ContentBlock, Message, is_deferred_tool};
 
 const CHARS_PER_TOKEN: usize = 4;
 /// Flat per image, because all we have is the encoded blob, and its size
@@ -40,9 +40,18 @@ pub fn estimate_message_tokens(messages: &[Message]) -> u32 {
 
 /// [`estimate_message_tokens`] plus the system prompt and the serialized tool
 /// schemas, which a server checking `prompt + max_tokens <= context_window`
-/// counts too.
+/// counts too. A deferred definition travels in the request but not in the
+/// context, so it is not counted.
 pub fn estimate_prompt_tokens(messages: &[Message], system: &str, tools: &Value) -> u32 {
-    let overhead = (system.len() + json_len(tools)) / CHARS_PER_TOKEN;
+    let tools_len = match tools.as_array() {
+        Some(arr) => arr
+            .iter()
+            .filter(|t| !is_deferred_tool(t))
+            .map(json_len)
+            .sum(),
+        None => json_len(tools),
+    };
+    let overhead = (system.len() + tools_len) / CHARS_PER_TOKEN;
     estimate_message_tokens(messages).saturating_add(overhead as u32)
 }
 
@@ -257,6 +266,19 @@ mod tests {
             estimate_prompt_tokens(&messages, &system, &json!([{"name": "read"}]))
                 > estimate_message_tokens(&messages) + TEXT_TOKENS
         );
+    }
+
+    #[test]
+    fn deferred_tool_schemas_are_not_counted_in_the_prompt_estimate() {
+        let messages = [text_message(TEXT_BYTES)];
+        let schema = json!({"description": "d".repeat(TEXT_BYTES)});
+        let eager = json!([{"name": "srv__big", "input_schema": schema}]);
+        let mut deferred = eager.clone();
+        deferred[0][crate::types::DEFER_LOADING_KEY] = json!(true);
+
+        let without = estimate_prompt_tokens(&messages, "", &json!([]));
+        assert_eq!(estimate_prompt_tokens(&messages, "", &deferred), without);
+        assert!(estimate_prompt_tokens(&messages, "", &eager) > without);
     }
 
     #[test]

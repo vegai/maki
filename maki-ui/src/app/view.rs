@@ -185,6 +185,7 @@ impl App {
             layout.msg_area,
             self.selection_state.is_some(),
             images_visible,
+            self.command_palette.lua_commands(),
         );
     }
 
@@ -250,7 +251,8 @@ impl App {
                 self.input_has_keyboard(),
                 panel_hint,
             );
-            self.command_palette.view(frame, layout.input_area);
+            self.command_palette
+                .view(frame, layout.input_area, &self.input_box.buffer);
             return caret;
         }
         None
@@ -326,6 +328,10 @@ impl App {
             }
         }
         let r = self.float_mgr.view(frame, full, caret);
+        if r.width > 0 {
+            overlay_rect = r;
+        }
+        let r = self.alert_modal.view(frame, full);
         if r.width > 0 {
             overlay_rect = r;
         }
@@ -471,7 +477,7 @@ impl App {
     }
 
     #[cfg(test)]
-    pub(super) fn active_keybind_contexts(&self) -> Vec<KeybindContext> {
+    pub(super) fn active_keybind_contexts(&mut self) -> Vec<KeybindContext> {
         let mut contexts = vec![KeybindContext::General];
         if self.pack_review.is_open() || self.plan_form_active() {
             contexts.push(KeybindContext::FormInput);
@@ -483,7 +489,7 @@ impl App {
             contexts.push(KeybindContext::ThemePicker);
         } else if self.model_picker.is_open() {
             contexts.push(KeybindContext::ModelPicker);
-        } else if self.command_palette.is_active() {
+        } else if self.command_palette.is_active(&self.input_box.buffer) {
             contexts.push(KeybindContext::CommandPalette);
         } else if self.search_modal.is_open() {
             contexts.push(KeybindContext::Search);

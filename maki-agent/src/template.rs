@@ -1,14 +1,22 @@
 use std::borrow::Cow;
 use std::env;
 
-use jiff::Timestamp;
+use jiff::Zoned;
 
+/// What every prompt states about where it runs, the main one and subagents'
+/// alike, so none of them can drift out of step.
+const ENVIRONMENT: &str =
+    "Environment:\n- Working directory: {cwd}\n- Platform: {platform}\n- Date: {date}";
+
+/// `{environment}` goes first, so the placeholders it brings in are filled by
+/// the vars after it.
 pub fn env_vars() -> Vars {
     let cwd = env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| ".".into());
-    let date = Timestamp::now().strftime("%Y-%m-%d").to_string();
+    let date = Zoned::now().strftime("%Y-%m-%d").to_string();
     Vars::new()
+        .set("{environment}", ENVIRONMENT)
         .set("{cwd}", cwd)
         .set("{platform}", env::consts::OS)
         .set("{date}", date)
@@ -42,6 +50,7 @@ impl Vars {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jiff::Timestamp;
     use test_case::test_case;
 
     fn format_date(ts: Timestamp) -> String {
@@ -73,5 +82,12 @@ mod tests {
         let vars = env_vars();
         let result = vars.apply("{date}");
         assert_ne!(result.as_ref(), "{date}");
+    }
+
+    #[test]
+    fn environment_is_filled_in_whole() {
+        let environment = env_vars().apply("{environment}").into_owned();
+        assert!(environment.starts_with("Environment:"), "{environment}");
+        assert!(!environment.contains('{'), "{environment}");
     }
 }

@@ -14,7 +14,7 @@ Maki ships with 21 built-in tools in this reference (20 on by default, 1 opt-in 
 ### `bash` {#bash}
 
 Execute a bash command.
-Commands run in <cwd> by default.
+Commands run in the session's working directory (see Environment) by default.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|

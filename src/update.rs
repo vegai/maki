@@ -1,14 +1,38 @@
-#[cfg(unix)]
-use std::ffi::CString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use maki_storage::paths::canonicalize_clean;
 use maki_storage::version::{self, VersionError};
 use maki_storage::{StateDir, StorageError};
 
-const INSTALL_SCRIPT_URL: &str = "https://maki.sh/install.sh";
+#[cfg(not(windows))]
+const INSTALLER: Installer = Installer {
+    url: "https://maki.sh/install.sh",
+    lang: "bash",
+    suffix: ".sh",
+    program: "sh",
+    args: &[],
+};
+#[cfg(windows)]
+const INSTALLER: Installer = Installer {
+    url: "https://maki.sh/install.ps1",
+    lang: "powershell",
+    // PowerShell's -File refuses scripts that don't end in .ps1.
+    suffix: ".ps1",
+    program: "powershell",
+    args: &["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"],
+};
+
 const BACKUP_FILENAME: &str = "maki_backup";
 const INSTALL_DIR_ENV: &str = "MAKI_INSTALL_DIR";
+
+struct Installer {
+    url: &'static str,
+    lang: &'static str,
+    suffix: &'static str,
+    program: &'static str,
+    args: &'static [&'static str],
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum UpdateError {
@@ -57,35 +81,43 @@ pub enum UpdateError {
 
 fn fetch_script() -> Result<String, UpdateError> {
     use isahc::ReadResponseExt;
-    isahc::get(INSTALL_SCRIPT_URL)
+    isahc::get(INSTALLER.url)
         .and_then(|mut r| r.text().map_err(Into::into))
         .map_err(|source| UpdateError::Fetch {
-            url: INSTALL_SCRIPT_URL,
+            url: INSTALLER.url,
             source,
         })
         .or_else(|e| {
-            version::curl_fetch(INSTALL_SCRIPT_URL)
+            version::curl_fetch(INSTALLER.url)
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                 .map_err(|_| e)
         })
 }
 
-fn backup_binary(exe_path: &Path, storage: &StateDir) -> Result<PathBuf, UpdateError> {
-    let backup_path = storage.path().join(BACKUP_FILENAME);
-    std::fs::copy(exe_path, &backup_path).map_err(|e| UpdateError::Backup {
-        path: backup_path.clone(),
+/// Where `maki update` keeps the binary it replaced, for `maki rollback`.
+pub fn backup_path() -> Result<PathBuf, StorageError> {
+    Ok(StateDir::resolve()?.path().join(BACKUP_FILENAME))
+}
+
+fn backup_binary(exe_path: &Path, backup_path: &Path) -> Result<(), UpdateError> {
+    std::fs::copy(exe_path, backup_path).map_err(|e| UpdateError::Backup {
+        path: backup_path.to_path_buf(),
         source: e,
     })?;
-    Ok(backup_path)
+    Ok(())
 }
 
 fn execute_script(script: &str, install_dir: &Path) -> Result<(), UpdateError> {
-    let mut tmp = tempfile::NamedTempFile::new().map_err(UpdateError::WriteScript)?;
+    let mut tmp = tempfile::Builder::new()
+        .suffix(INSTALLER.suffix)
+        .tempfile()
+        .map_err(UpdateError::WriteScript)?;
     tmp.write_all(script.as_bytes())
         .map_err(UpdateError::WriteScript)?;
     tmp.flush().map_err(UpdateError::WriteScript)?;
 
-    let status = std::process::Command::new("sh")
+    let status = std::process::Command::new(INSTALLER.program)
+        .args(INSTALLER.args)
         .arg(tmp.path())
         .env(INSTALL_DIR_ENV, install_dir)
         .status()
@@ -98,8 +130,10 @@ fn execute_script(script: &str, install_dir: &Path) -> Result<(), UpdateError> {
 }
 
 fn current_exe_resolved() -> Result<PathBuf, UpdateError> {
+    // canonicalize_clean drops the `\\?\` prefix Windows adds. Otherwise it leaks
+    // into MAKI_INSTALL_DIR and install.ps1 adds a second, duplicate PATH entry.
     std::env::current_exe()
-        .and_then(|p| p.canonicalize())
+        .map(|p| canonicalize_clean(&p))
         .map_err(UpdateError::CurrentExe)
 }
 
@@ -108,15 +142,26 @@ fn needs_sudo(path: &Path) -> bool {
     let Some(dir) = path.parent() else {
         return false;
     };
-    let Ok(cpath) = CString::new(dir.as_os_str().as_encoded_bytes()) else {
-        return false;
-    };
-    unsafe { libc::access(cpath.as_ptr(), libc::W_OK) != 0 }
+    rustix::fs::access(dir, rustix::fs::Access::WRITE_OK).is_err()
 }
 
 #[cfg(not(unix))]
 fn needs_sudo(_path: &Path) -> bool {
     false
+}
+
+/// Windows won't overwrite a running exe, but it will rename one. So rollback
+/// parks the live maki.exe as maki.exe.old, the same trick install.ps1 uses.
+#[cfg(windows)]
+fn move_exe_aside(exe_path: &Path) -> Option<PathBuf> {
+    let old = exe_path.with_extension("exe.old");
+    let _ = std::fs::remove_file(&old);
+    std::fs::rename(exe_path, &old).ok().map(|()| old)
+}
+
+#[cfg(not(windows))]
+fn move_exe_aside(_exe_path: &Path) -> Option<PathBuf> {
+    None
 }
 
 fn restore_backup(backup_path: &Path, exe_path: &Path) -> Result<(), UpdateError> {
@@ -145,7 +190,14 @@ fn restore_backup(backup_path: &Path, exe_path: &Path) -> Result<(), UpdateError
         }
     } else {
         std::fs::copy(backup_path, &tmp).map_err(err)?;
-        std::fs::rename(&tmp, exe_path).map_err(err)?;
+        let moved_aside = move_exe_aside(exe_path);
+        if let Err(e) = std::fs::rename(&tmp, exe_path) {
+            if let Some(old) = moved_aside {
+                let _ = std::fs::rename(old, exe_path);
+            }
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err(e));
+        }
     }
     Ok(())
 }
@@ -183,14 +235,14 @@ pub fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
             })?
             .to_path_buf(),
     };
-    let storage = StateDir::resolve()?;
+    let backup_path = backup_path()?;
 
     let script = fetch_script()?;
 
     if no_color {
         println!("{script}");
     } else {
-        println!("{}", maki_ui::highlight_ansi("bash", &script));
+        println!("{}", maki_ui::highlight_ansi(INSTALLER.lang, &script));
     }
 
     if !skip_confirm && !prompt_yes(&install_dir) {
@@ -198,7 +250,7 @@ pub fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
         return Ok(());
     }
 
-    let backup_path = backup_binary(&exe_path, &storage)?;
+    backup_binary(&exe_path, &backup_path)?;
 
     execute_script(&script, &install_dir)?;
 
@@ -212,8 +264,7 @@ pub fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
 
 pub fn rollback() -> Result<(), UpdateError> {
     let exe_path = current_exe_resolved()?;
-    let storage = StateDir::resolve()?;
-    let backup_path = storage.path().join(BACKUP_FILENAME);
+    let backup_path = backup_path()?;
 
     if !backup_path.exists() {
         return Err(UpdateError::NoBackup(backup_path));
@@ -224,4 +275,41 @@ pub fn rollback() -> Result<(), UpdateError> {
     println!("Restored previous version.");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_case::test_case;
+
+    const CURRENT_EXE_CONTENT: &str = "current_version";
+    const BACKUP_EXE_CONTENT: &str = "backup_version";
+    const STALE_OLD_CONTENT: &str = "stale_old_version";
+
+    #[test_case(false; "clean")]
+    #[test_case(true; "with_stale_old_file")]
+    fn restore_backup_replaces_exe(has_stale_old: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let exe_path = dir.path().join("maki.exe");
+        let backup_path = dir.path().join("maki_backup");
+        let old_path = exe_path.with_extension("exe.old");
+
+        std::fs::write(&exe_path, CURRENT_EXE_CONTENT).unwrap();
+        std::fs::write(&backup_path, BACKUP_EXE_CONTENT).unwrap();
+        if has_stale_old {
+            std::fs::write(&old_path, STALE_OLD_CONTENT).unwrap();
+        }
+
+        restore_backup(&backup_path, &exe_path).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&exe_path).unwrap(),
+            BACKUP_EXE_CONTENT
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            std::fs::read_to_string(&old_path).unwrap(),
+            CURRENT_EXE_CONTENT
+        );
+    }
 }

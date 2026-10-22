@@ -2,11 +2,11 @@ use std::cell::RefCell;
 use std::cmp::Reverse;
 
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{Lua, Result as LuaResult, Table};
+use mlua::{Lua, LuaString, Result as LuaResult, Table};
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
-use super::util::pair::{Pair, pair};
+use super::util::pair::{Pair, pair, try_pair};
 
 thread_local! {
     /// `Matcher::new` allocates a score matrix of about 135KB, so building one
@@ -26,9 +26,12 @@ thread_local! {
 /// if err then return end
 /// print(md) -- "# Hello\n\nworld"
 #[lua_fn]
-fn html_to_markdown(_lua: &Lua, html: String) -> LuaResult<Pair<String>> {
+async fn html_to_markdown(_lua: Lua, html: LuaString) -> LuaResult<Pair<String>> {
+    let html = try_pair!(html.to_str()).to_owned();
     Ok(pair(
-        htmd::convert(&html).map_err(|e| format!("html_to_markdown: {e}")),
+        smol::unblock(move || htmd::convert(&html))
+            .await
+            .map_err(|e| format!("html_to_markdown: {e}")),
     ))
 }
 
@@ -164,8 +167,8 @@ fn fuzzy_list(
         let mut buf = Vec::new();
         // The Lua strings are held rather than copied into Rust ones: a
         // picker calls this on every keystroke over the same list.
-        let mut scored: Vec<(usize, u32, mlua::String)> = Vec::new();
-        for (i, entry) in haystacks.sequence_values::<mlua::String>().enumerate() {
+        let mut scored: Vec<(usize, u32, LuaString)> = Vec::new();
+        for (i, entry) in haystacks.sequence_values::<LuaString>().enumerate() {
             let Ok(text) = entry else { continue };
             let score = match text.to_str() {
                 Ok(utf8) => pattern.score(Utf32Str::new(&utf8, &mut buf), matcher),

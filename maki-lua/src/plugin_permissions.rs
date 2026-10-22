@@ -2,7 +2,7 @@ use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use maki_config::host_allowed;
+use maki_config::{host_allowed, is_valid_host_pattern};
 use maki_providers::plugin;
 use mlua::{Error as LuaError, Function, IntoLuaMulti, Lua, Result as LuaResult};
 use semver::Version;
@@ -57,8 +57,8 @@ impl NetEgress {
         }
     }
 
-    /// The manifest's list, for the one caller that has to answer "did this
-    /// plugin declare any hosts at all" before it can register a provider.
+    /// The raw manifest list. `allows` reads a missing list as "any host",
+    /// and some callers need to treat it as "no host" instead.
     pub(crate) fn declared(&self) -> &NetHosts {
         &self.declared
     }
@@ -77,14 +77,14 @@ impl NetEgress {
         Arc::clone(&self.providers)
     }
 
-    /// Whether this plugin may reach `host`: its manifest says so, or `host`
-    /// is where maki itself would send the credentials of a provider it
-    /// registered.
-    pub(crate) fn allows(&self, host: &str) -> bool {
+    /// Whether this plugin may reach `host:port`: its manifest says so, or it
+    /// is where maki itself would send the credentials of a provider the
+    /// plugin registered.
+    pub(crate) fn allows(&self, host: &str, port: u16) -> bool {
         let Some(declared) = &self.declared else {
             return true;
         };
-        host_allowed(host, declared) || self.serves(host)
+        host_allowed(host, port, declared) || self.serves(host, port)
     }
 
     /// Whether `url` is on the origin of a provider this plugin registered,
@@ -99,13 +99,13 @@ impl NetEgress {
             .any(|vouched| vouched.origin() == origin)
     }
 
-    fn serves(&self, host: &str) -> bool {
+    fn serves(&self, host: &str, port: u16) -> bool {
         self.providers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .filter_map(|slug| plugin::effective_host(slug))
-            .any(|origin| host_allowed(host, &[origin]))
+            .filter_map(|slug| plugin::effective_authority(slug))
+            .any(|origin| host_allowed(host, port, &[origin]))
     }
 }
 
@@ -157,10 +157,14 @@ impl PluginPermissions {
         self.allowed[perm as usize]
     }
 
-    /// Layering a call whose reach nobody declared takes full trust, since no
-    /// narrower price would be honest.
-    pub fn holds_all(&self) -> bool {
-        self.allowed.iter().all(|&allowed| allowed)
+    /// Reaching what nobody declared costs every capability a tool can reach,
+    /// since no narrower price would be honest. `agent` is not one of them:
+    /// it is about starting turns, and every tool already runs inside one, so
+    /// a plugin that may not start turns can still steer a call in one.
+    pub fn holds_all_reach(&self) -> bool {
+        Permission::ALL
+            .iter()
+            .all(|&perm| perm == Permission::Agent || self.is_allowed(perm))
     }
 
     pub fn from_manifest(manifest: &toml::Value) -> Self {
@@ -311,6 +315,15 @@ fn net_hosts_from_manifest(manifest: &toml::Value) -> NetHosts {
     Some(hosts.into())
 }
 
+/// A typo in `net_hosts` grants nothing. Without this warning the author only
+/// sees a blocked request later, with no hint that the list itself was wrong.
+pub(crate) fn warn_invalid_net_hosts(plugin: &str, hosts: &NetHosts) {
+    let entries = hosts.as_deref().unwrap_or_default();
+    for entry in entries.iter().filter(|entry| !is_valid_host_pattern(entry)) {
+        warn!(plugin, entry, "ignoring unparseable net_hosts entry");
+    }
+}
+
 /// Reads a package's requested permissions.
 ///
 /// Only an absent manifest means "requests nothing". A manifest that exists but
@@ -452,6 +465,7 @@ mod tests {
     const PLUGIN: &str = "test-plugin";
     const DECLARED_HOST: &str = "api.example.com";
     const OTHER_HOST: &str = "elsewhere.example";
+    const HTTPS_PORT: u16 = 443;
     /// A slug no load ever registered, which is the state every slug is in
     /// here: these run without a provider registry.
     const UNREGISTERED_SLUG: &str = "not-a-provider";
@@ -479,7 +493,7 @@ mod tests {
         for slug in owns {
             egress.owns((*slug).to_owned());
         }
-        assert_eq!(egress.allows(host), expected);
+        assert_eq!(egress.allows(host, HTTPS_PORT), expected);
     }
 
     #[test]
@@ -494,6 +508,16 @@ mod tests {
     fn denied_blocks_everything() {
         let p = PluginPermissions::denied();
         assert_denied(&p);
+    }
+
+    #[test]
+    fn full_reach_does_not_need_agent_but_misses_any_capability() {
+        let mut p = PluginPermissions::trusted();
+        p.set(Permission::Agent, false);
+        assert!(p.holds_all_reach());
+
+        p.set(Permission::Env, false);
+        assert!(!p.holds_all_reach());
     }
 
     #[test]

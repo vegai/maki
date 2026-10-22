@@ -4,7 +4,7 @@ use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 use std::process;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,10 @@ type FileStamp = (PathBuf, Option<SystemTime>, u64);
 /// per row while the model picker builds its list, so without this each of
 /// those costs a read plus a full TOML parse.
 static PARSED: Mutex<Option<(FileStamp, ProvidersConfig)>> = Mutex::new(None);
+
+/// Valid `top_p` is in the open interval exclusive of 0, up to 1 inclusive.
+const TOP_P_MIN: f64 = 0.0;
+const TOP_P_MAX: f64 = 1.0;
 
 /// The role a model plays, which is what tiered requests dispatch on. Lives
 /// here rather than in maki-providers so `providers.toml` can name it.
@@ -232,7 +236,7 @@ pub struct BuiltInProvider {
     pub protocol: Protocol,
     pub default_base_url: &'static str,
     pub default_api_key_env: &'static str,
-    pub default_model: &'static str,
+    pub default_model: Option<&'static str>,
     pub plans: Option<&'static [(&'static str, ProviderPlan)]>,
     pub login_url: Option<&'static str>,
     /// Whether the login flow should prompt for a base URL (e.g. local inference servers).
@@ -240,6 +244,10 @@ pub struct BuiltInProvider {
 }
 
 inventory::collect!(BuiltInProvider);
+
+/// Login rows of Lua plugin providers. They show up at runtime, too late for
+/// `inventory`, so they live here and every lookup checks both.
+static REGISTERED: RwLock<Vec<&'static BuiltInProvider>> = RwLock::new(Vec::new());
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OverrideFields {
@@ -277,6 +285,14 @@ pub struct ProviderDef {
     pub display_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol: Option<Protocol>,
+    /// The plugin owner selected to implement this provider name. Catalog
+    /// metadata does not select an implementation or grant it credentials.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_plugin"
+    )]
+    pub plugin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -287,6 +303,15 @@ pub struct ProviderDef {
     pub api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// Nucleus sampling threshold sent as `top_p` in the request body to this
+    /// provider. When unset, no `top_p` is sent (the provider's own default
+    /// applies). Must be in `(0, 1]`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_top_p"
+    )]
+    pub top_p: Option<f64>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub discover_models: bool,
     /// Extra HTTP headers sent with every request to this provider. Values
@@ -314,6 +339,12 @@ pub struct ProviderDef {
     /// price as a reference; see [`maki_providers::Model::subsidised_by`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subsidised_by: Option<String>,
+    /// Whether the endpoint expands `tool_reference` blocks into
+    /// `defer_loading` definitions, so a deferred MCP tool loads without
+    /// rewriting the cached tools prefix. Unset falls back to the built-in
+    /// row at its own URL, `false` for a custom slug or another `base_url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_deferred_tools: Option<bool>,
     /// Opencode-only: when `Some(false)`, free catalog models are hidden
     /// entirely. Defaults to `false` when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -378,12 +409,15 @@ impl ProvidersConfig {
         };
         let config = toml::from_str::<ProvidersConfig>(&content)
             .map_err(|e| format!("invalid {}: {e}", stamp.0.display()))?;
+        config.validate()?;
         debug!(path = %stamp.0.display(), "loaded providers config");
         *parsed = Some((stamp, config.clone()));
         Ok(config)
     }
 
     pub fn save(&self) -> Result<(), std::io::Error> {
+        self.validate()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let path = providers_file_path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -400,6 +434,17 @@ impl ProvidersConfig {
 
     pub fn get(&self, slug: &str) -> Option<&ProviderDef> {
         self.providers.get(slug)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        for (slug, def) in &self.providers {
+            if def.plugin.is_some() && def.protocol.is_some() {
+                return Err(format!(
+                    "provider '{slug}' must select either a plugin or a protocol"
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn upsert(&mut self, slug: String, def: ProviderDef) {
@@ -421,14 +466,25 @@ fn providers_file_path() -> PathBuf {
     })
 }
 
+pub fn set_registered_providers(rows: Vec<&'static BuiltInProvider>) {
+    *REGISTERED.write().unwrap_or_else(|e| e.into_inner()) = rows;
+}
+
 pub fn builtin_provider(slug: &str) -> Option<&'static BuiltInProvider> {
     inventory::iter::<BuiltInProvider>()
         .into_iter()
         .find(|p| p.slug == slug)
+        .or_else(|| {
+            let registered = REGISTERED.read().unwrap_or_else(|e| e.into_inner());
+            registered.iter().copied().find(|p| p.slug == slug)
+        })
 }
 
 pub fn all_builtins() -> Vec<&'static BuiltInProvider> {
-    inventory::iter::<BuiltInProvider>().collect()
+    let registered = REGISTERED.read().unwrap_or_else(|e| e.into_inner());
+    inventory::iter::<BuiltInProvider>()
+        .chain(registered.iter().copied())
+        .collect()
 }
 
 pub fn resolve_api_key_env(slug: &str, def: Option<&ProviderDef>) -> String {
@@ -460,14 +516,13 @@ pub fn base_url_override(slug: &str) -> Option<String> {
 /// that already carry a default (the openai-compat layer, whose static default
 /// can be more specific than the inventory one) use this.
 pub fn configured_base_url(slug: &str, def: Option<&ProviderDef>) -> Option<String> {
-    if let Some(url) = base_url_override(slug) {
-        return Some(url);
-    }
-    let def = def?;
-    if let Some(url) = &def.base_url {
-        return Some(url.clone());
-    }
-    let plan_name = def.plan.as_ref()?;
+    base_url_override(slug)
+        .or_else(|| def?.base_url.clone())
+        .or_else(|| plan_base_url(slug, def))
+}
+
+pub fn plan_base_url(slug: &str, def: Option<&ProviderDef>) -> Option<String> {
+    let plan_name = def?.plan.as_ref()?;
     builtin_provider(slug)?
         .plans?
         .iter()
@@ -592,7 +647,7 @@ pub fn resolve_default_model(slug: &str, def: Option<&ProviderDef>) -> Option<St
             }
         }
     }
-    builtin_provider(slug).map(|b| b.default_model.to_string())
+    builtin_provider(slug)?.default_model.map(str::to_owned)
 }
 
 pub fn resolve_login_url(slug: &str, plan: Option<&str>) -> Option<String> {
@@ -609,6 +664,45 @@ pub fn resolve_login_url(slug: &str, plan: Option<&str>) -> Option<String> {
         }
     }
     builtin_provider(slug).and_then(|b| b.login_url.map(|u| u.to_string()))
+}
+
+/// The `top_p` configured for `slug`. Read with `load_or_default` so a
+/// mid-session typo in `providers.toml` degrades to the default instead of
+/// taking the process down.
+pub fn top_p_for(slug: &str) -> Option<f64> {
+    ProvidersConfig::load_or_default()
+        .get(slug)
+        .and_then(|def| def.top_p)
+}
+
+fn de_plugin<'de, D>(de: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(de)?;
+    if let Some(name) = &value
+        && (name.is_empty() || name.trim() != name)
+    {
+        return Err(serde::de::Error::custom(
+            "plugin must name an owner without surrounding whitespace",
+        ));
+    }
+    Ok(value)
+}
+
+fn de_top_p<'de, D>(de: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<f64>::deserialize(de)?;
+    if let Some(v) = value
+        && (v.is_nan() || v <= TOP_P_MIN || v > TOP_P_MAX)
+    {
+        return Err(serde::de::Error::custom(format!(
+            "top_p must be in ({TOP_P_MIN}, {TOP_P_MAX}], got {v}"
+        )));
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -663,6 +757,47 @@ mod tests {
     }
 
     const EMPTY_PROVIDER_DEF_TOML: &str = "";
+
+    #[test]
+    fn selected_plugin_roundtrip_preserves_gateway_settings() {
+        const PLUGIN: &str = "provider-package";
+        const SLUG: &str = "selected-provider";
+        const GATEWAY: &str = "https://gateway.example/v1";
+        let config: ProvidersConfig = toml::from_str(&format!(
+            "[{SLUG}]\nplugin = {PLUGIN:?}\nbase_url = {GATEWAY:?}\n"
+        ))
+        .unwrap();
+        let parsed: ProvidersConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        let def = parsed.get(SLUG).unwrap();
+        assert_eq!(def.plugin.as_deref(), Some(PLUGIN));
+        assert_eq!(def.base_url.as_deref(), Some(GATEWAY));
+        assert!(def.protocol.is_none());
+        let legacy: ProviderDef = toml::from_str(EMPTY_PROVIDER_DEF_TOML).unwrap();
+        assert!(legacy.plugin.is_none());
+        assert!(!toml::to_string(&legacy).unwrap().contains("plugin"));
+    }
+
+    #[test_case("\"\"" ; "empty")]
+    #[test_case("\" \"" ; "whitespace")]
+    #[test_case("\" provider-package\"" ; "leading_whitespace")]
+    #[test_case("42" ; "wrong_type")]
+    fn invalid_plugin_owner_is_rejected(value: &str) {
+        assert!(toml::from_str::<ProviderDef>(&format!("plugin = {value}")).is_err());
+    }
+
+    #[test]
+    fn selected_plugin_cannot_save_a_protocol_definition() {
+        const SLUG: &str = "selected-provider";
+        const ERROR: &str = "must select either a plugin or a protocol";
+        let config: ProvidersConfig = toml::from_str(&format!(
+            "[{SLUG}]\nplugin = \"provider-package\"\nprotocol = \"openai\"\n"
+        ))
+        .unwrap();
+        let error = config.save().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains(SLUG));
+        assert!(error.to_string().contains(ERROR));
+    }
 
     #[test]
     fn provider_def_enable_free_models_defaults_none() {
@@ -919,6 +1054,30 @@ tier = "{input}"
     fn thinking_level_keys_are_checked_at_parse(fields: &str, parses: bool) {
         let entry = format!(r#"models = [{{ id = "m", thinking_fields = {fields} }}]"#);
         assert_eq!(toml::from_str::<ProviderDef>(&entry).is_ok(), parses);
+    }
+
+    #[test_case(0.0; "zero")]
+    #[test_case(-0.1; "negative")]
+    #[test_case(1.5; "above_one")]
+    fn top_p_out_of_range_rejected(value: f64) {
+        let res = toml::from_str::<ProviderDef>(&format!("top_p = {value}"));
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn top_p_nan_rejected() {
+        let err = toml::from_str::<ProviderDef>("top_p = nan")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("top_p must be in"), "{err}");
+    }
+
+    #[test]
+    fn top_p_boundaries_accepted() {
+        let def: ProviderDef = toml::from_str("top_p = 1.0").unwrap();
+        assert_eq!(def.top_p, Some(1.0));
+        let def2: ProviderDef = toml::from_str(&format!("top_p = {}", f64::MIN_POSITIVE)).unwrap();
+        assert!(def2.top_p.unwrap() > 0.0);
     }
 
     #[test_case("MyProvider", "myprovider"; "mixed_case")]

@@ -43,9 +43,7 @@ maki.api.register_tool({
   description = "Search the web for real-time information using "
     .. provider.label
     .. ".\n\n"
-    .. "Today's date is "
-    .. os.date("%Y-%m-%d")
-    .. ".\n\n"
+    .. "For time-sensitive queries, use today's date (see Environment).\n\n"
     .. "- Use for current events, documentation, APIs, or anything not in local files.\n"
     .. "- Prefer specific, targeted queries over broad ones.\n"
     .. "- Results include page titles, URLs, and content snippets.",

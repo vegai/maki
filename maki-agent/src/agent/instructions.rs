@@ -3,9 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::InstructionBlock;
 use crate::command::project_ancestor_dirs;
 use crate::template::Vars;
-use crate::{AgentMode, InstructionBlock};
 use maki_providers::model::Model;
 
 const INSTRUCTION_FILES: &[&str] = &[
@@ -86,26 +86,18 @@ pub fn is_instruction_file(name: &str) -> bool {
             .any(|f| *f == name || Path::new(f).file_name().is_some_and(|n| n == name))
 }
 
+/// Plan mode is left out on purpose. It reaches the model as a context update,
+/// so toggling it never rewrites the prompt.
 pub fn build_system_prompt(
     vars: &Vars,
-    mode: &AgentMode,
     instructions: &str,
     slots: &crate::prompt::ResolvedSlots,
     model: &Model,
 ) -> String {
-    let env = vars.apply(
-        "\n\nEnvironment:\n- Working directory: {cwd}\n- Platform: {platform}\n- Date: {date}",
-    );
+    let env = vars.apply("\n\n{environment}");
     let env = format!("{env}\n- Model: {}", model.spec());
     let instructions = format!("{env}{instructions}");
-    let mut out = crate::prompt::assemble(crate::prompt::PromptId::System, slots, &instructions);
-
-    if let Some(plan_path) = mode.plan_path() {
-        let plan_vars = Vars::new().set("{plan_path}", plan_path.display().to_string());
-        out.push_str(&plan_vars.apply(crate::prompt::PLAN_PROMPT));
-    }
-
-    out
+    crate::prompt::assemble(crate::prompt::PromptId::System, slots, &instructions)
 }
 
 fn read_unseen(path: &Path, loaded: &LoadedInstructions) -> Option<(PathBuf, String)> {
@@ -261,31 +253,16 @@ pub fn find_subdirectory_instructions(
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
 
     use test_case::test_case;
 
     use super::*;
 
-    const PLAN_PATH: &str = ".maki/plans/123.md";
     const LEGACY_RULES: &str = "legacy global rules";
     const XDG_RULES: &str = "xdg global rules";
 
-    #[test_case(&AgentMode::Build, false ; "build_excludes_plan")]
-    #[test_case(&AgentMode::Plan(PathBuf::from(PLAN_PATH)), true ; "plan_includes_plan")]
-    fn plan_section_presence(mode: &AgentMode, expect_plan: bool) {
-        let vars = Vars::new().set("{cwd}", "/tmp").set("{platform}", "linux");
-        let slots = crate::prompt::ResolvedSlots::default();
-        let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
-        let prompt = build_system_prompt(&vars, mode, "", &slots, &model);
-        assert_eq!(prompt.contains("Plan Mode"), expect_plan);
-        if expect_plan {
-            assert!(prompt.contains(PLAN_PATH));
-        }
-    }
-
     #[test]
-    fn after_instructions_slot_lands_between_instructions_and_plan() {
+    fn after_instructions_slot_lands_after_instructions() {
         use std::sync::Arc;
         const INSTR: &str = "Project instructions here";
         const EXTRA: &str = "MEMORY_EXTRA";
@@ -301,16 +278,11 @@ mod tests {
         );
         let prompt = build_system_prompt(
             &vars,
-            &AgentMode::Plan(PathBuf::from("plan.md")),
             &format!("\n{INSTR}"),
             &slots,
             &Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
         );
-        let positions = [INSTR, EXTRA, "Plan Mode"].map(|n| prompt.find(n).unwrap());
-        assert!(
-            positions.is_sorted(),
-            "expected order instructions < slot extra < plan section, got {positions:?}"
-        );
+        assert!(prompt.find(INSTR).unwrap() < prompt.find(EXTRA).unwrap());
     }
 
     #[test_case("AGENTS.md",                true  ; "direct_match")]

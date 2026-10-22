@@ -36,14 +36,16 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     api_key_env: auth::API_KEY_ENV,
     family: ModelFamily::Generic,
     supports_thinking: true,
+    supports_deferred_tools: false,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(GROK_MAX_OUTPUT_TOKENS),
     fallback_context_window: 500_000,
     models_toml: include_str!("../../../models/xai.toml"),
+    models_of: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
-        with_auth: create_with_auth,
+        with_auth: Some(create_with_auth),
     }),
     aperture: None,
     login: Some(LoginConfig {

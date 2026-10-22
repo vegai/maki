@@ -11,25 +11,20 @@ use std::fmt;
 use std::sync::{Arc, OnceLock};
 
 use jiff::Timestamp;
+use maki_storage::frame::FactsUpdate;
 use maki_storage::intern;
 pub use maki_storage::sessions::Effort;
-use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredThinking, TitleSource};
+use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredThinking, THINKING_ADAPTIVE, TitleSource};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
 use strum::{Display, IntoStaticStr};
 use tracing::warn;
 
 use crate::TokenUsage;
-use crate::image::{Fix, MAX_IMAGES, fix_for_wire};
+use crate::image::{Fix, IMAGE_EVICTION_STEP, MAX_IMAGES, fix_for_wire};
 use crate::model::Model;
 
 const LOCAL_BUDGET_FIELD: &str = "thinking_budget_tokens";
-
-/// The two thinking modes that are neither an effort level nor a token count.
-/// `Display` and [`Model::thinking_options`] both spell them from here, so the
-/// picker offers exactly the strings the parser accepts.
-pub(crate) const THINKING_OFF: &str = "off";
-pub(crate) const THINKING_ADAPTIVE: &str = "adaptive";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageMediaType {
@@ -145,6 +140,13 @@ pub const IMAGE_EVICTED_NOTE: &str = "[image omitted: too many images in this co
 pub const IMAGE_PLACEHOLDER: &str = "[image]";
 /// See [`Message::empty_marker`].
 pub const EMPTY_RESPONSE_MARKER: &str = "(empty)";
+/// Marks a definition the API keeps out of the model's context until a
+/// `tool_reference` loads it (see [`crate::Model::supports_deferred_tools`]).
+pub const DEFER_LOADING_KEY: &str = "defer_loading";
+
+pub fn is_deferred_tool(tool: &Value) -> bool {
+    tool[DEFER_LOADING_KEY].as_bool() == Some(true)
+}
 
 /// The last stop before the wire for every image in a request, whatever put
 /// it there. For models without vision, image blocks become a text note
@@ -179,22 +181,18 @@ pub async fn adapt_images_for_model<'a>(
         .collect();
     let note = |text: &str| ContentBlock::Text { text: text.into() };
     let vision = model.supports_vision();
+    let kept = images_kept(images.len());
     let mut edits: Vec<(usize, usize, ContentBlock)> = Vec::new();
-    // Counts survivors, not blocks, or an image nobody can read would cost a
-    // good one its place. Nothing past the cap is decoded at all.
-    let mut kept = 0;
-    for (m, b, source) in images {
+    // Nothing past the cap is decoded at all.
+    for (newest_first, (m, b, source)) in images.into_iter().enumerate() {
         if !vision {
             edits.push((m, b, note(IMAGE_OMITTED_NOTE)));
-        } else if kept == MAX_IMAGES {
+        } else if newest_first >= kept {
             edits.push((m, b, note(IMAGE_EVICTED_NOTE)));
         } else {
             match fix_for_wire(&source).await {
-                Fix::Keep => kept += 1,
-                Fix::Replace(source) => {
-                    kept += 1;
-                    edits.push((m, b, ContentBlock::Image { source }));
-                }
+                Fix::Keep => {}
+                Fix::Replace(source) => edits.push((m, b, ContentBlock::Image { source })),
                 Fix::Drop => edits.push((m, b, note(IMAGE_UNUSABLE_NOTE))),
             }
         }
@@ -228,10 +226,20 @@ pub async fn adapt_images_for_model<'a>(
             role: message.role.clone(),
             content,
             display_text: message.display_text.clone(),
-            kind: message.kind,
+            kind: message.kind.clone(),
         });
     }
     Cow::Owned(adapted)
+}
+
+/// How many of the newest `total` images a request keeps. Past the cap a
+/// whole [`IMAGE_EVICTION_STEP`] of the oldest goes at once, and new images
+/// fill the gap one by one. It depends on the count alone, never on which
+/// images decode, so which ones are evicted only moves once per step. An
+/// unreadable image therefore holds its slot until it ages out.
+fn images_kept(total: usize) -> usize {
+    let over = total.saturating_sub(MAX_IMAGES);
+    total - over.div_ceil(IMAGE_EVICTION_STEP) * IMAGE_EVICTION_STEP
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -274,6 +282,12 @@ pub enum ContentBlock {
         content: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
+        /// Wire names of deferred tools this result loaded. A provider with
+        /// API-side deferral replays them as `tool_reference` blocks, so the
+        /// definitions expand here instead of rewriting the cached tools
+        /// prefix; everyone else ignores them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        loaded_tools: Vec<String>,
     },
     Image {
         source: ImageSource,
@@ -291,8 +305,9 @@ impl ContentBlock {
 /// travel as a user message, and without this there is no way to tell it
 /// apart from the user actually typing. A prefix in the text would not do:
 /// a log line can print one.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum MessageKind {
     /// Someone said this, the user or the model.
     #[default]
@@ -300,6 +315,14 @@ pub enum MessageKind {
     /// The host noticed it and passed it to the model. It stays in session
     /// history for conversation order but is hidden from user-facing views.
     Observation,
+    /// Something the system prompt said has changed (date, model, plan
+    /// mode...). Editing the prompt would void the cache and every thinking
+    /// block bound to it, so we append this instead. Views hide it, since it
+    /// mostly repeats what the user just did (`/cd`, a model switch).
+    ///
+    /// It carries the facts it told, so what the model holds true can be read
+    /// off the transcript, even after a resume or a rewind.
+    ContextUpdate(Arc<FactsUpdate>),
 }
 
 impl MessageKind {
@@ -315,6 +338,19 @@ impl ContentBlock {
             name: name.into(),
             input,
             thought_signature: None,
+        }
+    }
+
+    pub fn tool_result(
+        tool_use_id: impl Into<String>,
+        content: impl Into<String>,
+        is_error: bool,
+    ) -> Self {
+        Self::ToolResult {
+            tool_use_id: tool_use_id.into(),
+            content: content.into(),
+            is_error,
+            loaded_tools: Vec::new(),
         }
     }
 }
@@ -358,6 +394,30 @@ impl Message {
 
     pub fn is_observation(&self) -> bool {
         self.kind == MessageKind::Observation
+    }
+
+    pub fn context_update(text: String, update: FactsUpdate) -> Self {
+        Self {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text }],
+            kind: MessageKind::ContextUpdate(Arc::new(update)),
+            ..Default::default()
+        }
+    }
+
+    pub fn is_context_update(&self) -> bool {
+        self.facts_update().is_some()
+    }
+
+    pub fn facts_update(&self) -> Option<&FactsUpdate> {
+        match &self.kind {
+            MessageKind::ContextUpdate(update) => Some(update),
+            _ => None,
+        }
+    }
+
+    pub fn is_from_host(&self) -> bool {
+        !self.kind.is_turn()
     }
 
     pub fn user(text: String) -> Self {
@@ -434,7 +494,7 @@ impl Message {
 
 impl TitleSource for Message {
     fn first_user_text(&self) -> Option<&str> {
-        if !self.role.is_user() || self.is_observation() {
+        if !self.role.is_user() || self.is_from_host() {
             return None;
         }
         self.user_text()
@@ -443,6 +503,9 @@ impl TitleSource for Message {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum ProviderEvent {
+    Waiting {
+        message: Option<String>,
+    },
     TextDelta {
         text: String,
     },
@@ -514,19 +577,55 @@ pub(crate) const FALLBACK_MAX_THINKING_BUDGET: u32 = 32_768;
 const ADAPTIVE_SINCE: (u32, u32) = (5, 0);
 const ADAPTIVE_SINCE_OPUS: (u32, u32) = (4, 7);
 const OPUS: &str = "opus";
+const CLAUDE: &str = "claude";
+const SNAPSHOT_DATE_LEN: usize = "20250514".len();
 
 /// `claude-opus-4.7` -> `("opus", (4, 7))`, `claude-opus-5-1m` -> `("opus", (5, 0))`.
-/// Copilot writes the version with a dot, hence the two separators. Legacy ids
-/// put the version first (`claude-3-5-sonnet-20241022`), so a numeric family
-/// tells us there is no modern version to read here. Gateway ids keep a
-/// vendor prefix (`anthropic/claude-opus-4-7`), so read the last path segment.
+/// Every provider dresses the id up its own way. Copilot writes `claude-opus-4.7`,
+/// Bedrock `us.anthropic.claude-opus-4-7-v1:0`, Vertex `claude-opus-4-1@20250805`
+/// and OpenRouter `anthropic/claude-opus-4.7:thinking`. So any char that is not
+/// a letter or digit splits the id, and we read what follows the `claude` word.
+/// Old ids put the version first (`claude-3-5-sonnet`), and a numeric family
+/// tells us there is no modern version to read.
 fn claude_version(model_id: &str) -> Option<(&str, (u32, u32))> {
-    let bare = model_id.rsplit('/').next().unwrap_or(model_id);
-    let mut parts = bare.strip_prefix("claude-")?.split(['-', '.']);
-    let family = parts.next().filter(|f| f.parse::<u32>().is_err())?;
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let mut tokens = model_id
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .skip_while(|token| *token != CLAUDE)
+        .skip(1);
+    let family = tokens.next().filter(|f| f.parse::<u32>().is_err())?;
+    let major = tokens.next().and_then(version_number)?;
+    let minor = tokens.next().and_then(version_number).unwrap_or(0);
     Some((family, (major, minor)))
+}
+
+/// Snapshot dates can sit right where the minor goes (`claude-opus-4-20250514`).
+/// We once read that date as the minor, and Opus 4 looked newer than 4.7.
+fn version_number(token: &str) -> Option<u32> {
+    token
+        .parse()
+        .ok()
+        .filter(|_| token.len() < SNAPSHOT_DATE_LEN)
+}
+
+/// Models from [`ADAPTIVE_SINCE`] on reject `type: "enabled"` with a 400. A
+/// version check, not an allowlist, so future releases and new families work
+/// automatically. Reads the id, not the provider, so a gateway serving Claude
+/// is covered too.
+pub(crate) fn requires_adaptive(model_id: &str) -> bool {
+    claude_version(model_id).is_some_and(|(family, version)| {
+        let since = if family == OPUS {
+            ADAPTIVE_SINCE_OPUS
+        } else {
+            ADAPTIVE_SINCE
+        };
+        version >= since
+    })
+}
+
+/// The releases that made thinking adaptive-only also reject any sampling
+/// parameter (`top_p`, `temperature`) with a 400, even with thinking off.
+pub(crate) fn rejects_sampling(model_id: &str) -> bool {
+    requires_adaptive(model_id)
 }
 
 /// How a provider's effort knob speaks: which levels its API accepts, what
@@ -857,7 +956,7 @@ impl ThinkingConfig {
     /// adaptive knob plus `output_config.effort`; legacy models get a plain
     /// token budget.
     pub fn apply_to_body(self, body: &mut Value, model: &Model) {
-        if Self::requires_adaptive(&model.id) {
+        if requires_adaptive(&model.id) {
             if matches!(self, Self::Off) {
                 return;
             }
@@ -877,20 +976,6 @@ impl ThinkingConfig {
                 body["thinking"] = json!({"type": "enabled", "budget_tokens": n});
             }
         }
-    }
-
-    /// Models from [`ADAPTIVE_SINCE`] on reject `type: "enabled"` with a 400. A
-    /// version check, not an allowlist, so future releases and new families
-    /// work automatically.
-    fn requires_adaptive(model_id: &str) -> bool {
-        claude_version(model_id).is_some_and(|(family, version)| {
-            version
-                >= if family == OPUS {
-                    ADAPTIVE_SINCE_OPUS
-                } else {
-                    ADAPTIVE_SINCE
-                }
-        })
     }
 
     pub fn apply_reasoning_effort(self, body: &mut Value, dialect: &EffortDialect, model: &Model) {
@@ -1032,12 +1117,7 @@ impl ThinkingConfig {
 
 impl std::fmt::Display for ThinkingConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Off => f.write_str(THINKING_OFF),
-            Self::Adaptive => f.write_str(THINKING_ADAPTIVE),
-            Self::Effort(e) => f.write_str(e.as_str()),
-            Self::Budget(n) => write!(f, "{n}"),
-        }
+        write!(f, "{}", StoredThinking::from(*self))
     }
 }
 
@@ -1091,11 +1171,25 @@ impl RequestOptions {
     }
 }
 
-#[derive(Debug)]
+/// A change the API made to the request before the model read it, such as a
+/// thinking block dropped because the prefix it was bound to changed. Kinds
+/// and reasons stay strings, because the API keeps adding new ones.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct InputTransformation {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Default)]
 pub struct StreamResponse {
     pub message: Message,
     pub usage: TokenUsage,
     pub stop_reason: Option<StopReason>,
+    pub input_transformations: Vec<InputTransformation>,
 }
 
 /// Provider-reported usage quota, independent of local token accounting. Not every
@@ -1180,7 +1274,11 @@ fn deserialize_reset_at<'de, D: Deserializer<'de>>(
 #[cfg(test)]
 mod tests {
 
+    use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    use maki_storage::frame::PlanChange;
+    use maki_storage::sessions::generate_title;
 
     use super::*;
     use crate::model::ThinkingSupport as Support;
@@ -1199,6 +1297,14 @@ mod tests {
     const SMALL_BUDGET: u32 = 2048;
     /// Between `Medium` and `High` against [`FALLBACK_MAX_THINKING_BUDGET`].
     const LARGE_BUDGET: u32 = 16_384;
+
+    const PROMPT: &str = "fix the flaky login test";
+    const UPDATE_TEXT: &str = "<context-update>plan mode is on</context-update>";
+    const UPDATE_DATE: &str = "2026-10-02";
+    const UPDATE_PLAN: &str = "/project/.maki/plan.md";
+    const UPDATE_HINT_SLOT: &str = "memory/tags";
+    const GONE_HINT_SLOT: &str = "todo/after_instructions";
+    const UPDATE_HINT: &str = "rust, cache";
 
     #[test_case("end_turn", StopReason::EndTurn   ; "end_turn")]
     #[test_case("tool_use", StopReason::ToolUse   ; "tool_use")]
@@ -1249,6 +1355,64 @@ mod tests {
         assert_eq!(observation.first_user_text(), None);
         let observation = serde_json::to_value(observation).unwrap();
         assert_eq!(observation["kind"], "observation");
+        let loaded: Message = serde_json::from_value(observation).unwrap();
+        assert_eq!(loaded.kind, MessageKind::Observation);
+    }
+
+    fn plan_mode_facts() -> FactsUpdate {
+        FactsUpdate {
+            date: Some(UPDATE_DATE.into()),
+            plan: Some(PlanChange::Entered(UPDATE_PLAN.into())),
+            hints: BTreeMap::from([
+                (UPDATE_HINT_SLOT.into(), Some(UPDATE_HINT.into())),
+                (GONE_HINT_SLOT.into(), None),
+            ]),
+            ..FactsUpdate::default()
+        }
+    }
+
+    /// A resume reads what the model holds true from the stored updates, so
+    /// the format is pinned. If it drifts, a resumed session forgets plan mode
+    /// or the hints.
+    #[test]
+    fn context_update_keeps_its_stored_format() {
+        let stored = json!({
+            "role": "user",
+            "content": [{ "type": "text", "text": UPDATE_TEXT }],
+            "kind": { "context_update": {
+                "date": UPDATE_DATE,
+                "plan": { "entered": UPDATE_PLAN },
+                "hints": { UPDATE_HINT_SLOT: UPDATE_HINT, GONE_HINT_SLOT: null }
+            } }
+        });
+        let update = Message::context_update(UPDATE_TEXT.into(), plan_mode_facts());
+        assert_eq!(serde_json::to_value(&update).unwrap(), stored);
+
+        let loaded: Message = serde_json::from_value(stored).unwrap();
+        assert_eq!(loaded.facts_update(), Some(&plan_mode_facts()));
+    }
+
+    /// A first run in plan mode tells the model before the user's prompt, and
+    /// the session must still be named after what the user typed.
+    #[test_case(Message::context_update(UPDATE_TEXT.into(), plan_mode_facts()) ; "context_update")]
+    #[test_case(Message::observation(UPDATE_TEXT.into())                       ; "observation")]
+    fn title_skips_what_the_host_wrote(host: Message) {
+        assert_eq!(
+            generate_title(&[host, Message::user(PROMPT.into())]),
+            PROMPT
+        );
+    }
+
+    /// A result that loaded nothing must serialize to the same bytes as
+    /// before, or every provider's cached transcript breaks on upgrade.
+    #[test]
+    fn tool_result_loaded_tools_is_backward_compatible() {
+        let stored = json!({ "type": "tool_result", "tool_use_id": "t1", "content": "ok" });
+        let old: ContentBlock = serde_json::from_value(stored.clone()).unwrap();
+        assert!(
+            matches!(&old, ContentBlock::ToolResult { loaded_tools, .. } if loaded_tools.is_empty())
+        );
+        assert_eq!(serde_json::to_value(&old).unwrap(), stored);
     }
 
     #[test_case(ImageMediaType::Png,  "image/png"  ; "png")]
@@ -1403,40 +1567,74 @@ mod tests {
         );
     }
 
+    /// Evicting edits early messages, which voids the cache and the thinking
+    /// bound to them. So each new image must leave the request an append of
+    /// the one before, except at most once per step when the oldest images
+    /// make way, and the API cap is never crossed.
     #[test]
-    fn adapt_images_evicts_the_oldest_past_the_request_cap() {
-        const EXTRA: usize = 3;
+    fn adapt_images_moves_the_prefix_once_per_step() {
+        const LAST_TOTAL: usize = MAX_IMAGES + 2 * IMAGE_EVICTION_STEP + 1;
         let model = clamp_test_model(anthropic_spec());
-        let blocks = adapt(&model, (1..=MAX_IMAGES + EXTRA).map(png_block).collect());
-        assert_eq!(image_count(&blocks), MAX_IMAGES);
-        assert!(
-            matches!(&blocks[EXTRA - 1], ContentBlock::Text { text } if text == IMAGE_EVICTED_NOTE),
-            "the oldest images are the ones that make way"
-        );
-        assert!(matches!(&blocks[EXTRA], ContentBlock::Image { .. }));
+        let images: Vec<ContentBlock> = (1..=LAST_TOTAL).map(png_block).collect();
+        let wire = |blocks: &[ContentBlock]| serde_json::to_value(blocks).unwrap();
+        let mut before = adapt(&model, images[..MAX_IMAGES].to_vec());
+        let mut last_move: Option<usize> = None;
+        for total in MAX_IMAGES + 1..=LAST_TOTAL {
+            let after = adapt(&model, images[..total].to_vec());
+            let kept = image_count(&after);
+            assert!(kept <= MAX_IMAGES, "{kept} images sent");
+            assert!(
+                kept > MAX_IMAGES - IMAGE_EVICTION_STEP,
+                "{kept} of {total} images kept"
+            );
+            assert!(
+                after[..total - kept].iter().all(
+                    |b| matches!(b, ContentBlock::Text { text } if text == IMAGE_EVICTED_NOTE)
+                ),
+                "the oldest images are the ones that make way"
+            );
+            if wire(&after[..total - 1]) != wire(&before) {
+                assert!(
+                    last_move.is_none_or(|at| total - at >= IMAGE_EVICTION_STEP),
+                    "prefix moved at image {total}, last moved at {last_move:?}"
+                );
+                last_move = Some(total);
+            }
+            before = after;
+        }
     }
 
-    /// An image no provider could read frees no room, so the cap is spent on
-    /// survivors: counting blocks instead would evict a good one in its place.
+    /// Readability must not decide what is evicted: an unreadable image that
+    /// freed its slot would pull an evicted one back in, editing an early
+    /// message outside the step schedule.
     #[test]
-    fn adapt_images_drops_what_it_cannot_read_without_spending_the_cap() {
+    fn adapt_images_evicts_the_same_images_whatever_decodes() {
         let model = clamp_test_model(anthropic_spec());
-        let mut content = vec![png_block(1), unreadable_block()];
-        content.extend((2..=MAX_IMAGES).map(png_block));
+        let readable: Vec<ContentBlock> = (1..=MAX_IMAGES + 1).map(png_block).collect();
+        let mut content = readable.clone();
+        content[MAX_IMAGES] = unreadable_block();
+        let evicted = |blocks: &[ContentBlock]| -> Vec<usize> {
+            blocks
+                .iter()
+                .enumerate()
+                .filter(
+                    |(_, b)| matches!(b, ContentBlock::Text { text } if text == IMAGE_EVICTED_NOTE),
+                )
+                .map(|(i, _)| i)
+                .collect()
+        };
         let blocks = adapt(&model, content);
-        assert_eq!(image_count(&blocks), MAX_IMAGES);
-        assert!(matches!(&blocks[1], ContentBlock::Text { text } if text == IMAGE_UNUSABLE_NOTE));
+        assert_eq!(evicted(&blocks), evicted(&adapt(&model, readable)));
+        assert!(
+            matches!(&blocks[MAX_IMAGES], ContentBlock::Text { text } if text == IMAGE_UNUSABLE_NOTE)
+        );
     }
 
     #[test]
     fn adapt_images_replaces_blocks_for_text_only_model() {
         let mut model = clamp_test_model(anthropic_spec());
         model.supports_vision_override = Some(false);
-        let tool_result = ContentBlock::ToolResult {
-            tool_use_id: "t1".into(),
-            content: "[image: pic.png 1KB]".into(),
-            is_error: false,
-        };
+        let tool_result = ContentBlock::tool_result("t1", "[image: pic.png 1KB]", false);
         let blocks = adapt(&model, vec![tool_result, unreadable_block()]);
         assert_eq!(blocks.len(), 2);
         assert!(matches!(&blocks[0], ContentBlock::ToolResult { .. }));
@@ -1532,16 +1730,26 @@ mod tests {
     #[test_case(ThinkingConfig::Adaptive, "claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}}) ; "adaptive_adaptive_model")]
     #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_opus_4_7")]
     #[test_case(ThinkingConfig::Effort(Low), "claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "low"}}) ; "effort_low_passthrough")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4-8-1m", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_opus_4_8_long_context")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-5-1m", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_opus_5_unparsable_minor")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4.7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_copilot_dotted_id")]
     #[test_case(ThinkingConfig::Budget(10000), "claude-sonnet-5", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_sonnet_5")]
-    #[test_case(ThinkingConfig::Budget(10000), "anthropic/claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_gateway_prefixed_id")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-3-5-sonnet-20241022", json!({"thinking": {"type": "enabled", "budget_tokens": 4096}}) ; "budget_legacy_dated_id")]
     fn thinking_apply_to_body(config: ThinkingConfig, model_id: &str, expected: Value) {
         let mut body = json!({});
         config.apply_to_body(&mut body, &thinking_model(model_id));
         assert_eq!(body, expected);
+    }
+
+    #[test_case("claude-opus-4-7", Some(("opus", (4, 7))) ; "anthropic")]
+    #[test_case("claude-opus-4.7", Some(("opus", (4, 7))) ; "copilot_dotted")]
+    #[test_case("claude-opus-5-1m", Some(("opus", (5, 0))) ; "long_context_suffix")]
+    #[test_case("anthropic/claude-opus-4-7", Some(("opus", (4, 7))) ; "gateway_prefix")]
+    #[test_case("anthropic/claude-opus-5:thinking", Some(("opus", (5, 0))) ; "openrouter_variant")]
+    #[test_case("anthropic.claude-opus-5-5", Some(("opus", (5, 5))) ; "bedrock")]
+    #[test_case("us.anthropic.claude-sonnet-5-v1:0", Some(("sonnet", (5, 0))) ; "bedrock_region")]
+    #[test_case("claude-opus-4-8@20260101", Some(("opus", (4, 8))) ; "vertex_snapshot")]
+    #[test_case("claude-opus-4-20250514", Some(("opus", (4, 0))) ; "date_is_not_a_minor")]
+    #[test_case("claude-3-5-sonnet-20241022", None ; "legacy_version_first")]
+    #[test_case("gpt-5", None ; "not_claude")]
+    fn claude_version_parses(model_id: &str, expected: Option<(&str, (u32, u32))>) {
+        assert_eq!(claude_version(model_id), expected);
     }
 
     const TRIMMED_TURN: u32 = 8_192;

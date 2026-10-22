@@ -16,6 +16,7 @@ local SIZE_STYLE = "dim"
 local WRITE_REJECT_PREFIX = "invalid tag(s) rejected: "
 local READ_REJECT_PREFIX = "warning: ignored invalid tag(s): "
 local UNREADABLE_PREFIX = "warning: unreadable memory files: "
+local EDIT_HINT = "Notes are plain files; to change one, use `edit` on "
 local NO_MATCH_MSG = "no memory files matched any of the given tags; use `list` to see available tags"
 local PRUNE_ADVISORY = "Consider removing or consolidating stale memories to stay under " .. M.MAX_TAGS .. " tags."
 
@@ -135,15 +136,22 @@ function M.format_rejected(rejected)
   return table.concat(out, ", ")
 end
 
-function M.validate_input(input)
+-- `dir` only feeds the unknown-command hint: models trained on memory tools
+-- with in-tool edits (edit, str_replace, insert) land there, and the real
+-- path lets them recover with the `edit` tool in one turn.
+function M.validate_input(input, dir)
   local cmd = input.command
+  local has_path = input.path ~= nil and input.path ~= ""
   if not VALID_COMMANDS[cmd] then
-    return "unknown command '" .. tostring(cmd) .. "'. Valid commands: " .. table.concat(COMMANDS, ", ")
+    local msg = "unknown command '" .. tostring(cmd) .. "'. Valid commands: " .. table.concat(COMMANDS, ", ")
+    if dir then
+      msg = msg .. ". " .. EDIT_HINT .. maki.fs.joinpath(dir, has_path and input.path or "<name>")
+    end
+    return msg
   end
   if input.tags ~= nil and type(input.tags) ~= "table" then
     return "'tags' must be an array"
   end
-  local has_path = input.path ~= nil and input.path ~= ""
   local has_tags = type(input.tags) == "table" and #input.tags > 0
   if cmd == "read" then
     if has_path and has_tags then
@@ -389,8 +397,8 @@ function M.encode_frontmatter(tags)
   return "---\n" .. yaml .. "---\n"
 end
 
-function M.cap_read_output(s, hint)
-  if #s <= M.MAX_FILE_BYTES then
+function M.cap_read_output(s, hint, ctx)
+  if (ctx and ctx:output_mode() == "full") or #s <= M.MAX_FILE_BYTES then
     return s
   end
   -- Back off UTF-8 continuation bytes so the cut never splits a codepoint.
@@ -426,7 +434,7 @@ function M.format_read_entry(name, size, content)
   return header .. "\n\n" .. body
 end
 
-function M.format_list(dir, raw_tags)
+function M.format_list(dir, raw_tags, ctx)
   local want, warning
   if raw_tags and #raw_tags > 0 then
     local werr
@@ -458,14 +466,14 @@ function M.format_list(dir, raw_tags)
   if matched == 0 then
     return join_parts("\n", warning, unreadable, NO_MATCH_MSG)
   end
-  local body = M.cap_read_output(table.concat(lines, "\n"), M.CAP_HINT_FILTER)
+  local body = M.cap_read_output(table.concat(lines, "\n"), M.CAP_HINT_FILTER, ctx)
   if not want and #groups > M.MAX_TAGS then
     body = body .. "\n" .. PRUNE_ADVISORY
   end
   return join_parts("\n", warning, unreadable, body), nil
 end
 
-function M.format_read(dir, raw_tags)
+function M.format_read(dir, raw_tags, ctx)
   local want, warning, err = normalize_to_want(raw_tags)
   if err then
     return nil, err
@@ -478,7 +486,7 @@ function M.format_read(dir, raw_tags)
   end
 
   local hint = #parts <= 1 and M.CAP_HINT_REWRITE or M.CAP_HINT_NARROW
-  local body = #parts > 0 and M.cap_read_output(table.concat(parts, "\n\n"), hint) or NO_MATCH_MSG
+  local body = #parts > 0 and M.cap_read_output(table.concat(parts, "\n\n"), hint, ctx) or NO_MATCH_MSG
   return join_parts("\n\n", warning, combine_unreadable(read_warnings), body)
 end
 

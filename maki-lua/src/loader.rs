@@ -11,6 +11,7 @@ use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::{ToolRegistry, ToolSource};
 use maki_config::{GatedFile, PluginFileConfig, PluginsConfig, ProjectConfig, RawConfig};
 use maki_providers::plugin::DeclAuthority;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::api::keymap::{KeybindTicket, KeymapReader};
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
@@ -19,14 +20,14 @@ use crate::api::util::command::{
     HintReader, LuaCommandReader, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction, UiAttachment,
 };
 use crate::error::PluginError;
-use crate::pack::DiscoveredPackage;
+use crate::pack::{DiscoveredPackage, Interaction};
 use crate::plugin_permissions::{
     MANIFEST_FILE, PluginPermissions, Requested, check_plugin_compatibility,
     load_plugin_permissions,
 };
 use crate::runtime::{
-    self, ClickFallback, ConfigScope, EndSession, LoadChunk, LoadContext, LuaThread, Request,
-    RestoreItem,
+    self, ClickFallback, ConfigScope, EndSession, LoadChunk, LoadContext, LuaThread, PrivateApi,
+    Request, RestoreItem,
 };
 use maki_agent::prompt::ResolvedSlots;
 use maki_storage::id::MakiId;
@@ -69,132 +70,124 @@ impl InitFiles {
 struct BundledPlugin {
     name: &'static str,
     dir: Dir<'static>,
+    private_api: Option<PrivateApi>,
+}
+
+impl BundledPlugin {
+    const fn new(name: &'static str, dir: Dir<'static>) -> Self {
+        Self {
+            name,
+            dir,
+            private_api: None,
+        }
+    }
 }
 
 /// `lib` is not a default builtin; it exists so plugins can
 /// `require()` shared modules across boundaries.
 static BUNDLED_PLUGINS: &[BundledPlugin] = &[
-    BundledPlugin {
-        name: "sessions",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/sessions"),
-    },
-    BundledPlugin {
-        name: "thinking",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/thinking"),
-    },
-    BundledPlugin {
-        name: "index",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/index"),
-    },
-    BundledPlugin {
-        name: "webfetch",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/webfetch"),
-    },
-    BundledPlugin {
-        name: "websearch",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/websearch"),
-    },
-    BundledPlugin {
-        name: "bash",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/bash"),
-    },
-    BundledPlugin {
-        name: "batch",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/batch"),
-    },
-    BundledPlugin {
-        name: "grep",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/grep"),
-    },
-    BundledPlugin {
-        name: "glob",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/glob"),
-    },
-    BundledPlugin {
-        name: "skill",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/skill"),
-    },
-    BundledPlugin {
-        name: "question",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/question"),
-    },
-    BundledPlugin {
-        name: "todo_write",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/todo_write"),
-    },
-    BundledPlugin {
-        name: "read",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/read"),
-    },
-    BundledPlugin {
-        name: "write",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/write"),
-    },
-    BundledPlugin {
-        name: "edit",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/edit"),
-    },
+    BundledPlugin::new(
+        "sessions",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/sessions"),
+    ),
+    BundledPlugin::new(
+        "thinking",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/thinking"),
+    ),
+    BundledPlugin::new(
+        "index",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/index"),
+    ),
+    BundledPlugin::new(
+        "webfetch",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/webfetch"),
+    ),
+    BundledPlugin::new(
+        "websearch",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/websearch"),
+    ),
+    BundledPlugin::new("bash", include_dir!("$CARGO_MANIFEST_DIR/../plugins/bash")),
+    BundledPlugin::new(
+        "batch",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/batch"),
+    ),
+    BundledPlugin::new("grep", include_dir!("$CARGO_MANIFEST_DIR/../plugins/grep")),
+    BundledPlugin::new("glob", include_dir!("$CARGO_MANIFEST_DIR/../plugins/glob")),
+    BundledPlugin::new(
+        "skill",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/skill"),
+    ),
+    BundledPlugin::new(
+        "question",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/question"),
+    ),
+    BundledPlugin::new(
+        "todo_write",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/todo_write"),
+    ),
+    BundledPlugin::new("read", include_dir!("$CARGO_MANIFEST_DIR/../plugins/read")),
+    BundledPlugin::new(
+        "write",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/write"),
+    ),
+    BundledPlugin::new("edit", include_dir!("$CARGO_MANIFEST_DIR/../plugins/edit")),
     // Below the tools it pre-approves: `memory` allows writes into its own
     // state dir, and a rule can only name a registered tool.
+    BundledPlugin::new(
+        "memory",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/memory"),
+    ),
+    BundledPlugin::new("task", include_dir!("$CARGO_MANIFEST_DIR/../plugins/task")),
+    BundledPlugin::new(
+        "code_execution",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/code_execution"),
+    ),
+    BundledPlugin::new(
+        "completion",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/completion"),
+    ),
     BundledPlugin {
-        name: "memory",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/memory"),
+        name: maki_providers::claude_code::PLUGIN,
+        private_api: Some(crate::api::claude_code::create_private_module),
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/claude_code"),
     },
-    BundledPlugin {
-        name: "task",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/task"),
-    },
-    BundledPlugin {
-        name: "code_execution",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/code_execution"),
-    },
-    BundledPlugin {
-        name: "completion",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/completion"),
-    },
-    BundledPlugin {
-        name: "view_image",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/view_image"),
-    },
-    BundledPlugin {
-        name: "lib",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/lib"),
-    },
-    BundledPlugin {
-        name: "list",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/list"),
-    },
+    BundledPlugin::new(
+        "view_image",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/view_image"),
+    ),
+    BundledPlugin::new("lib", include_dir!("$CARGO_MANIFEST_DIR/../plugins/lib")),
+    BundledPlugin::new("list", include_dir!("$CARGO_MANIFEST_DIR/../plugins/list")),
     // The rest register no tool. They declare a provider maki ships, on
     // the same surface a third-party plugin declares one with, which is what
     // keeps that surface honest.
-    BundledPlugin {
-        name: "synthetic",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/synthetic"),
-    },
-    BundledPlugin {
-        name: "deepseek",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/deepseek"),
-    },
-    BundledPlugin {
-        name: "mistral",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/mistral"),
-    },
-    BundledPlugin {
-        name: "tensorx",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/tensorx"),
-    },
-    BundledPlugin {
-        name: "regolo",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/regolo"),
-    },
-    BundledPlugin {
-        name: "requesty",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/requesty"),
-    },
-    BundledPlugin {
-        name: "openrouter",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/openrouter"),
-    },
+    BundledPlugin::new(
+        "synthetic",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/synthetic"),
+    ),
+    BundledPlugin::new(
+        "deepseek",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/deepseek"),
+    ),
+    BundledPlugin::new(
+        "mistral",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/mistral"),
+    ),
+    BundledPlugin::new(
+        "tensorx",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/tensorx"),
+    ),
+    BundledPlugin::new(
+        "regolo",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/regolo"),
+    ),
+    BundledPlugin::new(
+        "requesty",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/requesty"),
+    ),
+    BundledPlugin::new(
+        "openrouter",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/openrouter"),
+    ),
 ];
 
 /// Every bundled name, not just the default-enabled ones. An external package
@@ -311,18 +304,24 @@ impl Drop for PluginHost {
 }
 
 impl PluginHost {
+    /// A TUI host with JIT on, so tests get the whole `maki.ui` surface.
     pub fn new(registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
-        Self::with_jit(registry, true)
+        Self::start(registry, Interaction::Tty, true)
     }
 
     /// `jit: false` (the `--no-jit` flag) runs plugin Lua on the O1
     /// interpreter with full debug info. Applied at VM creation, so
     /// every chunk gets it, init.lua files included.
-    pub fn with_jit(registry: Arc<ToolRegistry>, jit: bool) -> Result<Self, PluginError> {
+    pub fn start(
+        registry: Arc<ToolRegistry>,
+        interaction: Interaction,
+        jit: bool,
+    ) -> Result<Self, PluginError> {
         let plugin_rules = Arc::new(PluginRuleStore::default());
         let lua = runtime::spawn(
             Arc::clone(&registry),
             *BUNDLED_DIRS,
+            interaction,
             jit,
             Arc::clone(&plugin_rules),
         )?;
@@ -521,24 +520,14 @@ impl PluginHost {
                     plugin: builtin.clone(),
                     source: mlua::Error::runtime("bundled plugin missing init.lua"),
                 })?;
-            let permissions = bundled_permissions(bundled)?;
-            let name: Arc<str> = Arc::from(builtin.as_str());
-            let opts = config
-                .opts
-                .get(builtin.as_str())
-                .cloned()
-                .map(Arc::new)
-                .unwrap_or_default();
-            self.send_load(
-                Arc::clone(&name),
-                vec![LoadChunk::bundled(name.as_ref(), init)],
-                LoadContext {
-                    opts,
-                    // The one load that ships inside the binary, and so the
-                    // one that may declare a provider under a built-in slug.
-                    authority: DeclAuthority::Bundled,
-                    ..LoadContext::plain(None, permissions)
-                },
+            self.load_bundled(
+                bundled,
+                init,
+                config
+                    .opts
+                    .get(builtin.as_str())
+                    .cloned()
+                    .unwrap_or_default(),
             )?;
         }
         Ok(())
@@ -564,7 +553,7 @@ impl PluginHost {
     }
 
     /// Option specs declared by loaded plugins via `maki.api.register_options`,
-    /// keyed by plugin name. Used by docgen.
+    /// keyed by plugin name.
     pub fn plugin_options(&self) -> Result<PluginOptionSpecs, PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.inner
@@ -572,6 +561,15 @@ impl PluginHost {
             .send(Request::CollectPluginOptions { reply: reply_tx })
             .map_err(|_| PluginError::HostDead)?;
         reply_rx.recv().map_err(|_| PluginError::HostDead)
+    }
+
+    pub fn loaded_plugins(&self) -> Result<Vec<String>, PluginError> {
+        let (reply, receiver) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::CollectLoadedPlugins { reply })
+            .map_err(|_| PluginError::HostDead)?;
+        receiver.recv().map_err(|_| PluginError::HostDead)
     }
 
     /// Runs a source as the global `init.lua`.
@@ -628,6 +626,42 @@ impl PluginHost {
             .map_err(|_| PluginError::HostDead)?;
         reply_rx.recv().map_err(|_| PluginError::HostDead)?;
         Ok(())
+    }
+
+    /// Runs trusted source with a bundled plugin's permissions and private API.
+    /// Used by builtins, Rust embedders and tests. Source from disk uses the manifest-derived loaders.
+    pub fn load_bundled_source(
+        &self,
+        name: &str,
+        source: &str,
+        opts: JsonMap<String, JsonValue>,
+    ) -> Result<(), PluginError> {
+        let bundled = BUNDLED_PLUGINS
+            .iter()
+            .find(|plugin| plugin.name == name)
+            .ok_or_else(|| PluginError::UnknownPlugin {
+                plugin: name.to_owned(),
+            })?;
+        self.load_bundled(bundled, source, opts)
+    }
+
+    fn load_bundled(
+        &self,
+        bundled: &BundledPlugin,
+        source: &str,
+        opts: JsonMap<String, JsonValue>,
+    ) -> Result<(), PluginError> {
+        let name = bundled.name;
+        self.send_load(
+            Arc::from(name),
+            vec![LoadChunk::bundled(name, source)],
+            LoadContext {
+                opts: Arc::new(opts),
+                authority: DeclAuthority::Bundled,
+                private_api: bundled.private_api,
+                ..LoadContext::plain(None, bundled_permissions(bundled)?)
+            },
+        )
     }
 
     /// Runs a source with every permission granted, for tests and embedders.
@@ -719,6 +753,7 @@ impl PluginHost {
                     revision_guard: package.revision_guard.clone(),
                     package: true,
                     authority: DeclAuthority::ThirdParty,
+                    private_api: None,
                 },
                 reply: reply_tx,
             })
@@ -796,6 +831,7 @@ impl PluginHost {
                 revision_guard,
                 package: true,
                 authority: DeclAuthority::ThirdParty,
+                private_api: None,
             },
         )
     }
@@ -1329,6 +1365,39 @@ mod tests {
     const GLOBAL_TRUST_PATH: &str = "~/src/me/*";
     const PROJECT_TRUST_PATH: &str = "**";
 
+    #[test_case("ordinary")]
+    #[test_case("claude_code")]
+    fn private_claude_helpers_require_bundled_authority(name: &str) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            name,
+            r#"
+            assert(maki.claude_code == nil)
+            assert(not pcall(require, "maki.claude_code.internal"))
+        "#,
+        )
+        .unwrap();
+    }
+
+    #[test_case(include_str!("../../plugins/claude_code/tests/spec.lua") ; "plugin_spec")]
+    #[test_case(include_str!("../../plugins/claude_code/tests/jobs.lua") ; "job_spec")]
+    fn claude_code_bundled_spec(source: &str) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_bundled_source(maki_providers::claude_code::PLUGIN, source, JsonMap::new())
+            .unwrap();
+    }
+
+    #[test]
+    fn loaded_plugins_include_plugins_without_options() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("empty", "return {}").unwrap();
+        assert_eq!(host.loaded_plugins().unwrap(), ["empty"]);
+        assert!(host.load_source("broken", "error('broken')").is_err());
+        assert_eq!(host.loaded_plugins().unwrap(), ["empty"]);
+        host.unload("empty").unwrap();
+        assert!(host.loaded_plugins().unwrap().is_empty());
+    }
+
     /// Closing the queue and reading it are one message. A Lua task can record
     /// an activation between a separate read and close, and a close that threw
     /// the queue away would strand exactly the request that was about to be
@@ -1354,9 +1423,9 @@ mod tests {
     /// (`tests/plugin_host.rs` boots hosts via `new`); only the O1
     /// interpreter path needs its own coverage.
     #[test]
-    fn with_jit_off_loads_builtins_and_registers_tools() {
+    fn jit_off_loads_builtins_and_registers_tools() {
         let reg = Arc::new(ToolRegistry::new());
-        let mut host = PluginHost::with_jit(Arc::clone(&reg), false).unwrap();
+        let mut host = PluginHost::start(Arc::clone(&reg), Interaction::Tty, false).unwrap();
         host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
             .unwrap();
         assert!(reg.has("glob"));
@@ -2238,6 +2307,8 @@ mod bundled_manifests {
     const TEST_DIR: &str = "tests";
     const LUA_EXT: &str = "lua";
     const REQUIRE_CALL: &str = "require(";
+    const PROVIDER_REGISTER: &str = "maki.provider.register";
+    const API_KEY_ENV_FIELD: &str = "api_key_env";
 
     /// Every guarded `maki.*` function under the dotted name lua calls it by.
     fn guarded_calls() -> Vec<(String, Permission)> {
@@ -2345,10 +2416,13 @@ mod bundled_manifests {
     /// as a tool, so a bundled plugin that starts registering one must join it.
     #[test]
     fn provider_builtins_are_the_bundled_plugins_that_register_a_provider() {
-        const REGISTER: &str = "maki.provider.register";
         let mut registering: Vec<&str> = BUNDLED_PLUGINS
             .iter()
-            .filter(|p| runtime_sources(&p.dir).iter().any(|s| calls(s, REGISTER)))
+            .filter(|p| {
+                runtime_sources(&p.dir)
+                    .iter()
+                    .any(|s| calls(s, PROVIDER_REGISTER))
+            })
             .map(|p| p.name)
             .collect();
         let mut expected = maki_config::PROVIDER_BUILTINS.to_vec();
@@ -2381,6 +2455,13 @@ mod bundled_manifests {
                     if calls(source, name) {
                         needed.entry(*permission).or_insert_with(|| name.clone());
                     }
+                }
+                // `api_key_env` is a field, not a call, so the scan above
+                // misses it. Registration still refuses it without `env`.
+                if calls(source, PROVIDER_REGISTER) && calls(source, API_KEY_ENV_FIELD) {
+                    needed
+                        .entry(Permission::Env)
+                        .or_insert_with(|| format!("{PROVIDER_REGISTER} with {API_KEY_ENV_FIELD}"));
                 }
             }
 

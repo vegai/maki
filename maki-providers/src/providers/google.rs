@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use flume::Sender;
 use futures_lite::io::{AsyncBufReadExt, BufReader};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
-use maki_storage::id::{MakiId, SessionRef};
+use maki_storage::id::MakiId;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
@@ -12,7 +12,7 @@ use tracing::warn;
 use maki_config::providers::Protocol;
 
 use crate::model::{Model, ModelFamily};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use crate::providers::Timeouts;
 use crate::providers::aperture::GEMINI_PATH_PREFIX;
 use crate::spec::{
@@ -53,14 +53,16 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     api_key_env: ENV_VAR,
     family: ModelFamily::Gemini,
     supports_thinking: true,
+    supports_deferred_tools: false,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(65_536),
     fallback_context_window: 1_000_000,
     models_toml: include_str!("../../models/google.toml"),
+    models_of: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
-        with_auth: create_with_auth,
+        with_auth: Some(create_with_auth),
     }),
     aperture: Some(ApertureRoute {
         path_prefix: GEMINI_PATH_PREFIX,
@@ -117,6 +119,9 @@ pub struct Google {
     stream_timeout: Duration,
     /// Env / `providers.toml` / inventory default, resolved once at construction.
     resolved_base_url: Option<String>,
+    /// Where a codec caller sends requests when its auth carries no origin.
+    /// Kept out of the auth cell, because an origin there outranks the user's.
+    fallback_base_url: Option<String>,
 }
 
 impl Google {
@@ -130,6 +135,7 @@ impl Google {
             key_pool: Some(pool),
             stream_timeout: timeouts.stream,
             resolved_base_url,
+            fallback_base_url: None,
         })
     }
 
@@ -144,7 +150,22 @@ impl Google {
             key_pool: None,
             stream_timeout: timeouts.stream,
             resolved_base_url,
+            fallback_base_url: None,
         }
+    }
+
+    pub(crate) fn with_fallback_base_url(mut self, base_url: Option<String>) -> Self {
+        self.fallback_base_url = base_url;
+        self
+    }
+
+    fn base_url(&self) -> String {
+        let auth = self.auth.lock().unwrap();
+        auth.base_url
+            .as_deref()
+            .or(self.fallback_base_url.as_deref())
+            .unwrap_or(BASE_URL)
+            .to_string()
     }
 
     fn build_request(&self, method: &str, url: &str) -> isahc::http::request::Builder {
@@ -167,19 +188,13 @@ impl Google {
     }
 
     fn stream_url(&self, model_id: &str) -> String {
-        let base = {
-            let auth = self.auth.lock().unwrap();
-            auth.base_url.as_deref().unwrap_or(BASE_URL).to_string()
-        };
+        let base = self.base_url();
         let encoded = super::urlenc(model_id);
         format!("{base}/models/{encoded}:streamGenerateContent?alt=sse")
     }
 
     fn models_url(&self) -> String {
-        let base = {
-            let auth = self.auth.lock().unwrap();
-            auth.base_url.as_deref().unwrap_or(BASE_URL).to_string()
-        };
+        let base = self.base_url();
         let key = self.api_key();
         format!("{base}/models?key={key}&pageSize=1000")
     }
@@ -191,6 +206,7 @@ impl Google {
         system: &str,
         tools: &Value,
         thinking: ThinkingConfig,
+        top_p: Option<f64>,
     ) -> Value {
         let mut body = json!({
             "contents": convert_messages(messages),
@@ -204,6 +220,12 @@ impl Google {
 
         if let Some(max_output) = model.output_tokens() {
             body["generationConfig"]["maxOutputTokens"] = json!(max_output);
+        }
+        // Gemini ignores `topP` on models that dropped sampling params (3.6+)
+        // instead of erroring, and 2.5 thinking models accept it, so unlike
+        // Anthropic and OpenAI it rides along even when thinking is on.
+        if let Some(top_p) = top_p {
+            body["generationConfig"]["topP"] = json!(top_p);
         }
 
         let tool_decls = convert_tools(tools);
@@ -223,7 +245,8 @@ impl Google {
         event_tx: &Sender<ProviderEvent>,
         thinking: ThinkingConfig,
     ) -> Result<StreamResponse, AgentError> {
-        let body = self.build_body(model, messages, system, tools, thinking);
+        let top_p = self.auth.lock().unwrap().top_p;
+        let body = self.build_body(model, messages, system, tools, thinking, top_p);
         let url = self.stream_url(&model.id);
         let json_body = serde_json::to_vec(&body)?;
 
@@ -252,12 +275,15 @@ impl Provider for Google {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(self.do_stream(model, messages, system, tools, event_tx, opts.thinking))
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         let url = self.models_url();
         let request = self.build_request("GET", &url).body(()).unwrap();
         let client = self.client.clone();
@@ -292,6 +318,11 @@ impl Provider for Google {
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
+            // Credentials handed in through `with_auth` belong to the caller,
+            // and our vendor key must never follow them to a third-party origin.
+            if self.key_pool.is_none() {
+                return Ok(());
+            }
             let pool = KeyPool::resolve(SLUG, ENV_VAR)?;
             *self.auth.lock().unwrap() =
                 resolve_auth_from_key(pool.current(), self.resolved_base_url.clone())?;
@@ -373,6 +404,7 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                     tool_use_id,
                     content,
                     is_error,
+                    ..
                 } => {
                     let parsed = serde_json::from_str::<Value>(content);
                     let mut response_val = match parsed {
@@ -672,6 +704,7 @@ async fn parse_sse(
         },
         usage,
         stop_reason,
+        ..Default::default()
     })
 }
 
@@ -769,12 +802,30 @@ mod tests {
             "be helpful",
             &json!([]),
             ThinkingConfig::Off,
+            None,
         );
 
         assert_eq!(body["contents"][0]["role"], "user");
         assert_eq!(body["systemInstruction"]["parts"][0]["text"], "be helpful");
         assert_eq!(body["generationConfig"]["maxOutputTokens"], 8192);
         assert!(body.get("tools").is_none());
+        assert!(body["generationConfig"].get("topP").is_none());
+    }
+
+    #[test_case(ThinkingConfig::Off ; "without_thinking")]
+    #[test_case(ThinkingConfig::Adaptive ; "with_thinking")]
+    fn google_build_body_sends_top_p(thinking: ThinkingConfig) {
+        let google = Google::with_auth(test_auth(), test_timeouts());
+        let messages = vec![Message::user("hello".into())];
+        let body = google.build_body(
+            &test_model(),
+            &messages,
+            "",
+            &json!([]),
+            thinking,
+            Some(0.8),
+        );
+        assert_eq!(body["generationConfig"]["topP"], 0.8);
     }
 
     #[test]
@@ -787,6 +838,7 @@ mod tests {
             "",
             &json!([]),
             ThinkingConfig::Adaptive,
+            None,
         );
 
         assert_eq!(
@@ -805,6 +857,7 @@ mod tests {
             "",
             &json!([]),
             ThinkingConfig::Budget(8192),
+            None,
         );
 
         // Clamped to the model's max thinking budget (half of 8192 output tokens).
@@ -873,11 +926,7 @@ mod tests {
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "call_1".into(),
-                    content: "file contents".into(),
-                    is_error: false,
-                }],
+                content: vec![ContentBlock::tool_result("call_1", "file contents", false)],
                 ..Default::default()
             },
         ];
@@ -902,11 +951,7 @@ mod tests {
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "call_1".into(),
-                    content: content.into(),
-                    is_error: false,
-                }],
+                content: vec![ContentBlock::tool_result("call_1", content, false)],
                 ..Default::default()
             },
         ];
@@ -927,11 +972,7 @@ mod tests {
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "call_1".into(),
-                    content: "boom".into(),
-                    is_error: true,
-                }],
+                content: vec![ContentBlock::tool_result("call_1", "boom", true)],
                 ..Default::default()
             },
         ];
@@ -970,11 +1011,7 @@ mod tests {
         let messages = vec![Message {
             role: Role::User,
             content: vec![
-                ContentBlock::ToolResult {
-                    tool_use_id: "call_1".into(),
-                    content: "[image: pic.png 1KB]".into(),
-                    is_error: false,
-                },
+                ContentBlock::tool_result("call_1", "[image: pic.png 1KB]", false),
                 ContentBlock::Image {
                     source: crate::ImageSource::new(
                         crate::ImageMediaType::Png,

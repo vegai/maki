@@ -13,7 +13,7 @@
   ],
   "expected": {
     "outcome": {
-      "error": "Api { status: 401, retry_after: None, overflow: None, quota_exhausted: false, auth_error: true }",
+      "error": "Api { status: 401, retry_after: None, overflow: None, quota_exhausted: false, auth_error: true, thinking_unbound: false }",
       "message": "API error (401): {\"error\":{\"message\":\"Authentication Fails, Your api key: ****abcd is invalid\",\"type\":\"authentication_error\",\"param\":null,\"code\":\"invalid_request_error\"}}"
     },
     "requests": [

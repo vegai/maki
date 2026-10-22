@@ -7,6 +7,7 @@
 //! waits on every event source at once and wakes the moment a plugin action,
 //! agent event, or keypress arrives instead of sleeping in `event::poll`.
 
+use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,6 +15,7 @@ use std::time::{Duration, Instant};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
+use futures_lite::FutureExt;
 
 use crossterm::event::{
     Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
@@ -36,7 +38,9 @@ use maki_lua::{
     UiAction, UiAttachment, UiReply,
 };
 use maki_providers::Timeouts;
-use maki_providers::provider::{Provider, fetch_all_models, from_model};
+use maki_providers::models_cache::{ModelList, fetch_all_models_cached};
+use maki_providers::provider::ModelListing;
+use maki_providers::provider::{Provider, from_model};
 use maki_providers::{Message, Model};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
@@ -45,6 +49,7 @@ use maki_storage::sessions::normalize_title;
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 use serde_json::json;
+use smol::Task;
 use tracing::{info, warn};
 
 use crate::agent::{
@@ -61,6 +66,7 @@ use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest, Status};
 use crate::input::InputReader;
 use crate::repaint::{Dirty, IDLE_POLL};
+use crate::theme;
 use crate::{AppSession, OpenSession};
 
 use crate::storage_writer::StorageWriter;
@@ -96,6 +102,8 @@ pub struct EventLoopParams {
     pub focused: usize,
     pub startup_warnings: Vec<String>,
     pub startup_notice: Option<String>,
+    /// Shown in a popup that stays up until dismissed, not a flash.
+    pub startup_alert: Option<String>,
     pub storage: StateDir,
     pub config: AgentConfig,
     pub ui_config: UiConfig,
@@ -345,6 +353,7 @@ struct SessionRuntime {
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
     last_status: SessionStatus,
+    last_title: String,
     /// Keyed by task id, never by position: a session reset reuses positions,
     /// so a new task would inherit the old one's status.
     last_tasks: Vec<(Arc<str>, TaskStatus)>,
@@ -399,7 +408,7 @@ struct SpawnCtx {
     lua_event_handle: EventHandle,
     mcp_handle: Option<McpHandle>,
     mcp_config_errors: McpConfigErrors,
-    available_models: Arc<ArcSwapOption<Vec<String>>>,
+    available_models: Arc<ArcSwapOption<ModelList>>,
     storage_writer: Arc<StorageWriter>,
     model_policy: Arc<ModelPolicy>,
     trust_question: Option<TrustQuestion>,
@@ -417,8 +426,10 @@ impl SpawnCtx {
                 id: SessionRef::from(session.id),
                 history: session.messages().to_vec(),
                 context_size: session.meta.context_size,
+                frame: session.frame().cloned(),
                 // The tab owns the session and persists it through
-                // `StorageWriter`, so the agent gets the transcript only.
+                // `StorageWriter`, so the agent only gets the transcript and
+                // the frame it was sent under.
                 session: None,
             },
             self.config.clone(),
@@ -454,12 +465,14 @@ impl SpawnCtx {
             app.restore_resumed_session();
         }
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
+        let last_title = app.state.session.title.clone();
         SessionRuntime {
             app,
             handles,
             shell_tx,
             shell_rx,
             last_status: SessionStatus::Idle,
+            last_title,
             last_tasks: Vec::new(),
             notifications: RunNotificationState::default(),
             slot: cell,
@@ -491,7 +504,7 @@ pub(crate) struct EventLoop<'t> {
     /// without this a second `/packupdate` would race the first over the same
     /// clones and locks.
     pack_running: bool,
-    _model_fetch_task: smol::Task<()>,
+    model_fetch: ModelFetch,
 }
 
 /// One item from any of the event loop's sources; `None` from `next_wake`
@@ -511,74 +524,91 @@ enum Wake {
 }
 
 struct BackgroundModels {
-    available: Arc<ArcSwapOption<Vec<String>>>,
+    available: Arc<ArcSwapOption<ModelList>>,
     warn_rx: flume::Receiver<String>,
     warn_tx: flume::Sender<String>,
     models_rx: flume::Receiver<()>,
     models_tx: flume::Sender<()>,
-    task: smol::Task<()>,
+    fetch: ModelFetch,
 }
 
-fn merge_batch(
-    available: &Arc<ArcSwapOption<Vec<String>>>,
-    batch: maki_providers::provider::ModelBatch,
-    warn_tx: &flume::Sender<String>,
-) {
-    for w in batch.warnings {
-        let _ = warn_tx.try_send(w);
-    }
-    if batch.models.is_empty() {
-        return;
-    }
-    let mut merged = available.load().as_deref().cloned().unwrap_or_default();
-    for spec in &batch.models {
-        if !merged.contains(spec) {
-            merged.push(spec.clone());
+#[derive(Default)]
+struct ModelFetch {
+    task: Option<Task<()>>,
+    pending: Option<ModelListing>,
+}
+
+impl ModelFetch {
+    fn request(&mut self, listing: ModelListing, start: impl FnOnce(ModelListing) -> Task<()>) {
+        if self.task.is_some() {
+            self.pending = Some(self.pending.unwrap_or(listing).max(listing));
+        } else {
+            self.task = Some(start(listing));
         }
     }
-    available.store(Some(Arc::new(merged)));
+
+    fn finished(&mut self) -> Option<ModelListing> {
+        self.task = None;
+        self.pending.take()
+    }
 }
 
-/// The one way discovery starts, so startup and `/models refresh` cannot drift
-/// apart. It only reports that it finished and leaves rebuilding to the UI
-/// thread, over a channel so the loop wakes on it instead of noticing at the
-/// next tick. The channel holds one slot, which collapses overlapping fetches
-/// into a single rebuild.
+/// ModelFetch serializes discovery and coalesces queued refreshes. Completion wakes the UI
+/// thread to rebuild the model list, including when discovery panics.
 fn fetch_models(
-    available: Arc<ArcSwapOption<Vec<String>>>,
+    available: Arc<ArcSwapOption<ModelList>>,
     policy: Arc<ModelPolicy>,
     warn_tx: flume::Sender<String>,
     models_tx: flume::Sender<()>,
-) -> smol::Task<()> {
+    listing: ModelListing,
+) -> Task<()> {
     smol::spawn(async move {
-        fetch_all_models(
+        let fetch = fetch_all_models_cached(
             &policy,
-            |batch| merge_batch(&available, batch, &warn_tx),
-            Some(Box::new(move || {
-                let _ = models_tx.try_send(());
-            })),
-        )
-        .await;
+            |list, warnings| {
+                for w in warnings {
+                    let _ = warn_tx.try_send(w);
+                }
+                available.store(Some(Arc::new(list)));
+            },
+            listing,
+        );
+        complete_model_fetch(fetch, &warn_tx, models_tx).await;
     })
 }
 
+async fn complete_model_fetch(
+    fetch: impl Future<Output = ()>,
+    warn_tx: &flume::Sender<String>,
+    models_tx: flume::Sender<()>,
+) {
+    if AssertUnwindSafe(fetch).catch_unwind().await.is_err() {
+        let _ = warn_tx.try_send("model discovery panicked; refresh to try again".to_owned());
+    }
+    let _ = models_tx.try_send(());
+}
+
 fn spawn_model_fetch(policy: Arc<ModelPolicy>) -> BackgroundModels {
-    let available: Arc<ArcSwapOption<Vec<String>>> = Arc::new(ArcSwapOption::empty());
+    let available: Arc<ArcSwapOption<ModelList>> = Arc::new(ArcSwapOption::empty());
     let (warn_tx, warn_rx) = flume::unbounded::<String>();
     let (models_tx, models_rx) = flume::bounded::<()>(1);
-    let task = fetch_models(
-        Arc::clone(&available),
-        policy,
-        warn_tx.clone(),
-        models_tx.clone(),
-    );
+    let mut fetch = ModelFetch::default();
+    fetch.request(ModelListing::Cached, |listing| {
+        fetch_models(
+            Arc::clone(&available),
+            policy,
+            warn_tx.clone(),
+            models_tx.clone(),
+            listing,
+        )
+    });
     BackgroundModels {
         available,
         warn_rx,
         warn_tx,
         models_rx,
         models_tx,
-        task,
+        fetch,
     }
 }
 
@@ -595,6 +625,7 @@ impl<'t> EventLoop<'t> {
             focused,
             mut startup_warnings,
             startup_notice,
+            startup_alert,
             storage,
             config,
             ui_config,
@@ -705,6 +736,9 @@ impl<'t> EventLoop<'t> {
         for warning in startup_warnings {
             app.queue_flash(warning);
         }
+        if let Some(alert) = startup_alert {
+            app.alert_modal.open(alert);
+        }
 
         let (pack_tx, pack_rx) = flume::unbounded();
         Ok(Self {
@@ -727,7 +761,7 @@ impl<'t> EventLoop<'t> {
             pack_tx,
             pack_rx,
             pack_running: false,
-            _model_fetch_task: bg.task,
+            model_fetch: bg.fetch,
         })
     }
 
@@ -779,6 +813,9 @@ impl<'t> EventLoop<'t> {
                 Err(e) => break Err(e),
             }
             self.checkpoint_all();
+            for rt in &self.sessions {
+                rt.handles.publish_chat_settings(&rt.app);
+            }
             if dirty.take()
                 && let Err(e) = self.paint()
             {
@@ -864,7 +901,12 @@ impl<'t> EventLoop<'t> {
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
             Wake::Warn(warning) => self.focused_app().flash(warning),
             Wake::Pack(preparation) => self.finish_pack(*preparation),
-            Wake::ModelsDiscovered => self.rebuild_models(),
+            Wake::ModelsDiscovered => {
+                self.rebuild_models();
+                if let Some(listing) = self.model_fetch.finished() {
+                    self.refresh_models(listing);
+                }
+            }
         }
         Ok(())
     }
@@ -950,6 +992,7 @@ impl<'t> EventLoop<'t> {
         self.emit_focus_changes();
         dirty |= self.start_mailbox_runs();
         self.emit_status_changes();
+        self.emit_title_changes();
         self.emit_task_changes();
         self.emit_notifications();
         // An `exit_on_done` exit waits on `QueueDrained`; a dead agent loop
@@ -1037,6 +1080,15 @@ impl<'t> EventLoop<'t> {
                     }
                 }
             }
+            UiAction::BackgroundUsage {
+                session,
+                model,
+                usage,
+            } => {
+                for rt in &mut self.sessions {
+                    rt.app.add_background_usage(session, &model, usage);
+                }
+            }
         }
     }
 
@@ -1077,6 +1129,26 @@ impl<'t> EventLoop<'t> {
         }
     }
 
+    /// `/rename` and title auto-generation change the title without touching
+    /// the status diff above, so the title gets its own diff per frame.
+    fn emit_title_changes(&mut self) {
+        let handle = &self.ctx.lua_event_handle;
+        for (i, rt) in self.sessions.iter_mut().enumerate() {
+            if rt.app.state.session.title == rt.last_title {
+                continue;
+            }
+            rt.last_title = rt.app.state.session.title.clone();
+            handle.fire_autocmd(
+                "SessionTitleChanged",
+                json!({
+                    "session_id": rt.id(),
+                    "title": rt.last_title,
+                    "focused": i == self.focused,
+                }),
+            );
+        }
+    }
+
     /// One diff per frame covers every path that finishes, cancels or errors a
     /// chat, so none of them has to remember to fire an event.
     fn emit_task_changes(&mut self) {
@@ -1111,7 +1183,7 @@ impl<'t> EventLoop<'t> {
             selected = select_notification(selected, candidate);
         }
         if let Some(notification) = selected.filter(|n| self.focus.allows(n))
-            && let Err(error) = notifier.notify(&notification.message())
+            && let Err(error) = notifier.notify(&notification.message(), notification.reason())
         {
             warn!(notifier = ?notifier.notifier(), %error, "terminal notifications disabled after write failure");
             self.notifier = None;
@@ -1339,7 +1411,10 @@ impl<'t> EventLoop<'t> {
             ModelRequest::Available => {
                 let available = self.ctx.available_models.load();
                 Ok(json!(
-                    available.as_deref().map(Vec::as_slice).unwrap_or(&[])
+                    available
+                        .as_deref()
+                        .map(|list| list.specs.as_slice())
+                        .unwrap_or(&[])
                 ))
             }
             ModelRequest::Set {
@@ -1376,6 +1451,7 @@ impl<'t> EventLoop<'t> {
         match req {
             TaskRequest::List => Ok(json!(self.focused_app().tasks())),
             TaskRequest::Focus { id } => self.focused_app().focus_task(&id).map(|()| json!(true)),
+            TaskRequest::Remove { id } => self.focused_app().remove_task(&id).map(|()| json!(true)),
         }
     }
 
@@ -1498,14 +1574,22 @@ impl<'t> EventLoop<'t> {
         }
     }
 
+    /// Only a real focus report may recolor the caret: resume heuristics and
+    /// stray input prove nothing, and no FocusGained follows $EDITOR or fg.
+    fn sync_cursor(&self) {
+        theme::set_cursor_focused(self.focus != Focus::Unfocused);
+    }
+
     fn translate(&mut self, raw: Event) -> (Option<Msg>, Option<Event>) {
         match raw {
             Event::FocusGained => {
                 self.focus.report(Focus::Focused);
+                self.sync_cursor();
                 (None, None)
             }
             Event::FocusLost => {
                 self.focus.report(Focus::Unfocused);
+                self.sync_cursor();
                 (None, None)
             }
             // The one place the host's view of a keypress is normalized, so
@@ -1684,9 +1768,11 @@ impl<'t> EventLoop<'t> {
                 let rt = &mut self.sessions[idx];
                 rt.reset_run_notifications();
                 let run_id = rt.app.run_id;
+                let workflow = rt.app.state.workflow;
                 rt.handles.queue.push(QueueItem::Compact(Compaction {
                     run_id,
                     instructions,
+                    workflow,
                 }));
             }
             Action::ToggleMcp(server_name, enabled) => {
@@ -1741,7 +1827,7 @@ impl<'t> EventLoop<'t> {
                 terminal::suspend(self.terminal);
                 self.focus.on_resume();
             }
-            Action::RefreshModels => self.refresh_models(),
+            Action::RefreshModels(listing) => self.refresh_models(listing),
             Action::RefreshUsage => self.refresh_usage(),
             Action::ManualExit => self.sessions[idx].notifications.on_manual_exit(),
         }
@@ -1795,15 +1881,16 @@ impl<'t> EventLoop<'t> {
         self.dispatch(self.focused, actions);
     }
 
-    fn refresh_models(&self) {
-        self.ctx.available_models.store(None);
-        fetch_models(
-            Arc::clone(&self.ctx.available_models),
-            Arc::clone(&self.ctx.model_policy),
-            self.warn_tx.clone(),
-            self.models_tx.clone(),
-        )
-        .detach();
+    fn refresh_models(&mut self, listing: ModelListing) {
+        self.model_fetch.request(listing, |listing| {
+            fetch_models(
+                Arc::clone(&self.ctx.available_models),
+                Arc::clone(&self.ctx.model_policy),
+                self.warn_tx.clone(),
+                self.models_tx.clone(),
+                listing,
+            )
+        });
     }
 
     fn refresh_usage(&mut self) {
@@ -1832,8 +1919,9 @@ impl<'t> EventLoop<'t> {
             .any(|rt| *rt.app.state.model.provider == *slug)
         {
             self.rebuild_models();
-        } else if let Some(builtin) = maki_config::providers::builtin_provider(&slug)
-            && let Err(e) = self.change_model(builtin.default_model)
+        } else if let Some(default_model) =
+            maki_config::providers::builtin_provider(&slug).and_then(|b| b.default_model)
+            && let Err(e) = self.change_model(default_model)
         {
             self.focused_app().flash(e);
         }
@@ -1933,10 +2021,63 @@ mod tests {
     use super::*;
     use maki_agent::DoneReason;
     use maki_providers::TokenUsage;
+    use std::future::pending;
     use test_case::test_case;
 
     const OBSERVATION: &str = "failed";
     const SHELL_RESULT: &str = "command finished";
+
+    #[test]
+    fn a_panicked_model_fetch_completes_and_allows_the_queued_refresh() {
+        let (models_tx, models_rx) = flume::bounded(1);
+        let (warn_tx, warn_rx) = flume::unbounded();
+        let mut fetch = ModelFetch {
+            task: None,
+            pending: None,
+        };
+        fetch.request(ModelListing::Cached, |_| {
+            smol::spawn(async move {
+                complete_model_fetch(async { panic!("discovery failed") }, &warn_tx, models_tx)
+                    .await;
+            })
+        });
+        fetch.request(ModelListing::Refresh, |_| unreachable!());
+        smol::block_on(models_rx.recv_async()).unwrap();
+        assert!(warn_rx.recv().unwrap().contains("model discovery panicked"));
+        let next = fetch.finished().unwrap();
+        assert_eq!(next, ModelListing::Refresh);
+        fetch.request(next, |_| smol::spawn(pending()));
+        assert!(fetch.task.is_some());
+    }
+
+    #[test]
+    fn model_refresh_waits_for_discovery_and_coalesces_with_priority() {
+        let mut fetch = ModelFetch {
+            task: None,
+            pending: None,
+        };
+        let mut started = Vec::new();
+        for listing in [
+            ModelListing::Cached,
+            ModelListing::Refresh,
+            ModelListing::Cached,
+            ModelListing::Refresh,
+        ] {
+            fetch.request(listing, |listing| {
+                started.push(listing);
+                smol::spawn(pending())
+            });
+        }
+        assert_eq!(started, [ModelListing::Cached]);
+        let next = fetch.finished().unwrap();
+        assert_eq!(next, ModelListing::Refresh);
+        fetch.request(next, |listing| {
+            started.push(listing);
+            smol::spawn(pending())
+        });
+        assert_eq!(started, [ModelListing::Cached, ModelListing::Refresh]);
+        assert_eq!(fetch.finished(), None);
+    }
 
     fn done_event() -> AgentEvent {
         AgentEvent::Done {

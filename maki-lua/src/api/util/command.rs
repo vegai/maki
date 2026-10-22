@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use maki_agent::SharedBuf;
+use maki_storage::id::MakiId;
+use maki_storage::sessions::StoredTokenUsage;
 use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
 use strum::{EnumString, VariantNames};
 
@@ -13,7 +15,7 @@ use crate::api::util::convert::json_to_lua;
 use crate::api::util::pair::{Pair, try_pair};
 use crate::key::Key;
 
-pub(crate) const NO_UI_ERR: &str = "no interactive UI attached";
+pub const NO_UI_ERR: &str = "no interactive UI attached";
 pub(crate) const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
 
 const ROW_REFINE: &str = "refine";
@@ -466,6 +468,7 @@ pub enum SessionRequest {
 pub enum TaskRequest {
     List,
     Focus { id: String },
+    Remove { id: String },
 }
 
 pub enum ModelRequest {
@@ -668,6 +671,14 @@ pub enum UiAction {
         depth: u8,
         reply_tx: flume::Sender<Result<(), String>>,
     },
+    /// What one background subagent turn spent. A tab keeps its channels
+    /// across `/new`, so the chat session id is the only way to tell if the
+    /// tab still shows the session that paid.
+    BackgroundUsage {
+        session: MakiId,
+        model: String,
+        usage: StoredTokenUsage,
+    },
 }
 
 /// Whether an event loop is draining `UiAction`. The channel cannot answer
@@ -678,8 +689,9 @@ pub enum UiAction {
 pub struct UiAttachment(Arc<AtomicBool>);
 
 impl Default for UiAttachment {
-    /// Attached until a loop says otherwise. Headless runs and ACP hand Lua no
-    /// sender at all, so the bit only ever describes a loop that went away.
+    /// Starts attached, so what a TUI host sends before its loop is up gets
+    /// answered once it is. A headless host has no sender at all, so this bit
+    /// only ever tells of a loop that went away.
     fn default() -> Self {
         Self(Arc::new(AtomicBool::new(true)))
     }

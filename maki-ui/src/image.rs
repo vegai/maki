@@ -27,10 +27,10 @@ pub fn media_type_for(path: &Path) -> Option<ImageMediaType> {
 }
 
 pub(crate) fn try_parse_image_path(text: &str) -> Option<(PathBuf, ImageMediaType)> {
-    let trimmed = text.trim().trim_matches('\'');
-    let (path_str, was_file_uri) = match trimmed.strip_prefix("file://") {
+    let text = text.trim();
+    let (path_str, was_file_uri) = match text.trim_matches('\'').strip_prefix("file://") {
         Some(rest) => (rest.replace("\\ ", " "), true),
-        None => (trimmed.replace("\\ ", " "), false),
+        None => (unquote_shell_path(text)?, false),
     };
     if path_str.contains("://") {
         return None;
@@ -47,6 +47,16 @@ pub(crate) fn try_parse_image_path(text: &str) -> Option<(PathBuf, ImageMediaTyp
     };
     let media_type = media_type_for(&path)?;
     Some((path, media_type))
+}
+
+fn unquote_shell_path(s: &str) -> Option<String> {
+    if cfg!(windows) {
+        return Some(s.trim_matches('\'').replace("\\ ", " "));
+    }
+    match shell_words::split(s).as_deref() {
+        Ok([path]) => Some(path.clone()),
+        _ => Path::new(s).is_file().then(|| s.to_owned()),
+    }
 }
 
 pub fn load_file_image(path: &Path, media_type: ImageMediaType) -> Result<ImageSource, String> {
@@ -88,6 +98,7 @@ fn encode_rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
     use test_case::test_case;
 
     #[test_case("file:///home/user/photo.png",      "/home/user/photo.png",  ImageMediaType::Png  ; "file_uri_png")]
@@ -99,6 +110,10 @@ mod tests {
     #[test_case("  /home/user/photo.jpg\n",          "/home/user/photo.jpg",  ImageMediaType::Jpeg ; "trimmed_whitespace")]
     #[test_case("'/home/user/photo.png'",            "/home/user/photo.png",  ImageMediaType::Png  ; "single_quoted")]
     #[test_case("/home/user/my\\ photo.png",         "/home/user/my photo.png", ImageMediaType::Png ; "escaped_space")]
+    #[test_case("/home/user/image\\ \\(14\\).png",   "/home/user/image (14).png", ImageMediaType::Png ; "escaped_parens")]
+    #[test_case("/home/user/a\\&b\\'c.png",          "/home/user/a&b'c.png",  ImageMediaType::Png  ; "escaped_metachars")]
+    #[test_case("'/home/user/it'\\''s (1).png'",     "/home/user/it's (1).png", ImageMediaType::Png ; "single_quoted_with_quote")]
+    #[test_case("\"/home/user/image (14).png\"",     "/home/user/image (14).png", ImageMediaType::Png ; "double_quoted")]
     fn try_parse_image_path_valid(
         input: &str,
         expected_path: &str,
@@ -107,6 +122,18 @@ mod tests {
         let (path, media) = try_parse_image_path(input).expect("should parse");
         assert_eq!(path.to_str().unwrap(), expected_path);
         assert_eq!(media, expected_media);
+    }
+
+    #[test_case("my photo.png"   ; "raw_space")]
+    #[test_case("image (14).png" ; "raw_parens")]
+    #[test_case("it's.png"       ; "raw_quote")]
+    fn try_parse_image_path_raw_existing_file(file_name: &str) {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join(file_name);
+        fs::write(&file, b"").unwrap();
+        let (path, media) = try_parse_image_path(file.to_str().unwrap()).expect("should parse");
+        assert_eq!(path, file);
+        assert_eq!(media, ImageMediaType::Png);
     }
 
     #[test]
@@ -123,6 +150,7 @@ mod tests {
     #[test_case("https://example.com/a.png" ; "https_url")]
     #[test_case("relative.png"           ; "relative_path")]
     #[test_case("look at /home/user/photo.png" ; "embedded_path")]
+    #[test_case("/home/user/a.png /home/user/b.png" ; "multiple_paths")]
     fn try_parse_image_path_none(input: &str) {
         assert!(try_parse_image_path(input).is_none());
     }

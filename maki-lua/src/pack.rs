@@ -208,10 +208,13 @@ pub fn granted(
     }
 }
 
-/// Whether this entry point can ask the user a question.
+/// Whether someone is there to answer. `Tty` is the TUI: it can confirm an
+/// install on the terminal before it starts, and its loop answers `maki.ui`
+/// calls once it runs. `None` is `maki -p`, the sdk and ACP.
 ///
-/// An install runs downloaded code, so it is a trust decision. A run with no
-/// terminal cannot take one, and must refuse rather than assume consent.
+/// An install runs downloaded code, so it is a trust decision. With nobody to
+/// ask we refuse it rather than assume consent. Lua also gets no UI sender
+/// then, so a UI call fails right away instead of waiting forever for a reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Interaction {
     Tty,
@@ -1617,6 +1620,9 @@ mod tests {
     const MISSING_WIDER_HOST: &str = "net host api.other.example";
     /// What the approval prompt lists for a manifest that drops its hosts.
     const MISSING_ANY_HOST: &str = "net host *";
+    const APPROVED_PINNED_HOST: &str = "api.example.com:7777";
+    /// [`NARROW_HOSTS_MANIFEST`]'s host with no port, which reaches every port.
+    const MISSING_UNPINNED_HOST: &str = "net host api.example.com";
     const TEST_REV: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const OTHER_REV: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -1672,7 +1678,7 @@ mod tests {
     /// word turns the request into a grant.
     fn greedy(name: &str, origin: Origin) -> DiscoveredPackage {
         let manifest = toml::from_str::<toml::Value>(
-            "[permissions]\nfs_read = true\nfs_write = true\nnet = true\nrun = true\nenv = true\n",
+            "[permissions]\nfs_read = true\nfs_write = true\nnet = true\nrun = true\nenv = true\nagent = true\n",
         )
         .unwrap();
         DiscoveredPackage {
@@ -1811,6 +1817,7 @@ mod tests {
     #[test_case(WIDENED_HOSTS_MANIFEST, Some(&[APPROVED_HOST]), &[MISSING_WIDER_HOST] ; "a_widened_host_list_asks_again")]
     #[test_case(NET_MANIFEST, Some(&[APPROVED_HOST]), &[MISSING_ANY_HOST] ; "a_dropped_host_list_asks_again")]
     #[test_case(NARROW_HOSTS_MANIFEST, None, &[] ; "a_list_narrows_an_approval_for_every_host")]
+    #[test_case(NARROW_HOSTS_MANIFEST, Some(&[APPROVED_PINNED_HOST]), &[MISSING_UNPINNED_HOST] ; "unpinning_a_port_asks_again")]
     fn net_hosts_are_approved_like_permissions(
         manifest: &str,
         approved: Option<&[&str]>,

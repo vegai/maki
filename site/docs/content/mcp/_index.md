@@ -65,7 +65,7 @@ url = "https://mcp.corp.example.com/mcp"
 ca_file = "~/certs/corp-ca.pem"
 ```
 
-On macOS, Maki uses its own OpenSSL, which does not read the keychain. The bundle replaces the default CAs for this server and its OAuth endpoints. If OAuth goes through a public provider, add the public CAs to the bundle too, for example `cat /etc/ssl/cert.pem corp-ca.pem > bundle.pem`. The path expands `${VAR}` and `~`, and a relative path starts from the folder of the `mcp.toml` that sets it. On macOS and Linux, you can instead trust a CA for every HTTPS request Maki makes by pointing `SSL_CERT_FILE` at a bundle that holds the public CAs as well.
+Maki checks certificates against the operating system's trust store, so a CA that is already trusted in the macOS keychain or the Windows certificate store works without `ca_file`. Set `ca_file` for a CA that is not in that store. The bundle replaces the default CAs for this server and its OAuth endpoints. If OAuth goes through a public provider, add the public CAs to the bundle too, for example `cat /etc/ssl/cert.pem corp-ca.pem > bundle.pem`. The path expands `${VAR}` and `~`, and a relative path starts from the folder of the `mcp.toml` that sets it. On macOS and Linux, you can instead trust a CA for every HTTPS request Maki makes by pointing `SSL_CERT_FILE` at a bundle that holds the public CAs as well.
 
 ### All options
 
@@ -75,7 +75,7 @@ On macOS, Maki uses its own OpenSSL, which does not read the keychain. The bundl
 | `url` | string | | HTTP: server URL |
 | `environment` | map | | Stdio only. Values expand `${VAR}` from the environment |
 | `headers` | map | | HTTP only. Values expand `${VAR}` from the environment |
-| `oauth` | table | | HTTP only: static client (`client_id`, optional `client_secret`, optional `callback_port`, optional `callback_path`, optional `callback_hostname`) |
+| `oauth` | table | | HTTP only: OAuth client (optional `client_id`, optional `client_secret`, optional `callback_port`, optional `callback_path`, optional `callback_hostname`, optional `callback_scheme`) |
 | `ca_file` | path | | HTTP only. PEM bundle that replaces the default CAs for this server and its OAuth |
 | `timeout` | u64 | 30000 | Milliseconds (1-300000) |
 | `enabled` | bool | true | |
@@ -87,7 +87,11 @@ One option lives at the top level of `mcp.toml`, outside any server:
 
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
-| `defer_tools` | usize | 10 | Defer tools only when more than this many exist |
+| `defer_tools` | usize | 10 | Defer tools only when more than this many exist. Ignored with [native tool search](#loads-and-the-prompt-cache), which always defers |
+
+## Tool filters
+
+See [tool name lists](/docs/cli/#tool-name-lists) for MCP name syntax and how filters affect deferred loading.
 
 ## Tool search
 
@@ -98,7 +102,7 @@ So Maki, like Claude Code, defers MCP tools by default. The model sees one small
 ```
 server ships 117 tool definitions
         │
-  more than defer_tools (10)?
+  native tool search, or more than defer_tools (10)?
    │ no          │ yes
    ▼             ▼
    all load      context gets one small tool: tool_search
@@ -118,7 +122,24 @@ url = "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp?toolsets=all"
 
 Ask about an incident, and the model searches for something like `datadog logs`, gets back the few matching tools, and the other hundred definitions never enter the conversation.
 
-With 10 or fewer tools across all your servers there is no search step: at that size, searching costs more than it saves, so everything loads upfront. The top-level `defer_tools` key moves that line:
+### Loads and the prompt cache
+
+Tool definitions sit at the front of the prompt, inside the cached prefix. Adding one there changes the prefix, so the next request rewrites the whole conversation at cache-write rates. On a long session that single rewrite can cost more than the search saved.
+
+With native tool search a load never touches the tools array. That is the Anthropic API (direct and Bedrock) on Claude Haiku 4.5, Sonnet 4.5, Opus 4.5 and newer. Older Claude models have no tool search and work like other providers, and so does a model Maki does not know yet. Maki sends every deferred definition on every request, marked as deferred so it stays out of the context, and a search result points at its matches, which the API expands in place. Calling a deferred tool straight from the catalog loads it the same way. The array is the same bytes all session long, and a load costs only the few hundred tokens of the search result.
+
+```
+request N     tools: [read, edit, ..., 117 deferred, tool_search]   cache hit
+              model: tool_search("logs")
+result        3 matches, expanded by the API
+request N+1   tools: same bytes                                      cache hit
+```
+
+So with native tool search Maki always defers, whatever the count, and a server that connects mid-session costs no rebuild. That includes an `always_load` server that connects late: its tools join deferred, and the model finds them through `tool_search`. A server that disconnects keeps its entries, and a call to one of its tools tells the model the server is not connected.
+
+Other providers have no such mechanism, so a load adds the definition to the tools array and the cache is rebuilt once. A gateway speaking the Anthropic protocol may or may not pass the expansion through. So a custom provider, or the built-in `anthropic` pointed at another `base_url`, gets the rebuild until its `providers.toml` row sets `supports_deferred_tools = true` (see [Provider fields](../providers/#provider-fields)).
+
+Without native tool search, with 10 or fewer tools across all your servers there is no search step: at that size, searching costs more than it saves, so everything loads upfront. If servers that connect later push the count past that line, `tool_search` joins then, with their tools behind it. The top-level `defer_tools` key moves that line:
 
 ```toml
 defer_tools = 30
@@ -170,17 +191,20 @@ maki mcp auth <server-name>     # manually trigger auth
 maki mcp logout <server-name>   # remove stored tokens
 ```
 
-Servers without dynamic client registration need a client you registered yourself (e.g. your own app on their platform). Add it to the server config so the auth flow uses it instead of trying to register:
+Servers without dynamic client registration need a client you registered yourself (e.g. your own app on their platform). Add it to the server config so the auth flow uses it instead of trying to register. Without `client_id`, the `callback_*` fields still apply and Maki registers a client dynamically with that redirect URI:
 
 | Field | Type | Notes |
 |-------|------|-------|
-| `client_id` | string | Client id of your registered app |
-| `client_secret` | string | Optional, for confidential clients |
+| `client_id` | string | Optional, client id of your registered app |
+| `client_secret` | string | Optional, for confidential clients (needs `client_id`) |
 | `callback_port` | u16 | Optional, pins the loopback port so the redirect URI can be pre-registered |
 | `callback_path` | string | Optional, loopback path of the redirect URI (default `/mcp/oauth/callback`) |
 | `callback_hostname` | string | Optional, loopback hostname of the redirect URI (default `127.0.0.1`) |
+| `callback_scheme` | string | Optional, `http` (default) or `https` |
 
 Set `callback_port` when the server only accepts exact redirect URIs. Otherwise Maki falls back to its default port, then to any free port, so the redirect URI changes between runs. Set `callback_path` when the server registered a different path (e.g. `/callback`). Set `callback_hostname` to `localhost` when the server registered the name form instead of the IP (the listener still binds to 127.0.0.1).
+
+Set `callback_scheme = "https"` (needs `callback_port`) when the server only accepts https redirect URIs, such as `https://localhost:3119/callback`. Maki runs no https listener, so the login must run in `maki mcp auth <server-name>` (the TUI can't finish it). When the browser shows a connection error, paste the full URL from its address bar into the terminal.
 
 ### Headless machines
 

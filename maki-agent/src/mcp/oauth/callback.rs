@@ -127,6 +127,17 @@ impl CallbackServer {
     }
 }
 
+/// Nothing listens on this URI. Same defaults as `bind`, so switching a
+/// server between http and https keeps the registered redirect URI stable.
+pub fn https_redirect_uri(port: Option<u16>, path: Option<&str>, hostname: Option<&str>) -> String {
+    format!(
+        "https://{}:{}{}",
+        hostname.unwrap_or(DEFAULT_HOSTNAME),
+        port.unwrap_or(PREFERRED_PORT),
+        path.unwrap_or(CALLBACK_PATH)
+    )
+}
+
 pub(crate) fn parse_query(query: &str) -> Vec<(String, String)> {
     query
         .split('&')
@@ -188,6 +199,17 @@ async fn respond(
 mod tests {
     use super::*;
     use test_case::test_case;
+
+    #[test_case(Some(3119), Some("/callback"), Some("localhost"), "https://localhost:3119/callback" ; "custom")]
+    #[test_case(None, None, None, "https://127.0.0.1:19876/mcp/oauth/callback" ; "defaults")]
+    fn builds_https_redirect_uri(
+        port: Option<u16>,
+        path: Option<&str>,
+        hostname: Option<&str>,
+        expected: &str,
+    ) {
+        assert_eq!(https_redirect_uri(port, path, hostname), expected);
+    }
 
     #[test_case("code=abc&state=xyz", &[("code", "abc"), ("state", "xyz")] ; "basic_params")]
     #[test_case("msg=hello%20world&foo=bar%2Bbaz", &[("msg", "hello world"), ("foo", "bar+baz")] ; "percent_encoded")]

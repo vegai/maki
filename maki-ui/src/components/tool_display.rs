@@ -42,8 +42,6 @@ const CODE_OUTPUT_DIVIDER: &str = "  ────────────";
 const INSTRUCTIONS_TOOL: &str = "load";
 /// Stands in for a tool message whose role carries no name.
 const UNNAMED_TOOL: &str = "?";
-const THINKING_HIDDEN_HEADER: &str = "thinking> ...";
-const THINKING_EXPAND_HINT: &str = " (click to expand)";
 
 pub struct RoleStyle {
     pub prefix: &'static str,
@@ -83,29 +81,21 @@ pub fn thinking_style() -> RoleStyle {
     }
 }
 
-/// The stand-in for thinking the reader chose not to see. The transcript and
-/// the `/btw` modal both draw it, so it lives here to keep them in step, but
-/// only the transcript rows can be clicked, hence `expandable`.
-pub(crate) fn thinking_indicator(line_count: usize, expandable: bool) -> Vec<Line<'static>> {
-    let theme = theme::current();
-    let mut footer = vec![Span::styled(
-        format!("({line_count} lines)"),
-        theme.tool_dim,
-    )];
-    if expandable {
-        footer.push(Span::styled(THINKING_EXPAND_HINT, theme.thinking));
-    }
-    vec![
-        Line::from(Span::styled(THINKING_HIDDEN_HEADER, theme.thinking)),
-        Line::from(footer),
-    ]
-}
-
 pub fn error_style() -> RoleStyle {
     RoleStyle {
         prefix: "",
         text_style: theme::current().error,
         prefix_style: theme::current().tool_error,
+        use_markdown: false,
+        max_line_bytes: None,
+    }
+}
+
+pub fn notice_style() -> RoleStyle {
+    RoleStyle {
+        prefix: "",
+        text_style: theme::current().tool_dim,
+        prefix_style: theme::current().tool_dim,
         use_markdown: false,
         max_line_bytes: None,
     }
@@ -882,7 +872,7 @@ mod tests {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
-            thinking_collapsed: false,
+            thinking_expanded: false,
             images: Vec::new(),
         }
     }
@@ -1021,7 +1011,7 @@ mod tests {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
-            thinking_collapsed: false,
+            thinking_expanded: false,
             images: Vec::new(),
         }
     }
@@ -1117,7 +1107,7 @@ mod tests {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
-            thinking_collapsed: false,
+            thinking_expanded: false,
             images: Vec::new(),
         }
     }
@@ -1158,7 +1148,7 @@ mod tests {
             render_snapshot: Some(snapshot),
             render_header: None,
             snapshot_theme_gen: 0,
-            thinking_collapsed: false,
+            thinking_expanded: false,
             images: Vec::new(),
         }
     }
@@ -1394,7 +1384,7 @@ mod tests {
         ; "legacy_batch_falls_back_to_text"
     )]
     #[test_case(
-        Some(ToolOutput::ReadDir(TextOutput { text: "dir listing".into(), instructions: None, state: None })),
+        Some(ToolOutput::ReadDir(TextOutput::from("dir listing"))),
         None, "read", true
         ; "readdir_uses_text_field"
     )]
@@ -1466,7 +1456,7 @@ mod tests {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
-            thinking_collapsed: false,
+            thinking_expanded: false,
             images: Vec::new(),
         }
     }
@@ -1568,7 +1558,7 @@ mod tests {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
-            thinking_collapsed: false,
+            thinking_expanded: false,
             images: Vec::new(),
         }
     }
@@ -1679,7 +1669,7 @@ mod tests {
             render_snapshot: Some(snapshot),
             render_header: None,
             snapshot_theme_gen: 0,
-            thinking_collapsed: false,
+            thinking_expanded: false,
             images: Vec::new(),
         };
         assert!(
@@ -1713,7 +1703,7 @@ mod tests {
             render_snapshot: Some(snapshot),
             render_header: None,
             snapshot_theme_gen: 0,
-            thinking_collapsed: false,
+            thinking_expanded: false,
             images: Vec::new(),
         };
         assert!(
@@ -1744,7 +1734,7 @@ mod tests {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
-            thinking_collapsed: false,
+            thinking_expanded: false,
             images: Vec::new(),
         };
         assert!(
