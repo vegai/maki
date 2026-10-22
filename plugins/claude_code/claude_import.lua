@@ -64,12 +64,12 @@ local function checkout_state(call, artifact, changes, keep_on_cancel)
   local git_env = git_utils.snapshot_git_env({}, maki.fs.joinpath(artifact.dir, path_utils.GIT_DIR), project)
   local state, files = {}, {}
   for _, change in ipairs(changes) do
-    local meta, meta_err = maki.fs.metadata(maki.fs.joinpath(project, change.path), false)
+    local regular, meta_err = native.checkout_file(maki.fs.joinpath(project, change.path))
     if meta_err then
       return nil, meta_err
-    elseif not meta then
+    elseif regular == nil then
       state[change.path] = false
-    elseif meta.is_file then
+    elseif regular then
       files[#files + 1] = change.path
     else
       state[change.path] = "not a file"
@@ -347,9 +347,11 @@ local function import_locked(ctx, call, spec)
     artifact.manifest.imported[change.path] = true
   end
   local replaced = false
+  for _, change in ipairs(todo) do
+    replaced = replaced or change.status ~= git_utils.ADDED
+  end
   for _, change in ipairs(landed) do
     artifact.manifest.imported[change.path] = true
-    replaced = replaced or change.status ~= git_utils.ADDED
   end
   local _, record_err = maki.fs.atomic_write(artifact.manifest_path, maki.json.encode(artifact.manifest))
   local unrecorded = record_err and UNRECORDED:format(record_err) or nil

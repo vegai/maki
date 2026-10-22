@@ -1137,6 +1137,36 @@ fn an_oversized_import_fails_before_checkout_changes() {
     assert!(temp_files(&coding.project()).is_empty());
 }
 
+#[test]
+fn a_partial_import_reports_originals_for_an_unfinished_replacement() {
+    let coding = Coding::new();
+    let bash = BASH_FAILING_AFTER
+        .replace("@FAILED@", FAILED_AFTER_WRITES)
+        .replace(
+            "    maki.fn.jobwait(",
+            r#"    input.command = input.command:gsub("(\ndrop [^\n]+\n)", "%1exit 1\n", 1)
+    maki.fn.jobwait("#,
+        );
+    let (reg, _host) = coding.host_with(&[], &bash);
+    let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
+    let id = artifact_id(&reply);
+    let error = coding
+        .import(
+            &reg,
+            json!({ "id": id, "paths": ["logo.bin", IMPORTED_LIB] }),
+        )
+        .unwrap_err();
+    assert!(coding.project().join("logo.bin").is_file());
+    assert!(!coding.project().join(IMPORTED_LIB).exists());
+    for directory in [ORIGINALS, "displaced"] {
+        let preserved = coding.artifact(&id).join(directory);
+        assert!(error.contains(preserved.to_str().unwrap()), "{error}");
+        assert!(listing(&preserved).iter().any(|attempt| {
+            fs::read_to_string(attempt.join(IMPORTED_LIB)).is_ok_and(|text| text == DIRTY_LIB)
+        }));
+    }
+}
+
 /// Failure to preserve any original must stop the import before the first checkout change.
 #[test]
 fn an_original_that_cannot_be_kept_changes_no_file() {

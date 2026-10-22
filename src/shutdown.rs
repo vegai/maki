@@ -1,6 +1,6 @@
 use std::io;
 #[cfg(unix)]
-use std::process;
+use std::{process, thread};
 
 #[cfg(unix)]
 use async_signal::{Signal, Signals};
@@ -11,20 +11,25 @@ use smol::stream::StreamExt;
 #[cfg(unix)]
 const SIGNAL_EXIT_OFFSET: i32 = 128;
 
-pub fn watch(cancel: CancelTrigger) -> io::Result<smol::Task<()>> {
+pub fn watch(cancel: CancelTrigger) -> io::Result<()> {
     #[cfg(unix)]
-    let mut signals = Signals::new([Signal::Int, Signal::Term])?;
-    Ok(smol::spawn(async move {
-        #[cfg(unix)]
-        let _ = signals.next().await;
-        #[cfg(not(unix))]
-        smol::future::pending::<()>().await;
-        cancel.cancel();
-        #[cfg(unix)]
-        if let Some(Ok(signal)) = signals.next().await {
-            process::exit(SIGNAL_EXIT_OFFSET + signal as i32);
-        }
-    }))
+    {
+        let mut signals = Signals::new([Signal::Int, Signal::Term])?;
+        thread::Builder::new()
+            .name("shutdown-signals".into())
+            .spawn(move || {
+                smol::block_on(async move {
+                    let _ = signals.next().await;
+                    cancel.cancel();
+                    if let Some(Ok(signal)) = signals.next().await {
+                        process::exit(SIGNAL_EXIT_OFFSET + signal as i32);
+                    }
+                });
+            })?;
+    }
+    #[cfg(not(unix))]
+    let _ = cancel;
+    Ok(())
 }
 
 #[cfg(all(test, unix))]
@@ -59,15 +64,18 @@ mod tests {
     #[ignore = "subprocess fixture run by second_signal_forces_exit"]
     fn signal_child() {
         let (trigger, token) = CancelToken::new();
-        let task = watch(trigger).unwrap();
+        watch(trigger).unwrap();
         println!("\n{READY}");
         std::io::stdout().flush().unwrap();
-        smol::block_on(async {
+        smol::block_on(smol::spawn(async move {
             token.cancelled().await;
             println!("{CANCELLED}");
             std::io::stdout().flush().unwrap();
-            task.await;
-        });
+            // Simulate a session write blocking the executor during shutdown.
+            loop {
+                thread::park();
+            }
+        }));
     }
 
     #[test_case(Signal::TERM ; "sigterm")]

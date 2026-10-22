@@ -139,6 +139,20 @@ for _, answered in ipairs({ false, true }) do
   end)
 end
 
+case("stderr_tail_caps_each_line_and_preserves_utf8", function()
+  local tail = {}
+  local long = string.rep("é", jobs.ERROR_BYTES)
+  jobs.keep_tail(tail, long)
+  assert(#tail[1] < #long)
+  assert(utf8.len(tail[1]))
+  has(tail[1], "truncated")
+  for _ = 1, jobs.ERROR_BYTES do
+    jobs.keep_tail(tail, OUTPUT)
+  end
+  eq(#tail, 10)
+  eq(tail[1], OUTPUT)
+end)
+
 case("a_native_deadline_reports_a_timeout", function()
   with_jobs(function(state)
     local call = jobs.new(STARTUP_MS, function() end)
@@ -336,6 +350,23 @@ case("artifact_cleanup_reports_a_failed_start", function()
     eq(#state.notices, 1)
     eq(state.notices[1].message, jobs.ERROR_PREFIX .. jobs.LEFT_BEHIND .. DIRECTORY)
   end)
+end)
+
+case("a_sweep_keeps_an_active_coding_artifact_until_its_call_settles", function()
+  local root = t.mktmpdir("cc_active_artifact")
+  with_jobs(function(state)
+    local call = jobs.new(STARTUP_MS)
+    local artifact = assert(snapshot.allocate(call, root, {}, STARTUP_MS))
+    local sweep = jobs.new(STARTUP_MS)
+    snapshot.sweep(sweep, root, -1)
+    eq(#state.started, 0)
+    sweep:answer()
+    call:answer()
+    snapshot.sweep(jobs.new(STARTUP_MS), root, -1)
+    eq(#state.started, 1)
+    state.started[1].opts.on_exit(1, SUCCESS_CODE)
+  end)
+  t.rmtree(root)
 end)
 
 case("a_sweep_lock_error_is_reported", function()

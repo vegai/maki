@@ -8,7 +8,6 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-use jsonrepair::{Options as RepairOptions, loads as repair_loads};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tracing::debug;
@@ -1129,15 +1128,18 @@ impl<'a> Turn<'a> {
 /// runs them by its own names. An unknown name stays, so maki reports it.
 fn unexpose_batch(catalog: &Catalog, input: &mut Value) {
     if let Some(Value::String(encoded)) = input.get(BATCH_CALLS)
-        && matches!(encoded.trim().as_bytes().first(), Some(b'[' | b'{'))
-        && let Some(Value::Array(calls)) = serde_json::from_str(encoded).ok().or_else(|| {
-            repair_loads(encoded, &RepairOptions::default())
-                .ok()
-                .filter(Value::is_array)
-                .inspect(|_| debug!(input = %line_preview(encoded), "repaired malformed JSON"))
-        })
+        && let Ok(calls) = serde_json::from_str::<Value>(encoded)
     {
-        input[BATCH_CALLS] = Value::Array(calls);
+        match calls {
+            Value::Array(_) => input[BATCH_CALLS] = calls,
+            Value::Object(_) => input[BATCH_CALLS] = Value::Array(vec![calls]),
+            _ => {}
+        }
+    }
+    if let Some(call) = input.get_mut(BATCH_CALLS)
+        && call.is_object()
+    {
+        *call = Value::Array(vec![call.take()]);
     }
     let Some(calls) = input.get_mut(BATCH_CALLS).and_then(Value::as_array_mut) else {
         return;
@@ -1921,8 +1923,10 @@ mod tests {
     #[test_case(r#"[{"tool":"mcp__maki__read","parameters":{"path":"a"}}]}]}"# ; "extra_closing_delimiters")]
     #[test_case("[{\"tool\":\"mcp__maki__read\",\"parameters\":{\"path\":\"a\"}}]\n</invoke>\n" ; "invoke_suffix")]
     #[test_case(r#"[{"tool":"mcp__maki__read" "parameters":{"path":"a"}}]"# ; "missing_comma")]
-    fn repaired_batches_translate_exposed_tool_names(encoded: &str) {
-        check_batch_input(json!({ BATCH_CALLS: encoded }), TOOL);
+    fn malformed_batches_are_left_for_tool_validation(encoded: &str) {
+        let mut input = json!({ BATCH_CALLS: encoded });
+        unexpose_batch(&catalog(), &mut input);
+        assert_eq!(input[BATCH_CALLS], encoded);
     }
 
     #[test_case("/* calls */" ; "block_comment")]
@@ -1932,6 +1936,16 @@ mod tests {
         let mut input = json!({ BATCH_CALLS: encoded });
         unexpose_batch(&catalog(), &mut input);
         assert_eq!(input[BATCH_CALLS], encoded);
+    }
+
+    #[test_case(false ; "object")]
+    #[test_case(true ; "encoded_object")]
+    fn a_single_batch_call_gets_its_maki_name(encoded: bool) {
+        let call = json!({ BATCH_CALL_TOOL: EXPOSED, "parameters": {"path":"a"} });
+        check_batch_input(
+            json!({ BATCH_CALLS: if encoded { Value::String(call.to_string()) } else { call } }),
+            TOOL,
+        );
     }
 
     fn check_batch_names(inner: &str, expected: &str, encoded: bool) {

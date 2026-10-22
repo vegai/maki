@@ -7,7 +7,7 @@ use super::super::stream::{
 use super::super::transcript::SERVER;
 use super::private_files::private_dir_async;
 use super::supervision::{
-    Group, Next, next, send, send_handshake, stdout_lines, supervised, unreadable,
+    Group, Next, ReadDeadline, send, send_handshake, stdout_lines, supervised, unreadable,
 };
 use super::{Limits, Listed};
 use crate::ProviderUsage;
@@ -145,8 +145,9 @@ pub(super) async fn probe(
         send_handshake(&mut stdin, deadline).await?;
         drop(stdin);
         let mut passed = false;
+        let mut timer = ReadDeadline::new(deadline);
         loop {
-            match next(&mut lines, None, deadline).await {
+            match timer.next(&mut lines, None, deadline).await {
                 Next::Line(Some(Ok(line))) => {
                     let event = parse_event(&line)?;
                     match handshake.feed(&event, plan_usage, false)? {
@@ -310,10 +311,11 @@ async fn ask(
     request: &Value,
     deadline: Instant,
 ) -> Result<Value, Error> {
+    let mut timer = ReadDeadline::new(deadline);
     let id = request["subtype"].as_str().unwrap_or_default();
     send(stdin, &control_request(id, request), deadline).await?;
     loop {
-        match next(lines, None, deadline).await {
+        match timer.next(lines, None, deadline).await {
             Next::Line(Some(Ok(line))) => {
                 let event = parse_event(&line)?;
                 let answer = &event["response"];
@@ -343,7 +345,10 @@ async fn version(
         drop(group.child.stdin.take());
         let mut lines = stdout_lines(group.child.stdout.take())?;
         let deadline = Instant::now() + startup;
-        let first = match next(&mut lines, None, deadline).await {
+        let first = match ReadDeadline::new(deadline)
+            .next(&mut lines, None, deadline)
+            .await
+        {
             Next::Line(Some(Ok(line))) => Some(line),
             Next::Line(Some(Err(source))) => return Err(Error::UnreadableVersion(source)),
             _ => None,

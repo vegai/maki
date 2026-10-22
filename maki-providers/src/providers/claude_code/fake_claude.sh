@@ -170,6 +170,7 @@ case $scenario in
   stalled_handoff) init none; connect; generation tool_use; while :; do line '{"type":"keep_alive"}'; sleep 0.2; done ;;
   progress_generation) init none; event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-haiku-4-5-20251001\"$start_usage}}"; while :; do line '{"type":"tool_progress","tool_use_id":"toolu_1","tool_name":"mcp__maki__read","elapsed_time_seconds":1}'; sleep 0.2; done ;;
   stalled_generation) init none; event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-haiku-4-5-20251001\"$start_usage}}"; while :; do line '{"type":"keep_alive"}'; sleep 0.2; done ;;
+  complete_output) init none; generation end_turn ;;
   ends_output) init none; exec >&-; sleep @WAIT_SECS@ ;;
   stalled_result | stalled_result_without_usage) init none; generation end_turn; while :; do line '{"type":"keep_alive"}'; sleep 0.2; done ;;
   overloaded) init none; line '{"type":"assistant","error":"unknown","is_api_error_message":true,"message":{"model":"<synthetic>","content":[{"type":"text","text":"Overloaded"}]}}'; line '{"type":"result","subtype":"success","is_error":true,"api_error_status":529,"result":"Overloaded"}'; sleep @WAIT_SECS@ ;;

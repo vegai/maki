@@ -506,7 +506,7 @@ impl Provider for CompatProvider {
                 // origin anywhere still fails there rather than posting to "".
                 let resolved = self.compat.base_url(&auth);
                 if !resolved.is_empty() {
-                    auth.base_url = Some(resolved);
+                    auth.base_url = Some(resolved.to_owned());
                 }
                 let mut body = responses::build_body(model, messages, system, tools);
                 // TODO: wire thinking budget into responses API when llama.cpp supports it

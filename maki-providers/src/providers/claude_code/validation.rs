@@ -24,6 +24,7 @@ use super::stream::{
     count,
 };
 
+pub use super::MAX_EVENT_BYTES;
 pub use super::checks::{GIT_ENTRY, git_directory};
 pub use super::run::{VersionCheck, invalidate_profile as invalidate_version};
 use super::settings::base_settings;
@@ -388,6 +389,12 @@ pub fn classify(
     expected_model: Option<&str>,
     mut model_checked: bool,
 ) -> Result<WorkerEvent, String> {
+    if line.len() > MAX_EVENT_BYTES {
+        return Err(Error::EventTooLarge {
+            limit: MAX_EVENT_BYTES,
+        }
+        .to_string());
+    }
     let event = stream::parse_event(line).map_err(|error| error.to_string())?;
     let mut check = || -> Result<(), Error> {
         let kind = stream::classify(&event, StreamMode::Worker, accepted)?;

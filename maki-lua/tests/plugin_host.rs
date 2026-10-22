@@ -1894,7 +1894,7 @@ fn live_click_reaches_running_tool() {
                 buf:on("click", function()
                     ctx:finish("{CLICKED_MSG}")
                 end)
-                maki.fn.jobstart("sleep 30", {{}})
+                maki.fn.jobstart("{JOB_THAT_WAITS}", {{}})
             end
         }})"#,
     );
@@ -1926,7 +1926,7 @@ fn live_click_routes_to_root_buf_among_many() {
                 local root = maki.ui.buf()
                 root:on("click", function() ctx:finish("{ROOT_MSG}") end)
                 ctx:live_buf(root)
-                maki.fn.jobstart("sleep 30", {{}})
+                maki.fn.jobstart("{JOB_THAT_WAITS}", {{}})
             end
         }})"#,
     );
@@ -3275,7 +3275,7 @@ local job
 seen = "unset"
 maki.api.create_autocmd("ProbeIsolation", {{
     callback = function()
-        job = maki.fn.jobstart("sleep 30")
+        job = maki.fn.jobstart("{JOB_THAT_WAITS}")
     end,
 }})
 maki.api.create_autocmd("ProbeIsolation", {{
@@ -5284,7 +5284,7 @@ fn ctx_set_deadline_times_out() {
             audiences = {{ "main" }},
             handler = function(input, ctx)
                 ctx:set_deadline(2)
-                maki.fn.jobstart("sleep 30", {{
+                maki.fn.jobstart("{JOB_THAT_WAITS}", {{
                     on_exit = function(_, _) ctx:finish("should-not-reach") end,
                 }})
                 return nil
@@ -5345,7 +5345,7 @@ maki.api.register_tool({
         maki.async.on_cancel(function(reason)
             ctx:finish({ llm_output = "partial: " .. reason, is_error = true })
         end)
-        maki.fn.jobwait(maki.fn.jobstart("sleep 30"))
+        maki.fn.jobwait(maki.fn.jobstart("@JOB_THAT_WAITS@"))
         return "unreachable"
     end,
 })
@@ -5360,8 +5360,11 @@ maki.api.register_tool({
 fn parked_handler_reports_its_hook_finish_reply_on_deadline() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_source("parked_deadline_plugin", PARKED_DEADLINE_PLUGIN)
-        .unwrap();
+    host.load_source(
+        "parked_deadline_plugin",
+        &PARKED_DEADLINE_PLUGIN.replace("@JOB_THAT_WAITS@", JOB_THAT_WAITS),
+    )
+    .unwrap();
 
     let result = exec_tool(&reg, "parked_deadline", json!({}));
 

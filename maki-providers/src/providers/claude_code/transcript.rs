@@ -165,7 +165,7 @@ fn push_line(out: &mut String, value: &impl Serialize) -> Result<(), Error> {
 }
 
 fn expose_input(input: &mut Value) {
-    if let Some(calls) = input[BATCH_CALLS].as_array_mut() {
+    if let Some(calls) = input.get_mut(BATCH_CALLS).and_then(Value::as_array_mut) {
         for call in calls {
             if let Some(name) = call[BATCH_CALL_TOOL].as_str() {
                 call[BATCH_CALL_TOOL] = Value::String(exposed_name(name));
@@ -263,10 +263,20 @@ mod tests {
 
     use super::super::error::Error;
     use super::{
-        Catalog, EXPOSED_PREFIX, MAX_EXPOSED_NAME, SERVER, TRANSCRIPT_HEADER, entry_of, fits,
-        server_name, transcript,
+        Catalog, EXPOSED_PREFIX, MAX_EXPOSED_NAME, SERVER, TRANSCRIPT_HEADER, entry_of,
+        expose_input, fits, server_name, transcript,
     };
     use crate::{ContentBlock, ImageMediaType, ImageSource, Message, Role};
+
+    #[test_case(json!("malformed") ; "string")]
+    #[test_case(json!([]) ; "array")]
+    #[test_case(Value::Null ; "null")]
+    #[test_case(json!(true) ; "boolean")]
+    fn malformed_batch_history_is_preserved(mut input: Value) {
+        let original = input.clone();
+        expose_input(&mut input);
+        assert_eq!(input, original);
+    }
 
     const IS_ERROR: &str = "is_error";
     const TEXT: &str = "text";

@@ -1,3 +1,4 @@
+use std::ffi::c_long;
 use std::io;
 use std::mem::zeroed;
 use std::os::fd::AsRawFd;
@@ -7,13 +8,18 @@ use std::process::Command;
 use std::ptr;
 
 use libc::{
-    _exit, AF_UNIX, EINTR, O_CLOEXEC, O_DIRECTORY, O_RDONLY, SIG_IGN, SIGCHLD, SIGHUP, SIGINT,
-    SIGQUIT, SIGTERM, SOCK_CLOEXEC, SOCK_STREAM, SYS_clone, SYS_close_range, SYS_getdents64,
-    SYS_socketpair, close, open, read, setpgid, sigaction, sigemptyset, syscall, write,
+    _exit, AF_UNIX, EINTR, F_GETFD, O_CLOEXEC, O_DIRECTORY, O_RDONLY, SIG_IGN, SIGCHLD, SIGHUP,
+    SIGINT, SIGQUIT, SIGTERM, SOCK_CLOEXEC, SOCK_STREAM, SYS_clone, SYS_close_range,
+    SYS_getdents64, SYS_socketpair, close, dup2, execve, fcntl, open, read, setpgid, sigaction,
+    sigemptyset, syscall, waitpid, write,
 };
 use rustix::io::Errno;
-use rustix::process::{Signal, getpgrp, getpid, kill_process_group};
+use rustix::process::{getpgrp, getpid};
 
+const SHELL: &[u8] = b"/bin/sh\0";
+const SHELL_NAME: &[u8] = b"sh\0";
+const SHELL_FLAG: &[u8] = b"-c\0";
+const WATCH: &[u8] = b"printf '\\0\\0\\0\\0'; exec 1>&-; IFS= read -r lifetime; kill -KILL 0\0";
 const FD_DIRECTORY: &[u8] = b"/proc/self/fd\0";
 const DIRECTORY_BUFFER: usize = 4096;
 const RECORD_LENGTH_OFFSET: usize = 16;
@@ -50,12 +56,8 @@ fn bind_with_setup(
             {
                 return Err(io::Error::last_os_error());
             }
-            let group = getpid();
             // Inherited atfork handlers can deadlock inside pre_exec.
-            #[cfg(not(target_arch = "s390x"))]
-            let pid = syscall(SYS_clone, SIGCHLD, 0usize, 0usize, 0usize, 0usize);
-            #[cfg(target_arch = "s390x")]
-            let pid = syscall(SYS_clone, 0usize, SIGCHLD, 0usize, 0usize, 0usize);
+            let pid = syscall_clone();
             match pid {
                 -1 => {
                     let error = io::Error::last_os_error();
@@ -66,36 +68,51 @@ fn bind_with_setup(
                 0 => {
                     let reader = reader.as_raw_fd();
                     let ready = ready[1];
-                    let error = setup(reader, ready)
+                    let error: io::Result<()> = setup(reader, ready).and_then(|()| {
+                        // Reparent the helper so a worker can wait for all of its children.
+                        let detached = syscall_clone();
+                        if detached < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        if detached > 0 {
+                            _exit(0);
+                        }
+                        if dup2(reader, 0) < 0 || dup2(ready, 1) < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        close_inherited(0, 1)?;
+                        let args = [
+                            SHELL_NAME.as_ptr(),
+                            SHELL_FLAG.as_ptr(),
+                            WATCH.as_ptr(),
+                            ptr::null(),
+                        ];
+                        let env = [ptr::null::<u8>()];
+                        execve(
+                            SHELL.as_ptr().cast(),
+                            args.as_ptr().cast(),
+                            env.as_ptr().cast(),
+                        );
+                        Err(io::Error::last_os_error())
+                    });
+                    let error = error
                         .err()
                         .and_then(|error| error.raw_os_error())
                         .unwrap_or(0);
-                    let sent = loop {
-                        let sent = write(ready, (&error as *const i32).cast(), size_of::<i32>());
-                        if sent >= 0 || io::Error::last_os_error().raw_os_error() != Some(EINTR) {
-                            break sent;
-                        }
-                    };
-                    if sent != size_of::<i32>() as isize || error != 0 {
-                        _exit(1);
-                    }
-                    close(ready);
-                    let mut byte = 0u8;
-                    loop {
-                        match read(reader, (&mut byte as *mut u8).cast(), 1) {
-                            0 => break,
-                            -1 if io::Error::last_os_error().raw_os_error() == Some(EINTR) => {}
-                            -1 => break,
-                            _ => {}
-                        }
-                    }
-                    let _ = kill_process_group(group, Signal::KILL);
-                    _exit(0);
+                    // Setup failures happen before descriptor duplication; exec failures after it.
+                    let reply = if fcntl(ready, F_GETFD) >= 0 { ready } else { 1 };
+                    let _ = write(reply, (&error as *const i32).cast(), size_of::<i32>());
+                    _exit(1);
                 }
                 _ => {
                     close(ready[1]);
                     let result = read_ready(ready[0]);
                     close(ready[0]);
+                    while waitpid(pid as i32, ptr::null_mut(), 0) < 0 {
+                        if io::Error::last_os_error().raw_os_error() != Some(EINTR) {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
                     result?;
                 }
             }
@@ -103,6 +120,18 @@ fn bind_with_setup(
         });
     }
     Ok(lifetime)
+}
+
+unsafe fn syscall_clone() -> c_long {
+    // SAFETY: this raw fork avoids inherited atfork handlers; callers use only async-signal-safe operations.
+    #[cfg(not(target_arch = "s390x"))]
+    unsafe {
+        syscall(SYS_clone, SIGCHLD, 0usize, 0usize, 0usize, 0usize)
+    }
+    #[cfg(target_arch = "s390x")]
+    unsafe {
+        syscall(SYS_clone, 0usize, SIGCHLD, 0usize, 0usize, 0usize)
+    }
 }
 
 unsafe fn read_ready(fd: i32) -> io::Result<()> {
@@ -214,14 +243,20 @@ mod tests {
     use super::{bind, bind_with_setup};
     use rustix::io::Errno;
     use rustix::process::{Pid, Signal, getpgrp, kill_process_group};
+    use std::env;
     use std::io;
     use std::io::{BufRead, BufReader};
     use std::os::unix::process::ExitStatusExt;
     use std::process::{Command, Stdio};
+    use std::ptr;
+    use std::time::Duration;
+    use wait_timeout::ChildExt;
 
     const CHILD: &str = "echo ready; exec sleep 30";
     const IGNORES_TERM: &str = "trap '' TERM; echo ready; exec sleep 30";
     const READY: &str = "ready\n";
+    const WAIT_CHILD: &str = "process::guard::tests::worker_without_children";
+    const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
     unsafe fn exits_before_ready(_: i32, _: i32) -> io::Result<()> {
         // SAFETY: this hook runs only in the forked watcher.
@@ -253,6 +288,34 @@ mod tests {
         kill_process_group(Pid::from_raw(child.id() as i32).unwrap(), Signal::TERM).unwrap();
         drop(lifetime);
         assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for a_worker_can_wait_for_all_its_children"]
+    fn worker_without_children() {
+        // SAFETY: this isolated fixture checks whether pre_exec left it any children.
+        let waited = unsafe { libc::waitpid(-1, ptr::null_mut(), libc::WNOHANG) };
+        assert_eq!(waited, -1);
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(Errno::CHILD.raw_os_error())
+        );
+    }
+
+    #[test]
+    fn a_worker_can_wait_for_all_its_children() {
+        let mut command = Command::new(env::current_exe().unwrap());
+        command.args(["--ignored", "--exact", WAIT_CHILD]);
+        let lifetime = bind(&mut command).unwrap();
+        let mut child = command.spawn().unwrap();
+        let status = child.wait_timeout(TEST_TIMEOUT).unwrap();
+        if status.is_none() {
+            drop(lifetime);
+            let _ = child.wait();
+            panic!("worker waited for the process guard");
+        }
+        assert!(status.unwrap().success());
+        drop(lifetime);
     }
 
     #[test]

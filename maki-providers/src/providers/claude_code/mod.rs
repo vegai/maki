@@ -83,7 +83,7 @@ const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
-const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 const DISPLAY_NAME: &str = "Claude Code (experimental)";
 #[cfg(test)]
 const WAIT: Duration = Duration::from_secs(30);
@@ -159,11 +159,14 @@ type PlanUsage = Arc<Mutex<Option<ProviderUsage>>>;
 static PLAN_USAGE: Mutex<BTreeMap<(PathBuf, PathBuf), PlanUsage>> = Mutex::new(BTreeMap::new());
 /// `None` when the provider is off.
 static PLUGIN_OPTIONS: Mutex<Option<PluginOptions>> = Mutex::new(None);
-/// Failed listings, keyed by `claude` and login like the saved list. The
-/// lock lets one listing run at a time, so a second fetch reads what the
-/// first one found.
-static FAILED_LISTINGS: AsyncMutex<BTreeMap<(PathBuf, PathBuf), (Instant, String)>> =
-    AsyncMutex::new(BTreeMap::new());
+#[derive(Default)]
+struct ListingState {
+    completed: Option<(Instant, Result<Vec<Listed>, String>)>,
+}
+
+type ListingLocks = BTreeMap<(PathBuf, PathBuf), Arc<AsyncMutex<ListingState>>>;
+
+static LISTINGS: Mutex<ListingLocks> = Mutex::new(BTreeMap::new());
 
 #[derive(Debug, Clone, Default, PartialEq)]
 struct PluginOptions {
@@ -573,27 +576,38 @@ impl ClaudeCode {
         if listing == ModelListing::Refresh && slots().try_acquire().is_none() {
             return Err(Error::ListingBusy);
         }
-        let mut failures = FAILED_LISTINGS.lock().await;
-        if listing == ModelListing::Cached {
-            if let Some(models) = saved().await {
-                return Ok(models);
-            }
-            if let Some((at, message)) = failures.get(&key)
-                && at.elapsed() < FAILED_LISTING_TTL
+        let started = Instant::now();
+        let state = Arc::clone(
+            LISTINGS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(key.clone())
+                .or_default(),
+        );
+        let mut state = state.lock().await;
+        if listing == ModelListing::Cached
+            && let Some(models) = saved().await
+        {
+            return Ok(models);
+        }
+        if let Some((at, result)) = &state.completed {
+            let age = at.elapsed();
+            if *at >= started
+                || (listing == ModelListing::Cached && result.is_err() && age < FAILED_LISTING_TTL)
             {
-                return Err(Error::ListedRecently {
-                    message: message.clone(),
-                    wait: FAILED_LISTING_TTL,
+                return result.clone().map_err(|message| Error::ListedRecently {
+                    message,
+                    wait: FAILED_LISTING_TTL.saturating_sub(age),
                 });
             }
         }
         let listed = self.ask_models(cwd, vars, listing).await;
-        match &listed {
-            Ok(_) => failures.remove(&key),
-            Err(error) if !error.is_version_error() && !matches!(error, Error::ListingBusy) => {
-                failures.insert(key, (Instant::now(), error.to_string()))
-            }
-            Err(_) => failures.remove(&key),
+        state.completed = match &listed {
+            Err(error) if error.is_version_error() || matches!(error, Error::ListingBusy) => None,
+            _ => Some((
+                Instant::now(),
+                listed.as_ref().cloned().map_err(ToString::to_string),
+            )),
         };
         listed
     }
@@ -1294,7 +1308,7 @@ mod on_the_fake {
     use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
     use std::pin::pin;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime};
 
     use futures_lite::future::poll_once;
@@ -1308,7 +1322,8 @@ mod on_the_fake {
     use super::fake::{Fake, HAIKU, IDLE, MARKER, OPUS, SYSTEM, VERSION_ERROR, tools};
     use super::run::{Limits, Listed, Thinking};
     use super::{
-        ClaudeCode, Exchange, SPEC, SavedModels, WAIT, keyed_models_path, save_models, slots,
+        ClaudeCode, Exchange, LISTINGS, SPEC, SavedModels, WAIT, keyed_models_path, save_models,
+        slots,
     };
     use crate::provider::{ModelListing, Provider};
     use crate::{Message, Model, ProviderUsage, StreamResponse};
@@ -1730,8 +1745,10 @@ mod on_the_fake {
 
     /// Two listings at once start Claude Code once, and the second reads what
     /// the first saved.
-    #[test]
-    fn two_listings_at_once_ask_claude_code_once() {
+    #[test_case(ModelListing::Cached, ModelListing::Cached ; "cached")]
+    #[test_case(ModelListing::Cached, ModelListing::Refresh ; "refresh_joins_cached")]
+    #[test_case(ModelListing::Refresh, ModelListing::Refresh ; "refreshes_coalesce")]
+    fn two_listings_at_once_ask_claude_code_once(first: ModelListing, second: ModelListing) {
         let fake = Fake::new("text");
         let home = tempdir().unwrap();
         let cache = Some(home.path().join(SAVED_LIST));
@@ -1739,8 +1756,8 @@ mod on_the_fake {
         let cwd = fake.project();
 
         let (first, second) = smol::block_on(future::zip(
-            provider.list(&cwd, ModelListing::Cached),
-            provider.list(&cwd, ModelListing::Cached),
+            provider.list(&cwd, first),
+            provider.list(&cwd, second),
         ));
         let ids = |listed: Vec<Listed>| -> Vec<String> {
             listed.into_iter().map(|model| model.id).collect()
@@ -1748,6 +1765,33 @@ mod on_the_fake {
         assert_eq!(ids(first.unwrap()), [OPUS, HAIKU]);
         assert_eq!(ids(second.unwrap()), [OPUS, HAIKU]);
         assert_eq!(fake.log("versions").lines().count(), 1);
+        assert_eq!(fake.log("calls").lines().count(), 3);
+    }
+
+    #[test]
+    fn a_listing_for_one_login_does_not_block_another() {
+        let blocked = Fake::new("text");
+        let other = Fake::new("text");
+        let home = tempdir().unwrap();
+        let first = provider_for(&blocked, home.path(), &env::temp_dir(), None);
+        let second = provider_for(&other, home.path(), &env::temp_dir(), None);
+        let key = (first.executable.clone(), first.login_dir().unwrap());
+        let state = Arc::clone(LISTINGS.lock().unwrap().entry(key).or_default());
+        smol::block_on(async {
+            let _held = state.lock().await;
+            let cwd = blocked.project();
+            let mut pending = pin!(first.list(&cwd, ModelListing::Cached));
+            assert!(poll_once(&mut pending).await.is_none());
+            let listed = second
+                .list(&other.project(), ModelListing::Cached)
+                .or(async {
+                    Timer::after(WAIT).await;
+                    panic!("an unrelated login was blocked by model discovery");
+                })
+                .await
+                .unwrap();
+            assert!(!listed.is_empty());
+        });
     }
 
     /// A failed discovery must suppress repeat CLI launches until expiry or an explicit
@@ -1764,7 +1808,10 @@ mod on_the_fake {
         let first = smol::block_on(provider.list(&cwd, ModelListing::Cached)).unwrap_err();
         let again = smol::block_on(provider.list(&cwd, ModelListing::Cached)).unwrap_err();
         assert!(!matches!(first, Error::ListedRecently { .. }), "{first}");
-        assert!(matches!(again, Error::ListedRecently { .. }), "{again}");
+        assert!(
+            matches!(again, Error::ListedRecently { wait, .. } if wait < super::FAILED_LISTING_TTL),
+            "{again}"
+        );
         assert_eq!(fake.log("versions").lines().count(), 1);
         assert_eq!(fake.log("calls").lines().count(), 1);
 

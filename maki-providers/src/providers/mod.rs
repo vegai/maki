@@ -43,6 +43,10 @@ pub(crate) const UNAUTHORIZED_STATUS: u16 = 401;
 const AUTHORIZATION_HEADER: &str = "authorization";
 const BEARER_PREFIX: &str = "Bearer ";
 
+pub(crate) fn endpoint(base: &str, path: &str) -> String {
+    format!("{}{path}", base.trim_end_matches('/'))
+}
+
 fn bearer_value(api_key: &str) -> String {
     format!("{BEARER_PREFIX}{api_key}")
 }

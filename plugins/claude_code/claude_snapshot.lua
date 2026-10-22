@@ -623,6 +623,18 @@ function M.allocate(call, root, env, timeout_ms)
     discard_failed_allocation(call, dir)
     return nil, "maki cannot mark " .. dir .. " as an artifact: " .. mark_err
   end
+  local lock, lock_err = maki.fs.try_lock(maki.fs.joinpath(dir, path_utils.IMPORT_LOCK))
+  if not lock then
+    discard_failed_allocation(call, dir)
+    return nil, "maki cannot lock its coding artifact: " .. lock_err
+  end
+  local released = call.released
+  call.released = function()
+    lock:close()
+    if released then
+      released()
+    end
+  end
   local snapshot = maki.fs.joinpath(dir, path_utils.SNAPSHOT_DIR)
   local git = maki.fs.joinpath(dir, path_utils.GIT_DIR)
   local artifact = {

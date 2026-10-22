@@ -312,11 +312,15 @@ fn request_policy_does_not_prevent_provider_creation_or_dry_run() {
 #[test_case(JSON_FORMAT, false ; "json_object")]
 #[test_case(JSON_FORMAT, true ; "verbose_json_array")]
 #[test_case("text", false ; "text_uses_stderr_only")]
+#[test_case(STREAM_FORMAT, false ; "sdk_stream_json")]
 fn startup_errors_keep_the_output_format(format: &str, verbose: bool) {
     let fixture = Fixture::new();
     let mut command = fixture.maki(MODEL, PROMPT, format);
     if verbose {
         command.arg("--verbose");
+    }
+    if format == STREAM_FORMAT {
+        command.args(["--input-format", STREAM_FORMAT]);
     }
     let output = finish(command);
     assert!(!output.status.success());

@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::model::Model;
+use crate::providers::endpoint;
 use crate::providers::openai_compat::tool_parameters;
 use crate::providers::{ResolvedAuth, sse_error_status};
 use crate::types::EffortDialect;
@@ -198,13 +199,9 @@ pub(crate) async fn do_stream(
     auth: &ResolvedAuth,
     stream_timeout: Duration,
 ) -> Result<StreamResponse, AgentError> {
-    let base = auth
-        .base_url
-        .as_deref()
-        .ok_or_else(|| AgentError::Config {
-            message: "Responses API requires a base_url in auth".into(),
-        })?
-        .trim_end_matches('/');
+    let base = auth.base_url.as_deref().ok_or_else(|| AgentError::Config {
+        message: "Responses API requires a base_url in auth".into(),
+    })?;
     let mut body = Cow::Borrowed(body);
     if summary_rejected(base) && has_summary(&body) {
         strip_summary(body.to_mut());
@@ -236,7 +233,7 @@ async fn post_responses(
         .configure_request(
             Request::builder()
                 .method("POST")
-                .uri(format!("{base}{RESPONSES_PATH}"))
+                .uri(endpoint(base, RESPONSES_PATH))
                 .header("content-type", "application/json")
                 .header("user-agent", super::super::user_agent()),
         )
