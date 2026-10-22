@@ -79,7 +79,7 @@ local opts = maki.api.register_options(output_limits.extend({
     default = "",
     desc = "Extra paths Claude cannot read, relative to the session's directory and comma-separated, for "
       .. "example `config/prod.yml,certs/**`. As in `.gitignore`, a pattern without a `/` matches at any "
-      .. "depth. They add to the default `.env*` and `secrets` rules, and coding snapshots never contain them.",
+      .. "depth. Defaults deny `.env*`, `secrets`, `.git/config`, `.maki/**` and `.claude/settings*.json` at any depth. Coding snapshots never contain these paths.",
   },
   deny_read_home = {
     default = "",

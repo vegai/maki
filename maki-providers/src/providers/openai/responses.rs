@@ -169,14 +169,17 @@ fn init_summary_rejected() -> &'static Mutex<HashSet<String>> {
 }
 
 fn summary_rejected(base: &str) -> bool {
-    init_summary_rejected().lock().unwrap().contains(base)
+    init_summary_rejected()
+        .lock()
+        .unwrap()
+        .contains(base.trim_end_matches('/'))
 }
 
 fn reject_summary(base: &str) {
     init_summary_rejected()
         .lock()
         .unwrap()
-        .insert(base.to_owned());
+        .insert(base.trim_end_matches('/').to_owned());
 }
 
 fn has_summary(body: &Value) -> bool {
@@ -663,12 +666,16 @@ mod tests {
         assert_eq!(body, json!({"reasoning": {"effort": "high"}}));
     }
 
-    #[test]
-    fn summary_memo_records_rejection_once() {
-        let base = "https://summary-memo.test/v1";
-        assert!(!summary_rejected(base));
-        reject_summary(base);
-        assert!(summary_rejected(base));
+    #[test_case("" ; "canonical")]
+    #[test_case("/" ; "trailing_slash")]
+    #[test_case("///" ; "multiple_trailing_slashes")]
+    fn summary_memo_normalizes_endpoint_aliases(suffix: &str) {
+        let base = format!("https://summary-memo-{}.test/v1", suffix.len());
+        let alias = format!("{base}{suffix}");
+        assert!(!summary_rejected(&base));
+        reject_summary(&alias);
+        assert!(summary_rejected(&base));
+        assert!(summary_rejected(&format!("{base}/")));
     }
 
     #[test]

@@ -31,6 +31,8 @@ const BMP_LIMIT: u32 = 0xffff;
 const MAX_UTF8_BYTES: usize = 4;
 const SYSTEM_EVENT: &str = "system";
 const INIT_EVENT: &str = "init";
+// Fields consumed by claude_stream.tool_line; the bundled progress-line spec checks this boundary.
+const TOOL_PROGRESS_FIELDS: &[&str] = &["file_path", "path", "pattern"];
 const VARIATION_SELECTORS: &[RangeInclusive<u32>] = &[
     0x180b..=0x180d,
     0x180f..=0x180f,
@@ -439,9 +441,7 @@ fn classify(lua: &Lua, line: String, mode: Table) -> LuaResult<Pair<Table>> {
                 content.retain(|block| block["type"] == "tool_use");
                 for block in content {
                     if let Some(input) = block.get_mut("input").and_then(Value::as_object_mut) {
-                        input.retain(|key, _| {
-                            matches!(key.as_str(), "file_path" | "path" | "pattern")
-                        });
+                        input.retain(|key, _| TOOL_PROGRESS_FIELDS.contains(&key.as_str()));
                     }
                 }
             }
