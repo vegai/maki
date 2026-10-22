@@ -1,6 +1,7 @@
 use std::io;
 #[cfg(unix)]
-use std::{process, thread};
+use std::process;
+use std::thread;
 
 #[cfg(unix)]
 use async_signal::{Signal, Signals};
@@ -13,23 +14,41 @@ const SIGNAL_EXIT_OFFSET: i32 = 128;
 
 pub fn watch(cancel: CancelTrigger) -> io::Result<()> {
     #[cfg(unix)]
-    {
-        let mut signals = Signals::new([Signal::Int, Signal::Term])?;
-        thread::Builder::new()
-            .name("shutdown-signals".into())
-            .spawn(move || {
-                smol::block_on(async move {
-                    let _ = signals.next().await;
-                    cancel.cancel();
-                    if let Some(Ok(signal)) = signals.next().await {
-                        process::exit(SIGNAL_EXIT_OFFSET + signal as i32);
-                    }
-                });
-            })?;
-    }
-    #[cfg(not(unix))]
-    let _ = cancel;
+    let mut signals = Signals::new([Signal::Int, Signal::Term])?;
+    thread::Builder::new()
+        .name("shutdown-signals".into())
+        .spawn(move || {
+            #[cfg(unix)]
+            smol::block_on(async move {
+                let _ = signals.next().await;
+                cancel.cancel();
+                if let Some(Ok(signal)) = signals.next().await {
+                    process::exit(SIGNAL_EXIT_OFFSET + signal as i32);
+                }
+            });
+            #[cfg(not(unix))]
+            {
+                let _cancel = cancel;
+                loop {
+                    thread::park();
+                }
+            }
+        })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod portability_tests {
+    use maki_agent::CancelToken;
+
+    use super::watch;
+
+    #[test]
+    fn installing_the_watcher_keeps_the_run_active() {
+        let (trigger, token) = CancelToken::new();
+        watch(trigger).unwrap();
+        assert!(!token.is_cancelled());
+    }
 }
 
 #[cfg(all(test, unix))]
