@@ -144,7 +144,7 @@ jobs:
       - run: just build
 
   windows:
-    name: Lint + Build (Windows)
+    name: Lint + Build + Shutdown Test (Windows)
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: windows-latest
@@ -159,6 +159,7 @@ jobs:
           tool: just
       - run: just lint
       - run: just build
+      - run: "cargo test -p maki --bin maki shutdown::"
 
   ci-pass:
     name: CI

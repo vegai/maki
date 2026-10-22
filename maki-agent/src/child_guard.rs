@@ -34,9 +34,7 @@ impl ChildGuard {
                 #[cfg(unix)]
                 {
                     let pid = child.id();
-                    if smol::unblock(move || wait_without_reaping(pid)).await {
-                        self.signals.kill();
-                    }
+                    let _ = smol::unblock(move || wait_without_reaping(pid)).await;
                 }
                 self.signals.disable();
                 let result = child.status().await;
@@ -115,14 +113,60 @@ impl Drop for ChildGuard {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::io;
     use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
+    use futures_lite::FutureExt;
+    use futures_lite::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use smol::process::Child;
 
     use rustix::process::{setsid, test_kill_process};
 
     use super::{ChildGuard, pid_of};
+
+    const BACKGROUND: &str =
+        "exec 3<&0; { printf 'ready\n'; IFS= read -r message <&3; printf '%s\n' \"$message\"; } &";
+    const READY: &str = "ready\n";
+    const PROBE: &[u8] = b"still running\n";
+    const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn normal_exit_leaves_background_jobs_running() {
+        smol::block_on(async {
+            let work = async {
+                let mut command = Command::new("/bin/sh");
+                command.args(["-c", BACKGROUND]);
+                // SAFETY: setsid is async-signal-safe and takes no borrowed data.
+                unsafe {
+                    command.pre_exec(|| setsid().map(|_| ()).map_err(io::Error::from));
+                }
+                let mut child = smol::process::Command::from(command)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let mut input = child.stdin.take().unwrap();
+                let mut output = BufReader::new(child.stdout.take().unwrap());
+                let mut guard = ChildGuard::new(child);
+                let mut line = String::new();
+                output.read_line(&mut line).await.unwrap();
+                assert_eq!(line, READY);
+                assert!(guard.status().await.unwrap().success());
+                drop(guard);
+                input.write_all(PROBE).await.unwrap();
+                line.clear();
+                output.read_line(&mut line).await.unwrap();
+                assert_eq!(line.as_bytes(), PROBE);
+            };
+            work.or(async {
+                smol::Timer::after(TEST_TIMEOUT).await;
+                panic!("background worker did not answer after the shell exited");
+            })
+            .await;
+        });
+    }
 
     fn spawn_sleep() -> Child {
         let mut std_cmd = std::process::Command::new("sleep");
