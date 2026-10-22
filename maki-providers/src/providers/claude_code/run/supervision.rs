@@ -325,14 +325,14 @@ pub(super) enum Next {
 
 pub(super) struct ReadDeadline {
     timer: Timer,
-    at: Instant,
+    at: Option<Instant>,
 }
 
 impl ReadDeadline {
     pub(super) fn new(at: Instant) -> Self {
         Self {
             timer: Timer::at(at),
-            at,
+            at: Some(at),
         }
     }
 
@@ -342,9 +342,9 @@ impl ReadDeadline {
         handoffs: Option<&Receiver<Handoff>>,
         deadline: Instant,
     ) -> Next {
-        if deadline < self.at {
+        if self.at.is_none_or(|at| deadline < at) {
             self.timer.set_at(deadline);
-            self.at = deadline;
+            self.at = Some(deadline);
         }
         loop {
             let next = async { Next::Line(lines.next().await) }
@@ -362,12 +362,16 @@ impl ReadDeadline {
                     Next::Late
                 })
                 .await;
-            if !matches!(next, Next::Late) || Instant::now() >= deadline {
+            if !matches!(next, Next::Late) {
+                return next;
+            }
+            self.at = None;
+            if Instant::now() >= deadline {
                 return next;
             }
             // Progress extends idle time without registering another alarm on each line.
             self.timer.set_at(deadline);
-            self.at = deadline;
+            self.at = Some(deadline);
         }
     }
 }
@@ -445,15 +449,36 @@ pub(super) async fn send(
 
 #[cfg(test)]
 mod tests {
-    use futures_lite::io::Cursor;
+    use std::time::{Duration, Instant};
+
+    use futures_lite::future::poll_once;
+    use futures_lite::{io::Cursor, stream};
     use test_case::test_case;
 
     use super::{
-        Error, MAX_EVENT_BYTES, STDERR_LINE_BYTES, TRUNCATED_LINE, event_line, stderr_line,
-        unreadable,
+        Error, MAX_EVENT_BYTES, Next, ReadDeadline, STDERR_LINE_BYTES, TRUNCATED_LINE, event_line,
+        stderr_line, unreadable,
     };
 
     const NEXT_LINE: &str = "next";
+
+    #[test]
+    fn a_read_deadline_can_be_reused_after_it_expires() {
+        smol::block_on(async {
+            let later = Instant::now();
+            let earlier = later - Duration::from_secs(1);
+            let mut timer = ReadDeadline::new(earlier);
+            let mut lines = stream::pending();
+            assert!(matches!(
+                timer.next(&mut lines, None, earlier).await,
+                Next::Late
+            ));
+            assert!(matches!(
+                poll_once(timer.next(&mut lines, None, later)).await,
+                Some(Next::Late)
+            ));
+        });
+    }
 
     #[test_case(false ; "unterminated_event")]
     #[test_case(true ; "terminated_event")]

@@ -636,6 +636,21 @@ fn startup_stderr_is_bounded_before_it_reaches_the_model() {
     assert!(error.contains("truncated"));
 }
 
+#[test]
+fn a_startup_refusal_caps_its_whole_error() {
+    const ERROR_LIMIT: usize = 40 * 1024;
+    const TRUNCATION_NOTE_BYTES: usize = 128;
+    let fake = FakeClaude::new();
+    fake.answer_version(&"é".repeat(ERROR_LIMIT));
+    let error = fake.ask(ANSWERS).unwrap_err();
+    assert!(
+        error.len() <= ERROR_LIMIT + TRUNCATION_NOTE_BYTES,
+        "error length: {}",
+        error.len()
+    );
+    assert!(error.contains("truncated"));
+}
+
 fn log_out(fake: &FakeClaude) {
     fake.write("account.json", ACCOUNT_LOGGED_OUT);
 }
