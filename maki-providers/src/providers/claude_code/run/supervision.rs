@@ -3,9 +3,9 @@ use super::super::checks::HANDSHAKE;
 use super::super::error::Error;
 use super::super::mcp::Handoff;
 use super::super::stream::control_request;
+use crate::process::GroupSignals;
 #[cfg(target_os = "linux")]
 use crate::process::guard;
-use crate::process::kill_group;
 #[cfg(unix)]
 use crate::process::{pid_of, wait_without_reaping};
 use flume::Receiver;
@@ -58,7 +58,7 @@ pub(in crate::providers::claude_code) async fn within<T>(
 /// Kills the group on drop until reaping starts.
 pub(super) struct Group {
     pub(super) child: Child,
-    signals_disabled: bool,
+    signals: GroupSignals,
     signalled: bool,
     exit_status: Option<ExitStatus>,
     #[cfg(target_os = "linux")]
@@ -93,14 +93,14 @@ impl Group {
 
     /// Only while the unreaped leader's pid still names the group.
     pub(super) fn kill(&mut self) {
-        if !self.signals_disabled {
+        if self.signals.is_enabled() {
             self.signalled = true;
-            kill_group(self.child.id());
+            self.signals.kill();
         }
     }
 
     pub(super) fn terminate(&mut self) {
-        if self.signals_disabled {
+        if !self.signals.is_enabled() {
             return;
         }
         self.signalled = true;
@@ -125,7 +125,7 @@ impl Group {
         }
         // The status future may reap even if its caller stops waiting. Disable further
         // signals before it starts, while the leader's pid still belongs to the group.
-        self.signals_disabled = true;
+        self.signals.disable();
         let status = within(Instant::now() + SHUTDOWN_GRACE, self.child.status())
             .await
             .ok_or(Error::ReapLate)?;
@@ -179,8 +179,8 @@ fn spawn_piped(command: process::Command) -> io::Result<Group> {
         .stderr(Stdio::piped())
         .spawn()?;
     Ok(Group {
+        signals: GroupSignals::new(child.id()),
         child,
-        signals_disabled: false,
         signalled: false,
         exit_status: None,
         #[cfg(target_os = "linux")]
@@ -217,7 +217,7 @@ pub(super) async fn supervised<T>(
     debug!(pid = group.child.id(), "claude-code: process started");
     let stderr = watch_stderr(&mut group.child);
     let result = work(&mut group).await;
-    if !group.signals_disabled {
+    if group.signals.is_enabled() {
         drop(group.child.stdin.take());
         group.terminate();
         if matches!(
@@ -231,17 +231,10 @@ pub(super) async fn supervised<T>(
         Ok(value) => Ok(value),
         Err(error) => {
             let error = match group.exit_status {
-                Some(status)
-                    if !matches!(
-                        error.cause(),
-                        Error::VersionFailed(_) | Error::ExitedEarly(_) | Error::ExitedInChecks(_)
-                    ) =>
-                {
-                    Error::WithExit {
-                        error: Box::new(error),
-                        status,
-                    }
-                }
+                Some(status) if !error.has_exit_status() => Error::WithExit {
+                    error: Box::new(error),
+                    status,
+                },
                 _ => error,
             };
             Err(stderr.explain(error).await)
@@ -330,25 +323,53 @@ pub(super) enum Next {
     Late,
 }
 
-pub(super) async fn next(
-    lines: &mut (impl Stream<Item = io::Result<String>> + Unpin),
-    handoffs: Option<&Receiver<Handoff>>,
-    deadline: Instant,
-) -> Next {
-    within(
-        deadline,
-        async { Next::Line(lines.next().await) }.or(async {
-            match handoffs {
-                Some(handoffs) => match handoffs.recv_async().await {
-                    Ok(handoff) => Next::Handoff(handoff),
-                    Err(_) => future::pending().await,
-                },
-                None => future::pending().await,
+pub(super) struct ReadDeadline {
+    timer: Timer,
+    at: Instant,
+}
+
+impl ReadDeadline {
+    pub(super) fn new(at: Instant) -> Self {
+        Self {
+            timer: Timer::at(at),
+            at,
+        }
+    }
+
+    pub(super) async fn next(
+        &mut self,
+        lines: &mut (impl Stream<Item = io::Result<String>> + Unpin),
+        handoffs: Option<&Receiver<Handoff>>,
+        deadline: Instant,
+    ) -> Next {
+        if deadline < self.at {
+            self.timer.set_at(deadline);
+            self.at = deadline;
+        }
+        loop {
+            let next = async { Next::Line(lines.next().await) }
+                .or(async {
+                    match handoffs {
+                        Some(handoffs) => match handoffs.recv_async().await {
+                            Ok(handoff) => Next::Handoff(handoff),
+                            Err(_) => future::pending().await,
+                        },
+                        None => future::pending().await,
+                    }
+                })
+                .or(async {
+                    (&mut self.timer).await;
+                    Next::Late
+                })
+                .await;
+            if !matches!(next, Next::Late) || Instant::now() >= deadline {
+                return next;
             }
-        }),
-    )
-    .await
-    .unwrap_or(Next::Late)
+            // Progress extends idle time without registering another alarm on each line.
+            self.timer.set_at(deadline);
+            self.at = deadline;
+        }
+    }
 }
 
 async fn event_line(reader: &mut (impl AsyncBufRead + Unpin)) -> io::Result<Option<String>> {
@@ -378,12 +399,15 @@ pub(super) fn stdout_lines(
     stdout: Option<ChildStdout>,
 ) -> Result<impl Stream<Item = io::Result<String>> + Unpin, Error> {
     let reader = BufReader::new(stdout.ok_or(Error::NoStdout)?);
-    Ok(Box::pin(stream::unfold(reader, |mut reader| async move {
-        event_line(&mut reader)
-            .await
-            .transpose()
-            .map(|line| (line, reader))
-    })))
+    Ok(Box::pin(
+        stream::unfold(reader, |mut reader| async move {
+            event_line(&mut reader)
+                .await
+                .transpose()
+                .map(|line| (line, reader))
+        })
+        .fuse(),
+    ))
 }
 
 /// Sends the check requests, which Claude Code answers before it reads a
@@ -546,6 +570,23 @@ mod process_tests {
         assert!(matches!(error.cause(), Error::Failed(message) if message == PROCESS_ERROR));
     }
 
+    #[test]
+    fn an_interrupted_exit_reports_the_process_status_once() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", FAIL_COMMAND]);
+        let error = smol::block_on(supervised::<()>(command, async |group| {
+            let status = group.wait(Instant::now() + SHUTDOWN_GRACE).await?;
+            Err(Error::ExitedEarly(status).after_start(true))
+        }))
+        .unwrap_err();
+        assert!(
+            matches!(&error, Error::WithStderr { error, .. }
+            if matches!(**error, Error::Interrupted(ref inner) if matches!(**inner, Error::ExitedEarly(_)))),
+            "{error:?}"
+        );
+        assert!(error.temporary().is_some());
+    }
+
     #[test_case(false ; "sigkill")]
     #[test_case(true ; "sigterm")]
     fn errors_after_an_explicit_stop_omit_process_status(graceful: bool) {
@@ -580,7 +621,7 @@ mod process_tests {
         let args = [LONG_SLEEP_SECS.to_owned()];
         let sleep = command(Path::new(SLEEP), &Fake::env(), &here, &args);
         let mut group = smol::block_on(Group::spawn(sleep)).unwrap();
-        group.signals_disabled = true;
+        group.signals.disable();
 
         if graceful {
             group.terminate();

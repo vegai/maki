@@ -27,7 +27,6 @@ use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
 use maki_lua::{EventHandle, SessionEndReason};
 use maki_providers::model::Model;
 use maki_providers::{TokenUsage, add_cost};
-use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
 use serde::Serialize;
@@ -184,7 +183,6 @@ pub struct PrintParams {
     /// The right to write [`Self::resumed`]'s session, taken when it was
     /// resolved and held for the whole run.
     pub claim: SessionClaim,
-    pub storage: StateDir,
 }
 
 pub fn run(params: PrintParams) -> Result<()> {
@@ -205,7 +203,6 @@ pub fn run(params: PrintParams) -> Result<()> {
         project_config,
         resumed,
         claim,
-        storage,
     } = params;
 
     let prompt = match prompt {
@@ -245,7 +242,6 @@ pub fn run(params: PrintParams) -> Result<()> {
         initial_wd: cwd,
         resumed,
         claim,
-        storage,
         defaults,
         model_policy,
         plugin_rules,
@@ -259,7 +255,7 @@ pub fn run(params: PrintParams) -> Result<()> {
         cwd,
         task,
     } = handle;
-    let _signals = crate::shutdown::watch(cancel).context("watch termination signals")?;
+    crate::shutdown::watch(cancel).context("watch termination signals")?;
     let start = Instant::now();
     let mut verbose_out = match format {
         OutputFormat::StreamJson => Some(VerboseOutput::StreamJson),

@@ -2,13 +2,27 @@ local native = require("maki.claude_code.internal")
 local M = {}
 
 M.ABSOLUTE_PATH = " must be relative to the project"
+M.PATH_NUL = "an input path cannot contain NUL"
 M.OUTSIDE_PROJECT = " goes out of the project"
 M.IMPORT_LOCK = "import.lock"
 M.PROJECT_LOCK = "maki-import.lock"
 M.SNAPSHOT_DIR = "snapshot"
 M.GIT_DIR = "git"
 M.MANIFEST = "manifest.json"
-local DEFAULT_DENY = { ".env*", "**/.env*", "secrets", "**/secrets", "secrets/**", "**/secrets/**" }
+local DEFAULT_DENY = {
+  ".env*",
+  "**/.env*",
+  "secrets",
+  "**/secrets",
+  "secrets/**",
+  "**/secrets/**",
+  ".git/config",
+  "**/.git/config",
+  ".maki/**",
+  "**/.maki/**",
+  ".claude/settings*.json",
+  "**/.claude/settings*.json",
+}
 
 M.ARTIFACT_ID = "^[A-Za-z0-9]+$"
 
@@ -104,6 +118,9 @@ end
 function M.relative_path(path)
   if type(path) ~= "string" or path == "" then
     return nil, "an input path must be a string that is not empty"
+  end
+  if path:find("\0", 1, true) then
+    return nil, M.PATH_NUL
   end
   if path:sub(1, 1) == "/" then
     return nil, path .. M.ABSOLUTE_PATH

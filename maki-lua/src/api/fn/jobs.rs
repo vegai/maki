@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use maki_config::ShellPreference;
+use maki_providers::process::GroupSignals;
 use maki_providers::{process, shell_command, strip_provider_keys};
 use maki_storage::id::MakiId;
 use mlua::{Lua, RegistryKey};
@@ -418,7 +419,10 @@ impl JobStore {
 
         let (event_tx, event_rx) = flume::unbounded();
 
-        let reap_state = Arc::new(ReapState::default());
+        let reap_state = Arc::new(ReapState {
+            group: Mutex::new(GroupSignals::new(pid)),
+            ..Default::default()
+        });
         let stdin = stdin_pipe
             .map(|stdin| spawn_stdin_writer(stdin, Arc::clone(&reap_state)))
             .transpose()?;
@@ -458,7 +462,7 @@ impl JobStore {
             let state = Arc::clone(&reap_state);
             smol::spawn(async move {
                 smol::Timer::after(timeout).await;
-                smol::unblock(move || kill_unreaped(pid, &state, true)).await;
+                smol::unblock(move || kill_unreaped(&state, true)).await;
             })
         });
 
@@ -823,7 +827,7 @@ impl JobStore {
 
     fn kill_all(&self) {
         for job in self.jobs.values() {
-            kill_unreaped(job.pid, &job.reap_state, false);
+            kill_unreaped(&job.reap_state, false);
         }
     }
 }
@@ -962,15 +966,15 @@ fn spawn_stdin_writer(
 /// so a slow platform kill cannot block the Lua thread.
 #[derive(Default)]
 struct ReapState {
-    reaped: Mutex<bool>,
+    group: Mutex<GroupSignals>,
     timed_out: AtomicBool,
     stdin_error: AtomicU8,
 }
 
 impl ReapState {
     /// A panic elsewhere must not block a reap or a kill.
-    fn lock(state: &Self) -> MutexGuard<'_, bool> {
-        state.reaped.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock(state: &Self) -> MutexGuard<'_, GroupSignals> {
+        state.group.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -983,9 +987,8 @@ fn reap(mut child: Child, state: &ReapState) -> i32 {
     #[cfg(unix)]
     let status = if process::wait_without_reaping(child.id()) {
         let mut state = lock();
-        let status = child.wait();
-        *state = true;
-        status
+        state.disable();
+        child.wait()
     } else {
         // With no exit to wait for, the reap waits by itself, outside the
         // lock every kill uses. The kills stop first.
@@ -993,14 +996,14 @@ fn reap(mut child: Child, state: &ReapState) -> i32 {
             pid = child.id(),
             "maki cannot wait for the job without reaping it, so a stop cannot kill it"
         );
-        *lock() = true;
+        lock().disable();
         child.wait()
     };
     #[cfg(not(unix))]
     let status = child.wait();
     #[cfg(not(unix))]
     {
-        *lock() = true;
+        lock().disable();
     }
     drop(child);
     status.map_or(-1, |status| status.code().unwrap_or(-1))
@@ -1031,20 +1034,21 @@ impl Drop for Unwatched {
 
 /// A reaped pid can identify another process. Hold the lock until the signal completes so
 /// [`reap`] cannot release the pid first.
-fn kill_unreaped(pid: u32, state: &ReapState, timed_out: bool) {
+fn kill_unreaped(state: &ReapState, timed_out: bool) {
     let reaped = ReapState::lock(state);
-    if !*reaped {
+    if reaped.is_enabled() {
         if timed_out {
             state.timed_out.store(true, Ordering::Release);
         }
-        process::kill_group(pid);
+        reaped.kill();
     }
 }
 
 fn kill_job(job: &JobMeta) {
+    #[cfg(windows)]
     let pid = job.pid;
     let state = Arc::clone(&job.reap_state);
-    let kill = move || kill_unreaped(pid, &state, false);
+    let kill = move || kill_unreaped(&state, false);
     #[cfg(windows)]
     if let Err(error) = thread::Builder::new().name("job-kill".into()).spawn(kill) {
         tracing::warn!(pid, %error, "could not start the job termination thread");
@@ -1131,7 +1135,7 @@ mod tests {
         loop {
             if let JobEvent::Exit(_, timed_out) = receiver.recv_timeout(JOB_EXIT_TIMEOUT).unwrap() {
                 assert!(timed_out);
-                assert!(*ReapState::lock(&store.jobs[&id].reap_state));
+                assert!(!ReapState::lock(&store.jobs[&id].reap_state).is_enabled());
                 break;
             }
         }
@@ -2298,7 +2302,7 @@ mod tests {
             store.record_event(id, &event);
         }
         assert!(
-            *ReapState::lock(&store.jobs[&id].reap_state),
+            !ReapState::lock(&store.jobs[&id].reap_state).is_enabled(),
             "{EXIT_WITHOUT_REAP}"
         );
         deliver(&mut store, &lua, id, &JobEvent::Exit(0, false));

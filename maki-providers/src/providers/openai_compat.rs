@@ -11,8 +11,8 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
-use super::ResolvedAuth;
 use super::copilot::copilot_usd;
+use super::{ResolvedAuth, endpoint};
 use crate::model::ModelFamily;
 use crate::types::rejects_sampling;
 use crate::{
@@ -199,13 +199,11 @@ impl OpenAiCompatProvider {
     /// Effective base URL: an auth-supplied value (dynamic/custom providers)
     /// wins, then the construction-time env / `providers.toml` override, then
     /// the static compat default.
-    pub(crate) fn base_url(&self, auth: &ResolvedAuth) -> String {
+    pub(crate) fn base_url<'a>(&'a self, auth: &'a ResolvedAuth) -> &'a str {
         auth.base_url
             .as_deref()
             .or(self.resolved_base_url.as_deref())
             .unwrap_or(&self.config.base_url)
-            .trim_end_matches('/')
-            .to_owned()
     }
 
     fn build_request(
@@ -218,7 +216,7 @@ impl OpenAiCompatProvider {
         auth.configure_request(
             Request::builder()
                 .method(method)
-                .uri(format!("{base}{path}"))
+                .uri(endpoint(base, path))
                 .header("user-agent", super::user_agent()),
         )
     }
@@ -282,7 +280,7 @@ impl OpenAiCompatProvider {
         parse_fn: impl Fn(&Value) -> Option<crate::model::ModelInfo>,
     ) -> Result<Vec<crate::model::ModelInfo>, AgentError> {
         let base = self.base_url(auth);
-        let url = format!("{base}{path}");
+        let url = endpoint(base, path);
         let body_text = self.get_text(auth, &url).await?;
         let body: Value = serde_json::from_str(&body_text)?;
 

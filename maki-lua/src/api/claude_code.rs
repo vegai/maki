@@ -243,7 +243,7 @@ fn worker_settings(lua: &Lua, policy: Table) -> LuaResult<LuaValue> {
 /// @param configured string? Explicit config directory.
 /// @param cwd string Session directory.
 /// @return (table?, string?) Validated preparation, or nil and the error.
-#[lua_fn(guard = FsRead)]
+#[lua_fn(guard = FsWrite)]
 async fn prepare_launch(
     lua: Lua,
     environ: HashMap<String, String>,
@@ -377,6 +377,26 @@ async fn unpack_blobs(
     }
 }
 
+/// Inspect an import target. Missing paths return nil, and blocked or looping parents count as conflicts.
+/// @param path string Checkout file path.
+/// @return (boolean?, string?) Whether the target is a regular file, or nil and an I/O error.
+#[lua_fn(guard = FsRead)]
+async fn checkout_file(_lua: Lua, path: String) -> LuaResult<Pair<bool>> {
+    let value = try_pair!(
+        smol::unblock(move || match fs::symlink_metadata(path) {
+            Ok(meta) => Ok(Some(meta.is_file())),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) if error.kind() == ErrorKind::NotADirectory => Ok(Some(false)),
+            #[cfg(unix)]
+            Err(error) if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) =>
+                Ok(Some(false)),
+            Err(error) => Err(error),
+        })
+        .await
+    );
+    Ok((value, None))
+}
+
 /// Classify a worker event with the provider's protocol rules before conversion to Lua.
 /// @param line string Raw stream-json event.
 /// @param mode table Accepted-init and expected-model state. Init events require mode.init with cwd, cli and worker.
@@ -409,6 +429,31 @@ fn classify(lua: &Lua, line: String, mode: Table) -> LuaResult<Pair<Table>> {
             &modes,
         );
     }
+    let event = &mut classified.event;
+    match event["type"].as_str() {
+        Some("assistant") => {
+            if let Some(content) = event["message"]
+                .get_mut("content")
+                .and_then(Value::as_array_mut)
+            {
+                content.retain(|block| block["type"] == "tool_use");
+                for block in content {
+                    if let Some(input) = block.get_mut("input").and_then(Value::as_object_mut) {
+                        input.retain(|key, _| {
+                            matches!(key.as_str(), "file_path" | "path" | "pattern")
+                        });
+                    }
+                }
+            }
+        }
+        Some("result" | "control_response" | "rate_limit_event") => {}
+        Some(SYSTEM_EVENT) if event["subtype"] == INIT_EVENT => {}
+        _ => {
+            if let Some(object) = event.as_object_mut() {
+                object.retain(|key, _| key == "type" || key == "subtype");
+            }
+        }
+    }
     let result = lua.create_table()?;
     result.set("event", json_to_lua(lua, event)?)?;
     result.set("model_checked", classified.model_checked)?;
@@ -428,7 +473,7 @@ lua_table! {
     /// the distinction between null, objects and arrays.
     "maki.claude_code.internal" => pub(crate) fn create_claude_code_table(perms: &PluginPermissions), DOCS [
         shell_secret_problem, escape_invisible, worker_handshake, base_args, worker_settings, prepare_launch(perms), private_dir(perms), home_state_files(perms),
-        classify, version_check(perms), invalidate_version, sanitize_git(perms), project_git_dir(perms), unpack_blobs(perms),
+        classify, checkout_file(perms), version_check(perms), invalidate_version, sanitize_git(perms), project_git_dir(perms), unpack_blobs(perms),
     ]
 }
 
@@ -504,6 +549,53 @@ mod tests {
             .unwrap();
         assert!(event.is_none());
         assert!(error.unwrap().contains(&expected));
+    }
+
+    #[test_case(false ; "file_parent")]
+    #[test_case(true ; "looping_parent")]
+    fn checkout_targets_with_blocked_parents_are_conflicts(looping: bool) {
+        let root = tempdir().unwrap();
+        let parent = root.path().join(NESTED);
+        if looping {
+            symlink(NESTED, &parent).unwrap();
+        } else {
+            fs::write(&parent, "file").unwrap();
+        }
+        let lua = Lua::new();
+        let table = create_claude_code_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let inspect: Function = table.get("checkout_file").unwrap();
+        let (regular, error): (Option<bool>, Option<String>) =
+            smol::block_on(inspect.call_async(parent.join(LINKED).to_str().unwrap())).unwrap();
+        assert_eq!(regular, Some(false));
+        assert_eq!(error, None);
+    }
+
+    #[test]
+    fn ignored_worker_events_do_not_copy_payloads_into_lua() {
+        let lua = Lua::new();
+        let table = create_claude_code_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let classify: Function = table.get("classify").unwrap();
+        let input = json!({ "type": "user", "message": {"content": "x".repeat(4096)} }).to_string();
+        let mode = lua.create_table().unwrap();
+        mode.set("accepted", true).unwrap();
+        let (result, error): (Option<Table>, Option<String>) =
+            classify.call((input, mode)).unwrap();
+        assert_eq!(error, None);
+        let event: Table = result.unwrap().get("event").unwrap();
+        assert_eq!(event.get::<String>("type").unwrap(), "user");
+        assert!(event.get::<Option<Table>>("message").unwrap().is_none());
+    }
+
+    #[test]
+    fn oversized_worker_events_return_a_bounded_error() {
+        let lua = Lua::new();
+        let table = create_claude_code_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let classify: Function = table.get("classify").unwrap();
+        let input = "x".repeat(maki_providers::claude_code::validation::MAX_EVENT_BYTES + 1);
+        let (result, error): (Option<Table>, Option<String>) =
+            classify.call((input, lua.create_table().unwrap())).unwrap();
+        assert!(result.is_none());
+        assert!(error.unwrap().contains("limit"));
     }
 
     #[test_case(false ; "direct_denied_directory")]

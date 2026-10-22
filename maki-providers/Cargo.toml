@@ -10,7 +10,6 @@ test-support = []
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-jsonrepair = { workspace = true }
 serde_yaml = { workspace = true }
 maki-storage = { workspace = true }
 thiserror = { workspace = true }
@@ -43,6 +42,7 @@ rustix = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+wait-timeout = { workspace = true }
 test-case = { workspace = true }
 tracing-subscriber = { workspace = true }
 

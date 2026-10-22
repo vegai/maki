@@ -826,7 +826,7 @@ case("settings_deny_the_defaults_and_the_configured_paths", function()
   local settings = launch.settings(worker_spec(READ, nil, launch.deny_rules(" config/prod.yml , ./certs/** ,, ")))
   eq(
     table.concat(settings.permissions.deny, " "),
-    "Read(./.env*) Read(./**/.env*) Read(./secrets) Read(./**/secrets) Read(./secrets/**) Read(./**/secrets/**) Read(./config/prod.yml) Read(./certs/**)"
+    "Read(./.env*) Read(./**/.env*) Read(./secrets) Read(./**/secrets) Read(./secrets/**) Read(./**/secrets/**) Read(./.git/config) Read(./**/.git/config) Read(./.maki/**) Read(./**/.maki/**) Read(./.claude/settings*.json) Read(./**/.claude/settings*.json) Read(./config/prod.yml) Read(./certs/**)"
   )
 end)
 
@@ -1232,6 +1232,12 @@ case("git_commands_override_hooks_fsmonitor_and_quoting", function()
   eq(argv[#argv], "status")
 end)
 
+case("read_workers_deny_project_agent_and_git_settings", function()
+  for _, path in ipairs({ ".git/config", ".maki/**", ".claude/settings*.json" }) do
+    has(table.concat(launch.deny_rules(""), "\n"), "Read(./" .. path .. ")")
+  end
+end)
+
 -- User input is normalized, so one file always has one spelling.
 for _, c in ipairs({
   { name = "a_relative_file", path = "fixtures/input.json", want = "fixtures/input.json" },
@@ -1240,6 +1246,7 @@ for _, c in ipairs({
   { name = "a_trailing_slash", path = "fixtures/", want = "fixtures" },
   { name = "an_absolute_path", path = "/etc/passwd", problem = "relative" },
   { name = "a_climb_out", path = "src/../../x", problem = "goes out of the project" },
+  { name = "a_nul_byte", path = "a\0b", problem = path_utils.PATH_NUL },
   { name = "an_empty_path", path = "", problem = "not empty" },
   { name = "the_whole_project", path = "./", problem = "the full project" },
 }) do

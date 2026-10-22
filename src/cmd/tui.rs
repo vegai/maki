@@ -458,7 +458,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
             cli,
             resumed,
             claim,
-            storage: storage.clone(),
             model: stack.model,
             config: stack.config.agent,
             permissions_config: stack.config.permissions,
@@ -494,7 +493,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
             project_config: trust.project_config.clone(),
             resumed,
             claim,
-            storage: storage.clone(),
         })
         .context("run print mode")?;
         return Ok(());

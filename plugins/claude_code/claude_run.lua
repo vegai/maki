@@ -239,7 +239,7 @@ function Run:on_exit(code)
     )
     return
   end
-  if self.stream.result and code == 0 then
+  if self.stream.result and (code == 0 or self.stream.failure) then
     self:finish_with(self.stream:outcome())
     return
   end

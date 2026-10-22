@@ -104,8 +104,8 @@ pub(crate) enum Error {
     #[error("`claude --version` printed nothing")]
     NoVersion,
     #[error(
-        "Claude Code model discovery failed. maki will retry after {} minutes or an explicit refresh: {message}",
-        wait.as_secs() / 60
+        "Claude Code model discovery failed. maki will retry after {} seconds or an explicit refresh: {message}",
+        wait.as_secs().max(1)
     )]
     ListedRecently { message: String, wait: Duration },
     #[error("Claude Code did not answer its {0} request")]
@@ -248,6 +248,17 @@ impl Error {
         match self {
             Self::WithStderr { error, .. } | Self::WithExit { error, .. } => error.cause(),
             _ => self,
+        }
+    }
+
+    pub(crate) fn has_exit_status(&self) -> bool {
+        match self {
+            Self::WithStderr { error, .. } | Self::Interrupted(error) => error.has_exit_status(),
+            Self::WithExit { .. }
+            | Self::VersionFailed(_)
+            | Self::ExitedEarly(_)
+            | Self::ExitedInChecks(_) => true,
+            _ => false,
         }
     }
 

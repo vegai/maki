@@ -4,11 +4,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use arc_swap::ArcSwap;
 use maki_providers::{ContextGauge, Message, TokenUsage};
-use maki_storage::StateDir;
 use maki_storage::frame::StoredFrame;
+use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::sessions::{
-    SAVE_FAILED, SESSIONS_DIR, Session, SessionClaim, SessionError, StoredMode, StoredThinking,
+    SAVE_FAILED, Session, SessionClaim, SessionError, StoredMode, StoredThinking,
 };
 use thiserror::Error;
 use tracing::warn;
@@ -159,8 +159,7 @@ pub struct SessionTrack {
 
 impl SessionTrack {
     /// Built once the provider resolves, so a run that never started leaves no
-    /// file behind. The state dir comes from the caller rather than being
-    /// resolved here, so the run writes where its history was read from.
+    /// file behind. The claim retains the directory the caller read the session from.
     ///
     /// Takes the claim by value, so nobody else can write the session for as
     /// long as this track can.
@@ -168,9 +167,9 @@ impl SessionTrack {
     /// Publishes the transcript and the settings under the session's id, so
     /// `maki.session.messages`, `export` and `read` work under a headless
     /// driver too, before anything is saved.
-    pub fn open(resumed: Resumed, claim: SessionClaim, storage: StateDir, cwd: &str) -> Self {
+    pub fn open(resumed: Resumed, claim: SessionClaim, cwd: &str) -> Self {
         let mirror: SharedMessages = Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
-        let store = SessionStore::open(storage, claim, resumed.session, cwd);
+        let store = SessionStore::open(claim, resumed.session, cwd);
         publish_live_session(resumed.id.id(), &mirror, &store.header);
         let store = Arc::new(Mutex::new(store));
         Self {
@@ -298,7 +297,6 @@ impl SessionCheckpoint {
 }
 
 struct SessionStore {
-    dir: StateDir,
     claim: SessionClaim,
     session: StoredSession,
     /// `session`'s header as readers see it, republished whenever it moves.
@@ -311,14 +309,13 @@ impl SessionStore {
     /// yet is held in memory until [`Self::record_turn`] has something to
     /// store, so every file on disk has a transcript in it. The blank model
     /// spec is [`SessionTrack::turn`]'s to fill, and it runs before any write.
-    fn open(dir: StateDir, claim: SessionClaim, stored: Option<StoredSession>, cwd: &str) -> Self {
+    fn open(claim: SessionClaim, stored: Option<StoredSession>, cwd: &str) -> Self {
         let session = stored.unwrap_or_else(|| {
             let mut session = StoredSession::new("", cwd);
             session.id = claim.id();
             session
         });
         Self {
-            dir,
             claim,
             header: Arc::new(ArcSwap::from_pointee(SessionHeader::of(&session))),
             session,
@@ -352,7 +349,6 @@ impl SessionStore {
         self.session.set_history(snapshot);
         self.session.meta.context_size = context_size;
         self.session.update_title_if_default();
-        self.dir.ensure_subdir(SESSIONS_DIR)?;
         self.claim.persist(&self.session)
     }
 }
@@ -363,6 +359,7 @@ mod tests {
     use std::path::PathBuf;
 
     use maki_providers::{ContentBlock, Role};
+    use maki_storage::StateDir;
     use maki_storage::frame::PromptFacts;
     use maki_storage::id::MakiId;
     use maki_storage::sessions::{SESSIONS_DIR, generate_title};
@@ -434,7 +431,6 @@ mod tests {
         SessionTrack::open(
             Resumed::stored(SessionRef::from(session_id()), load(tmp)),
             claim(tmp),
-            state_dir(tmp),
             CWD,
         )
     }
@@ -456,7 +452,7 @@ mod tests {
     }
 
     fn track_on(tmp: &TempDir) -> SessionTrack {
-        SessionTrack::open(resumed(), claim(tmp), state_dir(tmp), CWD)
+        SessionTrack::open(resumed(), claim(tmp), CWD)
     }
 
     fn input(mode: AgentMode) -> AgentInput {
@@ -684,7 +680,6 @@ mod tests {
         let mut track = SessionTrack::open(
             Resumed::stored(SessionRef::from(session_id()), stored),
             claim(&tmp),
-            state_dir(&tmp),
             CWD,
         );
         push_prompt(&mut track, OTHER_SPEC, PROMPT);
@@ -716,7 +711,7 @@ mod tests {
             frame: Some(Arc::clone(&frame)),
             ..resumed()
         };
-        let mut track = SessionTrack::open(resumed, claim(&tmp), state_dir(&tmp), CWD);
+        let mut track = SessionTrack::open(resumed, claim(&tmp), CWD);
         push_prompt(&mut track, MODEL_SPEC, OBSERVATION);
         drop(track);
 
@@ -725,7 +720,6 @@ mod tests {
         let reopened = SessionTrack::open(
             Resumed::stored(SessionRef::from(session_id()), stored),
             claim(&tmp),
-            state_dir(&tmp),
             CWD,
         );
         assert_eq!(reopened.history.frame(), Some(&frame), "{FRAME_KEPT}");
@@ -744,7 +738,7 @@ mod tests {
             ..Resumed::empty(SessionRef::from(id))
         };
         let claim = SessionClaim::acquire(id, &state_dir(&tmp)).expect("nothing else holds it");
-        let mut track = SessionTrack::open(resumed, claim, state_dir(&tmp), CWD);
+        let mut track = SessionTrack::open(resumed, claim, CWD);
 
         let restored = live_history(id).expect("an open track is live");
         assert_eq!(restored.len(), 1);

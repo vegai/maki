@@ -31,7 +31,6 @@ use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
 use maki_providers::model::Model;
 use maki_providers::{ImageSource, StopReason, Timeouts, TokenUsage, add_cost};
-use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
 use serde::Serialize;
@@ -417,7 +416,6 @@ pub struct SdkParams {
     /// The right to write [`Self::resumed`]'s session, taken when it was
     /// resolved and held for the whole run.
     pub claim: SessionClaim,
-    pub storage: StateDir,
     pub model: Model,
     pub config: AgentConfig,
     pub permissions_config: PermissionsConfig,
@@ -511,9 +509,8 @@ pub fn run(params: SdkParams) -> Result<()> {
         cli,
         resumed,
         claim,
-        storage,
         model,
-        mut config,
+        config,
         permissions_config,
         timeouts,
         prompt_slots,
@@ -524,10 +521,6 @@ pub fn run(params: SdkParams) -> Result<()> {
         project_config,
     } = params;
     cli.warn_ignored_flags();
-    if let Some(max) = cli.max_turns {
-        config.max_turns = Some(max);
-    }
-    config.final_answer = cli.final_answer;
     let permission_mode = PermissionMode::resolve(cli.permission_mode.as_deref(), cli.yolo);
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
@@ -540,7 +533,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     }
 
     let (trigger, shutdown) = CancelToken::new();
-    let _signals = crate::shutdown::watch(trigger).context("watch termination signals")?;
+    crate::shutdown::watch(trigger).context("watch termination signals")?;
     let (handle, mut events) = headless::spawn_interactive(InteractiveParams {
         shutdown: shutdown.clone(),
         model,
@@ -553,7 +546,6 @@ pub fn run(params: SdkParams) -> Result<()> {
         initial_wd: cwd.clone(),
         resumed,
         claim,
-        storage,
         yolo: permission_mode == PermissionMode::BypassPermissions,
         system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
         append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
@@ -563,14 +555,6 @@ pub fn run(params: SdkParams) -> Result<()> {
         project_config,
         local_tools: Default::default(),
     });
-    let (
-        Ready {
-            model: startup_model,
-            tool_names,
-        },
-        thinking,
-    ) = crate::headless_startup::startup(&handle.ready, &mut events, defaults.thinking)?;
-
     let (out_tx, out_rx) = flume::unbounded::<String>();
     let writer_thread = std::thread::spawn(move || {
         let mut stdout = io::stdout().lock();
@@ -585,6 +569,36 @@ pub fn run(params: SdkParams) -> Result<()> {
         session_id: handle.session_id.clone(),
         out_tx,
     };
+    let (
+        Ready {
+            model: startup_model,
+            tool_names,
+        },
+        thinking,
+    ) = match crate::headless_startup::startup(&handle.ready, &mut events, defaults.thinking) {
+        Ok(started) => started,
+        Err(error) => {
+            let emitted = writer.emit(WireInner::Result(ResultPayload {
+                subtype: "error_during_execution",
+                is_error: true,
+                duration_ms: 0,
+                duration_api_ms: 0,
+                num_turns: 0,
+                result: error.to_string(),
+                total_cost_usd: 0.0,
+                usage: TokenUsage::default(),
+                permission_denials: Vec::new(),
+            }));
+            drop(handle.input_tx);
+            smol::block_on(headless::await_shutdown(handle.task));
+            lua_handle.end_sessions_blocking([handle.session_id.id()], SessionEndReason::Completed);
+            drop(writer);
+            let _ = writer_thread.join();
+            emitted?;
+            return Err(error);
+        }
+    };
+
     let tools: Vec<&str> = tool_names
         .iter()
         .map(|t| maki_to_claude_tool_name(t))

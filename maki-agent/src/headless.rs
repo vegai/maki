@@ -8,7 +8,6 @@ use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_providers::Timeouts;
 use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
-use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
 use serde_json::Value;
@@ -66,9 +65,6 @@ pub struct HeadlessParams {
     /// The right to write [`Self::resumed`]'s session, taken before its
     /// transcript was read.
     pub claim: SessionClaim,
-    /// Where the transcript is written. The same dir the caller resolved the
-    /// session from, so a run cannot read one session and write another.
-    pub storage: StateDir,
     /// Launch defaults after CLI, config and saved-state precedence. The model
     /// gate stays in `RequestOptions::clamped`.
     pub defaults: SessionDefaults,
@@ -223,12 +219,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
             return;
         }
         let context = spec.builder();
-        let mut track = SessionTrack::open(
-            params.resumed,
-            params.claim,
-            params.storage,
-            &task_working_dir,
-        );
+        let mut track = SessionTrack::open(params.resumed, params.claim, &task_working_dir);
 
         let error_tx = event_tx.clone();
         let input = AgentInput::from_defaults(
@@ -306,8 +297,6 @@ pub struct InteractiveParams {
     pub resumed: Resumed,
     /// See [`HeadlessParams::claim`].
     pub claim: SessionClaim,
-    /// See [`HeadlessParams::storage`].
-    pub storage: StateDir,
     pub yolo: bool,
     pub system_prompt_override: Option<String>,
     pub append_system_prompt: Option<String>,
@@ -388,8 +377,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
         };
         let _ = ready_tx.send(spec.ready(&model, params.defaults.workflow, mcp.as_ref()));
         let context = spec.builder();
-        let mut track =
-            SessionTrack::open(params.resumed, params.claim, params.storage, &working_dir);
+        let mut track = SessionTrack::open(params.resumed, params.claim, &working_dir);
         let mut run_id: u64 = 0;
 
         while let Ok(Ok(input)) = params.shutdown.race(input_rx.recv_async()).await {

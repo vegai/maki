@@ -1,10 +1,13 @@
 -- Plugin jobs report exit after cancellation, so a slot must wait for every process.
+local truncate = require("maki.truncate")
 local M = {}
 
 M.ERROR_PREFIX = "claude_code: "
 M.LEFT_BEHIND = "maki did not remove: "
 M.CANCELLED = "cancelled"
 local STDERR_TAIL_LINES = 10
+local STDERR_LINE_BYTES = 4096
+M.ERROR_BYTES = STDERR_TAIL_LINES * STDERR_LINE_BYTES
 M.MS_PER_SEC = 1000
 
 local Call = {}
@@ -31,7 +34,7 @@ function M.new(startup_ms, released)
 end
 
 function M.keep_tail(tail, line)
-  tail[#tail + 1] = line
+  tail[#tail + 1] = truncate(line, nil, STDERR_LINE_BYTES)
   if #tail > STDERR_TAIL_LINES then
     table.remove(tail, 1)
   end

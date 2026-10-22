@@ -11,7 +11,8 @@ pub(super) use self::private_files::private_dir;
 use self::private_files::{PrivateDir, private_file};
 pub(super) use self::supervision::within;
 use self::supervision::{
-    Group, Next, SHUTDOWN_GRACE, next, send, send_handshake, stdout_lines, supervised, unreadable,
+    Group, Next, ReadDeadline, SHUTDOWN_GRACE, send, send_handshake, stdout_lines, supervised,
+    unreadable,
 };
 use super::checks::{InitExpect, require_system};
 use super::error::Error;
@@ -335,6 +336,7 @@ async fn exchange_reply(
     // Set when the reply is complete, and keep-alives must not move it.
     let mut finish_by = None;
     let mut result_late = false;
+    let mut timer = ReadDeadline::new(startup);
     loop {
         let waiting = turn.waiting();
         let deadline = match waiting {
@@ -351,9 +353,14 @@ async fn exchange_reply(
             ),
             Wait::Idle => last_event + limits.idle,
         };
-        let step = match next(&mut lines, Some(handoffs), deadline).await {
+        let step = match timer.next(&mut lines, Some(handoffs), deadline).await {
             Next::Line(Some(Ok(line))) => turn.feed(&line),
             Next::Line(Some(Err(source))) => Err(unreadable(source)),
+            Next::Line(None)
+                if !turn.is_broken() && turn.awaits_result() && turn.has_stream_usage() =>
+            {
+                Ok(Step::Done)
+            }
             Next::Line(None) => {
                 let ended = match group.wait(Instant::now() + limits.exit).await {
                     Ok(status) => Error::ExitedEarly(status),
@@ -512,8 +519,9 @@ async fn drain(
     deadline: Instant,
     stopped: bool,
 ) -> Result<(), Error> {
+    let mut timer = ReadDeadline::new(deadline);
     loop {
-        let step = match next(lines, Some(handoffs), deadline).await {
+        let step = match timer.next(lines, Some(handoffs), deadline).await {
             Next::Line(Some(Ok(line))) => turn.feed(&line).map(drop),
             Next::Line(Some(Err(source))) => Err(unreadable(source)),
             Next::Line(None) => return Ok(()),
@@ -525,7 +533,7 @@ async fn drain(
         };
         let cut = stopped
             && matches!(error, Error::NotAnEvent { .. } | Error::Io { .. })
-            && matches!(next(lines, None, deadline).await, Next::Line(None));
+            && matches!(timer.next(lines, None, deadline).await, Next::Line(None));
         return if cut { Ok(()) } else { Err(error) };
     }
 }
@@ -836,9 +844,10 @@ mod tests {
     /// Once the reply and every usage count have streamed, the result only
     /// repeats them. When it is late, maki keeps the reply and stops Claude
     /// Code, and keep-alives do not hold the request open.
-    #[test]
-    fn a_late_result_after_a_complete_reply_keeps_the_reply() {
-        let fake = Fake::new("stalled_result");
+    #[test_case("stalled_result" ; "late_result")]
+    #[test_case("complete_output" ; "eof_after_complete_reply")]
+    fn a_missing_result_after_a_complete_reply_keeps_the_reply(scenario: &str) {
+        let fake = Fake::new(scenario);
         let result = through_keep_alives(&fake, limits(STARTUP, IDLE, SHORT_HANDOFF, SHORT_EXIT));
 
         let response = result.unwrap();

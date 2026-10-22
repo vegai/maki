@@ -18,7 +18,7 @@ use crate::{AgentError, Effort, Message, ProviderEvent, RequestOptions, StreamRe
 use maki_storage::id::SessionRef;
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{ResolvedAuth, Timeouts, google, plugin};
+use super::{ResolvedAuth, Timeouts, endpoint, google, plugin};
 
 const HOST_ENV: &str = "APERTURE_HOST";
 const PER_MILLION: f64 = 1_000_000.0;
@@ -229,7 +229,7 @@ fn routed_auth(auth: &Arc<Mutex<ResolvedAuth>>, prefix: &str) -> Arc<Mutex<Resol
     if !prefix.is_empty()
         && let Some(base) = cloned.base_url.as_deref()
     {
-        cloned.base_url = Some(format!("{}{prefix}", base.trim_end_matches('/')));
+        cloned.base_url = Some(endpoint(base, prefix));
     }
     Arc::new(Mutex::new(cloned))
 }

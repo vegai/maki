@@ -75,6 +75,38 @@ fn runnable(path: &Path) -> bool {
     path.is_file() && allowed
 }
 
+/// Signal authority shared by process supervisors. Disable it before a reap can release the
+/// leader's pid. The owner keeps the child or a group reservation alive while it is enabled.
+#[derive(Default)]
+pub struct GroupSignals {
+    pid: u32,
+    enabled: bool,
+}
+
+impl GroupSignals {
+    pub fn new(pid: u32) -> Self {
+        Self { pid, enabled: true }
+    }
+
+    pub fn id(&self) -> u32 {
+        self.pid
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn disable(&mut self) {
+        self.enabled = false;
+    }
+
+    pub fn kill(&self) {
+        if self.enabled {
+            kill_group(self.pid);
+        }
+    }
+}
+
 /// A child started as a group leader has its pid as the group id.
 #[cfg(unix)]
 pub fn pid_of(pid: u32) -> Option<Pid> {

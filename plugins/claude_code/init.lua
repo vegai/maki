@@ -165,7 +165,7 @@ local semaphore = maki.async.semaphore(opts.max_concurrent)
 local callers = 0
 
 local function refuse(msg)
-  return { llm_output = ERROR_PREFIX .. msg, is_error = true }
+  return { llm_output = ERROR_PREFIX .. truncate(msg, nil, jobs.ERROR_BYTES), is_error = true }
 end
 
 local function snapshot_plan(input)

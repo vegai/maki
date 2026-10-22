@@ -19,7 +19,6 @@ maki-storage = { workspace = true }
 grep-regex = { workspace = true }
 grep-searcher = { workspace = true }
 similar = { workspace = true }
-jsonrepair = { workspace = true }
 jiff = { workspace = true }
 smol = { workspace = true }
 flume = { workspace = true }

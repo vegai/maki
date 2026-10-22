@@ -2,8 +2,9 @@ use std::io;
 use std::process::ExitStatus;
 use std::time::Duration;
 
+use maki_providers::process::GroupSignals;
 #[cfg(unix)]
-use maki_providers::process::{kill_group, pid_of};
+use maki_providers::process::{pid_of, wait_without_reaping};
 #[cfg(unix)]
 use rustix::process::{WaitOptions, waitpid};
 use smol::process::Child;
@@ -11,25 +12,33 @@ use smol::process::Child;
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct ChildGuard {
-    pid: u32,
+    signals: GroupSignals,
     child: Option<Child>,
 }
 
 impl ChildGuard {
     pub fn new(child: Child) -> Self {
         Self {
-            pid: child.id(),
+            signals: GroupSignals::new(child.id()),
             child: Some(child),
         }
     }
 
     pub fn id(&self) -> u32 {
-        self.pid
+        self.signals.id()
     }
 
     pub async fn status(&mut self) -> io::Result<ExitStatus> {
         match self.child.as_mut() {
             Some(child) => {
+                #[cfg(unix)]
+                {
+                    let pid = child.id();
+                    if smol::unblock(move || wait_without_reaping(pid)).await {
+                        self.signals.kill();
+                    }
+                }
+                self.signals.disable();
                 let result = child.status().await;
                 if result.is_ok() {
                     self.child = None;
@@ -46,6 +55,7 @@ impl ChildGuard {
     pub async fn kill_and_reap(&mut self) {
         self.signal_kill();
         if let Some(mut child) = self.child.take() {
+            self.signals.disable();
             futures_lite::future::or(
                 async {
                     let _ = child.status().await;
@@ -61,7 +71,7 @@ impl ChildGuard {
     #[cfg(unix)]
     fn signal_kill(&self) {
         if self.child.is_some() {
-            kill_group(self.pid);
+            self.signals.kill();
         }
     }
 
@@ -78,8 +88,9 @@ impl ChildGuard {
     // block the async executor.
     #[cfg(unix)]
     fn reap_nonblocking(&mut self) {
+        self.signals.disable();
         if self.child.take().is_some()
-            && let Some(pid) = pid_of(self.pid)
+            && let Some(pid) = pid_of(self.signals.id())
         {
             let _ = waitpid(Some(pid), WaitOptions::NOHANG);
         }

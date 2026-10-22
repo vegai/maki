@@ -79,6 +79,8 @@ maki.api.register_tool({
 "#;
 const NO_INIT: &str = "no_init";
 const CRASH: &str = "crash";
+const ERROR_RESULT: &str = "error_result";
+const LOGIN_ERROR: &str = "Not logged in";
 const ANSWER_THEN_CRASH: &str = "answer_then_crash";
 const ANSWER_THEN_GARBAGE: &str = "answer_then_garbage";
 const ANSWER_THEN_KEEP_ALIVE: &str = "answer_then_keep_alive";
@@ -251,7 +253,10 @@ while IFS= read -r msg; do
 done
 scenario=${scenario%%\\n*}
 if [ -z "$scenario" ] && [ -e "$dir/@PROBE_RUNS@" ]; then init none; answer; fi
-if [ -z "$scenario" ] && [ -e "$dir/probe_exit" ]; then echo "probe gave up" >&2; exit "$(cat "$dir/probe_exit")"; fi
+if [ -z "$scenario" ] && [ -e "$dir/probe_exit" ]; then
+  if [ -e "$dir/probe_stderr" ]; then cat "$dir/probe_stderr" >&2; else echo "probe gave up" >&2; fi
+  exit "$(cat "$dir/probe_exit")"
+fi
 [ -n "$scenario" ] || exit 0
 echo "print $scenario" >> "$dir/calls"
 case "$scenario" in
@@ -260,6 +265,7 @@ case "$scenario" in
   api_key) init ANTHROPIC_API_KEY; answer; sleep @HANG_SECS@ ;;
   init_then_api_key) init none; init ANTHROPIC_API_KEY; sleep @HANG_SECS@ ;;
   no_init) sleep @HANG_SECS@ ;;
+  error_result) init none; line '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"Not logged in"}'; exit 1 ;;
   crash) init none; echo boom >&2; exit 3 ;;
   answer_then_crash) init none; answer; echo boom >&2; exit 3 ;;
   answer_then_garbage) init none; answer; line 'Update available: run claude update' ;;
@@ -609,6 +615,25 @@ fn an_answered_run_goes_through_every_check() {
         !child_env.lines().any(|l| l.starts_with("CARGO_")),
         "got:\n{child_env}"
     );
+}
+
+#[test]
+fn an_error_result_survives_a_nonzero_exit() {
+    let fake = FakeClaude::new();
+    let error = fake.ask(ERROR_RESULT).unwrap_err();
+    assert!(error.contains(LOGIN_ERROR), "{error}");
+    assert!(!error.contains("after its result"), "{error}");
+}
+
+#[test]
+fn startup_stderr_is_bounded_before_it_reaches_the_model() {
+    const ERROR_LIMIT: usize = 4096;
+    let fake = FakeClaude::new();
+    fake.write("probe_exit", "1");
+    fake.write("probe_stderr", &"é".repeat(ERROR_LIMIT * 4));
+    let error = fake.ask(ANSWERS).unwrap_err();
+    assert!(error.len() < ERROR_LIMIT * 2);
+    assert!(error.contains("truncated"));
 }
 
 fn log_out(fake: &FakeClaude) {
