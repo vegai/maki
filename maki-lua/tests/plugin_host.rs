@@ -40,7 +40,6 @@ use test_case::test_case;
 const BUILTIN_COMMANDS: &[&str] = &["/sessions", "/rename", "/tasks"];
 #[cfg(unix)]
 const JOB_THAT_COMPLETES: &str = "true";
-#[cfg(unix)]
 const JOB_THAT_WAITS: &str = "sleep 30";
 const NARGS_ERR: &str = r#"'nargs' must be 0, 1, "?", "*", or "+""#;
 const GLOBAL_PACK_ONLY_ERR: &str = "only available in the global init.lua";
