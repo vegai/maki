@@ -522,7 +522,12 @@ async fn drain(
     let mut timer = ReadDeadline::new(deadline);
     loop {
         let step = match timer.next(lines, Some(handoffs), deadline).await {
-            Next::Line(Some(Ok(line))) => turn.feed(&line).map(drop),
+            Next::Line(Some(Ok(line))) => if stopped {
+                turn.feed_stopping(&line)
+            } else {
+                turn.feed(&line)
+            }
+            .map(drop),
             Next::Line(Some(Err(source))) => Err(unreadable(source)),
             Next::Line(None) => return Ok(()),
             Next::Handoff(handoff) => turn.park(handoff).map(drop),
@@ -763,6 +768,7 @@ mod tests {
 
     #[test_case("graceful_batch", true ; "a_cooperative_leader")]
     #[test_case("ignores_term_batch", false ; "a_leader_that_ignores_sigterm")]
+    #[test_case("shutdown_error_batch", true ; "shutdown_reports_its_cancelled_call")]
     fn stopping_a_tool_reply_keeps_calls_parked_during_cleanup(scenario: &str, cleans: bool) {
         let fake = Fake::new(scenario);
         fs::write(fake.dir.path().join(TRACK_SESSIONS), "").unwrap();

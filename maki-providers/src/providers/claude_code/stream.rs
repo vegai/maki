@@ -81,6 +81,8 @@ const NO_SUCH_TOOL: &str = "<tool_use_error>Error: No such tool available:";
 /// How Claude Code rejects a call it never hands to maki.
 const REJECTIONS: [&str; 2] = [INPUT_REJECTED, NO_SUCH_TOOL];
 const SHOWN_LINE_CHARS: usize = 80;
+const SHOWN_TOOL_ERROR_CHARS: usize = 1024;
+const MCP_CLOSED: &str = "MCP server \"maki\" connection closed before the tool call was answered.";
 /// How many event kinds the trace keeps for a failed request's log.
 const TRACE_LEN: usize = 32;
 const UNNAMED_HOOK: &str = "startup";
@@ -343,7 +345,11 @@ impl StreamedText {
 }
 
 fn answered(message: &Value) -> String {
-    line_preview(&message_text(message))
+    let text = message_text(message);
+    match text.char_indices().nth(SHOWN_TOOL_ERROR_CHARS) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text,
+    }
 }
 
 fn message_text(message: &Value) -> String {
@@ -683,7 +689,43 @@ impl<'a> Turn<'a> {
     /// can add API events to `stream_event`, so an unknown API event is
     /// ignored until the reply is complete.
     pub fn feed(&mut self, line: &str) -> Result<Step, Error> {
+        self.feed_event(parse_event(line)?)
+    }
+
+    /// SIGTERM can turn held MCP calls into connection-closed results. They describe
+    /// cleanup of the completed handoff, and every other event still has to validate.
+    pub fn feed_stopping(&mut self, line: &str) -> Result<Step, Error> {
         let event = parse_event(line)?;
+        if self.closing_handoffs(&event) {
+            self.record_event(&event);
+            return Ok(Step::Nothing);
+        }
+        self.feed_event(event)
+    }
+
+    fn closing_handoffs(&self, event: &Value) -> bool {
+        event["type"] == USER_EVENT
+            && self.is_complete()
+            && self.stop_reason.as_deref() == Some(TOOL_USE_STOP)
+            && !self.parked.is_empty()
+            && event["message"]["content"]
+                .as_array()
+                .is_some_and(|blocks| {
+                    !blocks.is_empty()
+                        && blocks.iter().all(|block| {
+                            block["type"] == TOOL_RESULT
+                                && block["is_error"] == true
+                                && block["tool_use_id"]
+                                    .as_str()
+                                    .is_some_and(|id| self.calls().any(|(call, _, _)| call == id))
+                                && block["content"]
+                                    .as_str()
+                                    .is_some_and(|text| text.starts_with(MCP_CLOSED))
+                        })
+                })
+    }
+
+    fn feed_event(&mut self, event: Value) -> Result<Step, Error> {
         self.record_event(&event);
         let accepted = self.accepted();
         let kind = classify(&event, StreamMode::Provider, accepted)?;
@@ -1230,10 +1272,10 @@ mod tests {
     use super::{
         ACCOUNT_ANSWER, API_ERROR_MARK, BATCH_CALL_TOOL, BATCH_CALLS, BATCH_TOOL, EXTRA_USAGE,
         EXTRA_USAGE_IN_USE, EventKind, HOOKS_ANSWER, Handshake, INPUT_REJECTED, MAX_TOKENS_STOP,
-        MAX_TURNS_ERROR, NO_SUCH_TOOL, PLAN_REJECTED, RATE_LIMITED, REFUSAL_STOP, RESULT_EVENT,
-        SETTINGS_ANSWER, SHOWN_LINE_CHARS, SUCCESS, Step, StreamMode, StreamedText, TOOL_RESULT,
-        TOOL_USE_STOP, Turn, WINDOW_FULL_STOP, classify, result_failure, unexpose_batch, usage_of,
-        user_message,
+        MAX_TURNS_ERROR, MCP_CLOSED, NO_SUCH_TOOL, PLAN_REJECTED, RATE_LIMITED, REFUSAL_STOP,
+        RESULT_EVENT, SETTINGS_ANSWER, SHOWN_TOOL_ERROR_CHARS, SUCCESS, Step, StreamMode,
+        StreamedText, TOOL_RESULT, TOOL_USE_STOP, Turn, WINDOW_FULL_STOP, answered, classify,
+        result_failure, unexpose_batch, usage_of, user_message,
     };
     use crate::{ContentBlock, StopReason, StreamResponse};
 
@@ -1258,8 +1300,8 @@ mod tests {
     const REFUSAL_EXPLANATION: &str = "This request triggered restrictions on violative cyber content and was blocked under Anthropic's Usage Policy.";
     const CLASSIFIER_NOTE: &str = "Your response above was stopped by a safety classifier. Do not produce that content again, even reworded.";
     const UNASKED: &str = "unasked";
-    /// Longer than an error shows, so only its start appears.
     const ANSWERED: &str = "Claude Code sent the request again without a stream after the stream error, then gave the result of the tool call that it made";
+    const ERROR_CHARACTER: &str = "é";
     const FIRST_CALL: &str = "toolu_1";
     const SECOND_CALL: &str = "toolu_2";
     const EXPOSED: &str = "mcp__maki__read";
@@ -2230,7 +2272,76 @@ mod tests {
         run(&[start_as(model)], Vec::new(), false).0
     }
 
-    /// The error keeps the start of Claude Code's answer, which explains it.
+    fn handoff_turn(turn: &mut Turn<'_>, complete: bool, held: bool) {
+        for line in handshake() {
+            turn.feed(&line).unwrap();
+        }
+        turn.prompted();
+        turn.feed(&init()).unwrap();
+        let mut lines = batch();
+        if !complete {
+            lines.pop();
+        }
+        for line in lines {
+            turn.feed(&line).unwrap();
+        }
+        if held {
+            turn.park(parked(Some(FIRST_CALL), "a")).unwrap();
+        }
+    }
+
+    #[test_case(FIRST_CALL, MCP_CLOSED, true, true, true ; "held_call_after_stop")]
+    #[test_case(SECOND_CALL, MCP_CLOSED, true, true, true ; "another_proposed_call_after_stop")]
+    #[test_case(FIRST_CALL, MCP_CLOSED, true, false, false ; "closure_before_stop_is_an_error")]
+    #[test_case(UNASKED, MCP_CLOSED, true, true, false ; "unknown_call_stays_an_error")]
+    #[test_case(FIRST_CALL, MCP_CLOSED, false, true, false ; "successful_result_stays_an_error")]
+    #[test_case(FIRST_CALL, ANSWERED, true, true, false ; "other_errors_stay_errors")]
+    fn shutdown_closures_require_a_known_failed_call(
+        id: &str,
+        text: &str,
+        is_error: bool,
+        stopping: bool,
+        accepted: bool,
+    ) {
+        with_turn(|mut turn| {
+            handoff_turn(&mut turn, true, true);
+            let line = json!({ "type": "user", "message": { "content": [{
+                "type": TOOL_RESULT, "tool_use_id": id, "is_error": is_error, "content": text,
+            }] } })
+            .to_string();
+            let step = if stopping {
+                turn.feed_stopping(&line)
+            } else {
+                turn.feed(&line)
+            };
+            assert_eq!(matches!(step, Ok(Step::Nothing)), accepted, "{step:?}");
+            if accepted {
+                let response = turn.response().unwrap();
+                assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
+                assert_eq!(response.message.tool_uses().count(), 2);
+            } else {
+                assert!(matches!(step, Err(Error::AnsweredItself(_))), "{step:?}");
+            }
+        });
+    }
+
+    #[test_case(false, true ; "incomplete_reply")]
+    #[test_case(true, false ; "no_handoff")]
+    fn shutdown_closures_do_not_complete_an_unfinished_handoff(complete: bool, held: bool) {
+        with_turn(|mut turn| {
+            handoff_turn(&mut turn, complete, held);
+            let line = json!({ "type": "user", "message": { "content": [{
+                "type": TOOL_RESULT, "tool_use_id": FIRST_CALL, "is_error": true,
+                "content": MCP_CLOSED,
+            }] } })
+            .to_string();
+            assert!(matches!(
+                turn.feed_stopping(&line),
+                Err(Error::AnsweredItself(_))
+            ));
+        });
+    }
+
     #[test_case(json!([{ "type": "tool_result", "content": ANSWERED }]) ; "a_text_result")]
     #[test_case(json!([{ "type": "tool_result", "content": [{ "type": "text", "text": ANSWERED }] }]) ; "a_result_in_parts")]
     #[test_case(json!(ANSWERED) ; "plain_text")]
@@ -2238,11 +2349,22 @@ mod tests {
         let line = json!({ "type": "user", "message": { "content": content } }).to_string();
         let (step, _) = run(&[start(), line], Vec::new(), false);
 
-        let shown: String = ANSWERED.chars().take(SHOWN_LINE_CHARS).collect();
         assert!(
-            matches!(&step, Err(Error::AnsweredItself(text)) if *text == shown),
+            matches!(&step, Err(Error::AnsweredItself(text)) if text == ANSWERED),
             "{step:?}"
         );
+    }
+
+    #[test_case(0 ; "at_the_limit")]
+    #[test_case(1 ; "past_the_limit")]
+    fn oversized_tool_errors_mark_their_truncation(extra: usize) {
+        let text = ERROR_CHARACTER.repeat(SHOWN_TOOL_ERROR_CHARS + extra);
+        let shown = answered(&json!({ "content": text }));
+        let mut expected = ERROR_CHARACTER.repeat(SHOWN_TOOL_ERROR_CHARS);
+        if extra > 0 {
+            expected.push('…');
+        }
+        assert_eq!(shown, expected);
     }
 
     /// A block after the reply could add a call that Claude Code never hands

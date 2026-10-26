@@ -113,8 +113,11 @@ while IFS= read -r msg; do
 done
 if [ -z "$got" ]; then [ "$scenario" = probe_runs ] && init none; exit 0; fi
 case $scenario in
-  graceful_batch | ignores_term_batch)
+  graceful_batch | ignores_term_batch | shutdown_error_batch)
     [ "$scenario" = ignores_term_batch ] && trap '' TERM
+    if [ "$scenario" = shutdown_error_batch ]; then
+      trap 'line '\''{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":true,"content":"MCP server \"maki\" connection closed before the tool call was answered. The tool did not execute."}]}}'\''; exit 0' TERM
+    fi
     init none; connect; generation tool_use; dispatch a
     if IFS= read -r reply <&3; then printf '%s' "$reply" > "$dir/answered_call"; fi
     ;;
