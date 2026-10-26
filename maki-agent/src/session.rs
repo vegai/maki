@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use arc_swap::ArcSwap;
 use maki_providers::{ContextGauge, Message, TokenUsage};
-use maki_storage::frame::StoredFrame;
 use maki_storage::StateDir;
+use maki_storage::frame::StoredFrame;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::sessions::{
     SAVE_FAILED, Session, SessionClaim, SessionError, StoredMode, StoredThinking,
@@ -229,7 +229,11 @@ impl SessionTurn<'_> {
 
     pub fn record_error(&mut self, message: String) {
         self.track.history.mark_unsaved();
-        let mut store = self.track.store.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut store = self
+            .track
+            .store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         store.session.set_history(&self.track.history.snapshot());
         store.session.record_error(message);
     }
@@ -260,7 +264,11 @@ impl Drop for SessionTurn<'_> {
             store,
         } = &mut *self.track;
         let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
-        store.session.token_usage += self.ledger.totals().usage;
+        let usage = self.ledger.totals().usage;
+        store.session.token_usage += usage;
+        if usage != TokenUsage::default() {
+            history.mark_unsaved();
+        }
         if history.has_unsaved() {
             match store.record_turn(&history.snapshot(), gauge.size()) {
                 Ok(()) => history.mark_saved(),
@@ -284,7 +292,10 @@ impl SessionCheckpoint {
         smol::unblock(move || {
             let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
             match store.record_turn(&snapshot, context_size) {
-                Ok(()) => true,
+                Ok(()) => {
+                    store.publish_header(true);
+                    true
+                }
                 Err(error) => {
                     warn!(%error, session_id = %store.session.id, "failed to checkpoint session");
                     eprintln!("{SAVE_FAILED}{}: {error}", store.session.id);
@@ -761,12 +772,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let id = MakiId::generate();
         let claim = SessionClaim::acquire(id, &state_dir(&tmp)).expect("nothing else holds it");
-        let mut track = SessionTrack::open(
-            Resumed::empty(SessionRef::from(id)),
-            claim,
-            state_dir(&tmp),
-            CWD,
-        );
+        let mut track = SessionTrack::open(Resumed::empty(SessionRef::from(id)), claim, CWD);
 
         let opened = live_header(id).expect("an open track publishes its header");
         assert_eq!(opened.cwd, CWD);
@@ -793,17 +799,13 @@ mod tests {
     /// A headless driver keeps no other record of its settings or its spend,
     /// so the turn has to put them on the session, where `read`, `export` and
     /// the next resume look.
-    #[test]
-    fn each_turn_records_its_settings_and_adds_its_usage() {
+    #[test_case(false ; "persist_on_drop")]
+    #[test_case(true ; "persist_after_checkpoint")]
+    fn each_turn_records_its_settings_and_adds_its_usage(checkpoint: bool) {
         let tmp = TempDir::new().unwrap();
         let id = MakiId::generate();
         let claim = SessionClaim::acquire(id, &state_dir(&tmp)).expect("nothing else holds it");
-        let mut track = SessionTrack::open(
-            Resumed::empty(SessionRef::from(id)),
-            claim,
-            state_dir(&tmp),
-            CWD,
-        );
+        let mut track = SessionTrack::open(Resumed::empty(SessionRef::from(id)), claim, CWD);
         let usage = TokenUsage {
             input: TURN_INPUT_TOKENS,
             ..Default::default()
@@ -811,9 +813,11 @@ mod tests {
         for _ in 0..TURNS {
             let mut turn = track.turn(MODEL_SPEC.into(), &input(AgentMode::Plan(PLAN_PATH.into())));
             turn.ledger().add(usage, None, None);
-            run_params(&mut turn)
-                .history
-                .push(Message::user(PROMPT.into()));
+            let params = run_params(&mut turn);
+            params.history.push(Message::user(PROMPT.into()));
+            if checkpoint {
+                smol::block_on(params.history.checkpoint(CONTEXT_SIZE));
+            }
         }
 
         let header = live_header(id).unwrap();

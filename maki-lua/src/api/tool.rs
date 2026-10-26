@@ -15,8 +15,8 @@ use maki_agent::tools::registry::{RegisteredTool, ToolRegistry};
 use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
 use maki_agent::tools::{
     BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
-    PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation,
-    ToolReach, is_tool_enabled, timeout_annotation,
+    PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolInvocation, ToolReach,
+    is_tool_enabled, timeout_annotation,
 };
 use maki_agent::{
     AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, SharedBuf, TextOutput, ToolOutput,

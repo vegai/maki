@@ -367,6 +367,9 @@ fn overlay_declared_tiers(def: &ProviderDef, models: &mut [ModelInfo]) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use crate::provider::RequestScope;
     use maki_storage::sessions::Effort::High;
     use test_case::test_case;
 
@@ -520,6 +523,7 @@ mod tests {
         assert_eq!(model.thinking_fields.is_some(), kept);
     }
 
+    const CWD: &str = "/test";
     const GATEWAY_SLUG: &str = "litellm";
     const GATEWAY_MODEL: &str = "gpt-5.6-terra";
     const PROMPT: &str = "hi";
@@ -574,7 +578,10 @@ mod tests {
                 &json!([]),
                 &tx,
                 RequestOptions::default(),
-                None,
+                RequestScope {
+                    session_id: None,
+                    cwd: Path::new(CWD),
+                },
             ))
         }
 

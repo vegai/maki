@@ -51,7 +51,7 @@ use crate::providers::anthropic::shared::{
 };
 use crate::providers::{Timeouts, anthropic, catalog};
 use crate::spec::{
-    AuthDoc, Build, CatalogDoc, GeneratedDocs, NO_CURATED_MODELS, Native, ProviderSpec,
+    AuthDoc, Build, CatalogDoc, GeneratedDocs, NO_CURATED_MODELS, Native, ProviderSpec, api_decides,
 };
 use crate::types::requires_adaptive;
 use crate::{
@@ -66,6 +66,7 @@ use validation::{
 };
 
 const CLAUDE_CODE: EffortDialect = EffortDialect {
+    name: None,
     supported: &[
         Effort::Low,
         Effort::Medium,
@@ -131,6 +132,8 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     family: ModelFamily::Claude,
     supports_thinking: true,
     supports_deferred_tools: false,
+    adaptive_effort: api_decides,
+    thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: false,
     fallback_max_output: None,
     fallback_context_window: 200_000,

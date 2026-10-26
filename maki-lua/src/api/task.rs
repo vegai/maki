@@ -31,7 +31,7 @@ async fn roundtrip(
 /// `plugin` field.
 ///
 /// @return (table|nil, string|nil) Array of `{id, session, name, focused, status?, plugin?}`
-///   where `status` is `"working"`, `"idle"` (a plugin task between prompts),
+///   where `status` is `"queued"`, `"working"`, `"idle"` (a plugin task between prompts),
 ///   `"done"`, or `"error"`, and `session` is the chat session that `stop()`
 ///   asks for. Or nil and an error.
 /// @example

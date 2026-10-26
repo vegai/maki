@@ -9,6 +9,7 @@
 
 local STRUCTURED_OUTPUT_NAME = "structured_output"
 local STRUCTURED_OUTPUT_DESCRIPTION = "Report your final result. Call it exactly once when your task is complete."
+local STRUCTURED_DUPLICATE_ERROR = "structured output was already recorded; the first valid result is retained"
 local STRUCTURED_OUTPUT_ACK = "Output recorded."
 local STRUCTURED_OUTPUT_PROMPT_SUFFIX = "\n\nWhen finished, call the structured_output tool with your final result."
 local MAX_NUDGES = 2
@@ -156,6 +157,9 @@ function Runner.prepare(input, ctx)
         description = STRUCTURED_OUTPUT_DESCRIPTION,
         input_schema = output_schema,
         handler = function(value)
+          if capture.value then
+            return nil, STRUCTURED_DUPLICATE_ERROR
+          end
           local errs = validator:validate(value)
           if errs then
             capture.last_errors = bounded_errors(errs)

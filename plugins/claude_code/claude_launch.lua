@@ -198,7 +198,7 @@ function M.home_credentials(home, extra, environ)
     deny(path)
   end
   local env = environ or {}
-  local function relocated(path)
+  local function relocated(path: string?)
     if path and path ~= "" then
       if path:sub(1, 1) ~= "/" then
         path = maki.fs.joinpath(cwd, path)

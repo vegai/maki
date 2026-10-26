@@ -15,7 +15,6 @@ use crate::spec::{
 };
 use crate::types::ThinkingFallback;
 use crate::{AgentError, Effort, Message, ProviderEvent, RequestOptions, StreamResponse};
-use maki_storage::id::SessionRef;
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{ResolvedAuth, Timeouts, endpoint, google, plugin};

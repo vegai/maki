@@ -70,7 +70,7 @@ function Run.new(ctx, call, spec, timeout_secs, opts)
     call = call,
     spec = spec,
     timeout_secs = timeout_secs,
-    route = CHECKING:format(spec.cli.version),
+    route = CHECKING:format(spec.cli.version :: string),
     handshake = launch.worker_handshake(spec),
     stderr_tail = {},
     has_progress = false,
@@ -209,7 +209,7 @@ function Run:on_line(line)
   elseif step.init then
     self.clock:stop()
     local subscription = " (" .. self.handshake:subscription_type() .. ")"
-    self.route = ROUTE_OK:format(subscription, self.spec.cli.version)
+    self.route = ROUTE_OK:format(subscription, self.spec.cli.version :: string)
     self.view:set_header(dim_lines(self:header_lines()))
   elseif step.lines then
     if not self.has_progress then
@@ -262,7 +262,7 @@ function Run:on_cancel(reason)
   local reply = partial.cut(self.view, answer, reason, self.timeout_secs)
   reply.llm_output = self:with_spent(reply.llm_output, true)
   if self.artifact and self.prompted then
-    reply.llm_output = reply.llm_output .. "\n" .. ABANDONED:format(self.artifact.snapshot)
+    reply.llm_output = reply.llm_output .. "\n" .. ABANDONED:format(self.artifact.snapshot :: string)
   end
   reply.state = { header = lines }
   self.ctx:finish(reply)

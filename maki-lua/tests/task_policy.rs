@@ -2,7 +2,6 @@
 //! Scripted providers exercise subagent dispatch, and Lua stubs isolate retry
 //! and cleanup policy.
 
-use maki_providers::provider::ModelListing;
 use std::sync::{Arc, Mutex};
 
 use futures_lite::future::poll_once;
@@ -11,7 +10,7 @@ use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{CallOrigin, ToolContext, ToolFilter, ToolRegistry};
 use maki_agent::{AgentMode, CancelToken, ToolOutput};
 use maki_lua::{PluginHost, SessionEndReason};
-use maki_providers::provider::{BoxFuture, Provider, RequestScope};
+use maki_providers::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use maki_providers::{
     AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
     StopReason, StreamResponse, TokenUsage,
@@ -981,9 +980,10 @@ impl Provider for StructuredOutputProvider {
 fn structured_task_respects_local_tool_policy(allow_list: bool, denied: bool) {
     let registry = Arc::clone(ToolRegistry::global_arc());
     let host = PluginHost::new(Arc::clone(&registry)).unwrap();
-    host.load_source(
-        "task_policy",
+    host.load_bundled_source(
+        TASK_TOOL,
         &format!("{INHERIT_MODEL}\n{TASK_PLUGIN_SRC}"),
+        serde_json::Map::new(),
     )
     .unwrap();
     let provider = Arc::new(StructuredOutputProvider::default());

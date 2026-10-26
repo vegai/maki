@@ -219,7 +219,9 @@ pub(crate) fn transcript(messages: &[Message]) -> Result<Vec<String>, Error> {
                     });
                 }
                 ContentBlock::Image { .. } => return Err(Error::Image),
-                ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {}
+                ContentBlock::Thinking { .. }
+                | ContentBlock::RedactedThinking { .. }
+                | ContentBlock::Unknown(_) => {}
             }
         }
         for result in &results {
@@ -267,6 +269,24 @@ mod tests {
         expose_input, fits, server_name, transcript,
     };
     use crate::{ContentBlock, ImageMediaType, ImageSource, Message, Role};
+
+    const UNKNOWN_CONTENT_BLOCK: &str = r#"{"type":"future_block"}"#;
+
+    #[test_case(0 ; "user_message")]
+    #[test_case(1 ; "assistant_message")]
+    fn unknown_blocks_leave_known_transcript_content_unchanged(message_index: usize) {
+        let mut messages = history();
+        let expected = transcript(&messages).unwrap();
+        messages[message_index]
+            .content
+            .push(serde_json::from_str(UNKNOWN_CONTENT_BLOCK).unwrap());
+
+        assert_eq!(transcript(&messages).unwrap(), expected);
+        assert!(matches!(
+            messages[message_index].content.last(),
+            Some(ContentBlock::Unknown(_))
+        ));
+    }
 
     #[test_case(json!("malformed") ; "string")]
     #[test_case(json!([]) ; "array")]

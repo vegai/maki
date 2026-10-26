@@ -21,7 +21,7 @@ use mlua::{
 use serde_json::Value;
 
 use crate::api::fs::{LOCK_BUSY, path_text};
-use crate::api::util::convert::json_to_lua;
+use crate::api::util::convert::{TableExt, json_to_lua};
 use crate::api::util::pair::{Pair, pair, try_pair};
 use crate::plugin_permissions::PluginPermissions;
 
@@ -405,12 +405,12 @@ async fn checkout_file(_lua: Lua, path: String) -> LuaResult<Pair<bool>> {
 /// @return (table?, string?) Event and normalized usage, or nil and the protocol error.
 #[lua_fn]
 fn classify(lua: &Lua, line: String, mode: Table) -> LuaResult<Pair<Table>> {
-    let model: Option<String> = mode.get("model")?;
+    let model: Option<String> = mode.opt("model")?;
     let mut classified = try_pair!(validation::classify(
         &line,
-        mode.get::<Option<bool>>("accepted")?.unwrap_or(false),
+        mode.opt::<bool>("accepted")?.unwrap_or(false),
         model.as_deref(),
-        mode.get::<Option<bool>>("model_checked")?.unwrap_or(false),
+        mode.opt::<bool>("model_checked")?.unwrap_or(false),
     ));
     let event = &classified.event;
     if classified.problem.is_none()
@@ -477,7 +477,8 @@ lua_table! {
     ]
 }
 
-#[cfg(all(test, unix))]
+#[cfg(unix)]
+#[cfg(test)]
 mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;

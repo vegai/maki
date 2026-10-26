@@ -525,7 +525,7 @@ impl CompatProvider {
                 .do_stream(model, headers, &body, event_tx, auth)
                 .await;
         }
-        let gateway = (self.compat.base_url(auth), model.id.clone());
+        let gateway = (self.compat.base_url(auth).to_owned(), model.id.clone());
         let refused_before = THINKING_REJECTED
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

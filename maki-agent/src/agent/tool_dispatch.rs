@@ -178,7 +178,17 @@ pub async fn run(
     let started = Instant::now();
     let mut done = match resolved.route {
         Some(route) if allowed => {
-            run_inner(name, route, id, &input, ctx, origin, ask.as_deref(), hook.as_ref()).await
+            run_inner(
+                name,
+                route,
+                id,
+                &input,
+                ctx,
+                origin,
+                ask.as_deref(),
+                hook.as_ref(),
+            )
+            .await
         }
         route => unavailable(ctx, name, id, route.is_none()),
     };
@@ -598,6 +608,7 @@ fn identifier_alias(name: &str) -> Option<String> {
 /// MCP tools raise it at their own gate, so the prompt names the scopes their
 /// rules would have judged. Local tools and tool search have no gate, so they
 /// get one here.
+#[allow(clippy::too_many_arguments)]
 async fn run_inner(
     name: &str,
     route: Route<'_>,

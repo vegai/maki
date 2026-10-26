@@ -134,7 +134,7 @@ mod tests {
     use maki_agent::tools::ToolRegistry;
     use maki_lua::PluginHost;
     use maki_providers::provider::{BoxFuture, ModelListing};
-    use maki_providers::{AgentError, ContentBlock, ModelInfo, StreamResponse};
+    use maki_providers::{AgentError, ContentBlock, ModelInfo, StreamResponse, TokenUsage};
     use maki_storage::frame::{PromptFacts, StoredFrame};
     use smol::Timer;
     use std::future;
@@ -165,8 +165,11 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<ModelListing, AgentError>> {
-            Box::pin(async { Ok(ModelListing::complete(Vec::new())) })
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
         }
     }
 

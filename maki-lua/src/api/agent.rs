@@ -1720,12 +1720,11 @@ mod tests {
     use maki_agent::tools::test_support::stub_ctx_with;
     use maki_agent::{DoneReason, TurnCompleteEvent};
     use maki_providers::model::ThinkingSupport;
-    use maki_providers::provider::{BoxFuture, Provider};
+    use maki_providers::provider::{BoxFuture, ModelListing, Provider, RequestScope};
     use maki_providers::{
         AgentError, ContentBlock, Message, ModelInfo, ProviderEvent, Role, StopReason,
         StreamResponse, TokenUsage,
     };
-    use maki_storage::id::SessionRef;
     use maki_storage::sessions::Effort;
     use mlua::AnyUserData;
     use serde_json::json;
@@ -1787,7 +1786,7 @@ mod tests {
             _tools: &'a JsonValue,
             events: &'a flume::Sender<ProviderEvent>,
             _opts: RequestOptions,
-            _session_id: Option<&'a SessionRef>,
+            _scope: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 events
@@ -1800,7 +1799,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
     }
@@ -1946,7 +1948,7 @@ mod tests {
             _: &'a JsonValue,
             _: &'a Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 self.0.send(system.to_owned()).unwrap();
@@ -1964,7 +1966,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
     }

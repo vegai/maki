@@ -140,8 +140,9 @@ fn jobstart(
 ) -> LuaResult<Pair<u32>> {
     let scope = opts
         .as_ref()
-        .map(|opts| opts.get::<Value>("scope"))
+        .map(|opts| opts.opt::<Value>("scope"))
         .transpose()?
+        .flatten()
         .unwrap_or(Value::Nil);
     let mut spec = JobSpec::new(parse_scope(lua, &plugin, scope)?, parse_command(cmd)?);
     let mut tail = None;
@@ -149,12 +150,10 @@ fn jobstart(
     if let Some(ref opts) = opts {
         spec.cwd = opts.opt("cwd")?;
         spec.env = opts.opt::<HashMap<String, String>>("env")?;
-        spec.clear_env = opts.get::<Option<bool>>("clear_env")?.unwrap_or(false);
-        spec.guard = opts.get::<Option<bool>>("guard")?.unwrap_or(false);
-        spec.timeout = opts
-            .get::<Option<u64>>("timeout_ms")?
-            .map(Duration::from_millis);
-        spec.pipe_stdin = match opts.get::<Option<String>>("stdin")?.as_deref() {
+        spec.clear_env = opts.opt::<bool>("clear_env")?.unwrap_or(false);
+        spec.guard = opts.opt::<bool>("guard")?.unwrap_or(false);
+        spec.timeout = opts.opt::<u64>("timeout_ms")?.map(Duration::from_millis);
+        spec.pipe_stdin = match opts.opt::<String>("stdin")?.as_deref() {
             None | Some(STDIN_NULL) => false,
             Some(STDIN_PIPE) => true,
             Some(_) => return Err(mlua::Error::runtime(STDIN_MODE_ERR)),
@@ -210,10 +209,9 @@ fn parse_redirect(
     has_callback: bool,
     fs_write: bool,
 ) -> LuaResult<Redirect> {
-    let value = opts.get::<Value>(key)?;
-    if value.is_nil() {
+    let Some(value) = opts.opt::<Value>(key)? else {
         return Ok(Redirect::Capture);
-    }
+    };
     if has_callback {
         return Err(mlua::Error::runtime(format!(
             "jobstart: {key} and on_{key} are mutually exclusive; tail the file from a second job to get both"
@@ -234,7 +232,7 @@ fn parse_redirect(
 }
 
 fn callback_key(lua: &Lua, opts: &Table, key: &str) -> LuaResult<Option<RegistryKey>> {
-    opts.get::<Option<Function>>(key)?
+    opts.opt::<Function>(key)?
         .map(|f| lua.create_registry_value(f))
         .transpose()
 }

@@ -597,6 +597,7 @@ mod tests {
                 AgentConfig::default(),
                 Vec::new(),
                 None,
+                LocalTools::default(),
             )
         };
         let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();

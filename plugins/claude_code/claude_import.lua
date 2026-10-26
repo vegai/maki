@@ -98,7 +98,7 @@ end
 --- because the sweep goes by its date and the approval can outlast the
 --- artifact's time limit.
 local function open_import(spec)
-  local dir = maki.fs.joinpath(spec.root, spec.id)
+  local dir = maki.fs.joinpath(spec.root, spec.id :: string)
   local manifest_path = maki.fs.joinpath(dir, path_utils.MANIFEST)
   local text = maki.fs.read(manifest_path)
   local manifest = text and maki.json.decode(text)
@@ -391,7 +391,7 @@ function M.import(ctx, call, spec)
   if type(spec.id) ~= "string" or not spec.id:match(path_utils.ARTIFACT_ID) then
     return nil, "an artifact id contains only the characters A to Z, a to z and 0 to 9"
   end
-  local dir = maki.fs.joinpath(spec.root, spec.id)
+  local dir = maki.fs.joinpath(spec.root, spec.id :: string)
   local missing = missing_artifact(spec.id)
   if not maki.fs.metadata(dir) then
     return nil, missing
