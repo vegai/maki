@@ -946,15 +946,15 @@ impl<'a> Turn<'a> {
         if let Some(refusal) = self.refusal.take() {
             return Err(self.refused(refusal, status_of(&event["api_error_status"])));
         }
-        // The one-turn cap stops Claude Code after a rejected tool call. Maki already
-        // owns the complete reply and must return that call through its own dispatch.
-        let rejected_at_limit = event["subtype"] == MAX_TURNS_ERROR
-            && self.rejected
+        // The one-turn cap can finish a rejected or held call. Maki owns the complete
+        // reply and returns its calls through its own dispatch.
+        let tool_reply_at_limit = event["subtype"] == MAX_TURNS_ERROR
+            && (self.rejected || !self.parked.is_empty())
             && self.is_complete()
             && self.stop_reason.as_deref() == Some(TOOL_USE_STOP)
             && self.lost.is_none()
             && event["api_error_status"].is_null();
-        if failed_result(event) && !rejected_at_limit {
+        if failed_result(event) && !tool_reply_at_limit {
             if let Some(status) = status_of(&event["api_error_status"]) {
                 return Err(self.refused(
                     Refusal {
@@ -1777,13 +1777,16 @@ mod tests {
         assert_eq!(response.message.tool_uses().count(), 1);
     }
 
-    #[test_case(false, true, None ; "without_a_tool_rejection")]
-    #[test_case(true, false, None ; "before_the_reply_is_complete")]
-    #[test_case(true, true, Some(TOO_MANY) ; "with_an_api_error")]
+    #[test_case(false, true, None, false ; "without_a_tool_rejection_or_handoff")]
+    #[test_case(true, false, None, false ; "before_the_rejected_reply_is_complete")]
+    #[test_case(true, true, Some(TOO_MANY), false ; "with_an_api_error")]
+    #[test_case(false, false, None, true ; "before_the_held_reply_is_complete")]
+    #[test_case(false, true, Some(TOO_MANY), true ; "an_api_error_after_handoff")]
     fn a_turn_limit_preserves_unresolved_failures(
         rejected_call: bool,
         complete: bool,
         status: Option<u16>,
+        held: bool,
     ) {
         let mut lines = reply(&[call(FIRST_CALL, "a")], TOOL_USE_STOP);
         if !complete {
@@ -1793,7 +1796,8 @@ mod tests {
             lines.push(rejected(FIRST_CALL));
         }
         lines.push(json!({ "type": RESULT_EVENT, "subtype": MAX_TURNS_ERROR, "is_error": true, "api_error_status": status }).to_string());
-        let (step, response) = run(&lines, Vec::new(), false);
+        let handoffs = held.then(|| parked(Some(FIRST_CALL), "a"));
+        let (step, response) = run(&lines, handoffs.into_iter().collect(), true);
         assert!(response.is_none());
         match status {
             Some(expected) => assert!(
@@ -1807,17 +1811,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_rejected_call_at_the_turn_limit_still_needs_final_usage() {
+    #[test_case(false ; "schema_rejection")]
+    #[test_case(true ; "held_call")]
+    fn a_call_at_the_turn_limit_still_needs_final_usage(held: bool) {
         let mut lines = vec![start()];
         lines.extend(streamed(call(FIRST_CALL, "a")));
-        lines.push(rejected(FIRST_CALL));
+        if !held {
+            lines.push(rejected(FIRST_CALL));
+        }
         lines.push(stream(
             json!({ "type": "message_delta", "delta": { "stop_reason": TOOL_USE_STOP } }),
         ));
         lines.push(stream(json!({ "type": "message_stop" })));
         lines.push(max_turns_result());
-        let (step, response) = run(&lines, Vec::new(), false);
+        let handoffs = held.then(|| parked(Some(FIRST_CALL), "a"));
+        let (step, response) = run(&lines, handoffs.into_iter().collect(), true);
         assert!(matches!(step, Ok(Step::Done)), "{step:?}");
         assert!(matches!(response, Some(Err(Error::NoFinalOutput))));
     }
@@ -2288,6 +2296,24 @@ mod tests {
         if held {
             turn.park(parked(Some(FIRST_CALL), "a")).unwrap();
         }
+    }
+
+    #[test_case(false ; "before_shutdown")]
+    #[test_case(true ; "during_shutdown")]
+    fn a_completed_handoff_survives_the_turn_limit(stopping: bool) {
+        with_turn(|mut turn| {
+            handoff_turn(&mut turn, true, true);
+            let result = max_turns_result();
+            let step = if stopping {
+                turn.feed_stopping(&result)
+            } else {
+                turn.feed(&result)
+            };
+            assert!(matches!(step, Ok(Step::Done)), "{step:?}");
+            let response = turn.response().unwrap();
+            assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
+            assert_eq!(response.message.tool_uses().count(), 2);
+        });
     }
 
     #[test_case(FIRST_CALL, MCP_CLOSED, true, true, true ; "held_call_after_stop")]

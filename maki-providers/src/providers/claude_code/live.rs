@@ -19,6 +19,7 @@ use test_case::test_case;
 use super::checks::launch_env;
 use super::error::Error;
 use super::run::{Exchange, Launch, Limits, Request, Thinking, models, request};
+use super::transcript::{BATCH_CALL_TOOL, BATCH_CALLS, BATCH_TOOL};
 use super::{SLUG, agent_error, utf8_vars};
 use crate::model::Model;
 use crate::process::find_program;
@@ -347,6 +348,74 @@ fn live_tool_calls_round_trip_through_maki() {
             text.contains(meaning),
             "the reply must use the results of maki: {text}"
         );
+    }
+}
+
+#[test_case(MODEL => ignore["runs the claude CLI on the subscription of the caller"] ; "haiku_batch")]
+#[test_case(ALWAYS_THINKING_MODEL => ignore["runs the claude CLI on the subscription of the caller"] ; "opus_batch")]
+fn live_batch_calls_round_trip_through_maki(model: &str) {
+    let live = Live::new();
+    let mut tools = lookup_tool();
+    tools.as_array_mut().unwrap().push(json!({
+        "name": BATCH_TOOL,
+        "description": "Run several tool calls in parallel and return their results.",
+        "input_schema": {
+            "type": "object",
+            "properties": { "tool_calls": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "tool": { "type": "string" },
+                        "input": {
+                            "type": "object",
+                            "properties": { "word": { "type": "string" } },
+                            "required": ["word"],
+                        },
+                    },
+                    "required": ["tool", "input"],
+                },
+            } },
+            "required": ["tool_calls"],
+        },
+    }));
+    let ask = |messages: &[Message]| {
+        live.ask(model, messages, &tools, None, Thinking::Default)
+            .unwrap()
+    };
+    let mut messages = vec![Message::user(format!(
+        "Make exactly one {BATCH_TOOL} call containing two {TOOL} calls, for {WORD} and \
+         {OTHER_WORD}. After receiving the batch result, repeat both results without a change."
+    ))];
+    let reply = ask(&messages);
+    assert_eq!(reply.stop_reason, Some(StopReason::ToolUse));
+    let calls: Vec<_> = reply.message.tool_uses().collect();
+    assert_eq!(calls.len(), 1);
+    let (id, name, input) = calls[0];
+    assert_eq!(name, BATCH_TOOL);
+    let nested = input[BATCH_CALLS].as_array().unwrap();
+    assert_eq!(nested.len(), 2);
+    let words: HashSet<_> = nested
+        .iter()
+        .map(|call| {
+            assert_eq!(call[BATCH_CALL_TOOL], TOOL);
+            call["input"]["word"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(words, HashSet::from([WORD, OTHER_WORD]));
+    let result = Message {
+        role: Role::User,
+        content: vec![ContentBlock::tool_result(
+            id,
+            format!("{WORD}: {MEANING}\n{OTHER_WORD}: {OTHER_MEANING}"),
+            false,
+        )],
+        ..Default::default()
+    };
+    messages.extend([reply.message, result]);
+    let text = answer(&ask(&messages));
+    for meaning in [MEANING, OTHER_MEANING] {
+        assert!(text.contains(meaning), "batch result missing from {text}");
     }
 }
 
