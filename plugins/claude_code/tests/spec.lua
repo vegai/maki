@@ -1183,19 +1183,6 @@ end
 
 -- ── claude_workspace ──
 
--- `S` means setuid without the execute bit.
-for _, c in ipairs({
-  { mode = "-rwxr-xr-x", want = true },
-  { mode = "-rwsr-xr-x", want = true },
-  { mode = "-rw-r--r--", want = false },
-  { mode = "-rwSr--r--", want = false },
-  { mode = "-rw-r-xr-x", want = false },
-}) do
-  case("owner_executes_" .. c.mode, function()
-    eq(path_utils.owner_executes(c.mode), c.want)
-  end)
-end
-
 case("a_snapshot_leaves_out_credentials_and_claude_config", function()
   local specs = table.concat(git_utils.excluded_pathspecs("config/prod.yml"), "|")
   for _, excluded in ipairs({ ".env*", "**/.env*", "secrets/**", "config/prod.yml" }) do

@@ -113,11 +113,15 @@ while IFS= read -r msg; do
 done
 if [ -z "$got" ]; then [ "$scenario" = probe_runs ] && init none; exit 0; fi
 case $scenario in
-  graceful_batch | ignores_term_batch | shutdown_error_batch)
+  graceful_batch | ignores_term_batch | shutdown_error_batch | shutdown_not_run_batch)
     [ "$scenario" = ignores_term_batch ] && trap '' TERM
-    if [ "$scenario" = shutdown_error_batch ]; then
+    if [ "$scenario" = shutdown_error_batch ] || [ "$scenario" = shutdown_not_run_batch ]; then
       close_batch() {
-        line '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":true,"content":"MCP server \"maki\" connection closed before the tool call was answered. The tool did not execute."}]}}'
+        if [ "$scenario" = shutdown_not_run_batch ]; then
+          line '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":true,"content":"MCP server \"maki\" connection closed before the tool call ran"}]}}'
+        else
+          line '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":true,"content":"MCP server \"maki\" connection closed before the tool call was answered."}]}}'
+        fi
         line '{"type":"result","subtype":"error_max_turns","is_error":true,"errors":["Reached maximum number of turns (1)"]}'
         exit 0
       }

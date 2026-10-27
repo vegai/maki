@@ -247,9 +247,9 @@ impl Provider for Xai {
 
     fn list_models(
         &self,
-        _listing: ModelListing,
+        listing: ModelListing,
     ) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
-        Box::pin(async {
+        Box::pin(async move {
             self.refresh_if_stale().await?;
             if self.is_oauth() {
                 return self
@@ -258,7 +258,10 @@ impl Provider for Xai {
                         let access = bearer_token(&auth).ok_or_else(|| AgentError::Config {
                             message: "xAI OAuth token missing from resolved auth".into(),
                         })?;
-                        smol::unblock(move || catalog::list_models(&access, false)).await
+                        smol::unblock(move || {
+                            catalog::list_models(&access, listing == ModelListing::Refresh)
+                        })
+                        .await
                     })
                     .await;
             }

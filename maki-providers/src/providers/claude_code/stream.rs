@@ -9,11 +9,13 @@ use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{Deserializer, Value, json};
 use tracing::debug;
 
 use super::checks::{self, ACCOUNT_ANSWER, HANDSHAKE, HOOKS_ANSWER, InitExpect, SETTINGS_ANSWER};
-use super::error::{Error, Problem, RATE_LIMITED, TOO_MANY_REQUESTS, UNKNOWN_ERROR, shown};
+use super::error::{
+    Error, Problem, RATE_LIMITED, TOO_MANY_REQUESTS, UNKNOWN_ERROR, preview, shown,
+};
 use super::mcp::Handoff;
 use super::transcript::{BATCH_CALL_TOOL, BATCH_CALLS, BATCH_TOOL, Catalog, SERVER, USER_ROLE};
 use crate::model::is_same_model;
@@ -26,6 +28,10 @@ use crate::{
 pub(crate) const INITIALIZE: &str = "initialize";
 pub(crate) const CONTROL_RESPONSE: &str = "control_response";
 pub(crate) const SUCCESS: &str = "success";
+pub(super) const INPUT_TOKENS: &str = "input_tokens";
+pub(super) const OUTPUT_TOKENS: &str = "output_tokens";
+pub(super) const CACHE_READ_INPUT_TOKENS: &str = "cache_read_input_tokens";
+pub(super) const CACHE_CREATION_INPUT_TOKENS: &str = "cache_creation_input_tokens";
 const SYSTEM_EVENT: &str = "system";
 pub(super) const ASSISTANT_EVENT: &str = "assistant";
 const USER_EVENT: &str = "user";
@@ -82,7 +88,8 @@ const NO_SUCH_TOOL: &str = "<tool_use_error>Error: No such tool available:";
 const REJECTIONS: [&str; 2] = [INPUT_REJECTED, NO_SUCH_TOOL];
 const SHOWN_LINE_CHARS: usize = 80;
 const SHOWN_TOOL_ERROR_CHARS: usize = 1024;
-const MCP_CLOSED: &str = "MCP server \"maki\" connection closed before the tool call was answered.";
+const MCP_CLOSED: &str = "MCP server \"maki\" connection closed before the tool call";
+const INVOKE_END: &str = "</invoke>";
 /// How many event kinds the trace keeps for a failed request's log.
 const TRACE_LEN: usize = 32;
 const UNNAMED_HOOK: &str = "startup";
@@ -345,11 +352,7 @@ impl StreamedText {
 }
 
 fn answered(message: &Value) -> String {
-    let text = message_text(message);
-    match text.char_indices().nth(SHOWN_TOOL_ERROR_CHARS) {
-        Some((cut, _)) => format!("{}…", &text[..cut]),
-        None => text,
-    }
+    preview(&message_text(message), SHOWN_TOOL_ERROR_CHARS)
 }
 
 fn message_text(message: &Value) -> String {
@@ -541,7 +544,7 @@ impl Handshake {
 }
 
 fn line_preview(line: &str) -> String {
-    line.chars().take(SHOWN_LINE_CHARS).collect()
+    preview(line, SHOWN_LINE_CHARS)
 }
 
 fn text_field(value: &Value, key: &str) -> String {
@@ -612,7 +615,11 @@ impl<'a> Turn<'a> {
 
     /// Only a held call is missing.
     fn awaits_handoff(&self) -> bool {
-        self.is_complete() && self.calls_tools() && self.parked.is_empty() && !self.rejected
+        self.is_complete() && self.calls_tools() && !self.handed_over()
+    }
+
+    fn handed_over(&self) -> bool {
+        self.rejected || !self.parked.is_empty()
     }
 
     pub fn calls_tools(&self) -> bool {
@@ -707,22 +714,8 @@ impl<'a> Turn<'a> {
         event["type"] == USER_EVENT
             && self.is_complete()
             && self.stop_reason.as_deref() == Some(TOOL_USE_STOP)
-            && !self.parked.is_empty()
-            && event["message"]["content"]
-                .as_array()
-                .is_some_and(|blocks| {
-                    !blocks.is_empty()
-                        && blocks.iter().all(|block| {
-                            block["type"] == TOOL_RESULT
-                                && block["is_error"] == true
-                                && block["tool_use_id"]
-                                    .as_str()
-                                    .is_some_and(|id| self.calls().any(|(call, _, _)| call == id))
-                                && block["content"]
-                                    .as_str()
-                                    .is_some_and(|text| text.starts_with(MCP_CLOSED))
-                        })
-                })
+            && self.handed_over()
+            && self.answers_calls(&event["message"], &[MCP_CLOSED])
     }
 
     fn feed_event(&mut self, event: Value) -> Result<Step, Error> {
@@ -742,7 +735,7 @@ impl<'a> Turn<'a> {
             EventKind::Stream => self.stream_event(&event["event"]),
             EventKind::Assistant => self.assistant(&event["message"]),
             EventKind::User if self.truncated() && continuation(&event) => Ok(Step::Nothing),
-            EventKind::User if self.rejects_calls(&event["message"]) => {
+            EventKind::User if self.answers_calls(&event["message"], &REJECTIONS) => {
                 self.rejected = true;
                 self.settle()
             }
@@ -854,12 +847,9 @@ impl<'a> Turn<'a> {
     /// Only the last `message_delta` has the real output count.
     fn take_usage(&mut self, usage: &Value, is_final: bool) {
         let fields = [
-            ("input_tokens", &mut self.usage.input),
-            (
-                "cache_creation_input_tokens",
-                &mut self.usage.cache_creation,
-            ),
-            ("cache_read_input_tokens", &mut self.usage.cache_read),
+            (INPUT_TOKENS, &mut self.usage.input),
+            (CACHE_CREATION_INPUT_TOKENS, &mut self.usage.cache_creation),
+            (CACHE_READ_INPUT_TOKENS, &mut self.usage.cache_read),
         ];
         for (key, field) in fields {
             if let Some(n) = count(usage, key) {
@@ -867,7 +857,7 @@ impl<'a> Turn<'a> {
             }
         }
         if is_final {
-            self.usage.output = count(usage, "output_tokens");
+            self.usage.output = count(usage, OUTPUT_TOKENS);
         }
     }
 
@@ -949,7 +939,7 @@ impl<'a> Turn<'a> {
         // The one-turn cap can finish a rejected or held call. Maki owns the complete
         // reply and returns its calls through its own dispatch.
         let tool_reply_at_limit = event["subtype"] == MAX_TURNS_ERROR
-            && (self.rejected || !self.parked.is_empty())
+            && self.handed_over()
             && self.is_complete()
             && self.stop_reason.as_deref() == Some(TOOL_USE_STOP)
             && self.lost.is_none()
@@ -1086,16 +1076,15 @@ impl<'a> Turn<'a> {
         if stop_reason != TOOL_USE_STOP {
             return Err(Error::StoppedFor(stop_reason));
         }
-        Ok(if self.parked.is_empty() && !self.rejected {
-            Step::Nothing
-        } else {
+        Ok(if self.handed_over() {
             Step::Done
+        } else {
+            Step::Nothing
         })
     }
 
-    /// The only answers Claude Code may give to maki's calls: a rejection over
-    /// the schema, or over a tool maki did not offer.
-    fn rejects_calls(&self, message: &Value) -> bool {
+    /// Every answer must reject a call in this reply with an expected CLI diagnostic.
+    fn answers_calls(&self, message: &Value, marks: &[&str]) -> bool {
         message["content"].as_array().is_some_and(|blocks| {
             !blocks.is_empty()
                 && blocks.iter().all(|block| {
@@ -1104,9 +1093,9 @@ impl<'a> Turn<'a> {
                         && block["tool_use_id"]
                             .as_str()
                             .is_some_and(|id| self.calls().any(|(call, _, _)| call == id))
-                        && block["content"].as_str().is_some_and(|text| {
-                            REJECTIONS.iter().any(|mark| text.starts_with(mark))
-                        })
+                        && block["content"]
+                            .as_str()
+                            .is_some_and(|text| marks.iter().any(|mark| text.starts_with(mark)))
                 })
         })
     }
@@ -1170,7 +1159,7 @@ impl<'a> Turn<'a> {
 /// runs them by its own names. An unknown name stays, so maki reports it.
 fn unexpose_batch(catalog: &Catalog, input: &mut Value) {
     if let Some(Value::String(encoded)) = input.get(BATCH_CALLS)
-        && let Ok(calls) = serde_json::from_str::<Value>(encoded)
+        && let Some(calls) = batch_calls(encoded)
     {
         match calls {
             Value::Array(_) => input[BATCH_CALLS] = calls,
@@ -1191,6 +1180,19 @@ fn unexpose_batch(catalog: &Catalog, input: &mut Value) {
             call[BATCH_CALL_TOOL] = Value::from(catalog.maki_name_or_made_up(exposed));
         }
     }
+}
+
+fn batch_calls(encoded: &str) -> Option<Value> {
+    let mut values = Deserializer::from_str(encoded).into_iter::<Value>();
+    let calls = values.next()?.ok()?;
+    if !calls.is_array() && !calls.is_object() {
+        return None;
+    }
+    let tail = encoded[values.byte_offset()..].trim_ascii();
+    let tail = tail.strip_suffix(INVOKE_END).unwrap_or(tail);
+    tail.bytes()
+        .all(|byte| byte.is_ascii_whitespace() || matches!(byte, b'}' | b']'))
+        .then_some(calls)
 }
 
 struct Refusal {
@@ -1970,10 +1972,32 @@ mod tests {
         check_batch_names(inner, expected, true);
     }
 
-    #[test_case(r#"[{"tool":"mcp__maki__read","parameters":{"path":"a"}}]}]}"# ; "extra_closing_delimiters")]
-    #[test_case("[{\"tool\":\"mcp__maki__read\",\"parameters\":{\"path\":\"a\"}}]\n</invoke>\n" ; "invoke_suffix")]
+    #[test_case(r#"[{"tool":"mcp__maki__read","parameters":{"path":"a"}}],{"tool":"other"}"# ; "another_call_outside_the_array")]
     #[test_case(r#"[{"tool":"mcp__maki__read" "parameters":{"path":"a"}}]"# ; "missing_comma")]
+    #[test_case(r#"[{"tool":"mcp__maki__read","parameters":{"path":"\q"}}]"# ; "invalid_escape")]
     fn malformed_batches_are_left_for_tool_validation(encoded: &str) {
+        let mut input = json!({ BATCH_CALLS: encoded });
+        unexpose_batch(&catalog(), &mut input);
+        assert_eq!(input[BATCH_CALLS], encoded);
+    }
+
+    #[test_case("}" ; "closing_brace")]
+    #[test_case("}\n</invoke>" ; "brace_then_newline_and_invoke")]
+    #[test_case("}</invoke>" ; "brace_then_invoke")]
+    #[test_case("}\n] }\t</invoke>\n" ; "closing_delimiters_and_whitespace")]
+    #[test_case("</invoke>" ; "invoke_only")]
+    fn batch_containers_accept_only_structural_tails(tail: &str) {
+        let calls = json!([{ BATCH_CALL_TOOL: EXPOSED, "parameters": { "path": "a" } }]);
+        check_batch_input(json!({ BATCH_CALLS: format!("{calls}{tail}") }), TOOL);
+        check_batch_input(json!({ BATCH_CALLS: format!("{}{tail}", calls[0]) }), TOOL);
+    }
+
+    #[test_case(",{}" ; "second_value")]
+    #[test_case("</invoke>extra" ; "text_after_invoke")]
+    #[test_case("</invoke></invoke>" ; "two_invoke_markers")]
+    #[test_case("null" ; "another_json_value")]
+    fn other_batch_tails_stay_unmodified(tail: &str) {
+        let encoded = format!("{}{tail}", json!([{ BATCH_CALL_TOOL: EXPOSED }]));
         let mut input = json!({ BATCH_CALLS: encoded });
         unexpose_batch(&catalog(), &mut input);
         assert_eq!(input[BATCH_CALLS], encoded);
@@ -1981,7 +2005,7 @@ mod tests {
 
     #[test_case("/* calls */" ; "block_comment")]
     #[test_case("// calls\n" ; "line_comment")]
-    fn batch_repair_requires_a_json_container_prefix(prefix: &str) {
+    fn batch_decoding_requires_a_json_container_prefix(prefix: &str) {
         let encoded = format!("{prefix}{}", json!([{ BATCH_CALL_TOOL: EXPOSED }]));
         let mut input = json!({ BATCH_CALLS: encoded });
         unexpose_batch(&catalog(), &mut input);
@@ -2313,6 +2337,22 @@ mod tests {
             let response = turn.response().unwrap();
             assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
             assert_eq!(response.message.tool_uses().count(), 2);
+        });
+    }
+
+    #[test_case(" was answered." ; "connection_closed_before_answer")]
+    #[test_case(" ran" ; "connection_closed_before_execution")]
+    fn shutdown_closures_after_a_rejection_do_not_need_a_parked_call(suffix: &str) {
+        with_turn(|mut turn| {
+            handoff_turn(&mut turn, true, false);
+            turn.feed(&rejected(FIRST_CALL)).unwrap();
+            let line = json!({ "type": "user", "message": { "content": [{
+                "type": TOOL_RESULT, "tool_use_id": SECOND_CALL, "is_error": true,
+                "content": format!("{MCP_CLOSED}{suffix}"),
+            }] } })
+            .to_string();
+            assert!(matches!(turn.feed_stopping(&line), Ok(Step::Nothing)));
+            assert_eq!(turn.response().unwrap().message.tool_uses().count(), 2);
         });
     }
 

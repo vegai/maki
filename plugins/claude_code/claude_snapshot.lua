@@ -251,8 +251,8 @@ local function copy_dependencies(call, artifact, spec, paths)
   local copied, tracked_folders, checked = {}, {}, {}
   for _, path in ipairs(paths) do
     tracked_folders[path] = true
-    for slash in path:gmatch("()/") do
-      tracked_folders[path:sub(1, slash - 1)] = true
+    for folder in path_utils.folders(path) do
+      tracked_folders[folder] = true
     end
   end
   for _, dir in ipairs(spec.dependencies) do

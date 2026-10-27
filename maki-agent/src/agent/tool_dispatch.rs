@@ -179,14 +179,16 @@ pub async fn run(
     let mut done = match resolved.route {
         Some(route) if allowed => {
             run_inner(
-                name,
                 route,
-                id,
-                &input,
-                ctx,
-                origin,
-                ask.as_deref(),
-                hook.as_ref(),
+                Call {
+                    id,
+                    name,
+                    input: &input,
+                    ctx,
+                    origin,
+                    ask: ask.as_deref(),
+                    hook: hook.as_ref(),
+                },
             )
             .await
         }
@@ -601,6 +603,16 @@ fn identifier_alias(name: &str) -> Option<String> {
     })
 }
 
+struct Call<'a> {
+    id: String,
+    name: &'a str,
+    input: &'a Value,
+    ctx: &'a ToolContext,
+    origin: CallOrigin,
+    ask: Option<&'a str>,
+    hook: Option<&'a Hook<'a>>,
+}
+
 /// Pure router: every arm owns its own start event, permission gate and
 /// telemetry, so adding a source never means editing another one's path.
 ///
@@ -608,49 +620,45 @@ fn identifier_alias(name: &str) -> Option<String> {
 /// MCP tools raise it at their own gate, so the prompt names the scopes their
 /// rules would have judged. Local tools and tool search have no gate, so they
 /// get one here.
-#[allow(clippy::too_many_arguments)]
-async fn run_inner(
-    name: &str,
-    route: Route<'_>,
-    id: String,
-    input: &Value,
-    ctx: &ToolContext,
-    origin: CallOrigin,
-    ask: Option<&str>,
-    hook: Option<&Hook<'_>>,
-) -> ToolDoneEvent {
+async fn run_inner(route: Route<'_>, call: Call<'_>) -> ToolDoneEvent {
+    let Call {
+        ref id,
+        name,
+        input,
+        ctx,
+        origin,
+        ask,
+        ..
+    } = call;
     if let (Some(_), Route::Local(_) | Route::ToolSearch(_)) = (ask, &route)
-        && let Err(e) = gate_on_input(ctx, &ToolKey::native(name), &id, input, ask, None).await
+        && let Err(e) = gate_on_input(ctx, &ToolKey::native(name), id, input, ask, None).await
     {
         return ToolDoneEvent {
             tool: Arc::from(name),
-            ..ToolDoneEvent::error(id, e)
+            ..ToolDoneEvent::error(call.id, e)
         };
     }
     match route {
-        Route::Local(local) => run_local_tool(&local.handler, id, name, input, ctx, origin).await,
-        Route::Native(entry) => {
-            run_native_tool(entry, id, name, input, ctx, origin, ask, hook).await
+        Route::Local(local) => {
+            run_local_tool(&local.handler, call.id, name, input, ctx, origin).await
         }
-        Route::ToolSearch(mcp) => run_tool_search(mcp, id, input, ctx, origin),
-        Route::Mcp(mcp, qualified) => {
-            execute_mcp_tool(ctx, mcp, &id, qualified, input, origin, ask, hook).await
-        }
+        Route::Native(entry) => run_native_tool(entry, call).await,
+        Route::ToolSearch(mcp) => run_tool_search(mcp, call.id, input, ctx, origin),
+        Route::Mcp(mcp, qualified) => execute_mcp_tool(mcp, qualified, call).await,
     }
 }
 
 /// Parse errors skip the start event so the UI never shows a phantom spinner.
-#[allow(clippy::too_many_arguments)]
-async fn run_native_tool(
-    entry: RegisteredTool,
-    id: String,
-    name: &str,
-    input: &Value,
-    ctx: &ToolContext,
-    origin: CallOrigin,
-    ask: Option<&str>,
-    hook: Option<&Hook<'_>>,
-) -> ToolDoneEvent {
+async fn run_native_tool(entry: RegisteredTool, call: Call<'_>) -> ToolDoneEvent {
+    let Call {
+        id,
+        name,
+        input,
+        ctx,
+        origin,
+        ask,
+        hook,
+    } = call;
     let tool_id: Arc<str> = Arc::from(entry.tool.name());
     let started = Instant::now();
 
@@ -1064,17 +1072,16 @@ async fn gate_on_input(
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn execute_mcp_tool(
-    ctx: &ToolContext,
-    mcp: &McpSession,
-    id: &str,
-    tool: Arc<str>,
-    input: &Value,
-    origin: CallOrigin,
-    ask: Option<&str>,
-    hook: Option<&Hook<'_>>,
-) -> ToolDoneEvent {
+async fn execute_mcp_tool(mcp: &McpSession, tool: Arc<str>, call: Call<'_>) -> ToolDoneEvent {
+    let Call {
+        ref id,
+        input,
+        ctx,
+        origin,
+        ask,
+        hook,
+        ..
+    } = call;
     let view = RoutedView::mcp(&tool);
     emit_raw_start(ctx, origin, id, &tool, view.summary.clone(), input);
     let done = |output: TextOutput, is_error: bool| ToolDoneEvent {

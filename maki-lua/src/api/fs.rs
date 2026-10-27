@@ -98,11 +98,13 @@ async fn mkdtemp(_lua: Lua, template: String) -> LuaResult<Pair<String>> {
 async fn rename(_lua: Lua, path: String, new_path: String) -> LuaResult<Pair<bool>> {
     let path = try_pair!(make_absolute(&path));
     let new_path = try_pair!(make_absolute(&new_path));
-    let moved_from = path.clone();
-    let moved_to = new_path.clone();
-    let result = smol::unblock(move || fs::rename(path, new_path)).await;
-    touched(moved_from, result.is_ok()).await;
-    touched(moved_to, result.is_ok()).await;
+    let result = smol::unblock(move || -> IoResult<()> {
+        fs::rename(&path, &new_path)?;
+        maki_agent::invalidate_for(&resolved(&path));
+        maki_agent::invalidate_for(&resolved(&new_path));
+        Ok(())
+    })
+    .await;
     Ok(pair(result.map(|()| true)))
 }
 

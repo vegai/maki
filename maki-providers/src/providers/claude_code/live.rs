@@ -352,6 +352,7 @@ fn live_tool_calls_round_trip_through_maki() {
 }
 
 #[test_case(MODEL => ignore["runs the claude CLI on the subscription of the caller"] ; "haiku_batch")]
+#[test_case(ADAPTIVE_MODEL => ignore["runs the claude CLI on the subscription of the caller"] ; "sonnet_batch")]
 #[test_case(ALWAYS_THINKING_MODEL => ignore["runs the claude CLI on the subscription of the caller"] ; "opus_batch")]
 fn live_batch_calls_round_trip_through_maki(model: &str) {
     let live = Live::new();

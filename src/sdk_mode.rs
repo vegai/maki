@@ -18,7 +18,6 @@ use color_eyre::Result;
 use color_eyre::eyre::{Context, bail, eyre};
 use flume::Sender;
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams, Ready};
-use maki_agent::mcp;
 use maki_agent::permissions::{PermissionAnswer, PluginRuleStore, TaggedAnswer};
 use maki_agent::prompt::ResolvedPrompts;
 use maki_agent::session::Resumed;
@@ -526,11 +525,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let working_dir = cwd.to_string_lossy().into_owned();
 
-    let (mcp_handle, mcp_config_errors) =
-        smol::block_on(mcp::start_connected(&cwd, project_config.clone()));
-    if !mcp_config_errors.is_empty() {
-        eprintln!("MCP config error: {mcp_config_errors}");
-    }
+    let mcp_handle = crate::headless_startup::start_mcp(&cwd, project_config.clone());
 
     let (trigger, shutdown) = CancelToken::new();
     crate::shutdown::watch(trigger).context("watch termination signals")?;

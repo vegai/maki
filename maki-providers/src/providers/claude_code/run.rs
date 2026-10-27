@@ -769,6 +769,7 @@ mod tests {
     #[test_case("graceful_batch", true ; "a_cooperative_leader")]
     #[test_case("ignores_term_batch", false ; "a_leader_that_ignores_sigterm")]
     #[test_case("shutdown_error_batch", true ; "shutdown_reports_its_cancelled_call")]
+    #[test_case("shutdown_not_run_batch", true ; "shutdown_reports_a_call_that_did_not_run")]
     fn stopping_a_tool_reply_keeps_calls_parked_during_cleanup(scenario: &str, cleans: bool) {
         let fake = Fake::new(scenario);
         fs::write(fake.dir.path().join(TRACK_SESSIONS), "").unwrap();

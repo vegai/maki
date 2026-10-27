@@ -271,14 +271,14 @@ function M.retyped_paths(changes)
   local paths, folders, found = {}, {}, {}
   for _, change in ipairs(changes) do
     paths[change.path] = true
-    for slash in change.path:gmatch("()/") do
-      folders[change.path:sub(1, slash - 1)] = true
+    for folder in path_utils.folders(change.path) do
+      folders[folder] = true
     end
   end
   for _, change in ipairs(changes) do
     found[change.path] = folders[change.path]
-    for slash in change.path:gmatch("()/") do
-      found[change.path] = found[change.path] or paths[change.path:sub(1, slash - 1)]
+    for folder in path_utils.folders(change.path) do
+      found[change.path] = found[change.path] or paths[folder]
     end
   end
   return found

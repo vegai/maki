@@ -57,7 +57,7 @@ new() {
   cp -- "$stage/$2" "$temp"
   temp_modes[$temp]=$mode
   modes[$mode]=1
-  if [ "$3" = +x ]; then executable+=("$temp"); else regular_files+=("$temp"); fi
+  case "$3" in +x) executable+=("$temp");; -x) regular_files+=("$temp");; esac
 }
 permissions() {
   local mode temp
@@ -153,8 +153,7 @@ function M.import_script(changes, project, git_dir, artifact, stage)
   end
   local staged, checked = {}, {}
   for _, change in ipairs(changes) do
-    for slash in change.path:gmatch("()/") do
-      local folder = change.path:sub(1, slash - 1)
+    for folder in path_utils.folders(change.path) do
       if not checked[folder] then
         checked[folder] = true
         checks[#checks + 1] = "folder " .. path_utils.bash_quote(CURRENT_DIR .. folder)
@@ -184,7 +183,10 @@ function M.import_script(changes, project, git_dir, artifact, stage)
         stages[#stages + 1] = "staged " .. change.new_sha
         hash_path(stage .. "/" .. change.new_sha, change.new_sha, "gone " .. change.new_sha)
       end
-      local flag = change.new_mode == git_utils.EXECUTABLE_MODE and "+x" or "-x"
+      local flag = "keep"
+      if change.status == git_utils.ADDED or change.old_mode ~= change.new_mode then
+        flag = change.new_mode == git_utils.EXECUTABLE_MODE and "+x" or "-x"
+      end
       local permissions = change.status == git_utils.ADDED and '"$fresh"'
         or '"${old_modes[' .. (#mode_paths - 1) .. ']}"'
       news[#news + 1] = "new " .. path .. " " .. change.new_sha .. " " .. flag .. " " .. permissions

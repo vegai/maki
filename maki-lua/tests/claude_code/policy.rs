@@ -30,6 +30,7 @@ use super::support::{
 
 mod coding;
 
+const TRUNCATED: &str = "truncated";
 const ANSWER: &str = "The parser lives in src/parse.rs:10.";
 const OLDER_VERSION: &str = "2.1.283";
 const NEWER_VERSION: &str = "2.1.290";
@@ -633,7 +634,7 @@ fn startup_stderr_is_bounded_before_it_reaches_the_model() {
     fake.write("probe_stderr", &"é".repeat(ERROR_LIMIT * 4));
     let error = fake.ask(ANSWERS).unwrap_err();
     assert!(error.len() < ERROR_LIMIT * 2);
-    assert!(error.contains("truncated"));
+    assert!(error.contains(TRUNCATED));
 }
 
 #[test]
@@ -648,7 +649,7 @@ fn a_startup_refusal_caps_its_whole_error() {
         "error length: {}",
         error.len()
     );
-    assert!(error.contains("truncated"));
+    assert!(error.contains(TRUNCATED));
 }
 
 fn log_out(fake: &FakeClaude) {

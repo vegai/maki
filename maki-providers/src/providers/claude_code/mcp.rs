@@ -320,7 +320,11 @@ async fn read_head<R: AsyncBufReadExt + Unpin>(
             AUTHORIZATION if authorization.is_some() => return Err(BAD_REQUEST),
             AUTHORIZATION => authorization = Some(value.to_owned()),
             TRANSFER_ENCODING => return Err(LENGTH_REQUIRED),
-            CONNECTION => close = value.eq_ignore_ascii_case(CLOSE),
+            CONNECTION => {
+                close |= value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case(CLOSE));
+            }
             _ => {}
         }
     }
@@ -407,7 +411,7 @@ fn answer(shared: &Shared, body: &[u8]) -> Reply {
         return plain(BAD_REQUEST);
     };
     let Some(method) = message["method"].as_str() else {
-        return plain(ACCEPTED);
+        return plain(BAD_REQUEST);
     };
     let Some(id) = message.get("id") else {
         // A call sent as a notification expects no answer, so Claude Code
@@ -506,7 +510,7 @@ mod tests {
 
     use flume::Receiver;
     use futures_lite::FutureExt;
-    use futures_lite::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use futures_lite::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Cursor};
     use futures_lite::{StreamExt, future, stream};
     use serde_json::{Value, json};
     use smol::Timer;
@@ -520,7 +524,7 @@ mod tests {
         LENGTH_REQUIRED, MAX_BODY_BYTES, MAX_CONNECTIONS, MAX_HEAD_BYTES, MAX_UNAUTHENTICATED,
         METHOD_NOT_ALLOWED, METHOD_NOT_FOUND, McpTool, NOT_FOUND, OK, PING, PROTOCOL_VERSIONS,
         Reply, Server, Shared, TOOL_USE_ID_META, TOOLS_CALL, TOOLS_LIST, UNAUTHORIZED, UNAVAILABLE,
-        accept_loop, answer, serve,
+        accept_loop, answer, read_head, serve,
     };
 
     const TOKEN: &str = "secret-token";
@@ -530,6 +534,18 @@ mod tests {
     const TOOL_USE_ID: &str = "toolu_1";
     /// A body length the request announces but never sends.
     const BODY_NEVER_SENT: usize = 1000;
+
+    #[test_case("close", true ; "close")]
+    #[test_case("keep-alive, CLOSE", true ; "close_in_a_token_list")]
+    #[test_case("keep-alive", false ; "keep_alive")]
+    #[test_case("disclose", false ; "not_a_close_token")]
+    fn connection_headers_parse_tokens(value: &str, close: bool) {
+        smol::block_on(async {
+            let request = head(&format!("Connection: {value}\r\nContent-Length: 0\r\n"));
+            let head = read_head(&mut Cursor::new(request)).await.unwrap().unwrap();
+            assert_eq!(head.close, close);
+        });
+    }
 
     fn tools() -> Vec<McpTool> {
         vec![McpTool {
@@ -840,6 +856,9 @@ mod tests {
     #[test_case(head(&format!("Authorization: Bearer {TOKEN}\r\nContent-Length: {BODY_NEVER_SENT}\r\n")), BAD_REQUEST ; "a_body_cut_short")]
     #[test_case(head(&format!("X-Padding: {}\r\n", "a".repeat(MAX_HEAD_BYTES))), HEADERS_TOO_LARGE ; "an_oversized_head")]
     #[test_case(post(&json!([{ "jsonrpc": "2.0", "id": 1, "method": TOOLS_CALL, "params": { "name": TOOL, "arguments": {} } }]), TOKEN), BAD_REQUEST ; "a_batch")]
+    #[test_case(post(&json!({ "jsonrpc": "2.0", "id": 1, "method": null }), TOKEN), BAD_REQUEST ; "a_null_method")]
+    #[test_case(post(&json!({ "jsonrpc": "2.0", "id": 1, "method": 42 }), TOKEN), BAD_REQUEST ; "a_numeric_method")]
+    #[test_case(post(&json!({ "jsonrpc": "2.0", "id": 1 }), TOKEN), BAD_REQUEST ; "a_missing_method")]
     fn a_request_maki_will_not_take_is_refused(request: Vec<u8>, status: &str) {
         let (reply, handoffs) = reply_to(&request);
         assert!(reply.starts_with(&format!("HTTP/1.1 {status}")), "{reply}");

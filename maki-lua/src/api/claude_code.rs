@@ -5,6 +5,8 @@ use std::io::{Error as IoError, ErrorKind};
 use std::ops::RangeInclusive;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::str::from_utf8;
 
@@ -26,6 +28,8 @@ use crate::api::util::pair::{Pair, pair, try_pair};
 use crate::plugin_permissions::PluginPermissions;
 
 pub(crate) const MODULE: &str = "maki.claude_code.internal";
+#[cfg(unix)]
+const OWNER_EXECUTE: u32 = 0o100;
 const HOME_STATE_PREFIX: &str = ".claude.json";
 const BMP_LIMIT: u32 = 0xffff;
 const MAX_UTF8_BYTES: usize = 4;
@@ -381,21 +385,32 @@ async fn unpack_blobs(
 
 /// Inspect an import target. Missing paths return nil, and blocked or looping parents count as conflicts.
 /// @param path string Checkout file path.
-/// @return (boolean?, string?) Whether the target is a regular file, or nil and an I/O error.
+/// @return (table?, string?) The target's regular and executable flags, or nil and an I/O error.
 #[lua_fn(guard = FsRead)]
-async fn checkout_file(_lua: Lua, path: String) -> LuaResult<Pair<bool>> {
+async fn checkout_file(lua: Lua, path: String) -> LuaResult<Pair<Table>> {
     let value = try_pair!(
         smol::unblock(move || match fs::symlink_metadata(path) {
-            Ok(meta) => Ok(Some(meta.is_file())),
+            Ok(meta) => {
+                #[cfg(unix)]
+                let executable = meta.permissions().mode() & OWNER_EXECUTE != 0;
+                #[cfg(not(unix))]
+                let executable = false;
+                Ok(Some((meta.is_file(), executable)))
+            }
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-            Err(error) if error.kind() == ErrorKind::NotADirectory => Ok(Some(false)),
+            Err(error) if error.kind() == ErrorKind::NotADirectory => Ok(Some((false, false))),
             #[cfg(unix)]
             Err(error) if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) =>
-                Ok(Some(false)),
+                Ok(Some((false, false))),
             Err(error) => Err(error),
         })
         .await
     );
+    let value = value
+        .map(|(regular, executable)| {
+            lua.create_table_from([("regular", regular), ("executable", executable)])
+        })
+        .transpose()?;
     Ok((value, None))
 }
 
@@ -480,8 +495,8 @@ lua_table! {
 #[cfg(unix)]
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::os::unix::fs::symlink;
+    use std::fs::{self, Permissions};
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     use mlua::{AnyUserData, Function, Lua, ObjectLike, Table, Value as LuaValue};
     use serde_json::{Value, json};
@@ -495,6 +510,7 @@ mod tests {
 
     const LINKED: &str = "linked";
     const NESTED: &str = "src";
+    const FILE_CONTENT: &str = "file";
 
     #[test_case('é', true ; "accented_letter")]
     #[test_case('\u{301}', true ; "combining_accent")]
@@ -565,10 +581,30 @@ mod tests {
         let lua = Lua::new();
         let table = create_claude_code_table(&lua, &PluginPermissions::trusted()).unwrap();
         let inspect: Function = table.get("checkout_file").unwrap();
-        let (regular, error): (Option<bool>, Option<String>) =
+        let (meta, error): (Option<Table>, Option<String>) =
             smol::block_on(inspect.call_async(parent.join(LINKED).to_str().unwrap())).unwrap();
-        assert_eq!(regular, Some(false));
+        assert!(!meta.unwrap().get::<bool>("regular").unwrap());
         assert_eq!(error, None);
+    }
+
+    #[test_case(0o700, true ; "owner_execute")]
+    #[test_case(0o750, true ; "owner_and_group_execute")]
+    #[test_case(0o650, false ; "group_execute_only")]
+    #[test_case(0o4600, false ; "setuid_without_execute")]
+    fn checkout_metadata_uses_the_owners_execute_bit(mode: u32, executable: bool) {
+        let root = tempdir().unwrap();
+        let path = root.path().join(LINKED);
+        fs::write(&path, FILE_CONTENT).unwrap();
+        fs::set_permissions(&path, Permissions::from_mode(mode)).unwrap();
+        let lua = Lua::new();
+        let table = create_claude_code_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let inspect: Function = table.get("checkout_file").unwrap();
+        let (meta, error): (Option<Table>, Option<String>) =
+            smol::block_on(inspect.call_async(path.to_str().unwrap())).unwrap();
+        assert_eq!(error, None);
+        let meta = meta.unwrap();
+        assert!(meta.get::<bool>("regular").unwrap());
+        assert_eq!(meta.get::<bool>("executable").unwrap(), executable);
     }
 
     #[test]

@@ -60,6 +60,8 @@ const PASSED_ENV: &[&str] = &[
     OAUTH_TOKEN_ENV,
 ];
 const PASSED_ENV_PREFIXES: &[&str] = &["LC_", "XDG_"];
+// Native launches keep the selected login. The same keys inside settings are
+// rejected by settings_conflicts because they can override that selection.
 const ROUTE_ENV: &[&str] = &[
     "CLAUDE_CODE_API_BASE_URL",
     OAUTH_TOKEN_ENV,

@@ -76,6 +76,9 @@ local changes = ({
   mode_only = {
     { path = [==[@PATH@]==], status = "M", old_sha = "@OLD@", new_sha = "@OLD@", old_mode = "100644", new_mode = "100755" },
   },
+  executable_edit = {
+    { path = [==[@PATH@]==], status = "M", old_sha = "@OLD@", new_sha = "@NEW@", old_mode = "100755", new_mode = "100755" },
+  },
   mode_cleared = {
     { path = [==[@PATH@]==], status = "M", old_sha = "@OLD@", new_sha = "@OLD@", old_mode = "100755", new_mode = "100644" },
   },
@@ -99,6 +102,7 @@ maki.fs.write("@REVIEW@", git_utils.diff_command({ git = "@GIT@", snapshot = "@P
 /// The changes an import applies, by their name in `GENERATE`.
 const EDIT_AND_ADD: &str = "edit_and_add";
 const MODE_ONLY: &str = "mode_only";
+const EXECUTABLE_EDIT: &str = "executable_edit";
 const MODE_CLEARED: &str = "mode_cleared";
 const TARGET: &str = "src/lib.rs";
 const ADDED: &str = "src/new/added.rs";
@@ -121,7 +125,10 @@ const CURRENT_DIR: &str = ".";
 const PRIVATE_MODE: u32 = 0o600;
 const GROUP_READ_MODE: u32 = 0o640;
 const PUBLIC_READ_MODE: u32 = 0o644;
+const PRIVATE_EXECUTE_MODE: u32 = 0o700;
+const GROUP_EXECUTE_MODE: u32 = 0o750;
 const PERMISSION_BITS: u32 = 0o777;
+const DEFAULT_UMASK: &str = "022";
 const SPECIAL_MODE_BITS: u32 = 0o7000;
 const SAME_FOLDER_ADDED: &str = "src/added.rs";
 const TWO_EDITS: &str = "two_edits";
@@ -437,10 +444,17 @@ fn an_import_clears_execute_bits_regardless_of_umask(mode: u32, umask: &str) {
 #[test_case(PRIVATE_MODE ; "owner_only")]
 #[test_case(GROUP_READ_MODE ; "group_read")]
 #[test_case(PUBLIC_READ_MODE ; "public_read")]
+#[test_case(PRIVATE_EXECUTE_MODE ; "owner_execute")]
+#[test_case(GROUP_EXECUTE_MODE ; "group_execute")]
 fn an_import_preserves_each_files_access_permissions(mode: u32) {
-    let import = Import::new(STAGING);
+    let changes = if mode & OWNER_EXECUTE != 0 {
+        EXECUTABLE_EDIT
+    } else {
+        EDIT_AND_ADD
+    };
+    let import = Import::with(STAGING, changes, TARGET, ADDED);
     fs::set_permissions(import.target(), fs::Permissions::from_mode(mode)).unwrap();
-    let output = import.run(&import.script);
+    let output = import.run(&format!("umask {DEFAULT_UMASK}\n{}", import.script));
     assert!(
         output.status.success(),
         "{}",
@@ -474,7 +488,7 @@ fn an_import_batches_metadata_permissions_and_folder_staging() {
     let count = |tool| log.lines().filter(|line| *line == tool).count();
     assert_eq!(count("stat"), 1);
     assert_eq!(count("mktemp"), 1);
-    assert_eq!(count("chmod"), 2);
+    assert_eq!(count("chmod"), 1);
     assert_eq!(count("cat"), 0);
     assert_eq!(fs::read_to_string(import.target()).unwrap(), RECORDED);
     assert_eq!(

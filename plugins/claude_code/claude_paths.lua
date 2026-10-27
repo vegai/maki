@@ -30,7 +30,6 @@ M.IMPORT_ORIGINALS = "originals"
 M.IMPORT_DISPLACED = "displaced"
 -- A unique stage keeps retries from removing another attempt's files.
 M.STAGE_TEMPLATE = "stage.XXXXXX"
-local OWNER_EXECUTE_BITS = "[xs]"
 local SHOWN_PATHS = 10
 
 function M.set_of(list)
@@ -39,6 +38,17 @@ function M.set_of(list)
     set[item] = true
   end
   return set
+end
+
+local function next_folder(path, previous)
+  local slash = path:find("/", previous and #previous + 2 or 1, true)
+  if slash then
+    return path:sub(1, slash - 1)
+  end
+end
+
+function M.folders(path)
+  return next_folder, path
 end
 
 local function trim(text)
@@ -92,12 +102,6 @@ function M.denied_paths(extra)
     end
   end
   return patterns
-end
-
---- Returns true if the owner can run a file whose {mode} is as
---- `stat -c %A` prints it.
-function M.owner_executes(mode)
-  return mode:match("^..." .. OWNER_EXECUTE_BITS) ~= nil
 end
 
 function M.first(items, limit)

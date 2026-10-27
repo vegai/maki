@@ -147,4 +147,11 @@ case("an_idle_plugin_task_sorts_with_the_running_ones", function()
   eq(sections(built.rows), "2:Running,3:Finished")
 end)
 
+case("only_working_and_queued_tasks_keep_the_status_hint", function()
+  eq(Rows.running(RESEARCH), true)
+  eq(Rows.running(QUEUED), true)
+  eq(Rows.running(MONITOR), false)
+  eq(Rows.running(BUILD), false)
+end)
+
 th.report()

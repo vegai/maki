@@ -493,7 +493,7 @@ function M.preflight(input, ctx, call, opts)
   if not version then
     return nil, version_err
   end
-  local cli = { version = version }
+  local cli: { version: string } = { version = version }
   return {
     model = model,
     worker = worker,

@@ -827,7 +827,7 @@ impl JobStore {
 
     fn kill_all(&self) {
         for job in self.jobs.values() {
-            kill_unreaped(&job.reap_state, false);
+            kill_job(job);
         }
     }
 }

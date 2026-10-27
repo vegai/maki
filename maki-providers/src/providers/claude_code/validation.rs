@@ -20,8 +20,8 @@ use crate::ProviderUsage;
 use super::checks;
 use super::error::{Error, Problem};
 use super::stream::{
-    self, API_ERROR_MARK, ASSISTANT_EVENT, EventKind, Handshake, RATE_LIMIT_EVENT, StreamMode,
-    count,
+    self, API_ERROR_MARK, ASSISTANT_EVENT, CACHE_CREATION_INPUT_TOKENS, CACHE_READ_INPUT_TOKENS,
+    EventKind, Handshake, INPUT_TOKENS, OUTPUT_TOKENS, RATE_LIMIT_EVENT, StreamMode, count,
 };
 
 pub use super::MAX_EVENT_BYTES;
@@ -65,6 +65,15 @@ const FILESYSTEM: &str = "filesystem";
 const DENY_READ: &str = "denyRead";
 const ALLOW_READ: &str = "allowRead";
 const ALLOW_WRITE: &str = "allowWrite";
+const EXCLUDED_COMMANDS: &str = "excludedCommands";
+const WEAKER_NESTED_SANDBOX: &str = "enableWeakerNestedSandbox";
+const ALLOW_ALL_UNIX_SOCKETS: &str = "allowAllUnixSockets";
+const ALLOW_UNIX_SOCKETS: &str = "allowUnixSockets";
+const ALLOW_LOCAL_BINDING: &str = "allowLocalBinding";
+const DENIED_DOMAINS: &str = "deniedDomains";
+const DISABLED: &str = "disabled";
+const DENY_WRITE: &str = "denyWrite";
+const ADDITIONAL_DIRECTORIES: &str = "additionalDirectories";
 
 pub fn shell_secret_problem(env: &HashMap<String, String>) -> Option<String> {
     for (name, value) in env {
@@ -444,10 +453,10 @@ pub fn classify(
 
 fn usage_counts(usage: &Value) -> Value {
     json!({
-        "input_tokens": count(usage, "input_tokens"),
-        "cache_read_input_tokens": count(usage, "cache_read_input_tokens"),
-        "cache_creation_input_tokens": count(usage, "cache_creation_input_tokens"),
-        "output_tokens": count(usage, "output_tokens"),
+        INPUT_TOKENS: count(usage, INPUT_TOKENS),
+        CACHE_READ_INPUT_TOKENS: count(usage, CACHE_READ_INPUT_TOKENS),
+        CACHE_CREATION_INPUT_TOKENS: count(usage, CACHE_CREATION_INPUT_TOKENS),
+        OUTPUT_TOKENS: count(usage, OUTPUT_TOKENS),
     })
 }
 
@@ -497,8 +506,8 @@ fn sandbox_problem(sandbox: &Value, expected: &Value) -> Option<String> {
         FAIL_IF_UNAVAILABLE,
         AUTO_ALLOW_BASH,
         ALLOW_UNSANDBOXED,
-        "excludedCommands",
-        "enableWeakerNestedSandbox",
+        EXCLUDED_COMMANDS,
+        WEAKER_NESTED_SANDBOX,
         NETWORK,
         FILESYSTEM,
     ];
@@ -506,9 +515,9 @@ fn sandbox_problem(sandbox: &Value, expected: &Value) -> Option<String> {
         || [ENABLED, FAIL_IF_UNAVAILABLE, ALLOW_UNSANDBOXED]
             .iter()
             .any(|key| sandbox.get(*key) != expected.get(*key))
-        || !empty_array(sandbox.get("excludedCommands"))
+        || !empty_array(sandbox.get(EXCLUDED_COMMANDS))
         || sandbox
-            .get("enableWeakerNestedSandbox")
+            .get(WEAKER_NESTED_SANDBOX)
             .is_some_and(|value| value != false)
     {
         return Some(outside.to_owned());
@@ -520,10 +529,10 @@ fn sandbox_problem(sandbox: &Value, expected: &Value) -> Option<String> {
     let network_keys = [
         STRICT_ALLOWLIST,
         ALLOWED_DOMAINS,
-        "allowAllUnixSockets",
-        "allowUnixSockets",
-        "allowLocalBinding",
-        "deniedDomains",
+        ALLOW_ALL_UNIX_SOCKETS,
+        ALLOW_UNIX_SOCKETS,
+        ALLOW_LOCAL_BINDING,
+        DENIED_DOMAINS,
     ];
     if network
         .keys()
@@ -534,12 +543,12 @@ fn sandbox_problem(sandbox: &Value, expected: &Value) -> Option<String> {
             &expected[NETWORK][ALLOWED_DOMAINS],
         )
         .is_some()
-        || !empty_array(network.get("allowUnixSockets"))
+        || !empty_array(network.get(ALLOW_UNIX_SOCKETS))
         || network
-            .get("allowAllUnixSockets")
+            .get(ALLOW_ALL_UNIX_SOCKETS)
             .is_some_and(|value| value != false)
         || network
-            .get("allowLocalBinding")
+            .get(ALLOW_LOCAL_BINDING)
             .is_some_and(|value| value != false)
     {
         return Some(network_error.to_owned());
@@ -548,13 +557,11 @@ fn sandbox_problem(sandbox: &Value, expected: &Value) -> Option<String> {
         Some(filesystem) => filesystem,
         None => return Some(read_error.to_owned()),
     };
-    let filesystem_keys = ["disabled", ALLOW_READ, DENY_READ, ALLOW_WRITE, "denyWrite"];
+    let filesystem_keys = [DISABLED, ALLOW_READ, DENY_READ, ALLOW_WRITE, DENY_WRITE];
     if filesystem
         .keys()
         .any(|key| !filesystem_keys.contains(&key.as_str()))
-        || filesystem
-            .get("disabled")
-            .is_some_and(|value| value != false)
+        || filesystem.get(DISABLED).is_some_and(|value| value != false)
     {
         return Some(read_error.to_owned());
     }
@@ -588,8 +595,8 @@ fn worker_problem(effective: &Value, expected: &Value) -> Option<String> {
     if permissions[BLOCK_OUTSIDE] != expected[PERMISSIONS][BLOCK_OUTSIDE] {
         return Some("Claude Code does not block reads outside the project".to_owned());
     }
-    if !empty_array(permissions.get("additionalDirectories")) {
-        let directories = &permissions["additionalDirectories"];
+    if !empty_array(permissions.get(ADDITIONAL_DIRECTORIES)) {
+        let directories = &permissions[ADDITIONAL_DIRECTORIES];
         let shown = directories.as_array().map_or_else(
             || "directories given as a table".to_owned(),
             |paths| {

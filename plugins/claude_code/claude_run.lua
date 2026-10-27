@@ -64,13 +64,13 @@ end
 local Run = {}
 Run.__index = Run
 
-function Run.new(ctx, call, spec, timeout_secs, opts)
+function Run.new(ctx, call, spec: { cli: { version: string }, [string]: any }, timeout_secs, opts)
   local self = setmetatable({
     ctx = ctx,
     call = call,
     spec = spec,
     timeout_secs = timeout_secs,
-    route = CHECKING:format(spec.cli.version :: string),
+    route = CHECKING:format(spec.cli.version),
     handshake = launch.worker_handshake(spec),
     stderr_tail = {},
     has_progress = false,

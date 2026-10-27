@@ -27,10 +27,13 @@ const SHOWN_JSON_CHARS: usize = 200;
 
 /// Limit JSON size so malformed CLI output cannot flood the error message.
 pub(super) fn shown(value: &Value) -> String {
-    let text = value.to_string();
-    match text.char_indices().nth(SHOWN_JSON_CHARS) {
+    preview(&value.to_string(), SHOWN_JSON_CHARS)
+}
+
+pub(super) fn preview(text: &str, limit: usize) -> String {
+    match text.char_indices().nth(limit) {
         Some((cut, _)) => format!("{}…", &text[..cut]),
-        None => text,
+        None => text.to_owned(),
     }
 }
 

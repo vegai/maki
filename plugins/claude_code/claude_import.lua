@@ -16,28 +16,6 @@ local LEFTOVERS_REMAIN = "maki could not remove its temporary files, so files st
 local UNRECORDED = "maki could not record this in the artifact (%s), so a second import will show these files as "
   .. "changed."
 
--- git records the owner's execute bit, whoever runs maki.
-local function owner_executes(call, cwd, paths, keep_on_cancel, timeout_ms)
-  if #paths == 0 then
-    return {}
-  end
-  local out, err = call:run_quick({ "xargs", "-0", "stat", "-c", "%A", "--" }, {
-    inherit_env = true,
-    cwd = cwd,
-    stdin = table.concat(paths, "\0"),
-    keep_on_cancel = keep_on_cancel,
-    timeout_ms = timeout_ms,
-  })
-  if not out then
-    return nil, err
-  end
-  local executes = {}
-  for i, mode in ipairs(maki.split(out, "\n")) do
-    executes[i] = path_utils.owner_executes(mode)
-  end
-  return executes
-end
-
 local function disk_blobs(call, env, cwd, paths, keep_on_cancel, timeout_ms)
   if #paths == 0 then
     return {}
@@ -61,16 +39,17 @@ end
 local function checkout_state(call, artifact, changes, keep_on_cancel)
   local project = artifact.manifest.project
   local timeout_ms = import_scripts.import_timeout(changes) * jobs.MS_PER_SEC
-  local git_env = git_utils.snapshot_git_env({}, maki.fs.joinpath(artifact.dir, path_utils.GIT_DIR), project)
-  local state, files = {}, {}
+  local git_env = git_utils.snapshot_git_env({}, artifact.git, project)
+  local state, files, executable = {}, {}, {}
   for _, change in ipairs(changes) do
-    local regular, meta_err = native.checkout_file(maki.fs.joinpath(project, change.path))
+    local meta, meta_err = native.checkout_file(maki.fs.joinpath(project, change.path))
     if meta_err then
       return nil, meta_err
-    elseif regular == nil then
+    elseif meta == nil then
       state[change.path] = false
-    elseif regular then
+    elseif meta.regular then
       files[#files + 1] = change.path
+      executable[#files] = meta.executable
     else
       state[change.path] = "not a file"
     end
@@ -78,10 +57,6 @@ local function checkout_state(call, artifact, changes, keep_on_cancel)
   local blobs, err = disk_blobs(call, git_env, project, files, keep_on_cancel, timeout_ms)
   if not blobs then
     return nil, err
-  end
-  local executable, executable_err = owner_executes(call, project, files, keep_on_cancel, timeout_ms)
-  if not executable then
-    return nil, executable_err
   end
   for i, path in ipairs(files) do
     state[path] = workspace.file_state(blobs[i], executable[i])
@@ -211,8 +186,8 @@ local function missing_folders(project, changes)
   local missing, seen = {}, {}
   for _, change in ipairs(changes) do
     if change.status == git_utils.ADDED then
-      for slash in change.path:gmatch("()/") do
-        local folder = maki.fs.joinpath(project, change.path:sub(1, slash - 1))
+      for parent in path_utils.folders(change.path) do
+        local folder = maki.fs.joinpath(project, parent)
         if not seen[folder] then
           seen[folder] = true
           local meta, meta_err = maki.fs.metadata(folder)
@@ -229,7 +204,7 @@ local function missing_folders(project, changes)
   return missing
 end
 
-local function stage_blobs(call, artifact, todo, stage)
+local function stage_blobs(call, artifact, todo, stage, timeout)
   local hashes, seen = {}, {}
   for _, change in ipairs(todo) do
     if change.status ~= git_utils.DELETED and not seen[change.new_sha] then
@@ -246,7 +221,7 @@ local function stage_blobs(call, artifact, todo, stage)
     env = git_utils.snapshot_git_env({}, artifact.git, artifact.manifest.project),
     stdin = table.concat(hashes, "\n") .. "\n",
     stdout = batch,
-    timeout_ms = import_scripts.import_timeout(todo) * jobs.MS_PER_SEC,
+    timeout_ms = timeout * jobs.MS_PER_SEC,
   })
   if not output then
     return nil, "maki cannot stage the artifact blobs: " .. err
@@ -264,13 +239,13 @@ local function apply_import(ctx, call, artifact, todo)
   if not stage then
     return nil, "maki cannot make a stage folder in the artifact: " .. stage_err
   end
-  local script =
-    import_scripts.import_script(todo, project, maki.fs.joinpath(artifact.dir, path_utils.GIT_DIR), artifact.dir, stage)
+  local script = import_scripts.import_script(todo, project, artifact.git, artifact.dir, stage)
+  local timeout = import_scripts.import_timeout(todo)
   local staged, blob_err
   if #script > MAX_IMPORT_SCRIPT_BYTES then
     blob_err = IMPORT_TOO_LARGE
   else
-    staged, blob_err = stage_blobs(call, artifact, todo, stage)
+    staged, blob_err = stage_blobs(call, artifact, todo, stage, timeout)
   end
   if not staged then
     maki.fs.rm(stage, { recursive = true, force = true })
@@ -280,7 +255,7 @@ local function apply_import(ctx, call, artifact, todo)
   local _, err = maki.agent.call_tool(ctx, "bash", {
     command = script,
     workdir = project,
-    timeout = import_scripts.import_timeout(todo),
+    timeout = timeout,
     description = "Import " .. #todo .. " changes from Claude Code",
   })
   if not err then
