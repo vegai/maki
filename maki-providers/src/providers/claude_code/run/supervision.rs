@@ -3,6 +3,7 @@ use super::super::checks::HANDSHAKE;
 use super::super::error::Error;
 use super::super::mcp::Handoff;
 use super::super::stream::control_request;
+use super::super::within;
 use crate::process::GroupSignals;
 #[cfg(target_os = "linux")]
 use crate::process::guard;
@@ -21,7 +22,6 @@ use serde_json::json;
 use smol::process::{Child, ChildStdin, ChildStdout, Command};
 use smol::{Task, Timer};
 use std::collections::VecDeque;
-use std::future::Future;
 use std::io;
 #[cfg(target_os = "linux")]
 use std::os::unix::net::UnixStream;
@@ -42,18 +42,6 @@ const TRUNCATED_LINE: &str = "…";
 #[derive(Debug, ThisError)]
 #[error("event exceeds the {MAX_EVENT_BYTES}-byte limit")]
 struct EventTooLarge;
-
-pub(in crate::providers::claude_code) async fn within<T>(
-    deadline: Instant,
-    work: impl Future<Output = T>,
-) -> Option<T> {
-    async { Some(work.await) }
-        .or(async {
-            Timer::at(deadline).await;
-            None
-        })
-        .await
-}
 
 /// Kills the group on drop until reaping starts.
 pub(super) struct Group {

@@ -6,10 +6,9 @@ mod supervision;
 pub(super) use self::launch::version_check;
 pub(crate) use self::launch::{Launch, models};
 use self::launch::{MCP_CONFIG_FLAG, base_args, checked_profile, command, probe};
-pub use self::launch::{VersionCheck, invalidate_profile};
-pub(super) use self::private_files::private_dir;
-use self::private_files::{PrivateDir, private_file};
-pub(super) use self::supervision::within;
+pub use self::launch::{VersionCheck, invalidate_version};
+pub(super) use self::private_files::private_dir_async;
+use self::private_files::{PrivateDir, private_dir, private_file};
 use self::supervision::{
     Group, Next, ReadDeadline, SHUTDOWN_GRACE, send, send_handshake, stdout_lines, supervised,
     unreadable,
@@ -20,6 +19,7 @@ use super::mcp::{self, Handoff};
 use super::settings::STARTUP_TIMEOUT_SECS;
 use super::stream::{Step, Turn, Wait, user_message};
 use super::transcript::{Catalog, SERVER, system_prompt, transcript};
+use super::within;
 use crate::providers::anthropic::shared::{long_context_window, strip_long_context};
 use crate::{Message, ProviderEvent, ProviderUsage, StreamResponse};
 use base64::Engine;
@@ -441,9 +441,10 @@ async fn stop_and_drain(
     let mut deadline = Instant::now() + limits.exit;
     if turn.truncated() {
         group.kill();
-        deadline = deadline.min(Instant::now() + SHUTDOWN_GRACE);
     } else if stopped {
         group.terminate();
+    }
+    if stopped {
         deadline = deadline.min(Instant::now() + SHUTDOWN_GRACE);
     }
     match drain(turn, lines, handoffs, deadline, stopped).await {

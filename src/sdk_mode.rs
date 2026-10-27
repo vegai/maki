@@ -1227,39 +1227,12 @@ fn map_tool_names_in_content(content: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use crate::tool_names::claude_to_maki_tool_name;
     use flume::Receiver;
     use maki_agent::SubagentInfo;
     use maki_config::ToolKey;
     use test_case::test_case;
 
     use super::*;
-
-    #[test_case("bash", "Bash")]
-    #[test_case("read", "Read")]
-    #[test_case("edit", "Edit")]
-    #[test_case("write", "Write")]
-    #[test_case("grep", "Grep")]
-    #[test_case("glob", "Glob")]
-    #[test_case("todo_write", "TodoWrite")]
-    #[test_case("webfetch", "WebFetch")]
-    #[test_case("websearch", "WebSearch")]
-    #[test_case("task", "Task")]
-    #[test_case("multiedit", "MultiEdit")]
-    #[test_case("code_execution", "CodeExecution")]
-    #[test_case("index", "Index")]
-    #[test_case("memory", "Memory")]
-    #[test_case("question", "Question")]
-    fn maki_to_claude_roundtrip(maki: &str, claude: &str) {
-        assert_eq!(maki_to_claude_tool_name(maki), claude);
-        assert_eq!(claude_to_maki_tool_name(claude), maki);
-    }
-
-    #[test]
-    fn unknown_tool_name_passthrough() {
-        assert_eq!(maki_to_claude_tool_name("unknown_tool"), "unknown_tool");
-        assert_eq!(claude_to_maki_tool_name("UnknownTool"), "UnknownTool");
-    }
 
     const MODEL: &str = "test-model";
 

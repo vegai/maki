@@ -1161,11 +1161,7 @@ fn unexpose_batch(catalog: &Catalog, input: &mut Value) {
     if let Some(Value::String(encoded)) = input.get(BATCH_CALLS)
         && let Some(calls) = batch_calls(encoded)
     {
-        match calls {
-            Value::Array(_) => input[BATCH_CALLS] = calls,
-            Value::Object(_) => input[BATCH_CALLS] = Value::Array(vec![calls]),
-            _ => {}
-        }
+        input[BATCH_CALLS] = calls;
     }
     if let Some(call) = input.get_mut(BATCH_CALLS)
         && call.is_object()

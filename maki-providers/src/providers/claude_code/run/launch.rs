@@ -35,6 +35,8 @@ const SET_MODEL: &str = "set_model";
 const CONTEXT_USAGE: &str = "get_context_usage";
 const PROBE_MODEL: &str = "haiku";
 const VERSION_FLAG: &str = "--version";
+const MAX_TURNS_FLAG: &str = "--max-turns";
+const TURN_LIMIT: &str = "1";
 const PARTIAL_MESSAGES_FLAG: &str = "--include-partial-messages";
 pub(super) const MCP_CONFIG_FLAG: &str = "--mcp-config";
 
@@ -74,11 +76,11 @@ impl ExecutableIdentity {
     }
 }
 
-static PROFILE_CACHE: LazyLock<Mutex<HashMap<PathBuf, (ExecutableIdentity, String)>>> =
+static VERSION_CACHE: LazyLock<Mutex<HashMap<PathBuf, (ExecutableIdentity, String)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-pub fn invalidate_profile(executable: &Path) {
-    PROFILE_CACHE
+pub fn invalidate_version(executable: &Path) {
+    VERSION_CACHE
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .remove(executable);
@@ -87,9 +89,9 @@ pub fn invalidate_profile(executable: &Path) {
 pub(super) fn base_args(model: &str) -> Vec<String> {
     let mut settings = settings::base_settings();
     settings[checks::AUTO_COMPACT] = json!(false);
-    settings["permissions"] = json!({ "allow": [format!("mcp__{SERVER}")] });
+    settings[checks::PERMISSIONS_KEY] = json!({ "allow": [format!("mcp__{SERVER}")] });
     let mut args = settings::base_args(model, "", checks::DEFAULT_MODE, &settings.to_string());
-    args.extend([PARTIAL_MESSAGES_FLAG, "--max-turns", "1"].map(str::to_owned));
+    args.extend([PARTIAL_MESSAGES_FLAG, MAX_TURNS_FLAG, TURN_LIMIT].map(str::to_owned));
     args
 }
 
@@ -194,7 +196,7 @@ pub struct VersionCheck {
 
 impl VersionCheck {
     fn remember(&self, version: &str) {
-        PROFILE_CACHE
+        VERSION_CACHE
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(
@@ -213,7 +215,7 @@ impl VersionCheck {
 
 pub(crate) async fn version_check(executable: &Path) -> Result<VersionCheck, Error> {
     let identity = executable_identity(executable).await?;
-    let version = PROFILE_CACHE
+    let version = VERSION_CACHE
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .get(executable)

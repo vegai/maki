@@ -27,6 +27,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fmt::Display;
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
@@ -34,11 +35,13 @@ use std::time::{Duration, Instant, SystemTime};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use flume::Sender;
+use futures_lite::FutureExt;
 #[cfg(unix)]
 use rustix::fs::OFlags;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+use smol::Timer;
 use smol::lock::{Mutex as AsyncMutex, Semaphore, SemaphoreGuard};
 use tracing::{debug, info, warn};
 
@@ -154,6 +157,15 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
         trailing_notes: &[NOTES],
     },
 };
+
+async fn within<T>(deadline: Instant, work: impl Future<Output = T>) -> Option<T> {
+    async { Some(work.await) }
+        .or(async {
+            Timer::at(deadline).await;
+            None
+        })
+        .await
+}
 
 /// Shared by all sessions, because each request is a process. The plugin
 /// limits its calls separately.
@@ -722,7 +734,7 @@ impl ClaudeCode {
 
     fn invalidate_version_on_error(&self, error: &Error) {
         if error.invalidates_version() {
-            run::invalidate_profile(&self.executable);
+            run::invalidate_version(&self.executable);
         }
     }
 }

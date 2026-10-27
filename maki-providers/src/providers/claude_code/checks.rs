@@ -116,7 +116,7 @@ const HARMLESS_POLICY: &[&str] = &[
     "model",
     "permissions",
 ];
-const PERMISSIONS_KEY: &str = "permissions";
+pub(super) const PERMISSIONS_KEY: &str = "permissions";
 const HARMLESS_POLICY_PERMISSIONS: &[&str] = &["deny", "disableBypassPermissionsMode"];
 const ENV_KEY: &str = "env";
 pub(crate) const FIRST_PARTY: &str = "firstParty";
@@ -161,12 +161,12 @@ const CWD: &str = "cwd";
 const SOURCES: &str = "sources";
 const ERRORS: &str = "errors";
 const SETTINGS: &str = "settings";
-const EFFECTIVE: &str = "effective";
+pub(super) const EFFECTIVE: &str = "effective";
 pub(super) const AUTO_COMPACT: &str = "autoCompactEnabled";
 const HOOKS: &str = "hooks";
 const POLICY: &str = "policy";
 const ALL_DISABLED: &str = "allDisabled";
-const DISABLED: &str = "disabled";
+pub(super) const DISABLED: &str = "disabled";
 
 #[derive(Debug, Serialize)]
 pub(crate) struct HandshakeStep {

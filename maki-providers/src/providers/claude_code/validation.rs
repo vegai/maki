@@ -17,7 +17,7 @@ use tracing::debug;
 
 use crate::ProviderUsage;
 
-use super::checks;
+use super::checks::{self, DISABLED, EFFECTIVE, PERMISSIONS_KEY};
 use super::error::{Error, Problem};
 use super::stream::{
     self, API_ERROR_MARK, ASSISTANT_EVENT, CACHE_CREATION_INPUT_TOKENS, CACHE_READ_INPUT_TOKENS,
@@ -26,7 +26,7 @@ use super::stream::{
 
 pub use super::MAX_EVENT_BYTES;
 pub use super::checks::{GIT_ENTRY, git_directory};
-pub use super::run::{VersionCheck, invalidate_profile as invalidate_version};
+pub use super::run::{VersionCheck, invalidate_version};
 use super::settings::base_settings;
 pub use super::settings::{EMPTY_MCP_CONFIG, STARTUP_TIMEOUT_SECS, base_args};
 use super::stream::usage_of as plan_usage;
@@ -50,7 +50,6 @@ const TMPDIR_ENV: &str = "TMPDIR";
 #[cfg(unix)]
 const UNIX_TEMP_DIR: &str = "/tmp";
 const PROBE_PATH_NOT_UTF8: &str = "probe path is not valid UTF-8";
-const PERMISSIONS: &str = "permissions";
 const BLOCK_OUTSIDE: &str = "blockReadsOutsideWorkingDirectories";
 const DENY: &str = "deny";
 const SANDBOX: &str = "sandbox";
@@ -71,7 +70,6 @@ const ALLOW_ALL_UNIX_SOCKETS: &str = "allowAllUnixSockets";
 const ALLOW_UNIX_SOCKETS: &str = "allowUnixSockets";
 const ALLOW_LOCAL_BINDING: &str = "allowLocalBinding";
 const DENIED_DOMAINS: &str = "deniedDomains";
-const DISABLED: &str = "disabled";
 const DENY_WRITE: &str = "denyWrite";
 const ADDITIONAL_DIRECTORIES: &str = "additionalDirectories";
 
@@ -116,7 +114,7 @@ struct WorkerPaths {
 impl WorkerPolicy {
     pub fn settings(&self) -> Value {
         let mut settings = base_settings();
-        settings[PERMISSIONS] = json!({
+        settings[PERMISSIONS_KEY] = json!({
             (BLOCK_OUTSIDE): true,
             (DENY): self.deny,
         });
@@ -175,7 +173,7 @@ impl WorkerHandshake {
                 |account| checks::account_problem(account, &self.modes),
                 |settings, hooks| {
                     checks::policy_problem(settings, hooks, false).or_else(|| {
-                        worker_problem(&settings["effective"], &self.policy.settings())
+                        worker_problem(&settings[EFFECTIVE], &self.policy.settings())
                             .map(Problem::WorkerPolicy)
                     })
                 },
@@ -360,14 +358,12 @@ pub async fn private_dir(
     project: PathBuf,
     denied: Vec<PathBuf>,
 ) -> Result<String, String> {
-    smol::unblock(move || {
-        let (dir, path) =
-            super::run::private_dir(&base, &project, &denied).map_err(|error| error.to_string())?;
-        let name = path.to_str().ok_or(PROBE_PATH_NOT_UTF8)?.to_owned();
-        dir.keep();
-        Ok(name)
-    })
-    .await
+    let (dir, path) = super::run::private_dir_async(&base, &project, &denied)
+        .await
+        .map_err(|error| error.to_string())?;
+    let name = path.to_str().ok_or(PROBE_PATH_NOT_UTF8)?.to_owned();
+    dir.keep();
+    Ok(name)
 }
 
 pub fn init_problem(
@@ -591,8 +587,8 @@ fn worker_problem(effective: &Value, expected: &Value) -> Option<String> {
     if !effective.is_object() {
         return Some("Claude Code does not report effective settings".to_owned());
     }
-    let permissions = &effective[PERMISSIONS];
-    if permissions[BLOCK_OUTSIDE] != expected[PERMISSIONS][BLOCK_OUTSIDE] {
+    let permissions = &effective[PERMISSIONS_KEY];
+    if permissions[BLOCK_OUTSIDE] != expected[PERMISSIONS_KEY][BLOCK_OUTSIDE] {
         return Some("Claude Code does not block reads outside the project".to_owned());
     }
     if !empty_array(permissions.get(ADDITIONAL_DIRECTORIES)) {
@@ -609,7 +605,11 @@ fn worker_problem(effective: &Value, expected: &Value) -> Option<String> {
         );
         return Some(format!("Claude Code can also read {shown}"));
     }
-    for rule in expected[PERMISSIONS][DENY].as_array().into_iter().flatten() {
+    for rule in expected[PERMISSIONS_KEY][DENY]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
         if !permissions[DENY]
             .as_array()
             .is_some_and(|denied| denied.contains(rule))
@@ -628,7 +628,7 @@ fn worker_problem(effective: &Value, expected: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PERMISSIONS, SANDBOX, TMPDIR_ENV, WorkerPaths, WorkerPolicy, prepare_launch,
+        PERMISSIONS_KEY, SANDBOX, TMPDIR_ENV, WorkerPaths, WorkerPolicy, prepare_launch,
         sandbox_problem, worker_problem,
     };
     use serde_json::{Value, json};
@@ -707,7 +707,7 @@ mod tests {
     fn null_additional_directories_are_not_an_empty_list() {
         let expected = expected();
         let mut effective = expected.clone();
-        effective[PERMISSIONS]["additionalDirectories"] = json!([null]);
+        effective[PERMISSIONS_KEY]["additionalDirectories"] = json!([null]);
         assert!(worker_problem(&effective, &expected).is_some());
     }
 }

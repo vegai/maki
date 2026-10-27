@@ -110,7 +110,7 @@ pub(in crate::providers::claude_code) fn private_dir(
     Ok((PrivateDir(Some(dir)), path))
 }
 
-pub(super) async fn private_dir_async(
+pub(in crate::providers::claude_code) async fn private_dir_async(
     base: &Path,
     project: &Path,
     denied: &[PathBuf],

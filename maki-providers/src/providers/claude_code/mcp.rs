@@ -19,9 +19,8 @@ use smol::net::{TcpListener, TcpStream};
 use smol::{Task, Timer};
 use tracing::warn;
 
-use super::MAX_EVENT_BYTES;
 use super::error::Error;
-use super::run::within;
+use super::{MAX_EVENT_BYTES, within};
 
 const ENDPOINT: &str = "/mcp";
 const MAX_HEAD_BYTES: usize = 16 * 1024;
@@ -220,43 +219,39 @@ async fn connection(stream: TcpStream, shared: Arc<Shared>, admission: Arc<Atomi
                 return;
             }
         };
-        let body = match admit(&shared, &head) {
-            Ok(()) => {
-                if authenticated.is_none() {
-                    authenticated = shared.authenticated_slots.try_acquire_arc();
-                    if authenticated.is_none() {
-                        if !shared.overloaded.swap(true, Ordering::Relaxed) {
-                            warn!(
-                                limit = MAX_CONNECTIONS,
-                                "claude-code: authenticated handoff connections are full"
-                            );
-                        }
-                        let _ = writer.write_all(&response(UNAVAILABLE, "")).await;
-                        return;
-                    }
-                    admission.store(true, Ordering::Release);
+        if let Err(status) = admit(&shared, &head) {
+            let _ = writer.write_all(&response(status, "")).await;
+            return;
+        }
+        if authenticated.is_none() {
+            authenticated = shared.authenticated_slots.try_acquire_arc();
+            if authenticated.is_none() {
+                if !shared.overloaded.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        limit = MAX_CONNECTIONS,
+                        "claude-code: authenticated handoff connections are full"
+                    );
                 }
-                match within(
-                    Instant::now() + shared.read_limit,
-                    read_body(&mut reader, head.length),
-                )
-                .await
-                {
-                    Some(body) => body,
-                    None => return,
-                }
+                let _ = writer.write_all(&response(UNAVAILABLE, "")).await;
+                return;
             }
-            Err(status) => Err(status),
-        };
-        head_limit = shared.read_limit;
-        let reply = match body {
-            Ok(body) => answer(&shared, &body),
-            Err(status) => {
+            admission.store(true, Ordering::Release);
+        }
+        let body = match within(
+            Instant::now() + shared.read_limit,
+            read_body(&mut reader, head.length),
+        )
+        .await
+        {
+            Some(Ok(body)) => body,
+            Some(Err(status)) => {
                 let _ = writer.write_all(&response(status, "")).await;
                 return;
             }
+            None => return,
         };
-        match reply {
+        head_limit = shared.read_limit;
+        match answer(&shared, &body) {
             Reply::Send { status, body } => {
                 if writer.write_all(&response(status, &body)).await.is_err() || head.close {
                     return;
@@ -504,21 +499,21 @@ fn response(status: &str, body: &str) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
     use std::io;
     use std::net::{Ipv4Addr, Shutdown};
     use std::sync::Arc;
+    use std::time::Instant;
 
     use flume::Receiver;
-    use futures_lite::FutureExt;
     use futures_lite::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Cursor};
     use futures_lite::{StreamExt, future, stream};
     use serde_json::{Value, json};
-    use smol::Timer;
     use smol::net::{TcpListener, TcpStream};
     use test_case::test_case;
 
-    use super::super::WAIT;
     use super::super::error::Error;
+    use super::super::{WAIT, within};
     use super::{
         ACCEPTED, BAD_REQUEST, CONTENT_TOO_LARGE, ENDPOINT, HEADERS_TOO_LARGE, Handoff, INITIALIZE,
         LENGTH_REQUIRED, MAX_BODY_BYTES, MAX_CONNECTIONS, MAX_HEAD_BYTES, MAX_UNAUTHENTICATED,
@@ -566,11 +561,7 @@ mod tests {
     }
 
     async fn bounded<T>(fut: impl Future<Output = T>) -> T {
-        async { Some(fut.await) }
-            .or(async {
-                Timer::after(WAIT).await;
-                None
-            })
+        within(Instant::now() + WAIT, fut)
             .await
             .unwrap_or_else(|| panic!("no event occurred in {WAIT:?}"))
     }

@@ -32,3 +32,25 @@ pub fn claude_to_maki_tool_name(name: &str) -> &str {
         .map(|(local, _)| *local)
         .unwrap_or(name)
 }
+
+#[cfg(test)]
+mod tests {
+    use test_case::test_case;
+
+    use super::{TOOL_NAME_MAP, claude_to_maki_tool_name, maki_to_claude_tool_name};
+
+    #[test_case(TOOL_NAME_MAP ; "all_mapped_tools")]
+    fn tool_names_round_trip(names: &[(&str, &str)]) {
+        for &(maki, claude) in names {
+            assert_eq!(maki_to_claude_tool_name(maki), claude);
+            assert_eq!(claude_to_maki_tool_name(claude), maki);
+        }
+    }
+
+    #[test_case("unknown_tool" ; "maki_spelling")]
+    #[test_case("UnknownTool" ; "claude_spelling")]
+    fn unknown_tool_names_pass_through(name: &str) {
+        assert_eq!(maki_to_claude_tool_name(name), name);
+        assert_eq!(claude_to_maki_tool_name(name), name);
+    }
+}

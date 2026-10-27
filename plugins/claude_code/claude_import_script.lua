@@ -168,7 +168,7 @@ function M.import_script(changes, project, git_dir, artifact, stage)
       local index = #mode_paths
       mode_paths[#mode_paths + 1] = CURRENT_DIR .. change.path
       modes[#modes + 1] = "same_mode " .. path .. ' "${old_modes[' .. index .. ']}" ' .. change.old_mode
-      local folder = (CURRENT_DIR .. change.path):match("^(.*)/")
+      local folder = maki.fs.dirname(CURRENT_DIR .. change.path)
       if not keep_folders[folder] then
         keep_folders[folder] = {}
         keep_order[#keep_order + 1] = folder
@@ -240,7 +240,7 @@ function M.leftovers_script(changes, project, stage, made)
   local lines = { 'into() { cd -P -- "$1" 2>/dev/null && [ "$(pwd -P)" = "$1" ]; }', "status=0" }
   local cleared = {}
   for _, change in ipairs(changes) do
-    local dir = (project .. "/" .. change.path):match("^(.*)/")
+    local dir = maki.fs.dirname(project .. "/" .. change.path)
     if change.status ~= git_utils.DELETED and not cleared[dir] then
       cleared[dir] = true
       local quoted = path_utils.shell_quote(dir)
@@ -256,7 +256,7 @@ function M.leftovers_script(changes, project, stage, made)
     end
   end
   for _, folder in ipairs(made) do
-    local parent, name = folder:match("^(.*)/([^/]+)$")
+    local parent, name = maki.fs.dirname(folder), maki.fs.basename(folder)
     lines[#lines + 1] = "into "
       .. path_utils.shell_quote(parent)
       .. " && rmdir -- "
