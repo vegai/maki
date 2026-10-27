@@ -1331,7 +1331,7 @@ mod tests {
             fs::read(format!("/proc/{}/cmdline", member.trim()))
                 .is_ok_and(|bytes| !bytes.is_empty())
         };
-        assert!(running(), "the fake never started its descendant");
+        assert!(wait_until(running), "the fake never started its descendant");
 
         let maki_pid = Pid::from_raw(maki.id().try_into().unwrap()).unwrap();
         kill_process(maki_pid, signal).unwrap();

@@ -37,14 +37,27 @@ pub fn claude_to_maki_tool_name(name: &str) -> &str {
 mod tests {
     use test_case::test_case;
 
-    use super::{TOOL_NAME_MAP, claude_to_maki_tool_name, maki_to_claude_tool_name};
+    use super::{claude_to_maki_tool_name, maki_to_claude_tool_name};
 
-    #[test_case(TOOL_NAME_MAP ; "all_mapped_tools")]
-    fn tool_names_round_trip(names: &[(&str, &str)]) {
-        for &(maki, claude) in names {
-            assert_eq!(maki_to_claude_tool_name(maki), claude);
-            assert_eq!(claude_to_maki_tool_name(claude), maki);
-        }
+    #[test_case("bash", "Bash" ; "bash")]
+    #[test_case("read", "Read" ; "read")]
+    #[test_case("edit", "Edit" ; "edit")]
+    #[test_case("write", "Write" ; "write")]
+    #[test_case("grep", "Grep" ; "grep")]
+    #[test_case("glob", "Glob" ; "glob")]
+    #[test_case("todo_write", "TodoWrite" ; "todo_write")]
+    #[test_case("webfetch", "WebFetch" ; "webfetch")]
+    #[test_case("websearch", "WebSearch" ; "websearch")]
+    #[test_case("task", "Task" ; "task")]
+    #[test_case("multiedit", "MultiEdit" ; "multiedit")]
+    #[test_case("code_execution", "CodeExecution" ; "code_execution")]
+    #[test_case("index", "Index" ; "index")]
+    #[test_case("memory", "Memory" ; "memory")]
+    #[test_case("question", "Question" ; "question")]
+    #[test_case("skill", "Skill" ; "skill")]
+    fn sdk_tool_names_round_trip(maki: &str, claude: &str) {
+        assert_eq!(maki_to_claude_tool_name(maki), claude);
+        assert_eq!(claude_to_maki_tool_name(claude), maki);
     }
 
     #[test_case("unknown_tool" ; "maki_spelling")]
