@@ -2408,7 +2408,7 @@ Requires the `run` [plugin permission](#plugin-permissions).
 
 **Returns:** (`integer?`, `string?`) Job id, or nil plus an error message when the
   process could not start (binary not found, bad `cwd`, redirect file not
-  writable).
+  writable). Yields while starting the process.
 
 **Example:**
 
@@ -2653,6 +2653,9 @@ The final item has no newline suffix.
 
 Unread data stays in memory. A descendant can retain stdin after the job
 exits. Use `guard` to stop that descendant and release the data.
+
+At most 16 MiB can wait in the job's stdin queue, including a write in progress.
+A full queue returns an error so the caller can wait for the child to consume input.
 
 Requires the `run` [plugin permission](#plugin-permissions).
 

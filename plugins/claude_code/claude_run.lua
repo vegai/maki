@@ -9,18 +9,12 @@ local snapshot = require("claude_snapshot")
 local Stream = require("claude_stream")
 
 local DEFAULT_OUTPUT_LINES = 5
-local BODY_INDENT_COLS = 4
-local MIN_MD_WIDTH = 20
 local ABANDONED = "The worker's snapshot stays in %s until maki removes it."
 local CHECKING = "Validate the login and policy of Claude Code %s"
 local ROUTE_OK = "claude.ai subscription%s on Claude Code %s, maki found no route conflict"
 local ROUTE_UNCONFIRMED = "maki could not confirm the route on Claude Code %s"
 local UNCHECKED_START = "Claude Code started its run before maki accepted its checks"
 local ERROR_PREFIX = jobs.ERROR_PREFIX
-
-local function body_width()
-  return math.max(maki.ui.terminal_size().cols - BODY_INDENT_COLS, MIN_MD_WIDTH)
-end
 
 local function view_opts(ctx, keep)
   local tol = ctx:tool_output_lines()
@@ -41,21 +35,9 @@ end
 
 -- `restore` rebuilds this from the saved header.
 local function render(header, text, is_error, ctx)
-  local buf = maki.ui.buf()
-  local view = ToolView.new(buf, view_opts(ctx, "head"))
-  view:set_header(dim_lines(header))
-  local ok, md_lines = false, nil
-  if not is_error then
-    ok, md_lines = pcall(maki.ui.markdown, text, body_width())
-  end
-  for _, line in ipairs(ok and md_lines or maki.split(text, "\n")) do
-    view:append(line)
-  end
-  view:finish()
-  buf:on("click", function()
-    view:toggle()
-  end)
-  return buf
+  local opts = view_opts(ctx, "head")
+  opts.header = dim_lines(header)
+  return ToolView.restore_markdown(text, is_error, opts)
 end
 
 -- Job callbacks only record the result and hand it to the call. A body built
@@ -293,7 +275,7 @@ function Run:start(argv, cwd, env, task)
   -- handshake is sent from inside the wait.
   return maki.async.await(1, function(done)
     self.resolve = done
-    self:send(launch.handshake_input())
+    self:send(launch.HANDSHAKE_INPUT)
   end)
 end
 

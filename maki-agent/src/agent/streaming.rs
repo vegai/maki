@@ -389,7 +389,6 @@ mod tests {
     use std::path::Path;
     use std::sync::Mutex;
 
-    use maki_providers::provider::ModelListing;
     use maki_providers::{
         Effort, KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Role, ThinkingConfig, TokenUsage,
     };
@@ -636,7 +635,6 @@ mod tests {
 
         fn list_models(
             &self,
-            _listing: ModelListing,
         ) -> maki_providers::provider::BoxFuture<
             '_,
             Result<Vec<maki_providers::ModelInfo>, AgentError>,
@@ -904,7 +902,6 @@ mod tests {
 
         fn list_models(
             &self,
-            _listing: ModelListing,
         ) -> maki_providers::provider::BoxFuture<
             '_,
             Result<Vec<maki_providers::ModelInfo>, AgentError>,

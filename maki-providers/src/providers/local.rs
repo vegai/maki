@@ -10,7 +10,7 @@ use tracing::warn;
 use maki_config::providers::{Protocol, ProvidersConfig};
 
 use crate::model::Model;
-use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
+use crate::provider::{BoxFuture, Provider, RequestScope};
 use crate::types::ThinkingFallback;
 use crate::{AgentError, Effort, Message, ProviderEvent, RequestOptions, StreamResponse};
 
@@ -185,10 +185,7 @@ impl Provider for LocalEndpoint {
         })
     }
 
-    fn list_models(
-        &self,
-        _listing: ModelListing,
-    ) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
             match self.discovery_mode {

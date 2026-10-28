@@ -52,35 +52,9 @@ local NOT_UTF8_CHANGES = "the names of %s are not UTF-8, so the manifest cannot 
 local SUBMODULES_LEFT_OUT = "the snapshot has no submodules, so the worker did not see "
 local PREPARED = "the prepare command changed %s, and the changes for import do not include these files"
 
-local DROP_ESCAPING_LINKS = [[
-root=$1
-shift
-mapfile -d '' -t targets < <(realpath -m -z -- "$@" 2>/dev/null)
-if wait "$!" && [ "${#targets[@]}" = "$#" ]; then batched=1; else batched=0; fi
-index=0
-for link do
-  if [ "$batched" = 1 ]; then
-    target=${targets[index]}
-  else
-    target=$(realpath -m -- "$link" 2>/dev/null) || target=
-  fi
-  index=$((index + 1))
-  case $target in "$root" | "$root"/*) continue ;; esac
-  rm -f -- "$link" || exit
-  printf '%s' "${link#"$root"/}" | od -An -v -tx1 | tr -d ' \n'
-  echo
-done
-]]
-
 -- Replace bytes that can break the job reader with `?`. Prefix paths with `./`
 -- so names such as `-delete` cannot become `find` expressions.
 local CHANGED_SINCE = [[find "./$1" -cnewer "$2" -print | LC_ALL=C tr -c '\n[:print:]' '?']]
-
-local function from_hex(line)
-  return (line:gsub("%x%x", function(pair)
-    return string.char(tonumber(pair, 16))
-  end))
-end
 
 local function checkout_git(call, spec, args)
   return call:run_quick(git_utils.git(args), { env = spec.env, cwd = spec.cwd })
@@ -320,46 +294,6 @@ local function copy_dependencies(call, artifact, spec, paths)
   return copied
 end
 
--- A link out of the snapshot could lead the worker into the checkout or
--- anywhere else.
-local function drop_escaping_links(call, artifact, symlinks)
-  if #symlinks == 0 then
-    return {}
-  end
-  local paths = {}
-  for _, link in ipairs(symlinks) do
-    paths[#paths + 1] = artifact.snapshot .. "/" .. link
-  end
-  local out, err = call:run_quick({
-    "xargs",
-    "-0",
-    "bash",
-    "-c",
-    DROP_ESCAPING_LINKS,
-    "bash",
-    artifact.snapshot,
-  }, {
-    env = artifact.git_env,
-    timeout_ms = artifact.timeout_ms,
-    stdin = table.concat(paths, "\0") .. "\0",
-    display = "remove external snapshot symlinks",
-  })
-  if not out then
-    return nil, err
-  end
-  local dropped, names = {}, {}
-  for line in out:gmatch("%x+") do
-    local path = from_hex(line)
-    dropped[path] = true
-    names[#names + 1] = path
-  end
-  if #names > 0 then
-    artifact.notes[#artifact.notes + 1] = "maki removed external symlinks from the snapshot: "
-      .. path_utils.shown(names)
-  end
-  return dropped
-end
-
 -- Commits exactly {paths} as the base, ignored paths included. The
 -- repository sits next to the snapshot, where the worker cannot write, so
 -- later git commands read metadata the worker could not touch. A `.git`
@@ -380,14 +314,10 @@ local function commit_base(call, artifact, paths, dependencies)
   if call.stopped then
     return jobs.CANCELLED
   end
-  local symlinks, metadata_err = M.sanitize(artifact)
+  local dropped, metadata_err = M.sanitize(artifact)
   local setup_err = mkdir_err or attributes_err or exclude_err or metadata_err
   if setup_err then
     return "maki cannot make the repository of the snapshot: " .. setup_err
-  end
-  local dropped, link_err = drop_escaping_links(call, artifact, symlinks)
-  if not dropped then
-    return link_err
   end
   if artifact.repositories or next(dropped) then
     local kept = {}
@@ -495,6 +425,7 @@ function M.fill(call, artifact, spec)
     artifact.unsettled = path_utils.shown(unsettled)
     artifact.notes[#artifact.notes + 1] = "dependencies changed during the copy, so they may mix two versions: "
       .. artifact.unsettled
+      .. ". Mention this for every check that uses them."
   end
   return commit_base(call, artifact, paths, spec.dependencies) or consistency_problem(call, artifact, spec)
 end
@@ -692,7 +623,11 @@ function M.sanitize(artifact)
       .. paths.private_files
       .. " hard-linked files in the snapshot"
   end
-  return paths.symlinks
+  if #paths.dropped_links > 0 then
+    artifact.notes[#artifact.notes + 1] = "maki removed external symlinks from the snapshot: "
+      .. path_utils.shown(paths.dropped_links)
+  end
+  return path_utils.set_of(paths.dropped_links)
 end
 
 local function stage_changes(call, artifact)
@@ -733,13 +668,9 @@ local function commit_prepared(call, artifact)
   if call.stopped then
     return jobs.CANCELLED
   end
-  local symlinks, metadata_err = M.sanitize(artifact)
-  if not symlinks then
-    return metadata_err
-  end
-  local dropped, link_err = drop_escaping_links(call, artifact, symlinks)
+  local dropped, metadata_err = M.sanitize(artifact)
   if not dropped then
-    return link_err
+    return metadata_err
   end
   local ignored, add_err = stage_changes(call, artifact)
   if not ignored then

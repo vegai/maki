@@ -1,34 +1,33 @@
 //! Each request owns its process group and holds tool calls until the reply is complete.
+#[path = "run/launch.rs"]
 mod launch;
+#[path = "run/private_files.rs"]
 mod private_files;
+#[path = "run/supervision.rs"]
 mod supervision;
 
-pub(super) use self::launch::version_check;
 pub(crate) use self::launch::{Launch, models};
-use self::launch::{MCP_CONFIG_FLAG, base_args, checked_profile, command, probe};
-pub use self::launch::{VersionCheck, invalidate_version};
+pub use self::launch::{VersionCheck, invalidate_version, version_check};
+use self::launch::{base_args, checked_profile, command, probe};
 pub(super) use self::private_files::private_dir_async;
 use self::private_files::{PrivateDir, private_dir, private_file};
 use self::supervision::{
-    Group, Next, ReadDeadline, SHUTDOWN_GRACE, send, send_handshake, stdout_lines, supervised,
-    unreadable,
+    Group, Next, ReadDeadline, SHUTDOWN_GRACE, send, send_handshake, supervised, unreadable,
 };
-use super::checks::{InitExpect, require_system};
+use super::checks::InitExpect;
 use super::error::Error;
 use super::mcp::{self, Handoff};
-use super::settings::STARTUP_TIMEOUT_SECS;
+use super::settings::{MCP_CONFIG_FLAG, STARTUP_TIMEOUT_SECS};
 use super::stream::{Step, Turn, Wait, user_message};
 use super::transcript::{Catalog, SERVER, system_prompt, transcript};
 use super::within;
 use crate::providers::anthropic::shared::{long_context_window, strip_long_context};
+use crate::providers::oauth_loopback::random_token;
 use crate::{Message, ProviderEvent, ProviderUsage, StreamResponse};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use flume::{Receiver, Sender};
 use futures_lite::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::env;
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -38,7 +37,6 @@ use tracing::{debug, info, warn};
 
 const PROMPT_FILE: &str = "system-prompt.md";
 const MCP_FILE: &str = "mcp.json";
-const TOKEN_BYTES: usize = 32;
 const LONG_CONTEXT_NAME: &str = "[1m]";
 const STARTUP: Duration = Duration::from_secs(STARTUP_TIMEOUT_SECS);
 const MCP_READ: Duration = Duration::from_secs(60);
@@ -115,9 +113,10 @@ pub(crate) enum Thinking {
 }
 
 fn token() -> Result<String, Error> {
-    let mut bytes = [0u8; TOKEN_BYTES];
-    getrandom::fill(&mut bytes).map_err(Error::Token)?;
-    Ok(URL_SAFE_NO_PAD.encode(bytes))
+    random_token().map_err(|error| Error::Io {
+        what: "make a handoff token",
+        source: io::Error::other(error),
+    })
 }
 
 /// Recheck current policy and the executable's identity before starting in the project.
@@ -129,7 +128,6 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
     // none.
     let (catalog, tools) = Catalog::new(req.exchange.tools)?;
     let conversation = user_message(&transcript(req.exchange.messages)?)?;
-    require_system(env::consts::OS)?;
     // maki marks the 1M window with a `-1m` id and Claude Code with a `[1m]`
     // name. The generation reports the model without either.
     let asked = strip_long_context(req.model);
@@ -328,8 +326,7 @@ async fn exchange_reply(
         limits,
     } = run;
     let mut prompted = Instant::now();
-    let mut stdin = group.child.stdin.take();
-    let mut lines = stdout_lines(group.child.stdout.take())?;
+    let (mut stdin, mut lines) = group.pipes()?;
     let mut startup = Instant::now() + limits.startup;
     send_handshake(&mut stdin, startup).await?;
     let mut last_event = Instant::now();
@@ -544,7 +541,7 @@ async fn drain(
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use std::env;
     use std::ffi::OsStr;
@@ -576,14 +573,13 @@ mod tests {
     use super::super::mcp::Handoff;
     use super::super::stream::Turn;
     use super::super::transcript::{Catalog, SERVER};
-    #[cfg(target_os = "linux")]
     use super::private_files::{DIR_PREFIX, OWNER_SEPARATOR, owner_namespace, sweep_dead_owners};
     use super::{
         EFFORT_FLAG, Exchange, Group, HANDOFF, HELD_CALL_TIMEOUT_MS, Launch, Limits, Listed,
         MCP_CONFIG_FLAG, NO_AUTO_COMPACT, NO_CLI_RETRIES, NO_MID_CONVERSATION_SYSTEM,
         NO_NONSTREAMING_FALLBACK, NO_THINKING, Request, SHOWN_THINKING, STARTUP,
         SYSTEM_PROMPT_FILE_FLAG, Thinking, Wait, command, finish_deadline, models, probe,
-        queued_handoffs, run_args, stdout_lines,
+        queued_handoffs, run_args,
     };
     use crate::providers::anthropic::{LABEL_SESSION, LABEL_WEEK_ALL};
     use crate::{ContentBlock, ImageMediaType, ImageSource, Role, StopReason};
@@ -980,7 +976,6 @@ mod tests {
 
     /// Cancellation can precede spawn completion or channel receipt. An unclaimed process
     /// group must stop in either case.
-    #[cfg(target_os = "linux")]
     #[test_case(true ; "before_the_send")]
     #[test_case(false ; "in_the_channel")]
     fn a_process_nobody_takes_is_stopped(cancelled_before_the_send: bool) {
@@ -993,7 +988,7 @@ mod tests {
             &args,
         )))
         .unwrap();
-        let pid = Pid::from_raw(group.child.id().try_into().unwrap()).unwrap();
+        let pid = Pid::from_raw(group.id().try_into().unwrap()).unwrap();
         let (reply, answer) = flume::bounded::<io::Result<Group>>(1);
         let answer = (!cancelled_before_the_send).then_some(answer);
         let _ = reply.send(Ok(group));
@@ -1133,7 +1128,7 @@ mod tests {
         let (catalog, _) =
             Catalog::new(&json!([{ "name": TOOL, "input_schema": { "type": "object" } }])).unwrap();
         let tools = catalog.exposed();
-        let profile = profile("2.1.284", "linux").unwrap();
+        let profile = profile("2.1.284").unwrap();
         let expect = InitExpect {
             version: &profile,
             model: ALIAS,
@@ -1298,7 +1293,6 @@ mod tests {
     /// A signal can kill maki before any destructor runs, so Claude Code must
     /// die with maki rather than with the request. The test binary runs
     /// itself as that maki, with `TMPDIR` in a dir this test owns.
-    #[cfg(target_os = "linux")]
     #[test_case(Signal::TERM ; "sigterm")]
     #[test_case(Signal::KILL ; "sigkill")]
     fn a_killed_maki_takes_claude_code_along(signal: Signal) {
@@ -1350,7 +1344,6 @@ mod tests {
     /// Only a directory whose maki is gone goes, and only one from this pid
     /// namespace and boot, where its pid names the same maki. A link to a directory
     /// stays, and so does what it points to.
-    #[cfg(target_os = "linux")]
     #[test]
     fn a_dead_makis_private_dir_is_swept() {
         let base = tempdir().unwrap();
@@ -1603,7 +1596,7 @@ mod tests {
         let args = ["-c".to_owned(), LINGERING_MEMBER.to_owned()];
         let shell = command(Path::new("/bin/sh"), &Fake::env(), &here, &args);
         let mut group = smol::block_on(Group::spawn(shell)).unwrap();
-        let mut lines = stdout_lines(group.child.stdout.take()).unwrap();
+        let (_stdin, mut lines) = group.pipes().unwrap();
         let member: String = smol::block_on(lines.next()).unwrap().unwrap();
         let status = smol::block_on(group.wait(Instant::now() + WAIT)).unwrap();
         assert!(status.success());

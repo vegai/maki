@@ -121,7 +121,7 @@ impl Drop for CheckedOutReceiver {
 ///     plugin can see. A second job with the same live name fails.
 /// @return (integer?, string?) Job id, or nil plus an error message when the
 ///   process could not start (binary not found, bad `cwd`, redirect file not
-///   writable).
+///   writable). Yields while starting the process.
 /// @example
 /// local id, err = maki.fn.jobstart({ "rg", "--json", pattern, dir }, {
 ///   on_stdout = function(_, line) print(line) end,
@@ -131,8 +131,8 @@ impl Drop for CheckedOutReceiver {
 ///   maki.log.warn("rg failed to start: " .. err)
 /// end
 #[lua_fn(guard = Run)]
-fn jobstart(
-    lua: &Lua,
+async fn jobstart(
+    lua: Lua,
     #[ctx] plugin: Arc<str>,
     #[ctx] fs_write: bool,
     cmd: Value,
@@ -144,7 +144,7 @@ fn jobstart(
         .transpose()?
         .flatten()
         .unwrap_or(Value::Nil);
-    let mut spec = JobSpec::new(parse_scope(lua, &plugin, scope)?, parse_command(cmd)?);
+    let mut spec = JobSpec::new(parse_scope(&lua, &plugin, scope)?, parse_command(cmd)?);
     let mut tail = None;
 
     if let Some(ref opts) = opts {
@@ -159,9 +159,9 @@ fn jobstart(
             Some(_) => return Err(mlua::Error::runtime(STDIN_MODE_ERR)),
         };
         spec.name = job_name(opts)?;
-        spec.on_stdout = callback_key(lua, opts, "on_stdout")?;
-        spec.on_stderr = callback_key(lua, opts, "on_stderr")?;
-        spec.on_exit = callback_key(lua, opts, "on_exit")?;
+        spec.on_stdout = callback_key(&lua, opts, "on_stdout")?;
+        spec.on_stderr = callback_key(&lua, opts, "on_stderr")?;
+        spec.on_exit = callback_key(&lua, opts, "on_exit")?;
         spec.stdout = parse_redirect(opts, "stdout", spec.on_stdout.is_some(), fs_write)?;
         spec.stderr = parse_redirect(opts, "stderr", spec.on_stderr.is_some(), fs_write)?;
         tail = opts.opt("tail")?;
@@ -174,8 +174,10 @@ fn jobstart(
         }
     }
 
-    let task_id = active_task_id(lua);
-    with_jobs(lua, |store| {
+    let task_id = active_task_id(&lua);
+    let gate = with_jobs(&lua, |store| Arc::clone(&store.start_gate));
+    let _starting = gate.lock().await;
+    with_jobs(&lua, |store| {
         if let Some(ref name) = spec.name
             && let Some(held) = store.find_named(name, task_id, &plugin)
         {
@@ -183,7 +185,11 @@ fn jobstart(
                 "jobstart: name {name:?} is already held by live job {held}"
             )));
         }
-        let id = try_pair!(store.start(spec));
+        Ok(())
+    })?;
+    let spawned = try_pair!(smol::unblock(move || spec.spawn()).await);
+    with_jobs(&lua, |store| {
+        let id = try_pair!(store.register(spawned));
         store.set_tail(id, tail);
         Ok((Some(id), None))
     })
@@ -458,6 +464,9 @@ fn jobstop(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<()> {
 ///
 /// Unread data stays in memory. A descendant can retain stdin after the job
 /// exits. Use `guard` to stop that descendant and release the data.
+///
+/// At most 16 MiB can wait in the job's stdin queue, including a write in progress.
+/// A full queue returns an error so the caller can wait for the child to consume input.
 ///
 /// @param id integer Job id returned by `jobstart`.
 /// @param data string|table Text to write, or a list of lines.

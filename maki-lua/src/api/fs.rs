@@ -16,6 +16,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::UNIX_EPOCH;
 
+#[cfg(unix)]
+use maki_storage::permissions::{PRIVATE_DIR_MODE, PRIVATE_FILE_MODE};
+
 use maki_agent::{FileQuery, FileReader, Ranked};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Buffer, Lua, Result as LuaResult, Table, UserData, UserDataMethods, Value};
@@ -32,8 +35,6 @@ use crate::runtime::LUA_MEMORY_LIMIT;
 // Luau allows strings and buffers up to 1 GiB, but the VM budget is the binding
 // limit: a read the VM cannot hold dies with a Lua memory error instead.
 const MAX_READ_BYTES: u64 = LUA_MEMORY_LIMIT as u64;
-#[cfg(unix)]
-const PRIVATE_FILE_MODE: u32 = 0o600;
 pub(super) const LOCK_BUSY: &str = "lock is held";
 const NON_UTF8_CONTENT_ERR: &str = "non-utf8 content; use read_bytes";
 const TAIL_SCAN_CHUNK: usize = 64 * 1024;
@@ -41,8 +42,6 @@ const TAIL_SCAN_CHUNK: usize = 64 * 1024;
 const INVALID_UTF8_PATH: &str = "path is not valid UTF-8";
 const INVALID_TEMPLATE: &str = "temporary directory template must end in XXXXXX";
 const TEMP_SUFFIX: &str = "XXXXXX";
-#[cfg(unix)]
-const PRIVATE_DIR_MODE: u32 = 0o700;
 
 pub(super) fn path_text(path: PathBuf) -> IoResult<String> {
     path.into_os_string()

@@ -55,9 +55,8 @@ M.MIN_TIMEOUT_SECS = 30
 M.MAX_TIMEOUT_SECS = 1800
 -- The process that runs the task answers these requests, so the answers
 -- cover every settings source it merged, managed policy included.
-M.HANDSHAKE = native.handshake
+M.HANDSHAKE_INPUT = native.handshake_input
 
-local EMPTY_MCP_CONFIG = native.empty_mcp_config
 local INSTRUCTIONS_HEADING = "The instructions maki loaded for this task, from the project and the user:"
 
 -- Claude Code passes its environment to Bash, in the sandbox too (tested on
@@ -190,11 +189,7 @@ function M.home_credentials(home, extra, environ)
       add(resolved)
     end
   end
-  local extras, paths_err = M.denied_home_paths(extra)
-  if not extras then
-    return nil, paths_err
-  end
-  for _, path in ipairs(extras) do
+  for _, path in ipairs(extra or {}) do
     deny(path)
   end
   local env = environ or {}
@@ -260,7 +255,7 @@ end
 
 function M.deny_rules(extra)
   local rules = {}
-  for i, pattern in ipairs(assert(path_utils.denied_paths(extra))) do
+  for i, pattern in ipairs(extra) do
     rules[i] = "Read(./" .. pattern .. ")"
   end
   return rules
@@ -277,67 +272,30 @@ function M.worker_handshake(spec)
   return native.worker_handshake(spec.worker.reported_modes, worker_policy(spec))
 end
 
---- `--setting-sources ""` drops the user's hooks, permissions and MCP
---- servers, and these settings turn off what Claude Code loads on its own. A
---- Workers that run commands use the sandbox with {spec.confine}'s absolute
---- paths, and Bash runs only inside it.
-function M.settings(spec)
-  return native.worker_settings(worker_policy(spec))
-end
-
 --- Returns how many whole seconds a call can run: {requested} or
 --- {configured}, clamped to the limits.
 function M.task_timeout(requested, configured)
   return math.floor(math.clamp(requested or configured, M.MIN_TIMEOUT_SECS, M.MAX_TIMEOUT_SECS))
 end
 
-function M.control_request(request)
-  return maki.json.encode({
-    type = "control_request",
-    request_id = request.id,
-    request = { subtype = request.subtype },
-  }) .. "\n"
-end
-
-function M.handshake_input()
-  local requests = {}
-  for _, request in ipairs(M.HANDSHAKE) do
-    requests[#requests + 1] = M.control_request(request)
-  end
-  return table.concat(requests)
-end
-
 --- Sent on stdin, so the process list never shows the task.
 --- {instructions} come first, because Claude Code loads none by itself.
 function M.user_message(prompt, instructions)
-  local content = prompt
+  local blocks = {}
   if instructions and instructions ~= "" then
-    content = {
-      { type = "text", text = INSTRUCTIONS_HEADING .. instructions },
-      { type = "text", text = prompt },
-    }
+    blocks[#blocks + 1] = INSTRUCTIONS_HEADING .. instructions
   end
-  return maki.json.encode({ type = "user", message = { role = "user", content = content } }) .. "\n"
+  blocks[#blocks + 1] = prompt
+  return native.user_message(blocks)
 end
 
 --- {spec} has the executable, model, deny and worker, plus `confine`
 --- for a sandboxed worker.
 function M.argv(spec)
   local worker = spec.worker
-  local args = native.base_args(
-    spec.model,
-    table.concat(worker.tools, ","),
-    worker.permission_mode,
-    maki.json.encode(M.settings(spec))
-  )
+  local args =
+    native.worker_args(spec.model, worker.tools, worker.permission_mode, worker_policy(spec), worker.contract)
   table.insert(args, 1, spec.executable)
-  local extra = {
-    "--mcp-config",
-    EMPTY_MCP_CONFIG,
-    "--append-system-prompt",
-    worker.contract,
-  }
-  table.move(extra, 1, #extra, #args + 1, args)
   return args
 end
 
@@ -400,7 +358,7 @@ function M.probe(call, spec, argv, env)
       end
     end,
     started = function(id)
-      return jobs.feed_stdin(id, M.handshake_input())
+      return jobs.feed_stdin(id, M.HANDSHAKE_INPUT)
     end,
   }, M.STARTUP_MS)
   if not ok then

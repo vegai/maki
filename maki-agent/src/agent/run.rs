@@ -451,18 +451,6 @@ impl<'h> Agent<'h> {
                 return Ok(DoneReason::MaxTurns);
             }
             self.try_auto_compact().await?;
-            if self.final_answer_turn()
-                && self
-                    .history
-                    .as_slice()
-                    .last()
-                    .filter(|message| message.display_text.as_deref() == Some(""))
-                    .and_then(Message::first_text_content)
-                    != Some(FINAL_ANSWER_NOTE)
-            {
-                self.history
-                    .push(Message::synthetic(FINAL_ANSWER_NOTE.to_owned()));
-            }
             let outcome = self.turn().await;
             self.history.checkpoint(self.gauge.size()).await;
             match outcome? {
@@ -564,6 +552,21 @@ impl<'h> Agent<'h> {
         if !continues_answer {
             self.tell_changes();
         }
+        if self.final_answer_turn()
+            && !self
+                .history
+                .as_slice()
+                .iter()
+                .rev()
+                .take_while(|message| message.role != Role::Assistant)
+                .any(|message| {
+                    message.display_text.as_deref() == Some("")
+                        && message.first_text_content() == Some(FINAL_ANSWER_NOTE)
+                })
+        {
+            self.history
+                .push(Message::synthetic(FINAL_ANSWER_NOTE.to_owned()));
+        }
         Ok(())
     }
 
@@ -650,8 +653,11 @@ impl<'h> Agent<'h> {
         self.emit_turn_complete(&response)?;
 
         if has_tools && self.config.final_answer && self.turns_exhausted() {
+            let history_len_before = self.history.len();
             self.history.push(response.message);
             self.history.close_dangling_tool_calls(FINAL_TOOLS_DENIED);
+            self.gauge
+                .append(&self.history.as_slice()[history_len_before..]);
             return Ok(TurnOutcome::Done(DoneReason::MaxTurns));
         }
 
@@ -1210,7 +1216,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use maki_config::ProjectConfig;
-    use maki_providers::provider::{BoxFuture, ModelListing, Provider, RequestScope};
+    use maki_providers::provider::{BoxFuture, Provider, RequestScope};
     use maki_providers::{
         ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
         StreamResponse, ThinkingSupport, TokenUsage,
@@ -1244,6 +1250,7 @@ mod tests {
     const DEFAULT_IDENTITY_PREFIX: &str = "You are Maki, an interactive CLI coding agent.";
     const ONE_GAUGE_MSG: &str =
         "TurnComplete, Done, and the compaction trigger must read one context gauge";
+    const FINAL_CONTEXT_INPUT: u32 = 1_000;
     const NOTICE_BODY: &str = "Background task find auth finished:\n\nok";
     const NOTICE_LINE: &str = "Background agent finished: find auth";
 
@@ -1331,10 +1338,7 @@ mod tests {
             })
         }
 
-        fn list_models(
-            &self,
-            _listing: ModelListing,
-        ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
             Box::pin(async { unimplemented!() })
         }
     }
@@ -1374,10 +1378,7 @@ mod tests {
             })
         }
 
-        fn list_models(
-            &self,
-            _listing: ModelListing,
-        ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
             Box::pin(async { unimplemented!() })
         }
     }
@@ -2119,11 +2120,12 @@ mod tests {
     #[test_case(true ; "model_still_calls_a_tool")]
     fn final_answer_turn_preserves_the_prefix_and_executes_no_tools(calls_tool: bool) {
         smol::block_on(async {
-            let final_response = if calls_tool {
+            let mut final_response = if calls_tool {
                 tool_call_response("glob", "last")
             } else {
                 text_response(StopReason::EndTurn)
             };
+            final_response.usage.input = FINAL_CONTEXT_INPUT;
             let mut history = History::new(Vec::new());
             let provider =
                 MockProvider::new(vec![tool_call_response("glob", "first"), final_response]);
@@ -2132,6 +2134,11 @@ mod tests {
             agent.config.max_turns = Some(2);
             agent.config.final_answer = true;
             let reason = agent.run(default_input()).await.unwrap();
+            if calls_tool {
+                let mut expected = ContextGauge::restored(FINAL_CONTEXT_INPUT);
+                expected.append(&agent.history.as_slice()[agent.history.len() - 2..]);
+                assert_eq!(agent.gauge.size(), expected.size());
+            }
             assert_eq!(
                 reason,
                 if calls_tool {
@@ -2179,6 +2186,34 @@ mod tests {
                 .collect();
             assert_eq!(notes, [None, Some("")]);
         });
+    }
+
+    #[test_case(false ; "preparation_retried")]
+    #[test_case(true ; "facts_change_during_retry")]
+    fn final_answer_note_survives_context_updates_without_duplication(change_again: bool) {
+        let mut history = History::new(Vec::new());
+        let world = World::default();
+        let (mut agent, _) = make_agent(MockProvider::new(Vec::new()), &mut history);
+        agent.context = world.builder();
+        agent.config.max_turns = Some(1);
+        agent.config.final_answer = true;
+        agent.prepare_request().unwrap();
+        agent.prompt_facts.as_mut().unwrap().date = NEXT_DATE.into();
+        agent.prepare_request().unwrap();
+        if change_again {
+            agent.prompt_facts.as_mut().unwrap().cwd = HERE_CWD.into();
+            agent.prepare_request().unwrap();
+        }
+        assert_eq!(
+            agent
+                .history
+                .as_slice()
+                .iter()
+                .filter(|message| message.first_text_content() == Some(FINAL_ANSWER_NOTE))
+                .count(),
+            1
+        );
+        assert!(!updates(agent.history).is_empty());
     }
 
     fn small_context_model(context_window: u32, max_output_tokens: u32) -> Model {
@@ -3396,10 +3431,7 @@ mod tests {
             })
         }
 
-        fn list_models(
-            &self,
-            _listing: ModelListing,
-        ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
             Box::pin(async { unimplemented!() })
         }
     }
@@ -3465,10 +3497,7 @@ mod tests {
             })
         }
 
-        fn list_models(
-            &self,
-            _listing: ModelListing,
-        ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
             Box::pin(async { unimplemented!() })
         }
     }
@@ -3501,7 +3530,15 @@ mod tests {
                 agent.config.max_turns = Some(1);
                 agent.config.final_answer = true;
             }
-            let recovered = agent.run(default_input()).await.is_ok();
+            let input = AgentInput {
+                mode: if bounded {
+                    AgentMode::Plan(PLAN_FILE.into())
+                } else {
+                    AgentMode::Build
+                },
+                ..default_input()
+            };
+            let recovered = agent.run(input).await.is_ok();
             drop(agent);
 
             assert_eq!(recovered, expected, "{message}");

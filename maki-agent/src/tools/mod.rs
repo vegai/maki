@@ -43,7 +43,7 @@ use crate::{AgentConfig, AgentMode, EventSender, RunLedger, SharedBuf};
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_providers::Model;
 use maki_providers::RequestOptions;
-use maki_providers::provider::{ModelListing, Provider, RequestScope};
+use maki_providers::provider::{Provider, RequestScope};
 use maki_storage::id::{MakiId, SessionRef};
 
 pub(crate) const TOOL_NAME_FIELD: &str = "name";
@@ -163,16 +163,7 @@ impl ToolFilter {
         self.matches_where(|candidate| candidate == name, ToolLocation::Registry)
     }
 
-    pub fn admits(
-        &self,
-        name: &str,
-        audience: ToolAudience,
-        caller: ToolAudience,
-        local_tools: Option<&LocalTools>,
-    ) -> bool {
-        if let Some(tool) = local_tools.and_then(|tools| tools.get(name)) {
-            return self.admits_local(name, tool.audience, caller);
-        }
+    pub fn admits(&self, name: &str, audience: ToolAudience, caller: ToolAudience) -> bool {
         audience.contains(caller) && self.matches(name)
     }
 
@@ -296,7 +287,10 @@ impl RequestTools {
                     let registered = registry
                         .get(name)
                         .map_or(ToolAudience::all(), |entry| entry.tool.audience());
-                    filter.admits(name, registered, audience, Some(local_tools))
+                    match local_tools.get(name) {
+                        Some(tool) => filter.admits_local(name, tool.audience, audience),
+                        None => filter.admits(name, registered, audience),
+                    }
                 })
             });
         }
@@ -615,7 +609,6 @@ impl Provider for NullProvider {
 
     fn list_models(
         &self,
-        _listing: ModelListing,
     ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, crate::AgentError>> {
         Box::pin(async { unimplemented!() })
     }
@@ -1070,20 +1063,16 @@ mod tests {
             ToolAudience::MAIN,
         );
         assert_eq!(
-            built.filter().admits(
-                WRITE_TOOL_NAME,
-                ToolAudience::all(),
-                ToolAudience::MAIN,
-                Some(&local_tools)
-            ),
+            built
+                .filter()
+                .admits_local(WRITE_TOOL_NAME, ToolAudience::all(), ToolAudience::MAIN),
             !denied
         );
         assert_eq!(
-            assembled.filter().admits(
+            assembled.filter().admits_local(
                 WRITE_TOOL_NAME,
                 ToolAudience::all(),
-                ToolAudience::MAIN,
-                Some(&local_tools)
+                ToolAudience::MAIN
             ),
             !denied
         );
@@ -1123,12 +1112,9 @@ mod tests {
             &if offered { definitions } else { json!([]) }
         );
         assert_eq!(
-            tools.filter().admits(
-                WRITE_TOOL_NAME,
-                ToolAudience::all(),
-                caller,
-                Some(&local_tools)
-            ),
+            tools
+                .filter()
+                .admits_local(WRITE_TOOL_NAME, tool_audience, caller),
             offered
         );
     }

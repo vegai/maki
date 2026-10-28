@@ -625,12 +625,16 @@ impl Provider for CompatProvider {
         })
     }
 
-    fn list_models(
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        let auth = self.auth.lock().unwrap().clone();
+        Box::pin(async move { self.compat.do_list_models(&auth).await })
+    }
+
+    fn list_models_for(
         &self,
         _listing: ModelListing,
     ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        let auth = self.auth.lock().unwrap().clone();
-        Box::pin(async move { self.compat.do_list_models(&auth).await })
+        self.list_models()
     }
 
     /// The protocol has no usage endpoint. A declaration whose provider has

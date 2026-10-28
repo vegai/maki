@@ -11,6 +11,7 @@ pub mod lock;
 pub mod log;
 pub mod model;
 pub mod paths;
+pub mod permissions;
 pub mod plans;
 pub mod sessions;
 pub mod theme;

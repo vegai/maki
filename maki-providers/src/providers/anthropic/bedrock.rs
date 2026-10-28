@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use crate::model::Model;
-use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
+use crate::provider::{BoxFuture, Provider, RequestScope};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::shared;
@@ -706,10 +706,7 @@ impl Provider for Bedrock {
         })
     }
 
-    fn list_models(
-        &self,
-        _listing: ModelListing,
-    ) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async {
             let models: Vec<crate::model::ModelInfo> = super::SPEC
                 .models()

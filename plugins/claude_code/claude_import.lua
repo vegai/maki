@@ -1,5 +1,4 @@
 local native = require("maki.claude_code.internal")
-local snapshot = require("claude_snapshot")
 local workspace = require("claude_workspace")
 local git_utils = require("claude_git")
 local import_scripts = require("claude_import_script")

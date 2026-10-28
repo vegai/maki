@@ -22,7 +22,6 @@
 //! this binary. Nothing one case leaves behind can reach the next.
 
 use super::environment;
-use maki_providers::provider::ModelListing;
 use maki_providers::provider::RequestScope;
 use std::collections::BTreeMap;
 use std::num::NonZero;
@@ -367,7 +366,7 @@ impl Replay {
     }
 
     fn models(&self) -> Value {
-        let listed = smol::block_on(self.provider.list_models(ModelListing::Cached));
+        let listed = smol::block_on(self.provider.list_models());
         json!({
             REQUESTS_KEY: self.recorded(),
             OUTCOME_KEY: listing(&listed),
@@ -379,7 +378,7 @@ impl Replay {
     /// through the request path alone.
     fn discovered(&self, slug: &str, turn: &Turn) -> Value {
         let model = turn.model();
-        let listed = smol::block_on(self.provider.list_models(ModelListing::Cached));
+        let listed = smol::block_on(self.provider.list_models());
         if let Ok(models) = &listed {
             model_registry::set_known_models(slug, models.clone());
         }

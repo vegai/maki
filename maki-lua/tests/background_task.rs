@@ -9,7 +9,7 @@ use maki_agent::tools::{ToolContext, ToolExecResult, ToolRegistry};
 use maki_agent::{AgentSeed, CancelToken, ModelSlot, SessionMailbox, ToolOutput};
 use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::{PluginHost, SessionEndReason};
-use maki_providers::provider::{BoxFuture, ModelListing, Provider, RequestScope};
+use maki_providers::provider::{BoxFuture, Provider, RequestScope};
 use maki_providers::{
     AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
     StopReason, StreamResponse, TokenUsage,
@@ -70,10 +70,7 @@ impl Provider for ParkedProvider {
         })
     }
 
-    fn list_models(
-        &self,
-        _listing: ModelListing,
-    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }

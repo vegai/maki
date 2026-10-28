@@ -4,9 +4,11 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::mem;
+#[cfg(target_os = "linux")]
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -18,6 +20,7 @@ use maki_providers::{process, shell_command, strip_provider_keys};
 use maki_storage::id::MakiId;
 use mlua::{Lua, RegistryKey};
 use shell_words::join as shell_join;
+use smol::lock::Mutex as AsyncMutex;
 
 use crate::api::fs::expand_tilde;
 
@@ -31,6 +34,8 @@ const READER_BUF_SIZE: usize = 8 * 1024;
 const JOB_EXITED_ERR: &str = "job: exited or closed its stdin";
 const STDIN_WRITE_ERR: &str = "job: writing stdin failed";
 const NO_STDIN_ERR: &str = "job: stdin is not an open pipe";
+const STDIN_FULL_ERR: &str = "job: stdin queue exceeds 16 MiB; wait for the job to consume input";
+const MAX_STDIN_BYTES: usize = 16 * 1024 * 1024;
 const STDOUT_STREAM: &str = "stdout";
 const STDERR_STREAM: &str = "stderr";
 const EXIT_EVENT: &str = "exit";
@@ -175,6 +180,23 @@ pub(crate) struct JobSpec {
 }
 
 impl JobSpec {
+    pub(super) fn spawn(self) -> Result<SpawnedJob, String> {
+        let mut command = self.command()?;
+        #[cfg(target_os = "linux")]
+        let lifetime = if self.guard {
+            Some(process::guard::bind(&mut command).map_err(|error| error.to_string())?)
+        } else {
+            None
+        };
+        let child = Unwatched(Some(command.spawn().map_err(|error| error.to_string())?));
+        Ok(SpawnedJob {
+            child,
+            #[cfg(target_os = "linux")]
+            lifetime,
+            spec: self,
+        })
+    }
+
     fn command(&self) -> Result<Command, String> {
         #[cfg(not(target_os = "linux"))]
         if self.guard {
@@ -370,9 +392,17 @@ pub(crate) struct CallbackUpdates {
     pub(super) on_exit: CallbackUpdate,
 }
 
+pub(super) struct SpawnedJob {
+    child: Unwatched,
+    #[cfg(target_os = "linux")]
+    lifetime: Option<UnixStream>,
+    spec: JobSpec,
+}
+
 pub(crate) struct JobStore {
     jobs: HashMap<u32, JobMeta>,
     next_id: u32,
+    pub(super) start_gate: Arc<AsyncMutex<()>>,
     /// Id served by the last [`JobStore::next_matching`], so the next scan
     /// starts past it.
     scan_cursor: u32,
@@ -383,12 +413,23 @@ impl JobStore {
         Self {
             jobs: HashMap::new(),
             next_id: 1,
+            start_gate: Arc::default(),
             scan_cursor: 0,
         }
     }
 
+    #[cfg(test)]
     pub fn start(&mut self, spec: JobSpec) -> Result<u32, String> {
-        let mut command = spec.command()?;
+        self.register(spec.spawn()?)
+    }
+
+    pub(super) fn register(&mut self, spawned: SpawnedJob) -> Result<u32, String> {
+        let SpawnedJob {
+            mut child,
+            #[cfg(target_os = "linux")]
+            lifetime,
+            spec,
+        } = spawned;
         let JobSpec {
             owner,
             cmd,
@@ -403,17 +444,13 @@ impl JobStore {
             on_exit,
             ..
         } = spec;
-        #[cfg(target_os = "linux")]
-        let lifetime = if guard {
-            Some(process::guard::bind(&mut command).map_err(|error| error.to_string())?)
-        } else {
-            None
-        };
-        let mut child = command.spawn().map_err(|e| e.to_string())?;
-        let pid = child.id();
-        let (stdin_pipe, stdout_pipe, stderr_pipe) =
-            (child.stdin.take(), child.stdout.take(), child.stderr.take());
-        let mut unwatched = Unwatched(Some(child));
+        let process = child.0.as_mut().ok_or(JOB_EXITED_ERR)?;
+        let pid = process.id();
+        let (stdin_pipe, stdout_pipe, stderr_pipe) = (
+            process.stdin.take(),
+            process.stdout.take(),
+            process.stderr.take(),
+        );
         let id = self.next_id;
         self.next_id += 1;
 
@@ -435,7 +472,7 @@ impl JobStore {
             .spawn(move || {
                 #[cfg(target_os = "linux")]
                 let _lifetime = lifetime;
-                let Some(child) = unwatched.0.take() else {
+                let Some(child) = child.0.take() else {
                     return;
                 };
                 #[cfg(target_os = "linux")]
@@ -766,18 +803,34 @@ impl JobStore {
         if job.exit_code.is_some() {
             return Err(JOB_EXITED_ERR);
         }
+        let stdin = job.stdin.as_ref().ok_or(NO_STDIN_ERR)?;
+        match job.reap_state.stdin_error.load(Ordering::Acquire) {
+            STDIN_EXITED => return Err(JOB_EXITED_ERR),
+            STDIN_FAILED => return Err(STDIN_WRITE_ERR),
+            _ => {}
+        }
         let len = data.len();
-        job.stdin
-            .as_ref()
-            .ok_or(NO_STDIN_ERR)?
-            .send(data)
-            .map_err(|_| {
+        if len == 0 {
+            return Ok(0);
+        }
+        job.reap_state
+            .stdin_bytes
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                queued
+                    .checked_add(len)
+                    .filter(|bytes| *bytes <= MAX_STDIN_BYTES)
+            })
+            .map_err(|_| STDIN_FULL_ERR)?;
+        if stdin.send(data).is_err() {
+            job.reap_state.stdin_bytes.fetch_sub(len, Ordering::AcqRel);
+            return Err(
                 if job.reap_state.stdin_error.load(Ordering::Acquire) == STDIN_EXITED {
                     JOB_EXITED_ERR
                 } else {
                     STDIN_WRITE_ERR
-                }
-            })?;
+                },
+            );
+        }
         Ok(len)
     }
 
@@ -942,7 +995,9 @@ fn spawn_stdin_writer(
         .name("job-stdin".into())
         .spawn(move || {
             for chunk in rx {
-                if let Err(error) = stdin.write_all(&chunk) {
+                let result = stdin.write_all(&chunk);
+                state.stdin_bytes.fetch_sub(chunk.len(), Ordering::AcqRel);
+                if let Err(error) = result {
                     state.stdin_error.store(
                         if matches!(
                             error.kind(),
@@ -969,6 +1024,7 @@ struct ReapState {
     group: Mutex<GroupSignals>,
     timed_out: AtomicBool,
     stdin_error: AtomicU8,
+    stdin_bytes: AtomicUsize,
 }
 
 impl ReapState {
@@ -1748,6 +1804,54 @@ mod tests {
         );
     }
 
+    #[test_case(0, STDIN_WRITE_ERR ; "disconnected_writer")]
+    #[test_case(STDIN_EXITED, JOB_EXITED_ERR ; "exited_writer")]
+    #[test_case(STDIN_FAILED, STDIN_WRITE_ERR ; "failed_writer")]
+    fn stdin_queue_errors_do_not_leak_reservations(state: u8, expected: &str) {
+        let mut store = make_store();
+        let mut job = stub_job(task_owner(1), None, None);
+        let (tx, rx) = flume::unbounded();
+        drop(rx);
+        job.stdin = Some(tx);
+        job.reap_state.stdin_error.store(state, Ordering::Release);
+        store.jobs.insert(1, job);
+        assert_eq!(store.send(1, Some(1), TEST_PLUGIN, vec![0]), Err(expected));
+        assert_eq!(
+            store.jobs[&1]
+                .reap_state
+                .stdin_bytes
+                .load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[test]
+    fn stdin_queue_bounds_bytes_and_ignores_empty_writes() {
+        let mut store = make_store();
+        let mut job = stub_job(task_owner(1), None, None);
+        let (tx, rx) = flume::unbounded();
+        job.stdin = Some(tx);
+        store.jobs.insert(1, job);
+        assert_eq!(store.send(1, Some(1), TEST_PLUGIN, Vec::new()), Ok(0));
+        assert!(rx.is_empty());
+        assert_eq!(
+            store.send(1, Some(1), TEST_PLUGIN, vec![0; MAX_STDIN_BYTES]),
+            Ok(MAX_STDIN_BYTES)
+        );
+        assert_eq!(
+            store.send(1, Some(1), TEST_PLUGIN, vec![0]),
+            Err(STDIN_FULL_ERR)
+        );
+        assert_eq!(rx.len(), 1);
+        assert_eq!(
+            store.jobs[&1]
+                .reap_state
+                .stdin_bytes
+                .load(Ordering::Acquire),
+            MAX_STDIN_BYTES
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn piped_stdin_reaches_the_job_until_it_is_closed() {
@@ -1773,6 +1877,13 @@ mod tests {
             })
             .collect();
         assert_eq!(out, [line]);
+        assert_eq!(
+            store.jobs[&id]
+                .reap_state
+                .stdin_bytes
+                .load(Ordering::Acquire),
+            0
+        );
         assert!(
             events
                 .iter()

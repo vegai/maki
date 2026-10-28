@@ -1,25 +1,25 @@
+mod blobs;
+mod snapshot;
+
 use std::collections::HashMap;
-use std::fmt::Write;
+use std::fmt::{self, Write};
 use std::fs;
 use std::io::{Error as IoError, ErrorKind};
 use std::ops::RangeInclusive;
-#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
-#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::str::from_utf8;
 
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::claude_code::validation::{
-    self, WorkerHandshake as NativeHandshake, WorkerPolicy,
+    self, EventKind, WorkerHandshake as NativeHandshake, WorkerPolicy,
 };
-#[cfg(unix)]
-use maki_providers::claude_code::{blobs, snapshot};
 use mlua::{
     Error as LuaError, Lua, LuaSerdeExt, LuaString, Result as LuaResult, Table, UserData,
     UserDataMethods, Value as LuaValue,
 };
+use rustix::fs::OFlags;
 use serde_json::Value;
 
 use crate::api::fs::{LOCK_BUSY, path_text};
@@ -27,14 +27,16 @@ use crate::api::util::convert::{TableExt, json_to_lua};
 use crate::api::util::pair::{Pair, pair, try_pair};
 use crate::plugin_permissions::PluginPermissions;
 
+const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
+
 pub(crate) const MODULE: &str = "maki.claude_code.internal";
-#[cfg(unix)]
 const OWNER_EXECUTE: u32 = 0o100;
 const HOME_STATE_PREFIX: &str = ".claude.json";
 const BMP_LIMIT: u32 = 0xffff;
 const MAX_UTF8_BYTES: usize = 4;
-const SYSTEM_EVENT: &str = "system";
-const INIT_EVENT: &str = "init";
 // Fields consumed by claude_stream.tool_line; the bundled progress-line spec checks this boundary.
 const TOOL_PROGRESS_FIELDS: &[&str] = &["file_path", "path", "pattern"];
 const VARIATION_SELECTORS: &[RangeInclusive<u32>] = &[
@@ -50,8 +52,7 @@ pub(crate) fn create_private_module(
 ) -> LuaResult<(&'static str, Table)> {
     let table = create_claude_code_table(lua, perms)?;
     table.set("lock_busy", LOCK_BUSY)?;
-    table.set("handshake", json_to_lua(lua, &validation::handshake())?)?;
-    table.set("empty_mcp_config", validation::EMPTY_MCP_CONFIG)?;
+    table.set("handshake_input", validation::handshake_input())?;
     table.set("startup_timeout_secs", validation::STARTUP_TIMEOUT_SECS)?;
     table.set("default_executable", validation::DEFAULT_EXECUTABLE)?;
     table.set(
@@ -76,42 +77,74 @@ fn is_printable(character: char) -> bool {
     }
 }
 
-/// Escape invisible path characters while preserving visible Unicode sequences.
-/// @param text string Path or shell-quoted path.
-/// @param shell boolean? Emit byte escapes for a Bash command.
-/// @return (string) Escaped text, or unchanged invalid UTF-8 bytes.
+fn escape_bytes(escaped: &mut String, bytes: &[u8], shell: bool) -> fmt::Result {
+    if shell {
+        escaped.push_str("'$'");
+    }
+    for byte in bytes {
+        write!(escaped, "\\{byte:03o}")?;
+    }
+    if shell {
+        escaped.push_str("''");
+    }
+    Ok(())
+}
+
+/// Quote a path for Bash or escape invisible characters for display.
+/// @param text string Raw path bytes.
+/// @param shell boolean? Emit a Bash-quoted path.
+/// @return (string) Escaped path.
 #[lua_fn]
-fn escape_invisible(lua: &Lua, text: LuaString, shell: Option<bool>) -> LuaResult<LuaString> {
-    let Ok(value) = text.to_str() else {
-        return Ok(text);
-    };
-    let mut escaped = String::with_capacity(value.len());
+fn escape_path(lua: &Lua, text: LuaString, shell: Option<bool>) -> LuaResult<LuaString> {
+    let shell = shell == Some(true);
+    let bytes = text.as_bytes();
+    let mut escaped = String::with_capacity(bytes.len());
+    if shell {
+        escaped.push('\'');
+    }
     let mut previous: Option<char> = None;
-    for character in value.chars() {
-        let visible = is_printable(character);
-        if visible
-            || previous.is_some_and(|base| !base.is_ascii())
-                && VARIATION_SELECTORS
-                    .iter()
-                    .any(|range| range.contains(&u32::from(character)))
-        {
-            escaped.push(character);
-        } else if shell == Some(true) {
-            escaped.push_str("'$'");
-            for byte in character.encode_utf8(&mut [0; MAX_UTF8_BYTES]).bytes() {
-                write!(escaped, "\\{byte:03o}").map_err(LuaError::external)?;
-            }
-            escaped.push_str("''");
-        } else {
-            let code = u32::from(character);
-            if code <= BMP_LIMIT {
-                write!(escaped, "\\u{code:04x}")
+    for chunk in bytes.utf8_chunks() {
+        for character in chunk.valid().chars() {
+            let visible = is_printable(character);
+            if character.is_ascii() && character.is_control() {
+                escape_bytes(&mut escaped, &[character as u8], shell)
+                    .map_err(LuaError::external)?;
+            } else if visible
+                || previous.is_some_and(|base| !base.is_ascii())
+                    && VARIATION_SELECTORS
+                        .iter()
+                        .any(|range| range.contains(&u32::from(character)))
+            {
+                match (character, shell) {
+                    ('\'', true) => escaped.push_str("'\\''"),
+                    ('\\', false) => escaped.push_str("\\\\"),
+                    _ => escaped.push(character),
+                }
+            } else if shell {
+                escape_bytes(
+                    &mut escaped,
+                    character.encode_utf8(&mut [0; MAX_UTF8_BYTES]).as_bytes(),
+                    true,
+                )
+                .map_err(LuaError::external)?;
             } else {
-                write!(escaped, "\\U{code:08x}")
+                let code = u32::from(character);
+                if code <= BMP_LIMIT {
+                    write!(escaped, "\\u{code:04x}")
+                } else {
+                    write!(escaped, "\\U{code:08x}")
+                }
+                .map_err(LuaError::external)?;
             }
-            .map_err(LuaError::external)?;
+            previous = visible.then_some(character);
         }
-        previous = visible.then_some(character);
+        if !chunk.invalid().is_empty() {
+            escape_bytes(&mut escaped, chunk.invalid(), shell).map_err(LuaError::external)?;
+            previous = None;
+        }
+    }
+    if shell {
+        escaped.push('\'');
     }
     lua.create_string(escaped)
 }
@@ -218,30 +251,38 @@ fn worker_handshake(lua: &Lua, modes: Vec<String>, policy: Table) -> LuaResult<W
     Ok(WorkerHandshake(NativeHandshake::new(modes, policy)))
 }
 
-/// Launch arguments shared with the subscription provider.
+/// Build worker arguments without serializing launch settings through Lua.
 /// @param model string Model name.
-/// @param tools string Comma-separated tool names.
+/// @param tools table Claude Code tool names.
 /// @param mode string Permission mode.
-/// @param settings string Serialized launch settings.
+/// @param policy table Deny rules and optional sandbox paths.
+/// @param contract string Worker instructions.
 /// @return (table) Command-line arguments.
 #[lua_fn]
-fn base_args(
-    _lua: &Lua,
+fn worker_args(
+    lua: &Lua,
     model: String,
-    tools: String,
+    tools: Vec<String>,
     mode: String,
-    settings: String,
+    policy: Table,
+    contract: String,
 ) -> LuaResult<Vec<String>> {
-    Ok(validation::base_args(&model, &tools, &mode, &settings))
+    let policy: WorkerPolicy = lua.from_value(LuaValue::Table(policy))?;
+    Ok(validation::worker_args(
+        &model,
+        &tools.join(","),
+        &mode,
+        &policy,
+        &contract,
+    ))
 }
 
-/// Build the worker settings from deny rules and optional sandbox paths.
-/// @param policy table Deny rules and optional sandbox paths.
-/// @return (table) Launch settings.
+/// Encode prompt blocks in the shared worker protocol.
+/// @param blocks table Prompt text blocks in order.
+/// @return (string) NDJSON user message.
 #[lua_fn]
-fn worker_settings(lua: &Lua, policy: Table) -> LuaResult<LuaValue> {
-    let policy: WorkerPolicy = lua.from_value(LuaValue::Table(policy))?;
-    json_to_lua(lua, &policy.settings())
+fn user_message(_lua: &Lua, blocks: Vec<String>) -> LuaResult<String> {
+    validation::user_message(&blocks).map_err(LuaError::external)
 }
 
 /// Prepare the login environment and validate every skipped settings file.
@@ -257,8 +298,12 @@ async fn prepare_launch(
     cwd: String,
 ) -> LuaResult<Pair<Table>> {
     let prepared = try_pair!(
-        smol::unblock(move || validation::worker_launch(environ, configured, Path::new(&cwd)))
-            .await
+        smol::unblock(move || validation::prepare_launch(
+            environ.into_iter().collect(),
+            configured.map(PathBuf::from),
+            Path::new(&cwd)
+        ))
+        .await
     );
     let result = lua.create_table()?;
     result.set("env", lua.create_table_from(prepared.env)?)?;
@@ -321,37 +366,29 @@ async fn sanitize_git(
     quarantine: String,
     git: String,
 ) -> LuaResult<Pair<Table>> {
-    #[cfg(unix)]
-    {
-        let result = smol::unblock(move || {
-            snapshot::sanitize_snapshot(
-                Path::new(&snapshot),
-                Path::new(&quarantine),
-                Path::new(&git),
-            )
-        })
-        .await;
-        match result {
-            Ok(paths) => {
-                let result = lua.create_table()?;
-                result.set("git_metadata", paths.git_metadata)?;
-                result.set("repositories", paths.repositories)?;
-                result.set("private_files", paths.private_files)?;
-                let symlinks = paths
-                    .symlinks
-                    .iter()
-                    .map(|path| lua.create_string(path.as_os_str().as_bytes()))
-                    .collect::<LuaResult<Vec<_>>>()?;
-                result.set("symlinks", lua.create_sequence_from(symlinks)?)?;
-                Ok((Some(result), None))
-            }
-            Err(error) => Ok((None, Some(error.to_string()))),
+    let result = smol::unblock(move || {
+        snapshot::sanitize_snapshot(
+            Path::new(&snapshot),
+            Path::new(&quarantine),
+            Path::new(&git),
+        )
+    })
+    .await;
+    match result {
+        Ok(paths) => {
+            let result = lua.create_table()?;
+            result.set("git_metadata", paths.git_metadata)?;
+            result.set("repositories", paths.repositories)?;
+            result.set("private_files", paths.private_files)?;
+            let dropped_links = paths
+                .dropped_links
+                .iter()
+                .map(|path| lua.create_string(path.as_os_str().as_bytes()))
+                .collect::<LuaResult<Vec<_>>>()?;
+            result.set("dropped_links", lua.create_sequence_from(dropped_links)?)?;
+            Ok((Some(result), None))
         }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (lua, snapshot, quarantine, git);
-        Ok((None, Some("snapshot sanitization requires Unix".into())))
+        Err(error) => Ok((None, Some(error.to_string()))),
     }
 }
 
@@ -367,20 +404,12 @@ async fn unpack_blobs(
     stage: String,
     hashes: Vec<String>,
 ) -> LuaResult<Pair<bool>> {
-    #[cfg(unix)]
-    {
-        Ok(pair(
-            smol::unblock(move || {
-                blobs::unpack(Path::new(&batch), Path::new(&stage), &hashes).map(|()| true)
-            })
-            .await,
-        ))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (batch, stage, hashes);
-        Ok((None, Some("blob staging requires Unix".into())))
-    }
+    Ok(pair(
+        smol::unblock(move || {
+            blobs::unpack(Path::new(&batch), Path::new(&stage), &hashes).map(|()| true)
+        })
+        .await,
+    ))
 }
 
 /// Inspect an import target. Missing paths return nil, and blocked or looping parents count as conflicts.
@@ -391,15 +420,11 @@ async fn checkout_file(lua: Lua, path: String) -> LuaResult<Pair<Table>> {
     let value = try_pair!(
         smol::unblock(move || match fs::symlink_metadata(path) {
             Ok(meta) => {
-                #[cfg(unix)]
                 let executable = meta.permissions().mode() & OWNER_EXECUTE != 0;
-                #[cfg(not(unix))]
-                let executable = false;
                 Ok(Some((meta.is_file(), executable)))
             }
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
             Err(error) if error.kind() == ErrorKind::NotADirectory => Ok(Some((false, false))),
-            #[cfg(unix)]
             Err(error) if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) =>
                 Ok(Some((false, false))),
             Err(error) => Err(error),
@@ -428,10 +453,7 @@ fn classify(lua: &Lua, line: String, mode: Table) -> LuaResult<Pair<Table>> {
         mode.opt::<bool>("model_checked")?.unwrap_or(false),
     ));
     let event = &classified.event;
-    if classified.problem.is_none()
-        && event["type"] == SYSTEM_EVENT
-        && event["subtype"] == INIT_EVENT
-    {
+    if classified.problem.is_none() && classified.kind == Some(EventKind::Init) {
         let expect: Table = mode.get("init")?;
         let version: String = expect.get::<Table>("cli")?.get("version")?;
         let cwd: String = expect.get("cwd")?;
@@ -447,8 +469,8 @@ fn classify(lua: &Lua, line: String, mode: Table) -> LuaResult<Pair<Table>> {
         );
     }
     let event = &mut classified.event;
-    match event["type"].as_str() {
-        Some("assistant") => {
+    match classified.kind {
+        Some(EventKind::Assistant) => {
             if let Some(content) = event["message"]
                 .get_mut("content")
                 .and_then(Value::as_array_mut)
@@ -461,8 +483,9 @@ fn classify(lua: &Lua, line: String, mode: Table) -> LuaResult<Pair<Table>> {
                 }
             }
         }
-        Some("result" | "control_response" | "rate_limit_event") => {}
-        Some(SYSTEM_EVENT) if event["subtype"] == INIT_EVENT => {}
+        Some(
+            EventKind::Result | EventKind::ControlResponse | EventKind::RateLimit | EventKind::Init,
+        ) => {}
         _ => {
             if let Some(object) = event.as_object_mut() {
                 object.retain(|key, _| key == "type" || key == "subtype");
@@ -487,16 +510,16 @@ lua_table! {
     /// Private helpers for the bundled Claude Code plugin. JSON inputs retain
     /// the distinction between null, objects and arrays.
     "maki.claude_code.internal" => pub(crate) fn create_claude_code_table(perms: &PluginPermissions), DOCS [
-        shell_secret_problem, escape_invisible, worker_handshake, base_args, worker_settings, prepare_launch(perms), private_dir(perms), home_state_files(perms),
+        shell_secret_problem, escape_path, worker_handshake, worker_args, user_message, prepare_launch(perms), private_dir(perms), home_state_files(perms),
         classify, checkout_file(perms), version_check(perms), invalidate_version, sanitize_git(perms), project_git_dir(perms), unpack_blobs(perms),
     ]
 }
 
-#[cfg(unix)]
 #[cfg(test)]
 mod tests {
     use std::fs::{self, Permissions};
     use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::process::Command;
 
     use mlua::{AnyUserData, Function, Lua, ObjectLike, Table, Value as LuaValue};
     use serde_json::{Value, json};
@@ -511,6 +534,25 @@ mod tests {
     const LINKED: &str = "linked";
     const NESTED: &str = "src";
     const FILE_CONTENT: &str = "file";
+    const PRINT_PATH: &str = "printf %s ";
+
+    #[test_case(b"a'\\\n\xff\xc3\xa9", "a'\\\\\\012\\377é" ; "mixed_valid_and_invalid_utf8")]
+    #[test_case(b"a\xe2\x80\xae\xff", "a\\u202e\\377" ; "bidi_and_invalid_byte")]
+    fn path_escaping_preserves_shell_bytes_and_printable_unicode(bytes: &[u8], display: &str) {
+        let lua = Lua::new();
+        let table = create_claude_code_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let escape: Function = table.get("escape_path").unwrap();
+        let input = lua.create_string(bytes).unwrap();
+        let shown: String = escape.call((input.clone(), false)).unwrap();
+        assert_eq!(shown, display);
+        let quoted: String = escape.call((input, true)).unwrap();
+        let output = Command::new("bash")
+            .args(["-c", &format!("{PRINT_PATH}{quoted}")])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, bytes);
+    }
 
     #[test_case('é', true ; "accented_letter")]
     #[test_case('\u{301}', true ; "combining_accent")]
@@ -533,7 +575,7 @@ mod tests {
     fn variation_selectors_need_a_non_ascii_predecessor(code: u32) {
         let lua = Lua::new();
         let table = create_claude_code_table(&lua, &PluginPermissions::trusted()).unwrap();
-        let escape: Function = table.get("escape_invisible").unwrap();
+        let escape: Function = table.get("escape_path").unwrap();
         for previous in [None, Some('n')] {
             let input = format!(
                 "{}{}",
@@ -690,8 +732,17 @@ mod tests {
         let lua = Lua::new();
         let table = create_claude_code_table(&lua, &PluginPermissions::trusted()).unwrap();
         let policy = json_to_lua(&lua, &policy).unwrap();
-        let settings: Function = table.get("worker_settings").unwrap();
-        assert!(settings.call::<LuaValue>(policy.clone()).is_err());
+        let args: Function = table.get("worker_args").unwrap();
+        assert!(
+            args.call::<LuaValue>((
+                String::new(),
+                Vec::<String>::new(),
+                String::new(),
+                policy.clone(),
+                String::new()
+            ))
+            .is_err()
+        );
         let handshake: Function = table.get("worker_handshake").unwrap();
         assert!(
             handshake

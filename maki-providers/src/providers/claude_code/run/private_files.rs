@@ -1,38 +1,24 @@
+use super::super::checks::inside_checkout;
 use super::super::error::Error;
-#[cfg(target_os = "linux")]
+use maki_storage::permissions::{PRIVATE_DIR_MODE, PRIVATE_FILE_MODE};
 use rustix::io::Errno;
-#[cfg(target_os = "linux")]
 use rustix::process::{Pid, getuid, test_kill_process};
-#[cfg(target_os = "linux")]
 use std::fs;
-#[cfg(unix)]
 use std::fs::Permissions;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-#[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
-#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "linux")]
 use std::process;
-#[cfg(target_os = "linux")]
 use std::sync::{Mutex, OnceLock, PoisonError};
 use tempfile::TempDir;
-#[cfg(target_os = "linux")]
 use tracing::{debug, warn};
 
 pub(super) const DIR_PREFIX: &str = "maki-claude-code.";
-#[cfg(target_os = "linux")]
 pub(super) const OWNER_SEPARATOR: char = '-';
-#[cfg(target_os = "linux")]
 const PID_NAMESPACE: &str = "/proc/self/ns/pid";
-#[cfg(target_os = "linux")]
 const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
-#[cfg(unix)]
-const PRIVATE_FILE_MODE: u32 = 0o600;
-#[cfg(unix)]
-const PRIVATE_DIR_MODE: u32 = 0o700;
 
 pub(in crate::providers::claude_code) struct PrivateDir(Option<TempDir>);
 
@@ -63,7 +49,6 @@ impl Drop for PrivateDir {
 pub(super) fn private_file(path: &Path, content: &str) -> io::Result<()> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
-    #[cfg(unix)]
     options.mode(PRIVATE_FILE_MODE);
     let mut file: File = options.open(path)?;
     file.write_all(content.as_bytes())
@@ -77,22 +62,18 @@ pub(in crate::providers::claude_code) fn private_dir(
     project: &Path,
     denied: &[PathBuf],
 ) -> Result<(PrivateDir, PathBuf), Error> {
-    let inside_checkout =
-        |path: &Path| path.starts_with(project) || denied.iter().any(|dir| path.starts_with(dir));
     let base = base.canonicalize().map_err(|source| Error::Path {
         what: "resolve the temporary directory",
         path: base.to_owned(),
         source,
     })?;
-    if inside_checkout(&base) {
+    if inside_checkout(&base, project, denied) {
         return Err(Error::TempInProject(base));
     }
-    #[cfg(target_os = "linux")]
     sweep_once(&base);
     let prefix = dir_prefix();
     let mut builder = tempfile::Builder::new();
     builder.prefix(&prefix);
-    #[cfg(unix)]
     builder.permissions(Permissions::from_mode(PRIVATE_DIR_MODE));
     let dir = builder.tempdir_in(&base).map_err(|source| Error::Path {
         what: "make a private directory in",
@@ -104,7 +85,7 @@ pub(in crate::providers::claude_code) fn private_dir(
         path: dir.path().to_owned(),
         source,
     })?;
-    if inside_checkout(&path) {
+    if inside_checkout(&path, project, denied) {
         return Err(Error::TempInProject(path));
     }
     Ok((PrivateDir(Some(dir)), path))
@@ -123,14 +104,12 @@ pub(in crate::providers::claude_code) async fn private_dir_async(
 
 /// Scope owners to this boot and pid namespace, including on shared temporary filesystems.
 fn dir_prefix() -> String {
-    #[cfg(target_os = "linux")]
     if let Some(namespace) = owner_namespace() {
         return format!("{DIR_PREFIX}{namespace}{OWNER_SEPARATOR}{}.", process::id());
     }
     DIR_PREFIX.to_owned()
 }
 
-#[cfg(target_os = "linux")]
 pub(super) fn owner_namespace() -> Option<&'static str> {
     static OWNER: OnceLock<Option<String>> = OnceLock::new();
     OWNER
@@ -144,7 +123,6 @@ pub(super) fn owner_namespace() -> Option<&'static str> {
 
 /// Artifact cleanup can take a long time. Run it outside the async threads and scan each
 /// base once.
-#[cfg(target_os = "linux")]
 fn sweep_once(base: &Path) {
     static SWEPT: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     let mut swept = SWEPT.lock().unwrap_or_else(PoisonError::into_inner);
@@ -159,7 +137,6 @@ fn sweep_once(base: &Path) {
 /// Removes the private directories in `base` whose maki is gone. A signal
 /// can kill maki before the directory's destructor runs. Only the user's own
 /// directories from this boot and pid namespace go, and a link is never followed.
-#[cfg(target_os = "linux")]
 pub(super) fn sweep_dead_owners(base: &Path) {
     let (Ok(entries), Some(namespace)) = (fs::read_dir(base), owner_namespace()) else {
         return;

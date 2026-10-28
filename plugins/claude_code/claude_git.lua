@@ -107,7 +107,7 @@ end
 
 function M.excluded_pathspecs(deny_read)
   local specs = M.collection_pathspecs({})
-  for _, pattern in ipairs(assert(path_utils.denied_paths(deny_read))) do
+  for _, pattern in ipairs(deny_read) do
     specs[#specs + 1] = ":(exclude,icase,glob)" .. pattern
     specs[#specs + 1] = ":(exclude,icase,glob)" .. pattern .. "/**"
   end

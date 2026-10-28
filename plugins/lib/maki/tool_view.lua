@@ -111,7 +111,7 @@ function ToolView.new(buf, opts)
   self.keep = (opts and opts.keep) or "tail"
   self.max_expand_lines = (opts and opts.max_expand_lines) or 2000
   self.max_line_bytes = (opts and opts.max_line_bytes) or nil
-  self.header = {}
+  self.header = (opts and opts.header) or {}
   self.ring = {}
   self.ring_start = 1
   self.ring_count = 0

@@ -11,6 +11,22 @@ local path_utils = require("claude_paths")
 
 local case, eq, has = t.case, t.eq, t.has
 
+local HANDSHAKE = {}
+for line in launch.HANDSHAKE_INPUT:gmatch("[^\n]+") do
+  local request = maki.json.decode(line)
+  HANDSHAKE[#HANDSHAKE + 1] = { id = request.request_id }
+end
+
+local function worker_settings(spec)
+  local args = launch.argv(spec)
+  for i, arg in ipairs(args) do
+    if arg == "--settings" then
+      return maki.json.decode(args[i + 1])
+    end
+  end
+  error("worker settings missing")
+end
+
 local CWD = "/work"
 local SECRET = "sk-ant-secret"
 local PROMPT = "--explain the parser"
@@ -27,7 +43,7 @@ local BUILTIN_PLUGINS = {
 }
 local MISSING = {}
 local READ = launch.WORKERS.read
-local DEFAULT_DENY_RULES = launch.deny_rules("")
+local DEFAULT_DENY_RULES = launch.deny_rules(assert(path_utils.denied_paths("")))
 local HOOKS_OFF = { hooks = maki.json.decode("[]"), policy = { allDisabled = true, policyHookCount = 0 } }
 local CONFINE = {
   deny_read = { "/work", "/home/u/.claude", "/artifacts" },
@@ -107,26 +123,32 @@ local function handshake_answer(handshake, id, response, subtype)
 end
 
 local function worker_spec(worker, confine, deny)
-  return { worker = worker or READ, confine = confine, deny = deny or DEFAULT_DENY_RULES }
+  return {
+    model = "sonnet",
+    executable = "claude",
+    worker = worker or READ,
+    confine = confine,
+    deny = deny or DEFAULT_DENY_RULES,
+  }
 end
 
 local function handshake_problem(answers, worker, confine)
   worker = worker or READ
   local responses = {
     account = account_answer(nil, worker.reported_modes[1]),
-    settings = { effective = launch.settings(worker_spec(worker, confine)), sources = maki.json.decode("[]") },
+    settings = { effective = worker_settings(worker_spec(worker, confine)), sources = maki.json.decode("[]") },
     hooks = HOOKS_OFF,
   }
   for id, response in pairs(answers) do
     responses[id] = response
   end
   local handshake = launch.worker_handshake(worker_spec(worker, confine))
-  for index, request in ipairs(launch.HANDSHAKE) do
+  for index, request in ipairs(HANDSHAKE) do
     local complete, problem = handshake_answer(handshake, request.id, responses[request.id])
     if problem then
       return problem
     end
-    eq(complete, index == #launch.HANDSHAKE)
+    eq(complete, index == #HANDSHAKE)
   end
 end
 
@@ -174,7 +196,7 @@ end)
 -- ── claude_launch ──
 
 local function sandbox_problem(sandbox, confine)
-  local expected = launch.settings(worker_spec(launch.WORKERS.code, confine))
+  local expected = worker_settings(worker_spec(launch.WORKERS.code, confine))
   local effective = table.clone(expected)
   effective.sandbox = sandbox
   return handshake_problem(
@@ -285,7 +307,8 @@ end
 
 case("home_credentials_cover_standard_stores_and_user_paths", function()
   local home = "/home/u"
-  local paths = assert(launch.home_credentials(home, "custom/login.json,tool/credentials"))
+  local paths =
+    assert(launch.home_credentials(home, assert(launch.denied_home_paths("custom/login.json,tool/credentials"))))
   for _, path in ipairs({
     ".gitconfig",
     ".config/git",
@@ -313,7 +336,7 @@ case("home_credentials_cover_standard_stores_and_user_paths", function()
     assert(contains(paths, home .. "/" .. path), path)
   end
   for _, path in ipairs({ "/etc/passwd", "../outside", "nested/../../outside" }) do
-    local denied, problem = launch.home_credentials(home, path)
+    local denied, problem = launch.denied_home_paths(path)
     eq(denied, nil)
     eq(problem, launch.DENY_HOME_OUTSIDE)
   end
@@ -358,7 +381,7 @@ case("argv_for_a_coding_worker_edits_and_runs_without_bypass", function()
   for _, forbidden in ipairs({ "--add-dir", "bypassPermissions", "--dangerously", "--allowedTools" }) do
     eq(joined:find(forbidden, 1, true), nil, "the argv must not contain " .. forbidden)
   end
-  local settings = launch.settings(worker_spec(launch.WORKERS.code, CONFINE))
+  local settings = worker_settings(worker_spec(launch.WORKERS.code, CONFINE))
   eq(settings.permissions.allow, nil)
   eq(settings.permissions.blockReadsOutsideWorkingDirectories, true)
   eq(
@@ -373,12 +396,12 @@ case("argv_for_a_coding_worker_edits_and_runs_without_bypass", function()
     })
   )
   has(maki.json.encode(settings), '"allowedDomains":[]')
-  eq(launch.settings(worker_spec()).sandbox, nil)
+  eq(worker_settings(worker_spec()).sandbox, nil)
 end)
 
 -- Returns the sandbox the flags set, after {edit} changes the merged result.
 local function merged_sandbox(edit)
-  local sandbox = maki.json.decode(maki.json.encode(launch.settings(worker_spec(launch.WORKERS.code, CONFINE)).sandbox))
+  local sandbox = maki.json.decode(maki.json.encode(worker_settings(worker_spec(launch.WORKERS.code, CONFINE)).sandbox))
   if edit then
     edit(sandbox)
   end
@@ -492,7 +515,7 @@ end
 case("a_coding_handshake_checks_the_sandbox_and_a_read_one_does_not", function()
   local settings = {
     sources = { { source = "flagSettings", settings = {} } },
-    effective = launch.settings(worker_spec()),
+    effective = worker_settings(worker_spec()),
   }
   local hooks = { hooks = maki.json.decode("[]"), policy = { allDisabled = true } }
   eq(handshake_problem({ settings = settings, hooks = hooks }), nil)
@@ -500,7 +523,7 @@ case("a_coding_handshake_checks_the_sandbox_and_a_read_one_does_not", function()
     handshake_problem({ settings = settings, hooks = hooks }, launch.WORKERS.code, CONFINE) or "",
     "outside its sandbox"
   )
-  settings.effective = launch.settings(worker_spec(launch.WORKERS.code, CONFINE))
+  settings.effective = worker_settings(worker_spec(launch.WORKERS.code, CONFINE))
   eq(handshake_problem({ settings = settings, hooks = hooks }, launch.WORKERS.code, CONFINE), nil)
 end)
 
@@ -518,7 +541,7 @@ end)
 -- The values here are literal rather than taken from the builder, so the
 -- test notices if `claude_launch` drops one of these switches.
 case("settings_switch_off_everything_claude_code_loads_on_its_own", function()
-  local settings = launch.settings(worker_spec())
+  local settings = worker_settings(worker_spec())
   eq(settings.disableAllHooks, true)
   eq(settings.autoMemoryEnabled, false)
   eq(settings.disableClaudeAiConnectors, true)
@@ -555,7 +578,7 @@ end)
 -- Returns the `get_settings` response when only maki's flags and {policy}
 -- apply, after {edit} changes the merged result.
 local function settings_answer(policy, edit)
-  local flags = maki.json.decode(maki.json.encode(launch.settings(worker_spec())))
+  local flags = maki.json.decode(maki.json.encode(worker_settings(worker_spec())))
   local sources = { { source = "flagSettings", settings = flags } }
   if policy then
     sources[#sources + 1] = { source = "policySettings", settings = policy }
@@ -823,7 +846,9 @@ end
 -- Configured paths follow the defaults, with spaces and empty entries
 -- dropped and no second ./ added.
 case("settings_deny_the_defaults_and_the_configured_paths", function()
-  local settings = launch.settings(worker_spec(READ, nil, launch.deny_rules(" config/prod.yml , ./certs/** ,, ")))
+  local settings = worker_settings(
+    worker_spec(READ, nil, launch.deny_rules(assert(path_utils.denied_paths(" config/prod.yml , ./certs/** ,, "))))
+  )
   eq(
     table.concat(settings.permissions.deny, " "),
     "Read(./.env*) Read(./**/.env*) Read(./secrets) Read(./**/secrets) Read(./secrets/**) Read(./**/secrets/**) Read(./.git/config) Read(./**/.git/config) Read(./.maki/**) Read(./**/.maki/**) Read(./.claude/settings*.json) Read(./**/.claude/settings*.json) Read(./config/prod.yml) Read(./certs/**)"
@@ -835,8 +860,8 @@ end)
 case("a_complete_clean_handshake_passes", function()
   local answers = { account = account_answer(), settings = settings_answer(), hooks = HOOKS_OFF }
   local handshake = launch.worker_handshake(worker_spec())
-  for i = #launch.HANDSHAKE, 1, -1 do
-    local complete, problem = handshake_answer(handshake, launch.HANDSHAKE[i].id, answers[launch.HANDSHAKE[i].id])
+  for i = #HANDSHAKE, 1, -1 do
+    local complete, problem = handshake_answer(handshake, HANDSHAKE[i].id, answers[HANDSHAKE[i].id])
     eq(problem, nil)
     eq(complete, i == 1)
   end
@@ -1184,7 +1209,7 @@ end
 -- ── claude_workspace ──
 
 case("a_snapshot_leaves_out_credentials_and_claude_config", function()
-  local specs = table.concat(git_utils.excluded_pathspecs("config/prod.yml"), "|")
+  local specs = table.concat(git_utils.excluded_pathspecs(assert(path_utils.denied_paths("config/prod.yml"))), "|")
   for _, excluded in ipairs({ ".env*", "**/.env*", "secrets/**", "config/prod.yml" }) do
     has(specs, ":(exclude,icase,glob)" .. excluded)
   end
@@ -1221,7 +1246,7 @@ end)
 
 case("read_workers_deny_project_agent_and_git_settings", function()
   for _, path in ipairs({ ".git/config", ".maki/**", ".claude/settings*.json" }) do
-    has(table.concat(launch.deny_rules(""), "\n"), "Read(./" .. path .. ")")
+    has(table.concat(launch.deny_rules(assert(path_utils.denied_paths(""))), "\n"), "Read(./" .. path .. ")")
   end
 end)
 

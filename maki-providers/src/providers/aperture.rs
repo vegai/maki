@@ -8,7 +8,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry};
-use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
+use crate::provider::{BoxFuture, Provider, RequestScope};
 use crate::spec::{
     AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, NO_CURATED_MODELS, Native,
     ProviderRegistry, ProviderSpec,
@@ -453,10 +453,7 @@ impl Provider for Aperture {
         })
     }
 
-    fn list_models(
-        &self,
-        _listing: ModelListing,
-    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
             let base = auth.base_url.as_deref().unwrap_or("");

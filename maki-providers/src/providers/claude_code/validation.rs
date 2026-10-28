@@ -4,15 +4,13 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder};
-#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf, absolute};
 
-#[cfg(unix)]
+use maki_storage::permissions::{PERMISSION_BITS, PRIVATE_DIR_MODE};
 use rustix::process::geteuid;
 use serde::Deserialize;
 use serde_json::{Value, json};
-#[cfg(unix)]
 use tracing::debug;
 
 use crate::ProviderUsage;
@@ -20,16 +18,17 @@ use crate::ProviderUsage;
 use super::checks::{self, DISABLED, EFFECTIVE, PERMISSIONS_KEY};
 use super::error::{Error, Problem};
 use super::stream::{
-    self, API_ERROR_MARK, ASSISTANT_EVENT, CACHE_CREATION_INPUT_TOKENS, CACHE_READ_INPUT_TOKENS,
-    EventKind, Handshake, INPUT_TOKENS, OUTPUT_TOKENS, RATE_LIMIT_EVENT, StreamMode, count,
+    self, API_ERROR_MARK, CACHE_CREATION_INPUT_TOKENS, CACHE_READ_INPUT_TOKENS, Handshake,
+    INPUT_TOKENS, OUTPUT_TOKENS, StreamMode, count,
 };
 
-pub use super::MAX_EVENT_BYTES;
+pub use super::super::MAX_EVENT_BYTES;
 pub use super::checks::{GIT_ENTRY, git_directory};
-pub use super::run::{VersionCheck, invalidate_version};
+pub use super::run::{VersionCheck, invalidate_version, version_check};
 use super::settings::base_settings;
 pub use super::settings::{EMPTY_MCP_CONFIG, STARTUP_TIMEOUT_SECS, base_args};
 use super::stream::usage_of as plan_usage;
+pub use super::stream::{EventKind, user_message};
 
 pub const DEFAULT_EXECUTABLE: &str = "claude";
 pub const DEFAULT_MAX_CONCURRENT: usize = 8;
@@ -38,16 +37,10 @@ pub(super) const CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 pub(super) const HOME_ENV: &str = "HOME";
 const RUNTIME_DIR_ENV: &str = "XDG_RUNTIME_DIR";
 const CACHE_HOME_ENV: &str = "XDG_CACHE_HOME";
-#[cfg(unix)]
 const FALLBACK_TEMP_DIR: &str = "/var/tmp";
 const DEFAULT_CACHE_DIR: &str = ".cache";
-#[cfg(unix)]
-const PRIVATE_MODE_MASK: u32 = 0o777;
 const SCRATCH_DIRECTORY: &str = "maki/claude-code";
-#[cfg(unix)]
-const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const TMPDIR_ENV: &str = "TMPDIR";
-#[cfg(unix)]
 const UNIX_TEMP_DIR: &str = "/tmp";
 const PROBE_PATH_NOT_UTF8: &str = "probe path is not valid UTF-8";
 const BLOCK_OUTSIDE: &str = "blockReadsOutsideWorkingDirectories";
@@ -136,8 +129,21 @@ impl WorkerPolicy {
     }
 }
 
-pub fn handshake() -> Value {
-    json!(checks::HANDSHAKE)
+pub fn handshake_input() -> String {
+    checks::HANDSHAKE
+        .iter()
+        .map(|step| stream::control_request(step.id, &json!({ "subtype": step.subtype })))
+        .collect()
+}
+
+pub fn worker_args(
+    model: &str,
+    tools: &str,
+    mode: &str,
+    policy: &WorkerPolicy,
+    contract: &str,
+) -> Vec<String> {
+    super::settings::worker_args(model, tools, mode, &policy.settings(), contract)
 }
 
 pub struct WorkerHandshake {
@@ -200,7 +206,6 @@ pub struct LaunchPreparation {
 
 fn default_temp_dir() -> PathBuf {
     let path = env::temp_dir();
-    #[cfg(unix)]
     if path.as_os_str().is_empty() {
         return PathBuf::from(UNIX_TEMP_DIR);
     }
@@ -213,7 +218,7 @@ fn env_value(vars: &[(String, String)], name: &str) -> Option<OsString> {
         .map(|(_, value)| OsString::from(value))
 }
 
-pub(super) fn prepare_launch(
+pub fn prepare_launch(
     vars: Vec<(String, String)>,
     configured: Option<PathBuf>,
     cwd: &Path,
@@ -277,15 +282,13 @@ fn scratch_base(
     denied: &[PathBuf],
     fallbacks: Vec<PathBuf>,
 ) -> Result<PathBuf, Error> {
-    let outside =
-        |path: &Path| !path.starts_with(cwd) && !denied.iter().any(|dir| path.starts_with(dir));
+    let outside = |path: &Path| !checks::inside_checkout(path, cwd, denied);
     if let Ok(base) = preferred.canonicalize()
         && base.is_dir()
         && outside(&base)
     {
         return Ok(base);
     }
-    #[cfg(unix)]
     let fallbacks = fallbacks
         .into_iter()
         .chain([PathBuf::from(FALLBACK_TEMP_DIR)
@@ -299,8 +302,7 @@ fn scratch_base(
         }
         let mut builder = DirBuilder::new();
         builder.recursive(true);
-        #[cfg(unix)]
-        builder.mode(PRIVATE_DIRECTORY_MODE);
+        builder.mode(PRIVATE_DIR_MODE);
         if builder.create(&path).is_err() {
             continue;
         }
@@ -310,11 +312,10 @@ fn scratch_base(
         if !metadata.is_dir() {
             continue;
         }
-        #[cfg(unix)]
         if metadata.uid() != geteuid().as_raw()
-            || metadata.permissions().mode() & PRIVATE_MODE_MASK != PRIVATE_DIRECTORY_MODE
+            || metadata.permissions().mode() & PERMISSION_BITS != PRIVATE_DIR_MODE
         {
-            debug!(path = %path.display(), uid = metadata.uid(), mode = metadata.permissions().mode() & PRIVATE_MODE_MASK, "claude-code: skipping scratch fallback with unsafe ownership or permissions");
+            debug!(path = %path.display(), uid = metadata.uid(), mode = metadata.permissions().mode() & PERMISSION_BITS, "claude-code: skipping scratch fallback with unsafe ownership or permissions");
             continue;
         }
         if let Ok(base) = path.canonicalize()
@@ -337,19 +338,6 @@ pub(super) fn login_dir(
             .or_else(|| var(CONFIG_DIR_ENV)),
         var(HOME_ENV),
     )
-}
-
-pub fn worker_launch(
-    vars: HashMap<String, String>,
-    configured: Option<String>,
-    cwd: &Path,
-) -> Result<LaunchPreparation, String> {
-    prepare_launch(
-        vars.into_iter().collect(),
-        configured.map(PathBuf::from),
-        cwd,
-    )
-    .map_err(|error| error.to_string())
 }
 
 /// Make a worker probe directory with the provider's ownership tag and checkout checks.
@@ -378,6 +366,7 @@ pub fn init_problem(
 }
 
 pub struct WorkerEvent {
+    pub kind: Option<EventKind>,
     pub event: Value,
     pub usage: Option<Value>,
     pub rate_limit: Option<ProviderUsage>,
@@ -401,10 +390,13 @@ pub fn classify(
         .to_string());
     }
     let event = stream::parse_event(line).map_err(|error| error.to_string())?;
+    let mut kind = None;
     let mut check = || -> Result<(), Error> {
-        let kind = stream::classify(&event, StreamMode::Worker, accepted)?;
+        let event_kind = stream::event_kind(&event, StreamMode::Worker)?;
+        kind = Some(event_kind);
+        stream::check_start(&event, event_kind, StreamMode::Worker, accepted)?;
         if let Some(expected) = expected_model {
-            let message = if kind == EventKind::Stream {
+            let message = if event_kind == EventKind::Stream {
                 &event["event"]["message"]
             } else {
                 &event["message"]
@@ -415,29 +407,26 @@ pub fn classify(
                 stream::check_model(ran, expected)?;
                 model_checked = true;
             }
-            if kind == EventKind::Result
-                && event["subtype"] == stream::SUCCESS
-                && event["is_error"] != true
-                && !model_checked
-            {
+            if event_kind == EventKind::Result && !stream::failed_result(&event) && !model_checked {
                 return Err(Error::NoModel);
             }
         }
         Ok(())
     };
     let problem = check().err().map(|error| error.to_string());
-    let usage = if event["type"] == ASSISTANT_EVENT {
+    let usage = if kind == Some(EventKind::Assistant) {
         &event["message"]["usage"]
     } else {
         &event["usage"]
     };
     let usage = usage.is_object().then(|| usage_counts(usage));
-    let rate_limit = (event["type"] == RATE_LIMIT_EVENT && event["rate_limit_info"].is_object())
+    let rate_limit = (kind == Some(EventKind::RateLimit) && event["rate_limit_info"].is_object())
         .then(|| plan_usage(&event["rate_limit_info"]));
-    let failure = (event["type"] == stream::RESULT_EVENT)
+    let failure = (kind == Some(EventKind::Result))
         .then(|| stream::result_failure(&event))
         .flatten();
     Ok(WorkerEvent {
+        kind,
         event,
         usage,
         rate_limit,
@@ -456,15 +445,13 @@ fn usage_counts(usage: &Value) -> Value {
     })
 }
 
-pub async fn version_check(executable: &Path) -> Result<VersionCheck, String> {
-    super::run::version_check(executable)
-        .await
-        .map_err(|error| error.to_string())
-}
-
-pub fn checkout_root(cwd: &Path) -> Result<PathBuf, String> {
-    let cwd = cwd.canonicalize().map_err(|error| error.to_string())?;
-    checks::checkout_root(&cwd).map_err(|error| error.to_string())
+pub fn checkout_root(cwd: &Path) -> Result<PathBuf, Error> {
+    let resolved = cwd.canonicalize().map_err(|source| Error::Path {
+        what: "resolve",
+        path: cwd.to_owned(),
+        source,
+    })?;
+    checks::checkout_root(&resolved)
 }
 
 fn empty_array(value: Option<&Value>) -> bool {

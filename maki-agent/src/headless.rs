@@ -15,7 +15,7 @@ use smol::lock::Mutex;
 use tracing::error;
 
 use crate::agent::{self, RunContext, RunContextBuilder};
-use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
+use crate::cancel::{CancelMap, CancelToken};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedPrompts;
 use crate::session::{Resumed, SessionTrack};
@@ -50,6 +50,7 @@ async fn connect(
 }
 
 pub struct HeadlessParams {
+    pub shutdown: CancelToken,
     pub dry_run: bool,
     pub model: Model,
     pub config: AgentConfig,
@@ -80,7 +81,6 @@ pub struct Ready {
 }
 
 pub struct HeadlessHandle {
-    pub cancel: CancelTrigger,
     pub ready: Receiver<Ready>,
     pub session_id: SessionRef,
     pub cwd: String,
@@ -206,7 +206,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
     let defaults = params.defaults;
     let working_dir_path = params.initial_wd.clone();
     let task_working_dir = working_dir.clone();
-    let (cancel, token) = CancelToken::new();
+    let token = params.shutdown;
     let (ready_tx, ready_rx) = flume::bounded(1);
     let task = smol::spawn(run_session(guard, params.mcp_handle.clone(), async move {
         let mut model = params.model;
@@ -274,7 +274,6 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
     }));
     (
         HeadlessHandle {
-            cancel,
             ready: ready_rx,
             session_id: session_ref,
             cwd: working_dir,

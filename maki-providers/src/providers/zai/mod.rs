@@ -8,7 +8,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::model::{Model, ModelFamily, ThinkingSupport};
-use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
+use crate::provider::{BoxFuture, Provider, RequestScope};
 use crate::providers::aperture::NO_PATH_PREFIX;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::spec::{
@@ -256,10 +256,7 @@ impl Provider for Zai {
         })
     }
 
-    fn list_models(
-        &self,
-        _listing: ModelListing,
-    ) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
             self.compat.do_list_models(&auth).await

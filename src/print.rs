@@ -20,7 +20,8 @@ use maki_agent::permissions::PluginRuleStore;
 use maki_agent::session::Resumed;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
-    AgentConfig, AgentEvent, DoneReason, Envelope, ImageSource, PermissionsConfig, SteerKind,
+    AgentConfig, AgentEvent, CancelToken, DoneReason, Envelope, ImageSource, PermissionsConfig,
+    SteerKind,
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
@@ -32,8 +33,10 @@ use maki_storage::sessions::SessionClaim;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::headless_startup::{start_mcp, startup};
 use crate::notice::{NOTIFICATION, ProviderNotice};
-use crate::wire::{failure_subtype, system_event};
+use crate::shutdown::watch;
+use crate::wire::{ERROR_DURING_EXECUTION, SUCCESS, failure_subtype, system_event};
 
 const SESSION_LINE_PREFIX: &str = "session: ";
 
@@ -77,7 +80,7 @@ impl PrintResult {
     fn error(session_id: SessionRef, duration_ms: u128, result: String) -> Self {
         Self {
             result_type: "result",
-            subtype: "error_during_execution",
+            subtype: ERROR_DURING_EXECUTION,
             is_error: true,
             duration_ms,
             num_turns: 0,
@@ -220,9 +223,12 @@ pub fn run(params: PrintParams) -> Result<()> {
     let prompt_slots = lua_handle.collect_prompt_slots();
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    let mcp_handle = crate::headless_startup::start_mcp(&cwd, project_config.clone());
+    let mcp_handle = start_mcp(&cwd, project_config.clone());
 
-    let (handle, mut events) = maki_agent::headless::spawn(HeadlessParams {
+    let (trigger, shutdown) = CancelToken::new();
+    watch(trigger).context("watch termination signals")?;
+    let (handle, mut events) = headless::spawn(HeadlessParams {
+        shutdown,
         dry_run,
         model,
         config,
@@ -243,13 +249,11 @@ pub fn run(params: PrintParams) -> Result<()> {
     });
 
     let HeadlessHandle {
-        cancel,
         ready,
         session_id,
         cwd,
         task,
     } = handle;
-    crate::shutdown::watch(cancel).context("watch termination signals")?;
     let start = Instant::now();
     let mut verbose_out = match format {
         OutputFormat::StreamJson => Some(VerboseOutput::StreamJson),
@@ -258,7 +262,7 @@ pub fn run(params: PrintParams) -> Result<()> {
     };
 
     let (Ready { model, tool_names }, thinking) =
-        match crate::headless_startup::startup(&ready, &mut events, defaults.thinking) {
+        match startup(&ready, &mut events, defaults.thinking) {
             Ok(started) => started,
             Err(error) => {
                 smol::block_on(headless::await_shutdown(task));
@@ -479,9 +483,9 @@ pub fn run(params: PrintParams) -> Result<()> {
     let subtype = stop_reason
         .and_then(failure_subtype)
         .unwrap_or(if is_error {
-            "error_during_execution"
+            ERROR_DURING_EXECUTION
         } else {
-            "success"
+            SUCCESS
         });
     write_result(
         format,
@@ -594,7 +598,7 @@ mod tests {
     fn wire_format_required_fields() {
         let result = PrintResult {
             result_type: "result",
-            subtype: "success",
+            subtype: SUCCESS,
             is_error: false,
             duration_ms: 1234,
             num_turns: 2,

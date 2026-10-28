@@ -14,7 +14,7 @@ use super::openai::responses;
 use super::openai_compat;
 use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing, ModelTier, lookup_entry};
 use crate::model_registry;
-use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
+use crate::provider::{BoxFuture, Provider, RequestScope};
 use crate::providers::{ResolvedAuth, Timeouts};
 use crate::spec::{AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec};
 use crate::{
@@ -826,10 +826,7 @@ impl Provider for Copilot {
         })
     }
 
-    fn list_models(
-        &self,
-        _listing: ModelListing,
-    ) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async move {
             let models = self.fetch_models().await?;
             let infos = models

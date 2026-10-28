@@ -1,6 +1,6 @@
 //! These tests run the claude CLI, so they spend a little of the caller's
 //! subscription. They run only on request: `cargo nextest run -p
-//! maki-providers --run-ignored only -E 'test(/claude_code::live::/)'`.
+//! maki-providers --run-ignored only -E 'test(/claude_code::linux::live::/)'`.
 
 use std::collections::HashSet;
 use std::env;

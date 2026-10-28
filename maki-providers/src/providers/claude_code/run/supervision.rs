@@ -5,32 +5,26 @@ use super::super::mcp::Handoff;
 use super::super::stream::control_request;
 use super::super::within;
 use crate::process::GroupSignals;
-#[cfg(target_os = "linux")]
 use crate::process::guard;
-#[cfg(unix)]
 use crate::process::{pid_of, wait_without_reaping};
 use flume::Receiver;
 use futures_lite::future;
 use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use futures_lite::stream;
 use futures_lite::{FutureExt, Stream, StreamExt};
-#[cfg(unix)]
 use rustix::io::Errno;
-#[cfg(unix)]
 use rustix::process::{Signal, kill_process};
 use serde_json::json;
 use smol::process::{Child, ChildStdin, ChildStdout, Command};
 use smol::{Task, Timer};
 use std::collections::VecDeque;
 use std::io;
-#[cfg(target_os = "linux")]
 use std::os::unix::net::UnixStream;
 use std::process::{self, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use thiserror::Error as ThisError;
 use tracing::debug;
-#[cfg(unix)]
 use tracing::warn;
 
 pub(super) const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
@@ -45,11 +39,10 @@ struct EventTooLarge;
 
 /// Kills the group on drop until reaping starts.
 pub(super) struct Group {
-    pub(super) child: Child,
+    child: Child,
     signals: GroupSignals,
     signalled: bool,
     exit_status: Option<ExitStatus>,
-    #[cfg(target_os = "linux")]
     _lifetime: UnixStream,
 }
 
@@ -70,6 +63,23 @@ impl From<Option<bool>> for LeaderExit {
 }
 
 impl Group {
+    pub(super) fn id(&self) -> u32 {
+        self.signals.id()
+    }
+
+    pub(super) fn pipes(
+        &mut self,
+    ) -> Result<
+        (
+            Option<ChildStdin>,
+            impl Stream<Item = io::Result<String>> + Unpin + use<>,
+        ),
+        Error,
+    > {
+        let lines = stdout_lines(self.child.stdout.take())?;
+        Ok((self.child.stdin.take(), lines))
+    }
+
     pub(super) async fn spawn(command: process::Command) -> Result<Self, Error> {
         smol::unblock(move || spawn_piped(command))
             .await
@@ -92,15 +102,12 @@ impl Group {
             return;
         }
         self.signalled = true;
-        #[cfg(unix)]
         if let Some(pid) = pid_of(self.child.id())
             && let Err(error) = kill_process(pid, Signal::TERM)
             && error != Errno::SRCH
         {
             warn!(pid = self.child.id(), %error, "could not request Claude Code shutdown");
         }
-        #[cfg(not(unix))]
-        self.kill();
     }
 
     /// Kill remaining group members before the leader reap so the pid cannot identify another
@@ -132,20 +139,10 @@ impl Group {
     }
 
     /// Does not reap the leader.
-    #[cfg(unix)]
     async fn exited_by(&self, deadline: Instant) -> LeaderExit {
         let pid = self.child.id();
         within(deadline, smol::unblock(move || wait_without_reaping(pid)))
             .await
-            .into()
-    }
-
-    /// The open process handle keeps the pid for this process.
-    #[cfg(not(unix))]
-    async fn exited_by(&mut self, deadline: Instant) -> LeaderExit {
-        within(deadline, self.child.status())
-            .await
-            .map(|status| status.is_ok())
             .into()
     }
 }
@@ -157,9 +154,7 @@ impl Drop for Group {
 }
 
 fn spawn_piped(command: process::Command) -> io::Result<Group> {
-    #[cfg(target_os = "linux")]
     let mut command = command;
-    #[cfg(target_os = "linux")]
     let lifetime = guard::bind(&mut command)?;
     let child = Command::from(command)
         .stdin(Stdio::piped())
@@ -171,7 +166,6 @@ fn spawn_piped(command: process::Command) -> io::Result<Group> {
         child,
         signalled: false,
         exit_status: None,
-        #[cfg(target_os = "linux")]
         _lifetime: lifetime,
     })
 }
@@ -202,7 +196,7 @@ pub(super) async fn supervised<T>(
     work: impl AsyncFnOnce(&mut Group) -> Result<T, Error>,
 ) -> Result<T, Error> {
     let mut group = Group::spawn(command).await?;
-    debug!(pid = group.child.id(), "claude-code: process started");
+    debug!(pid = group.id(), "claude-code: process started");
     let stderr = watch_stderr(&mut group.child);
     let result = work(&mut group).await;
     if group.signals.is_enabled() {
@@ -513,7 +507,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod process_tests {
     use std::env;
     use std::os::unix::process::ExitStatusExt;
@@ -525,7 +519,8 @@ mod process_tests {
     use rustix::process::{Pid, Signal, kill_process};
     use test_case::test_case;
 
-    use crate::providers::claude_code::fake::Fake;
+    use crate::providers::claude_code::linux::WAIT;
+    use crate::providers::claude_code::linux::fake::Fake;
 
     use super::super::launch::command;
     use super::{Error, Group, SHUTDOWN_GRACE, supervised};
@@ -644,7 +639,7 @@ mod process_tests {
 
         let pid = Pid::from_raw(group.child.id().try_into().unwrap()).unwrap();
         kill_process(pid, Signal::USR1).unwrap();
-        let status = smol::block_on(group.child.status()).unwrap();
+        let status = smol::block_on(group.wait(Instant::now() + WAIT)).unwrap();
         assert_eq!(status.signal(), Some(Signal::USR1.as_raw()));
     }
 }

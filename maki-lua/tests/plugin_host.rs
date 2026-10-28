@@ -1,4 +1,3 @@
-use maki_providers::provider::ModelListing;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -564,11 +563,11 @@ fn load_package_with(
 /// permission the named tool exposes and that tool is one the permission
 /// manager would ever consult. When it does not survive it costs the rule and
 /// not the plugin: the call simply prompts as it would have without it.
-#[test_case::test_case(EDIT_TOOL_SRC, true => 1 ; "granted_plugin_pre_approves_a_checked_tool")]
-#[test_case::test_case(EDIT_TOOL_SRC, false => 0 ; "plugin_granted_nothing_pre_approves_nothing")]
-#[test_case::test_case(NO_RULE_SRC, true => 0 ; "no_such_tool_is_registered")]
-#[test_case::test_case(UNCHECKED_EDIT_TOOL_SRC, true => 0 ; "tool_is_never_permission_checked")]
-#[test_case::test_case(READ_ONLY_EDIT_TOOL_SRC, true => 0 ; "tool_declares_reach_but_never_prompts")]
+#[test_case(EDIT_TOOL_SRC, true => 1 ; "granted_plugin_pre_approves_a_checked_tool")]
+#[test_case(EDIT_TOOL_SRC, false => 0 ; "plugin_granted_nothing_pre_approves_nothing")]
+#[test_case(NO_RULE_SRC, true => 0 ; "no_such_tool_is_registered")]
+#[test_case(UNCHECKED_EDIT_TOOL_SRC, true => 0 ; "tool_is_never_permission_checked")]
+#[test_case(READ_ONLY_EDIT_TOOL_SRC, true => 0 ; "tool_declares_reach_but_never_prompts")]
 fn allow_rule_survives_only_when_delegated(owner_src: &str, granted: bool) -> usize {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -659,19 +658,19 @@ fn permission_rule_validation_rejects(spec: &str, expected_err: &str) {
     assert!(err.to_string().contains(expected_err), "got: {err}");
 }
 
-#[test_case::test_case(BAD_NAME_SRC, MINIMAL_SCHEMA, "invalid name" ; "invalid_tool_name")]
-#[test_case::test_case(EMPTY_DESC_SRC, MINIMAL_SCHEMA, "description must be non-empty" ; "empty_description")]
-#[test_case::test_case(EMPTY_AUD_SRC, MINIMAL_SCHEMA, "audiences" ; "empty_audiences")]
-#[test_case::test_case(UNKNOWN_AUD_SRC, MINIMAL_SCHEMA, "unknown audience" ; "unknown_audience")]
-#[test_case::test_case(STRING_EXAMPLES_SRC, MINIMAL_SCHEMA, "'examples' must be a table" ; "string_examples")]
-#[test_case::test_case(TIMEOUT_FIELD_NOT_IN_SCHEMA_SRC, MINIMAL_SCHEMA, "not type 'integer'" ; "timeout_field_not_in_schema")]
-#[test_case::test_case(SCOPE_MISSING_FIELD_SRC, STRING_FIELD_SCHEMA, INVALID_PERMISSION_SCOPE_ERR ; "permission_scopes_missing_field")]
-#[test_case::test_case(SCOPE_NON_STRING_FIELD_SRC, NON_STRING_FIELD_SCHEMA, INVALID_PERMISSION_SCOPE_ERR ; "permission_scopes_non_string_field")]
-#[test_case::test_case(OLD_SCOPE_KEY_SRC, MINIMAL_SCHEMA, "'permission_scope' was removed" ; "old_permission_scope_key")]
-#[test_case::test_case(WRONG_TYPE_SCOPES_SRC, MINIMAL_SCHEMA, "'permission_scopes' must be a string field name or a function" ; "permission_scopes_wrong_type")]
-#[test_case::test_case(SCOPES_WITHOUT_PERMISSION_SRC, STRING_FIELD_SCHEMA, "must declare 'permission'" ; "scopes_without_permission")]
-#[test_case::test_case(UNKNOWN_PERMISSION_SRC, STRING_FIELD_SCHEMA, "unknown permission 'filesystem'" ; "unknown_permission")]
-#[test_case::test_case(FS_WRITE_WITHOUT_MUTABLE_PATH_SRC, STRING_FIELD_SCHEMA, "no 'mutable_path'" ; "fs_write_without_mutable_path")]
+#[test_case(BAD_NAME_SRC, MINIMAL_SCHEMA, "invalid name" ; "invalid_tool_name")]
+#[test_case(EMPTY_DESC_SRC, MINIMAL_SCHEMA, "description must be non-empty" ; "empty_description")]
+#[test_case(EMPTY_AUD_SRC, MINIMAL_SCHEMA, "audiences" ; "empty_audiences")]
+#[test_case(UNKNOWN_AUD_SRC, MINIMAL_SCHEMA, "unknown audience" ; "unknown_audience")]
+#[test_case(STRING_EXAMPLES_SRC, MINIMAL_SCHEMA, "'examples' must be a table" ; "string_examples")]
+#[test_case(TIMEOUT_FIELD_NOT_IN_SCHEMA_SRC, MINIMAL_SCHEMA, "not type 'integer'" ; "timeout_field_not_in_schema")]
+#[test_case(SCOPE_MISSING_FIELD_SRC, STRING_FIELD_SCHEMA, INVALID_PERMISSION_SCOPE_ERR ; "permission_scopes_missing_field")]
+#[test_case(SCOPE_NON_STRING_FIELD_SRC, NON_STRING_FIELD_SCHEMA, INVALID_PERMISSION_SCOPE_ERR ; "permission_scopes_non_string_field")]
+#[test_case(OLD_SCOPE_KEY_SRC, MINIMAL_SCHEMA, "'permission_scope' was removed" ; "old_permission_scope_key")]
+#[test_case(WRONG_TYPE_SCOPES_SRC, MINIMAL_SCHEMA, "'permission_scopes' must be a string field name or a function" ; "permission_scopes_wrong_type")]
+#[test_case(SCOPES_WITHOUT_PERMISSION_SRC, STRING_FIELD_SCHEMA, "must declare 'permission'" ; "scopes_without_permission")]
+#[test_case(UNKNOWN_PERMISSION_SRC, STRING_FIELD_SCHEMA, "unknown permission 'filesystem'" ; "unknown_permission")]
+#[test_case(FS_WRITE_WITHOUT_MUTABLE_PATH_SRC, STRING_FIELD_SCHEMA, "no 'mutable_path'" ; "fs_write_without_mutable_path")]
 fn registration_validation_rejects(fields: &str, schema: &str, expected_err: &str) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -3242,8 +3241,12 @@ maki.api.register_tool({{
     audiences = {{ "main" }},
     handler = function()
         local opts = {{ scope = {{ session = "{sid}" }}, name = "{JOB_NAME}" }}
-        local id = maki.fn.jobstart("exec sleep 30", opts)
-        local _, err = pcall(maki.fn.jobstart, "exec sleep 30", opts)
+        local function start() return maki.fn.jobstart("exec sleep 30", opts) end
+        local results = maki.async.gather({{ start, start }})
+        local id, err
+        for _, result in ipairs(results) do
+            if result.ok then id = result.value else err = result.err end
+        end
         return tostring(id) .. "|" .. tostring(err)
     end,
 }})
@@ -3386,6 +3389,7 @@ maki.api.create_autocmd("ProbeIsolation", {{
     callback = function()
         local info = job and maki.fn.jobinfo(job) or nil
         seen = info and ("alive:" .. info.status) or "{GONE}"
+        maki.ui.flash("{GONE}")
     end,
 }})
 maki.api.register_tool({{
@@ -3404,9 +3408,9 @@ maki.api.register_tool({{
     host.event_handle()
         .fire_autocmd("ProbeIsolation", json!({}));
 
-    // FireAutocmd and CallTool queue on the same channel and dispatch is
-    // awaited in order, so the second handler has already run here. A shared
-    // batch scope would report the first handler's job as alive.
+    host.ui_action_rx()
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the second autocmd callback did not finish");
     assert_eq!(exec_tool(&reg, "probe_isolation", json!({})).unwrap(), GONE);
 }
 
@@ -4017,10 +4021,10 @@ fn websearch_config(provider: &str) -> PluginsConfig {
 
 /// The backend the plugin talks to is invisible from Rust, so we read it off
 /// the one thing it leaks: the description the model gets.
-#[test_case::test_case("exa", "Exa AI" ; "default_backend")]
-#[test_case::test_case("youcom", "You.com" ; "opt_in_backend")]
-#[test_case::test_case("kagi", "Kagi" ; "keyed_backend")]
-#[test_case::test_case("searxng", "SearXNG" ; "self_hosted_backend")]
+#[test_case("exa", "Exa AI" ; "default_backend")]
+#[test_case("youcom", "You.com" ; "opt_in_backend")]
+#[test_case("kagi", "Kagi" ; "keyed_backend")]
+#[test_case("searxng", "SearXNG" ; "self_hosted_backend")]
 fn websearch_provider_option_selects_the_backend(provider: &str, expected: &str) {
     let (reg, _host) = builtins_host_with(&websearch_config(provider));
     let description = tool_description(&reg, &maki_config::AgentConfig::default(), "websearch");
@@ -4079,7 +4083,7 @@ fn websearch_time_range_is_searxng_only() {
     );
 }
 
-#[test_case::test_case(
+#[test_case(
     serde_json::json!({}),
     &["edit", "multiedit", "edit_lines"], &["insert_lines"]
     ; "defaults_on_insert_lines_opt_in"
@@ -4407,8 +4411,8 @@ const RUN_COMMAND_NO_ACTION: &str = "run_command did not reach the UI";
 /// counting toward the cap. The plugin lacks `agent`, so we can tell its own
 /// permissions rode along on the request and on the command it registered,
 /// and not some trusted default.
-#[test_case::test_case(Ok(()), "true|nil" ; "dispatched")]
-#[test_case::test_case(Err("unknown command".into()), "nil|unknown command" ; "rejected")]
+#[test_case(Ok(()), "true|nil" ; "dispatched")]
+#[test_case(Err("unknown command".into()), "nil|unknown command" ; "rejected")]
 fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash: &str) {
     let host = PluginHost::new(fresh_registry()).unwrap();
     let mut perms = maki_lua::PluginPermissions::trusted();
@@ -5834,7 +5838,7 @@ fn perm_tool_src(name: &str, handler_body: &str) -> String {
     "agent"
     ; "agent_denied_for_session_prompt"
 )]
-#[test_case::test_case(
+#[test_case(
     "chansend_deny",
     r#"local ok, err = pcall(function() maki.fn.chansend(1, "x") end)
                 return tostring(err)"#,
@@ -5885,20 +5889,20 @@ fn run_call_with(held: &[Permission], call: &str) -> String {
 /// changing how the session runs. Holding a neighbouring one opens nothing.
 /// A write that also starts a turn takes `agent` on top, even when the turn is
 /// only an option of the call.
-#[test_case::test_case("maki.session.messages()", &[Permission::SessionWrite, Permission::SessionSettings], Permission::SessionRead ; "messages_with_write_and_settings")]
-#[test_case::test_case("maki.session.export()", &[Permission::SessionWrite, Permission::SessionSettings], Permission::SessionRead ; "export_with_write_and_settings")]
-#[test_case::test_case("maki.ui.input()", &[Permission::SessionWrite, Permission::SessionSettings], Permission::SessionRead ; "input_with_write_and_settings")]
-#[test_case::test_case("maki.session.new()", &[Permission::SessionRead, Permission::SessionSettings], Permission::SessionWrite ; "new_with_read_and_settings")]
-#[test_case::test_case(r#"maki.session.delete("x")"#, &[Permission::SessionSettings], Permission::SessionWrite ; "delete_with_only_settings")]
-#[test_case::test_case(r#"maki.session.notify("ci red", { session = "x" })"#, &[Permission::SessionSettings], Permission::SessionWrite ; "notify_with_only_settings")]
-#[test_case::test_case(r#"maki.task.remove("x")"#, &[Permission::SessionSettings], Permission::SessionWrite ; "task_remove_with_only_settings")]
-#[test_case::test_case(r#"maki.session.prompt("go")"#, &[Permission::Agent], Permission::SessionWrite ; "prompt_with_only_agent")]
-#[test_case::test_case(r#"maki.session.prompt("go")"#, &[Permission::SessionWrite], Permission::Agent ; "prompt_with_only_session_write")]
-#[test_case::test_case(r#"maki.session.set_mode("plan")"#, &[Permission::SessionWrite], Permission::SessionSettings ; "set_mode_with_only_write")]
-#[test_case::test_case(r#"maki.session.set_title({ id = "x", title = "t" })"#, &[Permission::SessionWrite], Permission::SessionSettings ; "set_title_with_only_write")]
-#[test_case::test_case(r#"maki.model.set("x")"#, &[Permission::SessionWrite], Permission::SessionSettings ; "model_set_with_only_write")]
-#[test_case::test_case(r#"maki.session.notify("ci red", { session = "x", wake = true })"#, &[Permission::SessionWrite], Permission::Agent ; "waking_notify_with_only_write")]
-#[test_case::test_case(r#"maki.session.new({ prompt = "go" })"#, &[Permission::SessionWrite], Permission::Agent ; "new_with_a_prompt_with_only_write")]
+#[test_case("maki.session.messages()", &[Permission::SessionWrite, Permission::SessionSettings], Permission::SessionRead ; "messages_with_write_and_settings")]
+#[test_case("maki.session.export()", &[Permission::SessionWrite, Permission::SessionSettings], Permission::SessionRead ; "export_with_write_and_settings")]
+#[test_case("maki.ui.input()", &[Permission::SessionWrite, Permission::SessionSettings], Permission::SessionRead ; "input_with_write_and_settings")]
+#[test_case("maki.session.new()", &[Permission::SessionRead, Permission::SessionSettings], Permission::SessionWrite ; "new_with_read_and_settings")]
+#[test_case(r#"maki.session.delete("x")"#, &[Permission::SessionSettings], Permission::SessionWrite ; "delete_with_only_settings")]
+#[test_case(r#"maki.session.notify("ci red", { session = "x" })"#, &[Permission::SessionSettings], Permission::SessionWrite ; "notify_with_only_settings")]
+#[test_case(r#"maki.task.remove("x")"#, &[Permission::SessionSettings], Permission::SessionWrite ; "task_remove_with_only_settings")]
+#[test_case(r#"maki.session.prompt("go")"#, &[Permission::Agent], Permission::SessionWrite ; "prompt_with_only_agent")]
+#[test_case(r#"maki.session.prompt("go")"#, &[Permission::SessionWrite], Permission::Agent ; "prompt_with_only_session_write")]
+#[test_case(r#"maki.session.set_mode("plan")"#, &[Permission::SessionWrite], Permission::SessionSettings ; "set_mode_with_only_write")]
+#[test_case(r#"maki.session.set_title({ id = "x", title = "t" })"#, &[Permission::SessionWrite], Permission::SessionSettings ; "set_title_with_only_write")]
+#[test_case(r#"maki.model.set("x")"#, &[Permission::SessionWrite], Permission::SessionSettings ; "model_set_with_only_write")]
+#[test_case(r#"maki.session.notify("ci red", { session = "x", wake = true })"#, &[Permission::SessionWrite], Permission::Agent ; "waking_notify_with_only_write")]
+#[test_case(r#"maki.session.new({ prompt = "go" })"#, &[Permission::SessionWrite], Permission::Agent ; "new_with_a_prompt_with_only_write")]
 fn session_calls_need_their_own_permission(call: &str, held: &[Permission], missing: Permission) {
     let result = run_call_with(held, call);
     let refusal = Missing::Permission(missing).to_string();
@@ -5907,14 +5911,14 @@ fn session_calls_need_their_own_permission(call: &str, held: &[Permission], miss
 
 /// Metadata: no transcript content in or out, so nothing is asked of the
 /// plugin. Without a UI they answer an error pair, never a refusal.
-#[test_case::test_case("maki.session.list()" ; "session_list")]
-#[test_case::test_case("maki.session.live()" ; "session_live")]
-#[test_case::test_case("maki.session.read()" ; "session_read")]
-#[test_case::test_case("maki.session.current()" ; "session_current")]
-#[test_case::test_case(r#"maki.session.focus("x")"# ; "session_focus")]
-#[test_case::test_case("maki.task.list()" ; "task_list")]
-#[test_case::test_case(r#"maki.task.focus("main")"# ; "task_focus")]
-#[test_case::test_case("maki.model.get()" ; "model_get")]
+#[test_case("maki.session.list()" ; "session_list")]
+#[test_case("maki.session.live()" ; "session_live")]
+#[test_case("maki.session.read()" ; "session_read")]
+#[test_case("maki.session.current()" ; "session_current")]
+#[test_case(r#"maki.session.focus("x")"# ; "session_focus")]
+#[test_case("maki.task.list()" ; "task_list")]
+#[test_case(r#"maki.task.focus("main")"# ; "task_focus")]
+#[test_case("maki.model.get()" ; "model_get")]
 fn session_metadata_needs_no_permission(call: &str) {
     let result = run_call_with(&[], call);
     assert!(result.starts_with("true:"), "got: {result}");
@@ -7823,10 +7827,7 @@ impl Provider for TurnThenPark {
         })
     }
 
-    fn list_models(
-        &self,
-        _listing: ModelListing,
-    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }
@@ -8178,10 +8179,7 @@ impl Provider for OptsRecorder {
         })
     }
 
-    fn list_models(
-        &self,
-        _listing: ModelListing,
-    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }
@@ -8338,10 +8336,7 @@ impl Provider for CallOnce {
         })
     }
 
-    fn list_models(
-        &self,
-        _listing: ModelListing,
-    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }
@@ -8620,8 +8615,8 @@ fn a_plugin_session_can_only_reach_what_its_plugin_holds(
 /// The ctx form pays the same price whether or not a user could answer: a
 /// prompt is no gate under YOLO or an allow rule, and a handler inside a
 /// background session or under `maki -p` has nobody to ask anyway.
-#[test_case::test_case(false ; "unanswerable_ctx")]
-#[test_case::test_case(true ; "answerable_ctx")]
+#[test_case(false ; "unanswerable_ctx")]
+#[test_case(true ; "answerable_ctx")]
 fn a_ctx_session_pays_for_reach_whoever_could_answer(answerable: bool) {
     let (reg, _host) = reach_probe_host(r#"ctx, { tools = { { name = "edit" } }, mcp = false }"#);
     let inv = reg

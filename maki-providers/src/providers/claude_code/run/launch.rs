@@ -1,14 +1,12 @@
 use super::super::checks;
 use super::super::error::Error;
-use super::super::settings;
+use super::super::settings::{self, MCP_CONFIG_FLAG};
 use super::super::stream::{
     CONTROL_RESPONSE, Handshake, INITIALIZE, SUCCESS, Step, control_request, parse_event,
 };
 use super::super::transcript::SERVER;
 use super::private_files::private_dir_async;
-use super::supervision::{
-    Group, Next, ReadDeadline, send, send_handshake, stdout_lines, supervised, unreadable,
-};
+use super::supervision::{Group, Next, ReadDeadline, send, send_handshake, supervised, unreadable};
 use super::{Limits, Listed};
 use crate::ProviderUsage;
 use futures::future::join_all;
@@ -16,13 +14,10 @@ use futures_lite::Stream;
 use serde_json::{Value, json};
 use smol::process::ChildStdin;
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::ffi::OsStr;
 use std::fs::Metadata;
 use std::io;
-#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -38,7 +33,6 @@ const VERSION_FLAG: &str = "--version";
 const MAX_TURNS_FLAG: &str = "--max-turns";
 const TURN_LIMIT: &str = "1";
 const PARTIAL_MESSAGES_FLAG: &str = "--include-partial-messages";
-pub(super) const MCP_CONFIG_FLAG: &str = "--mcp-config";
 
 pub(crate) struct Launch<'a> {
     pub executable: &'a Path,
@@ -53,11 +47,8 @@ pub(crate) struct Launch<'a> {
 struct ExecutableIdentity {
     length: u64,
     modified: Option<SystemTime>,
-    #[cfg(unix)]
     inode: u64,
-    #[cfg(unix)]
     device: u64,
-    #[cfg(unix)]
     changed: (i64, i64),
 }
 
@@ -66,11 +57,8 @@ impl ExecutableIdentity {
         Self {
             length: metadata.len(),
             modified: metadata.modified().ok(),
-            #[cfg(unix)]
             inode: metadata.ino(),
-            #[cfg(unix)]
             device: metadata.dev(),
-            #[cfg(unix)]
             changed: (metadata.ctime(), metadata.ctime_nsec()),
         }
     }
@@ -107,7 +95,6 @@ pub(super) fn command(
         .current_dir(cwd)
         .env_clear()
         .envs(env.iter().map(|(name, value)| (name, value)));
-    #[cfg(unix)]
     command.process_group(0);
     command
 }
@@ -140,8 +127,7 @@ pub(super) async fn probe(
     plan_usage: &Mutex<Option<ProviderUsage>>,
 ) -> Result<Handshake, Error> {
     unprompted(launch, async |group| {
-        let mut stdin = group.child.stdin.take();
-        let mut lines = stdout_lines(group.child.stdout.take())?;
+        let (mut stdin, mut lines) = group.pipes()?;
         let mut handshake = Handshake::default();
         let deadline = Instant::now() + launch.limits.startup;
         send_handshake(&mut stdin, deadline).await?;
@@ -206,14 +192,13 @@ impl VersionCheck {
     }
 
     pub fn save(&self, output: &str) -> Result<String, String> {
-        let profile =
-            checks::profile(output, env::consts::OS).map_err(|error| error.to_string())?;
+        let profile = checks::profile(output).map_err(|error| error.to_string())?;
         self.remember(&profile);
         Ok(profile)
     }
 }
 
-pub(crate) async fn version_check(executable: &Path) -> Result<VersionCheck, Error> {
+pub async fn version_check(executable: &Path) -> Result<VersionCheck, Error> {
     let identity = executable_identity(executable).await?;
     let version = VERSION_CACHE
         .lock()
@@ -242,7 +227,7 @@ pub(super) async fn checked_profile(launch: &Launch<'_>) -> Result<String, Error
     )
     .await;
     dir.close().await;
-    let profile = checks::profile(&output?, env::consts::OS)?;
+    let profile = checks::profile(&output?)?;
     check.remember(&profile);
     Ok(profile)
 }
@@ -283,8 +268,7 @@ pub(crate) async fn models(
 /// `None` where the answer names a different model.
 async fn windows(launch: &Launch<'_>, models: &[String]) -> Result<Vec<Option<u32>>, Error> {
     unprompted(launch, async |group| {
-        let mut stdin = group.child.stdin.take();
-        let mut lines = stdout_lines(group.child.stdout.take())?;
+        let (mut stdin, mut lines) = group.pipes()?;
         let deadline = Instant::now() + launch.limits.startup;
         let initialize = json!({ "subtype": INITIALIZE });
         ask(&mut stdin, &mut lines, &initialize, deadline).await?;
@@ -344,8 +328,8 @@ async fn version(
 ) -> Result<String, Error> {
     let args = [VERSION_FLAG.to_owned()];
     supervised(command(executable, env, cwd, &args), async |group| {
-        drop(group.child.stdin.take());
-        let mut lines = stdout_lines(group.child.stdout.take())?;
+        let (stdin, mut lines) = group.pipes()?;
+        drop(stdin);
         let deadline = Instant::now() + startup;
         let first = match ReadDeadline::new(deadline)
             .next(&mut lines, None, deadline)

@@ -504,12 +504,15 @@ impl ToolRegistry {
         let snapshot = self.tools.load();
         let mut out = Vec::with_capacity(snapshot.len());
         for entry in snapshot.iter() {
-            if !ctx.filter.admits(
-                entry.name(),
-                entry.tool.audience(),
-                ctx.audience,
-                ctx.local_tools,
-            ) {
+            let admitted = match ctx.local_tools.and_then(|tools| tools.get(entry.name())) {
+                Some(local) => ctx
+                    .filter
+                    .admits_local(entry.name(), local.audience, ctx.audience),
+                None => ctx
+                    .filter
+                    .admits(entry.name(), entry.tool.audience(), ctx.audience),
+            };
+            if !admitted {
                 continue;
             }
             let description = vars.apply(&entry.tool.description(ctx)).into_owned();

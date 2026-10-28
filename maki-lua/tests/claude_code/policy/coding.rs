@@ -1729,9 +1729,8 @@ fn preparation_can_remove_links_with_non_utf8_names() {
 }
 
 #[test]
-fn escaping_links_are_checked_in_batches() {
+fn escaping_links_are_removed_without_shell_resolution() {
     const LINK_COUNT: usize = 256;
-    const MAX_REALPATH_CALLS: usize = 2;
     let coding = Coding::new();
     let tools = tempdir().unwrap();
     let realpath = on_path("realpath");
@@ -1759,11 +1758,7 @@ fn escaping_links_are_checked_in_batches() {
         );
     }
     assert!(fs::symlink_metadata(snapshot.join(PREPARED_LINK)).is_err());
-    let calls = fs::read_to_string(log).unwrap().lines().count();
-    assert!(
-        (1..=MAX_REALPATH_CALLS).contains(&calls),
-        "{calls} realpath processes"
-    );
+    assert!(!log.exists(), "snapshot sanitization started realpath");
 }
 
 #[test]

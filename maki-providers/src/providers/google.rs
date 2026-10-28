@@ -12,7 +12,7 @@ use tracing::warn;
 use maki_config::providers::Protocol;
 
 use crate::model::{Model, ModelFamily};
-use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
+use crate::provider::{BoxFuture, Provider, RequestScope};
 use crate::providers::Timeouts;
 use crate::providers::aperture::GEMINI_PATH_PREFIX;
 use crate::spec::{
@@ -283,10 +283,7 @@ impl Provider for Google {
         Box::pin(self.do_stream(model, messages, system, tools, event_tx, opts.thinking))
     }
 
-    fn list_models(
-        &self,
-        _listing: ModelListing,
-    ) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         let url = self.models_url();
         let request = self.build_request("GET", &url).body(()).unwrap();
         let client = self.client.clone();

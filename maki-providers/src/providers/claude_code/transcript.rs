@@ -185,7 +185,6 @@ pub(crate) fn transcript(messages: &[Message]) -> Result<Vec<String>, Error> {
         let mut out = String::new();
         let mut text = Vec::new();
         let mut calls = Vec::new();
-        let mut results = Vec::new();
         for block in &message.content {
             match block {
                 ContentBlock::Text { text: t } => text.push(t.as_str()),
@@ -211,21 +210,21 @@ pub(crate) fn transcript(messages: &[Message]) -> Result<Vec<String>, Error> {
                     is_error,
                     ..
                 } => {
-                    results.push(TranscriptResult {
-                        role: TOOL_RESULT_ROLE,
-                        tool_use_id,
-                        content,
-                        is_error: *is_error,
-                    });
+                    push_line(
+                        &mut out,
+                        &TranscriptResult {
+                            role: TOOL_RESULT_ROLE,
+                            tool_use_id,
+                            content,
+                            is_error: *is_error,
+                        },
+                    )?;
                 }
                 ContentBlock::Image { .. } => return Err(Error::Image),
                 ContentBlock::Thinking { .. }
                 | ContentBlock::RedactedThinking { .. }
                 | ContentBlock::Unknown(_) => {}
             }
-        }
-        for result in &results {
-            push_line(&mut out, result)?;
         }
         if !text.is_empty() || !calls.is_empty() {
             push_line(&mut out, &entry_of(message, &text, calls))?;

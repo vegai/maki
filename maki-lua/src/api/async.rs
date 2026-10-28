@@ -442,7 +442,8 @@ pub(crate) fn create_async_table(lua: &Lua, plugin: Arc<str>) -> LuaResult<Table
             let insert_pos = (argc - 1).min(args_vec.len());
             args_vec.insert(insert_pos, Value::Function(callback));
 
-            fun.call::<()>(MultiValue::from_iter(args_vec))?;
+            fun.call_async::<()>(MultiValue::from_iter(args_vec))
+                .await?;
 
             let result = rx
                 .recv_async()
@@ -584,12 +585,15 @@ mod tests {
         });
     }
 
-    #[test]
-    fn await_returns_multivalue_from_callback() {
+    #[test_case(false ; "synchronous_registration")]
+    #[test_case(true ; "yielding_registration")]
+    fn await_returns_multivalue_from_callback(yielding: bool) {
         smol::block_on(async {
             let (lua, _tbl) = setup();
+            lua.globals().set("yielding", yielding).unwrap();
             let code = r#"
                 local function producer(cb)
+                    if yielding then async_tbl.sleep(0) end
                     cb("hello", 42, true)
                 end
                 return async_tbl.await(1, producer)

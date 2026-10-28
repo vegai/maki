@@ -133,13 +133,13 @@ pub(crate) enum Step {
     Nothing,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamMode {
     Provider,
     Worker,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventKind {
     ControlResponse,
     RateLimit,
@@ -157,6 +157,12 @@ pub(crate) fn classify(
     mode: StreamMode,
     accepted: bool,
 ) -> Result<EventKind, Error> {
+    let kind = event_kind(event, mode)?;
+    check_start(event, kind, mode, accepted)?;
+    Ok(kind)
+}
+
+pub(super) fn event_kind(event: &Value, mode: StreamMode) -> Result<EventKind, Error> {
     let kind = match (event["type"].as_str(), event["subtype"].as_str()) {
         (Some(CONTROL_RESPONSE), _) => EventKind::ControlResponse,
         (Some(CONTROL_REQUEST), _) => {
@@ -190,6 +196,15 @@ pub(crate) fn classify(
         (Some(RESULT_EVENT), _) => EventKind::Result,
         _ => return Err(Error::UnknownEvent(event["type"].clone())),
     };
+    Ok(kind)
+}
+
+pub(super) fn check_start(
+    event: &Value,
+    kind: EventKind,
+    mode: StreamMode,
+    accepted: bool,
+) -> Result<(), Error> {
     if !accepted {
         if kind == EventKind::Result && failed_result(event) {
             if mode == StreamMode::Provider {
@@ -202,10 +217,10 @@ pub(crate) fn classify(
             return Err(Error::UncheckedStart);
         }
     }
-    Ok(kind)
+    Ok(())
 }
 
-fn failed_result(event: &Value) -> bool {
+pub(super) fn failed_result(event: &Value) -> bool {
     event["subtype"] != SUCCESS || event["is_error"] == true
 }
 
@@ -406,7 +421,7 @@ struct UserEvent<'a> {
     message: UserContent<'a>,
 }
 
-pub(crate) fn user_message(blocks: &[String]) -> Result<String, Error> {
+pub fn user_message(blocks: &[String]) -> Result<String, Error> {
     let message = UserEvent {
         message: UserContent {
             content: blocks
@@ -718,7 +733,7 @@ impl<'a> Turn<'a> {
             && self.answers_calls(&event["message"], &[MCP_CLOSED])
     }
 
-    fn feed_event(&mut self, event: Value) -> Result<Step, Error> {
+    fn feed_event(&mut self, mut event: Value) -> Result<Step, Error> {
         self.record_event(&event);
         let accepted = self.accepted();
         let kind = classify(&event, StreamMode::Provider, accepted)?;
@@ -733,7 +748,7 @@ impl<'a> Turn<'a> {
                 Ok(Step::Nothing)
             }
             EventKind::Stream => self.stream_event(&event["event"]),
-            EventKind::Assistant => self.assistant(&event["message"]),
+            EventKind::Assistant => self.assistant(&mut event["message"]),
             EventKind::User if self.truncated() && continuation(&event) => Ok(Step::Nothing),
             EventKind::User if self.answers_calls(&event["message"], &REJECTIONS) => {
                 self.rejected = true;
@@ -874,7 +889,7 @@ impl<'a> Turn<'a> {
     /// Each block comes in its own event, tagged with the generation's id. A
     /// completed reply is frozen, because a later block could add a call that
     /// Claude Code never hands to maki.
-    fn assistant(&mut self, message: &Value) -> Result<Step, Error> {
+    fn assistant(&mut self, message: &mut Value) -> Result<Step, Error> {
         if self.is_complete() {
             return Err(Error::LateContent);
         }
@@ -885,11 +900,7 @@ impl<'a> Turn<'a> {
         {
             return Err(Error::OutsideGeneration);
         }
-        for block in message["content"]
-            .as_array()
-            .map(Vec::as_slice)
-            .unwrap_or_default()
-        {
+        for block in message["content"].as_array_mut().into_iter().flatten() {
             let parsed = match block["type"].as_str() {
                 Some(TEXT_BLOCK) => ContentBlock::Text {
                     text: text_field(block, TEXT_BLOCK),
@@ -902,22 +913,19 @@ impl<'a> Turn<'a> {
                     data: text_field(block, "data"),
                 },
                 Some(TOOL_USE_BLOCK) => {
-                    let id = call_id(block)?;
+                    let id = call_id(block)?.to_owned();
                     let name = self.maki_name(&block["name"])?;
-                    let input = &block["input"];
+                    let input = block["input"].take();
                     if input.get(UNPARSED_TOOL_INPUT).is_some() {
                         return Err(Error::MalformedArguments(name));
                     }
                     if !input.is_object() {
-                        return Err(Error::NotArguments {
-                            name,
-                            input: input.clone(),
-                        });
+                        return Err(Error::NotArguments { name, input });
                     }
                     if self.calls().any(|(known, _, _)| known == id) {
-                        return Err(Error::RepeatedCall(id.to_owned()));
+                        return Err(Error::RepeatedCall(id));
                     }
-                    ContentBlock::tool_use(id, name, input.clone())
+                    ContentBlock::tool_use(id, name, input)
                 }
                 _ => return Err(Error::UnreadableBlock(block["type"].clone())),
             };
@@ -1279,7 +1287,6 @@ mod tests {
 
     const CWD: &str = "/work";
     const VERSION: &str = "2.1.284";
-    const LINUX: &str = "linux";
     const SERVER: &str = "maki";
     const END_TURN: &str = "end_turn";
     /// The model maki asks for, and the dated snapshot the generation
@@ -1484,7 +1491,7 @@ mod tests {
     /// Runs `test` on a turn with the test catalog, as a request for `ASKED`
     /// in `CWD` would build it.
     fn with_turn<T>(test: impl FnOnce(Turn<'_>) -> T) -> T {
-        let profile = profile(VERSION, LINUX).unwrap();
+        let profile = profile(VERSION).unwrap();
         let catalog = catalog();
         let tools = catalog.exposed();
         let expect = InitExpect {

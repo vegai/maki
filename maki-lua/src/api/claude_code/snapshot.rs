@@ -1,24 +1,28 @@
-use std::ffi::{CStr, OsStr};
+use std::collections::HashSet;
+use std::ffi::{CStr, OsStr, OsString};
 use std::fs::{self, File, FileTimes, Permissions};
-use std::io::{self, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+
+use maki_storage::permissions::PERMISSION_BITS;
 
 use maki_storage::id::MakiId;
 use rustix::fd::{AsFd, BorrowedFd};
 use rustix::fs::{
     AtFlags, Dir, FileType, Mode, OFlags, Stat, open, openat, renameat, statat, unlinkat,
 };
+use rustix::io::Errno;
 use rustix::path::Arg;
 
 use super::DIRECTORY_FLAGS;
-use super::checks::GIT_ENTRY;
+use maki_providers::claude_code::validation::GIT_ENTRY;
 
 const MAX_DEPTH: usize = 64;
+const MAX_LINK_EXPANSIONS: usize = 4096;
 const DEPTH_EXCEEDED: &str = "snapshot exceeds";
 const MAX_FAILURES: usize = 10;
-const PRIVATE_MODE_MASK: u32 = 0o777;
 const CONFIG: &str = "config";
 const HEAD: &str = "HEAD";
 const COMMONDIR: &str = "commondir";
@@ -26,13 +30,78 @@ const REPOSITORY_ENTRIES: &[&str] = &["objects", "refs"];
 const QUARANTINE_PREFIX: &str = "repository.";
 const QUARANTINE_ENTRY: &str = "metadata";
 const PRIVATE_COPY_PREFIX: &str = ".maki-private-";
+const ROOT_CHANGED: &str = "snapshot directory changed during sanitization";
 
 #[derive(Default)]
 pub struct SnapshotMetadata {
     pub git_metadata: Vec<String>,
     pub repositories: Vec<String>,
     pub private_files: usize,
-    pub symlinks: Vec<PathBuf>,
+    pub dropped_links: Vec<PathBuf>,
+}
+
+enum ResolveStep {
+    Component(OsString),
+    EndLink(PathBuf),
+}
+
+fn resolve_links(path: &Path) -> io::Result<PathBuf> {
+    let mut pending: Vec<_> = path
+        .components()
+        .rev()
+        .map(|part| ResolveStep::Component(part.as_os_str().to_owned()))
+        .collect();
+    let mut active = HashSet::new();
+    let mut expansions = 0;
+    let mut resolved = PathBuf::new();
+    while let Some(step) = pending.pop() {
+        let part = match step {
+            ResolveStep::Component(part) => part,
+            ResolveStep::EndLink(path) => {
+                active.remove(&path);
+                continue;
+            }
+        };
+        match part.as_bytes() {
+            b"." => {}
+            b".." => {
+                resolved.pop();
+            }
+            b"/" => resolved.push(part),
+            _ => {
+                resolved.push(part);
+                match fs::read_link(&resolved) {
+                    Ok(target) => {
+                        if !active.insert(resolved.clone()) {
+                            continue;
+                        }
+                        expansions += 1;
+                        if expansions > MAX_LINK_EXPANSIONS {
+                            return Err(Errno::LOOP.into());
+                        }
+                        pending.push(ResolveStep::EndLink(resolved.clone()));
+                        resolved.pop();
+                        pending.extend(
+                            target
+                                .components()
+                                .rev()
+                                .map(|part| ResolveStep::Component(part.as_os_str().to_owned())),
+                        );
+                    }
+                    Err(error)
+                        if error.raw_os_error() == Some(Errno::LOOP.raw_os_error())
+                            || matches!(
+                                error.kind(),
+                                ErrorKind::InvalidInput
+                                    | ErrorKind::NotFound
+                                    | ErrorKind::NotADirectory
+                            ) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 fn private_copy(parent: &impl AsFd, name: impl Arg + Copy) -> io::Result<()> {
@@ -55,7 +124,7 @@ fn private_copy(parent: &impl AsFd, name: impl Arg + Copy) -> io::Result<()> {
     )?);
     let result = (|| {
         io::copy(&mut source, &mut copy)?;
-        copy.set_permissions(Permissions::from_mode(metadata.mode() & PRIVATE_MODE_MASK))?;
+        copy.set_permissions(Permissions::from_mode(metadata.mode() & PERMISSION_BITS))?;
         copy.set_times(
             FileTimes::new()
                 .set_accessed(metadata.accessed()?)
@@ -259,13 +328,20 @@ pub fn sanitize_snapshot(
 ) -> io::Result<SnapshotMetadata> {
     fs::create_dir_all(quarantine)?;
     let root = File::from(open(snapshot, DIRECTORY_FLAGS, Mode::empty())?);
+    let resolved_root = snapshot.canonicalize()?;
+    let pinned = root.metadata()?;
+    let named = fs::metadata(&resolved_root)?;
+    if pinned.dev() != named.dev() || pinned.ino() != named.ino() {
+        return Err(io::Error::other(ROOT_CHANGED));
+    }
     let pointer = restore_pointer(&root, quarantine, git);
     let mut relocated = SnapshotMetadata::default();
     let root_repository = repository(&root);
     if root_repository {
         relocated.repositories.push(".".into());
     }
-    let scanned = walk(root, 0, |parent, name, path, metadata| {
+    let mut symlinks = Vec::new();
+    let scanned = walk(root.try_clone()?, 0, |parent, name, path, metadata| {
         if path == Path::new(GIT_ENTRY) {
             return Ok(Visit::Skip);
         }
@@ -285,7 +361,8 @@ pub fn sanitize_snapshot(
         }
         let kind = FileType::from_raw_mode(metadata.st_mode);
         if kind == FileType::Symlink {
-            relocated.symlinks.push(path.to_path_buf());
+            symlinks.push(path.to_path_buf());
+            return Ok(Visit::Skip);
         }
         if kind == FileType::RegularFile && metadata.st_nlink > 1 {
             private_copy(parent, name)?;
@@ -305,6 +382,26 @@ pub fn sanitize_snapshot(
         Ok(Visit::Scan)
     });
     pointer.and(scanned)?;
+    // Removing an alias before resolving the next link can disguise an escaping target as
+    // an internal missing path. Resolve the whole graph before deleting any link.
+    relocated.dropped_links = symlinks
+        .into_iter()
+        .filter(|path| {
+            !resolve_links(&resolved_root.join(path))
+                .is_ok_and(|target| target.starts_with(&resolved_root))
+        })
+        .collect();
+    for path in &relocated.dropped_links {
+        let mut parent = root.try_clone()?;
+        let mut parts = path.components().peekable();
+        while let Some(part) = parts.next() {
+            if parts.peek().is_none() {
+                unlinkat(&parent, part.as_os_str(), AtFlags::empty())?;
+            } else {
+                parent = directory(&parent, part.as_os_str())?;
+            }
+        }
+    }
     Ok(relocated)
 }
 
@@ -312,12 +409,15 @@ pub fn sanitize_snapshot(
 mod tests {
     use super::{
         COMMONDIR, CONFIG, DEPTH_EXCEEDED, GIT_ENTRY, HEAD, MAX_DEPTH, MAX_FAILURES,
-        QUARANTINE_ENTRY, Visit, quarantine_entry, sanitize_snapshot, walk,
+        QUARANTINE_ENTRY, Visit, quarantine_entry, resolve_links, sanitize_snapshot, walk,
     };
+    use rustix::io::Errno;
     use rustix::process::geteuid;
     use std::env;
+    use std::ffi::{OsStr, OsString};
     use std::fs::{self, File, Permissions};
     use std::io;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -332,6 +432,97 @@ mod tests {
     const FD_LIMIT_ENV: &str = "MAKI_SNAPSHOT_FD_LIMIT_TEST";
     const FD_LIMIT: usize = 128;
     const PENDING_REPOSITORIES: usize = FD_LIMIT * 2;
+    const LINK_CHAIN_LENGTH: usize = 64;
+    const RESOLUTION_LINK: &str = "link";
+    const REALPATH: &str = "realpath";
+
+    #[test_case(b"inside/file" ; "internal")]
+    #[test_case(b"missing/file" ; "missing_internal_target")]
+    #[test_case(b"../outside/missing" ; "missing_external_target")]
+    #[test_case(b"escape/../inside/file" ; "parent_after_external_link")]
+    #[test_case(b"escape/back/file" ; "external_link_returns_inside")]
+    #[test_case(b"dot/dot/inside/file" ; "repeated_finite_link")]
+    #[test_case(b"loop" ; "cyclic_link")]
+    #[test_case(b"chain0" ; "long_link_chain")]
+    #[test_case(b"missing/\xff" ; "non_utf8_target")]
+    fn link_resolution_and_removal_match_realpath(target: &[u8]) {
+        let dir = tempdir().unwrap();
+        let snapshot = dir.path().join("snapshot");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(snapshot.join("inside")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(snapshot.join("inside/file"), CONTENT).unwrap();
+        symlink(".", snapshot.join("dot")).unwrap();
+        symlink("../outside", snapshot.join("escape")).unwrap();
+        symlink(snapshot.join("inside"), outside.join("back")).unwrap();
+        symlink("loop", snapshot.join("loop")).unwrap();
+        symlink("growing/again", snapshot.join("growing")).unwrap();
+        for i in 0..LINK_CHAIN_LENGTH {
+            let next = if i + 1 == LINK_CHAIN_LENGTH {
+                "inside/file".to_owned()
+            } else {
+                format!("chain{}", i + 1)
+            };
+            symlink(next, snapshot.join(format!("chain{i}"))).unwrap();
+        }
+        let link = snapshot.join(RESOLUTION_LINK);
+        symlink(OsStr::from_bytes(target), &link).unwrap();
+        let output = Command::new(REALPATH)
+            .args(["-m", "-z", "--"])
+            .arg(&link)
+            .output()
+            .unwrap();
+        let expected = output.status.success().then(|| {
+            PathBuf::from(OsString::from_vec(
+                output.stdout.strip_suffix(&[0]).unwrap().to_vec(),
+            ))
+        });
+        assert_eq!(resolve_links(&link).ok(), expected);
+        let dropped =
+            expected.is_none_or(|path| !path.starts_with(snapshot.canonicalize().unwrap()));
+        let metadata = sanitize_snapshot(
+            &snapshot,
+            &dir.path().join("quarantine"),
+            &dir.path().join("repository"),
+        )
+        .unwrap();
+        assert_eq!(
+            metadata
+                .dropped_links
+                .contains(&PathBuf::from(RESOLUTION_LINK)),
+            dropped
+        );
+        assert_eq!(fs::symlink_metadata(link).is_err(), dropped);
+    }
+    #[test]
+    fn growing_cycles_resolve_without_following_the_unresolvable_tail() {
+        const GROWING: &str = "growing";
+        const TARGET: &str = "growing/again";
+        let dir = tempdir().unwrap();
+        symlink(TARGET, dir.path().join(GROWING)).unwrap();
+        assert_eq!(
+            resolve_links(&dir.path().join(GROWING)).unwrap(),
+            dir.path().join(TARGET)
+        );
+    }
+
+    #[test]
+    fn finite_alias_graphs_cannot_expand_without_bound() {
+        const LEVELS: usize = 14;
+        let dir = tempdir().unwrap();
+        symlink(".", dir.path().join("split0")).unwrap();
+        for level in 1..=LEVELS {
+            let previous = format!("split{}", level - 1);
+            symlink(
+                format!("{previous}/{previous}"),
+                dir.path().join(format!("split{level}")),
+            )
+            .unwrap();
+        }
+        let error = resolve_links(&dir.path().join(format!("split{LEVELS}"))).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(Errno::LOOP.raw_os_error()));
+    }
+
     const LIMIT_DESCRIPTORS: &str = "ulimit -n \"$1\" && shift && exec \"$@\"";
     const CHILD_TEST_PASSED: &str = "1 passed";
 
@@ -380,7 +571,7 @@ mod tests {
         assert_eq!(after.nlink(), 1);
         assert_eq!(
             after.permissions().mode() & 0o7777,
-            mode & super::PRIVATE_MODE_MASK
+            mode & super::PERMISSION_BITS
         );
         assert_eq!(after.modified().unwrap(), before.modified().unwrap());
         assert_eq!(fs::read_to_string(&copied).unwrap(), CONTENT);
@@ -413,7 +604,7 @@ mod tests {
         assert_eq!(fs::read_dir(&quarantine).unwrap().count(), 1);
         let metadata = sanitize_snapshot(&snapshot, &quarantine, &git).unwrap();
         assert!(metadata.git_metadata.is_empty());
-        assert!(metadata.symlinks.is_empty());
+        assert!(metadata.dropped_links.is_empty());
         assert_eq!(fs::read_dir(&quarantine).unwrap().count(), 1);
     }
 
@@ -433,7 +624,7 @@ mod tests {
         symlink(&outside, snapshot.join("linked")).unwrap();
         let metadata = sanitize_snapshot(&snapshot, &quarantine, &git).unwrap();
         assert!(metadata.git_metadata.is_empty());
-        assert_eq!(metadata.symlinks, [PathBuf::from("linked")]);
+        assert_eq!(metadata.dropped_links, [PathBuf::from("linked")]);
         assert_eq!(fs::read_to_string(&target).unwrap(), pointer);
         assert!(
             fs::symlink_metadata(snapshot.join(GIT_ENTRY))
@@ -441,7 +632,7 @@ mod tests {
                 .is_file()
         );
         assert_eq!(fs::read_dir(&quarantine).unwrap().count(), 1);
-        assert!(snapshot.join("linked/.git").exists());
+        assert!(fs::symlink_metadata(snapshot.join("linked")).is_err());
     }
 
     #[test_case("objects")]

@@ -455,15 +455,19 @@ fn resolve<'a>(ctx: &'a ToolContext, name: &'a str) -> Resolved<'a> {
     } else if let Some(entry) = ctx.registry.get(name) {
         Some(Route::Native(entry))
     } else if let Some(mcp) = ctx.mcp.as_ref() {
-        match mcp.resolve(name) {
-            Some(qualified) => Some(Route::Mcp(mcp, qualified)),
-            None if name == TOOL_SEARCH_TOOL_NAME => Some(Route::ToolSearch(mcp)),
-            None => None,
-        }
+        mcp_route(mcp, name)
     } else {
         None
     };
     Resolved { name, route }
+}
+
+fn mcp_route<'a>(mcp: &'a McpSession, name: &str) -> Option<Route<'a>> {
+    match mcp.resolve(name) {
+        Some(qualified) => Some(Route::Mcp(mcp, qualified)),
+        None if name == TOOL_SEARCH_TOOL_NAME => Some(Route::ToolSearch(mcp)),
+        None => None,
+    }
 }
 
 fn offered(ctx: &ToolContext, name: &str, route: &Route<'_>) -> bool {
@@ -479,7 +483,7 @@ fn offered(ctx: &ToolContext, name: &str, route: &Route<'_>) -> bool {
 
 fn offered_native(ctx: &ToolContext, name: &str, entry: &RegisteredTool) -> bool {
     ctx.tool_filter
-        .admits(name, entry.tool.audience(), ctx.audience, None)
+        .admits(name, entry.tool.audience(), ctx.audience)
 }
 
 /// One callable name, as [`resolve`] would route it.
@@ -550,11 +554,7 @@ pub fn callable(ctx: &ToolContext) -> Vec<Callable> {
         for name in names {
             // MCP has no audience system: a server is reachable or it is not,
             // and a session holding one already offers its tools to the model.
-            let route = if name == TOOL_SEARCH_TOOL_NAME {
-                Route::ToolSearch(mcp)
-            } else if let Some(qualified) = mcp.resolve(&name) {
-                Route::Mcp(mcp, qualified)
-            } else {
+            let Some(route) = mcp_route(mcp, &name) else {
                 continue;
             };
             if claimed.insert(name.clone()) && offered(ctx, &name, &route) {

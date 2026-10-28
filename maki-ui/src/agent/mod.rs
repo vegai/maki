@@ -295,7 +295,7 @@ mod tests {
     use maki_agent::live_session::BACKGROUND_PLAN_WRITE_DENIED;
     use maki_agent::{AgentEvent, AgentInput, AgentMode, AgentSeed, InputSource};
     use maki_config::{PermissionsConfig, ProjectConfig};
-    use maki_providers::provider::{BoxFuture, ModelListing, Provider, RequestScope};
+    use maki_providers::provider::{BoxFuture, Provider, RequestScope};
     use maki_providers::{
         AgentError, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
     };
@@ -337,10 +337,7 @@ mod tests {
             Box::pin(std::future::pending())
         }
 
-        fn list_models(
-            &self,
-            _listing: ModelListing,
-        ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
     }
@@ -445,10 +442,7 @@ mod tests {
             })
         }
 
-        fn list_models(
-            &self,
-            _listing: ModelListing,
-        ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
     }

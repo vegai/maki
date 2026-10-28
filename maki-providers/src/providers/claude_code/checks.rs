@@ -9,7 +9,6 @@ use std::io::{self, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 use maki_storage::paths::normalize_path;
-#[cfg(unix)]
 use rustix::fs::{Mode, OFlags, open};
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -18,7 +17,6 @@ use super::OAUTH_TOKEN_ENV;
 use super::error::{Error, Problem};
 
 pub(crate) const MINIMUM_VERSION: [u64; 3] = [2, 1, 284];
-const SYSTEMS: &[&str] = &["linux"];
 pub(crate) const ACCOUNT_ANSWER: &str = "account";
 pub(crate) const SETTINGS_ANSWER: &str = "settings";
 pub(crate) const HOOKS_ANSWER: &str = "hooks";
@@ -174,6 +172,10 @@ pub(crate) struct HandshakeStep {
     pub subtype: &'static str,
 }
 
+pub(super) fn inside_checkout(path: &Path, project: &Path, denied: &[PathBuf]) -> bool {
+    path.starts_with(project) || denied.iter().any(|dir| path.starts_with(dir))
+}
+
 fn minimum_version() -> String {
     MINIMUM_VERSION.map(|part| part.to_string()).join(".")
 }
@@ -189,18 +191,8 @@ fn version_parts(version: &str) -> Option<[u64; 3]> {
     parts.next().is_none().then_some(parsed)
 }
 
-pub(super) fn require_system(os: &str) -> Result<(), Error> {
-    if !SYSTEMS.contains(&os.to_ascii_lowercase().as_str()) {
-        return Err(Error::UnsupportedSystem {
-            os: os.to_owned(),
-            systems: SYSTEMS.join(", "),
-        });
-    }
-    Ok(())
-}
-
 /// A first word that is not `major.minor.patch` stops the request.
-pub(crate) fn profile(output: &str, os: &str) -> Result<String, Error> {
+pub(crate) fn profile(output: &str) -> Result<String, Error> {
     let version = output.split_whitespace().next().unwrap_or_default();
     let parts = version_parts(version).ok_or_else(|| Error::UnknownVersion(output.to_owned()))?;
     if parts < MINIMUM_VERSION {
@@ -209,7 +201,6 @@ pub(crate) fn profile(output: &str, os: &str) -> Result<String, Error> {
             oldest: minimum_version(),
         });
     }
-    require_system(os)?;
     Ok(version.to_owned())
 }
 
@@ -421,14 +412,11 @@ fn settings_conflicts(settings: &Value) -> Vec<String> {
 }
 
 fn limited_text(path: &Path, max_bytes: u64, too_large: &'static str) -> io::Result<String> {
-    #[cfg(unix)]
     let file = File::from(open(
         path,
         OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )?);
-    #[cfg(not(unix))]
-    let file = File::open(path)?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::new(ErrorKind::InvalidData, NOT_A_FILE));
     }
@@ -653,18 +641,15 @@ mod tests {
     use std::ffi::OsString;
     use std::fs::{self, File};
     use std::io::ErrorKind;
-    #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
 
-    #[cfg(unix)]
     use rustix::fs::{CWD as AT_CWD, Mode, mkfifoat};
     use serde_json::{Value, json};
     use tempfile::{TempDir, tempdir};
     use test_case::test_case;
 
     use super::super::error::{Error, Problem};
-    #[cfg(unix)]
     use super::NOT_A_FILE;
     use super::{
         ACCOUNT_ANSWER, COMMONDIR_FILE, CONNECTED, DEFAULT_MODE, ESSENTIAL_TRAFFIC_ONLY,
@@ -700,7 +685,6 @@ mod tests {
         assert_eq!(error.to_string(), SETTINGS_TOO_LARGE);
     }
 
-    #[cfg(unix)]
     #[test_case(false ; "fifo")]
     #[test_case(true ; "device_symlink")]
     fn nonregular_settings_fail_without_waiting(device: bool) {
@@ -713,7 +697,6 @@ mod tests {
         }
         assert!(file_conflicts(&[path])[0].contains(NOT_A_FILE));
     }
-    const LINUX: &str = "linux";
     const SERVER: &str = "maki";
     const TOOL: &str = "mcp__maki__read";
     const OTHER_TOOL: &str = "mcp__maki__bash";
@@ -775,27 +758,25 @@ mod tests {
         assert_eq!(settings, [ESSENTIAL_TRAFFIC_ONLY.1]);
     }
 
-    #[test_case("2.1.285 (Claude Code)", "Linux" => matches Ok(version) if version == "2.1.285" ; "newer_patch_case_insensitive_platform")]
-    #[test_case("  2.1.1000", "linux" => matches Ok(version) if version == "2.1.1000" ; "leading_whitespace")]
-    #[test_case("3.0.0", "linux" => matches Ok(version) if version == "3.0.0" ; "new_major_version")]
-    #[test_case("2.1.283 (Claude Code)", "linux" => matches Err(Error::TooOld { .. }) ; "too_old_patch")]
-    #[test_case("1.9.999", "linux" => matches Err(Error::TooOld { .. }) ; "too_old_major")]
-    #[test_case("2.1.284-beta (Claude Code)", "linux" => matches Err(Error::UnknownVersion(_)) ; "prerelease_refused")]
-    #[test_case("2.1.284.1", "linux" => matches Err(Error::UnknownVersion(_)) ; "extra_version_component")]
-    #[test_case("Update available", "linux" => matches Err(Error::UnknownVersion(_)) ; "update_notice")]
-    #[test_case("claude: not found", "linux" => matches Err(Error::UnknownVersion(_)) ; "missing_executable")]
-    #[test_case("", "linux" => matches Err(Error::UnknownVersion(_)) ; "empty_version")]
-    #[test_case(&minimum_version(), "darwin" => matches Err(Error::UnsupportedSystem { .. }) ; "unsupported_macos")]
-    #[test_case(&minimum_version(), "Windows_NT" => matches Err(Error::UnsupportedSystem { .. }) ; "unsupported_windows")]
-    fn versions_meet_the_launch_requirements(output: &str, system: &str) -> Result<String, Error> {
-        profile(output, system)
+    #[test_case("2.1.285 (Claude Code)" => matches Ok(version) if version == "2.1.285" ; "newer_patch")]
+    #[test_case("  2.1.1000" => matches Ok(version) if version == "2.1.1000" ; "leading_whitespace")]
+    #[test_case("3.0.0" => matches Ok(version) if version == "3.0.0" ; "new_major_version")]
+    #[test_case("2.1.283 (Claude Code)" => matches Err(Error::TooOld { .. }) ; "too_old_patch")]
+    #[test_case("1.9.999" => matches Err(Error::TooOld { .. }) ; "too_old_major")]
+    #[test_case("2.1.284-beta (Claude Code)" => matches Err(Error::UnknownVersion(_)) ; "prerelease_refused")]
+    #[test_case("2.1.284.1" => matches Err(Error::UnknownVersion(_)) ; "extra_version_component")]
+    #[test_case("Update available" => matches Err(Error::UnknownVersion(_)) ; "update_notice")]
+    #[test_case("claude: not found" => matches Err(Error::UnknownVersion(_)) ; "missing_executable")]
+    #[test_case("" => matches Err(Error::UnknownVersion(_)) ; "empty_version")]
+    fn versions_meet_the_launch_requirements(output: &str) -> Result<String, Error> {
+        profile(output)
     }
 
     #[test]
     fn the_minimum_version_is_supported() {
         let version = minimum_version();
         let output = format!("{version} (Claude Code)");
-        assert_eq!(profile(&output, "linux").unwrap(), version);
+        assert_eq!(profile(&output).unwrap(), version);
     }
 
     #[test_case("PATH" => (true, false) ; "passed_path")]
@@ -969,7 +950,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test_case(false, false ; "git_pointer_fifo")]
     #[test_case(false, true ; "git_pointer_device")]
     #[test_case(true, false ; "commondir_fifo")]
@@ -993,7 +973,6 @@ mod tests {
 
     /// Claude Code follows a `.git` link, so a link to a worktree's `.git`
     /// file still leads to the primary checkout.
-    #[cfg(unix)]
     #[test]
     fn a_linked_git_file_still_reaches_the_main_checkout() {
         let (_dir, tree) = worktree(b"gitdir: ../main/.git/worktrees/wt\n", Some(b"../..\n"));
@@ -1085,7 +1064,7 @@ mod tests {
     #[test_case(init(|e| e["plugins"] = Value::Null) => matches Some(Problem::NoPlugins) ; "no_plugin_list")]
     #[test_case(init(|e| e["cwd"] = json!(OTHER_DIR)) => matches Some(Problem::OtherDir(dir)) if dir == OTHER_DIR ; "another_dir")]
     fn init_must_match_the_launch(event: Value) -> Option<Problem> {
-        let profile = profile(VERSION, LINUX).unwrap();
+        let profile = profile(VERSION).unwrap();
         let tools: HashSet<String> = [TOOL.to_owned(), OTHER_TOOL.to_owned()].into();
         let expect = InitExpect {
             version: &profile,

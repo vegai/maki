@@ -149,7 +149,12 @@ function M.import_script(changes, project, git_dir, artifact, stage)
   local function hash_path(path, sha, refused)
     local index = #hashed_paths
     hashed_paths[#hashed_paths + 1] = path
-    hashed_checks[#hashed_checks + 1] = '[ "${hashes[' .. index .. ']}" = ' .. sha .. " ] || " .. refused
+    hashed_checks[#hashed_checks + 1] = '[ "${hashes['
+      .. index
+      .. ']}" = '
+      .. path_utils.bash_quote(sha)
+      .. " ] || "
+      .. refused
   end
   local staged, checked = {}, {}
   for _, change in ipairs(changes) do
@@ -167,7 +172,12 @@ function M.import_script(changes, project, git_dir, artifact, stage)
       hash_path(CURRENT_DIR .. change.path, change.old_sha, "changed " .. path)
       local index = #mode_paths
       mode_paths[#mode_paths + 1] = CURRENT_DIR .. change.path
-      modes[#modes + 1] = "same_mode " .. path .. ' "${old_modes[' .. index .. ']}" ' .. change.old_mode
+      modes[#modes + 1] = "same_mode "
+        .. path
+        .. ' "${old_modes['
+        .. index
+        .. ']}" '
+        .. path_utils.bash_quote(change.old_mode)
       local folder = maki.fs.dirname(CURRENT_DIR .. change.path)
       if not keep_folders[folder] then
         keep_folders[folder] = {}
@@ -180,8 +190,8 @@ function M.import_script(changes, project, git_dir, artifact, stage)
     else
       if not staged[change.new_sha] then
         staged[change.new_sha] = true
-        stages[#stages + 1] = "staged " .. change.new_sha
-        hash_path(stage .. "/" .. change.new_sha, change.new_sha, "gone " .. change.new_sha)
+        stages[#stages + 1] = "staged " .. path_utils.bash_quote(change.new_sha)
+        hash_path(stage .. "/" .. change.new_sha, change.new_sha, "gone " .. path_utils.bash_quote(change.new_sha))
       end
       local flag = "keep"
       if change.status == git_utils.ADDED or change.old_mode ~= change.new_mode then
@@ -189,7 +199,14 @@ function M.import_script(changes, project, git_dir, artifact, stage)
       end
       local permissions = change.status == git_utils.ADDED and '"$fresh"'
         or '"${old_modes[' .. (#mode_paths - 1) .. ']}"'
-      news[#news + 1] = "new " .. path .. " " .. change.new_sha .. " " .. flag .. " " .. permissions
+      news[#news + 1] = "new "
+        .. path
+        .. " "
+        .. path_utils.bash_quote(change.new_sha)
+        .. " "
+        .. path_utils.bash_quote(flag)
+        .. " "
+        .. permissions
       if change.status ~= git_utils.ADDED then
         writes[#writes + 1] = "drop " .. path
       end

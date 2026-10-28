@@ -170,24 +170,11 @@ function M.exclude_rule(dir)
 end
 
 function M.bash_quote(text)
-  local quoted = M.shell_quote(text):gsub("%c", function(char)
-    return string.format("'$'\\%03o''", char:byte())
-  end)
-  return native.escape_invisible(quoted, true)
+  return native.escape_path(text, true)
 end
 
---- Terminal control bytes can execute commands. Escape them and non-UTF-8 path bytes before
---- display.
 function M.printable(path)
-  path = path:gsub("\\", "\\\\")
-  return (
-    native.escape_invisible(
-      path:gsub(utf8.len(path) and "%c" or "[%c\128-\255]", function(char)
-        return string.format("\\%03o", char:byte())
-      end),
-      false
-    )
-  )
+  return native.escape_path(path, false)
 end
 
 function M.shown(paths)

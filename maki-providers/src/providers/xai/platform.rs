@@ -8,7 +8,7 @@ use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 use tracing::debug;
 
-use crate::model::Model;
+use crate::model::{Model, ModelInfo};
 use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use crate::providers::openai::responses;
 use crate::providers::openai_compat::{
@@ -245,10 +245,14 @@ impl Provider for Xai {
         })
     }
 
-    fn list_models(
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        self.list_models_for(ModelListing::Cached)
+    }
+
+    fn list_models_for(
         &self,
         listing: ModelListing,
-    ) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
             self.refresh_if_stale().await?;
             if self.is_oauth() {

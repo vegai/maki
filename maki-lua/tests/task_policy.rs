@@ -10,7 +10,7 @@ use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{CallOrigin, ToolContext, ToolFilter, ToolRegistry};
 use maki_agent::{AgentMode, CancelToken, ToolOutput};
 use maki_lua::{PluginHost, SessionEndReason};
-use maki_providers::provider::{BoxFuture, ModelListing, Provider, RequestScope};
+use maki_providers::provider::{BoxFuture, Provider, RequestScope};
 use maki_providers::{
     AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
     StopReason, StreamResponse, TokenUsage,
@@ -965,10 +965,7 @@ impl Provider for StructuredOutputProvider {
         })
     }
 
-    fn list_models(
-        &self,
-        _listing: ModelListing,
-    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }

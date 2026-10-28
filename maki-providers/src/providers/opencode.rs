@@ -5,7 +5,7 @@ use maki_storage::id::SessionRef;
 use serde_json::Value;
 
 use crate::model::{Model, ModelFamily, ModelInfo};
-use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
+use crate::provider::{BoxFuture, Provider, RequestScope};
 use crate::providers::catalog::{
     CatalogMeta, CatalogTransport, EndpointType, FreeTier, ProviderQuirks,
     adaptive_effort_if_available, init_shared_catalog_if_needed,
@@ -274,10 +274,7 @@ impl Provider for Opencode {
         })
     }
 
-    fn list_models(
-        &self,
-        _listing: ModelListing,
-    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(self.do_list_models())
     }
 

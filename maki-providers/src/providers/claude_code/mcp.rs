@@ -150,13 +150,17 @@ async fn accept_loop(
     shared: Arc<Shared>,
 ) {
     let mut connections: Vec<Connection> = Vec::new();
+    let mut accept_failed = false;
     loop {
         let stream = match incoming.next().await {
             Some(Ok(stream)) => stream,
             // A connection that closed before the accept, or a brief shortage
             // of descriptors, must not stop the task that holds every call.
             Some(Err(error)) => {
-                warn!(%error, "claude-code: the handoff server cannot accept a connection");
+                if !accept_failed {
+                    warn!(%error, "claude-code: the handoff server cannot accept a connection");
+                    accept_failed = true;
+                }
                 Timer::after(ACCEPT_RETRY).await;
                 continue;
             }

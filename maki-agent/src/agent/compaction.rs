@@ -618,7 +618,7 @@ mod tests {
     use std::path::Path;
     use std::sync::Mutex;
 
-    use maki_providers::provider::{BoxFuture, ModelListing, Provider, RequestScope};
+    use maki_providers::provider::{BoxFuture, Provider, RequestScope};
     use maki_providers::{
         ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
         StreamResponse, TokenUsage,
@@ -703,10 +703,7 @@ mod tests {
             })
         }
 
-        fn list_models(
-            &self,
-            _listing: ModelListing,
-        ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
             Box::pin(async { unimplemented!() })
         }
     }

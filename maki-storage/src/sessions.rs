@@ -1887,17 +1887,21 @@ where
             message.truncate(message.floor_char_boundary(MAX_ERROR_BYTES - ERROR_TRUNCATED.len()));
             message.push_str(ERROR_TRUNCATED);
         }
-        if self.errors.len() >= MAX_RECORDED_ERRORS {
+        let pruned = self.errors.len() >= MAX_RECORDED_ERRORS;
+        if pruned {
             self.errors
                 .drain(..self.errors.len() - MAX_RECORDED_ERRORS / 2);
-            self.rewrite();
         }
         self.errors.push(RecordedError {
             message,
             timestamp: Some(now_epoch()),
             message_count: Some(self.messages.len()),
         });
-        self.touch();
+        if pruned {
+            self.rewrite();
+        } else {
+            self.touch();
+        }
     }
 
     pub fn messages(&self) -> &[M] {

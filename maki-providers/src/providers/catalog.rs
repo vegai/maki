@@ -956,10 +956,7 @@ impl Provider for CatalogProvider {
         })
     }
 
-    fn list_models(
-        &self,
-        _listing: ModelListing,
-    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
             Ok(self
                 .data
@@ -1032,11 +1029,15 @@ impl Provider for LazyCatalogProvider {
         })
     }
 
-    fn list_models(
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        self.list_models_for(ModelListing::Cached)
+    }
+
+    fn list_models_for(
         &self,
         listing: ModelListing,
     ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async move { self.resolve().await?.list_models(listing).await })
+        Box::pin(async move { self.resolve().await?.list_models_for(listing).await })
     }
 }
 
@@ -1099,9 +1100,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        Authentication, CatalogData, CatalogMeta, EndpointType, ModelListing, ProviderData,
-        ProviderQuirks, SessionRef, StateDir, available_if_warm, determine_catalog_format,
-        parse_model, quirks_for,
+        Authentication, CatalogData, CatalogMeta, EndpointType, ProviderData, ProviderQuirks,
+        SessionRef, StateDir, available_if_warm, determine_catalog_format, parse_model, quirks_for,
     };
     use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
     use crate::provider::{Provider, RequestScope};
@@ -1223,11 +1223,7 @@ mod tests {
         let data = opencode_go_provider_data("MAKI_TEST_OPENCODE_GO_UNSET_KEY_52814");
         let provider =
             super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
-        assert!(
-            smol::block_on(provider.list_models(ModelListing::Cached))
-                .unwrap()
-                .is_empty()
-        );
+        assert!(smol::block_on(provider.list_models()).unwrap().is_empty());
 
         let model = Model {
             id: "free-model".into(),
@@ -1271,7 +1267,7 @@ mod tests {
         let data = opencode_go_provider_data("MAKI_TEST_OPENCODE_GO_UNSET_KEY_91472");
         let provider =
             super::CatalogProvider::new(data, &state_dir, Timeouts::default(), true).unwrap();
-        let models = smol::block_on(provider.list_models(ModelListing::Cached)).unwrap();
+        let models = smol::block_on(provider.list_models()).unwrap();
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["free-model"]);
     }
@@ -1283,7 +1279,7 @@ mod tests {
         let data = opencode_go_provider_data("MAKI_TEST_OPENCODE_GO_KEY_41827");
         let provider =
             super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
-        let models = smol::block_on(provider.list_models(ModelListing::Cached)).unwrap();
+        let models = smol::block_on(provider.list_models()).unwrap();
         let mut ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         ids.sort_unstable();
         assert_eq!(ids, ["free-model", "paid-model"]);

@@ -12,13 +12,14 @@ use tracing::debug;
 
 use crate::{StateDir, StorageError, atomic_write_permissions};
 
+use crate::permissions::PRIVATE_FILE_MODE;
+
 const AUTH_DIR: &str = "auth";
 /// Plugin providers keep their credentials apart from everything else under
 /// [`AUTH_DIR`]: a plugin picks its own slug, and in a shared directory that
 /// name could be `mcp-<server>` or a catalog provider's slug, the file maki
 /// keeps somebody else's secret in.
 const PLUGIN_AUTH_DIR: &str = "plugins";
-const AUTH_FILE_MODE: u32 = 0o600;
 const REFRESH_BUFFER_SECS: u64 = 60;
 const LOCK_SUFFIX: &str = ".lock";
 const LOCK_WAIT: Duration = Duration::from_secs(30);
@@ -207,7 +208,7 @@ fn save_auth(path: &Path, data: &impl Serialize) -> Result<(), StorageError> {
         fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_string_pretty(data)?;
-    atomic_write_permissions(path, json.as_bytes(), AUTH_FILE_MODE)?;
+    atomic_write_permissions(path, json.as_bytes(), PRIVATE_FILE_MODE)?;
     debug!(path = %path.display(), "auth data saved");
     Ok(())
 }
@@ -370,7 +371,7 @@ mod tests {
         #[cfg(unix)]
         {
             let metadata = fs::metadata(auth_path(&dir, "anthropic")).unwrap();
-            assert_eq!(metadata.permissions().mode() & 0o777, AUTH_FILE_MODE);
+            assert_eq!(metadata.permissions().mode() & 0o777, PRIVATE_FILE_MODE);
         }
 
         assert!(delete_tokens(&dir, "anthropic").unwrap());

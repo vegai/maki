@@ -2,6 +2,10 @@ pub(crate) mod agent;
 pub(crate) mod r#async;
 pub(crate) mod autocmd;
 pub(crate) mod base64;
+#[cfg(target_os = "linux")]
+pub(crate) mod claude_code;
+#[cfg(not(target_os = "linux"))]
+#[path = "claude_code_unsupported.rs"]
 pub(crate) mod claude_code;
 pub(crate) mod env;
 pub(crate) mod r#fn;

@@ -4,7 +4,6 @@
 //! maki selects once per process.
 #![cfg(target_os = "linux")]
 
-use std::collections::HashMap;
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, File};
@@ -78,7 +77,6 @@ const DEPENDENCY_DIR: &str = "node_modules";
 const DEPENDENCY_FILE: &str = "node_modules/pkg/index.js";
 const EDIT_DEPENDENCY: &str = "echo edited >> node_modules/pkg/index.js";
 const DEPENDENCY_UNSETTLED: &str = "dependencies changed during the copy";
-const WORKER_TOLD_UNSETTLED: &str = "Some dependencies changed while maki copied them";
 const CHANGED_DURING_COPY: &str = "the checkout changed during the snapshot: ";
 /// How the refusal names `TMPDIR`, before any file is made there.
 const TMPDIR: &str = "TMPDIR";
@@ -246,9 +244,9 @@ fn a_temp_dir_that_leads_into_the_project_uses_a_safe_fallback(linked: bool) {
     let (reg, _host) = fake_host(&claude, outside.path());
     let err = ask(&reg, &session_ctx()).unwrap_err();
     assert!(err.contains(NO_EVENT_STOP), "got: {err}");
-    let prepared = validation::worker_launch(
-        HashMap::from([(TMPDIR.to_owned(), tmpdir.to_string_lossy().into_owned())]),
-        Some(outside.path().to_string_lossy().into_owned()),
+    let prepared = validation::prepare_launch(
+        vec![(TMPDIR.to_owned(), tmpdir.to_string_lossy().into_owned())],
+        Some(outside.path().to_owned()),
         &project,
     )
     .unwrap();
@@ -266,9 +264,9 @@ fn an_empty_tmpdir_uses_a_safe_default_for_launch_and_worker_checks() {
     let outside = tempdir().unwrap();
     let claude = fake_claude(outside.path(), VERSION_ONLY);
     let _tmpdir = EnvVar::set(TMPDIR, "");
-    let prepared = validation::worker_launch(
-        HashMap::from([(TMPDIR.to_owned(), String::new())]),
-        Some(outside.path().to_str().unwrap().to_owned()),
+    let prepared = validation::prepare_launch(
+        vec![(TMPDIR.to_owned(), String::new())],
+        Some(outside.path().to_owned()),
         &env::current_dir().unwrap(),
     )
     .unwrap();
@@ -353,9 +351,9 @@ fn a_temp_dir_elsewhere_in_the_checkout_uses_a_safe_fallback() {
     let (reg, _host) = fake_host(&claude, outside.path());
     let err = ask(&reg, &stub_ctx_in(&sub, None, None)).unwrap_err();
     assert!(err.contains(NO_EVENT_STOP), "got: {err}");
-    let prepared = validation::worker_launch(
-        HashMap::from([(TMPDIR.to_owned(), elsewhere.to_string_lossy().into_owned())]),
-        Some(outside.path().to_string_lossy().into_owned()),
+    let prepared = validation::prepare_launch(
+        vec![(TMPDIR.to_owned(), elsewhere.to_string_lossy().into_owned())],
+        Some(outside.path().to_owned()),
         &sub,
     )
     .unwrap();
@@ -431,9 +429,10 @@ fn a_dependency_changed_during_the_copy_is_reported() {
         "got: {}",
         copy.err
     );
-    assert!(
-        copy.prompt.contains(WORKER_TOLD_UNSETTLED),
-        "got: {}",
+    assert_eq!(
+        copy.prompt.matches(DEPENDENCY_UNSETTLED).count(),
+        1,
+        "{}",
         copy.prompt
     );
 }
@@ -499,7 +498,9 @@ fn an_api_key_and_address_never_reach_claude_code() {
     let (reg, _host) = fake_host(&claude, tools.path());
     let result = ask(&reg, &session_ctx());
 
-    let child_env = fs::read_to_string(tools.path().join("env")).unwrap();
+    let child_env = fs::read_to_string(tools.path().join("env")).unwrap_or_else(|error| {
+        panic!("the worker did not save its environment: {error}; {result:?}")
+    });
     assert!(
         fs::exists(tools.path().join("prompt")).unwrap(),
         "the task must reach Claude Code: {result:?}"

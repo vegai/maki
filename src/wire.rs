@@ -3,6 +3,9 @@ use maki_storage::id::SessionRef;
 use serde::Serialize;
 use uuid::Uuid;
 
+pub const SUCCESS: &str = "success";
+pub const ERROR_DURING_EXECUTION: &str = "error_during_execution";
+
 #[derive(Serialize)]
 struct SystemEvent<'a, T> {
     #[serde(rename = "type")]
@@ -36,7 +39,7 @@ pub fn wire_uuid() -> String {
 pub fn failure_subtype(reason: DoneReason) -> Option<&'static str> {
     match reason {
         DoneReason::MaxTurns => Some("error_max_turns"),
-        DoneReason::Cancelled | DoneReason::Dropped => Some("error_during_execution"),
+        DoneReason::Cancelled | DoneReason::Dropped => Some(ERROR_DURING_EXECUTION),
         DoneReason::EndTurn | DoneReason::MaxTokens | DoneReason::Compact => None,
     }
 }

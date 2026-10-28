@@ -39,7 +39,7 @@ use tracing::warn;
 use crate::cli::Cli;
 use crate::notice::{NOTIFICATION, ProviderNotice};
 use crate::tool_names::maki_to_claude_tool_name;
-use crate::wire::{system_event, wire_uuid};
+use crate::wire::{ERROR_DURING_EXECUTION, SUCCESS, system_event, wire_uuid};
 
 const NOTICE_SUBTYPE: &str = "notice";
 
@@ -398,7 +398,7 @@ impl SdkWriter {
     ) -> Result<()> {
         self.emit(WireInner::ControlResponse(ControlResponsePayload {
             response: ControlResponseInner {
-                subtype: if error.is_some() { "error" } else { "success" },
+                subtype: if error.is_some() { "error" } else { SUCCESS },
                 request_id: request_id.into(),
                 response,
                 error,
@@ -574,7 +574,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         Ok(started) => started,
         Err(error) => {
             let emitted = writer.emit(WireInner::Result(ResultPayload {
-                subtype: "error_during_execution",
+                subtype: ERROR_DURING_EXECUTION,
                 is_error: true,
                 duration_ms: 0,
                 duration_api_ms: 0,
@@ -999,7 +999,7 @@ impl EventPump {
         // Zero on an unpriced model, which is what its turns reported too.
         let total_cost_usd = self.cost.unwrap_or_default();
         self.writer.emit(WireInner::Result(ResultPayload {
-            subtype: failure.unwrap_or("success"),
+            subtype: failure.unwrap_or(SUCCESS),
             is_error: failure.is_some(),
             duration_ms,
             duration_api_ms: duration_ms,
@@ -1191,7 +1191,7 @@ impl EventPump {
                 if parent_tool_use_id.is_none() {
                     self.shared.lock().unwrap().failed = true;
                     self.emit_turn_result(
-                        Some("error_during_execution"),
+                        Some(ERROR_DURING_EXECUTION),
                         message.clone(),
                         0,
                         TokenUsage::default(),
@@ -1421,7 +1421,7 @@ mod tests {
     fn wire_result_serializes_correctly() {
         let msg = WireMessage {
             inner: WireInner::Result(ResultPayload {
-                subtype: "success",
+                subtype: SUCCESS,
                 is_error: false,
                 duration_ms: 1000,
                 duration_api_ms: 1000,
@@ -1436,7 +1436,7 @@ mod tests {
         };
         let json: Value = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["type"], "result");
-        assert_eq!(json["subtype"], "success");
+        assert_eq!(json["subtype"], SUCCESS);
         assert_eq!(json["num_turns"], 1);
         assert!(json.get("session_id").is_some());
     }
@@ -1462,7 +1462,7 @@ mod tests {
         let msg = WireMessage {
             inner: WireInner::ControlResponse(ControlResponsePayload {
                 response: ControlResponseInner {
-                    subtype: "success",
+                    subtype: SUCCESS,
                     request_id: "req_1".into(),
                     response: Some(serde_json::json!({"commands": []})),
                     error: None,

@@ -34,8 +34,6 @@ local PREPARING = "Run the prepare command..."
 local SCOPE = "claude %s %s"
 local WAITING = "Wait for a free Claude Code slot..."
 local PREPARE_FAILED = "maki could not prepare the dependencies (%s). Report any check that needs them as unavailable."
-local UNSETTLED = "Some dependencies changed while maki copied them (%s). They can contain parts of two versions. "
-  .. "Mention this for every check that uses them."
 
 local description = [[Send a task to Claude through the user's Claude subscription.
 
@@ -139,14 +137,17 @@ local dependencies, dependencies_err = path_utils.dependency_dirs(opts.dependenc
 if not dependencies then
   error("the `dependencies` option: " .. dependencies_err)
 end
-local _, home_deny_err = launch.denied_home_paths(opts.deny_read_home)
+local denied_home_paths, home_deny_err = launch.denied_home_paths(opts.deny_read_home)
 if home_deny_err then
   error("the `deny_read_home` option: " .. home_deny_err)
 end
-local _, denied_err = path_utils.denied_paths(opts.deny_read)
+local denied_paths, denied_err = path_utils.denied_paths(opts.deny_read)
 if denied_err then
   error("the `deny_read` option: " .. denied_err)
 end
+opts = table.clone(opts)
+opts.deny_read_home = denied_home_paths
+opts.deny_read = denied_paths
 
 local function artifacts_root()
   if opts.artifact_dir ~= "" then
@@ -343,9 +344,6 @@ local function run(input, ctx, call, timeout_secs)
   local task = input.prompt
   if artifact.prepare_err then
     task = task .. "\n\n" .. PREPARE_FAILED:format(artifact.prepare_err)
-  end
-  if artifact.unsettled then
-    task = task .. "\n\n" .. UNSETTLED:format(artifact.unsettled)
   end
   for _, note in ipairs(artifact.notes) do
     task = task .. "\n\nnote: " .. note

@@ -38,7 +38,7 @@ pub(super) fn preview(text: &str, limit: usize) -> String {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum Error {
+pub enum Error {
     #[error(
         "all Claude Code request slots are busy; retry model discovery after a request finishes"
     )]
@@ -53,8 +53,6 @@ pub(crate) enum Error {
     UnknownVersion(String),
     #[error("Claude Code {version} is older than {oldest}, the oldest version maki runs")]
     TooOld { version: String, oldest: String },
-    #[error("maki runs Claude Code only on {systems}, not on {os}")]
-    UnsupportedSystem { os: String, systems: String },
     #[error(
         "the Claude Code config directory {} is not an absolute path. Set the claude_code plugin's `config_dir` option, CLAUDE_CONFIG_DIR or HOME to an absolute path.",
         .0.display()
@@ -81,9 +79,6 @@ pub(crate) enum Error {
         what: &'static str,
         source: io::Error,
     },
-    #[error("maki cannot make a handoff token: {0}")]
-    Token(getrandom::Error),
-
     #[error("Claude Code did not read its input in time")]
     InputNotTaken,
     #[error("Claude Code did not finish its startup checks within {0} s")]
@@ -346,7 +341,7 @@ fn is_temporary_status(status: u16) -> bool {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum Problem {
+pub enum Problem {
     #[error("{0}")]
     WorkerPolicy(String),
     #[error("Claude Code did not report its login")]
