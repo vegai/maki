@@ -314,7 +314,7 @@ local function commit_base(call, artifact, paths, dependencies)
   if call.stopped then
     return jobs.CANCELLED
   end
-  local dropped, metadata_err = M.sanitize(artifact, true)
+  local dropped, metadata_err = M.sanitize(artifact)
   local setup_err = mkdir_err or attributes_err or exclude_err or metadata_err
   if setup_err then
     return "maki cannot make the repository of the snapshot: " .. setup_err
@@ -594,9 +594,10 @@ end
 
 -- Git traverses nested repositories during ordinary status commands. Keep their metadata
 -- outside the work tree, without discarding the worker's files or repository objects.
-function M.sanitize(artifact, prune_links)
+-- Prune external or unresolved links unless keep_links is set for worker output.
+function M.sanitize(artifact, keep_links)
   local quarantine = maki.fs.joinpath(artifact.dir, QUARANTINE_DIR)
-  local paths, err = native.sanitize_git(artifact.snapshot, quarantine, artifact.git, prune_links == true)
+  local paths, err = native.sanitize_git(artifact.snapshot, quarantine, artifact.git, keep_links ~= true)
   if not paths then
     return nil, err
   end
@@ -668,7 +669,7 @@ local function commit_prepared(call, artifact)
   if call.stopped then
     return jobs.CANCELLED
   end
-  local dropped, metadata_err = M.sanitize(artifact, true)
+  local dropped, metadata_err = M.sanitize(artifact)
   if not dropped then
     return metadata_err
   end
@@ -694,7 +695,7 @@ local function commit_prepared(call, artifact)
 end
 
 --- `prepare` runs as the user, outside the sandbox, with local Git variables
---- unset and the artifact's `TMPDIR`. maki removes external symlinks and makes
+--- unset and the artifact's `TMPDIR`. maki removes external or unresolved symlinks and makes
 --- hard-linked files private before the worker starts.
 --- Records a command error and returns any fatal sanitation or baseline error.
 function M.prepare(call, artifact, command, env, timeout_ms)
@@ -712,7 +713,7 @@ end
 -- Sanitation moves metadata before restoring the trusted root pointer, so a worker link
 -- cannot redirect the write.
 function M.collect(call, artifact, project)
-  local _, metadata_err = M.sanitize(artifact)
+  local _, metadata_err = M.sanitize(artifact, true)
   if metadata_err then
     return nil, metadata_err
   end

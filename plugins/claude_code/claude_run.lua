@@ -207,7 +207,7 @@ end
 function Run:on_exit(code)
   if self.finished then
     if self.artifact and self.prompted then
-      local _, problem = snapshot.sanitize(self.artifact)
+      local _, problem = snapshot.sanitize(self.artifact, true)
       if problem then
         maki.notify(ERROR_PREFIX .. "maki could not secure the retained snapshot: " .. problem, "error")
       end

@@ -60,9 +60,7 @@ local function with_jobs(run)
     {
       maki.fn,
       "chansend_limits",
-      function()
-        return { max_bytes = STDIN_LIMIT, full_error = STDIN_FULL, oversized_error = STDIN_OVERSIZED }
-      end,
+      { max_bytes = STDIN_LIMIT, full_error = STDIN_FULL, oversized_error = STDIN_OVERSIZED },
     },
     {
       maki.async,

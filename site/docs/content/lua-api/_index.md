@@ -2366,6 +2366,9 @@ have no callbacks, tails or events and count as truncated in job reports.
 A redirect conflicts with the corresponding output callback and needs
 `fs_write`. Use separate writer and reader jobs to store and process output.
 
+Yields while starting the process. Call from a coroutine. Cancel hooks and
+describe callbacks cannot yield.
+
 Requires the `run` [plugin permission](#plugin-permissions).
 
 **Parameters:**
@@ -2408,8 +2411,7 @@ Requires the `run` [plugin permission](#plugin-permissions).
 
 **Returns:** (`integer?`, `string?`) Job id, or nil plus an error message when the
   process could not start (binary not found, bad `cwd`, redirect file not
-  writable or a live name is already held). Yields while starting the process.
-  Call from a coroutine. Cancel hooks and describe callbacks cannot yield.
+  writable or a live name is already held).
 
 **Example:**
 
@@ -2658,8 +2660,9 @@ The final item has no newline suffix.
 Unread data stays in memory. A descendant can retain stdin after the job
 exits. Use `guard` to stop that descendant and release the data.
 
-`chansend_limits().max_bytes` bounds the queue, including a write in progress.
-A full queue returns an error so the caller can wait for the child to consume input.
+`chansend_limits.max_bytes` bounds the queue, including a write in progress.
+`chansend_limits.full_error` means wait for the child to consume input and retry.
+`chansend_limits.oversized_error` means split the write into smaller chunks.
 
 Requires the `run` [plugin permission](#plugin-permissions).
 
@@ -2680,15 +2683,13 @@ maki.fn.chanclose(id, "stdin")
 
 ---
 
-### `maki.fn.chansend_limits()` {#maki-fn-chansend_limits}
+### `maki.fn.chansend_limits` {#maki-fn-chansend_limits}
 
 ```lua
-maki.fn.chansend_limits()
+maki.fn.chansend_limits
 ```
 
-Query the stdin queue capacity and the errors callers can handle by retrying or splitting.
-
-**Returns:** (`table`) `max_bytes`, `full_error`, and `oversized_error`.
+Stdin queue limits: `max_bytes` includes a write in progress, `full_error` means retry later, and `oversized_error` means split the write.
 
 ---
 

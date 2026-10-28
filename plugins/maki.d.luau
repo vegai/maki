@@ -66,7 +66,7 @@ declare maki: {
     jobattach: @checked (job_id: number, opts: any) -> (boolean?, string?),
     jobfind: @checked (name: string) -> (number?, string?),
     chansend: @checked (id: number, data: any) -> (number?, string?),
-    chansend_limits: @checked () -> (any),
+    chansend_limits: any,
     chanclose: @checked (id: number, stream: string?) -> (number?, string?),
     executable: @checked (name: string) -> (number),
     exepath: @checked (name: string) -> (string),

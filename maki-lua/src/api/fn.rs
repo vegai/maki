@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use flume::Receiver;
+use flume::{Receiver, Sender};
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::process;
 use maki_storage::id::MakiId;
@@ -16,6 +16,7 @@ use crate::api::fs::expand_tilde;
 use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
 use crate::api::util::convert::TableExt;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
+use crate::docs::FnDoc;
 use crate::plugin_permissions::{Permission, PluginPermissions, denied_error};
 use crate::runtime::{active_task_id, job_task_id, strip_traceback, with_jobs};
 
@@ -46,6 +47,18 @@ const STDIN_NULL: &str = "null";
 const CHANCLOSE_STREAM_ERR: &str = "chanclose: you can close only \"stdin\"";
 const CHANSEND_DATA_ERR: &str = "chansend: data must be a string or a list";
 const STDIN_STREAM: &str = "stdin";
+
+#[allow(non_upper_case_globals)]
+const chansend_limits__doc: FnDoc = FnDoc {
+    name: "chansend_limits",
+    args: "",
+    desc: "Stdin queue limits: `max_bytes` includes a write in progress, `full_error` means retry later, and `oversized_error` means split the write.",
+    params: &[],
+    returns: "",
+    guard: None,
+    value: true,
+    example: "",
+};
 
 struct CheckedOutReceiver {
     lua: Lua,
@@ -89,6 +102,9 @@ impl Drop for CheckedOutReceiver {
 /// A redirect conflicts with the corresponding output callback and needs
 /// `fs_write`. Use separate writer and reader jobs to store and process output.
 ///
+/// Yields while starting the process. Call from a coroutine. Cancel hooks and
+/// describe callbacks cannot yield.
+///
 /// @param cmd string|table Shell command, or an argv table like
 ///   `{ "tail", "-F", path }`.
 /// @param opts table? Optional settings:
@@ -124,8 +140,7 @@ impl Drop for CheckedOutReceiver {
 ///     plugin can see. A second job with the same live name fails.
 /// @return (integer?, string?) Job id, or nil plus an error message when the
 ///   process could not start (binary not found, bad `cwd`, redirect file not
-///   writable or a live name is already held). Yields while starting the process.
-///   Call from a coroutine. Cancel hooks and describe callbacks cannot yield.
+///   writable or a live name is already held).
 /// @example
 /// local id, err = maki.fn.jobstart({ "rg", "--json", pattern, dir }, {
 ///   on_stdout = function(_, line) print(line) end,
@@ -469,17 +484,6 @@ fn jobstop(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<()> {
     Ok(())
 }
 
-/// Query the stdin queue capacity and the errors callers can handle by retrying or splitting.
-/// @return (table) `max_bytes`, `full_error`, and `oversized_error`.
-#[lua_fn]
-fn chansend_limits(lua: &Lua) -> LuaResult<Table> {
-    let limits = lua.create_table()?;
-    limits.set("max_bytes", MAX_STDIN_BYTES)?;
-    limits.set("full_error", STDIN_FULL_ERR)?;
-    limits.set("oversized_error", STDIN_OVERSIZED_ERR)?;
-    Ok(limits)
-}
-
 /// Write {data} to job {id}'s stdin. Start the job with `stdin = "pipe"`.
 /// Unlike `vim.fn.chansend`, an error returns nil and a message instead of 0.
 /// List items use newline separators. A newline inside an item becomes NUL.
@@ -488,8 +492,9 @@ fn chansend_limits(lua: &Lua) -> LuaResult<Table> {
 /// Unread data stays in memory. A descendant can retain stdin after the job
 /// exits. Use `guard` to stop that descendant and release the data.
 ///
-/// `chansend_limits().max_bytes` bounds the queue, including a write in progress.
-/// A full queue returns an error so the caller can wait for the child to consume input.
+/// `chansend_limits.max_bytes` bounds the queue, including a write in progress.
+/// `chansend_limits.full_error` means wait for the child to consume input and retry.
+/// `chansend_limits.oversized_error` means split the write into smaller chunks.
 ///
 /// @param id integer Job id returned by `jobstart`.
 /// @param data string|table Text to write, or a list of lines.
@@ -774,10 +779,7 @@ fn find_program_here(name: &str) -> Option<PathBuf> {
 /// local view = maki.fn.winsaveview()
 /// maki.fn.winrestview({ topline = view.topline + 1 })
 #[lua_fn]
-async fn winsaveview(
-    lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
-) -> LuaResult<Pair<Table>> {
+async fn winsaveview(lua: Lua, #[ctx] tx: Option<Sender<UiAction>>) -> LuaResult<Pair<Table>> {
     let view =
         try_pair!(ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::WinSaveView { reply_tx }).await);
     let t = lua.create_table()?;
@@ -803,13 +805,30 @@ async fn winsaveview(
 #[lua_fn]
 fn winrestview(
     _lua: &Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<Sender<UiAction>>,
     view: Table,
 ) -> LuaResult<Pair<bool>> {
     let topline = view.opt::<i64>("topline")?.unwrap_or(1);
     let scroll_top = topline.saturating_sub(1).clamp(0, i64::from(u32::MAX)) as u32;
     try_pair!(ui_send(tx.as_ref(), UiAction::WinRestView { scroll_top }));
     Ok((Some(true), None))
+}
+
+pub(crate) fn create_fn_table(
+    lua: &Lua,
+    plugin: Arc<str>,
+    perms: &PluginPermissions,
+    fs_write: bool,
+    tx: Option<Sender<UiAction>>,
+) -> LuaResult<Table> {
+    let table = lua.create_table()?;
+    add_fn_fns(&table, lua, plugin, perms, fs_write, tx)?;
+    let limits = lua.create_table()?;
+    limits.set("max_bytes", MAX_STDIN_BYTES)?;
+    limits.set("full_error", STDIN_FULL_ERR)?;
+    limits.set("oversized_error", STDIN_OVERSIZED_ERR)?;
+    table.set("chansend_limits", limits)?;
+    Ok(table)
 }
 
 lua_table! {
@@ -822,16 +841,16 @@ lua_table! {
     ///   on_exit = function(_, code) print("done: " .. code) end,
     /// })
     /// ```
-    "maki.fn" => pub(crate) fn create_fn_table(
+    extend "maki.fn" => fn add_fn_fns(
         plugin: Arc<str>,
         perms: &PluginPermissions,
         fs_write: bool,
-        tx: Option<flume::Sender<UiAction>>,
+        tx: Option<Sender<UiAction>>,
     ), DOCS [
         jobstart(perms, plugin, fs_write), jobstop(perms, plugin), jobforget(perms, plugin),
         jobwait(perms, plugin), jobinfo(perms, plugin), joblist(perms, plugin),
         jobattach(perms, plugin), jobfind(perms, plugin),
-        chansend(perms, plugin), chansend_limits, chanclose(perms, plugin),
+        chansend(perms, plugin), manual chansend_limits, chanclose(perms, plugin),
         executable(perms), exepath(perms),
         winsaveview(tx), winrestview(tx),
     ]
@@ -843,6 +862,7 @@ mod tests {
     use super::{create_fn_table, with_jobs};
     #[cfg(unix)]
     use crate::plugin_permissions::PluginPermissions;
+    use flume::Sender;
     #[cfg(unix)]
     use futures_lite::{FutureExt, future::poll_once};
     #[cfg(unix)]
@@ -868,11 +888,10 @@ mod tests {
     const LINE_WITH_NUL: &[u8] = b"two\0parts";
 
     #[cfg(unix)]
-    #[test_case(false ; "unnamed_starts_do_not_wait_for_the_name_gate")]
-    #[test_case(true ; "named_starts_wait_for_the_name_gate")]
-    fn only_named_starts_take_the_gate(named: bool) {
+    #[test]
+    fn only_named_starts_take_the_gate() {
         const PLUGIN: &str = "gate-test";
-        const COMMAND: &str = "true";
+        const COMMAND: &str = "cat";
         const START_TIMEOUT: Duration = Duration::from_secs(5);
         smol::block_on(async {
             let lua = Lua::new();
@@ -886,21 +905,24 @@ mod tests {
             .unwrap();
             let gate = with_jobs(&lua, |store| Arc::clone(&store.start_gate));
             let held = gate.lock().await;
-            let options = lua.create_table_from([("scope", "plugin")]).unwrap();
-            if named {
-                options.set("name", PLUGIN).unwrap();
-            }
+            let named_options = lua
+                .create_table_from([("scope", "plugin"), ("stdin", "pipe")])
+                .unwrap();
+            named_options.set("name", PLUGIN).unwrap();
             let start: Function = table.get("jobstart").unwrap();
             let mut starting =
-                pin!(start.call_async::<(Option<u32>, Option<String>)>((COMMAND, options)));
-            let held = if named {
-                assert!(poll_once(starting.as_mut()).await.is_none());
-                drop(held);
-                None
-            } else {
-                Some(held)
-            };
-            let (id, error) = starting
+                pin!(start.call_async::<(Option<u32>, Option<String>)>((COMMAND, named_options)));
+            assert!(poll_once(starting.as_mut()).await.is_none());
+            let unnamed_options = lua
+                .create_table_from([("scope", "plugin"), ("stdin", "pipe")])
+                .unwrap();
+            let unnamed =
+                start.call_async::<(Option<u32>, Option<String>)>((COMMAND, unnamed_options));
+            let (id, error) = unnamed
+                .or(async {
+                    let result = starting.as_mut().await;
+                    panic!("named start passed the held gate: {result:?}")
+                })
                 .or(async {
                     smol::Timer::after(START_TIMEOUT).await;
                     panic!("jobstart waited on an unrelated start")
@@ -908,7 +930,15 @@ mod tests {
                 .await
                 .unwrap();
             assert!(id.is_some(), "{error:?}");
+            assert!(poll_once(starting.as_mut()).await.is_none());
+            assert!(with_jobs(&lua, |store| store.find_named(PLUGIN, None, PLUGIN)).is_none());
             drop(held);
+            let (id, error) = starting.await.unwrap();
+            assert!(id.is_some(), "{error:?}");
+            assert_eq!(
+                with_jobs(&lua, |store| store.find_named(PLUGIN, None, PLUGIN)),
+                id
+            );
         });
     }
 
@@ -953,7 +983,7 @@ mod tests {
         assert_eq!(chansend_bytes(Value::Table(lines)).unwrap(), expected);
     }
 
-    fn lua_with_view(tx: Option<flume::Sender<UiAction>>) -> Lua {
+    fn lua_with_view(tx: Option<Sender<UiAction>>) -> Lua {
         let lua = Lua::new();
         let t = lua.create_table().unwrap();
         winsaveview__register(&t, &lua, tx.clone()).unwrap();

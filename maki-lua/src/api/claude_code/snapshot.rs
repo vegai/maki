@@ -20,7 +20,8 @@ use super::DIRECTORY_FLAGS;
 use maki_providers::claude_code::validation::GIT_ENTRY;
 
 const MAX_DEPTH: usize = 64;
-const MAX_LINK_READS: usize = 64 * 1024;
+const BASE_LINK_READS: usize = 64 * 1024;
+const PER_LINK_READS: usize = MAX_DEPTH * 2;
 const DEPTH_EXCEEDED: &str = "snapshot exceeds";
 const MAX_FAILURES: usize = 10;
 const CONFIG: &str = "config";
@@ -45,14 +46,14 @@ enum ResolveStep {
     EndLink(PathBuf),
 }
 
-fn resolve_links(path: &Path, remaining: &mut usize) -> io::Result<PathBuf> {
+fn resolve_links(root: &Path, path: &Path, remaining: &mut usize) -> io::Result<PathBuf> {
     let mut pending: Vec<_> = path
         .components()
         .rev()
         .map(|part| ResolveStep::Component(part.as_os_str().to_owned()))
         .collect();
     let mut active = HashSet::new();
-    let mut resolved = PathBuf::new();
+    let mut resolved = root.to_path_buf();
     while let Some(step) = pending.pop() {
         let part = match step {
             ResolveStep::Component(part) => part,
@@ -382,13 +383,14 @@ pub fn sanitize_snapshot(
     if !prune_links {
         return Ok(relocated);
     }
-    let mut remaining = MAX_LINK_READS;
+    let mut remaining =
+        BASE_LINK_READS.saturating_add(symlinks.len().saturating_mul(PER_LINK_READS));
     // Removing an alias before resolving the next link can disguise an escaping target as
     // an internal missing path. Resolve the whole graph before deleting any link.
     relocated.dropped_links = symlinks
         .into_iter()
         .filter(|path| {
-            !resolve_links(&resolved_root.join(path), &mut remaining)
+            !resolve_links(&resolved_root, path, &mut remaining)
                 .is_ok_and(|target| target.starts_with(&resolved_root))
         })
         .collect();
@@ -409,9 +411,9 @@ pub fn sanitize_snapshot(
 #[cfg(test)]
 mod tests {
     use super::{
-        COMMONDIR, CONFIG, DEPTH_EXCEEDED, GIT_ENTRY, HEAD, MAX_DEPTH, MAX_FAILURES,
-        MAX_LINK_READS, QUARANTINE_ENTRY, Visit, quarantine_entry, resolve_links,
-        sanitize_snapshot, walk,
+        BASE_LINK_READS, COMMONDIR, CONFIG, DEPTH_EXCEEDED, GIT_ENTRY, HEAD, MAX_DEPTH,
+        MAX_FAILURES, QUARANTINE_ENTRY, Visit, quarantine_entry, resolve_links, sanitize_snapshot,
+        walk,
     };
     use rustix::io::Errno;
     use rustix::process::geteuid;
@@ -479,8 +481,16 @@ mod tests {
                 output.stdout.strip_suffix(&[0]).unwrap().to_vec(),
             ))
         });
-        let mut remaining = MAX_LINK_READS;
-        assert_eq!(resolve_links(&link, &mut remaining).ok(), expected);
+        let mut remaining = BASE_LINK_READS;
+        assert_eq!(
+            resolve_links(
+                &snapshot.canonicalize().unwrap(),
+                Path::new(RESOLUTION_LINK),
+                &mut remaining
+            )
+            .ok(),
+            expected
+        );
         let dropped =
             expected.is_none_or(|path| !path.starts_with(snapshot.canonicalize().unwrap()));
         let metadata = sanitize_snapshot(
@@ -504,9 +514,14 @@ mod tests {
         const TARGET: &str = "growing/again";
         let dir = tempdir().unwrap();
         symlink(TARGET, dir.path().join(GROWING)).unwrap();
-        let mut remaining = MAX_LINK_READS;
+        let mut remaining = BASE_LINK_READS;
         assert_eq!(
-            resolve_links(&dir.path().join(GROWING), &mut remaining).unwrap(),
+            resolve_links(
+                &dir.path().canonicalize().unwrap(),
+                Path::new(GROWING),
+                &mut remaining
+            )
+            .unwrap(),
             dir.path().join(TARGET)
         );
     }
@@ -524,9 +539,13 @@ mod tests {
             )
             .unwrap();
         }
-        let mut remaining = MAX_LINK_READS;
-        let error =
-            resolve_links(&dir.path().join(format!("split{LEVELS}")), &mut remaining).unwrap_err();
+        let mut remaining = BASE_LINK_READS;
+        let error = resolve_links(
+            &dir.path().canonicalize().unwrap(),
+            Path::new(&format!("split{LEVELS}")),
+            &mut remaining,
+        )
+        .unwrap_err();
         assert_eq!(error.raw_os_error(), Some(Errno::LOOP.raw_os_error()));
         assert_eq!(remaining, 0);
     }
@@ -535,7 +554,7 @@ mod tests {
     fn aliases_share_one_resolution_budget_and_collection_keeps_links() {
         const ALIASES: usize = 512;
         const CHAIN: usize = 8;
-        const PADDING: usize = 32;
+        const PADDING: usize = 256;
         const ALIAS_PREFIX: &str = "alias";
         let dir = tempdir().unwrap();
         let snapshot = dir.path().join("snapshot");
@@ -575,9 +594,54 @@ mod tests {
             })
             .count();
         assert!(
-            dropped >= ALIASES / 2,
-            "{dropped} aliases exhausted the shared budget"
+            dropped >= ALIASES * 3 / 4,
+            "only {dropped} aliases were removed after exhausting the shared budget"
         );
+        for path in &prepared.dropped_links {
+            assert!(
+                fs::symlink_metadata(snapshot.join(path)).is_err(),
+                "{} remains",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn thousands_of_internal_dependency_links_survive_under_a_deep_root() {
+        const LINKS: usize = 5_000;
+        const ROOT_DEPTH: usize = 12;
+        const DEPENDENCY_DEPTH: usize = 12;
+        const TARGET: &str = "../../target@1.0.0/node_modules/target";
+        let dir = tempdir().unwrap();
+        let snapshot = dir.path().join("root/".repeat(ROOT_DEPTH));
+        let dependencies = snapshot
+            .join("nested/".repeat(DEPENDENCY_DEPTH))
+            .join("node_modules/.pnpm");
+        fs::create_dir_all(dependencies.join("target@1.0.0/node_modules/target")).unwrap();
+        for index in 0..LINKS {
+            let modules = dependencies.join(format!("p{index}@1.0.0/node_modules"));
+            fs::create_dir_all(&modules).unwrap();
+            symlink(TARGET, modules.join("target")).unwrap();
+        }
+        let metadata = sanitize_snapshot(
+            &snapshot,
+            &dir.path().join("quarantine"),
+            &dir.path().join("repository"),
+            true,
+        )
+        .unwrap();
+        assert!(
+            metadata.dropped_links.is_empty(),
+            "{} safe links removed",
+            metadata.dropped_links.len()
+        );
+        for index in 0..LINKS {
+            assert_eq!(
+                fs::read_link(dependencies.join(format!("p{index}@1.0.0/node_modules/target")))
+                    .unwrap(),
+                Path::new(TARGET)
+            );
+        }
     }
 
     const LIMIT_DESCRIPTORS: &str = "ulimit -n \"$1\" && shift && exec \"$@\"";

@@ -43,7 +43,7 @@ function M.keep_tail(tail, line)
 end
 
 function M.feed_stdin(id, data)
-  local limits = maki.fn.chansend_limits()
+  local limits = maki.fn.chansend_limits
   local chunk_bytes = math.min(STDIN_CHUNK_BYTES, limits.max_bytes)
   for offset = 1, #data, chunk_bytes do
     local chunk = data:sub(offset, offset + chunk_bytes - 1)
