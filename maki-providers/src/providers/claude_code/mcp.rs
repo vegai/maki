@@ -153,7 +153,10 @@ async fn accept_loop(
     let mut accept_failed = false;
     loop {
         let stream = match incoming.next().await {
-            Some(Ok(stream)) => stream,
+            Some(Ok(stream)) => {
+                accept_failed = false;
+                stream
+            }
             // A connection that closed before the accept, or a brief shortage
             // of descriptors, must not stop the task that holds every call.
             Some(Err(error)) => {

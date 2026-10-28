@@ -3241,11 +3241,15 @@ maki.api.register_tool({{
     audiences = {{ "main" }},
     handler = function()
         local opts = {{ scope = {{ session = "{sid}" }}, name = "{JOB_NAME}" }}
-        local function start() return maki.fn.jobstart("exec sleep 30", opts) end
+        local function start()
+            local id, err = maki.fn.jobstart("exec sleep 30", opts)
+            return {{ id = id, err = err }}
+        end
         local results = maki.async.gather({{ start, start }})
         local id, err
         for _, result in ipairs(results) do
-            if result.ok then id = result.value else err = result.err end
+            assert(result.ok, result.err)
+            if result.value.id then id = result.value.id else err = result.value.err end
         end
         return tostring(id) .. "|" .. tostring(err)
     end,

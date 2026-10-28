@@ -175,7 +175,7 @@ const WORKER_EDIT: &str = "worker\n";
 const WORKER_DIFF: &str = "+worker";
 const PROMPT_START: &str = "print";
 const PREPARED_LINK: &str = "prepared_link";
-const LINKS_LEFT_OUT: &str = "maki removed external symlinks from the snapshot";
+const LINKS_LEFT_OUT: &str = "maki removed external or unresolved symlinks from the snapshot";
 const PRIVATE_COPIES: &str = "hard-linked files in the snapshot";
 const IGNORED_DIR: &str = "dist/";
 const IGNORED_FILE: &str = "dist/bundle.js";
@@ -1662,22 +1662,9 @@ fn an_import_refuses_a_link_swapped_in_during_approval(swapped: &str) {
 
 /// `prepare` runs outside the sandbox and can create external links. Remove these links
 /// before the worker starts.
-#[test_case(false ; "batched_resolution")]
-#[test_case(true ; "partial_resolution_failure")]
-fn an_unsafe_link_prepare_makes_is_dropped(fail_batch: bool) {
+#[test]
+fn an_unsafe_link_prepare_makes_is_dropped() {
     let coding = Coding::new();
-    let _path = fail_batch.then(|| {
-        let realpath = on_path("realpath");
-        executable(
-            coding.fake.dir.path(),
-            "realpath",
-            &format!(
-                "#!/bin/sh\nif [ \"$2\" = -z ]; then printf '/partial\\0'; exit 1; fi\nexec '{}' \"$@\"\n",
-                realpath.display()
-            ),
-        );
-        environment::EnvVar::prepend_path(coding.fake.dir.path())
-    });
     let prepare = format!("ln -s {OUTSIDE_TARGET} {PREPARED_LINK}");
     let (reg, _host) = coding.host(&[("prepare", json!(prepare))]);
     let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
@@ -1704,6 +1691,21 @@ fn an_unsafe_link_prepare_makes_is_dropped(fail_batch: bool) {
         fs::read_link(snapshot.join("src/inner")).unwrap(),
         Path::new("lib.rs")
     );
+}
+
+#[test_case("created_link", "A" ; "a_new_external_link")]
+#[test_case("src/inner", "M" ; "a_retargeted_tracked_link")]
+fn collection_preserves_worker_links_for_manual_application(path: &str, status: &str) {
+    const SCENARIO: &str = "code_edit_link";
+    let coding = Coding::new();
+    let (reg, _host) = coding.host(&[]);
+    let reply = coding.code(&reg, SCENARIO, &[]).unwrap();
+    let snapshot = coding.snapshot(&artifact_id(&reply));
+    assert_eq!(
+        fs::read_link(snapshot.join(path)).unwrap(),
+        Path::new(OUTSIDE_TARGET)
+    );
+    assert!(reply.contains(&format!("{status} {path}")), "{reply}");
 }
 
 #[test]

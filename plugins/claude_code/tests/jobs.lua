@@ -9,6 +9,9 @@ local OUTPUT = "complete"
 local CALLBACK_ERROR = "exit callback failed"
 local SEND_ERROR = "stdin send failed"
 local CLOSE_ERROR = "stdin close failed"
+local STDIN_LIMIT = 16
+local STDIN_FULL = "fixture stdin full"
+local STDIN_OVERSIZED = "fixture oversized write"
 local DIRECTORY = "/probe/hook-output"
 local SUCCESS_CODE = 0
 local STOPPED_CODE = 137
@@ -56,8 +59,30 @@ local function with_jobs(run)
     },
     {
       maki.fn,
+      "chansend_limits",
+      function()
+        return { max_bytes = STDIN_LIMIT, full_error = STDIN_FULL, oversized_error = STDIN_OVERSIZED }
+      end,
+    },
+    {
+      maki.async,
+      "sleep",
+      function()
+        state.waited = true
+        state.full = false
+      end,
+    },
+    {
+      maki.fn,
       "chansend",
       function(_, data)
+        if state.full then
+          return nil, STDIN_FULL
+        end
+        if #data > STDIN_LIMIT then
+          return nil, STDIN_OVERSIZED
+        end
+        state.input = (state.input or "") .. data
         if state.send_error then
           return nil, state.send_error
         end
@@ -235,6 +260,19 @@ case("redirected_output_keeps_the_guard_and_explicit_timeout", function()
     local output, err = call:run_quick(COMMAND, { stdout = DIRECTORY, stdin = OUTPUT, timeout_ms = timeout })
     eq(output, "")
     eq(err, nil)
+    eq(state.closes, 1)
+  end)
+end)
+
+case("stdin_larger_than_the_queue_is_chunked_and_retried_without_losing_bytes", function()
+  with_jobs(function(state)
+    state.full = true
+    local input = string.rep("a\0b\n", STDIN_LIMIT)
+    local ok, err = jobs.feed_stdin(1, input)
+    eq(ok, 1)
+    eq(err, nil)
+    eq(state.input, input)
+    eq(state.waited, true)
     eq(state.closes, 1)
   end)
 end)

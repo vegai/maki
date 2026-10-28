@@ -4,8 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder};
+use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf, absolute};
+use std::sync::Arc;
 
 use maki_storage::permissions::{PERMISSION_BITS, PRIVATE_DIR_MODE};
 use rustix::process::geteuid;
@@ -15,6 +17,7 @@ use tracing::debug;
 
 use crate::ProviderUsage;
 
+use super::OAUTH_TOKEN_ENV;
 use super::checks::{self, DISABLED, EFFECTIVE, PERMISSIONS_KEY};
 use super::error::{Error, Problem};
 use super::stream::{
@@ -24,11 +27,12 @@ use super::stream::{
 
 pub use super::super::MAX_EVENT_BYTES;
 pub use super::checks::{GIT_ENTRY, git_directory};
+use super::run::private_dir_async;
 pub use super::run::{VersionCheck, invalidate_version, version_check};
-use super::settings::base_settings;
-pub use super::settings::{EMPTY_MCP_CONFIG, STARTUP_TIMEOUT_SECS, base_args};
+pub use super::settings::STARTUP_TIMEOUT_SECS;
+use super::settings::{self, base_settings};
 use super::stream::usage_of as plan_usage;
-pub use super::stream::{EventKind, user_message};
+pub use super::stream::{EventKind, TOOL_USE_BLOCK, user_message};
 
 pub const DEFAULT_EXECUTABLE: &str = "claude";
 pub const DEFAULT_MAX_CONCURRENT: usize = 8;
@@ -69,7 +73,7 @@ const ADDITIONAL_DIRECTORIES: &str = "additionalDirectories";
 pub fn shell_secret_problem(env: &HashMap<String, String>) -> Option<String> {
     for (name, value) in env {
         let upper = name.to_ascii_uppercase();
-        if upper == super::OAUTH_TOKEN_ENV {
+        if upper == OAUTH_TOKEN_ENV {
             return Some(format!(
                 "Claude Code passes {name} to its shell, where a coding worker can read it. Remove the variable and log in with `claude auth login`, or use the read profile."
             ));
@@ -143,17 +147,17 @@ pub fn worker_args(
     policy: &WorkerPolicy,
     contract: &str,
 ) -> Vec<String> {
-    super::settings::worker_args(model, tools, mode, &policy.settings(), contract)
+    settings::worker_args(model, tools, mode, &policy.settings(), contract)
 }
 
 pub struct WorkerHandshake {
     answers: Handshake,
     modes: Vec<String>,
-    policy: WorkerPolicy,
+    policy: Arc<WorkerPolicy>,
 }
 
 impl WorkerHandshake {
-    pub fn new(modes: Vec<String>, policy: WorkerPolicy) -> Self {
+    pub fn new(modes: Vec<String>, policy: Arc<WorkerPolicy>) -> Self {
         Self {
             answers: Handshake::default(),
             modes,
@@ -161,30 +165,24 @@ impl WorkerHandshake {
         }
     }
 
-    pub fn answer(&mut self, response: &Value) -> Result<bool, String> {
-        if !self
-            .answers
-            .record(response)
-            .map_err(|error| error.to_string())?
-        {
+    pub fn answer(&mut self, response: &Value) -> Result<bool, Error> {
+        if !self.answers.record(response)? {
             return Ok(false);
         }
         self.finish()?;
         Ok(true)
     }
 
-    pub fn finish(&self) -> Result<(), String> {
-        self.answers
-            .check(
-                |account| checks::account_problem(account, &self.modes),
-                |settings, hooks| {
-                    checks::policy_problem(settings, hooks, false).or_else(|| {
-                        worker_problem(&settings[EFFECTIVE], &self.policy.settings())
-                            .map(Problem::WorkerPolicy)
-                    })
-                },
-            )
-            .map_err(|error| error.to_string())
+    pub fn finish(&self) -> Result<(), Error> {
+        self.answers.check(
+            |account| checks::account_problem(account, &self.modes),
+            |settings, hooks| {
+                checks::policy_problem(settings, hooks, false).or_else(|| {
+                    worker_problem(&settings[EFFECTIVE], &self.policy.settings())
+                        .map(Problem::WorkerPolicy)
+                })
+            },
+        )
     }
 
     pub fn subscription_type(&self) -> Option<&str> {
@@ -345,11 +343,15 @@ pub async fn private_dir(
     base: PathBuf,
     project: PathBuf,
     denied: Vec<PathBuf>,
-) -> Result<String, String> {
-    let (dir, path) = super::run::private_dir_async(&base, &project, &denied)
-        .await
-        .map_err(|error| error.to_string())?;
-    let name = path.to_str().ok_or(PROBE_PATH_NOT_UTF8)?.to_owned();
+) -> Result<String, Error> {
+    let (dir, path) = private_dir_async(&base, &project, &denied).await?;
+    let name = path
+        .to_str()
+        .ok_or_else(|| Error::Io {
+            what: "name the probe directory",
+            source: io::Error::new(io::ErrorKind::InvalidData, PROBE_PATH_NOT_UTF8),
+        })?
+        .to_owned();
     dir.keep();
     Ok(name)
 }
@@ -360,9 +362,8 @@ pub fn init_problem(
     cwd: &Path,
     tools: HashSet<String>,
     modes: &[String],
-) -> Option<String> {
+) -> Option<Problem> {
     checks::init_problem(event, version, cwd, &tools, modes, None)
-        .map(|problem| problem.to_string())
 }
 
 pub struct WorkerEvent {
@@ -371,7 +372,7 @@ pub struct WorkerEvent {
     pub usage: Option<Value>,
     pub rate_limit: Option<ProviderUsage>,
     pub model_checked: bool,
-    pub problem: Option<String>,
+    pub problem: Option<Error>,
     pub failure: Option<String>,
 }
 
@@ -382,18 +383,15 @@ pub fn classify(
     accepted: bool,
     expected_model: Option<&str>,
     mut model_checked: bool,
-) -> Result<WorkerEvent, String> {
+) -> Result<WorkerEvent, Error> {
     if line.len() > MAX_EVENT_BYTES {
         return Err(Error::EventTooLarge {
             limit: MAX_EVENT_BYTES,
-        }
-        .to_string());
+        });
     }
-    let event = stream::parse_event(line).map_err(|error| error.to_string())?;
-    let mut kind = None;
-    let mut check = || -> Result<(), Error> {
-        let event_kind = stream::event_kind(&event, StreamMode::Worker)?;
-        kind = Some(event_kind);
+    let event = stream::parse_event(line)?;
+    let kind = stream::event_kind(&event, StreamMode::Worker);
+    let mut check = |event_kind| -> Result<(), Error> {
         stream::check_start(&event, event_kind, StreamMode::Worker, accepted)?;
         if let Some(expected) = expected_model {
             let message = if event_kind == EventKind::Stream {
@@ -413,7 +411,10 @@ pub fn classify(
         }
         Ok(())
     };
-    let problem = check().err().map(|error| error.to_string());
+    let (kind, problem) = match kind {
+        Ok(kind) => (Some(kind), check(kind).err()),
+        Err(error) => (None, Some(error)),
+    };
     let usage = if kind == Some(EventKind::Assistant) {
         &event["message"]["usage"]
     } else {

@@ -20,7 +20,7 @@ use super::DIRECTORY_FLAGS;
 use maki_providers::claude_code::validation::GIT_ENTRY;
 
 const MAX_DEPTH: usize = 64;
-const MAX_LINK_EXPANSIONS: usize = 4096;
+const MAX_LINK_READS: usize = 64 * 1024;
 const DEPTH_EXCEEDED: &str = "snapshot exceeds";
 const MAX_FAILURES: usize = 10;
 const CONFIG: &str = "config";
@@ -45,14 +45,13 @@ enum ResolveStep {
     EndLink(PathBuf),
 }
 
-fn resolve_links(path: &Path) -> io::Result<PathBuf> {
+fn resolve_links(path: &Path, remaining: &mut usize) -> io::Result<PathBuf> {
     let mut pending: Vec<_> = path
         .components()
         .rev()
         .map(|part| ResolveStep::Component(part.as_os_str().to_owned()))
         .collect();
     let mut active = HashSet::new();
-    let mut expansions = 0;
     let mut resolved = PathBuf::new();
     while let Some(step) = pending.pop() {
         let part = match step {
@@ -70,14 +69,11 @@ fn resolve_links(path: &Path) -> io::Result<PathBuf> {
             b"/" => resolved.push(part),
             _ => {
                 resolved.push(part);
+                *remaining = remaining.checked_sub(1).ok_or(Errno::LOOP)?;
                 match fs::read_link(&resolved) {
                     Ok(target) => {
                         if !active.insert(resolved.clone()) {
                             continue;
-                        }
-                        expansions += 1;
-                        if expansions > MAX_LINK_EXPANSIONS {
-                            return Err(Errno::LOOP.into());
                         }
                         pending.push(ResolveStep::EndLink(resolved.clone()));
                         resolved.pop();
@@ -325,6 +321,7 @@ pub fn sanitize_snapshot(
     snapshot: &Path,
     quarantine: &Path,
     git: &Path,
+    prune_links: bool,
 ) -> io::Result<SnapshotMetadata> {
     fs::create_dir_all(quarantine)?;
     let root = File::from(open(snapshot, DIRECTORY_FLAGS, Mode::empty())?);
@@ -382,12 +379,16 @@ pub fn sanitize_snapshot(
         Ok(Visit::Scan)
     });
     pointer.and(scanned)?;
+    if !prune_links {
+        return Ok(relocated);
+    }
+    let mut remaining = MAX_LINK_READS;
     // Removing an alias before resolving the next link can disguise an escaping target as
     // an internal missing path. Resolve the whole graph before deleting any link.
     relocated.dropped_links = symlinks
         .into_iter()
         .filter(|path| {
-            !resolve_links(&resolved_root.join(path))
+            !resolve_links(&resolved_root.join(path), &mut remaining)
                 .is_ok_and(|target| target.starts_with(&resolved_root))
         })
         .collect();
@@ -409,7 +410,8 @@ pub fn sanitize_snapshot(
 mod tests {
     use super::{
         COMMONDIR, CONFIG, DEPTH_EXCEEDED, GIT_ENTRY, HEAD, MAX_DEPTH, MAX_FAILURES,
-        QUARANTINE_ENTRY, Visit, quarantine_entry, resolve_links, sanitize_snapshot, walk,
+        MAX_LINK_READS, QUARANTINE_ENTRY, Visit, quarantine_entry, resolve_links,
+        sanitize_snapshot, walk,
     };
     use rustix::io::Errno;
     use rustix::process::geteuid;
@@ -477,13 +479,15 @@ mod tests {
                 output.stdout.strip_suffix(&[0]).unwrap().to_vec(),
             ))
         });
-        assert_eq!(resolve_links(&link).ok(), expected);
+        let mut remaining = MAX_LINK_READS;
+        assert_eq!(resolve_links(&link, &mut remaining).ok(), expected);
         let dropped =
             expected.is_none_or(|path| !path.starts_with(snapshot.canonicalize().unwrap()));
         let metadata = sanitize_snapshot(
             &snapshot,
             &dir.path().join("quarantine"),
             &dir.path().join("repository"),
+            true,
         )
         .unwrap();
         assert_eq!(
@@ -500,15 +504,16 @@ mod tests {
         const TARGET: &str = "growing/again";
         let dir = tempdir().unwrap();
         symlink(TARGET, dir.path().join(GROWING)).unwrap();
+        let mut remaining = MAX_LINK_READS;
         assert_eq!(
-            resolve_links(&dir.path().join(GROWING)).unwrap(),
+            resolve_links(&dir.path().join(GROWING), &mut remaining).unwrap(),
             dir.path().join(TARGET)
         );
     }
 
     #[test]
     fn finite_alias_graphs_cannot_expand_without_bound() {
-        const LEVELS: usize = 14;
+        const LEVELS: usize = 16;
         let dir = tempdir().unwrap();
         symlink(".", dir.path().join("split0")).unwrap();
         for level in 1..=LEVELS {
@@ -519,8 +524,60 @@ mod tests {
             )
             .unwrap();
         }
-        let error = resolve_links(&dir.path().join(format!("split{LEVELS}"))).unwrap_err();
+        let mut remaining = MAX_LINK_READS;
+        let error =
+            resolve_links(&dir.path().join(format!("split{LEVELS}")), &mut remaining).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(Errno::LOOP.raw_os_error()));
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn aliases_share_one_resolution_budget_and_collection_keeps_links() {
+        const ALIASES: usize = 512;
+        const CHAIN: usize = 8;
+        const PADDING: usize = 32;
+        const ALIAS_PREFIX: &str = "alias";
+        let dir = tempdir().unwrap();
+        let snapshot = dir.path().join("snapshot");
+        let quarantine = dir.path().join("quarantine");
+        let git = dir.path().join("repository");
+        fs::create_dir_all(snapshot.join("d")).unwrap();
+        let padding = "d/../".repeat(PADDING);
+        for level in 0..CHAIN {
+            let target = if level == 0 {
+                "d".to_owned()
+            } else {
+                format!("chain{}", level - 1)
+            };
+            symlink(
+                format!("{padding}{target}"),
+                snapshot.join(format!("chain{level}")),
+            )
+            .unwrap();
+        }
+        for alias in 0..ALIASES {
+            symlink(
+                format!("chain{}", CHAIN - 1),
+                snapshot.join(format!("{ALIAS_PREFIX}{alias}")),
+            )
+            .unwrap();
+        }
+        let collected = sanitize_snapshot(&snapshot, &quarantine, &git, false).unwrap();
+        assert!(collected.dropped_links.is_empty());
+        let prepared = sanitize_snapshot(&snapshot, &quarantine, &git, true).unwrap();
+        let dropped = prepared
+            .dropped_links
+            .iter()
+            .filter(|path| {
+                path.as_os_str()
+                    .as_bytes()
+                    .starts_with(ALIAS_PREFIX.as_bytes())
+            })
+            .count();
+        assert!(
+            dropped >= ALIASES / 2,
+            "{dropped} aliases exhausted the shared budget"
+        );
     }
 
     const LIMIT_DESCRIPTORS: &str = "ulimit -n \"$1\" && shift && exec \"$@\"";
@@ -536,7 +593,7 @@ mod tests {
         let expected = format!("gitdir: {}\n", git.display());
         fs::write(&outside, &expected).unwrap();
         fs::hard_link(&outside, snapshot.join(GIT_ENTRY)).unwrap();
-        sanitize_snapshot(&snapshot, &dir.path().join("quarantine"), &git).unwrap();
+        sanitize_snapshot(&snapshot, &dir.path().join("quarantine"), &git, true).unwrap();
         assert_eq!(fs::metadata(snapshot.join(GIT_ENTRY)).unwrap().nlink(), 1);
         fs::write(snapshot.join(GIT_ENTRY), CONTENT).unwrap();
         assert_eq!(fs::read_to_string(outside).unwrap(), expected);
@@ -562,7 +619,7 @@ mod tests {
         let copied = snapshot.join(CONFIG);
         fs::hard_link(&source, &copied).unwrap();
         assert!(
-            sanitize_snapshot(&snapshot, &quarantine, &git)
+            sanitize_snapshot(&snapshot, &quarantine, &git, true)
                 .unwrap()
                 .private_files
                 > 0
@@ -592,7 +649,7 @@ mod tests {
         fs::write(snapshot.join(GIT_ENTRY), &pointer).unwrap();
         fs::write(snapshot.join("nested").join(name), "untrusted metadata").unwrap();
         assert_eq!(
-            sanitize_snapshot(&snapshot, &quarantine, &git)
+            sanitize_snapshot(&snapshot, &quarantine, &git, true)
                 .unwrap()
                 .git_metadata,
             [format!("nested/{name}")]
@@ -602,7 +659,7 @@ mod tests {
             pointer
         );
         assert_eq!(fs::read_dir(&quarantine).unwrap().count(), 1);
-        let metadata = sanitize_snapshot(&snapshot, &quarantine, &git).unwrap();
+        let metadata = sanitize_snapshot(&snapshot, &quarantine, &git, true).unwrap();
         assert!(metadata.git_metadata.is_empty());
         assert!(metadata.dropped_links.is_empty());
         assert_eq!(fs::read_dir(&quarantine).unwrap().count(), 1);
@@ -622,7 +679,7 @@ mod tests {
         fs::write(&target, &pointer).unwrap();
         symlink(&target, snapshot.join(GIT_ENTRY)).unwrap();
         symlink(&outside, snapshot.join("linked")).unwrap();
-        let metadata = sanitize_snapshot(&snapshot, &quarantine, &git).unwrap();
+        let metadata = sanitize_snapshot(&snapshot, &quarantine, &git, true).unwrap();
         assert!(metadata.git_metadata.is_empty());
         assert_eq!(metadata.dropped_links, [PathBuf::from("linked")]);
         assert_eq!(fs::read_to_string(&target).unwrap(), pointer);
@@ -655,7 +712,7 @@ mod tests {
         }
         fs::write(repository.join(HEAD), CONTENT).unwrap();
         fs::write(repository.join(CONFIG), CONTENT).unwrap();
-        let paths = sanitize_snapshot(&snapshot, &quarantine, &git).unwrap();
+        let paths = sanitize_snapshot(&snapshot, &quarantine, &git, true).unwrap();
         assert_eq!(paths.repositories, [REPOSITORY]);
         assert!(!repository.exists());
         let entries: Vec<_> = fs::read_dir(&quarantine)
@@ -725,6 +782,7 @@ mod tests {
             &snapshot,
             &root.path().join("quarantine"),
             &root.path().join("repository"),
+            true,
         )
         .err()
         .unwrap();
@@ -765,7 +823,13 @@ mod tests {
             fs::write(child.join(HEAD), CONTENT).unwrap();
             fs::write(child.join(CONFIG).join(HEAD), CONTENT).unwrap();
         }
-        sanitize_snapshot(&snapshot, &quarantine, &root.path().join("repository")).unwrap();
+        sanitize_snapshot(
+            &snapshot,
+            &quarantine,
+            &root.path().join("repository"),
+            true,
+        )
+        .unwrap();
         assert_eq!(
             fs::read_dir(quarantine).unwrap().count(),
             PENDING_REPOSITORIES + 1
@@ -804,7 +868,7 @@ mod tests {
         fs::create_dir(snapshot.join("nested")).unwrap();
         fs::write(snapshot.join("nested/.git"), CONTENT).unwrap();
         fs::set_permissions(&unreadable, Permissions::from_mode(0o0)).unwrap();
-        let result = sanitize_snapshot(&snapshot, &quarantine, &git);
+        let result = sanitize_snapshot(&snapshot, &quarantine, &git, true);
         fs::set_permissions(&unreadable, Permissions::from_mode(0o700)).unwrap();
         assert!(result.is_err());
         assert!(!snapshot.join("nested/.git").exists());
@@ -821,7 +885,7 @@ mod tests {
             .unwrap()
             .set_len(LARGE_POINTER_BYTES)
             .unwrap();
-        sanitize_snapshot(&snapshot, &quarantine, &git).unwrap();
+        sanitize_snapshot(&snapshot, &quarantine, &git, true).unwrap();
         assert_eq!(
             fs::read_to_string(snapshot.join(GIT_ENTRY)).unwrap(),
             format!("gitdir: {}\n", git.display())
@@ -877,7 +941,7 @@ mod tests {
         fs::write(snapshot.join(HEAD), CONTENT).unwrap();
         fs::write(snapshot.join(CONFIG), CONTENT).unwrap();
         fs::write(snapshot.join("work.txt"), CONTENT).unwrap();
-        let result = sanitize_snapshot(&snapshot, &quarantine, &git).unwrap();
+        let result = sanitize_snapshot(&snapshot, &quarantine, &git, true).unwrap();
         assert_eq!(result.repositories, ["."]);
         assert!(!snapshot.join(HEAD).exists());
         assert!(!snapshot.join(CONFIG).exists());

@@ -10,19 +10,21 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::str::from_utf8;
+use std::sync::Arc;
 
 use maki_lua_macro::{lua_fn, lua_table};
+use maki_providers::claude_code::Error as ClaudeError;
 use maki_providers::claude_code::validation::{
     self, EventKind, WorkerHandshake as NativeHandshake, WorkerPolicy,
 };
 use mlua::{
     Error as LuaError, Lua, LuaSerdeExt, LuaString, Result as LuaResult, Table, UserData,
-    UserDataMethods, Value as LuaValue,
+    UserDataMethods, UserDataRef, Value as LuaValue,
 };
 use rustix::fs::OFlags;
 use serde_json::Value;
 
-use crate::api::fs::{LOCK_BUSY, path_text};
+use crate::api::fs::path_text;
 use crate::api::util::convert::{TableExt, json_to_lua};
 use crate::api::util::pair::{Pair, pair, try_pair};
 use crate::plugin_permissions::PluginPermissions;
@@ -51,7 +53,6 @@ pub(crate) fn create_private_module(
     perms: &PluginPermissions,
 ) -> LuaResult<(&'static str, Table)> {
     let table = create_claude_code_table(lua, perms)?;
-    table.set("lock_busy", LOCK_BUSY)?;
     table.set("handshake_input", validation::handshake_input())?;
     table.set("startup_timeout_secs", validation::STARTUP_TIMEOUT_SECS)?;
     table.set("default_executable", validation::DEFAULT_EXECUTABLE)?;
@@ -221,6 +222,18 @@ async fn home_state_files(_lua: Lua, home: String) -> LuaResult<Pair<Vec<String>
     ))
 }
 
+struct Policy(Arc<WorkerPolicy>);
+
+impl UserData for Policy {}
+
+/// Parse the immutable worker policy once for argv and handshake validation.
+/// @param policy table Deny rules and optional sandbox paths.
+/// @return (userdata) Shared policy.
+#[lua_fn]
+fn worker_policy(lua: &Lua, policy: Table) -> LuaResult<Policy> {
+    Ok(Policy(Arc::new(lua.from_value(LuaValue::Table(policy))?)))
+}
+
 struct WorkerHandshake(NativeHandshake);
 
 impl UserData for WorkerHandshake {
@@ -243,36 +256,41 @@ impl UserData for WorkerHandshake {
 
 /// Collect and validate worker control responses with the provider's handshake rules.
 /// @param modes table Allowed permission modes.
-/// @param policy table Deny rules and optional sandbox paths.
+/// @param policy userdata Shared worker policy.
 /// @return (userdata) Handshake with answer, finish, resolved_model and subscription_type methods.
 #[lua_fn]
-fn worker_handshake(lua: &Lua, modes: Vec<String>, policy: Table) -> LuaResult<WorkerHandshake> {
-    let policy = lua.from_value(LuaValue::Table(policy))?;
-    Ok(WorkerHandshake(NativeHandshake::new(modes, policy)))
+fn worker_handshake(
+    _lua: &Lua,
+    modes: Vec<String>,
+    policy: UserDataRef<Policy>,
+) -> LuaResult<WorkerHandshake> {
+    Ok(WorkerHandshake(NativeHandshake::new(
+        modes,
+        Arc::clone(&policy.0),
+    )))
 }
 
 /// Build worker arguments without serializing launch settings through Lua.
 /// @param model string Model name.
 /// @param tools table Claude Code tool names.
 /// @param mode string Permission mode.
-/// @param policy table Deny rules and optional sandbox paths.
+/// @param policy userdata Shared worker policy.
 /// @param contract string Worker instructions.
 /// @return (table) Command-line arguments.
 #[lua_fn]
 fn worker_args(
-    lua: &Lua,
+    _lua: &Lua,
     model: String,
     tools: Vec<String>,
     mode: String,
-    policy: Table,
+    policy: UserDataRef<Policy>,
     contract: String,
 ) -> LuaResult<Vec<String>> {
-    let policy: WorkerPolicy = lua.from_value(LuaValue::Table(policy))?;
     Ok(validation::worker_args(
         &model,
         &tools.join(","),
         &mode,
-        &policy,
+        &policy.0,
         &contract,
     ))
 }
@@ -358,6 +376,7 @@ fn invalidate_version(_lua: &Lua, executable: String) -> LuaResult<()> {
 /// @param snapshot string Snapshot directory.
 /// @param quarantine string Private directory for preserved metadata.
 /// @param git string Trusted artifact repository.
+/// @param prune_links boolean Remove escaping links before the worker starts.
 /// @return (table?, string?) Metadata and repository paths, or nil and the error.
 #[lua_fn(guard = FsWrite)]
 async fn sanitize_git(
@@ -365,12 +384,14 @@ async fn sanitize_git(
     snapshot: String,
     quarantine: String,
     git: String,
+    prune_links: bool,
 ) -> LuaResult<Pair<Table>> {
     let result = smol::unblock(move || {
         snapshot::sanitize_snapshot(
             Path::new(&snapshot),
             Path::new(&quarantine),
             Path::new(&git),
+            prune_links,
         )
     })
     .await;
@@ -466,7 +487,8 @@ fn classify(lua: &Lua, line: String, mode: Table) -> LuaResult<Pair<Table>> {
             Path::new(&cwd),
             tools.into_iter().collect(),
             &modes,
-        );
+        )
+        .map(ClaudeError::from);
     }
     let event = &mut classified.event;
     match classified.kind {
@@ -475,7 +497,7 @@ fn classify(lua: &Lua, line: String, mode: Table) -> LuaResult<Pair<Table>> {
                 .get_mut("content")
                 .and_then(Value::as_array_mut)
             {
-                content.retain(|block| block["type"] == "tool_use");
+                content.retain(|block| block["type"] == validation::TOOL_USE_BLOCK);
                 for block in content {
                     if let Some(input) = block.get_mut("input").and_then(Value::as_object_mut) {
                         input.retain(|key, _| TOOL_PROGRESS_FIELDS.contains(&key.as_str()));
@@ -495,7 +517,7 @@ fn classify(lua: &Lua, line: String, mode: Table) -> LuaResult<Pair<Table>> {
     let result = lua.create_table()?;
     result.set("event", json_to_lua(lua, event)?)?;
     result.set("model_checked", classified.model_checked)?;
-    result.set("problem", classified.problem)?;
+    result.set("problem", classified.problem.map(|error| error.to_string()))?;
     result.set("failure", classified.failure)?;
     if let Some(usage) = &classified.usage {
         result.set("usage", json_to_lua(lua, usage)?)?;
@@ -510,7 +532,7 @@ lua_table! {
     /// Private helpers for the bundled Claude Code plugin. JSON inputs retain
     /// the distinction between null, objects and arrays.
     "maki.claude_code.internal" => pub(crate) fn create_claude_code_table(perms: &PluginPermissions), DOCS [
-        shell_secret_problem, escape_path, worker_handshake, worker_args, user_message, prepare_launch(perms), private_dir(perms), home_state_files(perms),
+        shell_secret_problem, escape_path, worker_policy, worker_handshake, worker_args, user_message, prepare_launch(perms), private_dir(perms), home_state_files(perms),
         classify, checkout_file(perms), version_check(perms), invalidate_version, sanitize_git(perms), project_git_dir(perms), unpack_blobs(perms),
     ]
 }
@@ -596,7 +618,10 @@ mod tests {
         let lua = Lua::new();
         let table = create_claude_code_table(&lua, &PluginPermissions::trusted()).unwrap();
         let create: Function = table.get("worker_handshake").unwrap();
-        let policy = json_to_lua(&lua, &json!({ "deny": [] })).unwrap();
+        let parse: Function = table.get("worker_policy").unwrap();
+        let policy: AnyUserData = parse
+            .call(json_to_lua(&lua, &json!({ "deny": [] })).unwrap())
+            .unwrap();
         let handshake: AnyUserData = create.call((vec!["default"], policy)).unwrap();
         let (complete, error): (Option<bool>, Option<String>) =
             handshake.call_method("answer", INVALID_JSON).unwrap();
@@ -732,23 +757,8 @@ mod tests {
         let lua = Lua::new();
         let table = create_claude_code_table(&lua, &PluginPermissions::trusted()).unwrap();
         let policy = json_to_lua(&lua, &policy).unwrap();
-        let args: Function = table.get("worker_args").unwrap();
-        assert!(
-            args.call::<LuaValue>((
-                String::new(),
-                Vec::<String>::new(),
-                String::new(),
-                policy.clone(),
-                String::new()
-            ))
-            .is_err()
-        );
-        let handshake: Function = table.get("worker_handshake").unwrap();
-        assert!(
-            handshake
-                .call::<LuaValue>((Vec::<String>::new(), policy))
-                .is_err()
-        );
+        let parse: Function = table.get("worker_policy").unwrap();
+        assert!(parse.call::<LuaValue>(policy).is_err());
     }
 
     #[test_case("" ; "checkout")]

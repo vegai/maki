@@ -314,7 +314,7 @@ local function commit_base(call, artifact, paths, dependencies)
   if call.stopped then
     return jobs.CANCELLED
   end
-  local dropped, metadata_err = M.sanitize(artifact)
+  local dropped, metadata_err = M.sanitize(artifact, true)
   local setup_err = mkdir_err or attributes_err or exclude_err or metadata_err
   if setup_err then
     return "maki cannot make the repository of the snapshot: " .. setup_err
@@ -459,7 +459,7 @@ function M.sweep(call, root, ttl_hours)
   -- Artifact locks are unlinked during deletion. Keep this lock outside the deleted tree.
   local sweep_lock, lock_err = maki.fs.try_lock(maki.fs.joinpath(root, SWEEP_LOCK))
   if not sweep_lock then
-    if lock_err == native.lock_busy then
+    if lock_err == maki.fs.lock_busy then
       return
     end
     local meta, meta_err = maki.fs.metadata(root)
@@ -594,9 +594,9 @@ end
 
 -- Git traverses nested repositories during ordinary status commands. Keep their metadata
 -- outside the work tree, without discarding the worker's files or repository objects.
-function M.sanitize(artifact)
+function M.sanitize(artifact, prune_links)
   local quarantine = maki.fs.joinpath(artifact.dir, QUARANTINE_DIR)
-  local paths, err = native.sanitize_git(artifact.snapshot, quarantine, artifact.git)
+  local paths, err = native.sanitize_git(artifact.snapshot, quarantine, artifact.git, prune_links == true)
   if not paths then
     return nil, err
   end
@@ -624,7 +624,7 @@ function M.sanitize(artifact)
       .. " hard-linked files in the snapshot"
   end
   if #paths.dropped_links > 0 then
-    artifact.notes[#artifact.notes + 1] = "maki removed external symlinks from the snapshot: "
+    artifact.notes[#artifact.notes + 1] = "maki removed external or unresolved symlinks from the snapshot: "
       .. path_utils.shown(paths.dropped_links)
   end
   return path_utils.set_of(paths.dropped_links)
@@ -668,7 +668,7 @@ local function commit_prepared(call, artifact)
   if call.stopped then
     return jobs.CANCELLED
   end
-  local dropped, metadata_err = M.sanitize(artifact)
+  local dropped, metadata_err = M.sanitize(artifact, true)
   if not dropped then
     return metadata_err
   end

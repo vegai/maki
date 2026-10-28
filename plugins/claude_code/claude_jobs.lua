@@ -5,6 +5,8 @@ local M = {}
 M.ERROR_PREFIX = "claude_code: "
 M.LEFT_BEHIND = "maki did not remove: "
 M.CANCELLED = "cancelled"
+local STDIN_CHUNK_BYTES = 64 * 1024
+local STDIN_RETRY_MS = 10
 local STDERR_TAIL_LINES = 10
 local STDERR_LINE_BYTES = 4096
 M.ERROR_BYTES = STDERR_TAIL_LINES * STDERR_LINE_BYTES
@@ -41,9 +43,20 @@ function M.keep_tail(tail, line)
 end
 
 function M.feed_stdin(id, data)
-  local sent, err = maki.fn.chansend(id, data)
-  if not sent then
-    return nil, err
+  local limits = maki.fn.chansend_limits()
+  local chunk_bytes = math.min(STDIN_CHUNK_BYTES, limits.max_bytes)
+  for offset = 1, #data, chunk_bytes do
+    local chunk = data:sub(offset, offset + chunk_bytes - 1)
+    while true do
+      local sent, err = maki.fn.chansend(id, chunk)
+      if sent then
+        break
+      end
+      if err ~= limits.full_error then
+        return nil, err
+      end
+      maki.async.sleep(STDIN_RETRY_MS)
+    end
   end
   return maki.fn.chanclose(id, "stdin")
 end

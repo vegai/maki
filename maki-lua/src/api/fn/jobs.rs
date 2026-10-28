@@ -34,8 +34,11 @@ const READER_BUF_SIZE: usize = 8 * 1024;
 const JOB_EXITED_ERR: &str = "job: exited or closed its stdin";
 const STDIN_WRITE_ERR: &str = "job: writing stdin failed";
 const NO_STDIN_ERR: &str = "job: stdin is not an open pipe";
-const STDIN_FULL_ERR: &str = "job: stdin queue exceeds 16 MiB; wait for the job to consume input";
-const MAX_STDIN_BYTES: usize = 16 * 1024 * 1024;
+pub(super) const STDIN_FULL_ERR: &str =
+    "job: stdin queue is full; wait for the job to consume input";
+pub(super) const STDIN_OVERSIZED_ERR: &str =
+    "job: stdin write exceeds the queue capacity; send smaller chunks";
+pub(super) const MAX_STDIN_BYTES: usize = 16 * 1024 * 1024;
 const STDOUT_STREAM: &str = "stdout";
 const STDERR_STREAM: &str = "stderr";
 const EXIT_EVENT: &str = "exit";
@@ -181,7 +184,11 @@ pub(crate) struct JobSpec {
 
 impl JobSpec {
     pub(super) fn spawn(self) -> Result<SpawnedJob, String> {
-        let mut command = self.command()?;
+        let command = self.command()?;
+        self.spawn_command(command)
+    }
+
+    fn spawn_command(self, mut command: Command) -> Result<SpawnedJob, String> {
         #[cfg(target_os = "linux")]
         let lifetime = if self.guard {
             Some(process::guard::bind(&mut command).map_err(|error| error.to_string())?)
@@ -813,6 +820,9 @@ impl JobStore {
         if len == 0 {
             return Ok(0);
         }
+        if len > MAX_STDIN_BYTES {
+            return Err(STDIN_OVERSIZED_ERR);
+        }
         job.reap_state
             .stdin_bytes
             .try_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
@@ -1126,10 +1136,16 @@ fn text_line(mut bytes: Vec<u8>) -> String {
 #[cfg(test)]
 mod tests {
     use crate::runtime::with_jobs;
+    #[cfg(target_os = "linux")]
+    use futures_lite::future::poll_once;
+    #[cfg(target_os = "linux")]
+    use rustix::process::getpid;
     #[cfg(unix)]
     use std::fs::{self, Permissions};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::os::unix::process::CommandExt;
     use test_case::test_case;
 
     use super::*;
@@ -1835,6 +1851,11 @@ mod tests {
         assert_eq!(store.send(1, Some(1), TEST_PLUGIN, Vec::new()), Ok(0));
         assert!(rx.is_empty());
         assert_eq!(
+            store.send(1, Some(1), TEST_PLUGIN, vec![0; MAX_STDIN_BYTES + 1]),
+            Err(STDIN_OVERSIZED_ERR)
+        );
+        assert!(rx.is_empty());
+        assert_eq!(
             store.send(1, Some(1), TEST_PLUGIN, vec![0; MAX_STDIN_BYTES]),
             Ok(MAX_STDIN_BYTES)
         );
@@ -2065,8 +2086,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unwatched_job_is_killed_and_reaped() {
-        use std::os::unix::process::CommandExt;
-
         let child = Command::new("sleep")
             .arg("30")
             .process_group(0)
@@ -2078,6 +2097,46 @@ mod tests {
             rustix::process::test_kill_process(pid),
             Err(rustix::io::Errno::SRCH)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancelling_a_guarded_spawn_kills_and_reaps_the_unregistered_child() {
+        smol::block_on(async {
+            let (mut entered, mut notification) = UnixStream::pair().unwrap();
+            let (mut release, mut blocked) = UnixStream::pair().unwrap();
+            entered.set_read_timeout(Some(JOB_EXIT_TIMEOUT)).unwrap();
+            let spec = JobSpec {
+                guard: true,
+                ..JobSpec::new(task_owner(1), NEVER_ENDS)
+            };
+            let mut command = spec.command().unwrap();
+            // SAFETY: the hook only writes a stack integer and waits on a socket, without
+            // allocation or locks. The parent owns the peer that releases it after cancellation.
+            unsafe {
+                command.pre_exec(move || {
+                    notification.write_all(&getpid().as_raw_nonzero().get().to_ne_bytes())?;
+                    let mut ready = [0];
+                    blocked.read_exact(&mut ready)?;
+                    Ok(())
+                });
+            }
+            let mut spawning = Box::pin(smol::unblock(move || spec.spawn_command(command)));
+            assert!(poll_once(spawning.as_mut()).await.is_none());
+            let pid = smol::unblock(move || {
+                let mut bytes = [0; size_of::<i32>()];
+                entered.read_exact(&mut bytes).unwrap();
+                i32::from_ne_bytes(bytes) as u32
+            })
+            .await;
+            assert!(group_alive(pid));
+            drop(spawning);
+            release.write_all(&[0]).unwrap();
+            assert!(
+                wait_for_group_exit(pid),
+                "the cancelled spawn left its process group alive"
+            );
+        });
     }
 
     /// The `sleep` holds none of the job's pipes, so without the group kill

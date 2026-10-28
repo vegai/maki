@@ -2408,7 +2408,8 @@ Requires the `run` [plugin permission](#plugin-permissions).
 
 **Returns:** (`integer?`, `string?`) Job id, or nil plus an error message when the
   process could not start (binary not found, bad `cwd`, redirect file not
-  writable). Yields while starting the process.
+  writable or a live name is already held). Yields while starting the process.
+  Call from a coroutine. Cancel hooks and describe callbacks cannot yield.
 
 **Example:**
 
@@ -2616,9 +2617,9 @@ maki.fn.jobfind({name})
 ```
 
 Find the live job of this plugin that `jobstart` registered under {name}.
-An exited job never answers, so `jobfind(...) or jobstart(...)` restarts a
-job that died instead of adopting its id. The name stays on the `joblist`
-row, which is where you go to see why it died.
+An exited job never answers. The name stays on its `joblist` row so you can inspect
+why it died. Another coroutine may claim the name while `jobstart` yields.
+Check for a start error, or look up the winner again.
 
 Requires the `run` [plugin permission](#plugin-permissions).
 
@@ -2634,7 +2635,10 @@ Requires the `run` [plugin permission](#plugin-permissions).
 ```lua
 local id = maki.fn.jobfind("log-tail")
 if not id then
-  id = maki.fn.jobstart("tail -F /tmp/log", { name = "log-tail", scope = "plugin" })
+  local err
+  id, err = maki.fn.jobstart("tail -F /tmp/log", { name = "log-tail", scope = "plugin" })
+  if not id then id = maki.fn.jobfind("log-tail") end
+  if not id then return nil, err end
 end
 ```
 
@@ -2654,7 +2658,7 @@ The final item has no newline suffix.
 Unread data stays in memory. A descendant can retain stdin after the job
 exits. Use `guard` to stop that descendant and release the data.
 
-At most 16 MiB can wait in the job's stdin queue, including a write in progress.
+`chansend_limits().max_bytes` bounds the queue, including a write in progress.
 A full queue returns an error so the caller can wait for the child to consume input.
 
 Requires the `run` [plugin permission](#plugin-permissions).
@@ -2673,6 +2677,18 @@ local id = maki.fn.jobstart({ "cat" }, { stdin = "pipe" })
 maki.fn.chansend(id, "hello\n")
 maki.fn.chanclose(id, "stdin")
 ```
+
+---
+
+### `maki.fn.chansend_limits()` {#maki-fn-chansend_limits}
+
+```lua
+maki.fn.chansend_limits()
+```
+
+Query the stdin queue capacity and the errors callers can handle by retrying or splitting.
+
+**Returns:** (`table`) `max_bytes`, `full_error`, and `oversized_error`.
 
 ---
 
@@ -3238,7 +3254,17 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 
 - `{path}` (`string`) Lock file, created privately if absent. Symlinks are refused on Unix.
 
-**Returns:** (`userdata?`, `string?`) Lock with close(), nil and "lock is held" if busy, or nil and an I/O error.
+**Returns:** (`userdata?`, `string?`) Lock with close(), nil and `maki.fs.lock_busy` if busy, or nil and an I/O error.
+
+---
+
+### `maki.fs.lock_busy` {#maki-fs-lock_busy}
+
+```lua
+maki.fs.lock_busy
+```
+
+The error string returned by `try_lock` while another caller holds the lock.
 
 ---
 

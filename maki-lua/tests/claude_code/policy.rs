@@ -283,6 +283,7 @@ case "$scenario" in
     cat src/lib.rs > "$dir/snapshot_lib"
     printf 'worker\n' >> src/lib.rs; printf 'fresh\n' > src/new.rs; rm src/old.rs; printf '\000\001' > logo.bin
     printf '#!/bin/sh\n' > run.sh; chmod +x run.sh
+    if [ "$scenario" = code_edit_link ]; then ln -s /etc created_link; ln -sfn /etc src/inner; fi
     if [ "$scenario" = code_edit_ignored ]; then mkdir -p dist; printf 'bundle\n' > dist/bundle.js; fi
     if [ -d node_modules ]; then printf 'patched\n' >> node_modules/pkg/index.js; fi
     answer ;;

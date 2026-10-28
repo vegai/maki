@@ -262,10 +262,13 @@ function M.deny_rules(extra)
 end
 
 local function worker_policy(spec)
-  return {
-    deny = spec.deny,
-    sandbox = spec.worker.sandboxed and assert(spec.confine, "a sandboxed worker needs confinement paths") or nil,
-  }
+  if not spec.policy then
+    spec.policy = native.worker_policy({
+      deny = spec.deny,
+      sandbox = spec.worker.sandboxed and assert(spec.confine, "a sandboxed worker needs confinement paths") or nil,
+    })
+  end
+  return spec.policy
 end
 
 function M.worker_handshake(spec)

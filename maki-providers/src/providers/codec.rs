@@ -19,7 +19,7 @@ use super::openai_compat::{DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiC
 use super::{KeyRotation, ResolvedAuth, Timeouts};
 use crate::model::{Model, ModelInfo, ThinkingSupport};
 use crate::model_registry;
-use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
+use crate::provider::{BoxFuture, Provider, RequestScope};
 use crate::spec::ProviderSpec;
 use crate::types::{EffortDialect, ThinkingFallback, dialect, merge_body};
 use crate::{
@@ -563,7 +563,10 @@ impl CompatProvider {
     }
 }
 
-#[warn(clippy::missing_trait_methods)]
+#[expect(
+    clippy::missing_trait_methods,
+    reason = "list_models_for uses the provider default"
+)]
 impl Provider for CompatProvider {
     fn stream_message<'a>(
         &'a self,
@@ -628,13 +631,6 @@ impl Provider for CompatProvider {
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         let auth = self.auth.lock().unwrap().clone();
         Box::pin(async move { self.compat.do_list_models(&auth).await })
-    }
-
-    fn list_models_for(
-        &self,
-        _listing: ModelListing,
-    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        self.list_models()
     }
 
     /// The protocol has no usage endpoint. A declaration whose provider has

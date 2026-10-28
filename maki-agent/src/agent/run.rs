@@ -3471,19 +3471,35 @@ mod tests {
     /// Fails while a request still carries thinking, or always.
     struct UnboundThinkingProvider {
         always: bool,
+        requests: Arc<Mutex<Vec<CapturedRequest>>>,
     }
 
     impl Provider for UnboundThinkingProvider {
         fn stream_message<'a>(
             &'a self,
-            _: &'a Model,
+            model: &'a Model,
             messages: &'a [Message],
-            _: &'a str,
-            _: &'a Value,
+            system: &'a str,
+            tools: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
             _scope: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            self.requests.lock().unwrap().push(CapturedRequest {
+                model: model.id.clone(),
+                system: system.to_owned(),
+                tools: tools.clone(),
+                // Recovery intentionally removes invalid thinking. Everything else must
+                // remain append-only across the retry.
+                messages: messages
+                    .iter()
+                    .cloned()
+                    .map(|mut message| {
+                        message.content.retain(|block| !block.is_thinking());
+                        serde_json::to_value(message).unwrap()
+                    })
+                    .collect(),
+            });
             let thinking = messages
                 .iter()
                 .flat_map(|m| &m.content)
@@ -3523,8 +3539,14 @@ mod tests {
                     ..Default::default()
                 },
             ]);
-            let (mut agent, event_rx) =
-                make_agent(UnboundThinkingProvider { always }, &mut history);
+            let requests = Arc::default();
+            let (mut agent, event_rx) = make_agent(
+                UnboundThinkingProvider {
+                    always,
+                    requests: Arc::clone(&requests),
+                },
+                &mut history,
+            );
 
             if bounded {
                 agent.config.max_turns = Some(1);
@@ -3542,6 +3564,9 @@ mod tests {
             drop(agent);
 
             assert_eq!(recovered, expected, "{message}");
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_append_only(&requests[0], &requests[1]);
             if bounded {
                 assert_eq!(
                     history

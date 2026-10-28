@@ -167,6 +167,19 @@ impl ToolFilter {
         audience.contains(caller) && self.matches(name)
     }
 
+    pub(crate) fn admits_definition(
+        &self,
+        name: &str,
+        audience: ToolAudience,
+        caller: ToolAudience,
+        local_audience: Option<ToolAudience>,
+    ) -> bool {
+        match local_audience {
+            Some(audience) => self.admits_local(name, audience, caller),
+            None => self.admits(name, audience, caller),
+        }
+    }
+
     pub(crate) fn admits_local(
         &self,
         name: &str,
@@ -287,10 +300,12 @@ impl RequestTools {
                     let registered = registry
                         .get(name)
                         .map_or(ToolAudience::all(), |entry| entry.tool.audience());
-                    match local_tools.get(name) {
-                        Some(tool) => filter.admits_local(name, tool.audience, audience),
-                        None => filter.admits(name, registered, audience),
-                    }
+                    filter.admits_definition(
+                        name,
+                        registered,
+                        audience,
+                        local_tools.get(name).map(|tool| tool.audience),
+                    )
                 })
             });
         }

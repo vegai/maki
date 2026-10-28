@@ -1,8 +1,7 @@
 use super::super::MAX_EVENT_BYTES;
-use super::super::checks::HANDSHAKE;
 use super::super::error::Error;
 use super::super::mcp::Handoff;
-use super::super::stream::control_request;
+use super::super::validation::handshake_input;
 use super::super::within;
 use crate::process::GroupSignals;
 use crate::process::guard;
@@ -14,7 +13,6 @@ use futures_lite::stream;
 use futures_lite::{FutureExt, Stream, StreamExt};
 use rustix::io::Errno;
 use rustix::process::{Signal, kill_process};
-use serde_json::json;
 use smol::process::{Child, ChildStdin, ChildStdout, Command};
 use smol::{Task, Timer};
 use std::collections::VecDeque;
@@ -402,11 +400,7 @@ pub(super) async fn send_handshake(
     stdin: &mut Option<ChildStdin>,
     deadline: Instant,
 ) -> Result<(), Error> {
-    for step in HANDSHAKE {
-        let request = control_request(step.id, &json!({ "subtype": step.subtype }));
-        send(stdin, &request, deadline).await?;
-    }
-    Ok(())
+    send(stdin, &handshake_input(), deadline).await
 }
 
 /// A process that ignores stdin can block a write larger than the pipe buffer. Bound the

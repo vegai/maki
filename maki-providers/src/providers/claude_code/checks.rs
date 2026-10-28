@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 
 use maki_storage::paths::normalize_path;
 use rustix::fs::{Mode, OFlags, open};
-use serde::Serialize;
 use serde_json::{Map, Value};
 
 use super::OAUTH_TOKEN_ENV;
@@ -166,7 +165,7 @@ const POLICY: &str = "policy";
 const ALL_DISABLED: &str = "allDisabled";
 pub(super) const DISABLED: &str = "disabled";
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub(crate) struct HandshakeStep {
     pub id: &'static str,
     pub subtype: &'static str,

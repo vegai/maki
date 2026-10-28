@@ -21,7 +21,10 @@ use crate::runtime::{active_task_id, job_task_id, strip_traceback, with_jobs};
 
 mod jobs;
 pub use jobs::set_shell_preference;
-use jobs::{CallbackUpdate, CallbackUpdates, JobCommand, JobSnapshot, Redirect};
+use jobs::{
+    CallbackUpdate, CallbackUpdates, JobCommand, JobSnapshot, MAX_STDIN_BYTES, Redirect,
+    STDIN_FULL_ERR, STDIN_OVERSIZED_ERR,
+};
 pub(crate) use jobs::{JobEvent, JobOwner, JobSpec, JobStore};
 
 const MAX_TAIL_LINES: usize = 1024;
@@ -121,7 +124,8 @@ impl Drop for CheckedOutReceiver {
 ///     plugin can see. A second job with the same live name fails.
 /// @return (integer?, string?) Job id, or nil plus an error message when the
 ///   process could not start (binary not found, bad `cwd`, redirect file not
-///   writable). Yields while starting the process.
+///   writable or a live name is already held). Yields while starting the process.
+///   Call from a coroutine. Cancel hooks and describe callbacks cannot yield.
 /// @example
 /// local id, err = maki.fn.jobstart({ "rg", "--json", pattern, dir }, {
 ///   on_stdout = function(_, line) print(line) end,
@@ -176,17 +180,22 @@ async fn jobstart(
 
     let task_id = active_task_id(&lua);
     let gate = with_jobs(&lua, |store| Arc::clone(&store.start_gate));
-    let _starting = gate.lock().await;
-    with_jobs(&lua, |store| {
+    let _starting = if spec.name.is_some() {
+        Some(gate.lock().await)
+    } else {
+        None
+    };
+    let available = with_jobs(&lua, |store| {
         if let Some(ref name) = spec.name
             && let Some(held) = store.find_named(name, task_id, &plugin)
         {
-            return Err(mlua::Error::runtime(format!(
+            return Err(format!(
                 "jobstart: name {name:?} is already held by live job {held}"
-            )));
+            ));
         }
         Ok(())
-    })?;
+    });
+    try_pair!(available);
     let spawned = try_pair!(smol::unblock(move || spec.spawn()).await);
     with_jobs(&lua, |store| {
         let id = try_pair!(store.register(spawned));
@@ -252,9 +261,9 @@ fn job_name(opts: &Table) -> LuaResult<Option<String>> {
 }
 
 /// Find the live job of this plugin that `jobstart` registered under {name}.
-/// An exited job never answers, so `jobfind(...) or jobstart(...)` restarts a
-/// job that died instead of adopting its id. The name stays on the `joblist`
-/// row, which is where you go to see why it died.
+/// An exited job never answers. The name stays on its `joblist` row so you can inspect
+/// why it died. Another coroutine may claim the name while `jobstart` yields.
+/// Check for a start error, or look up the winner again.
 ///
 /// @param name string Name passed to `jobstart`.
 /// @return (integer|nil, string|nil) Job id, or nil and an error when no live
@@ -262,7 +271,10 @@ fn job_name(opts: &Table) -> LuaResult<Option<String>> {
 /// @example
 /// local id = maki.fn.jobfind("log-tail")
 /// if not id then
-///   id = maki.fn.jobstart("tail -F /tmp/log", { name = "log-tail", scope = "plugin" })
+///   local err
+///   id, err = maki.fn.jobstart("tail -F /tmp/log", { name = "log-tail", scope = "plugin" })
+///   if not id then id = maki.fn.jobfind("log-tail") end
+///   if not id then return nil, err end
 /// end
 #[lua_fn(guard = Run)]
 fn jobfind(lua: &Lua, #[ctx] plugin: Arc<str>, name: String) -> LuaResult<Pair<u32>> {
@@ -457,6 +469,17 @@ fn jobstop(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<()> {
     Ok(())
 }
 
+/// Query the stdin queue capacity and the errors callers can handle by retrying or splitting.
+/// @return (table) `max_bytes`, `full_error`, and `oversized_error`.
+#[lua_fn]
+fn chansend_limits(lua: &Lua) -> LuaResult<Table> {
+    let limits = lua.create_table()?;
+    limits.set("max_bytes", MAX_STDIN_BYTES)?;
+    limits.set("full_error", STDIN_FULL_ERR)?;
+    limits.set("oversized_error", STDIN_OVERSIZED_ERR)?;
+    Ok(limits)
+}
+
 /// Write {data} to job {id}'s stdin. Start the job with `stdin = "pipe"`.
 /// Unlike `vim.fn.chansend`, an error returns nil and a message instead of 0.
 /// List items use newline separators. A newline inside an item becomes NUL.
@@ -465,7 +488,7 @@ fn jobstop(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<()> {
 /// Unread data stays in memory. A descendant can retain stdin after the job
 /// exits. Use `guard` to stop that descendant and release the data.
 ///
-/// At most 16 MiB can wait in the job's stdin queue, including a write in progress.
+/// `chansend_limits().max_bytes` bounds the queue, including a write in progress.
 /// A full queue returns an error so the caller can wait for the child to consume input.
 ///
 /// @param id integer Job id returned by `jobstart`.
@@ -808,7 +831,7 @@ lua_table! {
         jobstart(perms, plugin, fs_write), jobstop(perms, plugin), jobforget(perms, plugin),
         jobwait(perms, plugin), jobinfo(perms, plugin), joblist(perms, plugin),
         jobattach(perms, plugin), jobfind(perms, plugin),
-        chansend(perms, plugin), chanclose(perms, plugin),
+        chansend(perms, plugin), chansend_limits, chanclose(perms, plugin),
         executable(perms), exepath(perms),
         winsaveview(tx), winrestview(tx),
     ]
@@ -816,7 +839,21 @@ lua_table! {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::{create_fn_table, with_jobs};
+    #[cfg(unix)]
+    use crate::plugin_permissions::PluginPermissions;
+    #[cfg(unix)]
+    use futures_lite::{FutureExt, future::poll_once};
+    #[cfg(unix)]
+    use mlua::Function;
     use mlua::{Lua, Table, Value};
+    #[cfg(unix)]
+    use std::pin::pin;
+    #[cfg(unix)]
+    use std::sync::Arc;
+    #[cfg(unix)]
+    use std::time::Duration;
     use test_case::test_case;
 
     use super::{
@@ -829,6 +866,51 @@ mod tests {
     const NOT_UTF8_LINE: &[u8] = b"latin\xe9";
     const LINE_WITH_NEWLINE: &[u8] = b"two\nparts";
     const LINE_WITH_NUL: &[u8] = b"two\0parts";
+
+    #[cfg(unix)]
+    #[test_case(false ; "unnamed_starts_do_not_wait_for_the_name_gate")]
+    #[test_case(true ; "named_starts_wait_for_the_name_gate")]
+    fn only_named_starts_take_the_gate(named: bool) {
+        const PLUGIN: &str = "gate-test";
+        const COMMAND: &str = "true";
+        const START_TIMEOUT: Duration = Duration::from_secs(5);
+        smol::block_on(async {
+            let lua = Lua::new();
+            let table = create_fn_table(
+                &lua,
+                PLUGIN.into(),
+                &PluginPermissions::trusted(),
+                false,
+                None,
+            )
+            .unwrap();
+            let gate = with_jobs(&lua, |store| Arc::clone(&store.start_gate));
+            let held = gate.lock().await;
+            let options = lua.create_table_from([("scope", "plugin")]).unwrap();
+            if named {
+                options.set("name", PLUGIN).unwrap();
+            }
+            let start: Function = table.get("jobstart").unwrap();
+            let mut starting =
+                pin!(start.call_async::<(Option<u32>, Option<String>)>((COMMAND, options)));
+            let held = if named {
+                assert!(poll_once(starting.as_mut()).await.is_none());
+                drop(held);
+                None
+            } else {
+                Some(held)
+            };
+            let (id, error) = starting
+                .or(async {
+                    smol::Timer::after(START_TIMEOUT).await;
+                    panic!("jobstart waited on an unrelated start")
+                })
+                .await
+                .unwrap();
+            assert!(id.is_some(), "{error:?}");
+            drop(held);
+        });
+    }
 
     #[test_case(JobEvent::Stdout(CALLBACK_LINE.into()), 3 ; "stdout")]
     #[test_case(JobEvent::Stderr(CALLBACK_LINE.into()), 3 ; "stderr")]

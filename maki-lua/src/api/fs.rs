@@ -28,6 +28,7 @@ use rustix::fs::OFlags;
 use crate::agent_autocmd::HostEvent;
 use crate::api::util::convert::TableExt;
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
+use crate::docs::FnDoc;
 use crate::loader::EventHandle;
 use crate::plugin_permissions::PluginPermissions;
 use crate::runtime::LUA_MEMORY_LIMIT;
@@ -35,7 +36,7 @@ use crate::runtime::LUA_MEMORY_LIMIT;
 // Luau allows strings and buffers up to 1 GiB, but the VM budget is the binding
 // limit: a read the VM cannot hold dies with a Lua memory error instead.
 const MAX_READ_BYTES: u64 = LUA_MEMORY_LIMIT as u64;
-pub(super) const LOCK_BUSY: &str = "lock is held";
+const LOCK_BUSY: &str = "lock is held";
 const NON_UTF8_CONTENT_ERR: &str = "non-utf8 content; use read_bytes";
 const TAIL_SCAN_CHUNK: usize = 64 * 1024;
 
@@ -130,7 +131,7 @@ impl UserData for FileLock {
 
 /// Try to hold an exclusive file lock. Closing or dropping the handle releases it.
 /// @param path string Lock file, created privately if absent. Symlinks are refused on Unix.
-/// @return (userdata?, string?) Lock with close(), nil and "lock is held" if busy, or nil and an I/O error.
+/// @return (userdata?, string?) Lock with close(), nil and `maki.fs.lock_busy` if busy, or nil and an I/O error.
 #[lua_fn(guard = FsWrite)]
 async fn try_lock(_lua: Lua, path: String) -> LuaResult<Pair<FileLock>> {
     let path = try_pair!(make_absolute(&path));
@@ -1351,6 +1352,29 @@ async fn fuzzy_files(
     Ok((Some(tbl), None))
 }
 
+#[allow(non_upper_case_globals)]
+const lock_busy__doc: FnDoc = FnDoc {
+    name: "lock_busy",
+    args: "",
+    desc: "The error string returned by `try_lock` while another caller holds the lock.",
+    params: &[],
+    returns: "",
+    guard: None,
+    value: true,
+    example: "",
+};
+
+pub(crate) fn create_fs_table(
+    lua: &Lua,
+    perms: &PluginPermissions,
+    plugin: Arc<str>,
+) -> LuaResult<Table> {
+    let table = lua.create_table()?;
+    add_fs_fns(&table, lua, perms, plugin)?;
+    table.set("lock_busy", LOCK_BUSY)?;
+    Ok(table)
+}
+
 lua_table! {
     /// File-system utilities, modelled after `vim.fs` and `vim.uv`.
     ///
@@ -1361,10 +1385,10 @@ lua_table! {
     /// local text, err = maki.fs.read("init.lua")
     /// if err then return end
     /// ```
-    "maki.fs" => pub(crate) fn create_fs_table(perms: &PluginPermissions, plugin: Arc<str>), DOCS [
+    extend "maki.fs" => fn add_fs_fns(perms: &PluginPermissions, plugin: Arc<str>), DOCS [
         read(perms), read_bytes(perms), metadata(perms), realpath(perms), mkdtemp(perms), rename(perms), dirname, basename,
         joinpath, normalize, abspath, parents, root(perms), relpath, ext,
-        dir(perms), try_lock(perms), write(perms), append(perms), atomic_write(perms), rm(perms), mkdir(perms),
+        dir(perms), try_lock(perms), manual lock_busy, write(perms), append(perms), atomic_write(perms), rm(perms), mkdir(perms),
         glob(perms), grep(perms), fuzzy_files(perms, plugin),
     ]
 }
@@ -3398,7 +3422,7 @@ mod tests {
         let (second, error): (Option<AnyUserData>, Option<String>) =
             smol::block_on(lock.call_async(path.to_str().unwrap())).unwrap();
         assert!(second.is_none());
-        assert_eq!(error.as_deref(), Some(LOCK_BUSY));
+        assert_eq!(error, Some(table.get::<String>("lock_busy").unwrap()));
         let first = first.unwrap();
         first.call_method::<()>("close", ()).unwrap();
         let (third, error): (Option<AnyUserData>, Option<String>) =
