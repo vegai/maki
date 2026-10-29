@@ -5,10 +5,9 @@ pub(crate) mod base64;
 #[cfg(target_os = "linux")]
 pub(crate) mod claude_code;
 #[cfg(not(target_os = "linux"))]
-#[path = "claude_code_unsupported.rs"]
-pub(crate) mod claude_code;
+pub(crate) use claude_code_unsupported as claude_code;
 mod claude_code_common;
-#[cfg(test)]
+#[cfg(any(test, not(target_os = "linux")))]
 pub(crate) mod claude_code_unsupported;
 pub(crate) mod env;
 pub(crate) mod r#fn;
