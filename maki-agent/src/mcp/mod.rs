@@ -23,6 +23,8 @@ pub mod protocol;
 pub mod stdio;
 pub mod transport;
 
+#[cfg(unix)]
+use maki_providers::process::kill_group;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
@@ -1464,7 +1466,7 @@ fn spawn_persist_enabled(path: PathBuf, name: String, enabled: bool) {
 #[cfg(unix)]
 pub fn kill_process_groups(pids: &[u32]) {
     for &pid in pids {
-        maki_providers::process::kill_group(pid);
+        kill_group(pid);
     }
 }
 

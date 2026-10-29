@@ -109,9 +109,9 @@ end
 function M.import_script(changes, project, git_dir, artifact, stage)
   local words = git_utils.shell_environment()
   for _, word in ipairs(git_utils.git({ "--git-dir=" .. git_dir })) do
-    words[#words + 1] = path_utils.bash_quote(word)
+    words[#words + 1] = path_utils.shell_quote(word)
   end
-  local quoted_project = path_utils.bash_quote(project)
+  local quoted_project = path_utils.shell_quote(project)
   local lines = { "# Import changes into " .. path_utils.printable(project) }
   for _, change in ipairs(changes) do
     lines[#lines + 1] = "# " .. change.status .. " " .. path_utils.printable(change.path)
@@ -119,20 +119,20 @@ function M.import_script(changes, project, git_dir, artifact, stage)
   lines[#lines + 1] = ""
   for _, line in ipairs({
     "set -e",
-    "note=" .. path_utils.bash_quote(IMPORT_NOTE),
-    "changed_note=" .. path_utils.bash_quote(IMPORT_CHANGED),
-    "gone_note=" .. path_utils.bash_quote(ARTIFACT_GONE),
-    "link_note=" .. path_utils.bash_quote(IMPORT_NO_LINK),
-    "hash_note=" .. path_utils.bash_quote(HASH_FAILED),
-    "checkout_note=" .. path_utils.bash_quote(CHECKOUT_GONE),
+    "note=" .. path_utils.shell_quote(IMPORT_NOTE),
+    "changed_note=" .. path_utils.shell_quote(IMPORT_CHANGED),
+    "gone_note=" .. path_utils.shell_quote(ARTIFACT_GONE),
+    "link_note=" .. path_utils.shell_quote(IMPORT_NO_LINK),
+    "hash_note=" .. path_utils.shell_quote(HASH_FAILED),
+    "checkout_note=" .. path_utils.shell_quote(CHECKOUT_GONE),
     "changed_exit=" .. IMPORT_CHANGED_EXIT,
     "originals="
-      .. path_utils.bash_quote(artifact .. "/" .. path_utils.IMPORT_ORIGINALS .. "/" .. stage:match("[^/]+$")),
+      .. path_utils.shell_quote(artifact .. "/" .. path_utils.IMPORT_ORIGINALS .. "/" .. stage:match("[^/]+$")),
     "displaced="
-      .. path_utils.bash_quote(artifact .. "/" .. path_utils.IMPORT_DISPLACED .. "/" .. stage:match("[^/]+$")),
-    "stage=" .. path_utils.bash_quote(stage),
-    "receipt=" .. path_utils.bash_quote(M.receipt_path(artifact, stage)),
-    "temp_template=" .. path_utils.bash_quote(M.temp_name(stage) .. TEMP_RANDOM),
+      .. path_utils.shell_quote(artifact .. "/" .. path_utils.IMPORT_DISPLACED .. "/" .. stage:match("[^/]+$")),
+    "stage=" .. path_utils.shell_quote(stage),
+    "receipt=" .. path_utils.shell_quote(M.receipt_path(artifact, stage)),
+    "temp_template=" .. path_utils.shell_quote(M.temp_name(stage) .. TEMP_RANDOM),
     GIT_FUNCTION:format(table.concat(words, " ")),
     IMPORT_FUNCTIONS,
     "cd -P -- " .. quoted_project .. ' && [ "$(pwd -P)" = ' .. quoted_project .. " ] || checkout_gone",
@@ -152,7 +152,7 @@ function M.import_script(changes, project, git_dir, artifact, stage)
     hashed_checks[#hashed_checks + 1] = '[ "${hashes['
       .. index
       .. ']}" = '
-      .. path_utils.bash_quote(sha)
+      .. path_utils.shell_quote(sha)
       .. " ] || "
       .. refused
   end
@@ -161,10 +161,10 @@ function M.import_script(changes, project, git_dir, artifact, stage)
     for folder in path_utils.folders(change.path) do
       if not checked[folder] then
         checked[folder] = true
-        checks[#checks + 1] = "folder " .. path_utils.bash_quote(CURRENT_DIR .. folder)
+        checks[#checks + 1] = "folder " .. path_utils.shell_quote(CURRENT_DIR .. folder)
       end
     end
-    local path = path_utils.bash_quote(CURRENT_DIR .. change.path)
+    local path = path_utils.shell_quote(CURRENT_DIR .. change.path)
     if change.status == git_utils.ADDED then
       checks[#checks + 1] = "absent " .. path
     else
@@ -177,7 +177,7 @@ function M.import_script(changes, project, git_dir, artifact, stage)
         .. ' "${old_modes['
         .. index
         .. ']}" '
-        .. path_utils.bash_quote(change.old_mode)
+        .. path_utils.shell_quote(change.old_mode)
       local folder = maki.fs.dirname(CURRENT_DIR .. change.path)
       if not keep_folders[folder] then
         keep_folders[folder] = {}
@@ -190,8 +190,8 @@ function M.import_script(changes, project, git_dir, artifact, stage)
     else
       if not staged[change.new_sha] then
         staged[change.new_sha] = true
-        stages[#stages + 1] = "staged " .. path_utils.bash_quote(change.new_sha)
-        hash_path(stage .. "/" .. change.new_sha, change.new_sha, "gone " .. path_utils.bash_quote(change.new_sha))
+        stages[#stages + 1] = "staged " .. path_utils.shell_quote(change.new_sha)
+        hash_path(stage .. "/" .. change.new_sha, change.new_sha, "gone " .. path_utils.shell_quote(change.new_sha))
       end
       local flag = "keep"
       if change.status == git_utils.ADDED or change.old_mode ~= change.new_mode then
@@ -202,9 +202,9 @@ function M.import_script(changes, project, git_dir, artifact, stage)
       news[#news + 1] = "new "
         .. path
         .. " "
-        .. path_utils.bash_quote(change.new_sha)
+        .. path_utils.shell_quote(change.new_sha)
         .. " "
-        .. path_utils.bash_quote(flag)
+        .. path_utils.shell_quote(flag)
         .. " "
         .. permissions
       if change.status ~= git_utils.ADDED then
@@ -212,16 +212,16 @@ function M.import_script(changes, project, git_dir, artifact, stage)
       end
       writes[#writes + 1] = "put " .. path
     end
-    writes[#writes + 1] = "record " .. path_utils.bash_quote(change.path)
+    writes[#writes + 1] = "record " .. path_utils.shell_quote(change.path)
   end
   for _, folder in ipairs(keep_order) do
-    keeps[#keeps + 1] = "keep " .. path_utils.bash_quote(folder) .. " " .. table.concat(keep_folders[folder], " ")
+    keeps[#keeps + 1] = "keep " .. path_utils.shell_quote(folder) .. " " .. table.concat(keep_folders[folder], " ")
   end
   local hashes = {}
   if #hashed_paths > 0 then
     hashes = {
       "hashes=$(printf '%s' "
-        .. path_utils.bash_quote(git_utils.quoted_lines(hashed_paths))
+        .. path_utils.shell_quote(git_utils.quoted_lines(hashed_paths))
         .. " | g hash-object --no-filters --stdin-paths) || hash_failed",
       'mapfile -t hashes <<< "$hashes"',
     }
@@ -229,14 +229,14 @@ function M.import_script(changes, project, git_dir, artifact, stage)
   end
   local metadata = {}
   for i, path in ipairs(mode_paths) do
-    mode_paths[i] = path_utils.bash_quote(path)
+    mode_paths[i] = path_utils.shell_quote(path)
   end
   if #mode_paths > 0 then
     metadata = {
       "old_modes=$(printf '%s\\0' "
         .. table.concat(mode_paths, " ")
         .. " | xargs -0 stat -c %a --) || changed "
-        .. path_utils.bash_quote(project),
+        .. path_utils.shell_quote(project),
       'mapfile -t old_modes <<< "$old_modes"',
     }
   end

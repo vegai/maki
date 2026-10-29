@@ -1,14 +1,13 @@
-use std::env::consts::OS;
-
 use serde_json::{Map, Value};
 use thiserror::Error as ThisError;
 
+use super::UNSUPPORTED_SYSTEM;
 use crate::provider::Provider;
 use crate::{AgentError, Timeouts};
 
 #[derive(Debug, ThisError)]
 pub enum Error {
-    #[error("maki runs Claude Code only on Linux, not on {OS}")]
+    #[error("{UNSUPPORTED_SYSTEM}")]
     UnsupportedSystem,
 }
 

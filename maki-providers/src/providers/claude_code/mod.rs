@@ -24,6 +24,15 @@ pub(crate) const SLUG: &str = "claude-code";
 
 pub(crate) const OAUTH_TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 
+pub const UNSUPPORTED_SYSTEM: &str = "maki runs Claude Code only on Linux";
+pub const DEFAULT_EXECUTABLE: &str = "claude";
+pub const DEFAULT_MAX_CONCURRENT: usize = 8;
+pub const MIN_MAX_CONCURRENT: usize = 1;
+pub const STARTUP_TIMEOUT_SECS: u64 = 60;
+pub const EXECUTABLE_OPTION: &str = "executable";
+pub const CONFIG_DIR_OPTION: &str = "config_dir";
+pub const MAX_CONCURRENT_OPTION: &str = "provider_max_concurrent";
+
 pub const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 
 const DISPLAY_NAME: &str = "Claude Code (experimental)";

@@ -8,9 +8,7 @@ use maki_lua::PluginHost;
 use tempfile::tempdir;
 
 #[cfg(unix)]
-const PERMISSION_BITS: u32 = 0o777;
-#[cfg(unix)]
-const PRIVATE_DIR_MODE: u32 = 0o700;
+use maki_storage::permissions::{PERMISSION_BITS, PRIVATE_DIR_MODE};
 
 const NATIVE_DIRECTORIES: &str = r#"
 local dir = assert(maki.fs.mkdtemp(@TEMPLATE@))

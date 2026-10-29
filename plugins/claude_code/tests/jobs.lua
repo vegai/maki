@@ -36,6 +36,7 @@ local function with_jobs(run)
       maki.fn,
       "jobstart",
       function(argv, opts)
+        assert(coroutine.isyieldable(), "jobstart cannot run in a synchronous callback")
         if state.start_error then
           return nil, state.start_error
         end
@@ -113,7 +114,9 @@ local function with_jobs(run)
         start(function(...)
           result = table.pack(...)
         end)
-        state.finish()
+        if not result then
+          state.finish()
+        end
         assert(result, "the exit callback did not resolve the wait")
         return table.unpack(result, 1, result.n)
       end,
@@ -126,7 +129,9 @@ local function with_jobs(run)
   maki.set_notify_handler(function(message, level)
     state.notices[#state.notices + 1] = { message = message, level = level }
   end)
-  local ok, err = pcall(run, state)
+  local ok, err = pcall(coroutine.wrap(function()
+    run(state)
+  end))
   maki.set_notify_handler(nil)
   for _, override in ipairs(overrides) do
     override[1][override[2]] = override.original
@@ -275,6 +280,17 @@ case("stdin_larger_than_the_queue_is_chunked_and_retried_without_losing_bytes", 
   end)
 end)
 
+case("a_close_error_keeps_the_completed_prompt_handoff", function()
+  with_jobs(function(state)
+    state.close_error = CLOSE_ERROR
+    local ok, err, queued = jobs.feed_stdin(1, OUTPUT)
+    eq(ok, nil)
+    eq(err, CLOSE_ERROR)
+    eq(queued, true)
+    eq(state.input, OUTPUT)
+  end)
+end)
+
 for _, failure in ipairs({ "send", "close" }) do
   case("a_stdin_" .. failure .. "_error_stops_the_job_and_wins_over_its_exit", function()
     with_jobs(function(state)
@@ -374,6 +390,17 @@ for _, code in ipairs({ SUCCESS_CODE, STOPPED_CODE }) do
     end)
   end)
 end
+
+case("a_failed_start_returns_an_error_pair", function()
+  with_jobs(function(state)
+    state.start_error = SEND_ERROR
+    local call = jobs.new(STARTUP_MS)
+    local output, err = call:run_quick(COMMAND, {})
+    eq(output, nil)
+    has(err, SEND_ERROR)
+    eq(call.alive, 0)
+  end)
+end)
 
 case("artifact_cleanup_reports_a_failed_start", function()
   with_jobs(function(state)

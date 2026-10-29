@@ -11,6 +11,8 @@ declare maki: {
   NIL: any,
   agent: {
     resolve_model: @checked (ctx: any, opts: any) -> (any, string?),
+    cwd: @checked (ctx: any) -> (string?, string?),
+    instructions: @checked (ctx: any) -> (string?, string?),
     system_prompt: @checked (ctx: any, opts: any) -> (string?, string?),
     tools: @checked (ctx: any, opts: any) -> (any, string?),
     callable_tools: @checked (ctx: any) -> (any, string?),

@@ -242,6 +242,10 @@ pub enum Error {
 }
 
 impl Error {
+    pub(super) fn io(what: &'static str) -> impl FnOnce(io::Error) -> Self {
+        move |source| Self::Io { what, source }
+    }
+
     pub(crate) fn cause(&self) -> &Self {
         match self {
             Self::WithStderr { error, .. } | Self::WithExit { error, .. } => error.cause(),
@@ -340,10 +344,26 @@ fn is_temporary_status(status: u16) -> bool {
     status == TOO_MANY_REQUESTS || status >= SERVER_ERROR
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum Problem {
-    #[error("{0}")]
-    WorkerPolicy(String),
+    #[error("Claude Code can run shell commands outside its sandbox")]
+    SandboxOutside,
+    #[error("Claude Code's sandbox lets shell commands use the network")]
+    SandboxNetwork,
+    #[error("Claude Code's sandbox lets shell commands read paths that maki denies")]
+    SandboxReadDenied,
+    #[error("Claude Code's sandbox lets shell commands read {0}")]
+    SandboxRead(String),
+    #[error("Claude Code's sandbox lets shell commands write to {0}")]
+    SandboxWrite(String),
+    #[error("Claude Code does not report effective settings")]
+    NoEffectiveSettings,
+    #[error("Claude Code does not block reads outside the project")]
+    OutsideProjectReads,
+    #[error("Claude Code can also read {0}")]
+    AdditionalDirectories(String),
+    #[error("Claude Code does not apply the deny rule {0}")]
+    MissingDenyRule(String),
     #[error("Claude Code did not report its login")]
     NoLogin,
     #[error("Claude Code would use an API key from {} instead of the subscription", shown(.0))]

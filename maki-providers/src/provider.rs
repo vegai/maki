@@ -352,10 +352,11 @@ pub async fn fetch_all_models(
 mod tests {
     use super::*;
     use crate::providers::{anthropic, claude_code};
+    use test_case::test_case;
 
     /// Only a provider with its own rows falls back to them after an error.
-    #[test_case::test_case(&anthropic::SPEC => (false, STATIC_FALLBACK) ; "a_provider_with_its_own_rows")]
-    #[test_case::test_case(&claude_code::SPEC => (true, NO_FALLBACK) ; "one_that_runs_anothers_models")]
+    #[test_case(&anthropic::SPEC => (false, STATIC_FALLBACK) ; "a_provider_with_its_own_rows")]
+    #[test_case(&claude_code::SPEC => (true, NO_FALLBACK) ; "one_that_runs_anothers_models")]
     fn a_failed_listing_says_whether_it_fell_back(spec: &ProviderSpec) -> (bool, &'static str) {
         let batch = failed_listing(
             spec,

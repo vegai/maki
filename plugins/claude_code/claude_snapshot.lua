@@ -52,12 +52,8 @@ local NOT_UTF8_CHANGES = "the names of %s are not UTF-8, so the manifest cannot 
 local SUBMODULES_LEFT_OUT = "the snapshot has no submodules, so the worker did not see "
 local PREPARED = "the prepare command changed %s, and the changes for import do not include these files"
 
--- Replace bytes that can break the job reader with `?`. Prefix paths with `./`
--- so names such as `-delete` cannot become `find` expressions.
-local CHANGED_SINCE = [[find "./$1" -cnewer "$2" -print | LC_ALL=C tr -c '\n[:print:]' '?']]
-
 local function checkout_git(call, spec, args)
-  return call:run_quick(git_utils.git(args), { env = spec.env, cwd = spec.cwd })
+  return call:run_lines(git_utils.git(args), { env = spec.env, cwd = spec.cwd })
 end
 
 local function list_files(call, spec, args, pathspecs)
@@ -102,7 +98,7 @@ local function clone_unsupported(err)
 end
 
 local function snapshot_git(call, artifact, args, stdin)
-  return call:run_quick(
+  return call:run_lines(
     git_utils.git(args),
     { env = artifact.git_env, cwd = artifact.snapshot, stdin = stdin, timeout_ms = artifact.timeout_ms }
   )
@@ -121,7 +117,8 @@ local function commit_snapshot(call, artifact, message)
   if commit_err then
     return nil, commit_err
   end
-  return snapshot_git(call, artifact, { "rev-parse", "HEAD" })
+  local lines, err = snapshot_git(call, artifact, { "rev-parse", "HEAD" })
+  return lines and lines[1], err
 end
 
 local function symlinked_parent(cwd, path, checked)
@@ -349,7 +346,7 @@ local function consistency_problem(call, artifact, spec)
     { "update-index", "-q", "--refresh" },
     { "diff-files", "--name-only" },
   }) do
-    changed, err = call:run_quick(git_utils.git(args), { env = env, cwd = spec.cwd, timeout_ms = artifact.timeout_ms })
+    changed, err = call:run_lines(git_utils.git(args), { env = env, cwd = spec.cwd, timeout_ms = artifact.timeout_ms })
     if not changed then
       break
     end
@@ -377,18 +374,23 @@ end
 -- Dependencies are too large to compare file by file, so maki compares
 -- change times with {marker}, written just before the copy.
 local function unsettled_dependencies(call, artifact, spec, dependencies, marker)
-  local changed = {}
+  if #dependencies == 0 then
+    return {}
+  end
+  local argv = { "find" }
   for _, dir in ipairs(dependencies) do
-    local out, err = call:run_quick(
-      { "sh", "-c", CHANGED_SINCE, "sh", dir, marker },
-      { env = spec.env, cwd = spec.cwd, timeout_ms = artifact.timeout_ms }
-    )
-    if not out then
-      return nil, "maki cannot examine the dependency " .. dir .. ": " .. err
-    end
-    for path in out:gmatch("[^\n]+") do
-      changed[#changed + 1] = path:gsub("^%./", "")
-    end
+    argv[#argv + 1] = "./" .. dir
+  end
+  for _, arg in ipairs({ "-cnewer", marker, "-print" }) do
+    argv[#argv + 1] = arg
+  end
+  local out, err = call:run_lines(argv, { env = spec.env, cwd = spec.cwd, timeout_ms = artifact.timeout_ms })
+  if not out then
+    return nil, "maki cannot examine the dependencies: " .. err
+  end
+  local changed = {}
+  for _, path in ipairs(out) do
+    changed[#changed + 1] = path:gsub("^%./", "")
   end
   return changed
 end
@@ -439,7 +441,7 @@ local function remove_artifact(call, dir, released)
       released()
     end
   end
-  if not pcall(call.start, call, { "sh", "-c", SWEEP_CONTENTS, "sh", dir, OWNER_MARKER }, {}, finished) then
+  if not call:start({ "sh", "-c", SWEEP_CONTENTS, "sh", dir, OWNER_MARKER }, {}, finished) then
     finished()
   end
 end
@@ -517,13 +519,12 @@ function M.resolve_root(root, spec)
     elseif meta_err then
       return nil, "maki cannot read " .. existing .. ": " .. meta_err
     end
-    -- A link to a missing target looks missing, and a folder made through
-    -- it lands at the link's target.
     local name, parent = maki.fs.basename(existing), maki.fs.dirname(existing)
-    for _, entry in ipairs(maki.fs.dir(parent) or {}) do
-      if entry[1] == name then
-        return nil, existing .. LINK_TO_NOWHERE
-      end
+    local entry, entry_err = maki.fs.metadata(existing, false)
+    if entry then
+      return nil, existing .. LINK_TO_NOWHERE
+    elseif entry_err then
+      return nil, "maki cannot read " .. existing .. ": " .. entry_err
     end
     table.insert(missing, 1, name)
     existing = parent
@@ -731,7 +732,8 @@ function M.collect(call, artifact, project)
     artifact.notes[#artifact.notes + 1] = "gitignored output stays in the snapshot and is outside the import: "
       .. path_utils.shown(unrecorded)
   end
-  local tree, tree_err = snapshot_git(call, artifact, { "write-tree" })
+  local tree_lines, tree_err = snapshot_git(call, artifact, { "write-tree" })
+  local tree = tree_lines and tree_lines[1]
   if not tree then
     return nil, tree_err
   end
@@ -743,14 +745,14 @@ function M.collect(call, artifact, project)
   end
   -- JSON holds only UTF-8, so the manifest cannot record the other names.
   local changes, unnamed = {}, {}
-  for _, change in ipairs(git_utils.parse_raw_diff(raw)) do
+  local parsed, binary = git_utils.parse_raw_diff(raw)
+  for _, change in ipairs(parsed) do
     if utf8.len(change.path) then
       changes[#changes + 1] = change
     else
       unnamed[#unnamed + 1] = change.path
     end
   end
-  local binary = git_utils.binary_paths(raw)
   local retyped = git_utils.retyped_paths(changes)
   for _, change in ipairs(changes) do
     change.kind = workspace.repository_path(change.path, artifact.repositories) and workspace.REPOSITORY_KIND

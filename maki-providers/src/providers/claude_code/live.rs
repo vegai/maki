@@ -4,7 +4,7 @@
 
 use std::collections::HashSet;
 use std::env;
-use std::fs;
+use std::fs::{self, Permissions};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -20,6 +20,7 @@ use super::checks::launch_env;
 use super::error::Error;
 use super::run::{Exchange, Launch, Limits, Request, Thinking, models, request};
 use super::transcript::{BATCH_CALL_TOOL, BATCH_CALLS, BATCH_TOOL};
+use super::validation::login_dir;
 use super::{SLUG, agent_error, utf8_vars};
 use crate::model::Model;
 use crate::process::find_program;
@@ -427,11 +428,9 @@ fn live_stopping_a_tool_reply_removes_its_session() {
     let tracking = tempdir().unwrap();
     let wrapper = tracking.path().join("claude");
     let pids = tracking.path().join("pids");
-    let sessions = super::validation::login_dir(&live.env, None)
-        .unwrap()
-        .join(SESSION_DIRECTORY);
+    let sessions = login_dir(&live.env, None).unwrap().join(SESSION_DIRECTORY);
     fs::write(&wrapper, TRACKED_CLAUDE).unwrap();
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(EXECUTABLE_MODE)).unwrap();
+    fs::set_permissions(&wrapper, Permissions::from_mode(EXECUTABLE_MODE)).unwrap();
     live.env.extend([
         (
             REAL_CLAUDE_ENV.to_owned(),

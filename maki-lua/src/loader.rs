@@ -631,8 +631,8 @@ impl PluginHost {
         Ok(())
     }
 
-    /// Runs trusted source with a bundled plugin's permissions and private API.
-    /// Used by builtins, Rust embedders and tests. Source from disk uses the manifest-derived loaders.
+    /// Runs trusted test source with a bundled plugin's permissions and private API.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn load_bundled_source(
         &self,
         name: &str,
@@ -1387,8 +1387,14 @@ mod tests {
     use crate::api::util::command::{LuaCommandInfo, LuaCommandWriter};
     use crate::plugin_permissions::PluginReach;
     use crossterm::event::KeyCode;
+    use maki_agent::AgentMode;
     use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, assemble};
     use maki_agent::tools::ToolRegistry;
+    use maki_agent::tools::test_support::stub_ctx;
+    use maki_providers::claude_code::UNSUPPORTED_SYSTEM;
+    use serde_json::json;
+    #[cfg(target_os = "linux")]
+    use std::process::Command;
     use std::time::Instant;
     use test_case::test_case;
 
@@ -1409,12 +1415,83 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test_case(include_str!("../../plugins/claude_code/tests/spec.lua") ; "plugin_spec")]
     #[test_case(include_str!("../../plugins/claude_code/tests/jobs.lua") ; "job_spec")]
     fn claude_code_bundled_spec(source: &str) {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_bundled_source(maki_providers::claude_code::PLUGIN, source, JsonMap::new())
             .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn git_environment_cleanup_matches_the_installed_git() {
+        let output = Command::new("git")
+            .args(["rev-parse", "--local-env-vars"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let names: Vec<_> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let source = format!(
+            r#"
+            local git = require("claude_git")
+            local expected = maki.json.decode([==[{}]==])
+            local names = {{}}
+            for name in git.without_local_git_env(""):gmatch("%S+") do names[name] = true end
+            names.unset = nil
+            for _, name in ipairs(expected) do assert(names[name], name) names[name] = nil end
+            assert(next(names) == nil)
+        "#,
+            serde_json::to_string(&names).unwrap()
+        );
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_bundled_source("claude_code", &source, JsonMap::new())
+            .unwrap();
+    }
+
+    #[test]
+    fn unsupported_claude_loads_without_disrupting_later_builtins() {
+        let registry = Arc::new(ToolRegistry::new());
+        let mut host = PluginHost::new(Arc::clone(&registry)).unwrap();
+        let bundled = BUNDLED_PLUGINS
+            .iter()
+            .find(|plugin| plugin.name == "claude_code")
+            .unwrap();
+        let unsupported = BundledPlugin {
+            name: bundled.name,
+            dir: bundled.dir.clone(),
+            private_api: Some(crate::api::claude_code_unsupported::create_private_module),
+        };
+        let source = bundled
+            .dir
+            .get_file("init.lua")
+            .unwrap()
+            .contents_utf8()
+            .unwrap();
+        host.load_bundled(&unsupported, source, JsonMap::new())
+            .unwrap();
+        host.load_builtins(&PluginsConfig {
+            names: vec!["view_image".into(), "openrouter".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        let loaded = host.loaded_plugins().unwrap();
+        assert!(loaded.iter().any(|name| name == "view_image"));
+        assert!(loaded.iter().any(|name| name == "openrouter"));
+        let ctx = stub_ctx(&AgentMode::Build);
+        for (name, input) in [
+            ("claude_code", json!({"prompt": "inspect"})),
+            ("claude_code_import", json!({"id": "Ab12Cd34"})),
+        ] {
+            let invocation = registry.get(name).unwrap().try_parse(&input).unwrap();
+            let result = smol::block_on(invocation.execute(&ctx));
+            assert!(result.output.unwrap_err().contains(UNSUPPORTED_SYSTEM));
+        }
     }
 
     #[test]

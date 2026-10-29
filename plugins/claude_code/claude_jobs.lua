@@ -58,7 +58,8 @@ function M.feed_stdin(id, data)
       maki.async.sleep(STDIN_RETRY_MS)
     end
   end
-  return maki.fn.chanclose(id, "stdin")
+  local closed, err = maki.fn.chanclose(id, "stdin")
+  return closed, err, true
 end
 
 function Call:settle()
@@ -99,7 +100,7 @@ function Call:start(argv, job_opts, on_exit)
   end
   local id, err = maki.fn.jobstart(argv, job_opts)
   if not id then
-    error(err, 0)
+    return nil, err
   end
   self.alive = self.alive + 1
   return id
@@ -110,11 +111,14 @@ end
 --- applies to such a job unless it has its own.
 function Call:spawn(argv, job_opts, how)
   if self.stopped and not how.keep_on_cancel then
-    error(M.CANCELLED, 0)
+    return nil, M.CANCELLED
   end
   local limit = how.timeout_ms or how.keep_on_cancel and self.startup_ms or nil
   job_opts.timeout_ms = limit
-  local id = self:start(argv, job_opts, how.on_exit)
+  local id, err = self:start(argv, job_opts, how.on_exit)
+  if not id then
+    return nil, err
+  end
   if not how.keep_on_cancel then
     self.stoppable[#self.stoppable + 1] = id
   end
@@ -172,21 +176,27 @@ function Call:run_to_end(argv, job_opts, how, timeout_ms)
     end
   end
   local code = maki.async.await(1, function(done)
-    local id = self:spawn(argv, job_opts, {
+    local function finished(_, exit_code, timed_out)
+      local result = not timed_out and exit_code or nil
+      local leftover = how.leftover and how.leftover(lines)
+      if leftover then
+        self:remove_dir(leftover, function()
+          done(result, timed_out)
+        end)
+      else
+        done(result, timed_out)
+      end
+    end
+    local id, err = self:spawn(argv, job_opts, {
       keep_on_cancel = how.keep_on_cancel,
       timeout_ms = timeout_ms,
-      on_exit = function(_, exit_code, timed_out)
-        local result = not timed_out and exit_code or nil
-        local leftover = how.leftover and how.leftover(lines)
-        if leftover then
-          self:remove_dir(leftover, function()
-            done(result, timed_out)
-          end)
-        else
-          done(result, timed_out)
-        end
-      end,
+      on_exit = finished,
     })
+    if not id then
+      input_error = err
+      finished()
+      return
+    end
     if how.started then
       local _, err = how.started(id)
       if err then
@@ -205,7 +215,7 @@ end
 --- Otherwise `env` supplies the entire child environment.
 --- The `display` option replaces the joined argv in error messages.
 --- `leftover` returns a directory to remove after exit, including cancellation.
-function Call:run_quick(argv, spec)
+function Call:run_lines(argv, spec)
   local shown = "`" .. (spec.display or table.concat(argv, " ")) .. "`"
   local stderr_tail = {}
   local job_opts = {
@@ -224,10 +234,9 @@ function Call:run_quick(argv, spec)
       return M.feed_stdin(id, spec.stdin)
     end
   end
-  local ok, code, lines, run_error =
-    pcall(self.run_to_end, self, argv, job_opts, how, spec.timeout_ms or self.startup_ms)
-  if not ok then
-    return nil, M.with_stderr("maki cannot run " .. shown .. ": " .. tostring(code), stderr_tail)
+  local code, lines, run_error = self:run_to_end(argv, job_opts, how, spec.timeout_ms or self.startup_ms)
+  if run_error then
+    return nil, M.with_stderr("maki cannot run " .. shown .. ": " .. run_error, stderr_tail)
   end
   if not code then
     return nil, shown .. " did not complete in time", true
@@ -235,10 +244,12 @@ function Call:run_quick(argv, spec)
   if code ~= 0 then
     return nil, M.with_stderr(shown .. " exited with code " .. code, stderr_tail)
   end
-  if run_error then
-    return nil, M.with_stderr("maki cannot run " .. shown .. ": " .. run_error, stderr_tail)
-  end
-  return table.concat(lines, "\n")
+  return lines
+end
+
+function Call:run_quick(argv, spec)
+  local lines, err, timed_out = self:run_lines(argv, spec)
+  return lines and table.concat(lines, "\n"), err, timed_out
 end
 
 return M

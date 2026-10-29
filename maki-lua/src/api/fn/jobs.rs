@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::mem;
 #[cfg(target_os = "linux")]
 use std::os::unix::net::UnixStream;
@@ -175,6 +175,7 @@ pub(crate) struct JobSpec {
     /// the job.
     pub guard: bool,
     pub timeout: Option<Duration>,
+    pub max_line_bytes: Option<usize>,
     pub stdout: Redirect,
     pub stderr: Redirect,
     pub on_stdout: Option<RegistryKey>,
@@ -289,6 +290,7 @@ impl JobSpec {
             pipe_stdin: false,
             guard: false,
             timeout: None,
+            max_line_bytes: None,
             stdout: Redirect::Capture,
             stderr: Redirect::Capture,
             on_stdout: None,
@@ -444,6 +446,7 @@ impl JobStore {
             #[cfg(target_os = "linux")]
             guard,
             timeout,
+            max_line_bytes,
             stdout,
             stderr,
             on_stdout,
@@ -470,8 +473,22 @@ impl JobStore {
         let stdin = stdin_pipe
             .map(|stdin| spawn_stdin_writer(stdin, Arc::clone(&reap_state)))
             .transpose()?;
-        let stdout_handle = spawn_reader(stdout_pipe, "job-stdout", &event_tx, JobEvent::Stdout)?;
-        let stderr_handle = spawn_reader(stderr_pipe, "job-stderr", &event_tx, JobEvent::Stderr)?;
+        let stdout_handle = spawn_reader(
+            stdout_pipe,
+            "job-stdout",
+            &event_tx,
+            JobEvent::Stdout,
+            max_line_bytes,
+            Arc::clone(&reap_state),
+        )?;
+        let stderr_handle = spawn_reader(
+            stderr_pipe,
+            "job-stderr",
+            &event_tx,
+            JobEvent::Stderr,
+            max_line_bytes,
+            Arc::clone(&reap_state),
+        )?;
 
         let wait_reaped = Arc::clone(&reap_state);
         thread::Builder::new()
@@ -972,6 +989,8 @@ fn spawn_reader(
     name: &str,
     events: &flume::Sender<JobEvent>,
     event: fn(String) -> JobEvent,
+    max_line_bytes: Option<usize>,
+    reap_state: Arc<ReapState>,
 ) -> Result<Option<thread::JoinHandle<()>>, String> {
     let Some(stream) = stream else {
         return Ok(None);
@@ -980,17 +999,50 @@ fn spawn_reader(
     thread::Builder::new()
         .name(name.into())
         .spawn(move || {
-            for line in BufReader::with_capacity(READER_BUF_SIZE, stream)
-                .split(b'\n')
-                .map_while(Result::ok)
-            {
-                if events.send(event(text_line(line))).is_err() {
-                    break;
+            let mut reader = BufReader::with_capacity(READER_BUF_SIZE, stream);
+            loop {
+                match read_output_line(&mut reader, max_line_bytes) {
+                    Ok(Some(line)) => {
+                        if events.send(event(text_line(line))).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        let _ = events.send(JobEvent::Stderr(error.to_string()));
+                        kill_unreaped(&reap_state, false);
+                        break;
+                    }
                 }
             }
         })
         .map(Some)
         .map_err(|error| error.to_string())
+}
+
+fn read_output_line(
+    reader: &mut impl BufRead,
+    limit: Option<usize>,
+) -> io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    let bytes = reader
+        .take(limit.map_or(u64::MAX, |limit| (limit as u64).saturating_add(1)))
+        .read_until(b'\n', &mut line)?;
+    if bytes == 0 {
+        return Ok(None);
+    }
+    if line.last() == Some(&b'\n') {
+        line.pop();
+    }
+    if let Some(limit) = limit
+        && line.len() > limit
+    {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("job: output line exceeds the {limit}-byte limit"),
+        ));
+    }
+    Ok(Some(line))
 }
 
 /// Writing to a pipe the child does not read blocks, so writes happen on
@@ -1142,6 +1194,7 @@ mod tests {
     use rustix::process::getpid;
     #[cfg(unix)]
     use std::fs::{self, Permissions};
+    use std::io::Cursor;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
@@ -1150,6 +1203,39 @@ mod tests {
 
     use super::*;
     use crate::api::r#fn::deliver_job_event;
+
+    const LINE_LIMIT: usize = 4;
+    const LINE_LIMIT_ERROR: &str = "job: output line exceeds the 4-byte limit";
+
+    #[test_case(b"test\n", false ; "at_limit")]
+    #[test_case(b"tests\n", true ; "over_limit")]
+    #[test_case(b"tests", true ; "unterminated_over_limit")]
+    fn output_line_limits_bound_the_read(bytes: &[u8], too_large: bool) {
+        let mut reader = Cursor::new(bytes);
+        let line = read_output_line(&mut reader, Some(LINE_LIMIT));
+        if too_large {
+            assert_eq!(line.unwrap_err().to_string(), LINE_LIMIT_ERROR);
+        } else {
+            assert_eq!(line.unwrap().unwrap(), b"test");
+        }
+        assert!(reader.position() <= (LINE_LIMIT + 1) as u64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_oversized_unterminated_line_stops_the_job_before_dispatch() {
+        const COMMAND: &str = "printf tests; exec sleep 300";
+        const WAIT: Duration = Duration::from_secs(5);
+        let mut store = JobStore::new();
+        let mut spec = JobSpec::new(task_owner(1), COMMAND);
+        spec.max_line_bytes = Some(LINE_LIMIT);
+        let id = store.start(spec).unwrap();
+        let rx = store.jobs[&id].event_rx.as_ref().unwrap();
+        assert!(
+            matches!(rx.recv_timeout(WAIT).unwrap(), JobEvent::Stderr(error) if error == LINE_LIMIT_ERROR)
+        );
+        assert!(matches!(rx.recv_timeout(WAIT).unwrap(), JobEvent::Exit(code, false) if code != 0));
+    }
 
     #[cfg(unix)]
     const JOB_SHELL: &str = "bash";

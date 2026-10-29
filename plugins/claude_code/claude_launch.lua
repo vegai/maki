@@ -323,6 +323,7 @@ end
 
 function M.job_opts(cwd, env, stderr_tail)
   return {
+    max_line_bytes = native.max_event_bytes,
     cwd = cwd,
     env = env,
     clear_env = true,
@@ -346,7 +347,7 @@ function M.probe(call, spec, argv, env)
   local stream = Stream.new({ cwd = dir, worker = spec.worker, cli = spec.cli })
   local handshake = M.worker_handshake(spec)
   local problem, stderr_tail = nil, {}
-  local ok, code, _, run_error = pcall(call.run_to_end, call, argv, M.job_opts(dir, env, stderr_tail), {
+  local code, _, run_error = call:run_to_end(argv, M.job_opts(dir, env, stderr_tail), {
     leftover = function()
       return dir
     end,
@@ -364,9 +365,8 @@ function M.probe(call, spec, argv, env)
       return jobs.feed_stdin(id, M.HANDSHAKE_INPUT)
     end,
   }, M.STARTUP_MS)
-  if not ok then
-    call:remove_dir(dir)
-    return "maki cannot start Claude Code: " .. tostring(code)
+  if run_error then
+    return jobs.with_stderr("maki cannot run Claude Code checks: " .. run_error, stderr_tail)
   end
   if problem then
     return jobs.with_stderr(problem, stderr_tail)
@@ -380,9 +380,6 @@ function M.probe(call, spec, argv, env)
   local _, incomplete = handshake:finish()
   if incomplete then
     return jobs.with_stderr(incomplete, stderr_tail)
-  end
-  if run_error then
-    return jobs.with_stderr("maki cannot run Claude Code checks: " .. run_error, stderr_tail)
   end
 end
 
@@ -407,11 +404,11 @@ function M.preflight(input, ctx, call, opts)
   end
 
   -- Under ACP, the session can work in a different checkout from maki's.
-  local cwd, cwd_err = ctx:cwd()
+  local cwd, cwd_err = maki.agent.cwd(ctx)
   if not cwd then
     return nil, M.NO_SESSION_DIR .. tostring(cwd_err)
   end
-  local instructions, instructions_err = ctx:instructions()
+  local instructions, instructions_err = maki.agent.instructions(ctx)
   if not instructions then
     return nil, "maki cannot load the instructions of the session: " .. tostring(instructions_err)
   end
@@ -445,8 +442,6 @@ function M.preflight(input, ctx, call, opts)
       end,
     })
     if not output then
-      -- A failed spawn has no exit callback to remove the directory.
-      call:remove_dir(dir)
       return nil, output_err
     end
     version, version_err = check:save(output)

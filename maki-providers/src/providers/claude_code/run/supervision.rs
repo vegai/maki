@@ -81,10 +81,7 @@ impl Group {
     pub(super) async fn spawn(command: process::Command) -> Result<Self, Error> {
         smol::unblock(move || spawn_piped(command))
             .await
-            .map_err(|source| Error::Io {
-                what: "start Claude Code",
-                source,
-            })
+            .map_err(Error::io("start Claude Code"))
     }
 
     /// Only while the unreaped leader's pid still names the group.
@@ -130,10 +127,7 @@ impl Group {
         if matches!(exited, LeaderExit::TimedOut) {
             return Err(Error::ExitLate);
         }
-        status.map_err(|source| Error::Io {
-            what: "reap Claude Code",
-            source,
-        })
+        status.map_err(Error::io("reap Claude Code"))
     }
 
     /// Does not reap the leader.
@@ -414,10 +408,7 @@ pub(super) async fn send(
     within(deadline, async {
         pipe.write_all(data.as_bytes())
             .await
-            .map_err(|source| Error::Io {
-                what: "write to Claude Code",
-                source,
-            })
+            .map_err(Error::io("write to Claude Code"))
     })
     .await
     .ok_or(Error::InputNotTaken)?

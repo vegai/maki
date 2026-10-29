@@ -19,7 +19,7 @@ local function disk_blobs(call, env, cwd, paths, keep_on_cancel, timeout_ms)
   if #paths == 0 then
     return {}
   end
-  local out, err = call:run_quick(git_utils.git({ "hash-object", "--no-filters", "--stdin-paths" }), {
+  local out, err = call:run_lines(git_utils.git({ "hash-object", "--no-filters", "--stdin-paths" }), {
     env = env,
     cwd = cwd,
     stdin = git_utils.quoted_lines(paths),
@@ -29,7 +29,7 @@ local function disk_blobs(call, env, cwd, paths, keep_on_cancel, timeout_ms)
   if not out then
     return nil, err
   end
-  return maki.split(out, "\n")
+  return out
 end
 
 -- Maps each path to its `file_state`, false when missing, or a note when it

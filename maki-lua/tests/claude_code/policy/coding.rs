@@ -1442,6 +1442,66 @@ fn a_cancel_while_the_snapshot_is_made_discards_it(locked: bool) {
     assert!(emptied, "these files stay: {:?}", listing(&artifacts));
 }
 
+#[test]
+fn a_failed_dependency_scan_stops_the_worker() {
+    const SCAN_FAILURE: &str = "dependency scan failed";
+    let coding = Coding::new();
+    write(&coding.project().join("deps/file"), BASE_LIB);
+    let tools = tempdir().unwrap();
+    executable(
+        tools.path(),
+        "find",
+        &format!("#!/bin/sh\nprintf '%s\\n' '{SCAN_FAILURE}' >&2\nexit 1\n"),
+    );
+    let _path = environment::EnvVar::prepend_path(tools.path());
+    let (reg, _host) = coding.host(&[("dependencies", json!("deps"))]);
+    let error = coding.code(&reg, CODE_EDIT, &[]).unwrap_err();
+    assert!(
+        error.contains("maki cannot examine the dependencies") && error.contains(SCAN_FAILURE),
+        "{error}"
+    );
+    assert!(coding.fake.log("prompt").is_empty());
+}
+
+#[test]
+fn a_cancel_during_sanitization_discards_the_idle_artifact() {
+    let coding = Coding::new();
+    let started = tempdir().unwrap();
+    let marker = started.path().join(PREPARE_STARTED);
+    let (reg, host) = coding.host(&[]);
+    let mut opts = coding.fake.opts(ONE_SLOT);
+    opts.insert("artifact_dir".into(), json!(coding.artifacts.path()));
+    let source = format!(
+        r#"local native = require("maki.claude_code.internal")
+        native.sanitize_git = function()
+            assert(maki.fs.write({marker}, ""))
+            maki.async.await(1, function() end)
+        end
+        {plugin}"#,
+        marker = json!(marker),
+        plugin = include_str!("../../../../plugins/claude_code/init.lua"),
+    );
+    host.load_bundled_source(TOOL, &source, opts).unwrap();
+    let mut ctx = coding.ctx(&reg);
+    let (trigger, token) = CancelToken::new();
+    ctx.cancel = token;
+    let canceller = thread::spawn(move || {
+        let sanitizing = wait_until(DEADLINE, || marker.exists());
+        trigger.cancel();
+        sanitizing
+    });
+    let input = json!({ "prompt": CODE_EDIT, "model": MODEL_ALIAS, "profile": CODE_PROFILE });
+    let result = run_tool(&reg, &ctx, TOOL, input);
+    assert!(canceller.join().unwrap(), "sanitize did not start");
+    let error = result.unwrap_err();
+    assert!(error.contains(CANCELLED), "{error}");
+    assert!(
+        wait_until(DEADLINE, || artifact_listing(coding.artifacts.path())
+            .is_empty()),
+        "cancelled artifact remains"
+    );
+}
+
 /// A hook policy keeps on writes into the probe directory before the coding
 /// call is stopped. The hook's file stays in the directory the reply names,
 /// but the stopped call removes its artifact. With one slot, the next call

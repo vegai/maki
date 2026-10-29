@@ -34,9 +34,7 @@ use super::settings::{self, base_settings};
 use super::stream::usage_of as plan_usage;
 pub use super::stream::{EventKind, TOOL_USE_BLOCK, user_message};
 
-pub const DEFAULT_EXECUTABLE: &str = "claude";
-pub const DEFAULT_MAX_CONCURRENT: usize = 8;
-pub const MIN_MAX_CONCURRENT: usize = 1;
+pub use super::super::{DEFAULT_EXECUTABLE, DEFAULT_MAX_CONCURRENT, MIN_MAX_CONCURRENT};
 pub(super) const CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 pub(super) const HOME_ENV: &str = "HOME";
 const RUNTIME_DIR_ENV: &str = "XDG_RUNTIME_DIR";
@@ -44,7 +42,7 @@ const CACHE_HOME_ENV: &str = "XDG_CACHE_HOME";
 const FALLBACK_TEMP_DIR: &str = "/var/tmp";
 const DEFAULT_CACHE_DIR: &str = ".cache";
 const SCRATCH_DIRECTORY: &str = "maki/claude-code";
-const TMPDIR_ENV: &str = "TMPDIR";
+pub(super) const TMPDIR_ENV: &str = "TMPDIR";
 const UNIX_TEMP_DIR: &str = "/tmp";
 const PROBE_PATH_NOT_UTF8: &str = "probe path is not valid UTF-8";
 const BLOCK_OUTSIDE: &str = "blockReadsOutsideWorkingDirectories";
@@ -177,10 +175,8 @@ impl WorkerHandshake {
         self.answers.check(
             |account| checks::account_problem(account, &self.modes),
             |settings, hooks| {
-                checks::policy_problem(settings, hooks, false).or_else(|| {
-                    worker_problem(&settings[EFFECTIVE], &self.policy.settings())
-                        .map(Problem::WorkerPolicy)
-                })
+                checks::policy_problem(settings, hooks, false)
+                    .or_else(|| worker_problem(&settings[EFFECTIVE], &self.policy.settings()))
             },
         )
     }
@@ -477,13 +473,10 @@ fn foreign_path(value: Option<&Value>, ours: &Value) -> Option<String> {
         })
 }
 
-fn sandbox_problem(sandbox: &Value, expected: &Value) -> Option<String> {
-    let outside = "Claude Code can run shell commands outside its sandbox";
-    let network_error = "Claude Code's sandbox lets shell commands use the network";
-    let read_error = "Claude Code's sandbox lets shell commands read paths that maki denies";
+fn sandbox_problem(sandbox: &Value, expected: &Value) -> Option<Problem> {
     let sandbox = match sandbox.as_object() {
         Some(sandbox) => sandbox,
-        None => return Some(outside.to_owned()),
+        None => return Some(Problem::SandboxOutside),
     };
     let safe_keys = [
         ENABLED,
@@ -504,11 +497,11 @@ fn sandbox_problem(sandbox: &Value, expected: &Value) -> Option<String> {
             .get(WEAKER_NESTED_SANDBOX)
             .is_some_and(|value| value != false)
     {
-        return Some(outside.to_owned());
+        return Some(Problem::SandboxOutside);
     }
     let network = match sandbox.get(NETWORK).and_then(Value::as_object) {
         Some(network) => network,
-        None => return Some(network_error.to_owned()),
+        None => return Some(Problem::SandboxNetwork),
     };
     let network_keys = [
         STRICT_ALLOWLIST,
@@ -535,11 +528,11 @@ fn sandbox_problem(sandbox: &Value, expected: &Value) -> Option<String> {
             .get(ALLOW_LOCAL_BINDING)
             .is_some_and(|value| value != false)
     {
-        return Some(network_error.to_owned());
+        return Some(Problem::SandboxNetwork);
     }
     let filesystem = match sandbox.get(FILESYSTEM).and_then(Value::as_object) {
         Some(filesystem) => filesystem,
-        None => return Some(read_error.to_owned()),
+        None => return Some(Problem::SandboxReadDenied),
     };
     let filesystem_keys = [DISABLED, ALLOW_READ, DENY_READ, ALLOW_WRITE, DENY_WRITE];
     if filesystem
@@ -547,13 +540,11 @@ fn sandbox_problem(sandbox: &Value, expected: &Value) -> Option<String> {
         .any(|key| !filesystem_keys.contains(&key.as_str()))
         || filesystem.get(DISABLED).is_some_and(|value| value != false)
     {
-        return Some(read_error.to_owned());
+        return Some(Problem::SandboxReadDenied);
     }
     let expected = &expected[FILESYSTEM];
     if let Some(path) = foreign_path(filesystem.get(ALLOW_READ), &expected[ALLOW_READ]) {
-        return Some(format!(
-            "Claude Code's sandbox lets shell commands read {path}"
-        ));
+        return Some(Problem::SandboxRead(path));
     }
     for path in expected[DENY_READ].as_array().into_iter().flatten() {
         if !filesystem
@@ -561,23 +552,21 @@ fn sandbox_problem(sandbox: &Value, expected: &Value) -> Option<String> {
             .and_then(Value::as_array)
             .is_some_and(|denied| denied.contains(path))
         {
-            return Some(format!(
-                "Claude Code's sandbox lets shell commands read {}",
-                path.as_str().unwrap_or_default()
+            return Some(Problem::SandboxRead(
+                path.as_str().unwrap_or_default().to_owned(),
             ));
         }
     }
-    foreign_path(filesystem.get(ALLOW_WRITE), &expected[ALLOW_WRITE])
-        .map(|path| format!("Claude Code's sandbox lets shell commands write to {path}"))
+    foreign_path(filesystem.get(ALLOW_WRITE), &expected[ALLOW_WRITE]).map(Problem::SandboxWrite)
 }
 
-fn worker_problem(effective: &Value, expected: &Value) -> Option<String> {
+fn worker_problem(effective: &Value, expected: &Value) -> Option<Problem> {
     if !effective.is_object() {
-        return Some("Claude Code does not report effective settings".to_owned());
+        return Some(Problem::NoEffectiveSettings);
     }
     let permissions = &effective[PERMISSIONS_KEY];
     if permissions[BLOCK_OUTSIDE] != expected[PERMISSIONS_KEY][BLOCK_OUTSIDE] {
-        return Some("Claude Code does not block reads outside the project".to_owned());
+        return Some(Problem::OutsideProjectReads);
     }
     if !empty_array(permissions.get(ADDITIONAL_DIRECTORIES)) {
         let directories = &permissions[ADDITIONAL_DIRECTORIES];
@@ -591,7 +580,7 @@ fn worker_problem(effective: &Value, expected: &Value) -> Option<String> {
                     .join(", ")
             },
         );
-        return Some(format!("Claude Code can also read {shown}"));
+        return Some(Problem::AdditionalDirectories(shown));
     }
     for rule in expected[PERMISSIONS_KEY][DENY]
         .as_array()
@@ -602,9 +591,8 @@ fn worker_problem(effective: &Value, expected: &Value) -> Option<String> {
             .as_array()
             .is_some_and(|denied| denied.contains(rule))
         {
-            return Some(format!(
-                "Claude Code does not apply the deny rule {}",
-                rule.as_str().unwrap_or_default()
+            return Some(Problem::MissingDenyRule(
+                rule.as_str().unwrap_or_default().to_owned(),
             ));
         }
     }
@@ -615,6 +603,7 @@ fn worker_problem(effective: &Value, expected: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::Problem;
     use super::{
         PERMISSIONS_KEY, SANDBOX, TMPDIR_ENV, WorkerPaths, WorkerPolicy, prepare_launch,
         sandbox_problem, worker_problem,
@@ -668,17 +657,21 @@ mod tests {
         .settings()
     }
 
-    #[test_case("/excludedCommands", json!(null) ; "null_command_exclusions")]
-    #[test_case("/network/allowedDomains", json!([null]) ; "null_domain_entry")]
-    #[test_case("/network/allowAllUnixSockets", json!(null) ; "null_socket_policy")]
-    #[test_case("/network/strictAllowlist", json!(false) ; "network_allowlist_disabled")]
-    #[test_case("/enabled", json!(false) ; "sandbox_disabled")]
-    #[test_case("/failIfUnavailable", json!(false) ; "sandbox_fallback")]
-    #[test_case("/allowUnsandboxedCommands", json!(true) ; "unsandboxed_commands")]
-    #[test_case("/filesystem/allowRead", json!([null]) ; "null_read_entry")]
-    #[test_case("/filesystem/allowWrite", json!([OUTSIDE]) ; "foreign_write_path")]
-    #[test_case("/unknownEscape", json!(true) ; "unknown_sandbox_setting")]
-    fn effective_sandbox_rejects_nulls_and_unknown_escape_settings(path: &str, value: Value) {
+    #[test_case("/excludedCommands", json!(null), Problem::SandboxOutside ; "null_command_exclusions")]
+    #[test_case("/network/allowedDomains", json!([null]), Problem::SandboxNetwork ; "null_domain_entry")]
+    #[test_case("/network/allowAllUnixSockets", json!(null), Problem::SandboxNetwork ; "null_socket_policy")]
+    #[test_case("/network/strictAllowlist", json!(false), Problem::SandboxNetwork ; "network_allowlist_disabled")]
+    #[test_case("/enabled", json!(false), Problem::SandboxOutside ; "sandbox_disabled")]
+    #[test_case("/failIfUnavailable", json!(false), Problem::SandboxOutside ; "sandbox_fallback")]
+    #[test_case("/allowUnsandboxedCommands", json!(true), Problem::SandboxOutside ; "unsandboxed_commands")]
+    #[test_case("/filesystem/allowRead", json!([null]), Problem::SandboxRead("null".into()) ; "null_read_entry")]
+    #[test_case("/filesystem/allowWrite", json!([OUTSIDE]), Problem::SandboxWrite(OUTSIDE.into()) ; "foreign_write_path")]
+    #[test_case("/unknownEscape", json!(true), Problem::SandboxOutside ; "unknown_sandbox_setting")]
+    fn effective_sandbox_rejects_nulls_and_unknown_escape_settings(
+        path: &str,
+        value: Value,
+        want: Problem,
+    ) {
         let expected = expected();
         let mut sandbox = expected[SANDBOX].clone();
         let (parent, key) = path.rsplit_once('/').unwrap();
@@ -688,7 +681,8 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .insert(key.to_owned(), value);
-        assert!(sandbox_problem(&sandbox, &expected[SANDBOX]).is_some());
+        let actual = sandbox_problem(&sandbox, &expected[SANDBOX]).unwrap();
+        assert_eq!(actual, want);
     }
 
     #[test]
@@ -696,6 +690,9 @@ mod tests {
         let expected = expected();
         let mut effective = expected.clone();
         effective[PERMISSIONS_KEY]["additionalDirectories"] = json!([null]);
-        assert!(worker_problem(&effective, &expected).is_some());
+        assert!(matches!(
+            worker_problem(&effective, &expected),
+            Some(Problem::AdditionalDirectories(_))
+        ));
     }
 }

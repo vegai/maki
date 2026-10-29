@@ -156,10 +156,6 @@ function M.path_problem(path)
   return nil
 end
 
-function M.shell_quote(text)
-  return "'" .. text:gsub("'", "'\\''") .. "'"
-end
-
 function M.dependency_dirs(option)
   return M.comma_list(option, M.relative_path)
 end
@@ -169,7 +165,7 @@ function M.exclude_rule(dir)
   return "/" .. dir:gsub("[%*%?%[%]\\!# ]", "\\%0") .. "/\n"
 end
 
-function M.bash_quote(text)
+function M.shell_quote(text)
   return native.escape_path(text, true)
 end
 

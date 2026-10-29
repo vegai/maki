@@ -177,11 +177,11 @@ for _, code in ipairs({ 0x180b, 0x180f, 0xfe0f, 0xe0100 }) do
     eq(path_utils.printable(invisible_prefix .. selector .. ".rs"), "a\\u200b" .. escape .. ".rs")
     eq(path_utils.printable("字" .. selector .. selector .. ".rs"), "字" .. selector .. escape .. ".rs")
     eq(path_utils.printable("a" .. selector .. selector .. ".rs"), "a" .. escape .. escape .. ".rs")
-    local shell = path_utils.bash_quote("src/main" .. selector .. ".rs")
+    local shell = path_utils.shell_quote("src/main" .. selector .. ".rs")
     eq(shell:find(selector, 1, true), nil)
-    shell = path_utils.bash_quote(invisible_prefix .. selector .. ".rs")
+    shell = path_utils.shell_quote(invisible_prefix .. selector .. ".rs")
     eq(shell:find(selector, 1, true), nil)
-    local _, raw_selectors = path_utils.bash_quote("字" .. selector .. selector .. ".rs"):gsub(selector, "")
+    local _, raw_selectors = path_utils.shell_quote("字" .. selector .. selector .. ".rs"):gsub(selector, "")
     eq(raw_selectors, 1)
   end)
 end
@@ -1337,11 +1337,11 @@ case("an_exclude_rule_matches_its_dir_literally", function()
 end)
 
 case("a_quoted_path_reads_back_byte_for_byte", function()
-  eq(git_utils.listed_paths("plain/name.rs")[1], "plain/name.rs")
-  eq(git_utils.listed_paths('"new\\nline"')[1], "new\nline")
-  eq(git_utils.listed_paths('"q\\"uote\\\\"')[1], 'q"uote\\')
-  eq(git_utils.listed_paths('"\\303\\244.txt"')[1], "\195\164.txt")
-  eq(git_utils.listed_paths('"\\\\303"')[1], "\\303")
+  eq(git_utils.listed_paths({ "plain/name.rs" })[1], "plain/name.rs")
+  eq(git_utils.listed_paths(maki.split('"new\\nline"', "\n"))[1], "new\nline")
+  eq(git_utils.listed_paths(maki.split('"q\\"uote\\\\"', "\n"))[1], 'q"uote\\')
+  eq(git_utils.listed_paths(maki.split('"\\303\\244.txt"', "\n"))[1], "\195\164.txt")
+  eq(git_utils.listed_paths(maki.split('"\\\\303"', "\n"))[1], "\\303")
 end)
 
 case("paths_for_hash_object_are_quoted_whole", function()
@@ -1363,9 +1363,12 @@ end
 
 case("the_raw_diff_reads_every_change", function()
   local changes = git_utils.parse_raw_diff(
-    raw("100644", "100644", SHA_A, SHA_B, "M", "src/lib.rs")
-      .. raw("000000", "100755", SHA_0, SHA_B, "A", "bin/run")
-      .. raw("100644", "000000", SHA_A, SHA_0, "D", '"old\\tname.txt"')
+    maki.split(
+      raw("100644", "100644", SHA_A, SHA_B, "M", "src/lib.rs")
+        .. raw("000000", "100755", SHA_0, SHA_B, "A", "bin/run")
+        .. raw("100644", "000000", SHA_A, SHA_0, "D", '"old\\tname.txt"'),
+      "\n"
+    )
   )
   eq(#changes, 3)
   eq(changes[1].path, "src/lib.rs")
@@ -1376,7 +1379,8 @@ case("the_raw_diff_reads_every_change", function()
 end)
 
 case("numstat_marks_binary_files", function()
-  local binary = git_utils.binary_paths('3\t1\tsrc/lib.rs\n-\t-\tlogo.png\n-\t-\t"\\303\\244.png"')
+  local _, binary =
+    git_utils.parse_raw_diff(maki.split('3\t1\tsrc/lib.rs\n-\t-\tlogo.png\n-\t-\t"\\303\\244.png"', "\n"))
   eq(binary["logo.png"], true)
   eq(binary["\195\164.png"], true)
   eq(binary["src/lib.rs"], nil)
@@ -1392,10 +1396,10 @@ local STAGED = table.concat({
 }, "\n")
 
 case("a_snapshot_takes_each_file_once_and_no_submodule", function()
-  local files, submodules = git_utils.tracked_paths(STAGED)
+  local files, submodules = git_utils.tracked_paths(maki.split(STAGED, "\n"))
   eq(table.concat(files, "|"), "src/lib.rs|link|merging.rs|sp\195\164ce.rs")
   eq(table.concat(submodules, "|"), "vendor/x")
-  eq(table.concat(git_utils.listed_paths('a.rs\n"b\\nc.rs"'), "|"), "a.rs|b\nc.rs")
+  eq(table.concat(git_utils.listed_paths(maki.split('a.rs\n"b\\nc.rs"', "\n")), "|"), "a.rs|b\nc.rs")
 end)
 
 for _, c in ipairs({

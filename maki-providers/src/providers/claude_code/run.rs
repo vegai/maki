@@ -25,6 +25,7 @@ use crate::providers::anthropic::shared::{long_context_window, strip_long_contex
 use crate::providers::oauth_loopback::random_token;
 use crate::{Message, ProviderEvent, ProviderUsage, StreamResponse};
 use flume::{Receiver, Sender};
+use futures::future::try_join;
 use futures_lite::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -138,18 +139,14 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
     let (handoff_tx, handoffs) = flume::unbounded();
     let server = mcp::serve(token()?, tools, handoff_tx, MCP_READ)
         .await
-        .map_err(|source| Error::Io {
-            what: "start the handoff server",
-            source,
-        })?;
+        .map_err(Error::io("start the handoff server"))?;
     let checks = async {
         let profile = checked_profile(launch).await?;
         let offered = probe(launch, req.plan_usage).await?;
         Ok::<_, Error>((profile, offered))
     };
     let ((profile, offered), (dir, dir_path)) =
-        futures::future::try_join(checks, request_files(launch, req.exchange.system, &server))
-            .await?;
+        try_join(checks, request_files(launch, req.exchange.system, &server)).await?;
     // An alias such as `sonnet` runs whatever model the account answer maps
     // it to.
     let runs = offered.resolved_model(asked).unwrap_or(asked);
@@ -230,10 +227,7 @@ async fn request_files(
         let (dir, path) = private_dir(&temp_dir, &project, &denied)?;
         private_file(&path.join(PROMPT_FILE), &prompt)
             .and_then(|()| private_file(&path.join(MCP_FILE), &mcp_config.to_string()))
-            .map_err(|source| Error::Io {
-                what: "write the request files",
-                source,
-            })?;
+            .map_err(Error::io("write the request files"))?;
         Ok((dir, path))
     })
     .await
@@ -862,8 +856,8 @@ mod tests {
 
     /// Events without content can follow the result, like the keep-alive
     /// Claude Code prints on long runs.
-    #[test_case("text_then_keep_alive")]
-    #[test_case("text_then_fail")]
+    #[test_case("text_then_keep_alive" ; "text_then_keep_alive")]
+    #[test_case("text_then_fail" ; "text_then_fail")]
     fn a_reply_without_calls_ends_at_its_result(scenario: &str) {
         let fake = Fake::new(scenario);
         let (result, _) = smol::block_on(fake.request());
@@ -908,9 +902,9 @@ mod tests {
         assert!(fake.log("mcp_status").is_empty());
     }
 
-    #[test_case("missing_block_eof", false)]
-    #[test_case("missing_block_late", false)]
-    #[test_case("status_only_error", true)]
+    #[test_case("missing_block_eof", false ; "missing_block_eof")]
+    #[test_case("missing_block_late", false ; "missing_block_late")]
+    #[test_case("status_only_error", true ; "status_only_error")]
     fn incomplete_generations_have_consistent_retry_policy(scenario: &str, retryable: bool) {
         let fake = Fake::new(scenario);
         let (result, _) = smol::block_on(fake.request_with(

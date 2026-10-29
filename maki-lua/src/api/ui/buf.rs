@@ -273,9 +273,12 @@ fn on(lua: &Lua, this: &BufHandle, event: String, callback: Function) -> LuaResu
         // Change callbacks fire inline from buf mutations, so they
         // must not yield or mutate this buffer.
         "change" => {
-            let callback_lua = lua.clone();
+            let callback_lua = lua.weak();
             this.buf.set_on_change(move || {
-                if let Err(e) = call_inline(&callback_lua, callback.clone(), ()) {
+                let Some(lua) = callback_lua.try_upgrade() else {
+                    return;
+                };
+                if let Err(e) = call_inline(&lua, callback.clone(), ()) {
                     tracing::warn!(error = %e, "buf change callback failed");
                 }
             });

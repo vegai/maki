@@ -50,6 +50,7 @@ use smol::lock::{Mutex as AsyncMutex, Semaphore, SemaphoreGuard};
 use tracing::{debug, info, warn};
 
 use self::validation::LaunchPreparation;
+use super::{CONFIG_DIR_OPTION, EXECUTABLE_OPTION, MAX_CONCURRENT_OPTION};
 use super::{MAX_EVENT_BYTES, OAUTH_TOKEN_ENV, SPEC};
 #[cfg(test)]
 use super::{PLUGIN, SLUG};
@@ -68,9 +69,7 @@ use crate::{
 pub use error::Error;
 use maki_storage::atomic_write;
 use run::{Exchange, Launch, Limits, Listed, Request, Thinking};
-use validation::{
-    CONFIG_DIR_ENV, DEFAULT_EXECUTABLE, DEFAULT_MAX_CONCURRENT, HOME_ENV, MIN_MAX_CONCURRENT,
-};
+use validation::{DEFAULT_EXECUTABLE, DEFAULT_MAX_CONCURRENT, MIN_MAX_CONCURRENT};
 
 const CLAUDE_CODE: EffortDialect = EffortDialect {
     name: None,
@@ -91,9 +90,6 @@ const PLUGIN_OFF: &str =
     "enable the claude_code plugin in init.lua: `plugins = { claude_code = { enabled = true } }`";
 // The provider reads these plugin options too, so the plugin and the
 // provider run the same `claude` with the same login.
-const EXECUTABLE_OPTION: &str = "executable";
-const CONFIG_DIR_OPTION: &str = "config_dir";
-const MAX_CONCURRENT_OPTION: &str = "provider_max_concurrent";
 /// The login lives in Claude Code's config directory, so there is no key
 /// variable.
 const WAITING_FOR_SLOT: &str = "waiting for a Claude Code request slot";
@@ -426,7 +422,7 @@ fn utf8_vars(vars: impl Iterator<Item = (OsString, OsString)>) -> Vec<(String, S
         .collect()
 }
 
-type Environment = dyn Fn(Option<&[&str]>) -> Vec<(String, String)> + Send + Sync;
+type Environment = dyn Fn() -> Vec<(String, String)> + Send + Sync;
 
 struct ClaudeCode {
     executable: PathBuf,
@@ -434,7 +430,6 @@ struct ClaudeCode {
     /// maki's environment, read afresh for each request.
     environment: Box<Environment>,
     models_cache: Option<PathBuf>,
-    windows: Mutex<Option<(SystemTime, SavedModels)>>,
     /// Takes precedence over `$CLAUDE_CONFIG_DIR`.
     config_dir: Option<PathBuf>,
 }
@@ -451,15 +446,8 @@ impl ClaudeCode {
         Ok(Self {
             executable,
             limits: Limits::new(timeouts.stream),
-            environment: Box::new(|names| match names {
-                None => utf8_vars(env::vars_os()),
-                Some(names) => names
-                    .iter()
-                    .filter_map(|name| env::var(name).ok().map(|value| ((*name).to_owned(), value)))
-                    .collect(),
-            }),
+            environment: Box::new(|| utf8_vars(env::vars_os())),
             models_cache: models_cache_path(),
-            windows: Mutex::default(),
             config_dir: options.config_dir.clone(),
         })
     }
@@ -475,10 +463,7 @@ impl ClaudeCode {
     }
 
     fn login_dir(&self) -> Result<PathBuf, Error> {
-        validation::login_dir(
-            &(self.environment)(Some(&[CONFIG_DIR_ENV, HOME_ENV])),
-            self.config_dir.as_deref(),
-        )
+        validation::login_dir(&(self.environment)(), self.config_dir.as_deref())
     }
 
     fn launch<'a>(&'a self, prepared: &'a LaunchPreparation, cwd: &'a Path) -> Launch<'a> {
@@ -510,31 +495,19 @@ impl ClaudeCode {
     /// Model discovery starts up to six processes. Cache successful lists for 24 hours
     /// and failures for five minutes. An explicit refresh bypasses both caches.
     async fn list(&self, cwd: &Path, listing: ModelListing) -> Result<Vec<Listed>, Error> {
-        let vars = (self.environment)(None);
+        let vars = (self.environment)();
         let key = (
             self.executable.clone(),
             validation::login_dir(&vars, self.config_dir.as_deref())?,
         );
         let saved = async || {
-            {
-                let windows = self.windows.lock().unwrap_or_else(PoisonError::into_inner);
-                if let Some((at, saved)) = &*windows
-                    && saved.executable == key.0
-                    && saved.config_dir == key.1
-                    && at.elapsed().is_ok_and(|age| age <= MODELS_CACHE_TTL)
-                {
-                    return Some(saved.models.clone());
-                }
-            }
             let path = self.models_cache.clone()?;
             let (executable, config_dir) = key.clone();
-            let (at, saved) = smol::unblock(move || {
+            let (_, saved) = smol::unblock(move || {
                 saved_models(&path, MODELS_CACHE_TTL, &executable, &config_dir)
             })
             .await?;
-            let models = saved.models.clone();
-            self.remember_windows(saved, at);
-            Some(models)
+            Some(saved.models)
         };
         if listing == ModelListing::Cached
             && let Some(models) = saved().await
@@ -580,34 +553,13 @@ impl ClaudeCode {
         listed
     }
 
-    fn remember_windows(&self, saved: SavedModels, at: SystemTime) {
-        *self.windows.lock().unwrap_or_else(PoisonError::into_inner) = Some((at, saved));
-    }
-
-    /// Load the last list lazily, retaining only this provider's current login and executable.
     fn window_of(&self, id: &str) -> Option<u32> {
-        let config_dir = self.login_dir().ok()?;
-        let mut windows = self.windows.lock().unwrap_or_else(PoisonError::into_inner);
-        if windows.as_ref().is_none_or(|(_, saved)| {
-            saved.executable != self.executable || saved.config_dir != config_dir
-        }) {
-            let models = self
-                .models_cache
-                .as_deref()
-                .and_then(|path| saved_models(path, Duration::MAX, &self.executable, &config_dir))
-                .unwrap_or_else(|| {
-                    (
-                        SystemTime::UNIX_EPOCH,
-                        SavedModels {
-                            executable: self.executable.clone(),
-                            config_dir,
-                            models: Vec::new(),
-                        },
-                    )
-                });
-            *windows = Some(models);
-        }
-        let (_, saved) = windows.as_ref()?;
+        let (_, saved) = saved_models(
+            self.models_cache.as_deref()?,
+            Duration::MAX,
+            &self.executable,
+            &self.login_dir().ok()?,
+        )?;
         saved
             .models
             .iter()
@@ -637,7 +589,6 @@ impl ClaudeCode {
             config_dir: prepared.config_dir,
             models,
         };
-        self.remember_windows(saved.clone(), SystemTime::now());
         if let Some(path) = &self.models_cache {
             let path = path.to_owned();
             return Ok(smol::unblock(move || {
@@ -671,7 +622,7 @@ impl ClaudeCode {
             slot_wait_ms = run::millis(waiting.elapsed()),
             "claude-code: request slot acquired"
         );
-        let prepared = self.prepare_async(&cwd, (self.environment)(None)).await?;
+        let prepared = self.prepare_async(&cwd, (self.environment)()).await?;
         let usage = self.plan_usage(&prepared.config_dir);
         run::request(Request {
             launch: self.launch(&prepared, &cwd),
@@ -858,7 +809,7 @@ mod tests {
     const MEDIUM_ROW: &str = "claude-sonnet-5";
     const DATED_MEDIUM_ROW: &str = "claude-sonnet-5-20261001";
     const STANDARD_WINDOW: u32 = 200_000;
-    const MAX_CONCURRENT: &str = "provider_max_concurrent";
+    use super::MAX_CONCURRENT_OPTION;
     const INVALID: &str = "invalid_request";
     const TOO_LONG: &str = "Prompt is too long";
     const OVERLOADED_KIND: &str = "overloaded";
@@ -1000,34 +951,6 @@ mod tests {
             id: id.to_owned(),
             window,
         }
-    }
-
-    #[test]
-    fn listed_windows_load_lazily_and_survive_disk_pruning() {
-        let root = tempdir().unwrap();
-        let provider = provider_in(
-            root.path(),
-            vec![listed(DEFAULT_ROW, Some(STANDARD_WINDOW))],
-        );
-        let saved = SavedModels {
-            executable: provider.executable.clone(),
-            config_dir: root.path().to_owned(),
-            models: vec![listed(DEFAULT_ROW, Some(LONG_CONTEXT_WINDOW))],
-        };
-        let cache = provider.models_cache.as_ref().unwrap();
-        assert!(save_models(cache, &saved));
-        assert_eq!(provider.window_of(DEFAULT_ROW), Some(LONG_CONTEXT_WINDOW));
-        let path = keyed_models_path(cache, &saved.executable, &saved.config_dir);
-        fs::remove_file(path).unwrap();
-        assert_eq!(provider.window_of(DEFAULT_ROW), Some(LONG_CONTEXT_WINDOW));
-        provider.remember_windows(
-            SavedModels {
-                models: vec![listed(DEFAULT_ROW, Some(STANDARD_WINDOW))],
-                ..saved
-            },
-            SystemTime::now(),
-        );
-        assert_eq!(provider.window_of(DEFAULT_ROW), Some(STANDARD_WINDOW));
     }
 
     #[test]
@@ -1249,7 +1172,10 @@ mod tests {
     fn slots_follow_a_new_max_concurrent() {
         let _off = ProviderOff;
         let options = |max: usize| {
-            let table = json!({ MAX_CONCURRENT: max }).as_object().unwrap().clone();
+            let table = json!({ MAX_CONCURRENT_OPTION: max })
+                .as_object()
+                .unwrap()
+                .clone();
             HashMap::from([(PLUGIN.to_owned(), table)])
         };
         configure_plugin(true, options(1).get(PLUGIN));
@@ -1274,7 +1200,7 @@ mod on_the_fake {
     use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
     use std::pin::pin;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
     use futures_lite::future::poll_once;
@@ -1397,14 +1323,8 @@ mod on_the_fake {
         ClaudeCode {
             executable: fake.executable(),
             limits: Limits::new(IDLE),
-            environment: Box::new(move |names| {
-                vars.iter()
-                    .filter(|(name, _)| names.is_none_or(|names| names.contains(&name.as_str())))
-                    .cloned()
-                    .collect()
-            }),
+            environment: Box::new(move || vars.to_vec()),
             models_cache,
-            windows: Mutex::default(),
             config_dir: None,
         }
     }
@@ -1463,7 +1383,7 @@ mod on_the_fake {
         provider.config_dir = Some(PathBuf::from(PLUGIN_LOGIN));
 
         let prepared =
-            smol::block_on(provider.prepare_async(&fake.project(), (provider.environment)(None)))
+            smol::block_on(provider.prepare_async(&fake.project(), (provider.environment)()))
                 .unwrap();
         let given: Vec<&str> = prepared
             .env
@@ -1481,17 +1401,12 @@ mod on_the_fake {
         let fake = Fake::new("text");
         let home = tempdir().unwrap();
         let mut provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
-        let mut vars = (provider.environment)(None);
+        let mut vars = (provider.environment)();
         vars.push((CONFIG_DIR_VAR.to_owned(), String::new()));
-        provider.environment = Box::new(move |names| {
-            vars.iter()
-                .filter(|(name, _)| names.is_none_or(|names| names.contains(&name.as_str())))
-                .cloned()
-                .collect()
-        });
+        provider.environment = Box::new(move || vars.clone());
 
         let prepared =
-            smol::block_on(provider.prepare_async(&fake.project(), (provider.environment)(None)))
+            smol::block_on(provider.prepare_async(&fake.project(), (provider.environment)()))
                 .unwrap();
         assert!(
             prepared.env.iter().all(|(name, _)| name != CONFIG_DIR_VAR),
@@ -1582,7 +1497,6 @@ mod on_the_fake {
             let listed = provider.list(&cwd, ModelListing::Cached).await.unwrap();
             assert_eq!(listed, saved.models);
             assert!(!fake.dir.path().join("pid").exists());
-            provider.windows.lock().unwrap().take();
             fs::remove_file(keyed_models_path(
                 &cache,
                 &saved.executable,
@@ -1600,25 +1514,11 @@ mod on_the_fake {
         });
     }
 
-    #[test_case(false ; "no_saved_list")]
-    #[test_case(true ; "expired_memory_list")]
-    fn a_cached_listing_waits_for_a_busy_slot(stale: bool) {
+    #[test]
+    fn a_cached_listing_waits_for_a_busy_slot() {
         let fake = Fake::new("text");
         let home = tempdir().unwrap();
         let provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
-        if stale {
-            provider.remember_windows(
-                SavedModels {
-                    executable: fake.executable(),
-                    config_dir: home.path().join(CLAUDE_DIR),
-                    models: vec![Listed {
-                        id: SAVED_MODEL.to_owned(),
-                        window: None,
-                    }],
-                },
-                SystemTime::now() - STALE_LIST,
-            );
-        }
         smol::block_on(async {
             let slots = slots();
             let held: Vec<_> = iter::from_fn(|| slots.try_acquire_arc()).collect();
@@ -1641,39 +1541,6 @@ mod on_the_fake {
                 .unwrap();
             assert!(!models.is_empty());
             assert!(models.iter().all(|model| model.id != SAVED_MODEL));
-        });
-    }
-
-    #[test_case(false ; "disk_cache_removed")]
-    #[test_case(true ; "no_disk_cache_configured")]
-    fn a_successful_listing_is_cached_in_memory(without_disk: bool) {
-        let fake = Fake::new("text");
-        let home = tempdir().unwrap();
-        let cache = (!without_disk).then(|| home.path().join(SAVED_LIST));
-        let provider = provider_for(&fake, home.path(), &env::temp_dir(), cache.clone());
-        smol::block_on(async {
-            let cwd = fake.project();
-            let first = provider.list(&cwd, ModelListing::Cached).await.unwrap();
-            if let Some(cache) = cache {
-                fs::remove_file(keyed_models_path(
-                    &cache,
-                    &fake.executable(),
-                    &home.path().join(CLAUDE_DIR),
-                ))
-                .unwrap();
-            }
-            let calls = fake.log("calls");
-            assert_eq!(
-                provider.list(&cwd, ModelListing::Cached).await.unwrap(),
-                first
-            );
-            assert_eq!(fake.log("calls"), calls);
-            provider.windows.lock().unwrap().as_mut().unwrap().0 = SystemTime::now() - STALE_LIST;
-            assert_eq!(
-                provider.list(&cwd, ModelListing::Cached).await.unwrap(),
-                first
-            );
-            assert_ne!(fake.log("calls"), calls);
         });
     }
 

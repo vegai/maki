@@ -158,14 +158,13 @@ function Run:on_answer()
     return
   end
   self.stream:set_model(model)
-  if self:send(launch.user_message(self.task, self.spec.instructions)) then
+  local sent, err, queued = jobs.feed_stdin(self.job_id, launch.user_message(self.task, self.spec.instructions))
+  if queued then
     self.prompted = true
-    -- Keep the worker snapshot regardless of the result so the user can inspect its work.
     self.call.artifact = nil
-    local closed, err = maki.fn.chanclose(self.job_id, "stdin")
-    if not closed then
-      self:stop("maki cannot close Claude Code stdin: " .. tostring(err))
-    end
+  end
+  if not sent then
+    self:stop("maki cannot send the task to Claude Code: " .. tostring(err))
   end
 end
 
@@ -258,11 +257,16 @@ function Run:start(argv, cwd, env, task)
   job_opts.on_stdout = function(_, line)
     self:on_line(line)
   end
-  self.job_id = self.call:spawn(argv, job_opts, {
+  local id, err = self.call:spawn(argv, job_opts, {
     on_exit = function(_, code)
       self:on_exit(code)
     end,
   })
+  if not id then
+    local text = "maki cannot start Claude Code: " .. tostring(err)
+    return { llm_output = truncate(text, self.max_lines, self.max_bytes), shown = text, is_error = true }
+  end
+  self.job_id = id
   maki.async.on_cancel(function(reason)
     self:on_cancel(reason)
   end)

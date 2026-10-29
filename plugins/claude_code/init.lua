@@ -47,8 +47,8 @@ local import_description = [[Apply a claude_code artifact's changes to the check
 If a target changed since the snapshot, the import stops before any checkout change. A later conflict can stop import partway. The error lists applied changes. A retry preserves earlier backups and applies changes that remain safe. Use `paths` to select files.]]
 
 local opts = maki.api.register_options(output_limits.extend({
-  executable = { default = native.default_executable, desc = "The Claude Code executable." },
-  config_dir = {
+  [native.executable_option] = { default = native.default_executable, desc = "The Claude Code executable." },
+  [native.config_dir_option] = {
     default = "",
     desc = "Absolute path of a Claude Code config directory for maki, in place of "
       .. "`$CLAUDE_CONFIG_DIR` or `~/.claude`. Use it to give maki a different Claude login.",
@@ -59,7 +59,7 @@ local opts = maki.api.register_options(output_limits.extend({
     min = 1,
     desc = "The maximum number of claude_code tool calls running at the same time.",
   },
-  provider_max_concurrent = {
+  [native.max_concurrent_option] = {
     default = native.default_provider_max_concurrent,
     min = native.min_provider_max_concurrent,
     desc = "The maximum number of concurrent claude-code provider generations, including subagents. "
@@ -378,6 +378,9 @@ local function discard_unkept(call, removed)
 end
 
 local function handler(input, ctx)
+  if native.unsupported then
+    return refuse(native.unsupported)
+  end
   if type(input.prompt) ~= "string" or input.prompt:match("^%s*$") then
     return refuse("the call must have a prompt")
   end
@@ -396,8 +399,10 @@ local function handler(input, ctx)
   -- call.
   maki.async.on_cancel(function()
     call:stop()
-    call:answer()
-    discard_unkept(call)
+    maki.async.spawn(function()
+      discard_unkept(call)
+      call:answer()
+    end)
   end)
   if callers > opts.max_concurrent then
     local buf = maki.ui.buf()
@@ -481,11 +486,14 @@ maki.api.register_tool({
 })
 
 local function import_handler(input, ctx)
+  if native.unsupported then
+    return refuse(native.unsupported)
+  end
   local artifacts, artifacts_err = artifacts_root()
   if not artifacts then
     return refuse(artifacts_err)
   end
-  local project, project_err = ctx:cwd()
+  local project, project_err = maki.agent.cwd(ctx)
   if not project then
     return refuse(launch.NO_SESSION_DIR .. tostring(project_err))
   end

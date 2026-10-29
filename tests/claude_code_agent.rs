@@ -28,6 +28,7 @@ mod wire;
 use isolation::Isolation;
 use wire::{INIT, JSON_FORMAT, RESULT, STREAM_FORMAT, SYSTEM};
 
+const NO_SCRATCH: &str = "maki cannot create a private scratch directory outside the project";
 const GLOSSARY: &str = "glossary.txt";
 /// Only the glossary contains this value. A reply with it establishes that the subagent
 /// read the glossary.
@@ -269,7 +270,7 @@ fn unavailable_scratch_fails_per_request_without_starting_claude() {
     let result = events.last().unwrap();
     assert_eq!(result["type"], RESULT);
     assert_eq!(result["is_error"], true);
-    assert!(result[RESULT].as_str().unwrap().contains("Set TMPDIR"));
+    assert!(result[RESULT].as_str().unwrap().contains(NO_SCRATCH));
     assert!(!claude.with_extension(RAN_EXTENSION).exists());
 }
 

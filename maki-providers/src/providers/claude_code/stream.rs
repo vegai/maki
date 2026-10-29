@@ -3,7 +3,6 @@
 //!
 //! The held call establishes the handoff to maki. Text replies complete at their result event.
 
-use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
@@ -38,7 +37,6 @@ const USER_EVENT: &str = "user";
 pub(super) const RESULT_EVENT: &str = "result";
 const MAX_TURNS_ERROR: &str = "error_max_turns";
 const STREAM_EVENT: &str = "stream_event";
-const UNKNOWN_EVENT_KIND: &str = "?";
 const CONTROL_REQUEST: &str = "control_request";
 pub(super) const RATE_LIMIT_EVENT: &str = "rate_limit_event";
 const KEEP_ALIVE_EVENT: &str = "keep_alive";
@@ -77,7 +75,8 @@ const WINDOW_FULL_STOP: &str = "model_context_window_exceeded";
 /// Stop reasons of an incomplete reply.
 const CUT_STOPS: [&str; 2] = [MAX_TOKENS_STOP, WINDOW_FULL_STOP];
 const TOOL_RESULT: &str = "tool_result";
-pub(super) const API_ERROR_MARK: &str = "is_api_error_message";
+pub(super) const API_ERROR_STATUS: &str = "api_error_status";
+pub const API_ERROR_MARK: &str = "is_api_error_message";
 /// The plan status of a `rate_limit_event` once the plan's limit is used up.
 const PLAN_REJECTED: &str = "rejected";
 /// As 2.1.280 words it.
@@ -103,25 +102,6 @@ const PERCENT: f64 = 100.0;
 const UNPARSED_TOOL_INPUT: &str = "__unparsedToolInput";
 const MS_PER_SEC: u64 = 1000;
 
-const TRACE_KINDS: &[&str] = &[
-    MESSAGE_START,
-    BLOCK_START,
-    BLOCK_DELTA,
-    BLOCK_STOP,
-    MESSAGE_DELTA,
-    MESSAGE_STOP,
-    STREAM_EVENT,
-    ASSISTANT_EVENT,
-    USER_EVENT,
-    RESULT_EVENT,
-    CONTROL_RESPONSE,
-    CONTROL_REQUEST,
-    SYSTEM_EVENT,
-    RATE_LIMIT_EVENT,
-    KEEP_ALIVE_EVENT,
-    TOOL_PROGRESS_EVENT,
-    UNKNOWN_EVENT_KIND,
-];
 #[derive(Debug)]
 pub(crate) enum Step {
     /// Send the prompt.
@@ -318,7 +298,7 @@ pub(crate) struct Turn<'a> {
     /// which can name an API error as the cause.
     lost: Option<Error>,
     /// Kinds of the latest events, logged when the request fails.
-    trace: VecDeque<Cow<'static, str>>,
+    trace: VecDeque<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -681,7 +661,7 @@ impl<'a> Turn<'a> {
     pub fn trace(&self) -> String {
         self.trace
             .iter()
-            .map(AsRef::as_ref)
+            .map(String::as_str)
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -690,20 +670,14 @@ impl<'a> Turn<'a> {
         let kind = match (event["type"].as_str(), event["subtype"].as_str()) {
             (Some(STREAM_EVENT), _) => event["event"]["type"].as_str().unwrap_or(STREAM_EVENT),
             (Some(kind), _) => kind,
-            (None, _) => UNKNOWN_EVENT_KIND,
+            (None, _) => return,
         };
         if self.trace.len() == TRACE_LEN {
             self.trace.pop_front();
         }
         self.trace.push_back(match event["subtype"].as_str() {
-            Some(subtype) if kind == event["type"] => Cow::Owned(format!("{kind}/{subtype}")),
-            _ => TRACE_KINDS
-                .iter()
-                .find(|known| **known == kind)
-                .map_or_else(
-                    || Cow::Owned(kind.to_owned()),
-                    |known| Cow::Borrowed(*known),
-                ),
+            Some(subtype) if kind == event["type"] => format!("{kind}/{subtype}"),
+            _ => kind.to_owned(),
         });
     }
 
@@ -743,7 +717,7 @@ impl<'a> Turn<'a> {
                 self.refusal = Some(Refusal {
                     kind: event["error"].as_str().unwrap_or_default().to_owned(),
                     text: message_text(&event["message"]),
-                    status: status_of(&event["api_error_status"]),
+                    status: status_of(&event[API_ERROR_STATUS]),
                 });
                 Ok(Step::Nothing)
             }
@@ -942,7 +916,7 @@ impl<'a> Turn<'a> {
 
     fn finish_result(&mut self, event: &Value) -> Result<Step, Error> {
         if let Some(refusal) = self.refusal.take() {
-            return Err(self.refused(refusal, status_of(&event["api_error_status"])));
+            return Err(self.refused(refusal, status_of(&event[API_ERROR_STATUS])));
         }
         // The one-turn cap can finish a rejected or held call. Maki owns the complete
         // reply and returns its calls through its own dispatch.
@@ -951,9 +925,9 @@ impl<'a> Turn<'a> {
             && self.is_complete()
             && self.stop_reason.as_deref() == Some(TOOL_USE_STOP)
             && self.lost.is_none()
-            && event["api_error_status"].is_null();
+            && event[API_ERROR_STATUS].is_null();
         if failed_result(event) && !tool_reply_at_limit {
-            if let Some(status) = status_of(&event["api_error_status"]) {
+            if let Some(status) = status_of(&event[API_ERROR_STATUS]) {
                 return Err(self.refused(
                     Refusal {
                         kind: UNKNOWN_ERROR.into(),
@@ -1276,12 +1250,12 @@ mod tests {
     use super::super::mcp::Handoff;
     use super::super::transcript::Catalog;
     use super::{
-        ACCOUNT_ANSWER, API_ERROR_MARK, BATCH_CALL_TOOL, BATCH_CALLS, BATCH_TOOL, EXTRA_USAGE,
-        EXTRA_USAGE_IN_USE, EventKind, HOOKS_ANSWER, Handshake, INPUT_REJECTED, MAX_TOKENS_STOP,
-        MAX_TURNS_ERROR, MCP_CLOSED, NO_SUCH_TOOL, PLAN_REJECTED, RATE_LIMITED, REFUSAL_STOP,
-        RESULT_EVENT, SETTINGS_ANSWER, SHOWN_TOOL_ERROR_CHARS, SUCCESS, Step, StreamMode,
-        StreamedText, TOOL_RESULT, TOOL_USE_STOP, Turn, WINDOW_FULL_STOP, answered, classify,
-        result_failure, unexpose_batch, usage_of, user_message,
+        ACCOUNT_ANSWER, API_ERROR_MARK, API_ERROR_STATUS, BATCH_CALL_TOOL, BATCH_CALLS, BATCH_TOOL,
+        EXTRA_USAGE, EXTRA_USAGE_IN_USE, EventKind, HOOKS_ANSWER, Handshake, INPUT_REJECTED,
+        MAX_TOKENS_STOP, MAX_TURNS_ERROR, MCP_CLOSED, NO_SUCH_TOOL, PLAN_REJECTED, RATE_LIMITED,
+        REFUSAL_STOP, RESULT_EVENT, SETTINGS_ANSWER, SHOWN_TOOL_ERROR_CHARS, SUCCESS, Step,
+        StreamMode, StreamedText, TOOL_RESULT, TOOL_USE_STOP, Turn, WINDOW_FULL_STOP, answered,
+        classify, result_failure, unexpose_batch, usage_of, user_message,
     };
     use crate::{ContentBlock, StopReason, StreamResponse};
 
@@ -1800,7 +1774,7 @@ mod tests {
         if rejected_call {
             lines.push(rejected(FIRST_CALL));
         }
-        lines.push(json!({ "type": RESULT_EVENT, "subtype": MAX_TURNS_ERROR, "is_error": true, "api_error_status": status }).to_string());
+        lines.push(json!({ "type": RESULT_EVENT, "subtype": MAX_TURNS_ERROR, "is_error": true, API_ERROR_STATUS: status }).to_string());
         let handoffs = held.then(|| parked(Some(FIRST_CALL), "a"));
         let (step, response) = run(&lines, handoffs.into_iter().collect(), true);
         assert!(response.is_none());
@@ -1879,11 +1853,11 @@ mod tests {
     /// middle of a reply has kind "unknown" and no status on the reply.
     fn refused(kind: &str, status: Option<u16>, text: &str) -> [String; 2] {
         let reply = json!({
-            "type": "assistant", "error": kind, API_ERROR_MARK: true, "api_error_status": status,
+            "type": "assistant", "error": kind, API_ERROR_MARK: true, API_ERROR_STATUS: status,
             "message": { "model": "<synthetic>", "content": [{ "type": "text", "text": text }] },
         });
         let result = json!({
-            "type": "result", "subtype": SUCCESS, "is_error": true, "api_error_status": status.unwrap_or(TOO_MANY), "result": text,
+            "type": "result", "subtype": SUCCESS, "is_error": true, API_ERROR_STATUS: status.unwrap_or(TOO_MANY), "result": text,
         });
         [reply.to_string(), result.to_string()]
     }

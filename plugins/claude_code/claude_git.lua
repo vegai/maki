@@ -137,8 +137,8 @@ end
 
 function M.diff_command(artifact)
   local words = M.shell_environment()
-  words[#words + 1] = "GIT_DIR=" .. path_utils.bash_quote(artifact.git)
-  words[#words + 1] = "GIT_WORK_TREE=" .. path_utils.bash_quote(artifact.snapshot)
+  words[#words + 1] = "GIT_DIR=" .. path_utils.shell_quote(artifact.git)
+  words[#words + 1] = "GIT_WORK_TREE=" .. path_utils.shell_quote(artifact.snapshot)
   for _, word in
     ipairs(M.git({
       "diff",
@@ -150,7 +150,7 @@ function M.diff_command(artifact)
       "--",
     }))
   do
-    words[#words + 1] = path_utils.bash_quote(word)
+    words[#words + 1] = path_utils.shell_quote(word)
   end
   return table.concat(words, " ")
 end
@@ -192,7 +192,7 @@ end
 
 function M.listed_paths(output)
   local paths = {}
-  for line in (output or ""):gmatch("[^\n]+") do
+  for _, line in ipairs(output or {}) do
     paths[#paths + 1] = unquote(line)
   end
   return paths
@@ -209,7 +209,7 @@ end
 
 local function staged_entries(output)
   local entries = {}
-  for line in (output or ""):gmatch("[^\n]+") do
+  for _, line in ipairs(output or {}) do
     local tag, mode, sha, path = line:match("^([%a%?]?) ?(%d+) (%x+) %d+\t(.*)$")
     if mode and tag ~= "S" then
       entries[#entries + 1] = { mode = mode, sha = sha, path = unquote(path) }
@@ -236,8 +236,8 @@ end
 --- Returns each change as `{ path, status, old_mode, new_mode, old_sha,
 --- new_sha }`.
 function M.parse_raw_diff(output)
-  local changes = {}
-  for line in (output or ""):gmatch("[^\n]+") do
+  local changes, binary = {}, {}
+  for _, line in ipairs(output or {}) do
     local old_mode, new_mode, old_sha, new_sha, status, path = line:match("^:(%d+) (%d+) (%x+) (%x+) (%a)%d*\t(.*)$")
     if old_mode then
       changes[#changes + 1] = {
@@ -248,20 +248,14 @@ function M.parse_raw_diff(output)
         old_sha = old_sha,
         new_sha = new_sha,
       }
+    else
+      local path = line:match("^%-\t%-\t(.*)$")
+      if path then
+        binary[unquote(path)] = true
+      end
     end
   end
-  return changes
-end
-
-function M.binary_paths(output)
-  local binary = {}
-  for line in (output or ""):gmatch("[^\n]+") do
-    local path = line:match("^%-\t%-\t(.*)$")
-    if path then
-      binary[unquote(path)] = true
-    end
-  end
-  return binary
+  return changes, binary
 end
 
 --- A file that became a folder, or the reverse, shows up as a change to the

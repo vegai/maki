@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use maki_agent::tools::ToolRegistry;
 use maki_lua::PluginHost;
+use maki_storage::permissions::PERMISSION_BITS;
 use rustix::process::{Pid, Signal, kill_process_group};
 use tempfile::{TempDir, tempdir};
 use test_case::test_case;
@@ -89,9 +90,9 @@ for _, change in ipairs(changes) do
     staged[change.new_sha] = true
     local words = git_utils.shell_environment()
     for _, word in ipairs(git_utils.git({ "--git-dir=@GIT@", "cat-file", "blob", change.new_sha })) do
-      words[#words + 1] = path_utils.bash_quote(word)
+      words[#words + 1] = path_utils.shell_quote(word)
     end
-    lines[#lines + 1] = table.concat(words, " ") .. " > " .. path_utils.bash_quote("@STAGE@/" .. change.new_sha)
+    lines[#lines + 1] = table.concat(words, " ") .. " > " .. path_utils.shell_quote("@STAGE@/" .. change.new_sha)
   end
 end
 lines[#lines + 1] = import_scripts.import_script(changes, "@PROJECT@", "@GIT@", "@ARTIFACT@", "@STAGE@")
@@ -127,7 +128,6 @@ const GROUP_READ_MODE: u32 = 0o640;
 const PUBLIC_READ_MODE: u32 = 0o644;
 const PRIVATE_EXECUTE_MODE: u32 = 0o700;
 const GROUP_EXECUTE_MODE: u32 = 0o750;
-const PERMISSION_BITS: u32 = 0o777;
 const DEFAULT_UMASK: &str = "022";
 const SPECIAL_MODE_BITS: u32 = 0o7000;
 const SAME_FOLDER_ADDED: &str = "src/added.rs";

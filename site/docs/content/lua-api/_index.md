@@ -375,7 +375,12 @@ print(maki.json.encode(copy)) -- {"files":[],"mode":"strict"}
 maki.NIL
 ```
 
-`maki.NIL` is a value that stands for JSON null, like `vim.NIL`. `maki.json.decode` returns it for every null unless `luanil` says otherwise. Every conversion to JSON turns it back into null. So a decode, change, encode pass loses no key. It is truthy and not equal to nil, so test `x == maki.NIL` for null. Tool handler arguments and event payloads use nil for null instead, never `maki.NIL`.
+`maki.NIL` is a value that stands for JSON null, like `vim.NIL`.
+`maki.json.decode` returns it for every null unless `luanil` says otherwise.
+Every conversion to JSON turns it back into null. So a decode, change,
+encode pass loses no key. It is truthy and not equal to nil, so test
+`x == maki.NIL` for null. Tool handler arguments and event payloads use nil
+for null instead, never `maki.NIL`.
 
 **Example:**
 
@@ -479,12 +484,6 @@ only in compact mode.
   - `description` (`string`) Required. Non-empty description shown to the model.
   - `schema` (`table`) Required. JSON Schema object describing the tool's input parameters.
   - `handler` (`function`) Required. Called with `(input, ctx)` when the tool is invoked.
-    `ctx:cwd()` returns the directory the calling session started
-    in. `/cd` does not change it, and under ACP it can differ from
-    `maki.uv.cwd()`.
-    `ctx:instructions()` returns the instruction text maki's prompt
-    loads there. Both need `fs_read`. Outside a handler, they return
-    nil and an error.
     Must return a string or a table with any of these fields:
     - `llm_output` (`string`) Result text for the model or the calling code.
     - `is_error` (`boolean`) When true, the result is treated as an error.
@@ -1412,6 +1411,44 @@ print(model.spec, model.tier)
 
 ---
 
+### `maki.agent.cwd()` {#maki-agent-cwd}
+
+```lua
+maki.agent.cwd({ctx})
+```
+
+The calling session's canonical working directory. Under ACP it can differ from
+the process directory. Outside a handler, returns nil and an error.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Agent context.
+
+**Returns:** (`string?`, `string?`) Session directory, or nil and an error.
+
+---
+
+### `maki.agent.instructions()` {#maki-agent-instructions}
+
+```lua
+maki.agent.instructions({ctx})
+```
+
+Load the project and global instructions for the calling session's directory.
+Outside a handler, returns nil and an error.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Agent context.
+
+**Returns:** (`string?`, `string?`) Instruction text, or nil and an error.
+
+---
+
 ### `maki.agent.system_prompt()` {#maki-agent-system_prompt}
 
 ```lua
@@ -1422,6 +1459,8 @@ Build a system prompt from the parent's resolved prompt catalogue.
 Plugin template and section replacements apply. Environment variables like
 `{cwd}` are substituted automatically. Use this when you need a ready-made
 prompt for a subagent session.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -2404,6 +2443,8 @@ Requires the `run` [plugin permission](#plugin-permissions).
     with the current call. `"plugin"` keeps it alive until the plugin
     unloads or reloads. `{ session = "<id>" }` keeps it alive until that
     session ends, and survives plugin reload.
+  - `max_line_bytes` (`integer?`) maximum bytes per output line, excluding the newline.
+    An oversized line stops the job and reports the limit on stderr.
   - `tail` (`integer?`) trailing lines per stream kept for `jobinfo`
     (default 20, 0 disables, max 1024).
   - `name` (`string?`) handle for `jobfind`, unique among the live jobs this
@@ -2689,7 +2730,8 @@ maki.fn.chanclose(id, "stdin")
 maki.fn.chansend_limits
 ```
 
-Stdin queue limits: `max_bytes` includes a write in progress, `full_error` means retry later, and `oversized_error` means split the write.
+Stdin queue limits: `max_bytes` includes a write in progress, `full_error`
+means retry later, and `oversized_error` means split the write.
 
 ---
 

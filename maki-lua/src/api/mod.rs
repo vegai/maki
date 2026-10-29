@@ -7,6 +7,9 @@ pub(crate) mod claude_code;
 #[cfg(not(target_os = "linux"))]
 #[path = "claude_code_unsupported.rs"]
 pub(crate) mod claude_code;
+mod claude_code_common;
+#[cfg(test)]
+pub(crate) mod claude_code_unsupported;
 pub(crate) mod env;
 pub(crate) mod r#fn;
 pub(crate) mod fs;
@@ -157,7 +160,6 @@ pub(crate) fn create_maki_global(
     )?;
     split::split__register(&maki, lua)?;
     top::add_top_methods(&maki, lua, Arc::clone(&plugin))?;
-    maki.set("NIL", Value::NULL)?;
     maki.set(
         "async",
         r#async::create_async_table(lua, Arc::clone(&plugin))?,

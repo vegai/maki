@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use flume::{Receiver, Sender};
-use maki_lua_macro::{lua_fn, lua_table};
+use maki_lua_macro::{lua_fn, lua_table, lua_value};
 use maki_providers::process;
 use maki_storage::id::MakiId;
 use mlua::{
@@ -16,7 +16,6 @@ use crate::api::fs::expand_tilde;
 use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
 use crate::api::util::convert::TableExt;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
-use crate::docs::FnDoc;
 use crate::plugin_permissions::{Permission, PluginPermissions, denied_error};
 use crate::runtime::{active_task_id, job_task_id, strip_traceback, with_jobs};
 
@@ -46,19 +45,8 @@ const STDIN_PIPE: &str = "pipe";
 const STDIN_NULL: &str = "null";
 const CHANCLOSE_STREAM_ERR: &str = "chanclose: you can close only \"stdin\"";
 const CHANSEND_DATA_ERR: &str = "chansend: data must be a string or a list";
+const ZERO_LINE_LIMIT_ERR: &str = "jobstart: max_line_bytes must be positive";
 const STDIN_STREAM: &str = "stdin";
-
-#[allow(non_upper_case_globals)]
-const chansend_limits__doc: FnDoc = FnDoc {
-    name: "chansend_limits",
-    args: "",
-    desc: "Stdin queue limits: `max_bytes` includes a write in progress, `full_error` means retry later, and `oversized_error` means split the write.",
-    params: &[],
-    returns: "",
-    guard: None,
-    value: true,
-    example: "",
-};
 
 struct CheckedOutReceiver {
     lua: Lua,
@@ -134,6 +122,8 @@ impl Drop for CheckedOutReceiver {
 ///     with the current call. `"plugin"` keeps it alive until the plugin
 ///     unloads or reloads. `{ session = "<id>" }` keeps it alive until that
 ///     session ends, and survives plugin reload.
+///   `max_line_bytes` (integer?) maximum bytes per output line, excluding the newline.
+///     An oversized line stops the job and reports the limit on stderr.
 ///   `tail` (integer?) trailing lines per stream kept for `jobinfo`
 ///     (default 20, 0 disables, max 1024).
 ///   `name` (string?) handle for `jobfind`, unique among the live jobs this
@@ -172,6 +162,10 @@ async fn jobstart(
         spec.clear_env = opts.opt::<bool>("clear_env")?.unwrap_or(false);
         spec.guard = opts.opt::<bool>("guard")?.unwrap_or(false);
         spec.timeout = opts.opt::<u64>("timeout_ms")?.map(Duration::from_millis);
+        spec.max_line_bytes = opts.opt("max_line_bytes")?;
+        if spec.max_line_bytes == Some(0) {
+            return Err(mlua::Error::runtime(ZERO_LINE_LIMIT_ERR));
+        }
         spec.pipe_stdin = match opts.opt::<String>("stdin")?.as_deref() {
             None | Some(STDIN_NULL) => false,
             Some(STDIN_PIPE) => true,
@@ -814,21 +808,15 @@ fn winrestview(
     Ok((Some(true), None))
 }
 
-pub(crate) fn create_fn_table(
-    lua: &Lua,
-    plugin: Arc<str>,
-    perms: &PluginPermissions,
-    fs_write: bool,
-    tx: Option<Sender<UiAction>>,
-) -> LuaResult<Table> {
-    let table = lua.create_table()?;
-    add_fn_fns(&table, lua, plugin, perms, fs_write, tx)?;
+/// Stdin queue limits: `max_bytes` includes a write in progress, `full_error`
+/// means retry later, and `oversized_error` means split the write.
+#[lua_value]
+fn chansend_limits(lua: &Lua) -> LuaResult<Table> {
     let limits = lua.create_table()?;
     limits.set("max_bytes", MAX_STDIN_BYTES)?;
     limits.set("full_error", STDIN_FULL_ERR)?;
     limits.set("oversized_error", STDIN_OVERSIZED_ERR)?;
-    table.set("chansend_limits", limits)?;
-    Ok(table)
+    Ok(limits)
 }
 
 lua_table! {
@@ -841,7 +829,7 @@ lua_table! {
     ///   on_exit = function(_, code) print("done: " .. code) end,
     /// })
     /// ```
-    extend "maki.fn" => fn add_fn_fns(
+    "maki.fn" => pub(crate) fn create_fn_table(
         plugin: Arc<str>,
         perms: &PluginPermissions,
         fs_write: bool,
@@ -850,7 +838,7 @@ lua_table! {
         jobstart(perms, plugin, fs_write), jobstop(perms, plugin), jobforget(perms, plugin),
         jobwait(perms, plugin), jobinfo(perms, plugin), joblist(perms, plugin),
         jobattach(perms, plugin), jobfind(perms, plugin),
-        chansend(perms, plugin), manual chansend_limits, chanclose(perms, plugin),
+        chansend(perms, plugin), chansend_limits, chanclose(perms, plugin),
         executable(perms), exepath(perms),
         winsaveview(tx), winrestview(tx),
     ]

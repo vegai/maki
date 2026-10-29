@@ -2,6 +2,7 @@
 //! validation, concurrency) lives in the task plugin, not here.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -44,6 +45,7 @@ use serde_json::Value as JsonValue;
 use smol::lock::Mutex as AsyncMutex;
 use tracing::info;
 
+use crate::api::fs::canonical_path;
 use crate::api::session::{not_live, required_session};
 use crate::api::tool::{audiences_to_lua, parse_audience};
 use crate::api::ui::buf::BufHandle;
@@ -394,6 +396,34 @@ async fn resolve_model(
     Ok((Some(model_to_lua_table(&lua, &model)?), None))
 }
 
+fn session_cwd(ctx: &LuaCtx, method: &str) -> Result<PathBuf, String> {
+    Ok(dispatch_ctx(ctx, method)?.permissions.cwd().to_owned())
+}
+
+/// The calling session's canonical working directory. Under ACP it can differ from
+/// the process directory. Outside a handler, returns nil and an error.
+/// @param ctx LuaCtx Agent context.
+/// @return (string?, string?) Session directory, or nil and an error.
+#[lua_fn(guard = FsRead)]
+async fn cwd(_lua: Lua, ctx: UserDataRef<LuaCtx>) -> LuaResult<Pair<String>> {
+    let path = try_pair!(session_cwd(&ctx, "cwd"));
+    drop(ctx);
+    Ok(pair(canonical_path(path).await))
+}
+
+/// Load the project and global instructions for the calling session's directory.
+/// Outside a handler, returns nil and an error.
+/// @param ctx LuaCtx Agent context.
+/// @return (string?, string?) Instruction text, or nil and an error.
+#[lua_fn(guard = FsRead)]
+async fn instructions(_lua: Lua, ctx: UserDataRef<LuaCtx>) -> LuaResult<Pair<String>> {
+    let path = try_pair!(session_cwd(&ctx, "instructions"));
+    drop(ctx);
+    let path = try_pair!(canonical_path(path).await);
+    let text = smol::unblock(move || maki_agent::agent::load_instruction_text(&path)).await;
+    Ok((Some(text), None))
+}
+
 /// Build a system prompt from the parent's resolved prompt catalogue.
 /// Plugin template and section replacements apply. Environment variables like
 /// `{cwd}` are substituted automatically. Use this when you need a ready-made
@@ -414,13 +444,14 @@ async fn resolve_model(
 ///   instructions = true,
 /// })
 /// if err then error(err) end
-#[lua_fn]
+#[lua_fn(guard = FsRead)]
 async fn system_prompt(
     _lua: Lua,
     ctx: mlua::UserDataRef<LuaCtx>,
     opts: Table,
 ) -> LuaResult<Pair<String>> {
     let slots = Arc::clone(&try_pair!(dispatch_ctx(&ctx, "system_prompt")).prompt_slots);
+    let cwd = try_pair!(session_cwd(&ctx, "system_prompt"));
     // Nothing may hold the ctx borrow across the wait: a cancel hook firing
     // meanwhile needs `ctx:finish`, which takes it mutably.
     drop(ctx);
@@ -432,11 +463,11 @@ async fn system_prompt(
         other => return Ok(err_pair(format!("unknown prompt_id: {other}"))),
     };
 
-    let vars = maki_agent::template::env_vars();
+    let cwd = try_pair!(canonical_path(cwd).await);
+    let vars = maki_agent::template::env_vars_for(&cwd);
     let instructions_val: LuaValue = opts.get("instructions")?;
     let instructions = match instructions_val {
         LuaValue::Boolean(true) => {
-            let cwd = vars.apply("{cwd}").into_owned();
             smol::unblock(move || maki_agent::agent::load_instruction_text(&cwd)).await
         }
         LuaValue::Boolean(false) | LuaValue::Nil => String::new(),
@@ -1192,7 +1223,7 @@ lua_table! {
     /// })
     /// ```
     "maki.agent" => pub(crate) fn create_agent_table(plugin: Arc<str>, perms: PluginPermissions), DOCS [
-        resolve_model, system_prompt, tools, callable_tools, call_tool,
+        resolve_model, cwd(perms), instructions(perms), system_prompt(perms), tools, callable_tools, call_tool,
         session(plugin, perms), list,
     ]
 }

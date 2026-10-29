@@ -5968,8 +5968,8 @@ fn user_plugin_with_fs_read_can_read_but_not_write() {
 /// `fs_read`, and `env` stays reserved for the process environment.
 #[test_case("maki.env.state_dir()" ; "state_dir")]
 #[test_case(r#"maki.fn.executable("ls")"# ; "executable")]
-#[test_case("ctx:cwd()" ; "session_dir")]
-#[test_case("ctx:instructions()" ; "session_instructions")]
+#[test_case("maki.agent.cwd(ctx)" ; "session_dir")]
+#[test_case("maki.agent.instructions(ctx)" ; "session_instructions")]
 fn location_queries_cost_fs_read(call: &str) {
     const TOOL: &str = "location_test";
     let src = perm_tool_src(

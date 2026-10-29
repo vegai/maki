@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
+use std::str::from_utf8;
 
 use rustix::fs::{Mode, OFlags, open, openat};
 
@@ -32,7 +33,7 @@ pub fn unpack(batch: &Path, stage: &Path, hashes: &[String]) -> io::Result<()> {
             .by_ref()
             .take(MAX_HEADER_BYTES)
             .read_until(b'\n', &mut header)?;
-        let header_text = std::str::from_utf8(&header).map_err(io::Error::other)?;
+        let header_text = from_utf8(&header).map_err(io::Error::other)?;
         let size = header_text
             .strip_prefix(&format!("{hash} blob "))
             .and_then(|value| value.strip_suffix('\n'))

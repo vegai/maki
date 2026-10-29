@@ -317,6 +317,8 @@ pub fn delete_plugin_auth(dir: &StateDir, slug: &str) -> Result<bool, StorageErr
 mod tests {
     use super::*;
     #[cfg(unix)]
+    use crate::permissions::PERMISSION_BITS;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -371,7 +373,10 @@ mod tests {
         #[cfg(unix)]
         {
             let metadata = fs::metadata(auth_path(&dir, "anthropic")).unwrap();
-            assert_eq!(metadata.permissions().mode() & 0o777, PRIVATE_FILE_MODE);
+            assert_eq!(
+                metadata.permissions().mode() & PERMISSION_BITS,
+                PRIVATE_FILE_MODE
+            );
         }
 
         assert!(delete_tokens(&dir, "anthropic").unwrap());

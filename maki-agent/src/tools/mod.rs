@@ -36,7 +36,9 @@ use serde_json::{Value, json};
 
 use crate::agent::{CallInstructions, LoadedInstructions};
 use crate::cancel::{CancelMap, CancelToken};
-use crate::mcp::McpSession;
+use crate::mcp::{
+    McpSession, TOOL_SEARCH_TOOL_NAME, is_qualified_name, is_wire_name, same_tool_name,
+};
 use crate::permissions::PermissionManager;
 use crate::prompt::ResolvedPrompts;
 use crate::{AgentConfig, AgentMode, EventSender, RunLedger, SharedBuf};
@@ -128,19 +130,21 @@ enum ToolLocation {
 impl ToolFilter {
     pub(crate) fn cache_key(&self) -> Option<Value> {
         fn sorted(names: &[String]) -> Vec<&str> {
-            let mut names: Vec<&str> = names.iter().map(String::as_str).collect();
+            let mut names: Vec<&str> = names
+                .iter()
+                .map(String::as_str)
+                .filter(|name| {
+                    is_wire_name(name) || is_qualified_name(name) || *name == TOOL_SEARCH_TOOL_NAME
+                })
+                .collect();
             names.sort_unstable();
             names.dedup();
             names
         }
-        // Published definitions are already hashed by the frame fingerprint.
+        let excluded = sorted(&self.excluded);
         match &self.allowed {
-            Some(allowed) => {
-                Some(json!({ "only": sorted(allowed), "excluded": sorted(&self.excluded) }))
-            }
-            None if !self.excluded.is_empty() => {
-                Some(json!({ "excluded": sorted(&self.excluded) }))
-            }
+            Some(allowed) => Some(json!({ "only": sorted(allowed), "excluded": excluded })),
+            None if !excluded.is_empty() => Some(json!({ "excluded": excluded })),
             None => None,
         }
     }
@@ -192,7 +196,7 @@ impl ToolFilter {
 
     pub fn matches_external(&self, name: &str) -> bool {
         self.matches_where(
-            |candidate| crate::mcp::same_tool_name(name, candidate),
+            |candidate| same_tool_name(name, candidate),
             ToolLocation::External,
         )
     }

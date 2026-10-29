@@ -20,8 +20,8 @@ use super::DIRECTORY_FLAGS;
 use maki_providers::claude_code::validation::GIT_ENTRY;
 
 const MAX_DEPTH: usize = 64;
-const BASE_LINK_READS: usize = 64 * 1024;
-const PER_LINK_READS: usize = MAX_DEPTH * 2;
+const BASE_RESOLUTION_STEPS: usize = 64 * 1024;
+const PER_LINK_STEPS: usize = 128;
 const DEPTH_EXCEEDED: &str = "snapshot exceeds";
 const MAX_FAILURES: usize = 10;
 const CONFIG: &str = "config";
@@ -47,6 +47,9 @@ enum ResolveStep {
 }
 
 fn resolve_links(root: &Path, path: &Path, remaining: &mut usize) -> io::Result<PathBuf> {
+    *remaining = remaining
+        .checked_sub(path.components().count())
+        .ok_or(Errno::LOOP)?;
     let mut pending: Vec<_> = path
         .components()
         .rev()
@@ -70,12 +73,14 @@ fn resolve_links(root: &Path, path: &Path, remaining: &mut usize) -> io::Result<
             b"/" => resolved.push(part),
             _ => {
                 resolved.push(part);
-                *remaining = remaining.checked_sub(1).ok_or(Errno::LOOP)?;
                 match fs::read_link(&resolved) {
                     Ok(target) => {
                         if !active.insert(resolved.clone()) {
                             continue;
                         }
+                        *remaining = remaining
+                            .checked_sub(target.components().count() + 1)
+                            .ok_or(Errno::LOOP)?;
                         pending.push(ResolveStep::EndLink(resolved.clone()));
                         resolved.pop();
                         pending.extend(
@@ -359,7 +364,9 @@ pub fn sanitize_snapshot(
         }
         let kind = FileType::from_raw_mode(metadata.st_mode);
         if kind == FileType::Symlink {
-            symlinks.push(path.to_path_buf());
+            if prune_links {
+                symlinks.push(path.to_path_buf());
+            }
             return Ok(Visit::Skip);
         }
         if kind == FileType::RegularFile && metadata.st_nlink > 1 {
@@ -384,7 +391,7 @@ pub fn sanitize_snapshot(
         return Ok(relocated);
     }
     let mut remaining =
-        BASE_LINK_READS.saturating_add(symlinks.len().saturating_mul(PER_LINK_READS));
+        BASE_RESOLUTION_STEPS.saturating_add(symlinks.len().saturating_mul(PER_LINK_STEPS));
     // Removing an alias before resolving the next link can disguise an escaping target as
     // an internal missing path. Resolve the whole graph before deleting any link.
     relocated.dropped_links = symlinks
@@ -411,7 +418,7 @@ pub fn sanitize_snapshot(
 #[cfg(test)]
 mod tests {
     use super::{
-        BASE_LINK_READS, COMMONDIR, CONFIG, DEPTH_EXCEEDED, GIT_ENTRY, HEAD, MAX_DEPTH,
+        BASE_RESOLUTION_STEPS, COMMONDIR, CONFIG, DEPTH_EXCEEDED, GIT_ENTRY, HEAD, MAX_DEPTH,
         MAX_FAILURES, QUARANTINE_ENTRY, Visit, quarantine_entry, resolve_links, sanitize_snapshot,
         walk,
     };
@@ -481,7 +488,7 @@ mod tests {
                 output.stdout.strip_suffix(&[0]).unwrap().to_vec(),
             ))
         });
-        let mut remaining = BASE_LINK_READS;
+        let mut remaining = BASE_RESOLUTION_STEPS;
         assert_eq!(
             resolve_links(
                 &snapshot.canonicalize().unwrap(),
@@ -514,7 +521,7 @@ mod tests {
         const TARGET: &str = "growing/again";
         let dir = tempdir().unwrap();
         symlink(TARGET, dir.path().join(GROWING)).unwrap();
-        let mut remaining = BASE_LINK_READS;
+        let mut remaining = BASE_RESOLUTION_STEPS;
         assert_eq!(
             resolve_links(
                 &dir.path().canonicalize().unwrap(),
@@ -539,7 +546,7 @@ mod tests {
             )
             .unwrap();
         }
-        let mut remaining = BASE_LINK_READS;
+        let mut remaining = BASE_RESOLUTION_STEPS;
         let error = resolve_links(
             &dir.path().canonicalize().unwrap(),
             Path::new(&format!("split{LEVELS}")),
@@ -547,7 +554,30 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.raw_os_error(), Some(Errno::LOOP.raw_os_error()));
-        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn parent_components_cannot_expand_outside_the_resolution_budget() {
+        const LINKS: usize = 200;
+        const PARENTS: usize = 1_300;
+        let dir = tempdir().unwrap();
+        let padding = "../".repeat(PARENTS);
+        for index in 0..LINKS {
+            symlink(
+                format!("link{}/{padding}", index + 1),
+                dir.path().join(format!("link{index}")),
+            )
+            .unwrap();
+        }
+        let mut remaining = BASE_RESOLUTION_STEPS;
+        let error = resolve_links(
+            &dir.path().canonicalize().unwrap(),
+            Path::new("link0"),
+            &mut remaining,
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(Errno::LOOP.raw_os_error()));
+        assert!(remaining <= PARENTS + 1);
     }
 
     #[test]
@@ -701,8 +731,8 @@ mod tests {
         assert_eq!(fs::read_to_string(source).unwrap(), CONTENT);
     }
 
-    #[test_case(".git")]
-    #[test_case(".GiT")]
+    #[test_case(".git" ; "lowercase")]
+    #[test_case(".GiT" ; "mixed_case")]
     fn sanitize_keeps_the_trusted_pointer_and_moves_nested_metadata(name: &str) {
         let dir = tempdir().unwrap();
         let snapshot = dir.path().join("snapshot");
@@ -756,9 +786,9 @@ mod tests {
         assert!(fs::symlink_metadata(snapshot.join("linked")).is_err());
     }
 
-    #[test_case("objects")]
-    #[test_case("refs")]
-    #[test_case(COMMONDIR)]
+    #[test_case("objects" ; "objects")]
+    #[test_case("refs" ; "refs")]
+    #[test_case(COMMONDIR ; "shared_objects")]
     fn embedded_repositories_and_their_configs_are_quarantined(layout: &str) {
         let dir = tempdir().unwrap();
         let snapshot = dir.path().join("snapshot");

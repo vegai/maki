@@ -9,9 +9,8 @@ Stream.__index = Stream
 
 local ASSISTANT = "assistant"
 local RESULT = "result"
-local SYSTEM = "system"
 local CONTROL_RESPONSE = "control_response"
-local RATE_LIMIT_EVENT = "rate_limit_event"
+local RATE_LIMIT_EVENT = "rate_limit"
 local INIT = "init"
 local TOOL_USE = "tool_use"
 -- Each step's output count is a placeholder, so only the result has the
@@ -93,30 +92,30 @@ function Stream:feed(line)
   if not classified then
     return { stop = problem }
   end
-  local ev = classified.event
+  local ev, kind = classified.event, classified.kind
   self.model_checked = classified.model_checked
-  if ev.type == ASSISTANT and type(ev.message) == "table" and type(ev.message.id) == "string" and classified.usage then
+  if kind == ASSISTANT and type(ev.message) == "table" and type(ev.message.id) == "string" and classified.usage then
     self.usage_by_message[ev.message.id] = classified.usage
   end
   if classified.problem then
-    local init = ev.type == SYSTEM and ev.subtype == INIT
+    local init = kind == INIT
     if init then
       self.accepted = false
     end
     return { stop = classified.problem, init = init and ev or nil }
   end
-  if ev.type == CONTROL_RESPONSE and type(ev.response) == "table" then
+  if kind == CONTROL_RESPONSE and type(ev.response) == "table" then
     return { control = line }
   end
-  if ev.type == RATE_LIMIT_EVENT and type(ev.rate_limit_info) == "table" then
+  if kind == RATE_LIMIT_EVENT and type(ev.rate_limit_info) == "table" then
     self.rate_limit = classified.rate_limit
     return nil
   end
-  if ev.type == SYSTEM and ev.subtype == INIT then
+  if kind == INIT then
     self.accepted = true
     return { init = ev }
   end
-  if ev.type == RESULT then
+  if kind == RESULT then
     self.result = ev
     self.failure = classified.failure
     ev.usage = classified.usage
@@ -125,7 +124,7 @@ function Stream:feed(line)
     end
     return nil
   end
-  if ev.type ~= ASSISTANT or type(ev.message) ~= "table" or type(ev.message.content) ~= "table" then
+  if kind ~= ASSISTANT or type(ev.message) ~= "table" or type(ev.message.content) ~= "table" then
     return nil
   end
   local lines = {}

@@ -205,11 +205,14 @@ impl SessionTrack {
         session.meta.thinking = Some(input.thinking.into());
         session.meta.fast = input.fast;
         session.meta.workflow = input.workflow;
+        store.base_usage = store.session.token_usage;
+        store.ledger = Arc::default();
+        let ledger = Arc::clone(&store.ledger);
         store.publish_header(true);
         drop(store);
         SessionTurn {
             track: self,
-            ledger: Arc::default(),
+            ledger,
         }
     }
 }
@@ -264,12 +267,7 @@ impl Drop for SessionTurn<'_> {
             store,
         } = &mut *self.track;
         let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
-        let usage = self.ledger.totals().usage;
-        store.session.token_usage += usage;
-        if usage != TokenUsage::default() {
-            history.mark_unsaved();
-        }
-        if history.has_unsaved() {
+        if history.has_unsaved() || store.session.token_usage != store.current_usage() {
             match store.record_turn(&history.snapshot(), gauge.size()) {
                 Ok(()) => history.mark_saved(),
                 // Only headless runs save through here (the TUI has its own
@@ -312,6 +310,8 @@ struct SessionStore {
     session: StoredSession,
     /// `session`'s header as readers see it, republished whenever it moves.
     header: SharedHeader,
+    base_usage: TokenUsage,
+    ledger: Arc<RunLedger>,
 }
 
 impl SessionStore {
@@ -329,8 +329,16 @@ impl SessionStore {
         Self {
             claim,
             header: Arc::new(ArcSwap::from_pointee(SessionHeader::of(&session))),
+            base_usage: session.token_usage,
+            ledger: Arc::default(),
             session,
         }
+    }
+
+    fn current_usage(&self) -> TokenUsage {
+        let mut usage = self.base_usage;
+        usage += self.ledger.totals().usage;
+        usage
     }
 
     fn publish_header(&self, working: bool) {
@@ -358,6 +366,7 @@ impl SessionStore {
             return Ok(());
         }
         self.session.set_history(snapshot);
+        self.session.token_usage = self.current_usage();
         self.session.meta.context_size = context_size;
         self.session.update_title_if_default();
         self.claim.persist(&self.session)
@@ -810,13 +819,19 @@ mod tests {
             input: TURN_INPUT_TOKENS,
             ..Default::default()
         };
-        for _ in 0..TURNS {
+        for turn_index in 1..=TURNS {
             let mut turn = track.turn(MODEL_SPEC.into(), &input(AgentMode::Plan(PLAN_PATH.into())));
             turn.ledger().add(usage, None, None);
             let params = run_params(&mut turn);
             params.history.push(Message::user(PROMPT.into()));
             if checkpoint {
                 smol::block_on(params.history.checkpoint(CONTEXT_SIZE));
+                let stored = StoredSession::load(id, &state_dir(&tmp)).unwrap();
+                assert_eq!(
+                    stored.token_usage.input,
+                    TURN_INPUT_TOKENS * turn_index,
+                    "{USAGE_SUMMED}"
+                );
             }
         }
 

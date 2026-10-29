@@ -14,6 +14,7 @@ use serde_json::{Map, Value};
 
 use super::OAUTH_TOKEN_ENV;
 use super::error::{Error, Problem};
+use super::validation::{CONFIG_DIR_ENV, HOME_ENV, TMPDIR_ENV};
 
 pub(crate) const MINIMUM_VERSION: [u64; 3] = [2, 1, 284];
 pub(crate) const ACCOUNT_ANSWER: &str = "account";
@@ -39,13 +40,13 @@ const ESSENTIAL_TRAFFIC_ONLY: (&str, &str) = ("CLAUDE_CODE_DISABLE_NONESSENTIAL_
 pub(super) const PROXY_ENV: &[&str] = &["HTTP_PROXY", "HTTPS_PROXY"];
 const PASSED_ENV: &[&str] = &[
     "PATH",
-    "HOME",
+    HOME_ENV,
     "USER",
     "LOGNAME",
     "SHELL",
     "LANG",
     "TERM",
-    "TMPDIR",
+    TMPDIR_ENV,
     "TZ",
     PROXY_ENV[0],
     PROXY_ENV[1],
@@ -53,17 +54,13 @@ const PASSED_ENV: &[&str] = &[
     "NODE_EXTRA_CA_CERTS",
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
-    "CLAUDE_CONFIG_DIR",
+    CONFIG_DIR_ENV,
     OAUTH_TOKEN_ENV,
 ];
 const PASSED_ENV_PREFIXES: &[&str] = &["LC_", "XDG_"];
 // Native launches keep the selected login. The same keys inside settings are
 // rejected by settings_conflicts because they can override that selection.
-const ROUTE_ENV: &[&str] = &[
-    "CLAUDE_CODE_API_BASE_URL",
-    OAUTH_TOKEN_ENV,
-    "CLAUDE_CONFIG_DIR",
-];
+const ROUTE_ENV: &[&str] = &["CLAUDE_CODE_API_BASE_URL", OAUTH_TOKEN_ENV, CONFIG_DIR_ENV];
 const ROUTE_ENV_PREFIXES: &[&str] = &["CLAUDE_CODE_USE_", "ANTHROPIC_"];
 const HARMLESS_ENV: &[&str] = &[
     "CLAUDE_CODE_USE_COWORK_PLUGINS",
@@ -127,8 +124,8 @@ const BUILTIN_PLUGIN_MARKER: &str = "builtin";
 const UNREADABLE_FILE: &str = "maki cannot read it";
 const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
 const MAX_GIT_PATH_BYTES: u64 = 4096;
-const SETTINGS_TOO_LARGE: &str = "settings file exceeds the 1 MiB limit";
-const GIT_PATH_TOO_LARGE: &str = "Git path file exceeds the 4 KiB limit";
+const SETTINGS_TOO_LARGE: &str = "settings file exceeds the byte limit";
+const GIT_PATH_TOO_LARGE: &str = "Git path file exceeds the byte limit";
 const NOT_A_FILE: &str = "path is not a regular file";
 const NOT_AN_OBJECT: &str = "is not a JSON object";
 
@@ -422,7 +419,10 @@ fn limited_text(path: &Path, max_bytes: u64, too_large: &'static str) -> io::Res
     let mut bytes = Vec::new();
     file.take(max_bytes + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max_bytes {
-        return Err(io::Error::new(ErrorKind::InvalidData, too_large));
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("{too_large} ({max_bytes} bytes)"),
+        ));
     }
     String::from_utf8(bytes).map_err(|error| io::Error::new(ErrorKind::InvalidData, error))
 }
@@ -681,7 +681,10 @@ mod tests {
         bytes.extend_from_slice("é".as_bytes());
         fs::write(&path, bytes).unwrap();
         let error = super::limited_text(&path, MAX_SETTINGS_BYTES, SETTINGS_TOO_LARGE).unwrap_err();
-        assert_eq!(error.to_string(), SETTINGS_TOO_LARGE);
+        assert_eq!(
+            error.to_string(),
+            format!("{SETTINGS_TOO_LARGE} ({MAX_SETTINGS_BYTES} bytes)")
+        );
     }
 
     #[test_case(false ; "fifo")]

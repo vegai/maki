@@ -1195,6 +1195,12 @@ fn ask_prompt(reg: &ToolRegistry, authority: Authority) -> Option<LayerAnswer> {
     Some(LayerVerdict::Allow) ;
     "ctx_can_open_a_session_to_ask_a_model"
 )]
+#[test_case(
+    r#"assert(maki.agent.cwd(ctx))
+    assert(maki.agent.instructions(ctx))
+    return { decision = "allow" }"#,
+    Some(LayerVerdict::Allow) ; "session_location_is_available_in_a_prompt_layer"
+)]
 fn a_prompt_layer_answers_allow_or_deny(body: &str, expected: Option<LayerVerdict>) {
     let (reg, host) = host();
     load(&host, LAYER_PLUGIN, &prompt_layer(body));

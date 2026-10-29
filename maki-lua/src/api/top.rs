@@ -9,13 +9,12 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use maki_lua_macro::{lua_class, lua_fn, lua_table};
+use maki_lua_macro::{lua_class, lua_fn, lua_table, lua_value};
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 
 use crate::api::util::callback::call_inline;
 use crate::api::util::command::{UiAction, ui_send};
 use crate::api::util::convert::TableExt;
-use crate::docs::FnDoc;
 use crate::runtime::{DeferQueue, DeferredCallback};
 
 /// How deep `maki.deepcopy` follows nested tables before it gives up, so it
@@ -278,28 +277,26 @@ impl DeepCopy<'_> {
     }
 }
 
-#[allow(non_upper_case_globals)]
-const NIL__doc: FnDoc = FnDoc {
-    name: "NIL",
-    args: "",
-    desc: "`maki.NIL` is a value that stands for JSON null, like `vim.NIL`. \
-`maki.json.decode` returns it for every null unless `luanil` says otherwise. \
-Every conversion to JSON turns it back into null. So a decode, change, \
-encode pass loses no key. It is truthy and not equal to nil, so test \
-`x == maki.NIL` for null. Tool handler arguments and event payloads use nil \
-for null instead, never `maki.NIL`.",
-    params: &[],
-    returns: "",
-    guard: None,
-    value: true,
-    example: "local t = maki.json.decode('{\"a\": null}')\nassert(t.a == maki.NIL)\nprint(maki.json.encode(t)) -- {\"a\":null}",
-};
+/// `maki.NIL` is a value that stands for JSON null, like `vim.NIL`.
+/// `maki.json.decode` returns it for every null unless `luanil` says otherwise.
+/// Every conversion to JSON turns it back into null. So a decode, change,
+/// encode pass loses no key. It is truthy and not equal to nil, so test
+/// `x == maki.NIL` for null. Tool handler arguments and event payloads use nil
+/// for null instead, never `maki.NIL`.
+/// @example
+/// local t = maki.json.decode('{"a": null}')
+/// assert(t.a == maki.NIL)
+/// print(maki.json.encode(t)) -- {"a":null}
+#[lua_value(name = "NIL")]
+fn nil(_lua: &Lua) -> LuaResult<Value> {
+    Ok(Value::NULL)
+}
 
 lua_table! {
     extend "maki" => pub(crate) fn add_top_methods(
         plugin: Arc<str>,
     ), DOCS [
-        defer_fn(plugin), manual notify, set_notify_handler(plugin), deepcopy, manual NIL,
+        defer_fn(plugin), manual notify, set_notify_handler(plugin), deepcopy, nil,
     ]
 }
 

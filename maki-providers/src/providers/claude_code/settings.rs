@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 
 pub const EMPTY_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
-pub const STARTUP_TIMEOUT_SECS: u64 = 60;
+pub use super::super::STARTUP_TIMEOUT_SECS;
 pub(super) const MCP_CONFIG_FLAG: &str = "--mcp-config";
 const APPEND_SYSTEM_PROMPT_FLAG: &str = "--append-system-prompt";
 const BASE_ARGS: &[&str] = &[

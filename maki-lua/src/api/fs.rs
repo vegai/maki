@@ -20,7 +20,7 @@ use std::time::UNIX_EPOCH;
 use maki_storage::permissions::{PRIVATE_DIR_MODE, PRIVATE_FILE_MODE};
 
 use maki_agent::{FileQuery, FileReader, Ranked};
-use maki_lua_macro::{lua_fn, lua_table};
+use maki_lua_macro::{lua_fn, lua_table, lua_value};
 use mlua::{Buffer, Lua, Result as LuaResult, Table, UserData, UserDataMethods, Value};
 #[cfg(unix)]
 use rustix::fs::OFlags;
@@ -28,7 +28,6 @@ use rustix::fs::OFlags;
 use crate::agent_autocmd::HostEvent;
 use crate::api::util::convert::TableExt;
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
-use crate::docs::FnDoc;
 use crate::loader::EventHandle;
 use crate::plugin_permissions::PluginPermissions;
 use crate::runtime::LUA_MEMORY_LIMIT;
@@ -1352,27 +1351,10 @@ async fn fuzzy_files(
     Ok((Some(tbl), None))
 }
 
-#[allow(non_upper_case_globals)]
-const lock_busy__doc: FnDoc = FnDoc {
-    name: "lock_busy",
-    args: "",
-    desc: "The error string returned by `try_lock` while another caller holds the lock.",
-    params: &[],
-    returns: "",
-    guard: None,
-    value: true,
-    example: "",
-};
-
-pub(crate) fn create_fs_table(
-    lua: &Lua,
-    perms: &PluginPermissions,
-    plugin: Arc<str>,
-) -> LuaResult<Table> {
-    let table = lua.create_table()?;
-    add_fs_fns(&table, lua, perms, plugin)?;
-    table.set("lock_busy", LOCK_BUSY)?;
-    Ok(table)
+/// The error string returned by `try_lock` while another caller holds the lock.
+#[lua_value]
+fn lock_busy(_lua: &Lua) -> LuaResult<&'static str> {
+    Ok(LOCK_BUSY)
 }
 
 lua_table! {
@@ -1385,16 +1367,18 @@ lua_table! {
     /// local text, err = maki.fs.read("init.lua")
     /// if err then return end
     /// ```
-    extend "maki.fs" => fn add_fs_fns(perms: &PluginPermissions, plugin: Arc<str>), DOCS [
+    "maki.fs" => pub(crate) fn create_fs_table(perms: &PluginPermissions, plugin: Arc<str>), DOCS [
         read(perms), read_bytes(perms), metadata(perms), realpath(perms), mkdtemp(perms), rename(perms), dirname, basename,
         joinpath, normalize, abspath, parents, root(perms), relpath, ext,
-        dir(perms), try_lock(perms), manual lock_busy, write(perms), append(perms), atomic_write(perms), rm(perms), mkdir(perms),
+        dir(perms), try_lock(perms), lock_busy, write(perms), append(perms), atomic_write(perms), rm(perms), mkdir(perms),
         glob(perms), grep(perms), fuzzy_files(perms, plugin),
     ]
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use maki_storage::permissions::PERMISSION_BITS;
     #[cfg(unix)]
     use std::ffi::OsStr;
     use std::fs::OpenOptions;
@@ -3397,7 +3381,7 @@ mod tests {
             smol::block_on(lock.call_async(path.to_str().unwrap())).unwrap();
         assert_eq!(error, None);
         assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            fs::metadata(&path).unwrap().permissions().mode() & PERMISSION_BITS,
             PRIVATE_FILE_MODE
         );
         held.unwrap().call_method::<()>("close", ()).unwrap();

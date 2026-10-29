@@ -442,12 +442,29 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_default_filter_keeps_the_stored_frame_fingerprint() {
-        const STORED: &str = "679dc2f4a48a473b9e5f948abcf928e3";
+    #[test_case(false, "679dc2f4a48a473b9e5f948abcf928e3" ; "without_mcp")]
+    #[test_case(true, "9000657a8417bcfd7d032d863059feb7" ; "mcp_with_native_exclusion")]
+    fn the_default_filter_keeps_the_stored_frame_fingerprint(with_mcp: bool, expected: &str) {
+        let model = model(NATIVE_MODEL);
+        let mcp = stub_session(&[]);
+        let initial = context("a", "");
+        let context = RunContext::fixed(
+            String::new(),
+            RequestTools::assembled(
+                ToolRegistry::global(),
+                initial.tools.definitions().clone(),
+                &LocalTools::default(),
+                &AgentConfig {
+                    disabled_tools: vec!["question".into()],
+                    ..Default::default()
+                },
+                &model,
+                ToolAudience::MAIN,
+            ),
+        );
         assert_eq!(
-            fingerprint(&context("a", ""), None, &model(NATIVE_MODEL)),
-            STORED
+            fingerprint(&context, with_mcp.then_some(&mcp), &model),
+            expected
         );
     }
 

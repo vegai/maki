@@ -22,8 +22,10 @@ use mlua::{
     UserDataMethods, UserDataRef, Value as LuaValue,
 };
 use rustix::fs::OFlags;
+use rustix::io::Errno;
 use serde_json::Value;
 
+use super::claude_code_common::MODULE;
 use crate::api::fs::path_text;
 use crate::api::util::convert::{TableExt, json_to_lua};
 use crate::api::util::pair::{Pair, pair, try_pair};
@@ -34,7 +36,6 @@ const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 
-pub(crate) const MODULE: &str = "maki.claude_code.internal";
 const OWNER_EXECUTE: u32 = 0o100;
 const HOME_STATE_PREFIX: &str = ".claude.json";
 const BMP_LIMIT: u32 = 0xffff;
@@ -54,16 +55,7 @@ pub(crate) fn create_private_module(
 ) -> LuaResult<(&'static str, Table)> {
     let table = create_claude_code_table(lua, perms)?;
     table.set("handshake_input", validation::handshake_input())?;
-    table.set("startup_timeout_secs", validation::STARTUP_TIMEOUT_SECS)?;
-    table.set("default_executable", validation::DEFAULT_EXECUTABLE)?;
-    table.set(
-        "default_provider_max_concurrent",
-        validation::DEFAULT_MAX_CONCURRENT,
-    )?;
-    table.set(
-        "min_provider_max_concurrent",
-        validation::MIN_MAX_CONCURRENT,
-    )?;
+    super::claude_code_common::add_defaults(&table)?;
     Ok((MODULE, table))
 }
 
@@ -395,22 +387,18 @@ async fn sanitize_git(
         )
     })
     .await;
-    match result {
-        Ok(paths) => {
-            let result = lua.create_table()?;
-            result.set("git_metadata", paths.git_metadata)?;
-            result.set("repositories", paths.repositories)?;
-            result.set("private_files", paths.private_files)?;
-            let dropped_links = paths
-                .dropped_links
-                .iter()
-                .map(|path| lua.create_string(path.as_os_str().as_bytes()))
-                .collect::<LuaResult<Vec<_>>>()?;
-            result.set("dropped_links", lua.create_sequence_from(dropped_links)?)?;
-            Ok((Some(result), None))
-        }
-        Err(error) => Ok((None, Some(error.to_string()))),
-    }
+    let paths = try_pair!(result);
+    let result = lua.create_table()?;
+    result.set("git_metadata", paths.git_metadata)?;
+    result.set("repositories", paths.repositories)?;
+    result.set("private_files", paths.private_files)?;
+    let dropped_links = paths
+        .dropped_links
+        .iter()
+        .map(|path| lua.create_string(path.as_os_str().as_bytes()))
+        .collect::<LuaResult<Vec<_>>>()?;
+    result.set("dropped_links", lua.create_sequence_from(dropped_links)?)?;
+    Ok((Some(result), None))
 }
 
 /// Unpack a supervised git cat-file batch into private stage files.
@@ -446,7 +434,7 @@ async fn checkout_file(lua: Lua, path: String) -> LuaResult<Pair<Table>> {
             }
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
             Err(error) if error.kind() == ErrorKind::NotADirectory => Ok(Some((false, false))),
-            Err(error) if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) =>
+            Err(error) if error.raw_os_error() == Some(Errno::LOOP.raw_os_error()) =>
                 Ok(Some((false, false))),
             Err(error) => Err(error),
         })
@@ -515,6 +503,18 @@ fn classify(lua: &Lua, line: String, mode: Table) -> LuaResult<Pair<Table>> {
         }
     }
     let result = lua.create_table()?;
+    let kind = classified.kind.map(|kind| match kind {
+        EventKind::ControlResponse => "control_response",
+        EventKind::RateLimit => "rate_limit",
+        EventKind::Alive => "alive",
+        EventKind::Init => "init",
+        EventKind::System => "system",
+        EventKind::Assistant => "assistant",
+        EventKind::Stream => "stream",
+        EventKind::User => "user",
+        EventKind::Result => "result",
+    });
+    result.set("kind", kind)?;
     result.set("event", json_to_lua(lua, event)?)?;
     result.set("model_checked", classified.model_checked)?;
     result.set("problem", classified.problem.map(|error| error.to_string()))?;

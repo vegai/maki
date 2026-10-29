@@ -425,10 +425,8 @@ impl<M> Default for HistorySnapshot<M> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecordedError {
     pub message: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timestamp: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message_count: Option<usize>,
+    pub timestamp: u64,
+    pub message_count: usize,
 }
 
 /// The conversation collections are private so every change goes through a
@@ -1284,16 +1282,11 @@ fn append_messages_and_errors<M: Serialize, U: Serialize, T: Serialize>(
     first_message: usize,
     first_error: usize,
 ) -> Result<(), SessionError> {
-    let mut errors = session.errors[first_error..].iter().peekable();
-    for index in first_message..=session.messages.len() {
-        while let Some(error) = errors.next_if(|error| {
-            index == session.messages.len() || error.message_count.unwrap_or(0) <= index
-        }) {
-            append_record(buf, &LogRecord::<&M, &U, &T>::Error { d: error.clone() })?;
-        }
-        if let Some(message) = session.messages.get(index) {
-            append_record(buf, &LogRecord::<&M, &U, &T>::Msg { d: message })?;
-        }
+    for message in &session.messages[first_message..] {
+        append_record(buf, &LogRecord::<&M, &U, &T>::Msg { d: message })?;
+    }
+    for error in &session.errors[first_error..] {
+        append_record(buf, &LogRecord::<&M, &U, &T>::Error { d: error.clone() })?;
     }
     Ok(())
 }
@@ -1894,8 +1887,8 @@ where
         }
         self.errors.push(RecordedError {
             message,
-            timestamp: Some(now_epoch()),
-            message_count: Some(self.messages.len()),
+            timestamp: now_epoch(),
+            message_count: self.messages.len(),
         });
         if pruned {
             self.rewrite();
@@ -2587,14 +2580,9 @@ mod tests {
         }
         let loaded = TestSession::load_from(session.id, dir).unwrap();
         assert_eq!(loaded.errors(), session.errors());
-        assert_eq!(loaded.errors()[0].message_count, Some(1));
-        assert_eq!(loaded.errors()[1].message_count, Some(2));
-        assert!(
-            loaded
-                .errors()
-                .iter()
-                .all(|error| error.timestamp.is_some())
-        );
+        assert_eq!(loaded.errors()[0].message_count, 1);
+        assert_eq!(loaded.errors()[1].message_count, 2);
+        assert!(loaded.errors().iter().all(|error| error.timestamp > 0));
         let records: Vec<Value> = fs::read_to_string(jsonl_path(dir, session.id))
             .unwrap()
             .lines()
@@ -2605,34 +2593,7 @@ mod tests {
             .map(|record| record["t"].as_str().unwrap())
             .filter(|tag| matches!(*tag, "msg" | "error"))
             .collect();
-        assert_eq!(tags, ["msg", "error", "msg", "error"]);
-    }
-
-    #[test]
-    fn legacy_errors_without_metadata_still_load() {
-        let root = TempDir::new().unwrap();
-        let dir = root.path();
-        let mut session: TestSession = Session::new("model", "/project");
-        session.record_error(FIRST_FAILURE.into());
-        SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
-        let path = jsonl_path(dir, session.id);
-        let records: Vec<String> = fs::read_to_string(&path)
-            .unwrap()
-            .lines()
-            .map(|line| {
-                let mut record: Value = serde_json::from_str(line).unwrap();
-                if record["t"] == "error" {
-                    record.as_object_mut().unwrap().remove("timestamp");
-                    record.as_object_mut().unwrap().remove("message_count");
-                }
-                record.to_string()
-            })
-            .collect();
-        fs::write(path, records.join("\n") + "\n").unwrap();
-        let loaded = TestSession::load_from(session.id, dir).unwrap();
-        assert_eq!(loaded.errors()[0].message, FIRST_FAILURE);
-        assert_eq!(loaded.errors()[0].timestamp, None);
-        assert_eq!(loaded.errors()[0].message_count, None);
+        assert_eq!(tags, ["msg", "msg", "error", "error"]);
     }
 
     #[test]
