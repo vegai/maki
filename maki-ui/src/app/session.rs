@@ -6,18 +6,26 @@ use crate::app::tasks::TaskOutcome;
 use crate::chat::{Chat, DONE_TEXT, history_to_display};
 use crate::components::Action;
 use crate::components::rewind_picker::RewindEntry;
+use maki_agent::Transcript;
+use maki_agent::agent::SessionExport;
+use maki_agent::session::SessionHeader;
 use maki_lua::SessionEndReason;
+use maki_lua::agent_autocmd::HostEvent;
 use maki_providers::{Message, Model, RequestOptions, TokenUsage, estimate_message_tokens};
 use maki_storage::id::MakiId;
-use maki_storage::sessions::{SessionMeta, StoredMode, StoredSubagent};
+use maki_storage::sessions::{SessionClaim, SessionMeta, StoredMode, StoredSubagent};
 
 use crate::{AppSession, OpenSession};
 
 use super::session_state::{SessionState, rules_to_stored, stored_to_rules};
-use super::{App, Mode, PendingInput, PlanState, Status};
+use super::{App, MAIN_CHAT, Mode, PendingInput, PlanState, Status};
 
 /// The shortest gap between two writes that carry only UI state.
 const SOFT_SAVE_DELAY: Duration = Duration::from_millis(1000);
+
+pub(super) const FORK_TITLE_PREFIX: &str = "fork of ";
+pub(super) const FORK_EMPTY_MSG: &str = "Nothing to fork, the copy would be empty";
+const FORK_FAILED_MSG: &str = "Fork failed";
 
 /// What `App::checkpoint` last handed to the writer: which session, how far
 /// along it was, and when. The id is part of it because a session swapped into
@@ -37,6 +45,22 @@ pub(super) struct Sent {
 /// every tab that had one showed up in the picker as another empty session.
 pub(crate) fn session_has_content(session: &AppSession) -> bool {
     !session.messages().is_empty()
+}
+
+/// Cuts the transcript right before `turn_index` and returns what is left of
+/// `context_size`. Rewind and fork both go through here so they never disagree
+/// about what a cut leaves behind.
+fn truncate_to_turn(session: &mut AppSession, turn_index: usize, context_size: u32) -> u32 {
+    // The live size came from the provider, so it also counts the system
+    // prompt and the tool schemas, a baseline the estimator cannot see.
+    // Subtract only what we drop, or the gauge collapses until the next
+    // turn measures it again. An emptied history is a fresh session though,
+    // baseline included.
+    let baseline = context_size.saturating_sub(estimate_message_tokens(session.messages()));
+    session.truncate_messages(turn_index);
+    session.prune_orphans(|m| m.tool_uses().map(|(id, _, _)| id.to_owned()).collect());
+    let kept = estimate_message_tokens(session.messages());
+    if kept == 0 { 0 } else { baseline + kept }
 }
 
 impl App {
@@ -120,7 +144,7 @@ impl App {
     /// and an empty `Vec` does not allocate.
     fn build_meta(&self) -> SessionMeta {
         let state = &self.state;
-        let draft = self.input_box.buffer.value();
+        let draft = self.main_draft();
         SessionMeta {
             mode: Some(state.mode.into()),
             plan_path: state.plan.path().map(|p| p.to_string_lossy().into_owned()),
@@ -133,30 +157,30 @@ impl App {
             } else {
                 self.recoverable_queue.clone()
             },
-            thinking: Some(state.thinking.into()),
+            thinking: Some(state.thinking_intent().into()),
             fast: state.fast_intent(),
             workflow: state.workflow,
             yolo: self.permissions.persisted_yolo(),
         }
     }
 
-    /// Called where the set of subagent tabs changes, not at checkpoint time:
-    /// the turn-end path clears `chat_index` right after pruning it, so a later
-    /// rebuild would only ever find an empty map.
+    /// Mirrors every subagent tab into the session meta. Walks `chats`, not
+    /// `chat_index`: that one is a per-turn routing cache, and a finished
+    /// task dropped from it must still come back on reload.
     pub(super) fn sync_subagents(&mut self) {
-        let mut ordered: Vec<_> = self.chat_index.iter().collect();
-        ordered.sort_by_key(|&(_, chat_index)| chat_index);
-        let subagents = ordered
-            .into_iter()
-            .map(|(tool_id, &chat_index)| {
-                let chat = &self.chats[chat_index];
-                StoredSubagent {
-                    tool_use_id: tool_id.clone(),
+        let subagents = self
+            .chats
+            .iter()
+            .filter_map(|chat| {
+                Some(StoredSubagent {
+                    tool_use_id: chat.task_id()?.to_string(),
                     name: chat.name.clone(),
                     model: chat.model_id.clone(),
                     thinking: chat.opts.map(|o| o.thinking.into()),
                     fast: chat.opts.is_some_and(|o| o.fast),
-                }
+                    plugin: chat.plugin.clone(),
+                    cost: chat.cost,
+                })
             })
             .collect();
         self.state.session_mut().set_subagents(subagents);
@@ -169,9 +193,16 @@ impl App {
     }
 
     /// Call only once `state.session` is final: the chats it builds are
-    /// stamped with that session for life.
+    /// stamped with that session for life. A plugin task of that same session
+    /// stays if it is still running: a rewind rebuilds the main chat, not the
+    /// monitor a plugin runs beside it, and ending it here would leave a task
+    /// shown as done that keeps streaming and that Esc can no longer reach.
     pub(super) fn reset_ui_chrome(&mut self) {
-        self.chats.clear();
+        // Brings the main draft back to the box before the chats holding it go.
+        self.set_active_chat(MAIN_CHAT);
+        let session = self.state.session.id;
+        self.chats
+            .retain(|chat| chat.is_live_plugin_task_of(session));
         let mut main = Chat::new(
             self.state.session.id,
             None,
@@ -180,9 +211,10 @@ impl App {
             self.lua_event_handle.clone(),
         );
         main.set_restore_channel(self.restore_event_tx.clone());
-        self.chats.push(main);
-        self.active_chat = 0;
+        self.chats.insert(MAIN_CHAT, main);
+        self.active_chat = MAIN_CHAT;
         self.chat_index.clear();
+        self.deleted_tasks.clear();
         self.status = Status::Idle;
         self.clear_exit_request();
         self.queue.clear();
@@ -220,7 +252,7 @@ impl App {
             self.input_box.buffer.move_to_end();
         }
 
-        self.chats[0].request_restores(restore_items);
+        self.chats[MAIN_CHAT].request_restores(restore_items);
 
         // Read, not taken: the live chats below are the source `sync_subagents`
         // mirrors back, so emptying the session here would only make the next
@@ -234,13 +266,19 @@ impl App {
             let Some(messages) = self.state.session.subagent_messages().get(&sa.tool_use_id) else {
                 continue;
             };
+            if self.chat_of_task(&sa.tool_use_id).is_ok() {
+                continue;
+            }
             let (display, items) = history_to_display(
                 messages,
                 self.state.session.tool_outputs(),
                 &self.ui_config.tool_output_lines,
             );
-            self.chat_index
-                .insert(sa.tool_use_id.clone(), self.chats.len());
+            // Plugin tasks are never routed through `chat_index`.
+            if sa.plugin.is_none() {
+                self.chat_index
+                    .insert(sa.tool_use_id.clone(), self.chats.len());
+            }
             let mut chat = Chat::new(
                 self.state.session.id,
                 Some(&sa.tool_use_id),
@@ -249,6 +287,8 @@ impl App {
                 self.lua_event_handle.clone(),
             );
             chat.set_restore_channel(self.restore_event_tx.clone());
+            chat.plugin = sa.plugin;
+            chat.cost = sa.cost;
             chat.model_id = sa.model;
             chat.opts = sa.thinking.map(|thinking| RequestOptions {
                 thinking: thinking.into(),
@@ -319,7 +359,7 @@ impl App {
         );
         open.session.meta = SessionMeta {
             mode: Some(self.state.mode.into()),
-            thinking: Some(self.state.thinking.into()),
+            thinking: Some(self.state.thinking_intent().into()),
             fast: self.state.fast_intent(),
             workflow: self.state.workflow,
             plan_path: None,
@@ -331,6 +371,42 @@ impl App {
             yolo: self.permissions.persisted_yolo(),
         };
         open
+    }
+
+    /// `maki.session.new` lays its document over [`Self::blank_session`], so
+    /// a plugin's session starts where `Ctrl-N` would.
+    pub(crate) fn session_from(&self, transcript: Transcript) -> Result<OpenSession, String> {
+        let OpenSession { session, claim } = self.blank_session();
+        let session = transcript
+            .into_session(session)
+            .map_err(|e| e.to_string())?;
+        Ok(OpenSession { session, claim })
+    }
+
+    /// Settings come from live state rather than the session, because a
+    /// plugin can change one and export in the same drain, before the next
+    /// checkpoint syncs them. The agent's mirror runs ahead of what the tab
+    /// last saved and is shared, not copied. A tab whose agent never started
+    /// shares the session's own.
+    pub(crate) fn export(&self) -> SessionExport {
+        let state = &self.state;
+        let session = &state.session;
+        let header = SessionHeader {
+            mode: Some(state.mode.into()),
+            thinking: Some(state.thinking_intent().into()),
+            fast: state.fast_intent(),
+            usage: state.token_usage,
+            context_size: state.context_size,
+            ..SessionHeader::of(session)
+        };
+        match &self.shared_history {
+            Some(mirror) => SessionExport::live(header, &mirror.load()),
+            None => SessionExport {
+                header,
+                messages: Arc::clone(session.shared_messages()),
+                frame: session.frame().cloned(),
+            },
+        }
     }
 
     pub(super) fn reset_session(&mut self) -> Vec<Action> {
@@ -345,7 +421,7 @@ impl App {
         // Fire before the swap. A handler cleaning up after the session
         // that just ended needs its id, and the stamp always reads
         // whichever session is current.
-        self.fire_session_autocmd("SessionReset", serde_json::json!({}));
+        self.fire_session_event(HostEvent::SessionReset {});
         self.lua_event_handle
             .end_session(self.state.session.id, SessionEndReason::Reset);
         // Swapping the claim is what gives the old session back: the snapshot
@@ -362,6 +438,50 @@ impl App {
         vec![Action::RestartAgent(self.install_local_history())]
     }
 
+    /// `/fork` copies the session under a fresh id. The event loop opens the
+    /// copy as a session of its own and focuses it, so this one keeps running
+    /// in the background, untouched.
+    pub(super) fn fork_session(&mut self) -> Vec<Action> {
+        self.fork_session_with(|_| {})
+    }
+
+    /// The rewind picker's fork. The copy stops right before the chosen prompt
+    /// and keeps that prompt as its draft, so it feels like a rewind that left
+    /// the original alone.
+    pub(super) fn fork_to(&mut self, entry: RewindEntry) -> Vec<Action> {
+        self.fork_session_with(|forked| {
+            // The agent restores its gauge from this, and the full size on a
+            // short copy would auto compact it on its first prompt.
+            let context_size = forked.meta.context_size;
+            forked.meta.context_size = truncate_to_turn(forked, entry.turn_index, context_size);
+            forked.meta.input_draft = Some(entry.prompt_text);
+        })
+    }
+
+    fn fork_session_with(&mut self, adjust: impl FnOnce(&mut AppSession)) -> Vec<Action> {
+        // The last frame's snapshot still has `/fork` in the input box, and it
+        // can miss what the agent wrote since, so take a fresh one.
+        self.checkpoint_now();
+        let mut copy = AppSession::clone(&self.state.session);
+        adjust(&mut copy);
+        if !session_has_content(&copy) {
+            self.status_bar.flash(FORK_EMPTY_MSG.into());
+            return vec![];
+        }
+        let claim = SessionClaim::fresh(&self.storage);
+        let mut session = match copy.fork(claim.id(), &self.state.session.cwd, &self.storage) {
+            Ok(session) => session,
+            Err(e) => {
+                self.status_bar.flash(format!("{FORK_FAILED_MSG}: {e}"));
+                return vec![];
+            }
+        };
+        // Without this a young session forks into "fork of New session".
+        session.update_title_if_default();
+        session.set_title(format!("{FORK_TITLE_PREFIX}{}", session.title));
+        vec![Action::OpenFork(Box::new(OpenSession { session, claim }))]
+    }
+
     pub(super) fn open_rewind_picker(&mut self) -> Vec<Action> {
         match self.rewind_picker.open(self.state.session.messages()) {
             Ok(()) => vec![],
@@ -373,21 +493,11 @@ impl App {
     }
 
     pub(super) fn rewind_to(&mut self, entry: RewindEntry) -> Vec<Action> {
-        // The live size came from the provider, so it also counts the system
-        // prompt and the tool schemas, a baseline the estimator cannot see.
-        // Subtract only what we drop, or the gauge collapses until the next
-        // turn measures it again. An emptied history is a fresh session though,
-        // baseline included.
-        let baseline = self
-            .state
-            .context_size
-            .saturating_sub(estimate_message_tokens(self.state.session.messages()));
+        let measured = self.state.context_size;
         let session = self.state.session_mut();
-        session.truncate_messages(entry.turn_index);
-        session.prune_orphans(|m| m.tool_uses().map(|(id, _, _)| id.to_owned()).collect());
+        let context_size = truncate_to_turn(session, entry.turn_index, measured);
         session.update_title_if_default();
-        let kept = estimate_message_tokens(self.state.session.messages());
-        self.state.context_size = if kept == 0 { 0 } else { baseline + kept };
+        self.state.context_size = context_size;
 
         self.reset_ui_chrome();
         self.restore_display();

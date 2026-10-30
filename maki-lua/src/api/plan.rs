@@ -12,7 +12,9 @@ use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 use crate::api::util::command::{
     PlanFormRow, PlanRequest, PlanRowAction, UiAction, ui_json_roundtrip,
 };
+use crate::api::util::convert::TableExt;
 use crate::api::util::pair::Pair;
+use crate::plugin_permissions::PluginPermissions;
 
 const ID_KEY: &str = "id";
 const LABEL_KEY: &str = "label";
@@ -54,7 +56,7 @@ impl RowOwners {
         for entry in table.sequence_values::<Table>().flatten() {
             let (Ok(id), Ok(Some(handler))) = (
                 entry.get::<String>(ID_KEY),
-                entry.get::<Option<Function>>(HANDLER_KEY),
+                entry.opt::<Function>(HANDLER_KEY),
             ) else {
                 continue;
             };
@@ -285,14 +287,11 @@ fn row_from_table(
         .ok()
         .filter(|label| !label.is_empty())
         .ok_or(NO_LABEL_ERR)?;
-    let action = match entry.get::<Option<String>>(ACTION_KEY).unwrap_or_default() {
+    let action = match entry.opt::<String>(ACTION_KEY).unwrap_or_default() {
         Some(tag) => Some(PlanRowAction::from_tag(&tag).ok_or(UNKNOWN_ACTION_ERR)?),
         None => None,
     };
-    let handler = match entry
-        .get::<Option<Function>>(HANDLER_KEY)
-        .unwrap_or_default()
-    {
+    let handler = match entry.opt::<Function>(HANDLER_KEY).unwrap_or_default() {
         Some(handler) => {
             let plugin = owners
                 .owner(&id, &handler)
@@ -352,7 +351,7 @@ pub(crate) fn rows_from_table(
             }
             Err(reason) => {
                 let blamed = entry
-                    .get::<Option<Function>>(HANDLER_KEY)
+                    .opt::<Function>(HANDLER_KEY)
                     .ok()
                     .flatten()
                     .and_then(|h| owners.introduced_by(&h).cloned());
@@ -406,14 +405,14 @@ pub(crate) fn row_handler_opts(
 /// if plan and plan.ready then
 ///   print(plan.path, plan.content)
 /// end
-#[lua_fn]
+#[lua_fn(guard = SessionRead)]
 async fn read(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
     let session = match opts {
-        Some(opts) => opts.get("session")?,
+        Some(opts) => opts.opt("session")?,
         None => None,
     };
     ui_json_roundtrip(&lua, tx.as_ref(), |reply_tx| UiAction::Plan {
@@ -474,9 +473,11 @@ lua_table! {
     ///   return false
     /// end)
     /// ```
-    "maki.plan" => pub(crate) fn create_plan_table(tx: Option<flume::Sender<UiAction>>), DOCS [
-        read(tx),
-    ]
+    "maki.plan" => pub(crate) fn create_plan_table(
+        tx: Option<flume::Sender<UiAction>>,
+        perms: &PluginPermissions,
+    ),
+    DOCS [read(perms, tx)]
 }
 
 #[cfg(test)]
@@ -825,7 +826,7 @@ mod tests {
     #[test]
     fn plan_read_without_ui_returns_error_pair() {
         let lua = Lua::new();
-        let table = create_plan_table(&lua, None).unwrap();
+        let table = create_plan_table(&lua, None, &PluginPermissions::trusted()).unwrap();
         lua.globals().set("plan", table).unwrap();
         let (val, err): (Value, Option<String>) =
             smol::block_on(lua.load("return plan.read()").eval_async()).unwrap();
@@ -839,7 +840,7 @@ mod tests {
     fn the_session_option_travels_to_the_ui(call: &str, expected: Option<&str>) {
         let lua = Lua::new();
         let (tx, rx) = flume::unbounded::<UiAction>();
-        let table = create_plan_table(&lua, Some(tx)).unwrap();
+        let table = create_plan_table(&lua, Some(tx), &PluginPermissions::trusted()).unwrap();
         lua.globals().set("plan", table).unwrap();
         let served = std::thread::spawn(move || {
             let Ok(UiAction::Plan { req, reply_tx }) = rx.recv() else {

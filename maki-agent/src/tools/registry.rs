@@ -36,6 +36,17 @@ bitflags! {
     }
 }
 
+/// What a tool declares it reaches. `permission` is the capability it exposes
+/// to the model, and the price of hooking it, pre-approving it or handing it
+/// to a session. `prompted` tells whether a call ever meets the permission
+/// prompt, because a rule pre-approving a tool that never prompts would never
+/// be consulted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolReach {
+    pub permission: Permission,
+    pub prompted: bool,
+}
+
 impl Default for ToolAudience {
     fn default() -> Self {
         Self::all()
@@ -234,10 +245,8 @@ pub trait Tool: Send + Sync + 'static {
     fn tool_kind(&self) -> Option<&str> {
         None
     }
-    /// The plugin permission a rule pre-approving this tool requires. `None`
-    /// means the tool is never permission checked, so a rule naming it would
-    /// never be consulted.
-    fn required_permission(&self) -> Option<Permission> {
+    /// `None` is undeclared reach, which every consumer prices as everything.
+    fn reach(&self) -> Option<ToolReach> {
         None
     }
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError>;
@@ -495,10 +504,15 @@ impl ToolRegistry {
         let snapshot = self.tools.load();
         let mut out = Vec::with_capacity(snapshot.len());
         for entry in snapshot.iter() {
-            if !entry.tool.audience().contains(ctx.audience) {
-                continue;
-            }
-            if !ctx.filter.matches(entry.name()) {
+            let admitted = ctx.filter.admits_definition(
+                entry.name(),
+                entry.tool.audience(),
+                ctx.audience,
+                ctx.local_tools
+                    .and_then(|tools| tools.get(entry.name()))
+                    .map(|tool| tool.audience),
+            );
+            if !admitted {
                 continue;
             }
             let description = vars.apply(&entry.tool.description(ctx)).into_owned();
@@ -597,8 +611,9 @@ mod tests {
         )
         .unwrap();
 
-        let filter = crate::tools::ToolFilter::All;
+        let filter = crate::tools::ToolFilter::default();
         let ctx = DescriptionContext {
+            local_tools: None,
             filter: &filter,
             audience: ToolAudience::MAIN,
             workflow: false,
@@ -625,8 +640,9 @@ mod tests {
         )
         .unwrap();
 
-        let filter = crate::tools::ToolFilter::All;
+        let filter = crate::tools::ToolFilter::default();
         let ctx = DescriptionContext {
+            local_tools: None,
             filter: &filter,
             audience: ToolAudience::MAIN,
             workflow: false,
@@ -789,9 +805,10 @@ mod tests {
         reg.register(mock("everywhere"), lua_source("p")).unwrap();
 
         let vars = Vars::new();
-        let filter = crate::tools::ToolFilter::All;
+        let filter = crate::tools::ToolFilter::default();
         let names_for = |audience: ToolAudience| -> Vec<String> {
             let ctx = DescriptionContext {
+                local_tools: None,
                 filter: &filter,
                 audience,
                 workflow: false,

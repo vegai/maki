@@ -23,6 +23,83 @@ skill names + descriptions           MCP tool defs   tool_search
 
 The left column is the fixed overhead of every single request, so Maki keeps it small on purpose: a skill contributes one description line, memories one list of tags, a big MCP server one search tool. The bodies stay on disk until the agent asks.
 
+## One prompt per session
+
+Maki builds the system prompt and tool definitions once per session and sends the same bytes on every request. Providers cache by prefix, so an edit near the front makes the next request pay for the whole conversation again. On Claude models it also drops earlier thinking.
+
+When something changes mid-session (the date, the model, plan mode, the directory after `/cd`, a new memory tag), Maki appends a short update before your next message.
+
+A fresh prompt is built only on compaction, or for a change an update cannot carry: different tools (`/reload`, `/workflow`, a model with other capabilities) or a different system prompt passed in [headless](../headless/) mode. Such a change starts the cache over, and Maki tells you when it happens.
+
+Claude binds each thinking block to the prompt it was written under. Accounts that enforce this reject a request whose prompt moved under earlier thinking. When that happens Maki drops all earlier thinking once, tells you, and the session goes on. Later thinking is bound to the new prompt.
+
+A resumed session keeps its prompt across Maki upgrades, as long as the upgrade left the tools alone. Run `/compact` to pick up the new default.
+
+A request carries at most 100 images. Past that, Maki replaces the oldest 25 with a note at once, so the cache breaks once per 25 images rather than on every one.
+
+## Plugin prompt overrides
+
+Plugins can replace a named prompt section or a complete template with
+[`maki.api.set_prompt`](/docs/lua-api/#maki-api-set_prompt). Maki keeps its
+coding defaults when no plugin replaces them.
+
+```lua
+maki.api.set_prompt({
+    prompt = "system",
+    slot = "conventions",
+    content = "State uncertainty and cite the evidence you used.",
+})
+
+maki.api.set_prompt({
+    prompt = "system",
+    content = "You help analyse information.\n{{tool_usage}}\n{{instructions}}",
+})
+```
+
+The first call replaces the default conventions and keeps other sections. The
+second supplies the whole template. Sections, tool hints, and project
+instructions appear only at explicit markers. No environment or coding
+instructions are appended to a complete replacement.
+
+| Prompt ID | Consumer |
+| --- | --- |
+| `system` | Main agent in the TUI, print, SDK, and ACP |
+| `research`, `general` | Built-in task agents |
+| `plan` | Plan entry update |
+
+Sections are `identity`, `tone`, `objectivity`, `tool_usage`, `efficient_tools`,
+`conventions`, `completion`, and `after_instructions`. A section must occur in
+the selected template. A known section absent from an explicit target is
+ignored with a warning. Research and general prompts also have identity and
+tone sections. Omitting `prompt` in `set_prompt` targets only `system`.
+Additive hints without `prompt` target all conversational prompts that contain
+the section.
+
+Use `content = ""` to remove default section text or supply an empty template.
+Use [`register_prompt_hint`](/docs/lua-api/#maki-api-register_prompt_hint) to add
+text to a section without replacing its default. Additive hints remain in an
+included section after its default is replaced.
+
+The alphabetically last plugin wins a replacement. Within that plugin, the
+last registration wins. Unloading it restores the previous owner's value or
+the built-in default. Complete templates and section overrides compose after
+all registrations are resolved.
+
+Whole templates and default section replacements take static strings.
+Identity and tone also accept functions. Changed values arrive through context
+updates. Unloading the last override tells the model that it no longer applies.
+Changes to the date, working directory, or project instructions also use
+context updates, including with a complete main template. Changing the static
+system or plan replacement policy starts an announced new request frame.
+A changed plan prompt applies when the agent next enters plan mode.
+Side questions use the stored frame when one exists.
+An explicit SDK system-prompt override takes precedence over a plugin's main
+template.
+
+Prompt text does not change tool permissions, plan-mode restrictions, or
+instruction-file discovery. Select tools through plugin configuration and
+keep permission rules in their existing configuration.
+
 ## Instruction files
 
 At session start Maki walks from the project git root down to the working directory (no `.git` root, only the cwd). In each directory it loads **one** project instruction file, first match wins:
@@ -120,5 +197,23 @@ maki -r <session-id>
 ```
 
 `MAKI_DISABLE_AUTOCOMPACT=1` turns off the automatic compaction. A manual `/compact` still compacts.
+
+## Background tasks
+
+By default the [`task`](/docs/tools/#task) tool waits for its subagent. Turn on `allow_background` and the model gets a `background` input:
+
+```lua
+maki.setup({
+    plugins = {
+        task = { allow_background = true },
+    },
+})
+```
+
+With `background = true` the tool answers right away and the parent keeps working. To wait, the parent ends its turn. When the subagent is done, its result arrives as a notice that wakes the parent. Structured output and the partial output of an interrupted run come back the same way.
+
+To stop a task, open `/tasks`, select it, and press Ctrl+S. The parent still gets the result on its next turn, but the notice does not wake it.
+
+Background and blocking tasks share `plugins.task.max_concurrent`. A background task cannot ask for permission, so its tools need [allow rules](/docs/permissions/) or YOLO. Plan mode still blocks its file writes. Closing the chat or reloading plugins stops the chat's background tasks. Headless, SDK, and ACP runs have no live chat to deliver to, so there the call blocks as usual.
 
 Related: [Token Economy](/docs/token-economy/) for why all this frugality exists, [Configuration](/docs/configuration/) for the knobs.

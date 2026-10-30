@@ -14,7 +14,7 @@ local opts = maki.api.register_options(output_limits.extend({
     min = 10,
     desc = "Max match groups per search. A call's `limit` param overrides it.",
   },
-  max_line_bytes = { default = 500, min = 80, desc = "Skip lines longer than this many bytes." },
+  max_line_bytes = { default = 500, min = 80, desc = "Truncate lines the model sees at this many bytes." },
 }))
 
 local function has_context(groups)
@@ -64,7 +64,7 @@ end
 
 local function grep_view_opts(ctx)
   local tol = ctx:tool_output_lines()
-  return { max_lines = (tol and tol.other) or 10, keep = "head" }
+  return { max_lines = (tol and tol.grep) or 10, keep = "head" }
 end
 
 local function dim_spans(spans)
@@ -194,6 +194,7 @@ maki.api.register_prompt_hint({
 
 maki.api.register_tool({
   name = "grep",
+  permission = "fs_read",
   kind = "search",
   description = [[Search file contents using regex.
 
@@ -252,7 +253,7 @@ maki.api.register_tool({
 
     local limit = math.min(input.limit or opts.search_result_limit, MAX_PER_CALL_LIMIT)
 
-    local max_line_bytes = opts.max_line_bytes
+    local max_line_bytes = output_limits.line_bytes(opts, ctx)
 
     local entries, err = maki.fs.grep(pattern, {
       path = input.path,

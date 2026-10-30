@@ -6,25 +6,27 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use flume::Sender;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use isahc::config::{Configurable, VersionNegotiation};
 use isahc::{HttpClient, ReadResponseExt, Request};
-use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use crate::model::Model;
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, Provider, RequestScope};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::shared;
 
 pub(crate) const BEARER_TOKEN_ENV: &str = "AWS_BEARER_TOKEN_BEDROCK";
+const CONTAINER_CREDENTIALS_URI_ENV: &str = "AWS_CONTAINER_CREDENTIALS_FULL_URI";
 const BEDROCK_API_VERSION: &str = "bedrock-2023-05-31";
 const MIN_EVENTSTREAM_FRAME: usize = 16;
 const CONTAINER_METADATA_TIMEOUT: Duration = Duration::from_secs(5);
 const REFRESH_MARGIN: Duration = Duration::from_secs(5 * 60);
+const CONTAINER_CREDENTIALS_PENDING: &str =
+    "Bedrock container credentials were not fetched before signing the request";
 
 fn io_error(
     kind: std::io::ErrorKind,
@@ -42,6 +44,8 @@ enum AuthKind {
         // epoch seconds; Some only for temporary creds from the container endpoint.
         expires_at: Option<u64>,
     },
+    /// Fetched on the first request.
+    ContainerPending,
     Bearer {
         token: String,
     },
@@ -56,6 +60,12 @@ struct BedrockAuth {
 
 pub(crate) fn is_enabled() -> bool {
     env::var("CLAUDE_CODE_USE_BEDROCK").is_ok_and(|v| v == "1")
+}
+
+fn resolve_bedrock_top_p() -> Option<f64> {
+    // Bedrock is built from the anthropic branch, so it honours the anthropic
+    // slug's `top_p`; there is no `bedrock` section to read.
+    maki_config::providers::top_p_for(super::SLUG)
 }
 
 fn resolve_bedrock_auth() -> Result<BedrockAuth, AgentError> {
@@ -81,16 +91,9 @@ fn resolve_bedrock_auth() -> Result<BedrockAuth, AgentError> {
             session_token,
             expires_at: None,
         }
-    } else if let Ok(url) = env::var("AWS_CONTAINER_CREDENTIALS_FULL_URI") {
-        let (access_key, secret_key, session_token, expires_at) =
-            fetch_container_credentials(&url)?;
+    } else if env::var(CONTAINER_CREDENTIALS_URI_ENV).is_ok() {
         debug!("using Bedrock SigV4 auth from container credentials endpoint");
-        AuthKind::SigV4 {
-            access_key,
-            secret_key,
-            session_token,
-            expires_at,
-        }
+        AuthKind::ContainerPending
     } else {
         let profile = env::var("AWS_PROFILE").unwrap_or_else(|_| "default".into());
         let creds_path = env::var("HOME")
@@ -154,6 +157,19 @@ fn parse_aws_credentials_file(
             message: format!("profile '{profile}' not found or missing keys in credentials file"),
         }),
     }
+}
+
+fn fetch_container_auth() -> Result<AuthKind, AgentError> {
+    let url = env::var(CONTAINER_CREDENTIALS_URI_ENV).map_err(|_| AgentError::Config {
+        message: format!("{CONTAINER_CREDENTIALS_URI_ENV} is no longer set"),
+    })?;
+    let (access_key, secret_key, session_token, expires_at) = fetch_container_credentials(&url)?;
+    Ok(AuthKind::SigV4 {
+        access_key,
+        secret_key,
+        session_token,
+        expires_at,
+    })
 }
 
 fn fetch_container_credentials(
@@ -483,6 +499,7 @@ pub(crate) struct Bedrock {
     client: HttpClient,
     auth: Arc<Mutex<BedrockAuth>>,
     base_url: Option<String>,
+    top_p: Option<f64>,
 }
 
 impl Bedrock {
@@ -498,12 +515,14 @@ impl Bedrock {
             client: super::super::http_client(timeouts),
             auth: Arc::new(Mutex::new(auth)),
             base_url,
+            top_p: resolve_bedrock_top_p(),
         })
     }
 
     fn needs_refresh(&self) -> bool {
         let auth = self.auth.lock().unwrap();
         match &auth.kind {
+            AuthKind::ContainerPending => true,
             AuthKind::SigV4 {
                 expires_at: Some(exp),
                 ..
@@ -528,12 +547,13 @@ impl Provider for Bedrock {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             if self.needs_refresh() {
-                debug!("Bedrock creds near expiry, refreshing before request");
-                self.reload_auth().await?;
+                debug!("Bedrock container creds missing or near expiry, fetching before request");
+                let kind = smol::unblock(fetch_container_auth).await?;
+                self.auth.lock().unwrap().kind = kind;
             }
             let auth = self.auth.lock().unwrap().clone();
             let requested_id = env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| model.id.clone());
@@ -550,6 +570,7 @@ impl Provider for Bedrock {
                 }],
                 tools,
                 opts.thinking,
+                self.top_p,
             );
             // Fast mode lives only on the direct API, so Bedrock skips `opts.fast`
             // and never sends the `speed` param.
@@ -560,6 +581,9 @@ impl Provider for Bedrock {
             let mut betas = Vec::new();
             if has_examples {
                 betas.push(shared::BETA_TOOL_EXAMPLES_BEDROCK);
+            }
+            if shared::has_deferred_tools(tools) {
+                betas.push(shared::BETA_DEFERRED_TOOLS_BEDROCK);
             }
             if long_context {
                 betas.push(shared::LONG_CONTEXT_BETA);
@@ -606,6 +630,11 @@ impl Provider for Bedrock {
                     Some(vec![("Authorization".into(), format!("Bearer {token}"))])
                 }
                 AuthKind::None => None,
+                AuthKind::ContainerPending => {
+                    return Err(AgentError::Config {
+                        message: CONTAINER_CREDENTIALS_PENDING.into(),
+                    });
+                }
             };
 
             let mut builder = Request::builder()
@@ -690,7 +719,7 @@ impl Provider for Bedrock {
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
-            let new_auth = resolve_bedrock_auth()?;
+            let new_auth = smol::unblock(resolve_bedrock_auth).await?;
             *self.auth.lock().unwrap() = new_auth;
             debug!("reloaded Bedrock auth from env");
             Ok(())

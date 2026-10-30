@@ -5,6 +5,8 @@ use crate::agent::QueuedMessage;
 use crate::components::Status;
 use crate::theme;
 use maki_agent::{AgentInput, AgentMode, InputSource};
+use maki_lua::agent_autocmd::HostEvent;
+use maki_providers::RequestOptions;
 use maki_storage::StateDir;
 use maki_storage::plans;
 use ratatui::style::{Color, Modifier, Style};
@@ -88,7 +90,7 @@ impl App {
                 // The path is the whole point here, so with no path we stay
                 // quiet instead of handing a plugin an empty one to open.
                 if let Some(path) = path {
-                    self.fire_session_autocmd("PlanReady", serde_json::json!({ "path": path }));
+                    self.fire_session_event(HostEvent::PlanReady { path: &path });
                 }
             }
             PlanTrigger::InteractivePrompt => {
@@ -123,7 +125,7 @@ impl App {
         vec![]
     }
 
-    pub(super) fn agent_mode(&self) -> AgentMode {
+    pub(crate) fn agent_mode(&self) -> AgentMode {
         match self.state.mode {
             Mode::Plan => match self.state.plan.path() {
                 Some(p) => AgentMode::Plan(p.to_path_buf()),
@@ -136,15 +138,25 @@ impl App {
         }
     }
 
+    /// Background subagents are capped by this same value, so they can never
+    /// disagree with the chat's next prompt.
+    pub(crate) fn request_options(&self) -> RequestOptions {
+        RequestOptions {
+            thinking: self.state.thinking,
+            fast: self.state.fast,
+        }
+    }
+
     pub(crate) fn build_agent_input(&self, msg: &QueuedMessage) -> AgentInput {
+        let RequestOptions { thinking, fast } = self.request_options();
         AgentInput {
             message: msg.text.clone(),
             mode: self.agent_mode(),
             images: msg.images.clone(),
             preamble: Vec::new(),
             earlier: Vec::new(),
-            thinking: self.state.thinking,
-            fast: self.state.fast,
+            thinking,
+            fast,
             workflow: self.state.workflow,
             prompt: None,
             source: InputSource::Tui,

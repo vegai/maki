@@ -2,7 +2,7 @@ use std::io;
 use std::path::PathBuf;
 use std::str;
 use std::time::{Duration, Instant};
-use std::{env, fs, thread};
+use std::{fs, thread};
 
 use isahc::ReadResponseExt;
 use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
@@ -13,7 +13,7 @@ use tracing::{debug, error, warn};
 
 use crate::AgentError;
 use crate::providers::oauth_loopback::{self, LoginMethod, Loopback};
-use crate::providers::{KeyPool, ResolvedAuth, refreshed_tokens, urlenc};
+use crate::providers::{KeyPool, ResolvedAuth, UNAUTHORIZED_STATUS, urlenc};
 
 use super::catalog;
 
@@ -31,6 +31,7 @@ pub(crate) const API_KEY_ENV: &str = "XAI_API_KEY";
 pub(crate) const TOKEN_AUTH: &str = "xai-grok-cli";
 pub(crate) const AUTHENTICATE_RESPONSE: &str = "authenticate-response";
 pub(crate) const CLIENT_IDENTIFIER: &str = "maki";
+pub(crate) const GROK_CLI_VERSION: &str = "1.0.13";
 pub(crate) const CLI_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
 
 const CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
@@ -104,7 +105,7 @@ fn oauth_form_headers() -> Vec<(&'static str, String)> {
         ("content-type", "application/x-www-form-urlencoded".into()),
         ("accept", "application/json".into()),
         ("user-agent", crate::providers::user_agent().into()),
-        ("x-grok-client-version", env!("CARGO_PKG_VERSION").into()),
+        ("x-grok-client-version", GROK_CLI_VERSION.into()),
         ("x-grok-client-surface", "cli".into()),
     ]
 }
@@ -121,11 +122,10 @@ fn post_form(url: &str, body: &str, timeout: Duration) -> Result<(u16, String), 
         builder = builder.header(key, value);
     }
     let request = builder.body(body.as_bytes().to_vec())?;
-    let mut resp = client.send(request).map_err(|e| AgentError::Config {
-        message: format!("xAI OAuth request: {e}"),
-    })?;
+    // A transport error, not `Config`: only the token endpoint's answer may clear the tokens.
+    let mut resp = client.send(request)?;
     let status = resp.status().as_u16();
-    let text = resp.text().unwrap_or_default();
+    let text = resp.text()?;
     Ok((status, text))
 }
 
@@ -151,9 +151,10 @@ fn into_oauth_tokens(
 
 pub(crate) fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentError> {
     if tokens.refresh.is_empty() {
-        return Err(AgentError::Config {
-            message: "xAI credentials are expired and do not include a refresh token".into(),
-        });
+        return Err(AgentError::api(
+            UNAUTHORIZED_STATUS,
+            "xAI credentials are expired and do not include a refresh token",
+        ));
     }
     debug!(expired = tokens.is_expired(), "refreshing xAI OAuth tokens");
 
@@ -164,9 +165,10 @@ pub(crate) fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentE
     );
     let (status, body_text) = post_form(TOKEN_URL, &form_body, TOKEN_EXCHANGE_TIMEOUT)?;
     if status != 200 {
-        return Err(AgentError::Config {
-            message: format!("xAI token refresh failed ({status}): {body_text}"),
-        });
+        return Err(AgentError::api(
+            status,
+            format!("xAI token refresh failed: {body_text}"),
+        ));
     }
     let token_resp: TokenResponse = serde_json::from_str(&body_text)?;
     into_oauth_tokens(token_resp, Some(tokens.refresh.clone()))
@@ -181,10 +183,7 @@ fn oauth_headers(access: &str) -> Vec<(String, String)> {
             AUTHENTICATE_RESPONSE.into(),
         ),
         ("x-grok-client-identifier".into(), CLIENT_IDENTIFIER.into()),
-        (
-            "x-grok-client-version".into(),
-            env!("CARGO_PKG_VERSION").into(),
-        ),
+        ("x-grok-client-version".into(), GROK_CLI_VERSION.into()),
         ("x-grok-client-mode".into(), client_mode().into()),
     ]
 }
@@ -206,28 +205,15 @@ pub(crate) fn is_oauth(dir: &StateDir) -> bool {
     load_tokens(dir, PROVIDER).is_some()
 }
 
-pub fn resolve(dir: &StateDir) -> Result<ResolvedAuth, AgentError> {
+pub fn resolve(dir: &StateDir) -> Result<(ResolvedAuth, Option<OAuthTokens>), AgentError> {
     if let Some(tokens) = load_tokens(dir, PROVIDER) {
-        if !tokens.is_expired() {
-            debug!("using xAI OAuth authentication");
-            return build_oauth_resolved(&tokens);
-        }
-        match refreshed_tokens(dir, PROVIDER, None, refresh_tokens) {
-            Ok(fresh) => {
-                debug!("using xAI OAuth authentication (refreshed)");
-                return build_oauth_resolved(&fresh);
-            }
-            Err(e) => {
-                warn!(error = %e, "xAI OAuth refresh failed, clearing stale tokens");
-                delete_tokens(dir, PROVIDER).ok();
-                catalog::invalidate();
-            }
-        }
+        debug!("using xAI OAuth authentication");
+        return Ok((build_oauth_resolved(&tokens)?, Some(tokens)));
     }
 
     if let Ok(pool) = KeyPool::resolve(PROVIDER, API_KEY_ENV) {
         debug!("using xAI API key authentication");
-        return ResolvedAuth::bearer(PROVIDER, pool.current());
+        return Ok((ResolvedAuth::bearer(PROVIDER, pool.current())?, None));
     }
 
     Err(AgentError::Config {
@@ -615,6 +601,24 @@ fn normalize_epoch_ms(value: f64) -> u64 {
 mod tests {
     use super::*;
     use test_case::test_case;
+
+    #[test]
+    fn refresh_without_refresh_token_is_a_dead_token() {
+        let tokens = OAuthTokens {
+            access: "legacy-access".into(),
+            refresh: String::new(),
+            expires: 0,
+            account_id: None,
+        };
+        let err = refresh_tokens(&tokens).unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::Api {
+                status: UNAUTHORIZED_STATUS,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn parse_grok_oidc_scope() {

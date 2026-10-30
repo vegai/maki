@@ -7,10 +7,9 @@ use std::sync::Arc;
 use maki_agent::AgentEvent;
 use maki_agent::tools::ToolRegistry;
 use maki_config::ToolOutputLines;
-use maki_lua::{PluginHost, RestoreReason};
+use maki_lua::{PluginHost, RestoreReason, Split, UiAction};
 use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
-use test_case::test_case;
 
 const BASH_SRC: &str = include_str!("../../plugins/bash/init.lua");
 const GREP_SRC: &str = include_str!("../../plugins/grep/init.lua");
@@ -338,6 +337,32 @@ fn exec_live(host: &PluginHost, reg: &ToolRegistry, tool: &str, input: Value) ->
     }
 }
 
+const SKILL_TOOL: &str = "skill";
+const SKILL_NAME: &str = "release";
+/// Outside any home or cwd, so `shorten_path` leaves it alone.
+const SKILL_LOCATION: &str = "/srv/skills/release/SKILL.md";
+const SKILL_BODY: &str = "1 # Release\n2 Tag it.";
+
+/// Restore (session reload, batch child) must draw the skill like the live
+/// call did: content behind a line-number gutter, with the location in
+/// the header, not the llm's numbered text with the location on top.
+#[test]
+fn skill_restore_renders_content_not_llm_text() {
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let output = format!("{SKILL_LOCATION}\n   1 | # Release\n   2 | Tag it.");
+    let r = restore(
+        &host,
+        SKILL_TOOL,
+        json!({ "name": SKILL_NAME }),
+        &output,
+        None,
+        Vec::new(),
+    );
+    assert_eq!(r.body, SKILL_BODY);
+    assert_eq!(r.header, SKILL_LOCATION);
+}
+
 /// A directory has no skeleton, so index shows the plain listing. Restore must
 /// rebuild that same listing view instead of the index skeleton view, which
 /// would truncate to the index cap and highlight the entries as code.
@@ -378,21 +403,46 @@ fn index_dir_renders_identically_live_and_restored() {
     );
 }
 
-/// Nothing else runs the real plugin's restore, which now reads the chat and
-/// the reason off the ctx. A failed call is kept out of the panel but still
-/// shows its list in the transcript, so both answers render the same.
-#[test_case(false ; "applied")]
-#[test_case(true ; "failed")]
-fn todo_write_restore_renders_the_list(is_error: bool) {
+/// Nothing else runs the real plugin's restore. It draws the call's list into
+/// the chat from its input alone, so a failed call renders the same.
+#[test]
+fn todo_write_restore_renders_the_list() {
     let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
     host.load_source(TODO_TOOL, TODO_SRC).unwrap();
     let input = json!({ "todos": [{ "content": TODO_ITEM, "status": "in_progress" }] });
-    let mut item = in_subagent_load(restore_item(TODO_TOOL, input, "", None, Vec::new()));
-    item.is_error = is_error;
+    let item = in_subagent_load(restore_item(TODO_TOOL, input, "", None, Vec::new()));
 
     let r = run_restore(&host, item);
 
     assert!(r.body.contains(TODO_ITEM), "list missing: {}", r.body);
+}
+
+/// A session load replays a transcript, so its restores run with the panel
+/// closed. Refilling per-session state here would pop the panel open on the
+/// next focus change, resurrecting a list the turn already finished.
+#[test]
+fn todo_load_restore_leaves_the_panel_closed() {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source(TODO_TOOL, TODO_SRC).unwrap();
+    let input = json!({ "todos": [{ "content": TODO_ITEM, "status": "in_progress" }] });
+    run_restore(
+        &host,
+        in_subagent_load(restore_item(TODO_TOOL, input, "", None, Vec::new())),
+    );
+
+    // Focus what a restore-time store would have written: the calling chat's
+    // own ids.
+    let sid = session_ref().id().to_string();
+    host.event_handle().fire_autocmd(
+        "TaskFocusChanged",
+        json!({ "session_id": sid, "id": SUBAGENT_TASK_ID }),
+    );
+    host.load_source("barrier", "").unwrap();
+
+    let opened = host.ui_action_rx().drain().any(
+        |action| matches!(action, UiAction::OpenWin { config, .. } if config.split == Split::Panel),
+    );
+    assert!(!opened, "a load restore must not refill the panel");
 }
 
 const WHICH_TASK_SRC: &str = r#"

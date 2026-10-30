@@ -62,6 +62,7 @@ already done, so `reason` only replaces the text the model reads.
 | `tool_id` | id of the call, empty for nested calls |
 | `tool_kind` | kind the tool declares, like `read`, `edit`, or `execute`. `nil` if it declares none. |
 | `origin` | `"model"`, or `"nested"` when `batch`, `code_execution`, or `maki.agent.call_tool` made the call |
+| `output_mode` | `"compact"` when the result goes to the model, `"full"` when code such as `code_execution` made the call and needs the complete text |
 | `session_id` | session of the call. A subagent's calls arrive as `"model"` under its own session. |
 | `deadline_ms` | milliseconds left before the layer is dropped |
 | `input` | `output` only: the input the call ran with, after every input layer |
@@ -98,12 +99,19 @@ end)
 ### Trimming output
 
 An output layer runs before the output becomes part of the conversation, so what
-it drops is never paid for again:
+it drops is never paid for again.
+
+Calls from code pass through output layers too, with `ctx.output_mode` set to
+`"full"`. Leave that text whole so the script can parse it. Redact secrets in
+both modes:
 
 ```lua
 local MAX = 200
 
 maki.api.set_slot("tool.bash.output", function(prev, out, ctx)
+  if ctx.output_mode == "full" then
+    return prev(out, ctx)
+  end
   local lines = {}
   for line in out.text:gmatch("[^\n]+") do
     if not line:match("^%s*Compiling ") then
@@ -157,13 +165,16 @@ something else. The prompt you see names the rewritten call.
 
 **A layer borrows the tool's capability.** Wrapping `tool.bash.input` decides
 what bash runs, so the plugin holding that layer needs `run`, the capability the
-bash tool declares. A layer from a plugin without it is skipped and the rest of
-the chain still runs. The check happens per call, so a missing grant shows up in
-debug logs rather than as a warning at load.
+bash tool declares. A layer also reads what the model wrote and decides what
+it reads back. An output layer rewrites the result, and an input layer can
+refuse the call with any text or turn a command into `echo`. So every layer
+also needs `session_read` and `session_write`. A layer from a plugin without
+all of it is skipped and the rest of the chain still runs. The check happens per
+call, and the first skip shows a warning naming every missing key.
 
 | Tool | A layer needs |
 | --- | --- |
-| declares a permission, like `bash` | that permission |
+| declares a permission, like `bash` | that permission, `session_read` and `session_write` |
 | declares none: `read`, `batch`, MCP tools, ACP client tools, `tool_search` | every permission |
 
 Declaring no capability does not mean a tool uses none. `batch`,
@@ -332,8 +343,9 @@ result.
 ## Completion sources
 
 The bundled completion plugin offers files after `@`. Other plugins add entries
-through the `completion.sources` slot, which is free to layer. Append your
-sources and pass the list on:
+through the `completion.sources` slot. Layering it needs `session_read`,
+because a source sees what the user is typing. Append your sources and pass
+the list on:
 
 ```lua
 maki.api.set_slot("completion.sources", function(prev, sources)
@@ -341,8 +353,12 @@ maki.api.set_slot("completion.sources", function(prev, sources)
     trigger = "#",
     name = "issues",
     complete = function(query, ctx)
-      local out = maki.fn.jobwait(maki.fn.jobstart({ "gh", "issue", "list", "--search", query }))
+      local id = maki.fn.jobstart({ "gh", "issue", "list", "--search", query })
+      local out = id and maki.fn.jobwait(id)
       local items = {}
+      if not out then
+        return items
+      end
       for num, title in out.stdout:gmatch("(%d+)%s+%S+%s+([^\t]+)") do
         table.insert(items, { text = "#" .. num, label = "#" .. num .. " " .. title })
       end
@@ -371,7 +387,52 @@ true at that point, so a long loop can stop early. `ctx` also carries
 shows no rows, and the error is logged.
 
 `complete` runs with the permissions of the plugin that wrote it, so the example
-needs `run`.
+needs `run` as well.
+
+## Permission prompt
+
+`permission.prompt` fires where the permission prompt would show, once the
+rules and YOLO have had their say. The prompt is its default, so a layer either
+answers for the user or passes the call on:
+
+```lua
+maki.api.set_slot("permission.prompt", function(prev, req, ctx)
+  if req.tool == "bash" and req.input.command:match("^git status") then
+    return { decision = "allow" }
+  end
+  return prev(req, ctx)
+end)
+```
+
+`req` carries `tool`, `tool_id`, `input` and the `scopes` the prompt would ask
+about. A layer answers `decision = "allow"` or `decision = "deny"`, and a
+`"deny"` may carry `guidance`, which the model reads under the plugin's name
+rather than as the user's words. Anything else leaves the call to the prompt.
+
+A verdict settles the call in front of it and records nothing. The prompt's
+own answers, like `"allow_session"` or `"allow_always_global"`, write rules,
+so a layer cannot give them. Allowing `git status` with `allow_session` would
+leave a `git *` rule behind, and a later `git push --force` would never reach
+the layer. To avoid asking its model about the same call twice, a layer can
+cache the exact scopes on its own side.
+
+An escalated call never reaches the layers. When another plugin's
+`tool.*.input` layer returns `ask`, it sent that call to a human on purpose,
+and no `permission.prompt` layer may answer it. Under YOLO those escalated
+calls are the only ones that would reach a layer at all.
+
+`ctx` is the agent ctx of the call. `ctx:session_id()` and `ctx:task_id()` say
+whose call it is, a subagent included, and `maki.agent.session(ctx, ...)` with
+no tools can ask a model, billed to that session.
+
+When a layer allows a call, its tool row shows which plugin allowed it, since
+the user never saw a prompt. A call inside `batch` gets the mark on its own
+line, and a call inside `code_execution` puts it on the script's row. A layer
+that throws, answers something the prompt does not offer, or is still running
+after the same 60 second window, leaves the call to the prompt. Where nobody
+can answer a prompt, as with `maki -p`, the default denies, the same as without
+a layer. Wrapping costs the same as a `tool.<name>.input` layer, see the
+[price table](#rules).
 
 ## Plugin slots
 
@@ -412,8 +473,8 @@ Unloading the owner stops the chain firing, but does not free the name: nobody
 else can take it over, or re-declare it at a cheaper price and inherit the
 layers that trusted the old one.
 
-Names starting with `tool.`, `ui.`, and `agent.` are reserved for maki, which
-fires them at points whose ordering it guarantees.
+Names starting with `tool.`, `ui.`, `agent.`, and `permission.` are reserved for
+maki, which fires them at points whose ordering it guarantees.
 
 Use `maki.api.get_slots()` to see who owns and who wraps each slot.
 

@@ -21,16 +21,26 @@ use std::time::UNIX_EPOCH;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::frame::StoredFrame;
 use crate::id::{MakiId, MakiIdParseError};
 use crate::paths::canonical_key;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::lock::{Lock, LockError};
-use crate::{StateDir, StorageError, atomic_write, now_epoch};
+use crate::{StateDir, StorageError, atomic_write, now_epoch, plans};
 
 const SESSION_VERSION: u32 = 1;
-const LOG_FORMAT_VERSION: u32 = 2;
+/// 3: messages write `kind` as a bare tag with `facts` beside it, records a
+/// v2 reader would skip. Bump it only when an older build would lose data
+/// reading the new shape. Additive changes (new fields, new block types) need
+/// no bump.
+const LOG_FORMAT_VERSION: u32 = 3;
+/// v2 only nests `kind` differently, and messages still read that.
+const OLDEST_LOG_FORMAT_VERSION: u32 = 2;
+/// The refusal is all a user who rolled back across a format bump gets, so
+/// it says which way to go and which format it found.
+const NEWER_LOG_FORMAT: &str = "written by a newer maki, log format";
 pub const SESSIONS_DIR: &str = "sessions";
 const CWD_INDEX_FILE: &str = "cwd_latest.json";
 const CWD_INDEX_STEM: &str = "cwd_latest";
@@ -43,9 +53,13 @@ const NON_SESSION_STEMS: [&str; 2] = [CWD_INDEX_STEM, SCAN_CACHE_STEM];
 pub const SAVE_FAILED: &str = "maki: failed to save session ";
 const DEFAULT_TITLE: &str = "New session";
 const MAX_TITLE_LEN: usize = 60;
+const MAX_RECORDED_ERRORS: usize = 256;
+const MAX_ERROR_BYTES: usize = 16 * 1024;
+const ERROR_TRUNCATED: &str = "…";
 const EPOCH_CHANGED: &str = "messages were rewritten";
 const FILE_CHANGED_UNDERNEATH: &str = "file changed underneath";
 const CURSOR_AHEAD: &str = "cursor ahead of session";
+const FRAME_DROPPED: &str = "frame was dropped";
 const LOG_BLOATED: &str = "too many stale meta records";
 /// Every append leaves a whole meta record behind and only the last one is ever
 /// read. Past this many, the log is rewritten and they all go away at once.
@@ -64,6 +78,11 @@ const ARCHIVE_KEEP: usize = 3;
 const ARCHIVE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// A `msg` line starts with this. Matching the prefix beats parsing the log.
 const MSG_PREFIX: &[u8] = br#"{"t":"msg""#;
+/// The two thinking modes that are neither an effort level nor a token count.
+/// `Display`, `parse_setting` and the provider's thinking picker all spell
+/// them from here, so every surface offers exactly the strings the parser accepts.
+pub const THINKING_OFF: &str = "off";
+pub const THINKING_ADAPTIVE: &str = "adaptive";
 
 /// Hands out the token that tags one append-only run of a message list.
 /// Process wide, so two runs never pick the same number.
@@ -79,6 +98,12 @@ pub enum SessionError {
     Storage(#[from] StorageError),
     #[error("incompatible session version {found} (expected {expected})")]
     VersionMismatch { found: u32, expected: u32 },
+    #[error(
+        "session log {newer} {found}; this build reads up to {latest}",
+        newer = NEWER_LOG_FORMAT,
+        latest = LOG_FORMAT_VERSION
+    )]
+    NewerLogFormat { found: u32 },
     #[error("session ID mismatch: log owns {log_id}, got {given_id}")]
     IdMismatch { log_id: MakiId, given_id: MakiId },
     #[error("session log {path} has header id {raw_id:?} that is not a valid id: {source}")]
@@ -202,6 +227,14 @@ impl SessionClaim {
             warn!(error = %e, session_id = %id, "fresh session left unprotected");
             Self::new(id, sessions_dir, None)
         })
+    }
+
+    /// Whether a writer holds `id` right now. Unlike [`Self::acquire`] it
+    /// never waits and never takes the claim, so a reader asking is never
+    /// slowed down and never gets in a writer's way.
+    pub fn is_held(id: MakiId, dir: &StateDir) -> bool {
+        let path = lock_path(&dir.path().join(SESSIONS_DIR), id);
+        matches!(Lock::acquire_shared(&path), Err(LockError::Held { .. }))
     }
 
     pub fn id(&self) -> MakiId {
@@ -368,6 +401,9 @@ pub struct SessionMeta {
 pub struct HistorySnapshot<M> {
     pub epoch: u64,
     pub messages: Arc<Vec<M>>,
+    /// The prefix the messages were sent under. They are only valid together,
+    /// so every owner of a transcript saves both.
+    pub frame: Option<Arc<StoredFrame>>,
 }
 
 impl<M> HistorySnapshot<M> {
@@ -375,6 +411,7 @@ impl<M> HistorySnapshot<M> {
         Self {
             epoch: next_epoch(),
             messages: Arc::new(messages),
+            frame: None,
         }
     }
 }
@@ -383,6 +420,13 @@ impl<M> Default for HistorySnapshot<M> {
     fn default() -> Self {
         Self::new(Vec::new())
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecordedError {
+    pub message: String,
+    pub timestamp: u64,
+    pub message_count: usize,
 }
 
 /// The conversation collections are private so every change goes through a
@@ -405,6 +449,8 @@ pub struct Session<M, U, T> {
     pub cwd: String,
     pub model: String,
     messages: Arc<Vec<M>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    errors: Vec<RecordedError>,
     pub token_usage: U,
     #[serde(default = "HashMap::new")]
     tool_outputs: HashMap<String, Arc<T>>,
@@ -416,6 +462,8 @@ pub struct Session<M, U, T> {
     usage_by_model: HashMap<String, StoredTokenUsage>,
     #[serde(flatten)]
     pub meta: SessionMeta,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    frame: Option<Arc<StoredFrame>>,
     pub created_at: u64,
     pub updated_at: u64,
     /// Bumped by every mutation, so a checkpoint knows if there is anything
@@ -595,8 +643,8 @@ impl StoredThinking {
     /// config, and the Lua agent API all delegate here.
     pub fn parse_setting(input: &str) -> Result<Self, ThinkingParseError> {
         match input.trim() {
-            "off" => Ok(Self::Off),
-            "adaptive" => Ok(Self::Adaptive),
+            THINKING_OFF => Ok(Self::Off),
+            THINKING_ADAPTIVE => Ok(Self::Adaptive),
             other => {
                 if let Ok(level) = other.parse::<Effort>() {
                     return Ok(Self::Effort { level });
@@ -611,7 +659,19 @@ impl StoredThinking {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Inverse of [`StoredThinking::parse_setting`].
+impl fmt::Display for StoredThinking {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Off => f.write_str(THINKING_OFF),
+            Self::Adaptive => f.write_str(THINKING_ADAPTIVE),
+            Self::Effort { level } => f.write_str(level.as_str()),
+            Self::Budget { tokens } => write!(f, "{tokens}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredSubagent {
     pub tool_use_id: String,
     pub name: String,
@@ -623,6 +683,11 @@ pub struct StoredSubagent {
     pub thinking: Option<StoredThinking>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fast: bool,
+    /// The plugin that opened it, absent on a task a tool call spawned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<Arc<str>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -640,8 +705,15 @@ pub trait TitleSource {
 
 /// A pasted code block bakes `\n` into a title and skews width-based padding
 /// in single-line UI like the picker, so every title entry point calls this.
+/// Titles reach terminals as they are (`maki session list`), and an imported
+/// one may hold anything, so control characters split words too. An ESC or
+/// BEL left in could write the clipboard (OSC 52) or fake a link.
 pub fn normalize_title(title: &str) -> String {
-    title.split_whitespace().collect::<Vec<_>>().join(" ")
+    title
+        .split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub fn generate_title<M: TitleSource>(messages: &[M]) -> String {
@@ -679,10 +751,18 @@ enum LogRecord<M, U, T> {
     },
     #[serde(rename = "msg")]
     Msg { d: M },
+    #[serde(rename = "error")]
+    Error {
+        #[serde(flatten)]
+        d: RecordedError,
+    },
     #[serde(rename = "out")]
     Out { id: String, d: T },
     #[serde(rename = "sub_msg")]
     SubMsg { sub: String, d: M },
+    /// Written only when the frame changes. The last one wins on load.
+    #[serde(rename = "frame")]
+    Frame { d: Arc<StoredFrame> },
     #[serde(rename = "meta")]
     Meta {
         title: String,
@@ -710,12 +790,14 @@ pub struct SessionLog {
     /// truncated, deleted or wrote it, and an append would corrupt it.
     saved_len: u64,
     saved_msg_count: usize,
+    saved_error_count: usize,
     appends: usize,
     saved_tool_ids: HashSet<String>,
     saved_sub_msg_counts: HashMap<String, usize>,
     /// Serialized trailing meta record; lets `append` persist meta-only
     /// changes (title, draft, updated_at) instead of dropping them.
     saved_meta: Vec<u8>,
+    saved_frame: Option<Arc<StoredFrame>>,
 }
 
 fn sub_msg_snapshot<M>(map: &HashMap<String, Arc<Vec<M>>>) -> HashMap<String, usize> {
@@ -959,13 +1041,14 @@ impl SessionLog {
         self.ensure_appendable(session)?;
 
         let mut buf = Vec::new();
-        let mut new_msg_count = self.saved_msg_count;
         let mut new_tool_ids = Vec::new();
 
-        for msg in &session.messages[self.saved_msg_count..] {
-            append_record(&mut buf, &LogRecord::<&M, &U, &T>::Msg { d: msg })?;
-            new_msg_count += 1;
-        }
+        append_messages_and_errors(
+            &mut buf,
+            session,
+            self.saved_msg_count,
+            self.saved_error_count,
+        )?;
 
         for (id, output) in &session.tool_outputs {
             if !self.saved_tool_ids.contains(id) {
@@ -997,6 +1080,11 @@ impl SessionLog {
             }
         }
 
+        let frame_changed = session.frame != self.saved_frame;
+        if frame_changed && let Some(frame) = &session.frame {
+            append_frame::<M, U, T>(&mut buf, frame)?;
+        }
+
         let meta = meta_record(session)?;
         if buf.is_empty() && meta == self.saved_meta {
             return Ok(());
@@ -1017,12 +1105,16 @@ impl SessionLog {
 
         self.saved_len += buf.len() as u64;
         self.appends += 1;
-        self.saved_msg_count = new_msg_count;
+        self.saved_msg_count = session.messages.len();
+        self.saved_error_count = session.errors.len();
         self.saved_tool_ids.extend(new_tool_ids);
         for (sub_id, count) in new_sub_counts {
             self.saved_sub_msg_counts.insert(sub_id, count);
         }
         self.saved_meta = meta;
+        if frame_changed {
+            self.saved_frame = session.frame.clone();
+        }
 
         Ok(())
     }
@@ -1041,10 +1133,12 @@ impl SessionLog {
             saved_rewrites: session.rewrites,
             saved_len,
             saved_msg_count: session.messages.len(),
+            saved_error_count: session.errors.len(),
             appends: 0,
             saved_tool_ids: session.tool_outputs.keys().cloned().collect(),
             saved_sub_msg_counts: sub_msg_snapshot(&session.subagent_messages),
             saved_meta: meta_record(session).unwrap_or_default(),
+            saved_frame: session.frame.clone(),
         }
     }
 
@@ -1069,6 +1163,8 @@ impl SessionLog {
             FILE_CHANGED_UNDERNEATH
         } else if self.appends >= MAX_APPENDS {
             LOG_BLOATED
+        } else if session.frame.is_none() && self.saved_frame.is_some() {
+            FRAME_DROPPED
         } else if self.cursor_ahead(session) {
             // Nothing shrinks a session without minting a new epoch, so this
             // should never fire. It stays because the slices in `append` would
@@ -1081,7 +1177,8 @@ impl SessionLog {
     }
 
     fn cursor_ahead<M, U, T>(&self, session: &Session<M, U, T>) -> bool {
-        self.saved_msg_count > session.messages.len()
+        self.saved_error_count > session.errors.len()
+            || self.saved_msg_count > session.messages.len()
             || self
                 .saved_tool_ids
                 .iter()
@@ -1093,6 +1190,20 @@ impl SessionLog {
                     .is_none_or(|msgs| count > msgs.len())
             })
     }
+}
+
+fn append_frame<M, U, T>(buf: &mut Vec<u8>, frame: &Arc<StoredFrame>) -> Result<(), SessionError>
+where
+    M: Serialize,
+    U: Serialize,
+    T: Serialize,
+{
+    append_record(
+        buf,
+        &LogRecord::<&M, &U, &T>::Frame {
+            d: Arc::clone(frame),
+        },
+    )
 }
 
 fn meta_record<M, U, T>(session: &Session<M, U, T>) -> Result<Vec<u8>, SessionError>
@@ -1136,9 +1247,7 @@ where
             created_at: session.created_at,
         },
     )?;
-    for msg in session.messages.iter() {
-        append_record(&mut buf, &LogRecord::<&M, &U, &T>::Msg { d: msg })?;
-    }
+    append_messages_and_errors(&mut buf, session, 0, 0)?;
     for (id, output) in &session.tool_outputs {
         append_record(
             &mut buf,
@@ -1159,8 +1268,26 @@ where
             )?;
         }
     }
+    if let Some(frame) = &session.frame {
+        append_frame::<M, U, T>(&mut buf, frame)?;
+    }
     buf.extend_from_slice(&meta_record(session)?);
     file.write_all(&buf).map_err(StorageError::from)?;
+    Ok(())
+}
+
+fn append_messages_and_errors<M: Serialize, U: Serialize, T: Serialize>(
+    buf: &mut Vec<u8>,
+    session: &Session<M, U, T>,
+    first_message: usize,
+    first_error: usize,
+) -> Result<(), SessionError> {
+    for message in &session.messages[first_message..] {
+        append_record(buf, &LogRecord::<&M, &U, &T>::Msg { d: message })?;
+    }
+    for error in &session.errors[first_error..] {
+        append_record(buf, &LogRecord::<&M, &U, &T>::Error { d: error.clone() })?;
+    }
     Ok(())
 }
 
@@ -1182,6 +1309,22 @@ enum RawTag {
     Other,
 }
 
+/// A newer log is refused whole rather than read record by record: the
+/// records this build cannot parse would be skipped, and its next rewrite
+/// would make that loss permanent.
+fn check_log_format(v: u32) -> Result<(), SessionError> {
+    if v > LOG_FORMAT_VERSION {
+        return Err(SessionError::NewerLogFormat { found: v });
+    }
+    if v < OLDEST_LOG_FORMAT_VERSION {
+        return Err(SessionError::VersionMismatch {
+            found: v,
+            expected: LOG_FORMAT_VERSION,
+        });
+    }
+    Ok(())
+}
+
 fn load_jsonl<M, U, T>(data: &[u8], display_path: &str) -> Result<Session<M, U, T>, SessionError>
 where
     M: DeserializeOwned,
@@ -1195,6 +1338,7 @@ where
     let mut cwd = String::new();
     let mut created_at = 0u64;
     let mut messages: Vec<M> = Vec::new();
+    let mut errors = Vec::new();
     let mut tool_outputs = HashMap::new();
     let mut subagent_messages: HashMap<String, Vec<M>> = HashMap::new();
     let mut title = DEFAULT_TITLE.to_string();
@@ -1203,6 +1347,7 @@ where
     let mut subagents = Vec::new();
     let mut usage_by_model = HashMap::new();
     let mut meta = SessionMeta::default();
+    let mut frame = None;
     let mut got_header = false;
 
     for line in data.split(|&b| b == b'\n') {
@@ -1240,12 +1385,7 @@ where
                 cwd: h_cwd,
                 created_at: h_created,
             } => {
-                if v != LOG_FORMAT_VERSION {
-                    return Err(SessionError::VersionMismatch {
-                        found: v,
-                        expected: LOG_FORMAT_VERSION,
-                    });
-                }
+                check_log_format(v)?;
                 id = Some(h_id);
                 model = h_model;
                 cwd = h_cwd;
@@ -1253,12 +1393,14 @@ where
                 got_header = true;
             }
             LogRecord::Msg { d } => messages.push(d),
+            LogRecord::Error { d } => errors.push(d),
             LogRecord::Out { id: out_id, d } => {
                 tool_outputs.insert(out_id, Arc::new(d));
             }
             LogRecord::SubMsg { sub, d } => {
                 subagent_messages.entry(sub).or_default().push(d);
             }
+            LogRecord::Frame { d } => frame = Some(d),
             LogRecord::Meta {
                 title: m_title,
                 token_usage: m_usage,
@@ -1291,6 +1433,7 @@ where
         cwd,
         model,
         messages: Arc::new(messages),
+        errors,
         token_usage,
         tool_outputs,
         subagent_messages: subagent_messages
@@ -1300,6 +1443,7 @@ where
         subagents,
         usage_by_model,
         meta,
+        frame,
         created_at,
         updated_at,
         revision: 0,
@@ -1568,9 +1712,7 @@ fn scan_jsonl_header(path: &Path) -> Option<ScannedHeader> {
         reader.read_line(&mut line).ok()?;
         serde_json::from_str(line.trim_end()).ok()?
     };
-    if header.v != LOG_FORMAT_VERSION {
-        return None;
-    }
+    check_log_format(header.v).ok()?;
 
     let (title, updated_at) =
         read_last_meta(&mut file).unwrap_or_else(|| (DEFAULT_TITLE.to_string(), 0));
@@ -1709,6 +1851,7 @@ where
             cwd: cwd.into(),
             model: model.into(),
             messages: Arc::default(),
+            errors: Vec::new(),
             token_usage: U::default(),
             tool_outputs: HashMap::new(),
             subagent_messages: HashMap::new(),
@@ -1718,6 +1861,7 @@ where
                 mode: Some(StoredMode::Build),
                 ..Default::default()
             },
+            frame: None,
             created_at: now,
             updated_at: now,
             revision: 0,
@@ -1727,7 +1871,39 @@ where
         }
     }
 
+    pub fn errors(&self) -> &[RecordedError] {
+        &self.errors
+    }
+
+    pub fn record_error(&mut self, mut message: String) {
+        if message.len() > MAX_ERROR_BYTES {
+            message.truncate(message.floor_char_boundary(MAX_ERROR_BYTES - ERROR_TRUNCATED.len()));
+            message.push_str(ERROR_TRUNCATED);
+        }
+        let pruned = self.errors.len() >= MAX_RECORDED_ERRORS;
+        if pruned {
+            self.errors
+                .drain(..self.errors.len() - MAX_RECORDED_ERRORS / 2);
+        }
+        self.errors.push(RecordedError {
+            message,
+            timestamp: now_epoch(),
+            message_count: self.messages.len(),
+        });
+        if pruned {
+            self.rewrite();
+        } else {
+            self.touch();
+        }
+    }
+
     pub fn messages(&self) -> &[M] {
+        &self.messages
+    }
+
+    /// The transcript itself rather than a copy, for a reader that keeps it
+    /// past the borrow.
+    pub fn shared_messages(&self) -> &Arc<Vec<M>> {
         &self.messages
     }
 
@@ -1744,6 +1920,20 @@ where
 
     pub fn tool_outputs(&self) -> &HashMap<String, Arc<T>> {
         &self.tool_outputs
+    }
+
+    pub fn frame(&self) -> Option<&Arc<StoredFrame>> {
+        self.frame.as_ref()
+    }
+
+    /// For owners that write whole transcripts instead of mirroring a
+    /// [`HistorySnapshot`].
+    pub fn set_frame(&mut self, frame: Option<Arc<StoredFrame>>) {
+        if self.frame == frame {
+            return;
+        }
+        self.frame = frame;
+        self.touch();
     }
 
     pub fn subagent_messages(&self) -> &HashMap<String, Arc<Vec<M>>> {
@@ -1797,14 +1987,30 @@ where
     /// for the turns it runs, and counting the original's again would bill them
     /// twice. The epoch is minted fresh because no append cursor into the file
     /// this was read from says anything about the new one.
-    pub fn fork(mut self, id: MakiId, cwd: &str) -> Self {
+    ///
+    /// The fork runs beside the original, so nothing the original still owns
+    /// can be shared. Queued prompts stay behind, or both would run them. The
+    /// plan is copied into a file of its own, or planning in one would write
+    /// over the other's.
+    pub fn fork(mut self, id: MakiId, cwd: &str, storage: &StateDir) -> Result<Self, StorageError> {
+        self.meta.queued_messages.clear();
+        if let Some(plan_path) = &mut self.meta.plan_path {
+            let own_path = plans::new_plan_path(storage)?;
+            // A plan mode session that has not written its plan yet has no file.
+            if let Err(e) = fs::copy(&*plan_path, &own_path)
+                && e.kind() != ErrorKind::NotFound
+            {
+                return Err(e.into());
+            }
+            *plan_path = own_path.to_string_lossy().into_owned();
+        }
         self.id = id;
         self.cwd = cwd.into();
         self.token_usage = U::default();
         self.usage_by_model.clear();
         self.created_at = now_epoch();
         self.rewrite_messages();
-        self
+        Ok(self)
     }
 
     pub fn push_message(&mut self, msg: M) {
@@ -1827,8 +2033,9 @@ where
 
     /// Adopting a producer's snapshot inherits its run token, so the log's
     /// cursors survive exactly when the snapshot was an append.
-    fn set_history(&mut self, snapshot: &HistorySnapshot<M>) {
+    pub fn set_history(&mut self, snapshot: &HistorySnapshot<M>) {
         self.messages = Arc::clone(&snapshot.messages);
+        self.frame = snapshot.frame.clone();
         self.epoch = snapshot.epoch;
         self.touch();
     }
@@ -1847,7 +2054,10 @@ where
         U: PartialEq + Clone,
         T: Clone,
     {
-        let history = history.filter(|h| !Arc::ptr_eq(&this.messages, &h.messages));
+        let history = history.filter(|h| {
+            !Arc::ptr_eq(&this.messages, &h.messages)
+                || this.frame.as_ref().map(Arc::as_ptr) != h.frame.as_ref().map(Arc::as_ptr)
+        });
         if history.is_none() && this.meta == meta && this.token_usage == token_usage {
             return;
         }
@@ -1872,12 +2082,26 @@ where
         }
     }
 
-    pub fn set_subagent_messages(&mut self, id: String, msgs: Vec<M>) {
-        if self.subagent_messages.insert(id, Arc::new(msgs)).is_some() {
-            self.rewrite();
-        } else {
-            self.touch();
-        }
+    /// A transcript that only grew is appended like the main log. A plugin
+    /// task hands its whole history over after every prompt, so without this
+    /// each prompt would rewrite the session file. Anything else (a
+    /// compaction, a rewritten turn) still starts the file over.
+    pub fn set_subagent_messages(&mut self, id: String, msgs: Vec<M>)
+    where
+        M: PartialEq,
+    {
+        let grew = match self.subagent_messages.get(&id) {
+            Some(old) if msgs.starts_with(old) => {
+                if msgs.len() == old.len() {
+                    return;
+                }
+                true
+            }
+            Some(_) => false,
+            None => true,
+        };
+        self.subagent_messages.insert(id, Arc::new(msgs));
+        if grew { self.touch() } else { self.rewrite() }
     }
 
     fn set_token_usage(&mut self, usage: U)
@@ -1909,6 +2133,23 @@ where
         }
         self.subagents = subagents;
         self.touch();
+    }
+
+    /// An append cannot take a transcript back out of the log, so this is a
+    /// rewrite. The subagent's tool outputs live in the shared map and are
+    /// most of its weight, so they go too.
+    pub fn remove_subagent(&mut self, id: &str, tool_ids: impl Fn(&M) -> Vec<String>) {
+        let removed = self.subagent_messages.remove(id);
+        if let Some(msgs) = &removed {
+            let stale: HashSet<String> = msgs.iter().flat_map(&tool_ids).collect();
+            self.tool_outputs
+                .retain(|tool_id, _| !stale.contains(tool_id));
+        }
+        let len = self.subagents.len();
+        self.subagents.retain(|sa| sa.tool_use_id != id);
+        if removed.is_some() || self.subagents.len() != len {
+            self.rewrite();
+        }
     }
 
     pub fn usage_by_model(&self) -> &HashMap<String, StoredTokenUsage> {
@@ -1957,21 +2198,27 @@ where
     /// After `messages` is truncated (rewind), state keyed by tool_use_id can
     /// point at calls that no longer exist. On restore that shows up as ghost
     /// subagent tabs and leaked tool outputs, so this drops everything not
-    /// reachable from `messages`.
+    /// reachable from `messages`. A plugin task is never reachable from them:
+    /// its plugin runs it beside the chat, so a rewind leaves it alone.
     ///
     /// If you add another field keyed by tool_use_id, prune it here too.
     pub fn prune_orphans(&mut self, tool_ids: impl Fn(&M) -> Vec<String>) {
-        let main_ids: HashSet<String> = self.messages.iter().flat_map(&tool_ids).collect();
-        self.subagent_messages.retain(|id, _| main_ids.contains(id));
-        self.subagents
-            .retain(|sa| main_ids.contains(&sa.tool_use_id));
+        let mut kept: HashSet<String> = self.messages.iter().flat_map(&tool_ids).collect();
+        kept.extend(
+            self.subagents
+                .iter()
+                .filter(|sa| sa.plugin.is_some())
+                .map(|sa| sa.tool_use_id.clone()),
+        );
+        self.subagent_messages.retain(|id, _| kept.contains(id));
+        self.subagents.retain(|sa| kept.contains(&sa.tool_use_id));
 
         let live: HashSet<String> = self
             .subagent_messages
             .values()
             .flat_map(|msgs| msgs.iter())
             .flat_map(&tool_ids)
-            .chain(main_ids)
+            .chain(kept)
             .collect();
         self.tool_outputs.retain(|id, _| live.contains(id));
         self.rewrite();
@@ -2146,24 +2393,28 @@ where
 #[cfg(test)]
 mod tests {
     use super::Effort;
+    use super::StoredFrame;
     use super::StoredThinking;
     use super::ThinkingParseError;
     #[cfg(unix)]
     use super::canonical_key;
     use super::{
-        ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DEFAULT_TITLE, LOG_BLOATED,
-        MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR, StoredSubagent,
-        TAIL_BUF, generate_title, json_path, jsonl_path, load_cwd_index, lock_path, locks_dir,
-        next_epoch, update_cwd_index, write_full_session,
+        ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DEFAULT_TITLE,
+        ERROR_TRUNCATED, LOG_BLOATED, MAX_APPENDS, MAX_ERROR_BYTES, MAX_RECORDED_ERRORS,
+        MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR, StoredSubagent, TAIL_BUF,
+        generate_title, json_path, jsonl_path, load_cwd_index, lock_path, locks_dir, next_epoch,
+        update_cwd_index, write_full_session,
     };
     use super::{
-        HistorySnapshot, SCAN_CACHE_FILE, Session, SessionClaim, SessionError, SessionLog,
-        SessionMeta, StorageError, TitleSource,
+        HistorySnapshot, LOG_FORMAT_VERSION, NEWER_LOG_FORMAT, OLDEST_LOG_FORMAT_VERSION,
+        SCAN_CACHE_FILE, Session, SessionClaim, SessionError, SessionLog, SessionMeta,
+        StorageError, TitleSource, check_log_format,
     };
     use crate::StateDir;
+    use crate::frame::PromptFacts;
     use crate::id::MakiId;
-    use serde_json::Value;
-    use std::collections::HashMap;
+    use serde_json::{Value, json};
+    use std::collections::{BTreeMap, HashMap};
     use std::fs::{self, OpenOptions};
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -2176,6 +2427,8 @@ mod tests {
     const LEGACY_HEX_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
     const SONNET_COST: f64 = 0.42;
     const HAIKU_COST: f64 = 0.08;
+    const FIRST_FAILURE: &str = "first provider failure";
+    const SECOND_FAILURE: &str = "second provider failure";
     const TAMPERED_TITLE: &str = "tampered cached title";
     const LOCK_WHILE_HELD: &str = "a held claim is a lock file another process can see";
     const NO_ORPHAN_LOCK: &str = "an id with no transcript must not leave a lock behind";
@@ -2183,10 +2436,16 @@ mod tests {
     const READ_UNDER_CLAIM: &str = "the transcript must be read under a claim still held";
     const SHARED_CLAIM_HELD: &str = "a claim is held until its last clone drops";
     const PENDING_DRAFT: &str = "half typed thought";
+    const QUEUED_PROMPT: &str = "and then the tests";
+    const FORK_PLAN: &str = "1. split the parser";
     /// Two of these already break the byte budget.
     const FAKE_ARCHIVE_BYTES: u64 = ARCHIVE_MAX_BYTES / 2;
     const EXISTING_ARCHIVE_SEQ: u64 = 7;
     const ALL_RECORDED: usize = usize::MAX;
+    const FRAME_TAG: &str = r#""t":"frame""#;
+    const FRAME_SYSTEM: &str = "system";
+    const NEXT_FRAME_SYSTEM: &str = "system after compaction";
+    const LATE_MCP_TOOLS: [&str; 3] = ["github__search", "linear__issue", "sentry__events"];
 
     impl TitleSource for Value {
         fn first_user_text(&self) -> Option<&str> {
@@ -2248,44 +2507,115 @@ mod tests {
         fn ids(m: &Value) -> Vec<String> {
             vec![m.as_str().unwrap().to_owned()]
         }
-        fn subagent(id: &str) -> StoredSubagent {
+        fn subagent(id: &str, plugin: Option<&str>) -> StoredSubagent {
             StoredSubagent {
                 tool_use_id: id.into(),
                 name: "sub".into(),
                 model: None,
                 thinking: None,
                 fast: false,
+                plugin: plugin.map(Arc::from),
+                cost: None,
             }
         }
 
         let mut session: TestSession = Session::new("model", "/p");
         session.push_message("task-live".into());
-        session
-            .subagent_messages
-            .insert("task-live".into(), Arc::new(vec!["sub-tool".into()]));
-        session
-            .subagent_messages
-            .insert("task-stale".into(), Arc::new(vec!["stale-sub-tool".into()]));
-        session.set_subagents(vec![subagent("task-live"), subagent("task-stale")]);
-        for id in ["task-live", "sub-tool", "stale-sub-tool", "orphan"] {
+        for (task, tool) in [
+            ("task-live", "sub-tool"),
+            ("task-stale", "stale-sub-tool"),
+            ("session-monitor", "monitor-tool"),
+        ] {
+            session
+                .subagent_messages
+                .insert(task.into(), Arc::new(vec![tool.into()]));
+        }
+        session.set_subagents(vec![
+            subagent("task-live", None),
+            subagent("task-stale", None),
+            subagent("session-monitor", Some("ci")),
+        ]);
+        for id in [
+            "task-live",
+            "sub-tool",
+            "stale-sub-tool",
+            "monitor-tool",
+            "orphan",
+        ] {
             session.insert_tool_output(id.into(), Arc::new(Value::Null));
         }
 
         session.prune_orphans(ids);
 
-        assert_eq!(
-            session.subagent_messages().keys().collect::<Vec<_>>(),
-            ["task-live"]
-        );
+        let mut transcripts: Vec<_> = session.subagent_messages().keys().collect();
+        transcripts.sort();
+        assert_eq!(transcripts, ["session-monitor", "task-live"]);
         let subagent_ids: Vec<_> = session
             .subagents()
             .iter()
             .map(|sa| sa.tool_use_id.as_str())
             .collect();
-        assert_eq!(subagent_ids, ["task-live"]);
+        assert_eq!(subagent_ids, ["task-live", "session-monitor"]);
         let mut outputs: Vec<_> = session.tool_outputs().keys().cloned().collect();
         outputs.sort();
-        assert_eq!(outputs, ["sub-tool", "task-live"]);
+        assert_eq!(outputs, ["monitor-tool", "sub-tool", "task-live"]);
+    }
+
+    #[test_case(false ; "append")]
+    #[test_case(true ; "rewrite")]
+    fn recorded_errors_keep_their_time_and_transcript_position(rewrite: bool) {
+        let root = TempDir::new().unwrap();
+        let dir = root.path();
+        let mut session: TestSession = Session::new("model", "/project");
+        session.push_message(user_message("first"));
+        let claim = claim_for(dir, &session);
+        let mut log = SessionLog::rewrite(dir, &claim, &session).unwrap();
+        session.record_error(FIRST_FAILURE.into());
+        session.push_message(user_message("second"));
+        session.record_error(SECOND_FAILURE.into());
+        if rewrite {
+            SessionLog::rewrite(dir, &claim, &session).unwrap();
+        } else {
+            log.append(&claim, &session).unwrap();
+        }
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_eq!(loaded.errors(), session.errors());
+        assert_eq!(loaded.errors()[0].message_count, 1);
+        assert_eq!(loaded.errors()[1].message_count, 2);
+        assert!(loaded.errors().iter().all(|error| error.timestamp > 0));
+        let records: Vec<Value> = fs::read_to_string(jsonl_path(dir, session.id))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let tags: Vec<_> = records
+            .iter()
+            .map(|record| record["t"].as_str().unwrap())
+            .filter(|tag| matches!(*tag, "msg" | "error"))
+            .collect();
+        assert_eq!(tags, ["msg", "msg", "error", "error"]);
+    }
+
+    #[test]
+    fn recorded_errors_have_bounded_retention_and_utf8_safe_text() {
+        let root = TempDir::new().unwrap();
+        let dir = root.path();
+        let mut session: TestSession = Session::new("model", "/project");
+        let claim = claim_for(dir, &session);
+        for _ in 0..MAX_RECORDED_ERRORS {
+            session.record_error(FIRST_FAILURE.into());
+        }
+        claim.persist(&session).unwrap();
+        let epoch = session.rewrites;
+        session.record_error("é".repeat(MAX_ERROR_BYTES));
+        assert!(session.rewrites > epoch);
+        assert!(session.errors().len() <= MAX_RECORDED_ERRORS);
+        let message = &session.errors().last().unwrap().message;
+        assert!(message.len() <= MAX_ERROR_BYTES);
+        assert!(message.ends_with(ERROR_TRUNCATED));
+        claim.persist(&session).unwrap();
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_eq!(loaded.errors(), session.errors());
     }
 
     #[test]
@@ -2493,8 +2823,11 @@ mod tests {
         session.token_usage = Value::from(1_000);
         session.add_model_usage("m", usage(1_000, Some(SONNET_COST)));
         let id = MakiId::generate();
+        let tmp = TempDir::new().unwrap();
 
-        let forked = session.fork(id, FORK_CWD);
+        let forked = session
+            .fork(id, FORK_CWD, &StateDir::from_path(tmp.path().to_path_buf()))
+            .unwrap();
 
         assert_eq!(forked.id, id);
         assert_eq!(forked.cwd, FORK_CWD);
@@ -2502,6 +2835,35 @@ mod tests {
         assert!(forked.tool_outputs().contains_key(TOOL_ID));
         assert_eq!(forked.token_usage, Value::default());
         assert!(forked.usage_by_model().is_empty());
+    }
+
+    /// A fork runs beside the original, so it leaves the queue to the original
+    /// and plans in a file of its own, starting from the plan so far if there
+    /// is one.
+    #[test_case(Some(FORK_PLAN) ; "written_plan_is_copied")]
+    #[test_case(None ; "unwritten_plan_gets_a_fresh_path")]
+    fn fork_shares_neither_the_queue_nor_the_plan_file(plan: Option<&str>) {
+        let tmp = TempDir::new().unwrap();
+        let original_plan = tmp.path().join("original.md");
+        if let Some(plan) = plan {
+            fs::write(&original_plan, plan).unwrap();
+        }
+        let mut session: TestSession = Session::new("m", "/project");
+        session.meta.queued_messages = vec![QUEUED_PROMPT.into()];
+        session.meta.plan_path = Some(original_plan.to_string_lossy().into_owned());
+
+        let forked = session
+            .fork(
+                MakiId::generate(),
+                "/project",
+                &StateDir::from_path(tmp.path().to_path_buf()),
+            )
+            .unwrap();
+
+        assert!(forked.meta.queued_messages.is_empty());
+        let fork_plan = PathBuf::from(forked.meta.plan_path.unwrap());
+        assert_ne!(fork_plan, original_plan);
+        assert_eq!(fs::read_to_string(&fork_plan).ok().as_deref(), plan);
     }
 
     #[test]
@@ -2550,6 +2912,7 @@ mod tests {
         let run = HistorySnapshot {
             epoch: next_epoch(),
             messages: Arc::new(vec![user_message("hi")]),
+            frame: None,
         };
         let meta = session.meta.clone();
         Session::checkpoint(&mut session, Some(&run), meta.clone(), Value::Null);
@@ -2562,11 +2925,85 @@ mod tests {
         let advanced = HistorySnapshot {
             epoch: run.epoch,
             messages: Arc::new(vec![user_message("hi"), assistant_message("reply")]),
+            frame: None,
         };
         Session::checkpoint(&mut session, Some(&advanced), meta, Value::Null);
         write_through(&mut log, dir, &session);
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_same_session(&loaded, &session);
+    }
+
+    fn frame_with_system(system: &str) -> StoredFrame {
+        StoredFrame::new(
+            system.into(),
+            "hash".into(),
+            Some(PromptFacts {
+                date: "2026-10-02".into(),
+                cwd: "/project".into(),
+                model: "m".into(),
+                instructions: " \n".into(),
+                hints: BTreeMap::from([("memory/tags".into(), "rust, cache".into())]),
+            }),
+            Vec::new(),
+        )
+    }
+
+    /// The agent sets a frame, or grows it with late MCP tools, without adding
+    /// a message. That snapshot still has to reach disk, or a resumed session
+    /// sends tools its thinking was never signed under. A frame that stayed
+    /// the same is not written again when the next message comes.
+    #[test]
+    fn frame_only_snapshots_are_checkpointed_and_appended() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut produced = HistorySnapshot::new(vec![user_message("hi")]);
+        let mut session: Arc<TestSession> = Arc::new(Session::new("m", "/project"));
+        let meta = session.meta.clone();
+        Session::checkpoint(&mut session, Some(&produced), meta.clone(), Value::Null);
+        let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
+
+        let mut frame = frame_with_system(FRAME_SYSTEM);
+        for name in LATE_MCP_TOOLS {
+            frame
+                .mcp_tools
+                .push(json!({"name": name, "input_schema": {"type": "object"}}));
+            produced.frame = Some(Arc::new(frame.clone()));
+            Session::checkpoint(&mut session, Some(&produced), meta.clone(), Value::Null);
+            log.append(&claim_for(dir, &session), &session).unwrap();
+        }
+        produced.messages = Arc::new(vec![user_message("hi"), assistant_message("reply")]);
+        Session::checkpoint(&mut session, Some(&produced), meta, Value::Null);
+        log.append(&claim_for(dir, &session), &session).unwrap();
+
+        let raw = fs::read_to_string(jsonl_path(dir, session.id)).unwrap();
+        assert_eq!(raw.matches(FRAME_TAG).count(), LATE_MCP_TOOLS.len());
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_same_session(&loaded, &session);
+    }
+
+    /// Compaction drops the frame and may set the next one before the writer
+    /// runs. An append cannot erase a frame record, so the log must never let
+    /// the old one win on load.
+    #[test_case(None ; "dropped_loads_none")]
+    #[test_case(Some(NEXT_FRAME_SYSTEM) ; "replaced_after_a_drop_loads_the_new_one")]
+    fn a_dropped_frame_is_never_resurrected_by_the_log(next_system: Option<&str>) {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.push_message(user_message("hi"));
+        session.set_frame(Some(Arc::new(frame_with_system(FRAME_SYSTEM))));
+        let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
+
+        session.set_frame(None);
+        let next = next_system.map(|system| Arc::new(frame_with_system(system)));
+        session.set_frame(next.clone());
+        write_through(&mut log, dir, &session);
+        session.push_message(assistant_message("reply"));
+        write_through(&mut log, dir, &session);
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_eq!(loaded.frame(), next.as_ref());
         assert_same_session(&loaded, &session);
     }
 
@@ -2584,6 +3021,35 @@ mod tests {
         write_through(&mut log, dir, &session);
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_same_session(&loaded, &session);
+    }
+
+    /// The whole transcript comes back after every prompt of a plugin task.
+    /// One that only grew appends its tail; one handed over unchanged is not
+    /// even a write.
+    #[test]
+    fn extending_subagent_messages_appends_to_the_log() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
+        session.set_subagent_messages("sub-1".into(), vec![user_message("first")]);
+        write_through(&mut log, dir, &session);
+        let (rewrites, revision) = (session.rewrites, session.revision);
+
+        session.set_subagent_messages("sub-1".into(), vec![user_message("first")]);
+        assert_eq!(session.revision, revision);
+
+        session.set_subagent_messages(
+            "sub-1".into(),
+            vec![user_message("first"), assistant_message("reply")],
+        );
+        assert_eq!(session.rewrites, rewrites);
+        assert!(session.revision > revision);
+        log.append(&claim_for(dir, &session), &session).unwrap();
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_eq!(loaded.subagent_messages["sub-1"].len(), 2);
         assert_same_session(&loaded, &session);
     }
 
@@ -3139,6 +3605,7 @@ mod tests {
         ; "long_truncates_at_word"
     )]
     #[test_case("one\n\ntwo\t three", "one two three" ; "whitespace_collapses")]
+    #[test_case("a\u{1b}]52;c;eA==\u{7}b\u{9b}c", "a ]52;c;eA== b c" ; "control_characters_never_reach_a_terminal")]
     fn title_extraction(input: &str, expected: &str) {
         let messages: Vec<Value> = if input.is_empty() {
             vec![]
@@ -3684,12 +4151,13 @@ mod tests {
     }
 
     #[test]
-    fn load_wrong_version_jsonl_returns_error() {
+    fn load_newer_version_jsonl_names_the_format() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
+        let found = LOG_FORMAT_VERSION + 1;
         let bad_header = serde_json::json!({
             "t": "header",
-            "v": 999,
+            "v": found,
             "id": "01965087-4c71-7f00-8000-000000000000",
             "model": "m",
             "cwd": "/tmp",
@@ -3700,10 +4168,20 @@ mod tests {
         fs::write(&path, format!("{}\n", bad_header)).unwrap();
 
         let err = TestSession::load_from(id, dir).unwrap_err();
-        assert!(matches!(
-            err,
-            SessionError::VersionMismatch { found: 999, .. }
-        ));
+        assert!(matches!(err, SessionError::NewerLogFormat { found: f } if f == found));
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("{NEWER_LOG_FORMAT} {found}")),
+            "{message}"
+        );
+    }
+
+    #[test_case(OLDEST_LOG_FORMAT_VERSION, true      ; "oldest_still_read")]
+    #[test_case(LOG_FORMAT_VERSION, true             ; "current_read")]
+    #[test_case(OLDEST_LOG_FORMAT_VERSION - 1, false ; "older_than_oldest_refused")]
+    #[test_case(LOG_FORMAT_VERSION + 1, false        ; "newer_refused")]
+    fn log_format_versions_this_build_reads(v: u32, readable: bool) {
+        assert_eq!(check_log_format(v).is_ok(), readable);
     }
 
     #[test_case(StoredThinking::Off ; "off")]
@@ -3872,8 +4350,9 @@ mod tests {
         assert_eq!(loaded.messages().len(), 2);
     }
 
-    #[test]
-    fn unknown_record_type_is_skipped() {
+    #[test_case(br#"{"t":"future_type","d":{}}"# ; "unknown_type")]
+    #[test_case(br#"{"t":"frame","d":{"system":"s"}}"# ; "malformed_frame")]
+    fn unparseable_record_is_skipped(record: &[u8]) {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
@@ -3882,8 +4361,8 @@ mod tests {
 
         let path = jsonl_path(dir, session.id);
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
-        file.write_all(b"{\"t\":\"future_type\",\"d\":{}}\n")
-            .unwrap();
+        file.write_all(record).unwrap();
+        file.write_all(b"\n").unwrap();
         drop(file);
         append_raw_msg(&path, user_message("second"));
 
@@ -3948,7 +4427,7 @@ mod tests {
 
     const PROPERTY_SEED: u64 = 0x2545_F491_4F6C_DD1D;
     const PROPERTY_STEPS: usize = 500;
-    const MUTATION_KINDS: u64 = 8;
+    const MUTATION_KINDS: u64 = 10;
     const EXTERNAL_TRUNCATION: u64 = 12;
 
     /// Deterministic xorshift so a failure is always the same failure.
@@ -4001,6 +4480,7 @@ mod tests {
         );
         assert_eq!(loaded.title, expected.title, "title");
         assert_eq!(loaded.meta, expected.meta, "meta");
+        assert_eq!(loaded.frame(), expected.frame(), "frame");
         assert_eq!(loaded.updated_at, expected.updated_at, "updated_at");
     }
 
@@ -4026,6 +4506,13 @@ mod tests {
             }
             5 => session.replace_messages(vec![user_message(&format!("fresh-{step}"))]),
             6 => session.prune_orphans(tool_ids),
+            7 => session.set_frame(Some(Arc::new(StoredFrame::new(
+                format!("system-{step}"),
+                format!("hash-{step}"),
+                Default::default(),
+                Vec::new(),
+            )))),
+            8 => session.set_frame(None),
             _ => {
                 session.set_title(format!("title-{step}"));
                 session.set_meta(SessionMeta {

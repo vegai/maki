@@ -5,14 +5,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol_schema::{
+use agent_client_protocol_schema::v1::{
     AgentNotification, AgentRequest, AgentResponse, ConfigOptionUpdate, ContentBlock,
     CurrentModeUpdate, EmbeddedResourceResource, Error as AcpError, ImageContent,
     InitializeRequest, JsonRpcMessage, LoadSessionRequest, McpServer, NewSessionRequest,
     Notification, PromptRequest, PromptResponse, Request, RequestId, RequestPermissionRequest,
-    RequestPermissionResponse, Response, SessionId, SessionModeId, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
-    SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent,
+    RequestPermissionResponse, Response, SessionConfigOptionValue, SessionId, SessionModeId,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    TextContent,
 };
 use color_eyre::eyre::Context;
 use flume::{Sender, WeakSender};
@@ -24,13 +25,13 @@ use maki_agent::session::{Resumed, StoredSession};
 use maki_agent::tools::{LocalTool, LocalTools, QUESTION_TOOL_NAME, ToolAudience, local_tool};
 use maki_agent::types::AgentEvent;
 use maki_agent::{
-    AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource, InputSource, SessionEndReason,
-    SessionEvents,
+    AgentInput, AgentMode, CancelToken, Envelope, ImageMediaType, ImageSource, InputSource,
+    SessionEndReason, SessionEvents,
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults, TrustConfig};
 use maki_providers::model::Model;
-use maki_providers::provider::{available_model_specs, fetch_all_models};
+use maki_providers::provider::{ModelListing, available_model_specs, fetch_all_models};
 use maki_providers::{add_cost, settle_session};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
@@ -44,11 +45,6 @@ use tracing::{debug, info, warn};
 use crate::{AcpParams, SessionEndHook, elicitation, methods, permissions, translate};
 
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
-/// We advertise no auth methods, so there is no in-band `authenticate` the
-/// client could run mid-turn: the turn ends and the user re-logins out of band
-/// before prompting again.
-const AUTH_FAILED_MSG: &str =
-    "Authentication failed. Run `maki auth login`, then send the prompt again.";
 /// Turns already recorded were priced when they ran. `always_fast` is a live
 /// config value, so reading it here would reprice history the user paid for at
 /// standard rates. New turns still honour it.
@@ -101,6 +97,7 @@ struct Server {
     model_specs: Vec<String>,
     model_policy: Arc<ModelPolicy>,
     client_elicits_form: bool,
+    client_receives_notices: bool,
     defaults: SessionDefaults,
     session: Option<SessionState>,
     on_session_end: Option<SessionEndHook>,
@@ -136,6 +133,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         model_specs: available_model_specs(&params.model_policy),
         model_policy: Arc::clone(&params.model_policy),
         client_elicits_form: false,
+        client_receives_notices: false,
         defaults: params.defaults,
         session: None,
         on_session_end: params.on_session_end.clone(),
@@ -191,6 +189,7 @@ fn discover_models(policy: Arc<ModelPolicy>, tx: WeakSender<Incoming>) {
                 }
             },
             None,
+            ModelListing::Cached,
         )
         .await;
     })
@@ -261,8 +260,14 @@ async fn handle_request(
 ) {
     let result = match method {
         "initialize" => {
-            srv.client_elicits_form = parse_params::<InitializeRequest>(raw)
-                .is_ok_and(|req| elicitation::supports_form(&req.client_capabilities));
+            let capabilities = parse_params::<InitializeRequest>(raw)
+                .map(|req| req.client_capabilities)
+                .unwrap_or_default();
+            srv.client_elicits_form = elicitation::supports_form(&capabilities);
+            srv.client_receives_notices = capabilities
+                .session
+                .as_ref()
+                .is_some_and(|session| session.notices.is_some());
             Ok(AgentResponse::InitializeResponse(
                 methods::initialize_response(),
             ))
@@ -420,6 +425,7 @@ fn start_session(
     let project_trusted = project_config.is_trusted();
     let permissions_config = maki_config::load_permissions(&project_config);
     let (handle, events) = headless::spawn_interactive(InteractiveParams {
+        shutdown: CancelToken::none(),
         model: params.model.clone(),
         config: params.config.clone(),
         permissions_config,
@@ -430,7 +436,6 @@ fn start_session(
         initial_wd: cwd.clone(),
         resumed,
         claim: claim.clone(),
-        storage: params.storage.clone(),
         yolo: params.yolo,
         system_prompt_override: None,
         append_system_prompt: None,
@@ -446,11 +451,11 @@ fn start_session(
         session_ref.clone(),
         srv.out_tx.clone(),
         Arc::clone(&pending),
-        handle.cancel_tx.clone(),
         cwd,
         maki_storage::paths::home(),
         project_trusted,
         initial_cost,
+        srv.client_receives_notices,
     )
     .detach();
     srv.session = Some(SessionState {
@@ -753,7 +758,10 @@ fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, Acp
         return Err(AcpError::invalid_params().data(json_str(&detail)));
     }
 
-    let spec = req.value.0.to_string();
+    let SessionConfigOptionValue::ValueId { value } = req.value else {
+        return Err(AcpError::invalid_params().data(json_str(&"model must be a value id")));
+    };
+    let spec = value.0.to_string();
     if !srv.model_policy.allows(&spec) {
         return Err(AcpError::invalid_params().data(json_str(&"model is not allowed by policy")));
     }
@@ -890,11 +898,11 @@ fn start_event_pump(
     session_id: SessionRef,
     out_tx: Sender<Value>,
     pending: PendingState,
-    cancel_tx: Sender<()>,
     cwd: PathBuf,
     home: Option<PathBuf>,
     project_trusted: bool,
     initial_cost: Option<f64>,
+    notices: bool,
 ) -> Task<()> {
     smol::spawn(async move {
         let sid = SessionId::from(session_id.to_string());
@@ -982,20 +990,15 @@ fn start_event_pump(
                     );
                     continue;
                 }
-                // A child's auth failure parks its own agent, and the parent is
-                // blocked on that child, so this runs before subagent events
-                // are dropped.
-                AgentEvent::AuthRequired => {
-                    tool_inputs.clear();
-                    if let Some(id) = finish_turn(&pending) {
-                        let error = AcpError::auth_required().data(json_str(&AUTH_FAILED_MSG));
-                        send(&out_tx, Response::<AgentResponse>::new(id, Err(error)));
-                    }
-                    // The agent waits for a re-authentication nothing in this
-                    // protocol can deliver, and it reads no further input until
-                    // that wait ends.
-                    let _ = cancel_tx.try_send(());
-                    continue;
+                AgentEvent::ProviderWaiting { message } => {
+                    let Some(message) = message else {
+                        continue;
+                    };
+                    let text = match subagent {
+                        Some(info) => format!("{}: {message}", info.name),
+                        None => message,
+                    };
+                    translate::provider_waiting(text, notices)
                 }
                 _ if subagent.is_some() => continue,
                 AgentEvent::TextDelta { text } => translate::text_delta(&text),
@@ -1011,6 +1014,9 @@ fn start_event_pump(
                 AgentEvent::ToolOutput { id, content } => translate::tool_output(&id, &content),
                 AgentEvent::ToolDone(event) => translate::tool_done(&event, &cwd, home.as_deref()),
                 AgentEvent::TurnComplete(event) => translate::usage_update(&event, cost_total),
+                AgentEvent::ObservationLine { text } => {
+                    translate::notice(&MakiId::generate().to_string(), &text)
+                }
                 AgentEvent::Done { reason, .. } => {
                     tool_inputs.clear();
                     if let Some(id) = finish_turn(&pending) {
@@ -1022,13 +1028,18 @@ fn start_event_pump(
                     }
                     continue;
                 }
-                AgentEvent::Error { message } => {
+                AgentEvent::Error { message, auth } => {
                     // A turn that dies on a provider 500 never reaches `Done`,
                     // and the pump outlives the session, so without this the
                     // whole file a `write` was carrying stays pinned forever.
                     tool_inputs.clear();
                     if let Some(id) = finish_turn(&pending) {
-                        let error = AcpError::internal_error().data(Value::String(message));
+                        let error = if auth {
+                            AcpError::auth_required()
+                        } else {
+                            AcpError::internal_error()
+                        };
+                        let error = error.data(Value::String(message));
                         send(&out_tx, Response::<AgentResponse>::new(id, Err(error)));
                     }
                     continue;
@@ -1320,7 +1331,7 @@ mod tests {
         let (out_tx, out_rx) = flume::unbounded();
         let claim = SessionClaim::fresh(&StateDir::from_path(FIXTURE_CLAIMS.path().to_path_buf()));
         let handle = InteractiveHandle {
-            tool_names: Vec::new(),
+            ready: flume::unbounded().1,
             input_tx: flume::unbounded().0,
             answer_tx,
             cancel_tx: flume::unbounded().0,
@@ -1339,6 +1350,7 @@ mod tests {
             model_specs: Vec::new(),
             model_policy: Arc::new(ModelPolicy::default()),
             client_elicits_form: false,
+            client_receives_notices: false,
             defaults: SessionDefaults::default(),
             on_session_end: None,
             session: Some(SessionState {
@@ -1437,13 +1449,14 @@ mod tests {
 
     const PUMP_CWD: &str = "/project";
     const QUEUED_TEXT: &str = "queued before close";
+    const NOTICE_LINE: &str = "Background agent finished: find auth";
+    const CHILD_NOTICE_LINE: &str = "a child's own notice";
+    const HOST_NOTICE: &str = "the prompt changed, so the cache starts over";
     const PROMPT_ID: i64 = 7;
     const SUBAGENT_COST: f64 = 0.25;
     const TURN_COST: f64 = 0.5;
     const CONTEXT_WINDOW: u32 = 200_000;
     const PARENT_TOOL_USE_ID: &str = "toolu_1";
-    const NEXT_PROMPT_ID: i64 = 8;
-    const PROMPT_TEXT: &str = "rename foo to bar";
     /// A string id no ask can ever carry, since ours are minted as numbers.
     const UNANSWERABLE_ID: &str = "not-an-id";
     const SUBAGENT_NAME: &str = "task";
@@ -1469,26 +1482,16 @@ mod tests {
             session.handle.session_id.clone(),
             srv.out_tx.clone(),
             Arc::clone(&session.pending),
-            session.handle.cancel_tx.clone(),
             PathBuf::from(PUMP_CWD),
             None,
             PUMP_TRUSTED,
             initial_cost,
+            srv.client_receives_notices,
         );
         let sender = guard.sender(0);
         feed(&sender);
         drop(guard);
         smol::block_on(pump);
-    }
-
-    fn prompt_request(srv: &Server) -> Value {
-        let session = srv.session.as_ref().expect("a session is installed");
-        serde_json::json!({
-            "params": {
-                "sessionId": session.handle.session_id.to_string(),
-                "prompt": [{ "type": "text", "text": PROMPT_TEXT }],
-            }
-        })
     }
 
     fn turn_complete(cost: f64) -> Box<TurnCompleteEvent> {
@@ -1663,17 +1666,21 @@ mod tests {
         let session = srv.session.as_ref().expect("a session is installed");
         let (guard, _events) = maki_agent::event_stream();
         let event_tx = guard.sender(0);
-        let rx = async_lock::Mutex::new(answer_rx.clone());
+        let rx = smol::lock::Mutex::new(answer_rx.clone());
         smol::block_on(session.handle.permissions.enforce(
             &ToolKey::native(NEXT_TURN_TOOL),
             &PermissionScopes::single(NEXT_TURN_SCOPE.to_owned()),
+            None,
             &event_tx,
             Some(&rx),
             request_id,
             &CancelToken::none(),
             None,
             None,
+            None,
         ))
+        // No layers here, so nothing can have answered in a plugin's name.
+        .map(|_| ())
     }
 
     fn queue_answer(srv: &Server, request_id: &str, answer: PermissionAnswer) {
@@ -1789,12 +1796,139 @@ mod tests {
         assert!(pending(&srv).lock().unwrap().prompt.is_none());
     }
 
+    /// An accepted observation's line arrives as a finished card, in the order
+    /// the agent sent it, and the turn's permission and answer routing stay as
+    /// they were. A host notice is not sent, and a child's line stays in the
+    /// child, like the rest of its stream.
+    #[test]
+    fn an_accepted_notice_reaches_the_client_in_stream_order() {
+        let (srv, .., out_rx) = test_server();
+        pending(&srv).lock().unwrap().prompt = Some(RequestId::Number(PROMPT_ID));
+        run_pump(&srv, None, |sender| {
+            sender
+                .send(AgentEvent::ObservationLine {
+                    text: NOTICE_LINE.to_owned(),
+                })
+                .unwrap();
+            sender
+                .send(AgentEvent::Notice {
+                    text: HOST_NOTICE.to_owned(),
+                })
+                .unwrap();
+            sender
+                .send_envelope(Envelope {
+                    event: AgentEvent::ObservationLine {
+                        text: CHILD_NOTICE_LINE.to_owned(),
+                    },
+                    subagent: Some(subagent(None)),
+                    run_id: 0,
+                })
+                .unwrap();
+            sender
+                .send(AgentEvent::TextDelta {
+                    text: QUEUED_TEXT.to_owned(),
+                })
+                .unwrap();
+            sender.send(write_tool_start(PARENT_TOOL_USE_ID)).unwrap();
+            sender.send(permission_request(PARENT_TOOL_USE_ID)).unwrap();
+            sender.send(done_event()).unwrap();
+        });
+
+        let wire: Vec<Value> = out_rx.try_iter().collect();
+        let text = serde_json::to_value(translate::text_delta(QUEUED_TEXT)).unwrap();
+        assert_eq!(wire.len(), 5, "{wire:?}");
+        let card = &wire[0]["params"]["update"];
+        assert_eq!(card["sessionUpdate"], "tool_call");
+        assert_eq!(card["title"], NOTICE_LINE);
+        assert_eq!(card["status"], "completed");
+        assert_eq!(wire[1]["params"]["update"], text);
+        assert_eq!(
+            wire[2]["params"]["update"]["sessionUpdate"],
+            "tool_call_update"
+        );
+        assert_eq!(wire[3]["method"], "session/request_permission");
+        assert_eq!(
+            wire[3]["params"]["toolCall"]["title"],
+            MAIN_PERMISSION_TITLE
+        );
+        assert_eq!(wire[4]["id"], PROMPT_ID);
+        assert_eq!(wire[4]["result"]["stopReason"], "end_turn");
+    }
+
+    /// Clients only prompt a login on `auth_required`, so a rejected credential
+    /// must not come back as a generic failure.
+    #[test_case(true, AcpError::auth_required() ; "auth_error_asks_for_a_login")]
+    #[test_case(false, AcpError::internal_error() ; "other_error_is_internal")]
+    fn a_failed_turn_answers_the_prompt_with_its_error_kind(auth: bool, expected: AcpError) {
+        let (srv, .., out_rx) = test_server();
+        pending(&srv).lock().unwrap().prompt = Some(RequestId::Number(PROMPT_ID));
+        run_pump(&srv, None, |sender| {
+            sender
+                .send(AgentEvent::Error {
+                    message: TURN_ERROR.to_owned(),
+                    auth,
+                })
+                .unwrap();
+        });
+
+        let answer = out_rx.try_recv().expect("the pending prompt is answered");
+        assert_eq!(answer["id"], PROMPT_ID);
+        assert_eq!(answer["error"]["code"], i32::from(expected.code));
+        assert_eq!(answer["error"]["data"], TURN_ERROR);
+    }
+
+    #[test_case(true, false, "notice" ; "negotiated_notice")]
+    #[test_case(false, false, "agent_thought_chunk" ; "compatible_thought_fallback")]
+    #[test_case(true, true, "notice" ; "subagent_notice")]
+    #[test_case(false, true, "agent_thought_chunk" ; "subagent_fallback")]
+    fn provider_waiting_reaches_acp_without_leaving_the_prompt_pending(
+        notices: bool,
+        child: bool,
+        kind: &str,
+    ) {
+        const WAITING: &str = "waiting for a provider request slot";
+        let (mut srv, .., out_rx) = test_server();
+        srv.client_receives_notices = notices;
+        pending(&srv).lock().unwrap().prompt = Some(RequestId::Number(PROMPT_ID));
+        run_pump(&srv, None, |sender| {
+            sender
+                .send_envelope(Envelope {
+                    event: AgentEvent::ProviderWaiting {
+                        message: Some(WAITING.to_owned()),
+                    },
+                    subagent: child.then(|| subagent(None)),
+                    run_id: 0,
+                })
+                .unwrap();
+            sender
+                .send(AgentEvent::ProviderWaiting { message: None })
+                .unwrap();
+            sender.send(done_event()).unwrap();
+        });
+        let event = out_rx.try_recv().unwrap();
+        let update = &event["params"]["update"];
+        assert_eq!(update["sessionUpdate"], kind);
+        let expected = if child {
+            format!("{SUBAGENT_NAME}: {WAITING}")
+        } else {
+            WAITING.to_owned()
+        };
+        if notices {
+            assert_eq!(update["title"], expected);
+        } else {
+            assert_eq!(update["content"]["text"], format!("{expected}\n\n"));
+        }
+        assert_eq!(out_rx.try_recv().unwrap()["id"], PROMPT_ID);
+        assert!(out_rx.is_empty());
+        assert!(pending(&srv).lock().unwrap().prompt.is_none());
+    }
+
     /// A cached input holds the whole file a `write` is about to lay down, and
     /// this pump lives as long as the session does, so a turn that died on a
     /// provider error has to let go of it just like a turn that finished.
     #[test_case(None, true ; "a_live_turn_shows_the_file_its_tool_call_named")]
     #[test_case(Some(done_event()), false ; "a_finished_turn_releases_its_tool_inputs")]
-    #[test_case(Some(AgentEvent::Error { message: TURN_ERROR.to_owned() }), false ; "a_failed_turn_releases_its_tool_inputs")]
+    #[test_case(Some(AgentEvent::Error { message: TURN_ERROR.to_owned(), auth: false }), false ; "a_failed_turn_releases_its_tool_inputs")]
     fn a_terminal_event_releases_the_turns_tool_inputs(
         terminal: Option<AgentEvent>,
         keeps_input: bool,
@@ -1923,45 +2057,6 @@ mod tests {
             Some((ended, SessionEndReason::Replaced))
         );
         assert!(srv.session.is_none(), "close must take the session");
-    }
-
-    /// A prompt only ever gets one response, and the client may not send the
-    /// next one until it arrives. An auth failure parks the agent on an answer
-    /// ACP cannot produce, so the turn has to end here instead.
-    #[test]
-    fn auth_required_ends_the_prompt_instead_of_parking_the_session() {
-        let (mut srv, .., out_rx) = test_server();
-        let (input_tx, input_rx) = flume::unbounded();
-        let (cancel_tx, cancel_rx) = flume::unbounded();
-        let session = srv.session.as_mut().expect("a session is installed");
-        session.handle.input_tx = input_tx;
-        session.handle.cancel_tx = cancel_tx;
-        let raw = prompt_request(&srv);
-
-        handle_prompt(&mut srv, &raw, &RequestId::Number(PROMPT_ID)).unwrap();
-        run_pump(&srv, None, |sender| {
-            sender.send(AgentEvent::AuthRequired).unwrap();
-        });
-
-        let response = out_rx.try_recv().expect("the in-flight prompt is answered");
-        assert_eq!(response["id"], PROMPT_ID);
-        assert_eq!(
-            response["error"]["code"],
-            i32::from(AcpError::auth_required().code)
-        );
-        assert_eq!(
-            response["error"]["data"], AUTH_FAILED_MSG,
-            "the client is told why the turn ended: {response}"
-        );
-        assert!(
-            cancel_rx.try_recv().is_ok(),
-            "the agent parked on re-authentication is released"
-        );
-
-        assert!(pending(&srv).lock().unwrap().prompt.is_none());
-        handle_prompt(&mut srv, &raw, &RequestId::Number(NEXT_PROMPT_ID))
-            .expect("the next prompt is accepted");
-        assert_eq!(input_rx.len(), 2, "both prompts reached the agent");
     }
 
     /// JSON-RPC ids are `string | number`, and a client is free to echo ours

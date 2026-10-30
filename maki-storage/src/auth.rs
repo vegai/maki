@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions, TryLockError};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::thread::sleep;
@@ -11,17 +12,21 @@ use tracing::debug;
 
 use crate::{StateDir, StorageError, atomic_write_permissions};
 
+use crate::permissions::PRIVATE_FILE_MODE;
+
 const AUTH_DIR: &str = "auth";
 /// Plugin providers keep their credentials apart from everything else under
 /// [`AUTH_DIR`]: a plugin picks its own slug, and in a shared directory that
 /// name could be `mcp-<server>` or a catalog provider's slug, the file maki
 /// keeps somebody else's secret in.
 const PLUGIN_AUTH_DIR: &str = "plugins";
-const AUTH_FILE_MODE: u32 = 0o600;
 const REFRESH_BUFFER_SECS: u64 = 60;
 const LOCK_SUFFIX: &str = ".lock";
 const LOCK_WAIT: Duration = Duration::from_secs(30);
 const LOCK_POLL: Duration = Duration::from_millis(50);
+/// RFC 7591 §3.2.1: a `client_secret_expires_at` of 0 means the secret never
+/// expires. Atlassian's MCP server registers clients this way.
+const CLIENT_SECRET_NEVER_EXPIRES: u64 = 0;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OAuthTokens {
@@ -203,7 +208,7 @@ fn save_auth(path: &Path, data: &impl Serialize) -> Result<(), StorageError> {
         fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_string_pretty(data)?;
-    atomic_write_permissions(path, json.as_bytes(), AUTH_FILE_MODE)?;
+    atomic_write_permissions(path, json.as_bytes(), PRIVATE_FILE_MODE)?;
     debug!(path = %path.display(), "auth data saved");
     Ok(())
 }
@@ -238,6 +243,7 @@ pub fn load_mcp_auth(dir: &StateDir, server_name: &str, expected_url: &str) -> O
         return None;
     }
     if let Some(expires_at) = data.client_secret_expires_at
+        && expires_at != CLIENT_SECRET_NEVER_EXPIRES
         && now_millis() / 1000 >= expires_at
     {
         return None;
@@ -285,6 +291,16 @@ pub fn load_plugin_auth(dir: &StateDir, slug: &str) -> Option<PluginAuthData> {
     load_auth(&plugin_auth_path(dir, slug))
 }
 
+/// A fingerprint of what a plugin stored, or `None` when it stored nothing.
+/// A process compares two of these to notice that another one swapped the
+/// credentials. Hashing means it never keeps a second copy of the secret.
+pub fn plugin_auth_stamp(dir: &StateDir, slug: &str) -> Option<u64> {
+    let bytes = fs::read(plugin_auth_path(dir, slug)).ok()?;
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
 pub fn save_plugin_auth(
     dir: &StateDir,
     slug: &str,
@@ -300,6 +316,8 @@ pub fn delete_plugin_auth(dir: &StateDir, slug: &str) -> Result<bool, StorageErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::permissions::PERMISSION_BITS;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
@@ -355,7 +373,10 @@ mod tests {
         #[cfg(unix)]
         {
             let metadata = fs::metadata(auth_path(&dir, "anthropic")).unwrap();
-            assert_eq!(metadata.permissions().mode() & 0o777, AUTH_FILE_MODE);
+            assert_eq!(
+                metadata.permissions().mode() & PERMISSION_BITS,
+                PRIVATE_FILE_MODE
+            );
         }
 
         assert!(delete_tokens(&dir, "anthropic").unwrap());
@@ -452,5 +473,19 @@ mod tests {
         let dir = StateDir::from_path(tmp.path().to_path_buf());
         save_mcp_auth(&dir, "srv", &data).unwrap();
         assert!(load_mcp_auth(&dir, "srv", lookup_url).is_none());
+    }
+
+    #[test_case(None ; "no_expiry")]
+    #[test_case(Some(CLIENT_SECRET_NEVER_EXPIRES) ; "zero_never_expires")]
+    #[test_case(Some(now_millis() / 1000 + 3_600) ; "future_expiry")]
+    fn mcp_auth_load_keeps_unexpired_client(client_secret_expires_at: Option<u64>) {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let data = McpAuthData {
+            client_secret_expires_at,
+            ..test_mcp_data()
+        };
+        save_mcp_auth(&dir, "srv", &data).unwrap();
+        assert!(load_mcp_auth(&dir, "srv", TEST_URL).is_some());
     }
 }

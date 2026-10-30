@@ -1,17 +1,21 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_lock::{Semaphore, SemaphoreGuardArc};
 use futures::future::join_all;
 use maki_agent::cancel::CancelToken;
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use mlua::{Function, Lua, MultiValue, Result as LuaResult, Table, Value};
+use smol::lock::{Semaphore, SemaphoreGuardArc};
 
 use crate::docs::{FnDoc, ParamDoc};
-use crate::runtime::{TaskHandle, enqueue_async_task, lock_cell, register_cancel_hook};
+use crate::runtime::{
+    SpawnedTask, TaskHandle, enqueue_async_task, enqueue_spawned_task, lock_cell,
+    register_cancel_hook,
+};
 
 const AWAIT_MIN_ARGS: usize = 2;
 const PERMIT_RELEASED_ERR: &str = "permit already released";
+const SLEEP_NEGATIVE_ERR: &str = "maki.async.sleep: ms must be >= 0";
 
 /// Cancel-aware counting semaphore. Permits release on `:release()` or gc.
 struct LuaSemaphore {
@@ -81,9 +85,10 @@ lua_class! {
     "maki.async.Permit" => LuaPermit, PERMIT_DOCS [release]
 }
 
-/// Fire off a function as a new async task. It runs in the background and
-/// you do not wait for it. If you need the result, pass an {on_finish}
-/// callback.
+/// Start {fn} as a background task without waiting for it. Pass
+/// {on_finish} to get the result. The task is cancelled with its caller
+/// and stopped after 60 seconds. For work that outlives the caller, use
+/// `maki.async.spawn`.
 ///
 /// @param fn function Zero-argument function to execute.
 /// @param on_finish function? Optional callback `function(err, result)`. Called once {fn} completes.
@@ -115,6 +120,53 @@ fn run(lua: &Lua, r#fn: Function, on_finish: Option<Function>) -> LuaResult<()> 
     let work_key = lua.create_registry_value(actual_work)?;
     enqueue_async_task(lua, work_key)?;
     Ok(())
+}
+
+/// Run {fn} in a task that lives as long as your plugin, such as a
+/// repeating timer or a connection opened at load.
+///
+/// The task has no deadline and outlives the call that started it, so a
+/// tool handler can spawn it and return. It ends when {fn} returns or
+/// raises, when you call `task:cancel()`, or when the plugin unloads.
+/// Errors are logged and flashed with the plugin name.
+///
+/// Spawned at the top level of a plugin file, it starts after the plugin
+/// loads. It does not keep maki alive: `maki -p` drops it on exit.
+///
+/// Code that runs 5 seconds without yielding is still stopped. See
+/// `maki.async.sleep`.
+///
+/// @param fn function Zero-argument function to run.
+/// @return (maki.async.Task) Handle with `:cancel()`.
+/// @example
+/// local task = maki.async.spawn(function()
+///   while true do
+///     maki.async.sleep(2000)
+///     report()
+///   end
+/// end)
+///
+/// task:cancel()
+#[lua_fn]
+fn spawn(lua: &Lua, #[ctx] plugin: Arc<str>, r#fn: Function) -> LuaResult<SpawnedTask> {
+    let work_key = lua.create_registry_value(r#fn)?;
+    enqueue_spawned_task(lua, plugin, work_key)
+}
+
+/// Stop the task. A task that is waiting ends right away and runs its
+/// `maki.async.on_cancel` hooks. A task that cancels itself stops at its
+/// next yield. Extra calls do nothing.
+///
+/// @return
+#[lua_fn]
+fn cancel(lua: &Lua, this: &SpawnedTask) -> LuaResult<()> {
+    this.cancel(lua);
+    Ok(())
+}
+
+lua_class! {
+    /// Handle returned by `maki.async.spawn`.
+    "maki.async.Task" => SpawnedTask, TASK_DOCS [cancel]
 }
 
 /// Register {fn} to run as soon as the current task is cancelled or hits
@@ -170,14 +222,9 @@ async fn gather(lua: Lua, fns: Table) -> LuaResult<Table> {
         let f: Function = fns
             .raw_get(i)
             .map_err(|_| mlua::Error::runtime(format!("gather: funs[{i}] must be a function")))?;
-        children.push(lua.create_thread(f)?);
+        children.push(f.call_async::<Value>(()));
     }
-    let results = join_all(
-        children
-            .into_iter()
-            .map(|thread| async move { thread.into_async::<Value>(())?.await }),
-    )
-    .await;
+    let results = join_all(children).await;
     let out = lua.create_table_with_capacity(count, 0)?;
     for (i, res) in results.into_iter().enumerate() {
         let entry = lua.create_table()?;
@@ -196,23 +243,52 @@ async fn gather(lua: Lua, fns: Table) -> LuaResult<Table> {
     Ok(out)
 }
 
-/// Suspend the calling task for {ms} milliseconds. The plugin thread is
-/// never blocked, so other tasks and the UI keep running, and a cancel
-/// still lands while you sleep.
+/// Suspend the calling task for {ms} milliseconds. Other tasks and the UI
+/// keep running. Cancelling the task ends the sleep early with an error.
 ///
-/// For a timer that has to outlive the tool call that started it, such
-/// as a toast dismissing itself, use `maki.defer_fn`.
+/// All plugins share one Lua thread. Code that runs for 5 seconds without
+/// yielding is stopped with an error. `sleep(0)` lets every other ready
+/// task run once, then returns. Call it periodically in long loops.
 ///
-/// @param ms integer Milliseconds to sleep.
+/// A repeating timer is a sleep loop inside `maki.async.spawn`. For a
+/// one-shot timer that outlives the tool call, such as a toast that
+/// dismisses itself, use `maki.defer_fn`.
+///
+/// @param ms integer Milliseconds to wait. Negative values raise an error.
 /// @return
 /// @example
-/// maki.async.run(function()
-///   maki.async.sleep(4000)
-///   win:close()
+/// maki.async.spawn(function()
+///   while true do
+///     poll()
+///     maki.async.sleep(5000)
+///   end
 /// end)
+///
+/// -- A long loop that keeps the rest of maki responsive:
+/// for i, line in ipairs(lines) do
+///   if i % 1000 == 0 then
+///     maki.async.sleep(0)
+///   end
+///   process(line)
+/// end
 #[lua_fn]
-async fn sleep(_lua: Lua, ms: u64) -> LuaResult<()> {
-    smol::Timer::after(Duration::from_millis(ms)).await;
+async fn sleep(lua: Lua, ms: i64) -> LuaResult<()> {
+    if ms < 0 {
+        return Err(mlua::Error::runtime(SLEEP_NEGATIVE_ERR));
+    }
+    // A zero timer is ready on its first poll and never hands the thread back.
+    if ms == 0 {
+        smol::future::yield_now().await;
+        return Ok(());
+    }
+    let cancel = lua
+        .app_data_ref::<TaskHandle>()
+        .map(|h| lock_cell(&h).cancel.clone())
+        .unwrap_or_else(CancelToken::none);
+    cancel
+        .race(smol::Timer::after(Duration::from_millis(ms as u64)))
+        .await
+        .map_err(mlua::Error::runtime)?;
     Ok(())
 }
 
@@ -261,6 +337,7 @@ const await__doc: FnDoc = FnDoc {
     ],
     returns: "(...) Values passed by the caller to the injected callback.",
     guard: None,
+    value: false,
     example: "local result = maki.async.await(2, http.get, url)",
 };
 
@@ -283,6 +360,7 @@ const wrap__doc: FnDoc = FnDoc {
     ],
     returns: "(function) Wrapped function you can call like a normal function.",
     guard: None,
+    value: false,
     example: "local get = maki.async.wrap(2, http.get)\nlocal body = get(url)",
 };
 
@@ -305,16 +383,17 @@ const join__doc: FnDoc = FnDoc {
     ],
     returns: "",
     guard: None,
+    value: false,
     example: "maki.async.join(4, {\n  function() process(files[1]) end,\n  function() process(files[2]) end,\n  function() process(files[3]) end,\n})",
 };
 
 lua_table! {
     /// Tools for running things concurrently in Lua plugins.
     ///
-    /// Use `run` to fire off background tasks, `gather` or `join` to run
-    /// several functions at once, and `semaphore` to limit concurrency.
-    /// The `await` and `wrap` helpers bridge callback-based APIs into
-    /// coroutine-friendly calls.
+    /// `run` starts a background task that ends with its caller, and `spawn`
+    /// one that lives as long as the plugin. `gather` and `join` run several
+    /// functions at once, and `semaphore` limits how many. `await` and `wrap`
+    /// turn callback APIs into coroutine calls.
     ///
     /// ```lua
     /// local results = maki.async.gather({
@@ -322,14 +401,14 @@ lua_table! {
     ///   function() return fetch("b.txt") end,
     /// })
     /// ```
-    extend "maki.async" => pub(crate) fn add_async_fns(), DOCS [
-        run, sleep, manual r#await, manual wrap, manual join, gather, semaphore, on_cancel,
+    extend "maki.async" => pub(crate) fn add_async_fns(plugin: Arc<str>), DOCS [
+        run, spawn(plugin), sleep, manual r#await, manual wrap, manual join, gather, semaphore, on_cancel,
     ]
 }
 
-pub(crate) fn create_async_table(lua: &Lua) -> LuaResult<Table> {
+pub(crate) fn create_async_table(lua: &Lua, plugin: Arc<str>) -> LuaResult<Table> {
     let tbl = lua.create_table()?;
-    add_async_fns(&tbl, lua)?;
+    add_async_fns(&tbl, lua, plugin)?;
 
     tbl.set(
         "await",
@@ -363,7 +442,8 @@ pub(crate) fn create_async_table(lua: &Lua) -> LuaResult<Table> {
             let insert_pos = (argc - 1).min(args_vec.len());
             args_vec.insert(insert_pos, Value::Function(callback));
 
-            fun.call::<()>(MultiValue::from_iter(args_vec))?;
+            fun.call_async::<()>(MultiValue::from_iter(args_vec))
+                .await?;
 
             let result = rx
                 .recv_async()
@@ -440,10 +520,11 @@ mod tests {
     const ERR_ARGC_GE_1: &str = "argc must be >= 1";
     const ERR_ARGC_INTEGER: &str = "argc must be an integer";
     const ERR_SECOND_ARG_FN: &str = "second argument must be a function";
+    const TEST_PLUGIN: &str = "async_test";
 
     fn setup() -> (Lua, Table) {
         let lua = Lua::new();
-        let tbl = create_async_table(&lua).unwrap();
+        let tbl = create_async_table(&lua, Arc::from(TEST_PLUGIN)).unwrap();
         lua.globals().set("async_tbl", tbl.clone()).unwrap();
         (lua, tbl)
     }
@@ -504,12 +585,15 @@ mod tests {
         });
     }
 
-    #[test]
-    fn await_returns_multivalue_from_callback() {
+    #[test_case(false ; "synchronous_registration")]
+    #[test_case(true ; "yielding_registration")]
+    fn await_returns_multivalue_from_callback(yielding: bool) {
         smol::block_on(async {
             let (lua, _tbl) = setup();
+            lua.globals().set("yielding", yielding).unwrap();
             let code = r#"
                 local function producer(cb)
+                    if yielding then async_tbl.sleep(0) end
                     cb("hello", 42, true)
                 end
                 return async_tbl.await(1, producer)
@@ -864,5 +948,86 @@ mod tests {
             err.contains(CANCELLED_MSG),
             "expected error containing {CANCELLED_MSG:?}, got: {err}"
         );
+    }
+
+    #[test]
+    fn sleep_zero_lets_a_ready_task_run_first() {
+        let (lua, _tbl) = setup();
+        lua.load("order = {}").exec().unwrap();
+        let sleeper = lua
+            .load("table.insert(order, 'before'); async_tbl.sleep(0); table.insert(order, 'after')")
+            .exec_async();
+        let other = lua.load("table.insert(order, 'other')").exec_async();
+        let ex = smol::LocalExecutor::new();
+        smol::block_on(ex.run(async {
+            let sleeper = ex.spawn(sleeper);
+            let other = ex.spawn(other);
+            sleeper.await.unwrap();
+            other.await.unwrap();
+        }));
+        let order: Vec<String> = lua.load("return order").eval().unwrap();
+        assert_eq!(order, ["before", "other", "after"]);
+    }
+
+    #[test_case(-1; "negative_ms")]
+    fn sleep_validation(ms: i64) {
+        smol::block_on(async {
+            let (lua, _tbl) = setup();
+            let err = lua
+                .load(format!("return async_tbl.sleep({ms})"))
+                .eval_async::<Value>()
+                .await
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains(SLEEP_NEGATIVE_ERR),
+                "expected error containing {SLEEP_NEGATIVE_ERR:?}, got: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn sleep_suspends_for_the_requested_duration() {
+        smol::block_on(async {
+            let (lua, _tbl) = setup();
+            let began = std::time::Instant::now();
+            lua.load("async_tbl.sleep(30)").exec_async().await.unwrap();
+            assert!(
+                began.elapsed() >= Duration::from_millis(30),
+                "sleep(30) returned early after {:?}",
+                began.elapsed()
+            );
+        });
+    }
+
+    #[test]
+    fn sleep_observes_caller_cancel() {
+        smol::block_on(async {
+            let (lua, _tbl) = setup();
+            let (trigger, token) = CancelToken::new();
+            trigger.cancel();
+            lua.set_app_data::<TaskHandle>(Arc::new(Mutex::new(TaskCell::new(token, None, None))));
+
+            let code = r#"
+                local ok, err = pcall(async_tbl.sleep, 60_000)
+                return ok, tostring(err)
+            "#;
+            let vals: Vec<Value> = lua
+                .load(code)
+                .eval_async::<MultiValue>()
+                .await
+                .unwrap()
+                .into_vec();
+
+            assert!(
+                !vals[0].as_boolean().unwrap(),
+                "a cancelled sleep must not complete"
+            );
+            let err = vals[1].as_string().unwrap().to_string_lossy();
+            assert!(
+                err.contains(CANCELLED_MSG),
+                "expected error containing {CANCELLED_MSG:?}, got: {err}"
+            );
+        });
     }
 }

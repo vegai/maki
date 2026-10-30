@@ -1,8 +1,9 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use flume::Sender;
 use futures_lite::future;
-use maki_providers::provider::Provider;
+use maki_providers::provider::{Provider, RequestScope};
 use maki_providers::{Message, Model, ProviderEvent, RequestOptions};
 use maki_storage::id::SessionRef;
 use serde_json::Value;
@@ -34,18 +35,20 @@ impl App {
     ) {
         // The mirror is verbatim, so mid-turn it can end on an open tool call.
         // Providers reject that, so close them off on our own copy.
-        let mut messages = self
-            .shared_history
+        let snapshot = self.shared_history.as_ref().map(|h| h.load_full());
+        let mut messages = snapshot
             .as_ref()
-            .map(|h| Vec::clone(&h.load().messages))
+            .map(|s| Vec::clone(&s.messages))
             .unwrap_or_default();
         maki_agent::close_dangling_tool_calls(&mut messages, maki_agent::UNAVAILABLE_RESULT);
-        let system = self
-            .btw_system
+        // The session's own prompt, so the side question reads the transcript
+        // under the instructions it was written under.
+        let system = snapshot
             .as_ref()
-            .map(|s| String::clone(&s.load()))
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| BTW_FALLBACK_SYSTEM.to_string());
+            .and_then(|s| s.frame.as_ref())
+            .and_then(|f| f.prefix())
+            .unwrap_or(BTW_FALLBACK_SYSTEM)
+            .to_owned();
         messages.push(btw_question(&question));
 
         let (tx, rx) = flume::bounded(64);
@@ -59,6 +62,7 @@ impl App {
             messages,
             tx,
             Some(session_id),
+            self.permissions.cwd().to_owned(),
         ))
         .detach();
     }
@@ -71,20 +75,29 @@ async fn run_btw(
     messages: Vec<Message>,
     btw_tx: Sender<BtwEvent>,
     session_id: Option<SessionRef>,
+    cwd: PathBuf,
 ) {
     let (event_tx, event_rx) = flume::unbounded();
     let tools = Value::Array(vec![]);
     let messages = maki_providers::adapt_images_for_model(&model, &messages).await;
 
-    let stream_fut = provider.stream_message(
-        &model,
-        &messages,
-        &system,
-        &tools,
-        &event_tx,
-        RequestOptions::default(),
-        session_id.as_ref(),
-    );
+    // The request must own the sender so its completion closes the event channel.
+    let stream_fut = async move {
+        provider
+            .stream_message(
+                &model,
+                &messages,
+                &system,
+                &tools,
+                &event_tx,
+                RequestOptions::default(),
+                RequestScope {
+                    session_id: session_id.as_ref(),
+                    cwd: &cwd,
+                },
+            )
+            .await
+    };
 
     let forward_fut = async {
         while let Ok(event) = event_rx.recv_async().await {
@@ -114,14 +127,161 @@ async fn run_btw(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arc_swap::ArcSwap;
+    use futures_lite::FutureExt;
+    use maki_agent::HistorySnapshot;
+    use maki_agent::prompt::{PromptId, Slot};
+    use maki_agent::tools::ToolRegistry;
+    use maki_lua::PluginHost;
+    use maki_providers::provider::BoxFuture;
+    use maki_providers::{AgentError, ContentBlock, ModelInfo, StreamResponse, TokenUsage};
+    use maki_storage::frame::{PromptFacts, StoredFrame};
+    use smol::Timer;
+    use std::future;
+    use std::path::Path;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use test_case::test_case;
 
     const Q: &str = "why sqlite?";
+    const FRAME_POLICY: &str = "Use the active conversation policy.";
+
+    struct RecordingProvider(Sender<(String, Value)>);
+
+    impl Provider for RecordingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            system: &'a str,
+            tools: &'a Value,
+            _: &'a Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: RequestScope<'a>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                self.0.send((system.to_owned(), tools.clone())).unwrap();
+                future::pending().await
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    fn rendered_frame() -> StoredFrame {
+        StoredFrame::new(FRAME_POLICY.into(), String::new(), None, Vec::new())
+    }
+
+    /// An imported session holds a frame with facts and no prompt until its
+    /// first run, and an empty system is a 400 on Anthropic.
+    #[test_case(None, BTW_FALLBACK_SYSTEM ; "native_fallback")]
+    #[test_case(Some(rendered_frame()), FRAME_POLICY ; "stored_frame_precedence")]
+    #[test_case(Some(StoredFrame::facts_only(PromptFacts::default())), BTW_FALLBACK_SYSTEM ; "imported_before_first_run")]
+    fn side_question_uses_the_selected_policy(frame: Option<StoredFrame>, expected: &str) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "persona",
+            r#"
+            local calls = 0
+            maki.api.set_prompt({ slot = "identity", content = function()
+                calls += 1
+                return tostring(calls)
+            end })
+            "#,
+        )
+        .unwrap();
+        let mut app = crate::app::tests::test_app();
+        app.lua_event_handle = host.event_handle();
+        if let Some(frame) = frame {
+            let mut snapshot = HistorySnapshot::new(Vec::new());
+            snapshot.frame = Some(Arc::new(frame));
+            app.shared_history = Some(Arc::new(ArcSwap::from_pointee(snapshot)));
+        }
+        let (sent, requests) = flume::unbounded();
+        app.start_btw(
+            Q.into(),
+            Arc::new(RecordingProvider(sent)),
+            crate::components::test_model(),
+        );
+        let (system, tools) = smol::block_on(requests.recv_async()).unwrap();
+        assert_eq!(system, expected);
+        assert!(tools.as_array().unwrap().is_empty());
+        let prompts = host.event_handle().collect_prompt_slots();
+        assert_eq!(
+            prompts.get(PromptId::System, Slot::Identity)[0].content,
+            "1"
+        );
+    }
+
+    const SESSION_DIR: &str = "/session/dir";
+    const NEVER_ENDED: &str = "the side question did not stop";
+    const END_LIMIT: Duration = Duration::from_secs(10);
+
+    #[derive(Default)]
+    struct DirOnlyProvider {
+        asked_in: Mutex<Option<PathBuf>>,
+    }
+
+    impl Provider for DirOnlyProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _model: &'a Model,
+            _messages: &'a [Message],
+            _system: &'a str,
+            _tools: &'a Value,
+            _event_tx: &'a Sender<ProviderEvent>,
+            _opts: RequestOptions,
+            scope: RequestScope<'a>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            *self.asked_in.lock().unwrap() = Some(scope.cwd.to_owned());
+            Box::pin(async {
+                Ok(StreamResponse {
+                    input_transformations: Vec::new(),
+                    message: Message::default(),
+                    usage: TokenUsage::default(),
+                    stop_reason: None,
+                })
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[test]
+    fn a_side_question_runs_in_the_session_directory_and_ends() {
+        let provider = Arc::new(DirOnlyProvider::default());
+        let (tx, rx) = flume::unbounded();
+
+        let run = run_btw(
+            provider.clone(),
+            crate::components::test_model(),
+            String::new(),
+            vec![btw_question(Q)],
+            tx,
+            None,
+            PathBuf::from(SESSION_DIR),
+        );
+        smol::block_on(run.or(async {
+            Timer::after(END_LIMIT).await;
+            panic!("{NEVER_ENDED}");
+        }));
+
+        assert!(matches!(rx.try_recv(), Ok(BtwEvent::Done)));
+        assert_eq!(
+            provider.asked_in.lock().unwrap().as_deref(),
+            Some(Path::new(SESSION_DIR))
+        );
+    }
 
     fn user_text(msg: &Message) -> String {
         msg.content
             .iter()
             .filter_map(|b| match b {
-                maki_providers::ContentBlock::Text { text } => Some(text.as_str()),
+                ContentBlock::Text { text } => Some(text.as_str()),
                 _ => None,
             })
             .collect()

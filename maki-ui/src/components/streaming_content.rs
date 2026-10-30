@@ -1,4 +1,5 @@
 use crate::animation::Typewriter;
+use crate::components::thinking::{self, LiveTail};
 use crate::markdown::paint_semantic;
 use crate::theme;
 
@@ -75,9 +76,15 @@ impl StreamingCache {
     }
 }
 
+/// Memoized [`thinking::render_tail`] keyed by its row count, `None` result
+/// included, so a collapsed stream with nothing new to show repaints for free.
+type TailCache = Option<((CacheKey, usize), Option<Vec<Line<'static>>>)>;
+
 pub(crate) struct StreamingContent {
     typewriter: Typewriter,
     cache: StreamingCache,
+    tail: TailCache,
+    live_tail: LiveTail,
     renderer: Renderer,
     prefix: &'static str,
     text_style: Style,
@@ -94,6 +101,8 @@ impl StreamingContent {
         Self {
             typewriter: Typewriter::with_speed(ms_per_char),
             cache: StreamingCache::default(),
+            tail: None,
+            live_tail: LiveTail::default(),
             renderer: Renderer::streaming(),
             prefix,
             text_style,
@@ -108,11 +117,15 @@ impl StreamingContent {
     pub fn clear(&mut self) {
         self.typewriter.clear();
         self.cache.invalidate();
+        self.tail = None;
+        self.live_tail = LiveTail::default();
         self.renderer = Renderer::streaming();
     }
 
     pub fn take_all(&mut self) -> String {
         self.cache.invalidate();
+        self.tail = None;
+        self.live_tail = LiveTail::default();
         self.renderer = Renderer::streaming();
         self.typewriter.take_all()
     }
@@ -121,8 +134,9 @@ impl StreamingContent {
         self.typewriter.is_empty()
     }
 
+    /// Counts everything streamed so far, revealed or not.
     pub fn line_count(&self) -> usize {
-        self.typewriter.buffer_line_count()
+        thinking::line_count(self.typewriter.buffer())
     }
 
     pub fn is_animating(&self) -> bool {
@@ -134,6 +148,12 @@ impl StreamingContent {
         self.text_style = text_style;
         self.prefix_style = prefix_style;
         self.cache.invalidate();
+        self.tail = None;
+    }
+
+    #[cfg(test)]
+    pub fn cached_lines(&self) -> &[Line<'static>] {
+        &self.cache.lines
     }
 
     pub fn render_lines(&mut self, width: u16) -> &[Line<'static>] {
@@ -149,8 +169,25 @@ impl StreamingContent {
         &self.cache.lines
     }
 
-    pub fn cached_lines(&self) -> &[Line<'static>] {
-        &self.cache.lines
+    /// [`thinking::render_tail`] of what the typewriter has revealed.
+    pub fn render_tail(&mut self, rows: usize, width: u16) -> Option<&[Line<'static>]> {
+        self.typewriter.tick();
+        let visible = self.typewriter.visible();
+        let key = (
+            CacheKey::for_text(visible, width, theme::generation()),
+            rows,
+        );
+        if self.tail.as_ref().is_none_or(|(cached, _)| *cached != key) {
+            let lines = thinking::render_tail(
+                visible,
+                rows,
+                width,
+                self.text_style,
+                Some(&mut self.live_tail),
+            );
+            self.tail = Some((key, lines));
+        }
+        self.tail.as_ref().and_then(|(_, lines)| lines.as_deref())
     }
 
     #[cfg(test)]

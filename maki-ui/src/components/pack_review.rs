@@ -95,7 +95,7 @@ impl PackReview {
             PACK_REVIEW_TITLE,
             frame,
             area,
-            self.lines(),
+            Paragraph::new(self.lines()),
             (0, 0),
         );
     }

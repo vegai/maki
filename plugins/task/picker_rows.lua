@@ -1,7 +1,7 @@
 -- Row building for the /tasks picker in picker.lua: filtering, ordering and
--- sections, with no
--- host calls and no globals. Every refresh throws the old rows away and builds
--- them again, so nothing here can drift from the host list.
+-- sections, with no host calls and no globals. Every refresh throws the old
+-- rows away and builds them again, so nothing here can drift from the host
+-- list.
 
 local ListPicker = require("maki.list_picker")
 
@@ -10,9 +10,19 @@ local FINISHED_SECTION = "Finished"
 
 local M = {}
 
--- The main chat comes first and has no status. The subagents follow, running
--- ones above finished ones so a long job never gets buried under the ones that
--- already returned. Within a section, chat order.
+-- An idle plugin task is waiting for its next prompt, not finished.
+local function alive(status)
+  return status == "working" or status == "idle" or status == "queued"
+end
+
+function M.running(task)
+  return task.status == "working" or task.status == "queued"
+end
+
+-- The main chat comes first and has no status. The subagents follow, live
+-- ones above finished ones so a long job never gets buried under the ones
+-- that already returned. Within a section, newest first (`tasks` comes in
+-- chat order, which is spawn order), so the latest task is the one at hand.
 --
 -- Returns { rows, sections }. A row carries a section header only when it opens
 -- one, and `sections` counts what survived the filter.
@@ -23,7 +33,7 @@ function M.build(tasks, query)
     if ListPicker.matches(task.name, words) then
       if not task.status then
         main = task
-      elseif task.status == "working" then
+      elseif alive(task.status) then
         running[#running + 1] = task
       else
         finished[#finished + 1] = task
@@ -36,11 +46,19 @@ function M.build(tasks, query)
     rows[#rows + 1] = { task = main }
   end
   for _, group in ipairs({ { RUNNING_SECTION, running }, { FINISHED_SECTION, finished } }) do
-    for i, task in ipairs(group[2]) do
-      rows[#rows + 1] = { task = task, section = i == 1 and group[1] or nil }
+    local header, tasks_in_section = group[1], group[2]
+    for i = #tasks_in_section, 1, -1 do
+      rows[#rows + 1] = { task = tasks_in_section[i], section = i == #tasks_in_section and header or nil }
     end
   end
   return { rows = rows, sections = { running = #running, finished = #finished } }
+end
+
+-- Only a finished subagent may leave the list. The main chat is the session
+-- itself, and dropping a live task would orphan its transcript. The host has
+-- the final say. This check only decides which rows ask "are you sure".
+function M.deletable(task)
+  return task.status ~= nil and not alive(task.status)
 end
 
 -- Position of {id} among {rows}, or nil. The selection is kept as an id and

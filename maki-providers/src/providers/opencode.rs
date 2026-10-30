@@ -5,16 +5,16 @@ use maki_storage::id::SessionRef;
 use serde_json::Value;
 
 use crate::model::{Model, ModelFamily, ModelInfo};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, Provider, RequestScope};
 use crate::providers::catalog::{
     CatalogMeta, CatalogTransport, EndpointType, FreeTier, ProviderQuirks,
-    init_shared_catalog_if_needed,
+    adaptive_effort_if_available, init_shared_catalog_if_needed,
 };
 use crate::spec::{
     AuthDoc, Build, CatalogDoc, GENERIC_DISCOVERY_NOTE, GeneratedDocs, NO_CURATED_MODELS, Native,
     ProviderSpec,
 };
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{AgentError, Effort, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::{ResolvedAuth, Timeouts, with_prefix};
 
@@ -49,14 +49,18 @@ pub(crate) const ZEN_SPEC: ProviderSpec = ProviderSpec {
     api_key_env: ENV_VAR,
     family: ModelFamily::Generic,
     supports_thinking: true,
+    supports_deferred_tools: false,
+    adaptive_effort,
+    thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(128_000),
     fallback_context_window: 256_000,
     models_toml: NO_CURATED_MODELS,
+    models_of: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
-        with_auth: create_with_auth,
+        with_auth: Some(create_with_auth),
     }),
     aperture: None,
     login: None,
@@ -75,10 +79,14 @@ pub(crate) const GO_SPEC: ProviderSpec = ProviderSpec {
     api_key_env: ENV_VAR,
     family: ModelFamily::Generic,
     supports_thinking: false,
+    supports_deferred_tools: false,
+    adaptive_effort: |_| adaptive_effort_if_available(GO_SLUG),
+    thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(64_000),
     fallback_context_window: 128_000,
     models_toml: NO_CURATED_MODELS,
+    models_of: None,
     pricing_schedule: None,
     build: Build::Catalog,
     aperture: None,
@@ -91,6 +99,16 @@ pub(crate) const GO_SPEC: ProviderSpec = ProviderSpec {
         trailing_notes: &[],
     },
 };
+
+/// Zen ids name the sub-provider that serves them, as
+/// [`Opencode::stream_message`] reads them.
+fn adaptive_effort(model: &Model) -> Option<Effort> {
+    let sub_provider = model
+        .id
+        .split_once('/')
+        .map_or(ZEN_SLUG, |(sub_provider, _)| sub_provider);
+    adaptive_effort_if_available(sub_provider)
+}
 
 fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
     Ok(Box::new(Opencode::new(timeouts)))
@@ -220,8 +238,9 @@ impl Provider for Opencode {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        let session_id = scope.session_id;
         Box::pin(async move {
             let (sub_provider, actual_id) =
                 model.id.split_once('/').unwrap_or((ZEN_SLUG, &model.id));

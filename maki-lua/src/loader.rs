@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,25 +11,29 @@ use maki_agent::SessionEndReason;
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::{ToolRegistry, ToolSource};
 use maki_config::{GatedFile, PluginFileConfig, PluginsConfig, ProjectConfig, RawConfig};
+use maki_providers::claude_code::PLUGIN;
 use maki_providers::plugin::DeclAuthority;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 
+use crate::agent_autocmd::HostEvent;
 use crate::api::keymap::{KeybindTicket, KeymapReader};
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
 use crate::api::slot::{LayeredTools, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT};
 use crate::api::util::command::{
     HintReader, LuaCommandReader, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction, UiAttachment,
 };
+use crate::background::BackgroundSessions;
 use crate::error::PluginError;
-use crate::pack::DiscoveredPackage;
+use crate::pack::{DiscoveredPackage, Interaction};
 use crate::plugin_permissions::{
     MANIFEST_FILE, PluginPermissions, Requested, check_plugin_compatibility,
     load_plugin_permissions,
 };
 use crate::runtime::{
-    self, ClickFallback, ConfigScope, EndSession, LoadChunk, LoadContext, LuaThread, Request,
-    RestoreItem,
+    self, ClickFallback, ConfigScope, EndSession, LoadChunk, LoadContext, LuaThread, PrivateApi,
+    Request, RestoreItem,
 };
-use maki_agent::prompt::ResolvedSlots;
+use maki_agent::prompt::ResolvedPrompts;
 use maki_storage::id::MakiId;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -69,132 +74,124 @@ impl InitFiles {
 struct BundledPlugin {
     name: &'static str,
     dir: Dir<'static>,
+    private_api: Option<PrivateApi>,
+}
+
+impl BundledPlugin {
+    const fn new(name: &'static str, dir: Dir<'static>) -> Self {
+        Self {
+            name,
+            dir,
+            private_api: None,
+        }
+    }
 }
 
 /// `lib` is not a default builtin; it exists so plugins can
 /// `require()` shared modules across boundaries.
 static BUNDLED_PLUGINS: &[BundledPlugin] = &[
-    BundledPlugin {
-        name: "sessions",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/sessions"),
-    },
-    BundledPlugin {
-        name: "thinking",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/thinking"),
-    },
-    BundledPlugin {
-        name: "index",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/index"),
-    },
-    BundledPlugin {
-        name: "webfetch",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/webfetch"),
-    },
-    BundledPlugin {
-        name: "websearch",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/websearch"),
-    },
-    BundledPlugin {
-        name: "bash",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/bash"),
-    },
-    BundledPlugin {
-        name: "batch",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/batch"),
-    },
-    BundledPlugin {
-        name: "grep",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/grep"),
-    },
-    BundledPlugin {
-        name: "glob",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/glob"),
-    },
-    BundledPlugin {
-        name: "skill",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/skill"),
-    },
-    BundledPlugin {
-        name: "question",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/question"),
-    },
-    BundledPlugin {
-        name: "todo_write",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/todo_write"),
-    },
-    BundledPlugin {
-        name: "read",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/read"),
-    },
-    BundledPlugin {
-        name: "write",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/write"),
-    },
-    BundledPlugin {
-        name: "edit",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/edit"),
-    },
+    BundledPlugin::new(
+        "sessions",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/sessions"),
+    ),
+    BundledPlugin::new(
+        "thinking",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/thinking"),
+    ),
+    BundledPlugin::new(
+        "index",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/index"),
+    ),
+    BundledPlugin::new(
+        "webfetch",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/webfetch"),
+    ),
+    BundledPlugin::new(
+        "websearch",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/websearch"),
+    ),
+    BundledPlugin::new("bash", include_dir!("$CARGO_MANIFEST_DIR/../plugins/bash")),
+    BundledPlugin::new(
+        "batch",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/batch"),
+    ),
+    BundledPlugin::new("grep", include_dir!("$CARGO_MANIFEST_DIR/../plugins/grep")),
+    BundledPlugin::new("glob", include_dir!("$CARGO_MANIFEST_DIR/../plugins/glob")),
+    BundledPlugin::new(
+        "skill",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/skill"),
+    ),
+    BundledPlugin::new(
+        "question",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/question"),
+    ),
+    BundledPlugin::new(
+        "todo_write",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/todo_write"),
+    ),
+    BundledPlugin::new("read", include_dir!("$CARGO_MANIFEST_DIR/../plugins/read")),
+    BundledPlugin::new(
+        "write",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/write"),
+    ),
+    BundledPlugin::new("edit", include_dir!("$CARGO_MANIFEST_DIR/../plugins/edit")),
     // Below the tools it pre-approves: `memory` allows writes into its own
     // state dir, and a rule can only name a registered tool.
+    BundledPlugin::new(
+        "memory",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/memory"),
+    ),
+    BundledPlugin::new("task", include_dir!("$CARGO_MANIFEST_DIR/../plugins/task")),
+    BundledPlugin::new(
+        "code_execution",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/code_execution"),
+    ),
+    BundledPlugin::new(
+        "completion",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/completion"),
+    ),
     BundledPlugin {
-        name: "memory",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/memory"),
+        name: PLUGIN,
+        private_api: Some(crate::api::claude_code::create_private_module),
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/claude_code"),
     },
-    BundledPlugin {
-        name: "task",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/task"),
-    },
-    BundledPlugin {
-        name: "code_execution",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/code_execution"),
-    },
-    BundledPlugin {
-        name: "completion",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/completion"),
-    },
-    BundledPlugin {
-        name: "view_image",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/view_image"),
-    },
-    BundledPlugin {
-        name: "lib",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/lib"),
-    },
-    BundledPlugin {
-        name: "list",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/list"),
-    },
+    BundledPlugin::new(
+        "view_image",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/view_image"),
+    ),
+    BundledPlugin::new("lib", include_dir!("$CARGO_MANIFEST_DIR/../plugins/lib")),
+    BundledPlugin::new("list", include_dir!("$CARGO_MANIFEST_DIR/../plugins/list")),
     // The rest register no tool. They declare a provider maki ships, on
     // the same surface a third-party plugin declares one with, which is what
     // keeps that surface honest.
-    BundledPlugin {
-        name: "synthetic",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/synthetic"),
-    },
-    BundledPlugin {
-        name: "deepseek",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/deepseek"),
-    },
-    BundledPlugin {
-        name: "mistral",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/mistral"),
-    },
-    BundledPlugin {
-        name: "tensorx",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/tensorx"),
-    },
-    BundledPlugin {
-        name: "regolo",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/regolo"),
-    },
-    BundledPlugin {
-        name: "requesty",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/requesty"),
-    },
-    BundledPlugin {
-        name: "openrouter",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/openrouter"),
-    },
+    BundledPlugin::new(
+        "synthetic",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/synthetic"),
+    ),
+    BundledPlugin::new(
+        "deepseek",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/deepseek"),
+    ),
+    BundledPlugin::new(
+        "mistral",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/mistral"),
+    ),
+    BundledPlugin::new(
+        "tensorx",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/tensorx"),
+    ),
+    BundledPlugin::new(
+        "regolo",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/regolo"),
+    ),
+    BundledPlugin::new(
+        "requesty",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/requesty"),
+    ),
+    BundledPlugin::new(
+        "openrouter",
+        include_dir!("$CARGO_MANIFEST_DIR/../plugins/openrouter"),
+    ),
 ];
 
 /// Every bundled name, not just the default-enabled ones. An external package
@@ -311,18 +308,24 @@ impl Drop for PluginHost {
 }
 
 impl PluginHost {
+    /// A TUI host with JIT on, so tests get the whole `maki.ui` surface.
     pub fn new(registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
-        Self::with_jit(registry, true)
+        Self::start(registry, Interaction::Tty, true)
     }
 
     /// `jit: false` (the `--no-jit` flag) runs plugin Lua on the O1
     /// interpreter with full debug info. Applied at VM creation, so
     /// every chunk gets it, init.lua files included.
-    pub fn with_jit(registry: Arc<ToolRegistry>, jit: bool) -> Result<Self, PluginError> {
+    pub fn start(
+        registry: Arc<ToolRegistry>,
+        interaction: Interaction,
+        jit: bool,
+    ) -> Result<Self, PluginError> {
         let plugin_rules = Arc::new(PluginRuleStore::default());
         let lua = runtime::spawn(
             Arc::clone(&registry),
             *BUNDLED_DIRS,
+            interaction,
             jit,
             Arc::clone(&plugin_rules),
         )?;
@@ -521,24 +524,14 @@ impl PluginHost {
                     plugin: builtin.clone(),
                     source: mlua::Error::runtime("bundled plugin missing init.lua"),
                 })?;
-            let permissions = bundled_permissions(bundled)?;
-            let name: Arc<str> = Arc::from(builtin.as_str());
-            let opts = config
-                .opts
-                .get(builtin.as_str())
-                .cloned()
-                .map(Arc::new)
-                .unwrap_or_default();
-            self.send_load(
-                Arc::clone(&name),
-                vec![LoadChunk::bundled(name.as_ref(), init)],
-                LoadContext {
-                    opts,
-                    // The one load that ships inside the binary, and so the
-                    // one that may declare a provider under a built-in slug.
-                    authority: DeclAuthority::Bundled,
-                    ..LoadContext::plain(None, permissions)
-                },
+            self.load_bundled(
+                bundled,
+                init,
+                config
+                    .opts
+                    .get(builtin.as_str())
+                    .cloned()
+                    .unwrap_or_default(),
             )?;
         }
         Ok(())
@@ -564,7 +557,7 @@ impl PluginHost {
     }
 
     /// Option specs declared by loaded plugins via `maki.api.register_options`,
-    /// keyed by plugin name. Used by docgen.
+    /// keyed by plugin name.
     pub fn plugin_options(&self) -> Result<PluginOptionSpecs, PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.inner
@@ -572,6 +565,15 @@ impl PluginHost {
             .send(Request::CollectPluginOptions { reply: reply_tx })
             .map_err(|_| PluginError::HostDead)?;
         reply_rx.recv().map_err(|_| PluginError::HostDead)
+    }
+
+    pub fn loaded_plugins(&self) -> Result<Vec<String>, PluginError> {
+        let (reply, receiver) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::CollectLoadedPlugins { reply })
+            .map_err(|_| PluginError::HostDead)?;
+        receiver.recv().map_err(|_| PluginError::HostDead)
     }
 
     /// Runs a source as the global `init.lua`.
@@ -628,6 +630,42 @@ impl PluginHost {
             .map_err(|_| PluginError::HostDead)?;
         reply_rx.recv().map_err(|_| PluginError::HostDead)?;
         Ok(())
+    }
+
+    /// Runs trusted test source with a bundled plugin's permissions and private API.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn load_bundled_source(
+        &self,
+        name: &str,
+        source: &str,
+        opts: JsonMap<String, JsonValue>,
+    ) -> Result<(), PluginError> {
+        let bundled = BUNDLED_PLUGINS
+            .iter()
+            .find(|plugin| plugin.name == name)
+            .ok_or_else(|| PluginError::UnknownPlugin {
+                plugin: name.to_owned(),
+            })?;
+        self.load_bundled(bundled, source, opts)
+    }
+
+    fn load_bundled(
+        &self,
+        bundled: &BundledPlugin,
+        source: &str,
+        opts: JsonMap<String, JsonValue>,
+    ) -> Result<(), PluginError> {
+        let name = bundled.name;
+        self.send_load(
+            Arc::from(name),
+            vec![LoadChunk::bundled(name, source)],
+            LoadContext {
+                opts: Arc::new(opts),
+                authority: DeclAuthority::Bundled,
+                private_api: bundled.private_api,
+                ..LoadContext::plain(None, bundled_permissions(bundled)?)
+            },
+        )
     }
 
     /// Runs a source with every permission granted, for tests and embedders.
@@ -719,6 +757,7 @@ impl PluginHost {
                     revision_guard: package.revision_guard.clone(),
                     package: true,
                     authority: DeclAuthority::ThirdParty,
+                    private_api: None,
                 },
                 reply: reply_tx,
             })
@@ -796,6 +835,7 @@ impl PluginHost {
                 revision_guard,
                 package: true,
                 authority: DeclAuthority::ThirdParty,
+                private_api: None,
             },
         )
     }
@@ -993,6 +1033,7 @@ impl PluginHost {
             tx: self.inner.tx.clone(),
             prio_tx: self.inner.prio_tx.clone(),
             layered: Arc::clone(&self.inner.layered),
+            background: self.inner.background.clone(),
         }
     }
 
@@ -1034,6 +1075,7 @@ pub struct EventHandle {
     /// Published by the Lua thread and read without touching it: whether
     /// asking a chain can change the answer at all.
     layered: Arc<LayeredTools>,
+    background: BackgroundSessions,
 }
 
 impl EventHandle {
@@ -1042,7 +1084,16 @@ impl EventHandle {
             tx,
             prio_tx: flume::unbounded().0,
             layered: Arc::default(),
+            background: BackgroundSessions::default(),
         }
+    }
+
+    /// Esc in a plugin task's tab. Drops the session's registry entry, which
+    /// fires its cancel, and the plugin's pending `:prompt()` returns
+    /// "stopped by user". Synchronous on purpose: the registry is a mutex the
+    /// Lua thread shares, so a busy Lua thread cannot delay the stop.
+    pub fn cancel_plugin_session(&self, id: &str) {
+        self.background.stop(id);
     }
 
     #[doc(hidden)]
@@ -1124,6 +1175,7 @@ impl EventHandle {
             tx: shared.clone(),
             prio_tx: shared,
             layered: Arc::default(),
+            background: BackgroundSessions::default(),
         }
     }
 
@@ -1143,7 +1195,7 @@ impl EventHandle {
         });
     }
 
-    pub fn collect_prompt_slots(&self) -> ResolvedSlots {
+    pub fn collect_prompt_slots(&self) -> ResolvedPrompts {
         let (tx, rx) = flume::bounded(1);
         let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
         rx.recv().unwrap_or_default()
@@ -1163,7 +1215,7 @@ impl EventHandle {
         Ok(crate::pack::PackContext::new(declared, installed, active))
     }
 
-    pub async fn collect_prompt_slots_async(&self) -> ResolvedSlots {
+    pub async fn collect_prompt_slots_async(&self) -> ResolvedPrompts {
         let (tx, rx) = flume::bounded(1);
         let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
         rx.recv_async().await.unwrap_or_default()
@@ -1220,6 +1272,20 @@ impl EventHandle {
         }
     }
 
+    /// The one way host code fires an event, so every field it sends is one
+    /// [`HostEventKind::fields`](crate::agent_autocmd::HostEventKind::fields)
+    /// classifies. {session_id} is the session the event is about.
+    pub fn fire(&self, session_id: Option<&dyn Display>, event: HostEvent<'_>) {
+        let _ = self.tx.try_send(Request::FireAutocmd {
+            event: event.name().to_owned(),
+            data: event.payload(session_id),
+        });
+    }
+
+    /// Fires {event} with {data} as given, for tests that need a payload no
+    /// [`HostEvent`] carries. Test builds only, so host code has no way to
+    /// fire an event whose fields nobody classified.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn fire_autocmd(&self, event: &str, data: serde_json::Value) {
         let _ = self.tx.try_send(Request::FireAutocmd {
             event: event.to_owned(),
@@ -1320,14 +1386,125 @@ mod tests {
     use super::*;
     use crate::api::keymap::TAKEN_ERR;
     use crate::api::util::command::{LuaCommandInfo, LuaCommandWriter};
+    use crate::plugin_permissions::PluginReach;
     use crossterm::event::KeyCode;
-    use maki_agent::prompt::{PromptId, ResolvedSlots, Slot};
+    use maki_agent::AgentMode;
+    use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, assemble};
     use maki_agent::tools::ToolRegistry;
+    use maki_agent::tools::test_support::stub_ctx;
+    use maki_providers::claude_code::UNSUPPORTED_SYSTEM;
+    use serde_json::json;
+    #[cfg(target_os = "linux")]
+    use std::process::Command;
     use std::time::Instant;
     use test_case::test_case;
 
     const GLOBAL_TRUST_PATH: &str = "~/src/me/*";
     const PROJECT_TRUST_PATH: &str = "**";
+
+    #[test_case("ordinary")]
+    #[test_case(PLUGIN ; "bundled_name")]
+    fn private_claude_helpers_require_bundled_authority(name: &str) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            name,
+            r#"
+            assert(maki.claude_code == nil)
+            assert(not pcall(require, "maki.claude_code.internal"))
+        "#,
+        )
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test_case(include_str!("../../plugins/claude_code/tests/spec.lua") ; "plugin_spec")]
+    #[test_case(include_str!("../../plugins/claude_code/tests/jobs.lua") ; "job_spec")]
+    fn claude_code_bundled_spec(source: &str) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_bundled_source(PLUGIN, source, JsonMap::new())
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn git_environment_cleanup_matches_the_installed_git() {
+        let output = Command::new("git")
+            .args(["rev-parse", "--local-env-vars"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let names: Vec<_> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let source = format!(
+            r#"
+            local git = require("claude_git")
+            local expected = maki.json.decode([==[{}]==])
+            local names = {{}}
+            for name in git.without_local_git_env(""):gmatch("%S+") do names[name] = true end
+            names.unset = nil
+            for _, name in ipairs(expected) do assert(names[name], name) names[name] = nil end
+            assert(next(names) == nil)
+        "#,
+            serde_json::to_string(&names).unwrap()
+        );
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_bundled_source(PLUGIN, &source, JsonMap::new())
+            .unwrap();
+    }
+
+    #[test]
+    fn unsupported_claude_loads_without_disrupting_later_builtins() {
+        let registry = Arc::new(ToolRegistry::new());
+        let mut host = PluginHost::new(Arc::clone(&registry)).unwrap();
+        let bundled = BUNDLED_PLUGINS
+            .iter()
+            .find(|plugin| plugin.name == PLUGIN)
+            .unwrap();
+        let unsupported = BundledPlugin {
+            name: bundled.name,
+            dir: bundled.dir.clone(),
+            private_api: Some(crate::api::claude_code_unsupported::create_private_module),
+        };
+        let source = bundled
+            .dir
+            .get_file("init.lua")
+            .unwrap()
+            .contents_utf8()
+            .unwrap();
+        host.load_bundled(&unsupported, source, JsonMap::new())
+            .unwrap();
+        host.load_builtins(&PluginsConfig {
+            names: vec!["view_image".into(), "openrouter".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        let loaded = host.loaded_plugins().unwrap();
+        assert!(loaded.iter().any(|name| name == "view_image"));
+        assert!(loaded.iter().any(|name| name == "openrouter"));
+        let ctx = stub_ctx(&AgentMode::Build);
+        for (name, input) in [
+            (PLUGIN, json!({"prompt": "inspect"})),
+            ("claude_code_import", json!({"id": "Ab12Cd34"})),
+        ] {
+            let invocation = registry.get(name).unwrap().try_parse(&input).unwrap();
+            let result = smol::block_on(invocation.execute(&ctx));
+            assert!(result.output.unwrap_err().contains(UNSUPPORTED_SYSTEM));
+        }
+    }
+
+    #[test]
+    fn loaded_plugins_include_plugins_without_options() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("empty", "return {}").unwrap();
+        assert_eq!(host.loaded_plugins().unwrap(), ["empty"]);
+        assert!(host.load_source("broken", "error('broken')").is_err());
+        assert_eq!(host.loaded_plugins().unwrap(), ["empty"]);
+        host.unload("empty").unwrap();
+        assert!(host.loaded_plugins().unwrap().is_empty());
+    }
 
     /// Closing the queue and reading it are one message. A Lua task can record
     /// an activation between a separate read and close, and a close that threw
@@ -1354,9 +1531,9 @@ mod tests {
     /// (`tests/plugin_host.rs` boots hosts via `new`); only the O1
     /// interpreter path needs its own coverage.
     #[test]
-    fn with_jit_off_loads_builtins_and_registers_tools() {
+    fn jit_off_loads_builtins_and_registers_tools() {
         let reg = Arc::new(ToolRegistry::new());
-        let mut host = PluginHost::with_jit(Arc::clone(&reg), false).unwrap();
+        let mut host = PluginHost::start(Arc::clone(&reg), Interaction::Tty, false).unwrap();
         host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
             .unwrap();
         assert!(reg.has("glob"));
@@ -1403,14 +1580,14 @@ mod tests {
 
     /// Load `src` as one plugin, collect resolved slots.
     /// Panics on failure; use `load_err` to inspect errors.
-    fn slots_from(plugin: &str, src: &str) -> (PluginHost, ResolvedSlots) {
+    fn slots_from(plugin: &str, src: &str) -> (PluginHost, ResolvedPrompts) {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(plugin, src).unwrap();
         let slots = host.event_handle().collect_prompt_slots();
         (host, slots)
     }
 
-    fn contents(slots: &ResolvedSlots, prompt: PromptId, slot: Slot) -> Vec<&str> {
+    fn contents(slots: &ResolvedPrompts, prompt: PromptId, slot: Slot) -> Vec<&str> {
         slots
             .get(prompt, slot)
             .iter()
@@ -1428,6 +1605,7 @@ mod tests {
             name: Arc::from("/test"),
             description: Arc::from("desc"),
             plugin: Arc::from("p"),
+            reach: PluginReach::new(PluginPermissions::trusted()),
             max_args: 0,
         }]);
         let snap = reader.load();
@@ -1460,6 +1638,7 @@ mod tests {
             tx,
             prio_tx,
             layered: Arc::default(),
+            background: BackgroundSessions::default(),
         };
         handle.run_command(
             Arc::from("myplugin"),
@@ -1902,9 +2081,8 @@ mod tests {
 
     /// Targeting a prompt that does not have the slot quietly drops the hint.
     #[test]
-    fn register_prompt_hint_rejects_incompatible_slot_prompt() {
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-        let r = host.load_source(
+    fn register_prompt_hint_ignores_missing_slot() {
+        let (_host, slots) = slots_from(
             "drop",
             r#"
             maki.api.register_prompt_hint({
@@ -1914,8 +2092,8 @@ mod tests {
             })
             "#,
         );
-        assert!(r.is_err());
-        assert!(r.unwrap_err().to_string().contains("not available"));
+        assert!(contents(&slots, PromptId::Research, Slot::AfterInstructions).is_empty());
+        assert!(!assemble(PromptId::Research, &slots, "").contains("never lands"));
     }
 
     #[test]
@@ -2007,42 +2185,22 @@ mod tests {
         assert!(host.load_source("bad", &src).is_err());
     }
 
-    #[test]
-    fn identity_slot_lands_on_system_only() {
-        let (_host, slots) = slots_from(
-            "id",
-            r#"
-            maki.api.set_prompt({
-                slot = "identity",
-                content = "Custom identity",
-            })
-            "#,
+    #[test_case(Slot::Identity ; "identity")]
+    #[test_case(Slot::Tone ; "tone")]
+    #[test_case(Slot::Conventions ; "static_section")]
+    fn omitted_replacement_targets_only_the_main_prompt(slot: Slot) {
+        const CONTENT: &str = "Custom policy";
+        let (_host, prompts) = slots_from(
+            "persona",
+            &format!("maki.api.set_prompt({{ slot = \"{slot}\", content = {CONTENT:?} }})"),
         );
-        assert_eq!(
-            contents(&slots, PromptId::System, Slot::Identity),
-            ["Custom identity"]
-        );
-        assert!(contents(&slots, PromptId::Research, Slot::Identity).is_empty());
-        assert!(contents(&slots, PromptId::General, Slot::Identity).is_empty());
-    }
-
-    #[test]
-    fn tone_slot_lands_on_system_only() {
-        let (_host, slots) = slots_from(
-            "tone",
-            r#"
-            maki.api.set_prompt({
-                slot = "tone",
-                content = "Custom tone",
-            })
-            "#,
-        );
-        assert_eq!(
-            contents(&slots, PromptId::System, Slot::Tone),
-            ["Custom tone"]
-        );
-        assert!(contents(&slots, PromptId::Research, Slot::Tone).is_empty());
-        assert!(contents(&slots, PromptId::General, Slot::Tone).is_empty());
+        assert!(assemble(PromptId::System, &prompts, "").contains(CONTENT));
+        for pid in [PromptId::Research, PromptId::General] {
+            assert_eq!(
+                assemble(pid, &prompts, ""),
+                assemble(pid, &ResolvedPrompts::default(), ""),
+            );
+        }
     }
 
     #[test]
@@ -2105,6 +2263,8 @@ mod tests {
             contents(&slots, PromptId::System, Slot::Identity),
             ["Explicit identity"]
         );
+        assert!(contents(&slots, PromptId::Research, Slot::Identity).is_empty());
+        assert!(contents(&slots, PromptId::General, Slot::Identity).is_empty());
     }
 
     #[test]
@@ -2158,24 +2318,31 @@ mod tests {
     }
 
     #[test]
-    fn set_prompt_rejects_aggregate_slot() {
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-        let r = host.load_source(
-            "bad",
-            r#"maki.api.set_prompt({ slot = "tool_usage", content = "nope" })"#,
+    fn set_prompt_replaces_aggregate_default_and_preserves_hints() {
+        const REPLACEMENT: &str = "Analyse information without coding guidance.";
+        const HINT: &str = "Use the library catalogue.";
+        let (_host, slots) = slots_from(
+            "sections",
+            r#"
+            maki.api.set_prompt({ slot = "conventions", prompt = "system", content = "Analyse information without coding guidance." })
+            maki.api.register_prompt_hint({ slot = "conventions", prompt = "system", content = "Use the library catalogue." })
+            "#,
         );
-        assert!(r.is_err());
+        let rendered = assemble(PromptId::System, &slots, "");
+        assert!(rendered.contains(&format!("{REPLACEMENT}\n{HINT}")));
+        assert!(!rendered.contains("Never assume a library is available."));
+        assert!(slots.has_replacements());
+        assert!(!slots.policy_key().is_empty());
     }
 
     #[test]
-    fn set_prompt_rejects_incompatible_slot_prompt() {
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-        let r = host.load_source(
-            "bad",
-            r#"maki.api.set_prompt({ slot = "identity", prompt = "research", content = "x" })"#,
+    fn set_prompt_ignores_known_section_missing_from_template() {
+        let (_host, slots) = slots_from(
+            "absent",
+            r#"maki.api.set_prompt({ slot = "identity", prompt = "plan", content = "never lands" })"#,
         );
-        assert!(r.is_err());
-        assert!(r.unwrap_err().to_string().contains("not available"));
+        assert!(contents(&slots, PromptId::Plan, Slot::Identity).is_empty());
+        assert!(!assemble(PromptId::Plan, &slots, "").contains("never lands"));
     }
 
     #[test]
@@ -2194,7 +2361,7 @@ mod tests {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         let r = host.load_source(
             "bad",
-            r#"maki.api.set_prompt({ slot = "identity", content = "" })"#,
+            r#"maki.api.register_prompt_hint({ slot = "tool_usage", content = "" })"#,
         );
         assert!(r.is_err());
         assert!(r.unwrap_err().to_string().contains("empty"));
@@ -2216,6 +2383,236 @@ mod tests {
             ["Dyn identity"]
         );
     }
+
+    #[test]
+    fn singleton_callback_is_collected_once_per_snapshot() {
+        let (host, first) = slots_from(
+            "live",
+            r#"
+            local count = 0
+            maki.api.set_prompt({ prompt = {"system", "research", "general"}, slot = "identity", content = function()
+                count += 1
+                return tostring(count)
+            end })
+            "#,
+        );
+        let second = host.event_handle().collect_prompt_slots();
+        for &pid in PromptId::ALL {
+            assert_eq!(contents(&first, pid, Slot::Identity), ["1"]);
+            assert_eq!(contents(&second, pid, Slot::Identity), ["2"]);
+        }
+        assert!(!first.has_replacements());
+        assert!(!second.has_replacements());
+    }
+
+    #[test]
+    fn init_lua_replaces_template_and_section() {
+        const TEMPLATE: &str = "Analysis policy.\n{{conventions}}\n{{instructions}}";
+        const SECTION: &str = "Follow primary sources.";
+        const INSTRUCTIONS: &str = "Keep {{identity}} literal.";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.send_global_init_lua(
+            format!(
+                "maki.api.set_prompt({{prompt = \"system\", slot = \"conventions\", content = {SECTION:?}}})\n\
+                 maki.api.set_prompt({{prompt = \"system\", content = {TEMPLATE:?}}})\n\
+                 maki.setup({{}})"
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            assemble(
+                PromptId::System,
+                &host.event_handle().collect_prompt_slots(),
+                INSTRUCTIONS,
+            ),
+            format!("Analysis policy.\n{SECTION}\n{INSTRUCTIONS}")
+        );
+    }
+
+    #[test]
+    fn empty_replacements_clear_default_content() {
+        let (_host, slots) = slots_from(
+            "clear",
+            r#"
+            maki.api.set_prompt({ prompt = "system", slot = "identity", content = "" })
+            maki.api.set_prompt({ prompt = "system", slot = "conventions", content = "" })
+            maki.api.set_prompt({ prompt = "plan", content = "" })
+            "#,
+        );
+        const CODING_CONVENTION: &str = "Never assume a library is available.";
+        let defaults = assemble(PromptId::System, &ResolvedPrompts::default(), "");
+        assert!(defaults.contains(CODING_CONVENTION));
+        let rendered = assemble(PromptId::System, &slots, "");
+        assert!(!rendered.contains("You are Maki"));
+        assert!(!rendered.contains(CODING_CONVENTION));
+        assert_eq!(assemble(PromptId::Plan, &slots, ""), "");
+        assert!(slots.has_template(PromptId::Plan));
+    }
+
+    #[test_case("system", PromptId::System ; "system")]
+    #[test_case("research", PromptId::Research ; "research")]
+    #[test_case("general", PromptId::General ; "general")]
+    #[test_case("plan", PromptId::Plan ; "plan")]
+    fn complete_replacement_has_no_implicit_sections(name: &str, id: PromptId) {
+        const TEMPLATE: &str = "You help analyse information.";
+        let (_host, slots) = slots_from(
+            "author",
+            &format!("maki.api.set_prompt({{ prompt = {name:?}, content = {TEMPLATE:?} }})"),
+        );
+        assert_eq!(assemble(id, &slots, "coding instructions"), TEMPLATE);
+    }
+
+    #[test]
+    fn template_and_section_compose_independent_of_owner_order() {
+        const CONTENT: &str = "Follow the evidence.\nUse the library catalogue.";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "aaa_section",
+            r#"
+            maki.api.set_prompt({ prompt = "plan", slot = "conventions", content = "Follow the evidence." })
+            maki.api.register_prompt_hint({ prompt = "plan", slot = "conventions", content = "Use the library catalogue." })
+            "#,
+        ).unwrap();
+        host.load_source(
+            "zzz_template",
+            r#"maki.api.set_prompt({ prompt = "plan", content = "{{conventions}}" })"#,
+        )
+        .unwrap();
+        let slots = host.event_handle().collect_prompt_slots();
+        assert_eq!(assemble(PromptId::Plan, &slots, ""), CONTENT);
+    }
+
+    #[test]
+    fn replacements_use_alphabetical_owner_and_last_registration() {
+        const CONTENT: &str = "last template: last section";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "zzz",
+            r#"
+            maki.api.set_prompt({ prompt = "system", content = "old template: {{conventions}}" })
+            maki.api.set_prompt({ prompt = "system", slot = "conventions", content = "old section" })
+            maki.api.set_prompt({ prompt = "system", content = "last template: {{conventions}}" })
+            maki.api.set_prompt({ prompt = "system", slot = "conventions", content = "last section" })
+            "#,
+        ).unwrap();
+        host.load_source(
+            "aaa",
+            r#"
+            maki.api.set_prompt({ prompt = "system", content = "first template: {{conventions}}" })
+            maki.api.set_prompt({ prompt = "system", slot = "conventions", content = "first section" })
+            "#,
+        ).unwrap();
+        let slots = host.event_handle().collect_prompt_slots();
+        assert_eq!(assemble(PromptId::System, &slots, ""), CONTENT);
+        host.unload("zzz").unwrap();
+        assert_eq!(
+            assemble(
+                PromptId::System,
+                &host.event_handle().collect_prompt_slots(),
+                ""
+            ),
+            "first template: first section"
+        );
+    }
+
+    #[test]
+    fn repeated_singleton_discards_callback_and_replaces_only_its_targets() {
+        let (_host, slots) = slots_from(
+            "singleton",
+            r#"
+            maki.api.set_prompt({ prompt = { "system", "general" }, slot = "identity", content = function() return "first" end })
+            maki.api.set_prompt({ prompt = "system", slot = "identity", content = function() return "last" end })
+            "#,
+        );
+        assert_eq!(contents(&slots, PromptId::System, Slot::Identity), ["last"]);
+        assert_eq!(
+            contents(&slots, PromptId::General, Slot::Identity),
+            ["first"]
+        );
+    }
+
+    #[test]
+    fn replaced_singleton_callback_is_not_invoked() {
+        let (_host, slots) = slots_from(
+            "singleton",
+            r#"
+            local calls = 0
+            maki.api.set_prompt({ slot = "identity", content = function() calls += 1; return "old" end })
+            maki.api.set_prompt({ slot = "identity", content = function() return tostring(calls) end })
+            "#,
+        );
+        assert_eq!(contents(&slots, PromptId::System, Slot::Identity), ["0"]);
+    }
+
+    #[test]
+    fn unload_reload_and_failed_load_remove_all_replacements() {
+        const TEMPLATE: &str = "replacement: selected";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let source = r#"
+            maki.api.set_prompt({ prompt = "system", content = "replacement: {{conventions}}" })
+            maki.api.set_prompt({ prompt = "system", slot = "conventions", content = "selected" })
+            maki.api.set_prompt({ prompt = "system", slot = "identity", content = function() return "unused identity" end })
+        "#;
+        host.load_source("owned", source).unwrap();
+        let handle = host.event_handle();
+        assert_eq!(
+            assemble(PromptId::System, &handle.collect_prompt_slots(), ""),
+            TEMPLATE
+        );
+        host.unload("owned").unwrap();
+        assert!(!handle.collect_prompt_slots().has_replacements());
+        host.load_source("owned", source).unwrap();
+        host.load_source(
+            "owned",
+            r#"maki.api.set_prompt({ prompt = "system", content = "new" })"#,
+        )
+        .unwrap();
+        let reloaded = handle.collect_prompt_slots();
+        assert_eq!(assemble(PromptId::System, &reloaded, ""), "new");
+        assert!(contents(&reloaded, PromptId::System, Slot::Identity).is_empty());
+        assert!(
+            host.load_source("owned", &format!("{source}\nerror('failed load')"))
+                .is_err()
+        );
+        let failed = handle.collect_prompt_slots();
+        assert!(!failed.has_replacements());
+        assert!(contents(&failed, PromptId::System, Slot::Identity).is_empty());
+        assert_eq!(
+            assemble(PromptId::System, &failed, ""),
+            assemble(PromptId::System, &ResolvedPrompts::default(), "")
+        );
+    }
+
+    #[test_case(r#"{ content = "x" }"# ; "whole_requires_prompt")]
+    #[test_case(r#"{ prompt = { "system", "general" }, content = "x" }"# ; "whole_requires_one_prompt")]
+    #[test_case(r#"{ prompt = "nope", content = "x" }"# ; "unknown_prompt")]
+    #[test_case(r#"{ prompt = "btw_fallback", content = "x" }"# ; "unsupported_btw_fallback")]
+    #[test_case(r#"{ prompt = "continuation", content = "x" }"# ; "unsupported_continuation")]
+    #[test_case(r#"{ prompt = "compaction_user", content = "x" }"# ; "unsupported_compaction_user")]
+    #[test_case(r#"{ prompt = "compaction_system", content = "x" }"# ; "unsupported_compaction_system")]
+    #[test_case(r#"{ prompt = "plan_end", content = "x" }"# ; "unsupported_plan_end")]
+    #[test_case(r#"{ prompt = "system" }"# ; "missing_whole_content")]
+    #[test_case(r#"{ prompt = "system", content = function() return "x" end }"# ; "whole_callback")]
+    #[test_case(r#"{ slot = "conventions", content = function() return "x" end }"# ; "section_callback")]
+    #[test_case(r#"{ slot = "conventions", content = 42 }"# ; "section_wrong_type")]
+    #[test_case(r#"{ slot = "unknown", content = "x" }"# ; "unknown_section")]
+    #[test_case(r#"{ slot = "conventions" }"# ; "missing_section_content")]
+    #[test_case(r#"{ prompt = "system", content = string.rep("x", 1024 * 1024 + 1) }"# ; "oversized_whole")]
+    #[test_case(r#"{ slot = "conventions", content = string.rep("x", 1024 * 1024 + 1) }"# ; "oversized_section")]
+    fn invalid_replacement_is_rejected(spec: &str) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        assert!(
+            host.load_source("invalid", &format!("maki.api.set_prompt({spec})"))
+                .is_err()
+        );
+        assert!(
+            !host
+                .event_handle()
+                .collect_prompt_slots()
+                .has_replacements()
+        );
+    }
 }
 
 /// Holds every bundled `plugin.toml` to what its plugin actually does: the
@@ -2230,14 +2627,25 @@ mod bundled_manifests {
     use include_dir::{Dir, DirEntry, File};
     use maki_agent::tools::{ToolRegistry, ToolSource};
     use maki_config::{DEFAULT_BUILTINS, PluginsConfig};
+    use strum::VariantArray;
+    use test_case::test_case;
 
     use super::{Arc, BUNDLED_PLUGINS, HashMap, PluginHost, bundled_permissions, lib_dir};
+    use crate::agent_autocmd::HostEventKind;
     use crate::docs::{DocKind, api_docs};
     use crate::plugin_permissions::Permission;
 
     const TEST_DIR: &str = "tests";
     const LUA_EXT: &str = "lua";
     const REQUIRE_CALL: &str = "require(";
+    const PROVIDER_REGISTER: &str = "maki.provider.register";
+    const API_KEY_ENV_FIELD: &str = "api_key_env";
+    const AGENT_SESSION: &str = "maki.agent.session";
+    const SESSION_NOTIFY: &str = "maki.session.notify";
+    const WAKE_OPTION: &str = "wake =";
+    const DISABLED_WAKE: &str = "false";
+    const CREATE_AUTOCMD: &str = "maki.api.create_autocmd";
+    const LUA_QUOTES: [char; 2] = ['"', '\''];
 
     /// Every guarded `maki.*` function under the dotted name lua calls it by.
     fn guarded_calls() -> Vec<(String, Permission)> {
@@ -2245,9 +2653,13 @@ mod bundled_manifests {
             .into_iter()
             .filter(|module| module.kind == DocKind::Table)
             .flat_map(|module| {
-                module.fns.iter().filter_map(move |func| {
-                    let permission = Permission::from_key(func.guard?)?;
-                    Some((format!("{}.{}", module.name, func.name), permission))
+                module.fns.iter().flat_map(move |func| {
+                    func.guard
+                        .unwrap_or_default()
+                        .iter()
+                        .map(move |&permission| {
+                            (format!("{}.{}", module.name, func.name), permission)
+                        })
                 })
             })
             .collect()
@@ -2264,14 +2676,13 @@ mod bundled_manifests {
 
         let mut out: BTreeMap<String, BTreeSet<Permission>> = BTreeMap::new();
         for tool in registry.iter().iter() {
-            let (ToolSource::Lua { plugin }, Some(permission)) =
-                (&tool.source, tool.tool.required_permission())
+            let (ToolSource::Lua { plugin }, Some(reach)) = (&tool.source, tool.tool.reach())
             else {
                 continue;
             };
             out.entry(plugin.to_string())
                 .or_default()
-                .insert(permission);
+                .insert(reach.permission);
         }
         out
     }
@@ -2341,14 +2752,33 @@ mod bundled_manifests {
         })
     }
 
+    fn wakes_session(source: &str) -> bool {
+        calls(source, SESSION_NOTIFY)
+            && source.split(WAKE_OPTION).skip(1).any(|option| {
+                option.split([',', '}']).next().unwrap_or_default().trim() != DISABLED_WAKE
+            })
+    }
+
+    #[test_case("true", true ; "unconditional_wake")]
+    #[test_case("false", false ; "queue_only")]
+    #[test_case("not stopped", true ; "conditional_wake")]
+    #[test_case("false or enabled", true ; "conditional_after_false")]
+    fn notification_wake_usage_requires_the_agent_grant(value: &str, needed: bool) {
+        let source = format!("{SESSION_NOTIFY}('done', {{ session = id, wake = {value} }})");
+        assert_eq!(wakes_session(&source), needed);
+    }
+
     /// `PROVIDER_BUILTINS` is what keeps a provider plugin's name from reading
     /// as a tool, so a bundled plugin that starts registering one must join it.
     #[test]
     fn provider_builtins_are_the_bundled_plugins_that_register_a_provider() {
-        const REGISTER: &str = "maki.provider.register";
         let mut registering: Vec<&str> = BUNDLED_PLUGINS
             .iter()
-            .filter(|p| runtime_sources(&p.dir).iter().any(|s| calls(s, REGISTER)))
+            .filter(|p| {
+                runtime_sources(&p.dir)
+                    .iter()
+                    .any(|s| calls(s, PROVIDER_REGISTER))
+            })
             .map(|p| p.name)
             .collect();
         let mut expected = maki_config::PROVIDER_BUILTINS.to_vec();
@@ -2380,6 +2810,48 @@ mod bundled_manifests {
                 for (name, permission) in &guarded {
                     if calls(source, name) {
                         needed.entry(*permission).or_insert_with(|| name.clone());
+                    }
+                }
+                // `api_key_env` is a field, not a call, so the scan above
+                // misses it. Registration still refuses it without `env`.
+                if calls(source, PROVIDER_REGISTER) && calls(source, API_KEY_ENV_FIELD) {
+                    needed
+                        .entry(Permission::Env)
+                        .or_insert_with(|| format!("{PROVIDER_REGISTER} with {API_KEY_ENV_FIELD}"));
+                }
+                // Waking a chat is guarded only when the option is set, so
+                // it has no unconditional guard in the API metadata.
+                if wakes_session(source) {
+                    needed
+                        .entry(Permission::Agent)
+                        .or_insert_with(|| format!("{SESSION_NOTIFY} with {WAKE_OPTION}"));
+                }
+                // Events are never refused, they arrive without their content
+                // fields, so no guard records the need. A bundled plugin
+                // subscribing to an event that has content is reading it.
+                if calls(source, CREATE_AUTOCMD) {
+                    for &kind in HostEventKind::VARIANTS {
+                        let event: &str = kind.into();
+                        if !kind.fields().content.is_empty()
+                            && LUA_QUOTES
+                                .iter()
+                                .any(|q| source.contains(&format!("{q}{event}{q}")))
+                        {
+                            needed
+                                .entry(Permission::SessionRead)
+                                .or_insert_with(|| format!("subscribing to {event}"));
+                        }
+                    }
+                }
+                // A bundled plugin opening a session hands over whatever the
+                // chat has, and a session pays for everything it hands over.
+                if calls(source, AGENT_SESSION) {
+                    for &permission in Permission::ALL {
+                        if permission != Permission::Agent {
+                            needed
+                                .entry(permission)
+                                .or_insert_with(|| AGENT_SESSION.to_owned());
+                        }
                     }
                 }
             }

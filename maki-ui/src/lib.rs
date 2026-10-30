@@ -10,7 +10,7 @@ mod clipboard;
 mod clock;
 mod color_compat;
 mod components;
-pub use components::command::{BUILTIN_COMMANDS, BuiltinCommand};
+pub use components::command::{BUILTIN_COMMANDS, BuiltinCommand, PluginAccess, SUBMITS_PROMPT};
 pub use components::keybindings;
 mod highlight;
 pub use highlight::highlight_ansi;
@@ -39,6 +39,7 @@ mod terminal_image;
 use std::time::Instant;
 
 use color_eyre::Result;
+use maki_agent::session::{StoreError, save_new};
 use maki_lua::PackPlan;
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
@@ -67,6 +68,12 @@ impl OpenSession {
     pub fn load(id: MakiId, storage: &StateDir) -> Result<Self, SessionError> {
         let (session, claim) = AppSession::claim_and_load(id, storage)?;
         Ok(Self { session, claim })
+    }
+
+    /// For a session no tab opens. The write lands before this returns, so a
+    /// caller told the id already finds it in a listing.
+    pub(crate) fn store(self, storage: &StateDir) -> Result<MakiId, StoreError> {
+        save_new(self.session, &self.claim, storage)
     }
 }
 

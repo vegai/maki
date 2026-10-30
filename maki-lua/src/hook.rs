@@ -8,17 +8,39 @@ use std::time::Instant;
 
 use flume::Sender;
 use maki_agent::agent::{AgentCall, AgentHook, AgentSlot};
+use maki_agent::permissions::LayerAnswer;
+use maki_agent::tools::ToolContext;
 use maki_agent::tools::hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
 use maki_agent::tools::registry::BoxFuture;
 use serde_json::{Value, json};
 
-use crate::api::slot::{ANY_TOOL, LayeredTools, host_slot_name};
-use crate::runtime::{HookRun, Request};
+use crate::api::slot::{ANY_TOOL, LayerCost, LayeredTools, PERMISSION_PROMPT_SLOT, host_slot_name};
+use crate::api::util::ctx::LuaCtx;
+use crate::plugin_permissions::Permission;
+use crate::runtime::{HookRun, PromptRun, Request};
 
 /// Every `agent.*` slot steers what the agent does next: the prompt it
 /// answers, whether it stops, what it remembers after a compaction. No
 /// narrower price would be honest.
-const AGENT_SLOT_AUTHORITY: Authority = Authority::Unbounded;
+const AGENT_SLOT_COST: LayerCost<'static> = LayerCost::TOTAL;
+
+/// Conversation content, both ways, on every stage. A layer that sees the
+/// call reads what the model wrote (the file `write` puts on disk, the page
+/// `webfetch` asks for), and every layer decides what the model reads back:
+/// an output layer rewrites the result, while an input layer or a prompt can
+/// refuse with any text it likes, or turn a command into `echo`. Without this
+/// a `net`-only plugin could ship the input `ToolDone` keeps from it, or put
+/// words in front of the model.
+const TOOL_LAYER_CONTENT: &[Permission] = &[Permission::SessionRead, Permission::SessionWrite];
+
+/// What every layer on a tool call pays, `permission.prompt` included: the
+/// call's {authority}, plus [`TOOL_LAYER_CONTENT`].
+fn tool_layer_cost(authority: Authority) -> LayerCost<'static> {
+    LayerCost::Host {
+        authority,
+        content: TOOL_LAYER_CONTENT,
+    }
+}
 
 pub(crate) struct SlotHook {
     pub(crate) tx: Sender<Request>,
@@ -63,7 +85,7 @@ impl ToolHook for SlotHook {
                 host_slot_name(call.tool, stage),
                 host_slot_name(ANY_TOOL, stage),
             ],
-            authority: call.authority,
+            cost: tool_layer_cost(call.authority),
             cancel: call.cancel.clone(),
             deadline: call.deadline,
             value,
@@ -75,9 +97,42 @@ impl ToolHook for SlotHook {
                 "input": call.input,
                 "session_id": call.session_id,
                 "origin": call.origin.as_str(),
+                "output_mode": call.output_mode.as_str(),
                 "deadline_ms": deadline_ms(call.deadline),
             }),
             may_ask: stage == HookStage::Input,
+        })
+    }
+
+    fn prompt<'a>(
+        &'a self,
+        input: &'a Value,
+        scopes: &'a [String],
+        call: &'a HookCall<'a>,
+        ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Option<LayerAnswer>> {
+        Box::pin(async move {
+            if !self.layered.layers_surface(PERMISSION_PROMPT_SLOT) {
+                return None;
+            }
+            let (reply, answer) = flume::bounded(1);
+            let run = PromptRun {
+                cost: tool_layer_cost(call.authority),
+                cancel: call.cancel.clone(),
+                deadline: call.deadline,
+                req: json!({
+                    "tool": call.tool,
+                    "tool_id": call.tool_id,
+                    "input": input,
+                    "scopes": scopes,
+                }),
+                ctx: Box::new(LuaCtx::handler(ctx)),
+            };
+            self.tx
+                .send_async(Request::RunPrompt { run, reply })
+                .await
+                .ok()?;
+            answer.recv_async().await.ok().flatten()
         })
     }
 }
@@ -95,7 +150,7 @@ impl AgentHook for SlotHook {
     ) -> BoxFuture<'a, Verdict> {
         self.send(HookRun {
             slots: vec![slot.name().to_owned()],
-            authority: AGENT_SLOT_AUTHORITY,
+            cost: AGENT_SLOT_COST,
             cancel: call.cancel.clone(),
             deadline: call.deadline,
             value,

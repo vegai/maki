@@ -9,6 +9,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const FORM_LABEL: &str = " Plan complete ";
@@ -332,7 +333,7 @@ impl PlanForm {
         lines.push(Line::default());
         lines.push(fit(hint_line(HINT_PAIRS).spans, width));
 
-        render_form(&t, FORM_LABEL, frame, area, lines, (0, 0));
+        render_form(&t, FORM_LABEL, frame, area, Paragraph::new(lines), (0, 0));
     }
 }
 

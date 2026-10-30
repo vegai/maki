@@ -39,7 +39,6 @@ pub(crate) struct AgentHandles {
     pub(crate) agent_tx: flume::Sender<Envelope>,
     pub(crate) answer_tx: flume::Sender<String>,
     pub(crate) history: SharedMessages,
-    pub(crate) btw_system: Arc<ArcSwap<String>>,
     pub(crate) mcp_handle: Option<McpHandle>,
     pub(crate) mcp_config_errors: McpConfigErrors,
     pub(crate) queue: QueueSender,
@@ -92,13 +91,23 @@ impl AgentHandles {
     pub(crate) fn apply_to_app(&self, app: &mut App) {
         app.answer_tx = Some(self.answer_tx.clone());
         app.shared_history = Some(Arc::clone(&self.history));
-        app.btw_system = Some(Arc::clone(&self.btw_system));
         app.queue.set_shared(self.queue.clone());
         let restore_tx =
             maki_agent::EventSender::new(self.agent_tx.clone(), crate::app::RESTORE_RUN_ID);
         app.restore_event_tx = Some(restore_tx.clone());
         for chat in &mut app.chats {
             chat.set_restore_channel(Some(restore_tx.clone()));
+        }
+        self.publish_chat_settings(app);
+    }
+
+    /// Background subagents read the chat's mode and thinking from the seed. A
+    /// fresh loop gets them right away, before any monitor can look. The event
+    /// loop then sends them again on every pass, so code that changes a
+    /// setting never has to remember to.
+    pub(crate) fn publish_chat_settings(&self, app: &App) {
+        if let Some(seed) = self.mailbox.seed() {
+            seed.set_chat_settings(app.request_options(), &app.agent_mode());
         }
     }
 
@@ -155,6 +164,7 @@ impl AgentHandles {
                 // A respawn carries the app's last reported count across, so
                 // the next request is not left guessing at its own prompt.
                 context_size: app.state.context_size,
+                frame: app.state.session.frame().cloned(),
                 session: None,
             },
             config,
@@ -235,7 +245,6 @@ fn spawn_agent_internal(
     let shared_history: SharedMessages =
         Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
     maki_agent::agent::publish_live_history(resumed.id.id(), &shared_history);
-    let btw_system: Arc<ArcSwap<String>> = Arc::new(ArcSwap::from_pointee(String::new()));
     let cancels = RunCancels::new();
     let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
     let mailbox = SessionMailbox::register(resumed.id.id());
@@ -246,7 +255,6 @@ fn spawn_agent_internal(
         tool_output_lines,
         resumed,
         Arc::clone(&shared_history),
-        Arc::clone(&btw_system),
         mcp_handle.clone(),
         Arc::clone(permissions),
         agent_tx.clone(),
@@ -267,7 +275,6 @@ fn spawn_agent_internal(
         agent_tx,
         answer_tx,
         history: shared_history,
-        btw_system,
         mcp_handle,
         mcp_config_errors,
         queue: queue_tx,
@@ -285,20 +292,23 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Instant;
 
-    use maki_agent::{AgentEvent, AgentInput, AgentMode, InputSource};
+    use maki_agent::live_session::BACKGROUND_PLAN_WRITE_DENIED;
+    use maki_agent::{AgentEvent, AgentInput, AgentMode, AgentSeed, InputSource};
     use maki_config::{PermissionsConfig, ProjectConfig};
-    use maki_providers::provider::{BoxFuture, Provider};
+    use maki_providers::provider::{BoxFuture, Provider, RequestScope};
     use maki_providers::{
         AgentError, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
     };
 
     use super::shared_queue::{QueueItem, QueuedInput};
     use super::*;
+    use crate::app::Mode;
 
     const LONG_TIMEOUT: Duration = Duration::from_secs(60);
     const SHORT_TIMEOUT: Duration = Duration::from_millis(50);
     const PROBE_TEXT: &str = "probe-through-old-sender";
     const RESTORED_TEXT: &str = "restored-queued-message";
+    const DUPLICATE_CONSUMPTION: &str = "the restored item must be consumed once";
     const RESUMED_HISTORY_TEXT: &str = "resumed-conversation";
     const MODEL_A: &str = "model-a";
     const MODEL_B: &str = "model-b";
@@ -309,6 +319,7 @@ mod tests {
     const NO_CALL: &str = "the agent never reached the provider";
     const NO_TURN_END: &str = "the run never reported that it was over";
     const GATE_CLOSED: &str = "the in-flight call is no longer waiting to be released";
+    const SEED_NOT_LIVE: &str = "the respawned loop publishes a seed for the app's session";
 
     struct StubProvider;
 
@@ -321,7 +332,7 @@ mod tests {
             _tools: &'a serde_json::Value,
             _event_tx: &'a flume::Sender<ProviderEvent>,
             _opts: RequestOptions,
-            _session_id: Option<&'a SessionRef>,
+            _scope: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(std::future::pending())
         }
@@ -416,7 +427,7 @@ mod tests {
             _tools: &'a serde_json::Value,
             _event_tx: &'a flume::Sender<ProviderEvent>,
             _opts: RequestOptions,
-            _session_id: Option<&'a SessionRef>,
+            _scope: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             let id = model.id.clone();
             Box::pin(async move {
@@ -604,12 +615,6 @@ mod tests {
             run_id_before + 2,
             "each respawn must bump run_id exactly once"
         );
-        assert_eq!(
-            app.queue.text_messages(),
-            [RESTORED_TEXT],
-            "the restored item lands in the new queue exactly once"
-        );
-
         pre_gen1_sender
             .send(AgentEvent::TextDelta {
                 text: PROBE_TEXT.into(),
@@ -628,11 +633,21 @@ mod tests {
                 AgentEvent::QueueItemConsumed { ref text, .. } => {
                     assert_eq!(text, RESTORED_TEXT);
                     assert_eq!(envelope.run_id, app.run_id);
+                    assert!(!consumed_seen, "{DUPLICATE_CONSUMPTION}");
                     consumed_seen = true;
                 }
                 _ => {}
             }
         }
+        smol::block_on(handles.task.cancel());
+        assert!(
+            !handles
+                .agent_rx
+                .try_iter()
+                .any(|envelope| matches!(envelope.event, AgentEvent::QueueItemConsumed { .. })),
+            "{DUPLICATE_CONSUMPTION}"
+        );
+        assert!(app.queue.text_messages().is_empty());
     }
 
     /// If the seeded empty snapshot ever outlived `spawn`, the next checkpoint
@@ -675,6 +690,27 @@ mod tests {
             "a checkpoint right after respawn must not see the seeded empty snapshot"
         );
         assert_eq!(snapshot.messages[0].user_text(), Some(RESUMED_HISTORY_TEXT));
+    }
+
+    /// A monitor can prompt before the user sends anything, so the seed has to
+    /// know whether the chat plans, and its effort, from the moment the loop
+    /// exists.
+    /// `/new` and loads respawn under a new id with no settings to inherit.
+    #[test]
+    fn a_respawned_seed_starts_with_the_chat_settings() {
+        let (mut handles, model_slot, permissions) = stub_spawn();
+        let mut app = crate::app::tests::test_app();
+        app.set_mode(Mode::Plan);
+        app.state.thinking = ThinkingConfig::Adaptive;
+
+        respawn(&mut handles, &model_slot, &permissions, &mut app);
+        let id = app.state.session.id;
+        let seed = AgentSeed::live(id).expect(SEED_NOT_LIVE);
+        assert_eq!(seed.chat_opts(), app.request_options());
+        assert_eq!(
+            AgentSeed::background_write_block(id).as_deref(),
+            Some(BACKGROUND_PLAN_WRITE_DENIED)
+        );
     }
 
     #[test]

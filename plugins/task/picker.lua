@@ -15,19 +15,25 @@ local TICK_MS = 100
 -- A placeholder frame. The host swaps "spinner:*" spans for the live one, so
 -- running rows spin without this plugin redrawing.
 local RUNNING_ICON = "· "
+local QUEUED_ICON = "… "
 local MAIN_ICON = "● "
 -- The footer counts never animate, so they get a real bullet.
 local RUNNING_COUNT_ICON = "● "
 local DONE_ICON = "✓ "
 local ERROR_ICON = "✗ "
+local IDLE_ICON = "◌ "
 local NO_MATCHES_HINT = "  No matches"
-local FOOTER_KEYS = { { "Enter", "open" }, { "Esc", "cancel" } }
+local CONFIRM_HINT = "  Ctrl+D again to delete"
+local MAIN_TASK_ID = "main"
+local FOOTER_KEYS = { { "Enter", "open" }, { "Ctrl+S", "stop" }, { "Ctrl+D", "delete" }, { "Esc", "cancel" } }
 local HINT_KEY = "Ctrl+X"
 -- The main chat has no status, so it falls through to MAIN.
 local ICONS = {
   working = { RUNNING_ICON, "accent", true },
+  queued = { QUEUED_ICON, "dim" },
   done = { DONE_ICON, "success" },
   error = { ERROR_ICON, "error" },
+  idle = { IDLE_ICON, "dim" },
 }
 local MAIN = { MAIN_ICON, "accent" }
 
@@ -44,7 +50,7 @@ local function refresh_hint()
   maki.async.run(function()
     local n = 0
     for _, task in ipairs(maki.task.list() or {}) do
-      if task.status == "working" then
+      if Rows.running(task) then
         n = n + 1
       end
     end
@@ -93,10 +99,12 @@ local function rebuild()
 end
 
 local function render()
-  local lines = {}
-  local inner = board.width - 4
-  board.reserved = ListPicker.render_header(board.win, lines, board.input, FILTER_PREFIX, inner)
-  local cursor_line = board.reserved
+  board.header = {}
+  ListPicker.render_header(board.win, board.header, board.input, FILTER_PREFIX, board.width - 4)
+  -- `table.unpack` has an argument limit, and a long pasted query can wrap
+  -- into more lines than that.
+  local lines = table.move(board.header, 1, #board.header, 1, {})
+  local cursor_line = #lines
   local words = ListPicker.split_words(board.input:value())
   for _, row in ipairs(board.rows) do
     if row.section then
@@ -119,18 +127,26 @@ local function render()
     for _, span in ipairs(ListPicker.highlight_spans(task.name, words, base, match_style)) do
       line[#line + 1] = span
     end
+    local hint = selected and board.confirm == task.id and CONFIRM_HINT or ""
+    if hint ~= "" then
+      line[#line + 1] = { hint, "match_selected" }
+    end
     -- Rows with nothing on the right would otherwise end short of the border
     -- and read as padding on one side only, so the bar runs the full width.
-    local trail = board.width - 2 - dispw(icon) - dispw(task.name)
+    local owner = task.plugin and (task.plugin .. " ") or ""
+    local trail = board.width - 2 - dispw(icon) - dispw(task.name) - dispw(hint) - dispw(owner)
     if trail > 0 then
       line[#line + 1] = { string.rep(" ", trail), base }
+    end
+    if owner ~= "" then
+      line[#line + 1] = { owner, selected and "selected" or "dim" }
     end
     lines[#lines + 1] = line
     if selected then
       cursor_line = #lines
     end
   end
-  if #board.rows == 0 then
+  if #lines == #board.header then
     lines[#lines + 1] = { { NO_MATCHES_HINT, "dim" } }
   end
   board.buf:set_lines(lines)
@@ -176,6 +192,7 @@ local function move_sel(delta, wrap)
   if n == 0 then
     return
   end
+  board.confirm = nil
   local cur = Rows.index_of(board.rows, board.sel_id) or 1
   local idx
   if wrap then
@@ -192,7 +209,7 @@ local function move_sel(delta, wrap)
 end
 
 local function page_size()
-  return math.max(board.height - board.reserved - 1, 1)
+  return math.max(board.height - #board.header - 1, 1)
 end
 
 local function open_selected()
@@ -207,11 +224,74 @@ local function open_selected()
   finish(true)
 end
 
+local function stop_selected()
+  local idx = Rows.index_of(board.rows, board.sel_id)
+  if not idx then
+    return
+  end
+  local task = board.rows[idx].task
+  local this_board = board
+  board.confirm = nil
+  local _, err = maki.task.stop(task.id, { session = task.session })
+  if board ~= this_board then
+    return
+  end
+  if err then
+    maki.ui.flash(err)
+  end
+  refresh()
+end
+
+-- Ctrl+D asks first and deletes on the second press. A row that can never go
+-- (main, or a task still running) skips the question and goes straight to the
+-- host, which owns the refusal and its wording, so we only flash what it says.
+--
+-- remove() and refresh() both suspend and the picker can close meanwhile, so
+-- the board is checked after each. sel_id survives the refresh on purpose:
+-- rebuild() then seats the cursor on the row that slid into the deleted one's
+-- place, and we focus that row so the preview follows the cursor.
+local function delete_selected()
+  local idx = Rows.index_of(board.rows, board.sel_id)
+  if not idx then
+    return
+  end
+  local task = board.rows[idx].task
+  if Rows.deletable(task) and board.confirm ~= task.id then
+    board.confirm = task.id
+    render()
+    return
+  end
+  board.confirm = nil
+  local this_board = board
+  local _, err = maki.task.remove(task.id)
+  if board ~= this_board then
+    return
+  end
+  if err then
+    maki.ui.flash(err)
+    render()
+    return
+  end
+  if board.origin_id == task.id then
+    board.origin_id = MAIN_TASK_ID
+  end
+  refresh()
+  if board == this_board and board.sel_id then
+    local _, focus_err = maki.task.focus(board.sel_id)
+    if focus_err then
+      maki.ui.flash(focus_err)
+    end
+  end
+end
+
 local function handle_key(key)
   if key == "<C-c>" or key == "<C-x>" then
     finish(false)
   elseif key == "<Esc>" then
-    if board.input:is_empty() then
+    if board.confirm then
+      board.confirm = nil
+      render()
+    elseif board.input:is_empty() then
       finish(false)
     else
       board.input:clear()
@@ -228,37 +308,18 @@ local function handle_key(key)
     move_sel(page_size())
   elseif key == "<CR>" then
     open_selected()
+  elseif key == "<C-d>" then
+    delete_selected()
+  elseif key == "<C-s>" then
+    stop_selected()
   elseif board.input:handle_key(key) ~= "ignored" then
+    board.confirm = nil
     rebuild()
     render()
   end
 end
 
-local function open()
-  if board then
-    return
-  end
-  local buf = maki.ui.buf()
-  local win = maki.ui.open_win(buf, {
-    title = TITLE,
-    width = "70%",
-    height = "70%",
-    border = "rounded",
-    focus = true,
-    footer = FOOTER_KEYS,
-  })
-  board = {
-    win = win,
-    buf = buf,
-    width = win.width,
-    height = win.height,
-    input = TextInput.new(),
-    -- Owned by render(), the only place that knows how tall the query block
-    -- ended up once it wrapped.
-    reserved = 0,
-    tasks = {},
-    rows = {},
-  }
+local function browse()
   refresh()
   if not board then
     return
@@ -294,6 +355,45 @@ local function open()
       board.height = ev.height
       render()
     end
+  end
+end
+
+local function open()
+  if board then
+    return
+  end
+  local buf = maki.ui.buf()
+  local win = maki.ui.open_win(buf, {
+    title = TITLE,
+    width = "70%",
+    height = "70%",
+    border = "rounded",
+    focus = true,
+    footer = FOOTER_KEYS,
+  })
+  board = {
+    win = win,
+    buf = buf,
+    width = win.width,
+    height = win.height,
+    input = TextInput.new(),
+    -- The query block as render() last drew it. Only render() knows how tall
+    -- it ended up once it wrapped, and page_size() reads it back.
+    header = {},
+    tasks = {},
+    rows = {},
+  }
+  -- Without this an error leaves a frozen float behind, and `/tasks` refuses
+  -- to open again until a restart. By the time the error lands our board may
+  -- be closed already, or replaced by a newer `/tasks`, so we only close our
+  -- own.
+  local this_board = board
+  local ok, err = pcall(browse)
+  if not ok then
+    if board == this_board then
+      finish(false)
+    end
+    error(err, 0)
   end
 end
 

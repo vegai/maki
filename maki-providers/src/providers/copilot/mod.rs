@@ -5,7 +5,6 @@ use std::time::Duration;
 use flume::Sender;
 use futures_lite::io::BufReader;
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
-use maki_storage::id::SessionRef;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
@@ -14,7 +13,8 @@ use super::anthropic::shared;
 use super::openai::responses;
 use super::openai_compat;
 use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing, ModelTier, lookup_entry};
-use crate::provider::{BoxFuture, Provider};
+use crate::model_registry;
+use crate::provider::{BoxFuture, Provider, RequestScope};
 use crate::providers::{ResolvedAuth, Timeouts};
 use crate::spec::{AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec};
 use crate::{
@@ -45,14 +45,18 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     api_key_env: ENV_VAR,
     family: ModelFamily::Generic,
     supports_thinking: false,
+    supports_deferred_tools: false,
+    adaptive_effort,
+    thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(100_000),
     fallback_context_window: 200_000,
     models_toml: include_str!("../../../models/copilot.toml"),
+    models_of: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
-        with_auth: create_with_auth,
+        with_auth: Some(create_with_auth),
     }),
     aperture: None,
     login: Some(LoginConfig {
@@ -88,6 +92,9 @@ inventory::submit!(SPEC.config_row());
 const GRAPHQL_QUERY: &str = "query { viewer { copilotEndpoints { api } } }";
 const API_VERSION_HEADER: &str = "2025-10-01";
 const EDITOR_VERSION_HEADER: &str = concat!("Maki/", env!("CARGO_PKG_VERSION"));
+/// Without it the gateway falls back to the `copilot-language-server`
+/// integrator, which intermittently rejects newer models such as gpt-6-luna.
+const INTEGRATION_ID_HEADER: &str = "vscode-chat";
 const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 const RESPONSES_PATH: &str = "/responses";
 const MESSAGES_PATH: &str = "/v1/messages";
@@ -95,6 +102,8 @@ const MODELS_PATH: &str = "/models";
 
 /// Scales `/models` AI-credit prices (1 credit = $0.01) to USD per 1M tokens.
 const AIC_TO_USD_PER_MILLION: f64 = 10_000.0;
+/// `copilot_usage.total_nano_aiu` is billed in nano AI credits.
+const NANO_AIU_PER_USD: f64 = 100_000_000_000.0;
 
 pub struct Copilot {
     client: HttpClient,
@@ -164,13 +173,24 @@ impl Copilot {
         }
 
         let models = self.fetch_models().await?;
-        let mut guard = self.models.lock().unwrap();
-        guard.clear();
-        guard.extend(models.into_iter().map(|model| (model.id.clone(), model)));
-        Ok(guard
+        self.remember(models);
+        Ok(self
+            .models
+            .lock()
+            .unwrap()
             .get(model_id)
             .map(CopilotModel::endpoint)
             .unwrap_or_else(|| guess_endpoint(model_id)))
+    }
+
+    /// Merges rather than replaces: `/models` sometimes omits a model it
+    /// served a moment ago, and forgetting it would reroute that model to
+    /// a guessed endpoint mid-session.
+    fn remember(&self, models: Vec<CopilotModel>) {
+        self.models
+            .lock()
+            .unwrap()
+            .extend(models.into_iter().map(|model| (model.id.clone(), model)));
     }
 
     async fn fetch_models(&self) -> Result<Vec<CopilotModel>, AgentError> {
@@ -266,17 +286,15 @@ impl Copilot {
     ) -> Result<StreamResponse, AgentError> {
         let auth = self.auth().await?;
         let mut body = responses::build_body(model, messages, system, tools);
-        let reasoning_info = crate::model_registry::provider_info::<CopilotModelInfo>(
-            "copilot", &model.id,
-        )
-        .or_else(|| {
-            self.models
-                .lock()
-                .unwrap()
-                .get(&model.id)
-                .map(CopilotModel::reasoning_info)
-                .map(Arc::new)
-        });
+        let reasoning_info = model_registry::provider_info::<CopilotModelInfo>(SLUG, &model.id)
+            .or_else(|| {
+                self.models
+                    .lock()
+                    .unwrap()
+                    .get(&model.id)
+                    .map(CopilotModel::reasoning_info)
+                    .map(Arc::new)
+            });
         if let Some(info) = reasoning_info {
             responses::apply_responses_reasoning(
                 &mut body,
@@ -342,6 +360,19 @@ impl Copilot {
             interaction_type,
         ))
     }
+}
+
+/// Prices a turn from the `copilot_usage` bill Copilot attaches to every stream,
+/// next to the usage counts: on the final chat completions chunk, on
+/// `message_delta`, and on `response.completed`, always at the top level of the
+/// event rather than inside `usage`. It already reflects the context tier the
+/// request landed in, which raises every rate past a per-model prompt size, so
+/// it beats any table we could keep. Read loosely so an unexpected shape only
+/// leaves the turn unpriced instead of failing the whole event.
+pub(crate) fn copilot_usd(copilot_usage: &Value) -> Option<f64> {
+    copilot_usage["total_nano_aiu"]
+        .as_f64()
+        .map(|nano_aiu| nano_aiu / NANO_AIU_PER_USD)
 }
 
 #[derive(Clone)]
@@ -458,6 +489,7 @@ impl CopilotModel {
                 .any(|effort| effort == dialect::OFF),
             reasoning_efforts,
             adaptive_thinking: self.capabilities.supports.adaptive_thinking,
+            endpoint: self.endpoint(),
         }
     }
 
@@ -564,6 +596,7 @@ struct CopilotModelInfo {
     reasoning_efforts: Vec<Effort>,
     reasoning_off: bool,
     adaptive_thinking: bool,
+    endpoint: Endpoint,
 }
 
 #[derive(Deserialize)]
@@ -640,6 +673,7 @@ fn copilot_request(
         .header("authorization", format!("Bearer {}", auth.token))
         .header("content-type", "application/json")
         .header("editor-version", EDITOR_VERSION_HEADER)
+        .header("copilot-integration-id", INTEGRATION_ID_HEADER)
         .header("x-github-api-version", API_VERSION_HEADER)
         .header("user-agent", super::user_agent());
 
@@ -658,6 +692,10 @@ fn copilot_headers(auth: &CopilotAuth, interaction_type: Option<&str>) -> Vec<(S
         ("authorization".into(), format!("Bearer {}", auth.token)),
         ("content-type".into(), "application/json".into()),
         ("editor-version".into(), EDITOR_VERSION_HEADER.into()),
+        (
+            "copilot-integration-id".into(),
+            INTEGRATION_ID_HEADER.into(),
+        ),
         ("x-github-api-version".into(), API_VERSION_HEADER.into()),
     ];
     if let Some(interaction_type) = interaction_type {
@@ -697,20 +735,21 @@ fn messages_body(
     tools: &Value,
     thinking: ThinkingConfig,
 ) -> Value {
-    let mut body = json!({
-        "model": model.id,
-        "max_tokens": model.output_tokens().unwrap_or(shared::FALLBACK_MAX_TOKENS),
-        "system": [{"type": "text", "text": system}],
-        "messages": shared::wire_messages(messages),
-        "tools": tools,
-        "stream": true,
-    });
-    thinking.apply_to_body(&mut body, model);
+    let system = [shared::SystemBlock {
+        r#type: "text",
+        text: system,
+        cache_control: Some(shared::EPHEMERAL),
+    }];
+    let mut body =
+        shared::build_request_body_with_system(model, messages, &system, tools, thinking, None);
+    body["model"] = json!(model.id);
+    body["stream"] = json!(true);
     body
 }
 
 fn effort_dialect(info: &CopilotModelInfo) -> EffortDialect<'_> {
     EffortDialect {
+        name: None,
         supported: if info.reasoning_efforts.is_empty() {
             dialect::PREFER_HIGH.supported
         } else {
@@ -721,14 +760,37 @@ fn effort_dialect(info: &CopilotModelInfo) -> EffortDialect<'_> {
     }
 }
 
+fn adaptive_effort(model: &Model) -> Option<Effort> {
+    model_registry::provider_info::<CopilotModelInfo>(SLUG, &model.id)
+        .and_then(|info| listed_adaptive_effort(&info))
+}
+
+/// Only the responses endpoint renders `adaptive` through the dialect. The
+/// messages endpoint spells it natively and chat completions carries no
+/// reasoning at all.
+fn listed_adaptive_effort(info: &CopilotModelInfo) -> Option<Effort> {
+    (info.endpoint == Endpoint::Responses)
+        .then(|| effort_dialect(info).adaptive_effort())
+        .flatten()
+}
+
 fn guess_endpoint(model_id: &str) -> Endpoint {
     if model_id.starts_with("claude-") {
         Endpoint::Messages
-    } else if model_id.contains("gpt-5") || model_id.contains("codex") {
+    } else if model_id.contains("codex") || gpt_major(model_id).is_some_and(|major| major >= 5) {
         Endpoint::Responses
     } else {
         Endpoint::ChatCompletions
     }
+}
+
+fn gpt_major(model_id: &str) -> Option<u32> {
+    model_id
+        .strip_prefix("gpt-")?
+        .split(['.', '-'])
+        .next()?
+        .parse()
+        .ok()
 }
 
 impl Provider for Copilot {
@@ -740,7 +802,7 @@ impl Provider for Copilot {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let mut prefixed_system = String::new();
@@ -771,9 +833,7 @@ impl Provider for Copilot {
                 .iter()
                 .map(CopilotModel::model_info)
                 .collect::<Vec<_>>();
-            let mut guard = self.models.lock().unwrap();
-            guard.clear();
-            guard.extend(models.into_iter().map(|model| (model.id.clone(), model)));
+            self.remember(models);
             Ok(infos)
         })
     }
@@ -781,7 +841,6 @@ impl Provider for Copilot {
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
             *self.auth.lock().unwrap() = None;
-            self.models.lock().unwrap().clear();
             Ok(())
         })
     }
@@ -797,6 +856,7 @@ mod tests {
     const OPUS_CACHE_WRITE: f64 = 6.25;
     const CLAUDE_SPEC: &str = "copilot/claude-opus-5";
     const REPLY: &str = "reply";
+    const SOL: &str = "gpt-6.1-sol";
 
     #[test]
     fn endpoint_prefers_messages_then_responses_then_chat() {
@@ -820,6 +880,35 @@ mod tests {
 
         model.supported_endpoints.clear();
         assert_eq!(model.endpoint(), Endpoint::ChatCompletions);
+    }
+
+    #[test_case("gpt-6-luna", Endpoint::Responses ; "gpt_6")]
+    #[test_case("gpt-5.6-terra", Endpoint::Responses ; "gpt_5")]
+    #[test_case("gpt-10-mini", Endpoint::Responses ; "two_digit_major")]
+    #[test_case("gpt-5.3-codex", Endpoint::Responses ; "codex")]
+    #[test_case("gpt-4.1", Endpoint::ChatCompletions ; "gpt_4")]
+    #[test_case("gpt-4o", Endpoint::ChatCompletions ; "gpt_4o")]
+    #[test_case("claude-opus-5", Endpoint::Messages ; "claude")]
+    #[test_case("gemini-3.7-flash", Endpoint::ChatCompletions ; "other")]
+    fn guess_endpoint_for_unlisted_model(model_id: &str, expected: Endpoint) {
+        assert_eq!(guess_endpoint(model_id), expected);
+    }
+
+    #[test]
+    fn requests_identify_integrator() {
+        let auth = CopilotAuth {
+            token: "token".into(),
+            endpoint: DEFAULT_API_ENDPOINT.into(),
+        };
+        let request = copilot_request(Request::builder(), &auth, None);
+        assert_eq!(
+            request.headers_ref().unwrap()["copilot-integration-id"],
+            INTEGRATION_ID_HEADER
+        );
+        assert!(copilot_headers(&auth, None).contains(&(
+            "copilot-integration-id".into(),
+            INTEGRATION_ID_HEADER.into()
+        )));
     }
 
     #[test]
@@ -877,6 +966,27 @@ mod tests {
 
         assert!(model.is_enabled_chat_model());
         assert_eq!(model.model_info().tier, None);
+    }
+
+    /// On the responses endpoint `adaptive` is the dialect's level, snapped to
+    /// what the model lists. The Claude models report `adaptive_thinking` and
+    /// take the messages endpoint, which spells the mode natively.
+    #[test_case(RESPONSES_PATH, json!({"reasoning_effort": ["low", "high", "max"]}), Some(Effort::High); "responses sends a fixed level")]
+    #[test_case(RESPONSES_PATH, json!({"reasoning_effort": ["low", "medium"]}), Some(Effort::Medium); "the level snaps to what the model lists")]
+    #[test_case(RESPONSES_PATH, json!({"reasoning_effort": ["low", "high"], "adaptive_thinking": true}), None; "reported adaptive stays")]
+    #[test_case(MESSAGES_PATH, json!({"max_thinking_budget": 32_000}), None; "messages spells it natively")]
+    fn adaptive_effort_follows_the_endpoint_and_the_listing(
+        endpoint: &str,
+        supports: Value,
+        expected: Option<Effort>,
+    ) {
+        let listed: CopilotModel = serde_json::from_value(json!({
+            "id": SOL,
+            "supported_endpoints": [endpoint],
+            "capabilities": {"type": "chat", "supports": supports}
+        }))
+        .unwrap();
+        assert_eq!(listed_adaptive_effort(&listed.reasoning_info()), expected);
     }
 
     #[test_case(RESPONSES_PATH, true; "responses honors reasoning")]
@@ -978,6 +1088,22 @@ mod tests {
         assert_eq!(unmatched.pricing().unwrap().cache_write, 0.0);
     }
 
+    #[test_case(json!(7_576_685_000_u64), 0.07576685 ; "long_context_luna_turn")]
+    #[test_case(json!(0), 0.0 ; "free_turn")]
+    #[test_case(json!(375_000.5), 0.000003750005 ; "float_total")]
+    fn copilot_usd_converts_nano_credits_to_usd(nano_aiu: Value, expected_usd: f64) {
+        let usd = copilot_usd(&json!({"total_nano_aiu": nano_aiu})).unwrap();
+        assert!((usd - expected_usd).abs() < 1e-12);
+    }
+
+    #[test_case(Value::Null ; "no_billing_block")]
+    #[test_case(json!({"token_details": []}) ; "no_total")]
+    #[test_case(json!({"total_nano_aiu": "375000"}) ; "string_total")]
+    #[test_case(json!("billed") ; "not_an_object")]
+    fn copilot_usd_unusable_leaves_the_turn_unpriced(copilot_usage: Value) {
+        assert!(copilot_usd(&copilot_usage).is_none());
+    }
+
     #[test_case(json!({"id": "gpt-5"}) ; "no billing")]
     #[test_case(json!({"id": "gpt-5", "billing": {"token_prices": {"batch_size": 0, "default": {"input_price": 1.0, "output_price": 1.0, "cache_price": 0.1}}}}) ; "zero batch size")]
     fn pricing_falls_back_when_billing_unusable(billing: Value) {
@@ -993,6 +1119,7 @@ mod tests {
             reasoning_efforts: vec![Effort::Low, Effort::Medium, Effort::High],
             reasoning_off: true,
             adaptive_thinking: false,
+            endpoint: Endpoint::Responses,
         };
         let dialect = effort_dialect(&info);
 
@@ -1033,7 +1160,49 @@ mod tests {
 
         assert_eq!(
             body["messages"],
-            json!([{"role": "assistant", "content": [{"type": "text", "text": REPLY}]}])
+            json!([{"role": "assistant", "content": [{"type": "text", "text": REPLY, "cache_control": {"type": "ephemeral"}}]}])
+        );
+    }
+
+    #[test]
+    fn messages_body_marks_system_tools_and_recent_messages_for_cache() {
+        let model = Model::from_spec(CLAUDE_SPEC).unwrap();
+        let messages = vec![
+            Message::user("first".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "reply".into(),
+                }],
+                ..Default::default()
+            },
+            Message::user("latest".into()),
+        ];
+        let tools =
+            json!([{"name": "tool", "description": "test", "input_schema": {"type": "object"}}]);
+
+        let body = messages_body(&model, &messages, "system", &tools, ThinkingConfig::Off);
+
+        assert_eq!(
+            body["system"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert_eq!(
+            body["tools"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert!(
+            body["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+        assert_eq!(
+            body["messages"][1]["content"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert_eq!(
+            body["messages"][2]["content"][0]["cache_control"],
+            json!({"type": "ephemeral"})
         );
     }
 

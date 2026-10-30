@@ -15,23 +15,21 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use color_eyre::Result;
-use color_eyre::eyre::{Context, eyre};
+use color_eyre::eyre::{Context, bail, eyre};
 use flume::Sender;
-use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
-use maki_agent::mcp;
+use maki_agent::headless::{self, InteractiveHandle, InteractiveParams, Ready};
 use maki_agent::permissions::{PermissionAnswer, PluginRuleStore, TaggedAnswer};
-use maki_agent::prompt::ResolvedSlots;
+use maki_agent::prompt::ResolvedPrompts;
 use maki_agent::session::Resumed;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
-    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, InputSource,
+    AgentConfig, AgentEvent, AgentInput, AgentMode, CancelToken, DoneReason, Envelope, InputSource,
     PermissionsConfig, SessionEndReason, SessionEvents, SteerKind,
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
 use maki_providers::model::Model;
 use maki_providers::{ImageSource, StopReason, Timeouts, TokenUsage, add_cost};
-use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
 use serde::Serialize;
@@ -39,32 +37,11 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::cli::Cli;
+use crate::notice::{NOTIFICATION, ProviderNotice};
+use crate::tool_names::maki_to_claude_tool_name;
+use crate::wire::{ERROR_DURING_EXECUTION, SUCCESS, system_event, wire_uuid};
 
-const TOOL_NAME_MAP: &[(&str, &str)] = &[
-    ("bash", "Bash"),
-    ("read", "Read"),
-    ("edit", "Edit"),
-    ("write", "Write"),
-    ("grep", "Grep"),
-    ("glob", "Glob"),
-    ("todo_write", "TodoWrite"),
-    ("webfetch", "WebFetch"),
-    ("websearch", "WebSearch"),
-    ("task", "Task"),
-    ("multiedit", "MultiEdit"),
-    ("code_execution", "CodeExecution"),
-    ("index", "Index"),
-    ("memory", "Memory"),
-    ("question", "Question"),
-    ("skill", "Skill"),
-];
-
-/// Emits a hyphenated-hex UUIDv7 string for Claude Code SDK wire ids
-/// (message.id, assistant message.id).
-#[allow(clippy::disallowed_methods)]
-fn wire_uuid() -> String {
-    uuid::Uuid::now_v7().to_string()
-}
+const NOTICE_SUBTYPE: &str = "notice";
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum PermissionMode {
@@ -124,20 +101,12 @@ struct WireMessage {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WireInner {
-    System(SystemPayload),
     Assistant(AssistantPayload),
     User(UserPayload),
     Result(ResultPayload),
     StreamEvent(StreamEventPayload),
     ControlResponse(ControlResponsePayload),
     ControlRequest(ControlRequestPayload),
-}
-
-#[derive(Serialize)]
-struct SystemPayload {
-    subtype: &'static str,
-    #[serde(flatten)]
-    extra: Value,
 }
 
 #[derive(Serialize)]
@@ -395,14 +364,6 @@ impl StreamSynth {
     }
 }
 
-fn maki_to_claude_tool_name(name: &str) -> &str {
-    TOOL_NAME_MAP
-        .iter()
-        .find(|(m, _)| *m == name)
-        .map(|(_, c)| *c)
-        .unwrap_or(name)
-}
-
 #[derive(Clone)]
 struct SdkWriter {
     session_id: SessionRef,
@@ -416,13 +377,17 @@ impl SdkWriter {
             session_id: self.session_id.clone(),
             uuid: wire_uuid(),
         };
+        self.write(&msg)
+    }
+
+    fn write(&self, message: &impl Serialize) -> Result<()> {
         self.out_tx
-            .send(serde_json::to_string(&msg)?)
+            .send(serde_json::to_string(message)?)
             .map_err(|_| eyre!("stdout writer closed"))
     }
 
-    fn emit_system(&self, subtype: &'static str, extra: Value) -> Result<()> {
-        self.emit(WireInner::System(SystemPayload { subtype, extra }))
+    fn emit_system(&self, subtype: &'static str, extra: impl Serialize) -> Result<()> {
+        self.write(&system_event(&self.session_id, subtype, extra))
     }
 
     fn emit_control_response(
@@ -433,7 +398,7 @@ impl SdkWriter {
     ) -> Result<()> {
         self.emit(WireInner::ControlResponse(ControlResponsePayload {
             response: ControlResponseInner {
-                subtype: if error.is_some() { "error" } else { "success" },
+                subtype: if error.is_some() { "error" } else { SUCCESS },
                 request_id: request_id.into(),
                 response,
                 error,
@@ -450,12 +415,11 @@ pub struct SdkParams {
     /// The right to write [`Self::resumed`]'s session, taken when it was
     /// resolved and held for the whole run.
     pub claim: SessionClaim,
-    pub storage: StateDir,
     pub model: Model,
     pub config: AgentConfig,
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
-    pub prompt_slots: ResolvedSlots,
+    pub prompt_slots: ResolvedPrompts,
     pub defaults: SessionDefaults,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
@@ -535,6 +499,7 @@ struct Shared {
     model: Model,
     permission_mode: PermissionMode,
     turn_start: Instant,
+    failed: bool,
     permissions: Permissions,
 }
 
@@ -543,9 +508,8 @@ pub fn run(params: SdkParams) -> Result<()> {
         cli,
         resumed,
         claim,
-        storage,
         model,
-        mut config,
+        config,
         permissions_config,
         timeouts,
         prompt_slots,
@@ -556,22 +520,17 @@ pub fn run(params: SdkParams) -> Result<()> {
         project_config,
     } = params;
     cli.warn_ignored_flags();
-    if let Some(max) = cli.max_turns {
-        config.max_turns = Some(max);
-    }
     let permission_mode = PermissionMode::resolve(cli.permission_mode.as_deref(), cli.yolo);
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let working_dir = cwd.to_string_lossy().into_owned();
 
-    let (mcp_handle, mcp_config_errors) =
-        smol::block_on(mcp::start_connected(&cwd, project_config.clone()));
-    if !mcp_config_errors.is_empty() {
-        eprintln!("MCP config error: {mcp_config_errors}");
-    }
+    let mcp_handle = crate::headless_startup::start_mcp(&cwd, project_config.clone());
 
-    let startup_model = model.clone();
-    let (handle, events) = headless::spawn_interactive(InteractiveParams {
+    let (trigger, shutdown) = CancelToken::new();
+    crate::shutdown::watch(trigger).context("watch termination signals")?;
+    let (handle, mut events) = headless::spawn_interactive(InteractiveParams {
+        shutdown: shutdown.clone(),
         model,
         config,
         permissions_config,
@@ -582,7 +541,6 @@ pub fn run(params: SdkParams) -> Result<()> {
         initial_wd: cwd.clone(),
         resumed,
         claim,
-        storage,
         yolo: permission_mode == PermissionMode::BypassPermissions,
         system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
         append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
@@ -592,7 +550,6 @@ pub fn run(params: SdkParams) -> Result<()> {
         project_config,
         local_tools: Default::default(),
     });
-
     let (out_tx, out_rx) = flume::unbounded::<String>();
     let writer_thread = std::thread::spawn(move || {
         let mut stdout = io::stdout().lock();
@@ -607,8 +564,37 @@ pub fn run(params: SdkParams) -> Result<()> {
         session_id: handle.session_id.clone(),
         out_tx,
     };
-    let tools: Vec<&str> = handle
-        .tool_names
+    let (
+        Ready {
+            model: startup_model,
+            tool_names,
+        },
+        thinking,
+    ) = match crate::headless_startup::startup(&handle.ready, &mut events, defaults.thinking) {
+        Ok(started) => started,
+        Err(error) => {
+            let emitted = writer.emit(WireInner::Result(ResultPayload {
+                subtype: ERROR_DURING_EXECUTION,
+                is_error: true,
+                duration_ms: 0,
+                duration_api_ms: 0,
+                num_turns: 0,
+                result: error.to_string(),
+                total_cost_usd: 0.0,
+                usage: TokenUsage::default(),
+                permission_denials: Vec::new(),
+            }));
+            drop(handle.input_tx);
+            smol::block_on(headless::await_shutdown(handle.task));
+            lua_handle.end_sessions_blocking([handle.session_id.id()], SessionEndReason::Completed);
+            drop(writer);
+            let _ = writer_thread.join();
+            emitted?;
+            return Err(error);
+        }
+    };
+
+    let tools: Vec<&str> = tool_names
         .iter()
         .map(|t| maki_to_claude_tool_name(t))
         .collect();
@@ -618,6 +604,7 @@ pub fn run(params: SdkParams) -> Result<()> {
             "cwd": working_dir,
             "tools": tools,
             "model": startup_model.id,
+            "thinking": thinking,
             "permissionMode": permission_mode.as_str(),
             "apiKeySource": "none",
             "mcp_servers": [],
@@ -630,6 +617,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         model: startup_model.clone(),
         permission_mode,
         turn_start: Instant::now(),
+        failed: false,
         permissions: Permissions::new(handle.answer_tx.clone()),
     }));
 
@@ -664,7 +652,15 @@ pub fn run(params: SdkParams) -> Result<()> {
     }
     .spawn(events);
 
-    for line in io::stdin().lock().lines() {
+    let (line_tx, line_rx) = flume::bounded(1);
+    std::thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            if line_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    while let Ok(Ok(line)) = smol::block_on(shutdown.race(line_rx.recv_async())) {
         let line = line.context("read stdin")?;
         if line.is_empty() {
             continue;
@@ -750,6 +746,9 @@ pub fn run(params: SdkParams) -> Result<()> {
     // flight has to stop asking now: an unanswerable request parks the agent,
     // and a parked agent never ends the event stream the pump waits on.
     shared.lock().unwrap().permissions.close();
+    if shutdown.is_cancelled() {
+        shared.lock().unwrap().failed = true;
+    }
 
     let InteractiveHandle {
         input_tx,
@@ -770,6 +769,9 @@ pub fn run(params: SdkParams) -> Result<()> {
     lua_handle.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
     drop(writer);
     let _ = writer_thread.join();
+    if shared.lock().unwrap().failed {
+        bail!("one or more SDK turns failed");
+    }
     Ok(())
 }
 
@@ -985,21 +987,20 @@ impl EventPump {
 
     fn emit_turn_result(
         &mut self,
-        is_error: bool,
+        failure: Option<&'static str>,
         result: String,
         num_turns: u32,
         usage: TokenUsage,
     ) -> Result<()> {
-        let duration_ms = self.shared.lock().unwrap().turn_start.elapsed().as_millis();
+        let duration_ms = {
+            let shared = self.shared.lock().unwrap();
+            shared.turn_start.elapsed().as_millis()
+        };
         // Zero on an unpriced model, which is what its turns reported too.
         let total_cost_usd = self.cost.unwrap_or_default();
         self.writer.emit(WireInner::Result(ResultPayload {
-            subtype: if is_error {
-                "error_during_execution"
-            } else {
-                "success"
-            },
-            is_error,
+            subtype: failure.unwrap_or(SUCCESS),
+            is_error: failure.is_some(),
             duration_ms,
             duration_api_ms: duration_ms,
             num_turns,
@@ -1057,11 +1058,13 @@ impl EventPump {
             | AgentEvent::AutoCompacting { .. }
             | AgentEvent::CompactionDone { .. }
             | AgentEvent::AuthRequired
+            | AgentEvent::AllowedByPlugin { .. }
             | AgentEvent::SubagentHistory { .. }
             | AgentEvent::ToolSnapshot { .. }
             | AgentEvent::ToolHeaderSnapshot { .. }
             | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::Nudge
+            | AgentEvent::Notice { .. }
             | AgentEvent::PromptProgress { .. }
             | AgentEvent::StreamClosed => {}
             // A later kept message overwrites this with its own answer, so the
@@ -1071,6 +1074,17 @@ impl EventPump {
                 text,
             } if parent_tool_use_id.is_none() => self.result_text.clone_from(text),
             AgentEvent::Steered { .. } => {}
+            AgentEvent::ObservationLine { text } if parent_tool_use_id.is_none() => {
+                self.writer
+                    .emit_system(NOTICE_SUBTYPE, serde_json::json!({ "text": text }))?;
+            }
+            AgentEvent::ObservationLine { .. } => {}
+            AgentEvent::ProviderWaiting { message } => {
+                self.writer.emit_system(
+                    NOTIFICATION,
+                    ProviderNotice::new(message.as_deref(), parent_tool_use_id.as_deref()),
+                )?;
+            }
             AgentEvent::Retry {
                 attempt,
                 message,
@@ -1163,20 +1177,26 @@ impl EventPump {
                 reason,
                 ..
             } => {
-                // An interrupted run leaves a partial answer and a dropped one
-                // never ran, so neither is a success.
-                let is_error = match reason {
-                    DoneReason::Cancelled | DoneReason::Dropped => true,
-                    DoneReason::EndTurn
-                    | DoneReason::MaxTokens
-                    | DoneReason::MaxTurns
-                    | DoneReason::Compact => false,
-                };
+                if parent_tool_use_id.is_some() {
+                    return Ok(());
+                }
+                if *reason == DoneReason::MaxTurns {
+                    self.shared.lock().unwrap().failed = true;
+                }
+                let failure = crate::wire::failure_subtype(*reason);
                 let result = mem::take(&mut self.result_text);
-                self.emit_turn_result(is_error, result, *num_turns, *usage)?;
+                self.emit_turn_result(failure, result, *num_turns, *usage)?;
             }
-            AgentEvent::Error { message } => {
-                self.emit_turn_result(true, message.clone(), 0, TokenUsage::default())?;
+            AgentEvent::Error { message, .. } => {
+                if parent_tool_use_id.is_none() {
+                    self.shared.lock().unwrap().failed = true;
+                    self.emit_turn_result(
+                        Some(ERROR_DURING_EXECUTION),
+                        message.clone(),
+                        0,
+                        TokenUsage::default(),
+                    )?;
+                }
             }
         }
         Ok(())
@@ -1208,44 +1228,11 @@ fn map_tool_names_in_content(content: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use flume::Receiver;
+    use maki_agent::SubagentInfo;
     use maki_config::ToolKey;
     use test_case::test_case;
 
     use super::*;
-
-    fn claude_to_maki_tool_name(name: &str) -> &str {
-        TOOL_NAME_MAP
-            .iter()
-            .find(|(_, c)| *c == name)
-            .map(|(m, _)| *m)
-            .unwrap_or(name)
-    }
-
-    #[test_case("bash", "Bash")]
-    #[test_case("read", "Read")]
-    #[test_case("edit", "Edit")]
-    #[test_case("write", "Write")]
-    #[test_case("grep", "Grep")]
-    #[test_case("glob", "Glob")]
-    #[test_case("todo_write", "TodoWrite")]
-    #[test_case("webfetch", "WebFetch")]
-    #[test_case("websearch", "WebSearch")]
-    #[test_case("task", "Task")]
-    #[test_case("multiedit", "MultiEdit")]
-    #[test_case("code_execution", "CodeExecution")]
-    #[test_case("index", "Index")]
-    #[test_case("memory", "Memory")]
-    #[test_case("question", "Question")]
-    fn maki_to_claude_roundtrip(maki: &str, claude: &str) {
-        assert_eq!(maki_to_claude_tool_name(maki), claude);
-        assert_eq!(claude_to_maki_tool_name(claude), maki);
-    }
-
-    #[test]
-    fn unknown_tool_name_passthrough() {
-        assert_eq!(maki_to_claude_tool_name("unknown_tool"), "unknown_tool");
-        assert_eq!(claude_to_maki_tool_name("UnknownTool"), "UnknownTool");
-    }
 
     const MODEL: &str = "test-model";
 
@@ -1434,7 +1421,7 @@ mod tests {
     fn wire_result_serializes_correctly() {
         let msg = WireMessage {
             inner: WireInner::Result(ResultPayload {
-                subtype: "success",
+                subtype: SUCCESS,
                 is_error: false,
                 duration_ms: 1000,
                 duration_api_ms: 1000,
@@ -1449,26 +1436,21 @@ mod tests {
         };
         let json: Value = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["type"], "result");
-        assert_eq!(json["subtype"], "success");
+        assert_eq!(json["subtype"], SUCCESS);
         assert_eq!(json["num_turns"], 1);
         assert!(json.get("session_id").is_some());
     }
 
     #[test]
     fn wire_init_serializes_correctly() {
-        let msg = WireMessage {
-            inner: WireInner::System(SystemPayload {
-                subtype: "init",
-                extra: serde_json::json!({
-                    "cwd": "/tmp",
-                    "tools": ["Read"],
-                    "model": "test",
-                    "permissionMode": "default",
-                }),
+        let session_id = SessionRef::generate();
+        let msg = system_event(
+            &session_id,
+            "init",
+            serde_json::json!({
+                "cwd": "/tmp", "tools": ["Read"], "model": "test", "permissionMode": "default",
             }),
-            session_id: SessionRef::generate(),
-            uuid: "u".into(),
-        };
+        );
         let json: Value = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["type"], "system");
         assert_eq!(json["subtype"], "init");
@@ -1480,7 +1462,7 @@ mod tests {
         let msg = WireMessage {
             inner: WireInner::ControlResponse(ControlResponsePayload {
                 response: ControlResponseInner {
-                    subtype: "success",
+                    subtype: SUCCESS,
                     request_id: "req_1".into(),
                     response: Some(serde_json::json!({"commands": []})),
                     error: None,
@@ -1601,6 +1583,12 @@ mod tests {
     const TEST_TOOL_WIRE_NAME: &str = "Bash";
     const TEST_TOOL_USE_ID: &str = "toolu_1";
     const CONTROL_REQUEST_TYPE: &str = "control_request";
+    const SYSTEM_TYPE: &str = "system";
+    const RESULT_TYPE: &str = "result";
+    const NOTICE_LINE: &str = "Background agent finished: find auth";
+    const CHILD_NOTICE_LINE: &str = "a child's own notice";
+    const HOST_NOTICE: &str = "the prompt changed, so the cache starts over";
+    const NOTICE_CHILD: &str = "child-1";
     const NO_CONTROL_REQUEST: &str = "a request nobody can answer must not go on the wire";
     const NO_ANSWER: &str = "answer sent with nobody parked on it";
     const SOURCE_OPEN: &str = "a turn end must not close the answer source";
@@ -1628,6 +1616,7 @@ mod tests {
                 model: Model::from_spec(TEST_MODEL_SPEC).unwrap(),
                 permission_mode,
                 turn_start: Instant::now(),
+                failed: false,
                 permissions: Permissions::new(answer_tx),
             })),
             include_partial_messages: false,
@@ -1669,6 +1658,7 @@ mod tests {
         retained
             .send(AgentEvent::Error {
                 message: PUMP_ERROR.into(),
+                auth: false,
             })
             .unwrap();
         drop(guard);
@@ -1803,6 +1793,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn provider_waiting_emits_keyed_notifications_and_clear() {
+        const WAITING: &str = "waiting for a provider request slot";
+        let (mut pump, out_rx) = test_pump(PermissionMode::Default, flume::unbounded().0);
+        for message in [Some(WAITING.to_owned()), None] {
+            pump.handle(top_level(AgentEvent::ProviderWaiting { message }))
+                .unwrap();
+        }
+        let notices: Vec<Value> = out_rx
+            .try_iter()
+            .map(|line| serde_json::from_str(&line).unwrap())
+            .collect();
+        assert_eq!(notices.len(), 2);
+        for notice in &notices {
+            assert_eq!(notice["type"], "system");
+            assert_eq!(notice["subtype"], NOTIFICATION);
+            assert_eq!(notice["priority"], "low");
+            assert!(notice["uuid"].as_str().is_some());
+            assert_eq!(notice["session_id"], pump.session_id);
+        }
+        assert_eq!(notices[0]["text"], WAITING);
+        assert_eq!(notices[1]["text"], "");
+        assert_eq!(notices[0]["key"], notices[1]["key"]);
+        assert_eq!(pump.result_text, "");
+    }
+
     /// Nothing reached the model, so a client reading `is_error` must not take
     /// the empty turn for an answer.
     #[test]
@@ -1829,5 +1845,61 @@ mod tests {
         let wire: Value = serde_json::from_str(&out_rx.try_recv().unwrap()).unwrap();
         assert_eq!(wire["is_error"], true);
         assert_eq!(wire["result"], DROP_REASON);
+    }
+
+    /// The SDK has no history replay, so the line goes out live as a system
+    /// message. A host notice and a child's line stay out.
+    #[test]
+    fn an_accepted_notice_is_a_live_system_message() {
+        let (mut pump, out_rx) = test_pump(PermissionMode::Default, flume::unbounded().0);
+
+        pump.handle(top_level(AgentEvent::ObservationLine {
+            text: NOTICE_LINE.into(),
+        }))
+        .unwrap();
+        pump.handle(top_level(AgentEvent::Notice {
+            text: HOST_NOTICE.into(),
+        }))
+        .unwrap();
+        pump.handle(Envelope {
+            event: AgentEvent::ObservationLine {
+                text: CHILD_NOTICE_LINE.into(),
+            },
+            subagent: Some(SubagentInfo {
+                parent_tool_use_id: NOTICE_CHILD.into(),
+                name: NOTICE_CHILD.into(),
+                prompt: None,
+                model: None,
+                opts: None,
+                answer_tx: None,
+                inbox: None,
+            }),
+            run_id: 0,
+        })
+        .unwrap();
+        pump.handle(top_level(AgentEvent::Done {
+            usage: TokenUsage::default(),
+            cost: None,
+            list_cost: None,
+            context_size: 0,
+            context_window: 0,
+            num_turns: 1,
+            reason: DoneReason::EndTurn,
+        }))
+        .unwrap();
+
+        let wire: Vec<Value> = out_rx
+            .try_iter()
+            .map(|line| serde_json::from_str(&line).unwrap())
+            .collect();
+        assert_eq!(wire.len(), 2, "{wire:?}");
+        assert_eq!(wire[0]["type"], SYSTEM_TYPE);
+        assert_eq!(wire[0]["subtype"], NOTICE_SUBTYPE);
+        assert_eq!(wire[0]["text"], NOTICE_LINE);
+        assert_eq!(
+            wire[0]["session_id"],
+            pump.writer.session_id.to_string().as_str()
+        );
+        assert_eq!(wire[1]["type"], RESULT_TYPE);
     }
 }

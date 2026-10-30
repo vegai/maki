@@ -1,0 +1,4 @@
+- Search broadly first (glob, grep), then drill into relevant files.
+- Include specific file paths and line numbers when referencing code.
+- If you cannot find what was asked for, say so clearly.
+- Do not speculate beyond what the code shows.

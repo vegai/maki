@@ -6,7 +6,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use color_eyre::Result;
-use color_eyre::eyre::Context;
+use color_eyre::eyre::{Context, eyre};
 
 use maki_agent::command::{self, CustomCommand};
 use maki_agent::tools::ToolRegistry;
@@ -15,19 +15,59 @@ use maki_config::{Config, ProjectConfig, load_env_files, load_permissions};
 use maki_lua::{InitFiles, Interaction, PackPlan, PackReport, PluginHost};
 use maki_providers::model::Model;
 use maki_storage::StateDir;
+use maki_storage::sessions::StoredThinking;
 use maki_ui::{OpenSession, RunOutcome};
 
-use crate::cli::{Cli, normalize_tool_name};
+use crate::cli::{Cli, TOOL_ARGUMENT_PATTERNS_UNSUPPORTED, is_tool_argument_pattern};
 use crate::provider_scripts;
 use crate::resume::{self, Resolved};
 use crate::setup;
+use maki_agent::mcp::{TOOL_SEARCH_TOOL_NAME, is_qualified_name, is_wire_name};
 
 const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
-const STALE_PROJECT_CONFIG: &str = ".maki/config.toml";
-const STALE_GLOBAL_CONFIG: &str = "config.toml";
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
 const MODEL_FALLBACK_WARNING: &str = "model resolution failed, keeping previous model";
 const POLICY_GRANT_NOTICE: &str = "folder trusted by trust.paths pattern";
+const NO_ALLOWED_TOOLS: &str = "--allowed-tools matches no loaded tools or qualified MCP names";
+
+fn tool_filter_warnings(cli: &Cli, registry: &ToolRegistry, startup: bool) -> Result<Vec<String>> {
+    let known =
+        |name: &str| registry.get(name).is_some() || is_wire_name(name) || is_qualified_name(name);
+    if startup && !cli.allowed_tools.is_empty() && !cli.allowed_tools.iter().any(|name| known(name))
+    {
+        return Err(eyre!(
+            "{NO_ALLOWED_TOOLS}: {}",
+            cli.allowed_tools.join(", ")
+        ));
+    }
+    let mut warnings = Vec::new();
+    for name in cli
+        .disallowed_tools
+        .iter()
+        .filter(|name| is_tool_argument_pattern(name))
+    {
+        warnings.push(format!(
+            "--disallowed-tools: {TOOL_ARGUMENT_PATTERNS_UNSUPPORTED}: '{name}'"
+        ));
+    }
+    for (flag, names) in [
+        ("--allowed-tools", &cli.allowed_tools),
+        ("--disallowed-tools", &cli.disallowed_tools),
+    ] {
+        for name in names.iter().filter(|name| {
+            *name != TOOL_SEARCH_TOOL_NAME && !known(name) && !is_tool_argument_pattern(name)
+        }) {
+            let mut warning = format!("no loaded tool matches '{name}' in {flag}.");
+            let suggestion = name.replace('-', "_");
+            if suggestion != *name && registry.get(&suggestion).is_some() {
+                warning.push_str(&format!(" Did you mean '{suggestion}'?"));
+            }
+            warning.push_str(" The entry remains active for tools that load later.");
+            warnings.push(warning);
+        }
+    }
+    Ok(warnings)
+}
 
 /// One generation of the app: everything torn down and rebuilt on `/reload`.
 /// Dropping it joins the Lua thread via `PluginHost::drop`.
@@ -103,19 +143,16 @@ fn load_config(
         config.permissions.yolo = true;
     }
     if !cli.allowed_tools.is_empty() {
-        config.agent.allowed_tools = cli
-            .allowed_tools
-            .iter()
-            .map(|t| normalize_tool_name(t))
-            .collect::<Result<Vec<_>>>()?;
+        config.agent.allowed_tools = cli.allowed_tools.clone();
     }
     if !cli.disallowed_tools.is_empty() {
-        config.agent.disabled_tools.extend(
-            cli.disallowed_tools
-                .iter()
-                .filter_map(|t| normalize_tool_name(t).ok()),
-        );
+        config
+            .agent
+            .disabled_tools
+            .extend(cli.disallowed_tools.iter().cloned());
     }
+    config.agent.max_turns = cli.max_turns;
+    config.agent.final_answer = cli.final_answer;
     config.validate()?;
     Ok(config)
 }
@@ -151,11 +188,15 @@ fn build_stack(
     fallback: Option<(Config, Model)>,
 ) -> Result<(Stack, Vec<String>)> {
     let cli = launch.cli;
-    let mut plugin_host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !cli.no_jit)
-        .context("initialize lua plugin host")?;
+    let mut plugin_host = PluginHost::start(
+        Arc::clone(ToolRegistry::global_arc()),
+        launch.interaction,
+        !cli.no_jit,
+    )
+    .context("initialize lua plugin host")?;
 
     let (fallback_config, fallback_model) = fallback.unzip();
-    let (config, mut warnings) = super::load_plugins(
+    let (mut config, mut warnings) = super::load_plugins(
         &mut plugin_host,
         cli.no_plugins,
         if fallback_model.is_some() {
@@ -178,9 +219,22 @@ fn build_stack(
         },
     )?;
 
-    warnings.extend(provider_scripts::startup_warning());
+    warnings.extend(tool_filter_warnings(
+        cli,
+        ToolRegistry::global(),
+        fallback_model.is_none(),
+    )?);
     let commands = discover_commands(cli.no_commands, launch.cwd);
 
+    if cli.print {
+        setup::resolve_headless_thinking(&mut config.session_defaults, cli.thinking_override());
+    } else {
+        setup::resolve_thinking(
+            &mut config.session_defaults,
+            launch.storage,
+            cli.thinking_override(),
+        );
+    }
     let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, launch.storage);
     let (model, needs_login) = match (model_result, fallback_model) {
         (Ok((m, warning)), _) => {
@@ -211,13 +265,20 @@ fn build_stack(
 }
 
 /// The tab a run opens on. Which session that is lives in [`crate::resume`],
-/// and the only step left here is the TUI-only one: an explicit `--model` is a
-/// choice about the session being opened, and a session's own spec is what
-/// every later switch reads.
-fn open_tab(resolved: Resolved, model: &str, explicit_model: bool, cwd: &str) -> OpenSession {
+/// and explicit launch flags override the saved model and thinking level.
+fn open_tab(
+    resolved: Resolved,
+    model: &str,
+    explicit_model: bool,
+    thinking: Option<StoredThinking>,
+    cwd: &str,
+) -> OpenSession {
     let mut tab = resolved.into_session(model, cwd);
     if explicit_model {
         tab.session.set_model(model.to_owned());
+    }
+    if let Some(thinking) = thinking {
+        tab.session.meta.thinking = Some(thinking);
     }
     tab
 }
@@ -308,7 +369,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
     };
     let mut trust = project::resolve(&storage, &cwd, mode);
     load_env_files(&trust.project_config);
-    warn_stale_config_toml(&trust.project_config);
     let mut teardown = Teardown::default();
     let launch = Launch {
         cli: &cli,
@@ -375,7 +435,10 @@ pub fn run(mut cli: Cli) -> Result<()> {
     // mode that never opens the UI has to report them here or a broken
     // package fails in complete silence.
     if cli.is_sdk_mode() || cli.print {
-        for warning in &startup_warnings {
+        for warning in startup_warnings
+            .iter()
+            .chain(&provider_scripts::startup_warning())
+        {
             eprintln!("warning: {warning}");
         }
     }
@@ -395,7 +458,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
             cli,
             resumed,
             claim,
-            storage: storage.clone(),
             model: stack.model,
             config: stack.config.agent,
             permissions_config: stack.config.permissions,
@@ -415,6 +477,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         let (resumed, claim) = resolved.into_resumed();
         let timeouts = stack.timeouts();
         crate::print::run(crate::print::PrintParams {
+            dry_run: cli.dry_run,
             model: stack.model,
             prompt: cli.initial_prompt,
             image_paths: cli.images,
@@ -430,7 +493,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
             project_config: trust.project_config.clone(),
             resumed,
             claim,
-            storage: storage.clone(),
         })
         .context("run print mode")?;
         return Ok(());
@@ -440,6 +502,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         resolved,
         &stack.model.spec(),
         cli.model.is_some(),
+        cli.thinking_override(),
         &cwd_str,
     )];
     let mut focused = 0;
@@ -472,6 +535,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 focused,
                 startup_warnings: std::mem::take(&mut warnings),
                 startup_notice: notice.take(),
+                // Read per run: plugins have just (re)loaded, and a script one
+                // of them now replaces is no longer worth a word.
+                startup_alert: provider_scripts::startup_warning(),
                 storage: storage.clone(),
                 config: stack.config.agent.clone(),
                 ui_config: stack.config.ui.clone(),
@@ -502,7 +568,11 @@ pub fn run(mut cli: Cli) -> Result<()> {
         match outcome {
             RunOutcome::Exit { session_id, code } => {
                 if let Some(session_id) = session_id {
-                    eprintln!("Resume session:\n\n  maki -r {session_id}");
+                    let argv0 = env::args_os().next().unwrap_or_default();
+                    eprintln!(
+                        "Resume session:\n\n  {} -r {session_id}",
+                        argv0.to_string_lossy()
+                    );
                 }
                 let started = Instant::now();
                 drop(stack);
@@ -562,24 +632,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
     }
 }
 
-/// Trust has nothing to say about this file, because Maki no longer reads it.
-/// Someone who declined trust deserves to hear that the file is inert just as
-/// much as someone who accepted.
-fn warn_stale_config_toml(project_config: &ProjectConfig) {
-    let stale_paths = [
-        maki_config::global_config_dir().map(|dir| dir.join(STALE_GLOBAL_CONFIG)),
-        Some(project_config.config_root().join(STALE_PROJECT_CONFIG)),
-    ];
-    for path in stale_paths.into_iter().flatten() {
-        if path.is_file() {
-            tracing::warn!(
-                path = %path.display(),
-                "config.toml found but no longer used. Migrate to init.lua. See https://maki.sh/docs/configuration/"
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,7 +640,7 @@ mod tests {
     use maki_agent::tools::ToolRegistry;
     use maki_config::RawConfig;
     use maki_providers::Message;
-    use maki_storage::sessions::SessionClaim;
+    use maki_storage::sessions::{Effort, SessionClaim};
     use maki_ui::AppSession;
     use std::fs;
     use std::path::PathBuf;
@@ -600,6 +652,69 @@ mod tests {
     const STORED_SPEC: &str = "zai/glm-4.6";
     const CWD: &str = "/project";
     const STORED_MESSAGE: &str = "the turn the stored session already had";
+
+    #[test_case("srv.probe", true ; "qualified_mcp_tool")]
+    #[test_case("srv__probe", true ; "wire_mcp_tool")]
+    #[test_case("mcp__srv__probe", true ; "claude_mcp_tool")]
+    #[test_case(TOOL_SEARCH_TOOL_NAME, true ; "tool_search")]
+    #[test_case("unloaded_tool", false ; "unknown_registry_tool")]
+    fn tool_filter_warnings_accept_mcp_names(name: &str, accepted: bool) {
+        let cli = Cli::parse_from(["maki", "--disallowed-tools", name]);
+        assert_eq!(
+            tool_filter_warnings(&cli, &ToolRegistry::new(), true)
+                .unwrap()
+                .is_empty(),
+            accepted
+        );
+    }
+
+    #[test_case("raed", false ; "typo")]
+    #[test_case("unloaded_tool", false ; "unknown_plugin_name")]
+    #[test_case("srv.probe", true ; "qualified_mcp")]
+    #[test_case("srv__probe", true ; "wire_mcp")]
+    #[test_case("mcp__srv__probe", true ; "claude_mcp")]
+    #[test_case(TOOL_SEARCH_TOOL_NAME, false ; "tool_search_alone")]
+    #[test_case("tool_search,unloaded_tool", false ; "tool_search_with_unknown_tool")]
+    #[test_case("tool_search,srv.probe", true ; "tool_search_with_mcp_tool")]
+    fn empty_allow_lists_fail_unless_an_mcp_tool_can_load_later(name: &str, accepted: bool) {
+        let cli = Cli::parse_from(["maki", "--allowed-tools", name]);
+        let result = tool_filter_warnings(&cli, &ToolRegistry::new(), true);
+        assert_eq!(result.is_ok(), accepted);
+        if !accepted {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                format!("{NO_ALLOWED_TOOLS}: {}", cli.allowed_tools.join(", "))
+            );
+        }
+    }
+
+    #[test_case(true ; "startup")]
+    #[test_case(false ; "reload")]
+    fn missing_allowed_plugin_tools_only_abort_startup(startup: bool) {
+        const MISSING_TOOL: &str = "unloaded_plugin_tool";
+        let cli = Cli::parse_from(["maki", "--allowed-tools", MISSING_TOOL]);
+        let result = tool_filter_warnings(&cli, &ToolRegistry::new(), startup);
+        if startup {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                format!("{NO_ALLOWED_TOOLS}: {MISSING_TOOL}")
+            );
+        } else {
+            let warnings = result.unwrap();
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains(MISSING_TOOL));
+        }
+    }
+
+    #[test_case("Bash(git log:*)")]
+    #[test_case("srv.probe(argument:*)")]
+    fn tool_filter_warnings_explain_unsupported_argument_patterns(name: &str) {
+        let cli = Cli::parse_from(["maki", "--disallowed-tools", name]);
+        let warnings = tool_filter_warnings(&cli, &ToolRegistry::new(), true).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains(TOOL_ARGUMENT_PATTERNS_UNSUPPORTED));
+        assert!(!warnings[0].contains("load later"));
+    }
 
     fn no_names(_: &PluginHost) -> Result<Vec<String>> {
         Ok(Vec::new())
@@ -701,7 +816,7 @@ mod tests {
         let cli = Cli::parse_from(["maki", "--no-plugins"]);
         assert!(cli.no_plugins);
 
-        let mut plugin_host = PluginHost::with_jit(Arc::new(ToolRegistry::new()), true)
+        let mut plugin_host = PluginHost::new(Arc::new(ToolRegistry::new()))
             .expect("live host boots under --no-plugins");
 
         let config = load_config(
@@ -743,7 +858,7 @@ mod tests {
         assert!(!cli.no_plugins);
 
         let mut plugin_host =
-            PluginHost::with_jit(Arc::new(ToolRegistry::new()), true).expect("live host boots");
+            PluginHost::new(Arc::new(ToolRegistry::new())).expect("live host boots");
 
         match load_config(
             &plugin_host,
@@ -760,18 +875,24 @@ mod tests {
         plugin_host.begin_shutdown();
     }
 
-    /// A session's recorded spec is the single source of truth for the model
-    /// its tab runs on, so both directions matter. An explicit `--model` used
-    /// to be ignored on a resumed session, and without one the startup default
-    /// must not overwrite the recorded spec, or per tab models die on every
-    /// restart.
-    #[test_case(false, STORED_SPEC ; "a resumed tab keeps its own spec")]
-    #[test_case(true, STARTUP_SPEC ; "explicit model wins over a resumed spec")]
-    fn explicit_model_overrides_only_a_resumed_spec(explicit_model: bool, expected_spec: &str) {
+    /// Explicit launch flags replace saved settings. Startup defaults leave
+    /// those settings intact when the flags are absent.
+    #[test_case(&[], STORED_SPEC, None ; "a resumed tab keeps its saved settings")]
+    #[test_case(&["--model", STARTUP_SPEC], STARTUP_SPEC, None ; "explicit model wins")]
+    #[test_case(&["--thinking", "off"], STORED_SPEC, Some(StoredThinking::Off) ; "explicit thinking wins")]
+    #[test_case(&["--effort", "low"], STORED_SPEC, Some(StoredThinking::Effort { level: Effort::Low }) ; "explicit effort wins")]
+    #[test_case(&["--max-thinking-tokens", "2048"], STORED_SPEC, Some(StoredThinking::Budget { tokens: 2048 }) ; "explicit budget wins")]
+    fn launch_flags_override_resumed_settings(
+        flags: &[&str],
+        expected_spec: &str,
+        thinking: Option<StoredThinking>,
+    ) {
+        const SAVED_THINKING: StoredThinking = StoredThinking::Effort { level: Effort::Max };
         let dir = tempdir().expect("tempdir");
         let storage = StateDir::from_path(dir.path().join("state"));
         let cwd = dir.path().to_string_lossy().into_owned();
         let mut stored = AppSession::new(STORED_SPEC, &cwd);
+        stored.meta.thinking = Some(SAVED_THINKING);
         stored.push_message(Message::user(STORED_MESSAGE.to_owned()));
         let stored_id = stored.id;
         stored
@@ -780,10 +901,17 @@ mod tests {
                 &storage,
             )
             .expect("write session to disk");
-        let resolved = resume::resolve(&Cli::parse_from(["maki", "-c"]), &cwd, &storage)
-            .expect("continue resolves");
+        let cli = Cli::parse_from(["maki", "-c"].into_iter().chain(flags.iter().copied()));
+        let resolved = resume::resolve(&cli, &cwd, &storage).expect("continue resolves");
 
-        let session = open_tab(resolved, STARTUP_SPEC, explicit_model, &cwd).session;
+        let session = open_tab(
+            resolved,
+            STARTUP_SPEC,
+            cli.model.is_some(),
+            cli.thinking_override(),
+            &cwd,
+        )
+        .session;
 
         assert_eq!(session.id, stored_id);
         assert_eq!(
@@ -795,6 +923,10 @@ mod tests {
             vec![STORED_MESSAGE]
         );
         assert_eq!(session.model, expected_spec);
+        assert_eq!(
+            session.meta.thinking,
+            Some(thinking.unwrap_or(SAVED_THINKING))
+        );
     }
 
     /// A fresh tab opens on the startup spec, which already folded in
@@ -806,7 +938,7 @@ mod tests {
         let storage = StateDir::from_path(dir.path().join("state"));
         let resolved = Resolved::fresh(&storage);
         let id = resolved.id.id();
-        let session = open_tab(resolved, STARTUP_SPEC, false, CWD).session;
+        let session = open_tab(resolved, STARTUP_SPEC, false, None, CWD).session;
 
         assert_eq!(session.id, id);
         assert!(session.messages().is_empty());

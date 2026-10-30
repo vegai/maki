@@ -24,6 +24,12 @@ pub(crate) const MAX_EDGE: u32 = 1568;
 /// Anthropic refuses a request carrying more than 100 images, and no other
 /// provider is more generous.
 pub(crate) const MAX_IMAGES: usize = 100;
+/// How many slots one eviction frees past [`MAX_IMAGES`]. Evicting edits an
+/// early message, which voids the cache and the thinking bound to it, so it
+/// happens once per this many new images, not on every one. Saving evictions
+/// in history would avoid even that, but one miss per step is cheaper than
+/// the extra state.
+pub(crate) const IMAGE_EVICTION_STEP: usize = 25;
 /// Providers reject images over 5MB base64, and 3MB of raw bytes encodes to
 /// roughly 4MB.
 const MAX_RAW_BYTES: usize = 3 * 1024 * 1024;

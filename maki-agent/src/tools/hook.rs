@@ -9,9 +9,10 @@ use std::time::Instant;
 
 use serde_json::Value;
 
-use super::CallOrigin;
-use super::registry::BoxFuture;
+use super::registry::{BoxFuture, ToolReach};
+use super::{CallOrigin, ToolContext, ToolOutputMode};
 use crate::cancel::CancelToken;
+use crate::permissions::LayerAnswer;
 use maki_config::Permission;
 
 /// Fields of the value a [`HookStage::Output`] hook sees and returns.
@@ -54,9 +55,19 @@ pub enum Authority {
     /// Exactly the capability the tool declares; a layer needs that one.
     Capability(Permission),
     /// Reach nobody declared: a tool naming no capability, an MCP server tool,
-    /// an ACP client tool, search. A layer needs every capability, because no
-    /// narrower answer would be honest.
+    /// an ACP client tool, search. A layer needs every capability a tool can
+    /// reach, because no narrower answer would be honest. `agent` is not one:
+    /// every call already runs inside a turn.
     Unbounded,
+    /// Steering what the agent does next, up to turns nobody typed. A layer
+    /// needs every permission, `agent` included.
+    Total,
+}
+
+impl From<Option<ToolReach>> for Authority {
+    fn from(reach: Option<ToolReach>) -> Self {
+        reach.map_or(Self::Unbounded, |reach| Self::Capability(reach.permission))
+    }
 }
 
 pub struct HookCall<'a> {
@@ -70,6 +81,7 @@ pub struct HookCall<'a> {
     pub input: Option<&'a Value>,
     pub session_id: Option<&'a str>,
     pub origin: CallOrigin,
+    pub output_mode: ToolOutputMode,
     pub authority: Authority,
     /// The call's own cancellation, so a hook that runs elsewhere (the Lua
     /// thread) dies with the call rather than outliving the reply channel.
@@ -111,4 +123,14 @@ pub trait ToolHook: Send + Sync + 'static {
         value: Value,
         call: &'a HookCall<'a>,
     ) -> BoxFuture<'a, Verdict>;
+
+    /// Asked where the permission prompt would show, with the scopes it would
+    /// ask about. `None` leaves the call to the prompt.
+    fn prompt<'a>(
+        &'a self,
+        input: &'a Value,
+        scopes: &'a [String],
+        call: &'a HookCall<'a>,
+        ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Option<LayerAnswer>>;
 }

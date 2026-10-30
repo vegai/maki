@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use maki_agent::cancel::CancelToken;
-use maki_agent::tools::{Deadline, FileKey, MAIN_TASK_ID, ToolAudience, ToolContext, ToolLive};
+use maki_agent::tools::{
+    Deadline, FileKey, MAIN_TASK_ID, ToolAudience, ToolContext, ToolLive, ToolOutputMode,
+};
 use maki_config::{AgentConfig, ToolOutputLines};
 use maki_storage::id::SessionRef;
 use mlua::{LuaSerdeExt, MultiValue, UserData, UserDataMethods, Value as LuaValue};
@@ -51,7 +53,7 @@ pub(crate) struct AgentContext(ToolContext);
 impl From<&ToolContext> for AgentContext {
     fn from(ctx: &ToolContext) -> Self {
         let mut c = ctx.clone();
-        c.deadline = Deadline::None;
+        c.deadline = Deadline::default();
         c.tool_output_lines = ToolOutputLines::default();
         Self(c)
     }
@@ -102,6 +104,7 @@ enum Caps {
         config: AgentConfig,
         workflow: bool,
         audience: ToolAudience,
+        output_mode: ToolOutputMode,
     },
     Restore {
         state: Option<serde_json::Value>,
@@ -148,6 +151,7 @@ impl LuaCtx {
                 config: ctx.config.clone(),
                 workflow: ctx.workflow,
                 audience: ctx.audience,
+                output_mode: ctx.output_mode,
             },
         )
     }
@@ -205,6 +209,14 @@ impl LuaCtx {
         }
     }
 
+    fn output_mode(&self) -> ToolOutputMode {
+        match &self.caps {
+            Caps::Handler { agent } => agent.output_mode,
+            Caps::Start { output_mode, .. } => *output_mode,
+            Caps::Restore { .. } => ToolOutputMode::Compact,
+        }
+    }
+
     fn task_id(&self) -> &str {
         self.task_id.as_deref().unwrap_or(MAIN_TASK_ID)
     }
@@ -236,6 +248,8 @@ impl LuaCtx {
 impl UserData for LuaCtx {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("cancelled", |_, this, ()| Ok(this.cancel.is_cancelled()));
+
+        methods.add_method("output_mode", |_, this, ()| Ok(this.output_mode().as_str()));
 
         methods.add_method("workflow", |_, this, ()| {
             let Some(workflow) = this.workflow() else {
@@ -450,7 +464,7 @@ mod tests {
             Some(session_ref()),
             "the session owns the whole run, so it is not per-call state"
         );
-        assert!(matches!(agent.deadline, Deadline::None));
+        assert!(agent.deadline.at().is_none());
         assert_eq!(agent.tool_output_lines, ToolOutputLines::default());
         assert!(
             agent.local_tools.contains_key(LOCAL_TOOL_NAME),

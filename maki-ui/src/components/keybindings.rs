@@ -129,6 +129,7 @@ pub mod key {
     pub const QUIT: Bind = ctrl_bind!('c');
     pub const HELP: Bind = ctrl_bind!('h');
     pub const SESSIONS: Bind = ctrl_bind!('p');
+    pub const TASKS: Bind = ctrl_bind!('x');
     pub const SCROLL_HALF_UP: Bind = ctrl_bind!('u');
     pub const SCROLL_HALF_DOWN: Bind = ctrl_bind!('d');
     pub const SCROLL_PAGE_UP: Bind = Bind {
@@ -144,14 +145,19 @@ pub mod key {
     pub const SCROLL_LINE_UP: Bind = ctrl_bind!('y');
     pub const SCROLL_LINE_DOWN: Bind = ctrl_bind!('e');
     pub const SCROLL_TOP: Bind = ctrl_bind!('g');
-    pub const SCROLL_BOTTOM: Bind = ctrl_bind!('b');
+    pub const SCROLL_BOTTOM: Bind = Bind {
+        code: KeyCode::Char('g'),
+        modifiers: KeyModifiers::CONTROL.union(KeyModifiers::ALT),
+        label: mod_key!("Alt+G"),
+    };
     pub const POP_QUEUE: Bind = ctrl_bind!('q');
     pub const DELETE_WORD: Bind = ctrl_bind!('w');
     pub const SEARCH: Bind = ctrl_bind!('f');
+    pub const FORK: Bind = ctrl_bind!('f');
     pub const FILE_PICKER: Bind = ctrl_bind!('s');
     pub const OPEN_EDITOR: Bind = ctrl_bind!('o');
     pub const PLAN_TOGGLE: Bind = ctrl_bind!('t');
-    pub const MODEL_PICKER: Bind = ctrl_bind!('m');
+    pub const MODEL_PICKER: Bind = ctrl_bind!('l');
     pub const REFRESH: Bind = ctrl_bind!('r');
     pub const SUSPEND: Bind = ctrl_bind!('z');
     pub const DELETE: Bind = ctrl_bind!('d');
@@ -162,6 +168,11 @@ pub mod key {
         code: KeyCode::Char('o'),
         modifiers: KeyModifiers::ALT,
         label: "Alt+O",
+    };
+    pub const UNDO: Bind = Bind {
+        code: KeyCode::Char('z'),
+        modifiers: KeyModifiers::ALT,
+        label: "Alt+Z",
     };
 }
 
@@ -468,6 +479,12 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Single(key::UNDO.label),
+        description: "Undo typing / paste",
+        context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Alt("↑", "↓"),
         description: "Navigate input history",
         context: KeybindContext::Streaming,
@@ -534,6 +551,12 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Single(key::FORK.label),
+        description: "Fork up to the selected prompt and switch to it",
+        context: KeybindContext::RewindPicker,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Single("Enter"),
         description: "Remove item",
         context: KeybindContext::QueueFocus,
@@ -546,8 +569,20 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Single(key::REFRESH.label),
+        description: "Refresh available models",
+        context: KeybindContext::ModelPicker,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Single("!/@/#/$"),
         description: "Set tier (strong/medium/weak/compaction)",
+        context: KeybindContext::ModelPicker,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("%"),
+        description: "Fold or unfold provider",
         context: KeybindContext::ModelPicker,
         platform: Platform::All,
     },

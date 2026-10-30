@@ -2,6 +2,13 @@ pub(crate) mod agent;
 pub(crate) mod r#async;
 pub(crate) mod autocmd;
 pub(crate) mod base64;
+#[cfg(target_os = "linux")]
+pub(crate) mod claude_code;
+#[cfg(not(target_os = "linux"))]
+pub(crate) use claude_code_unsupported as claude_code;
+mod claude_code_common;
+#[cfg(any(test, not(target_os = "linux")))]
+pub(crate) mod claude_code_unsupported;
 pub(crate) mod env;
 pub(crate) mod r#fn;
 pub(crate) mod fs;
@@ -36,7 +43,9 @@ use mlua::{Lua, Result as LuaResult, Table, Value};
 use crate::api::options::PluginOpts;
 use crate::api::tool::{PendingRules, PendingTools};
 use crate::api::util::command::UiAction;
-use crate::plugin_permissions::{NetEgress, Permission, PluginPermissions};
+use crate::plugin_permissions::{
+    Permission, PluginPermissions, PluginReach, warn_invalid_net_hosts,
+};
 use maki_providers::plugin::DeclAuthority;
 
 /// Who a `maki` global belongs to: the name everything it registers is filed
@@ -62,17 +71,23 @@ pub(crate) fn create_maki_global(
         authority,
     } = owner;
     let maki = lua.create_table()?;
+    let reach = PluginReach::new(permissions.clone());
 
     let api = tool::create_api_table(
         lua,
         pending,
         pending_rules,
-        permissions.clone(),
+        reach.clone(),
         Arc::clone(&plugin),
         opts,
         ui_action_tx.clone(),
     )?;
-    autocmd::add_autocmd_methods(&api, lua, Arc::clone(&plugin))?;
+    autocmd::add_autocmd_methods(
+        &api,
+        lua,
+        Arc::clone(&plugin),
+        permissions.is_allowed(Permission::SessionRead),
+    )?;
     slot::add_slot_methods(&api, lua, Arc::clone(&plugin), permissions.clone())?;
     maki.set("api", api)?;
     maki.set("env", env::create_env_table(lua, permissions)?)?;
@@ -87,15 +102,19 @@ pub(crate) fn create_maki_global(
     maki.set("image", image::create_image_table(lua)?)?;
     maki.set("json", json::create_json_table(lua)?)?;
     maki.set("yaml", yaml::create_yaml_table(lua)?)?;
+    warn_invalid_net_hosts(&plugin, reach.egress().declared());
     // One egress value shared by the two namespaces that can open a socket, so
     // a provider registered through `maki.provider` is reachable from
     // `maki.net` without the manifest naming an origin only maki resolves.
-    let egress = NetEgress::new(permissions.net_hosts());
+    let egress = reach.egress().clone();
     maki.set(
         "net",
-        net::create_net_table(lua, permissions, egress.clone())?,
+        net::create_net_table(lua, permissions, egress.clone(), Arc::clone(&plugin))?,
     )?;
-    maki.set("plan", plan::create_plan_table(lua, ui_action_tx.clone())?)?;
+    maki.set(
+        "plan",
+        plan::create_plan_table(lua, ui_action_tx.clone(), permissions)?,
+    )?;
     maki.set(
         "provider",
         provider::create_provider_namespace(
@@ -109,16 +128,24 @@ pub(crate) fn create_maki_global(
     maki.set("text", text::create_text_table(lua)?)?;
     maki.set(
         "session",
-        session::create_session_table(lua, ui_action_tx.clone())?,
+        session::create_session_table(
+            lua,
+            ui_action_tx.clone(),
+            permissions,
+            permissions.is_allowed(Permission::Agent),
+        )?,
     )?;
     maki.set(
         "model",
-        model::create_model_table(lua, ui_action_tx.clone())?,
+        model::create_model_table(lua, ui_action_tx.clone(), permissions)?,
     )?;
-    maki.set("task", task::create_task_table(lua, ui_action_tx.clone())?)?;
+    maki.set(
+        "task",
+        task::create_task_table(lua, ui_action_tx.clone(), permissions)?,
+    )?;
     maki.set(
         "ui",
-        ui::create_ui_table(lua, ui_action_tx.clone(), Arc::clone(&plugin))?,
+        ui::create_ui_table(lua, ui_action_tx.clone(), Arc::clone(&plugin), permissions)?,
     )?;
     maki.set(
         "fn",
@@ -132,12 +159,18 @@ pub(crate) fn create_maki_global(
     )?;
     split::split__register(&maki, lua)?;
     top::add_top_methods(&maki, lua, Arc::clone(&plugin))?;
-    maki.set("async", r#async::create_async_table(lua)?)?;
+    maki.set(
+        "async",
+        r#async::create_async_table(lua, Arc::clone(&plugin))?,
+    )?;
     maki.set(
         "interpreter",
         interpreter::create_interpreter_table(lua, permissions)?,
     )?;
-    maki.set("agent", agent::create_agent_table(lua)?)?;
+    maki.set(
+        "agent",
+        agent::create_agent_table(lua, Arc::clone(&plugin), permissions.clone())?,
+    )?;
     maki.set(
         "keymap",
         keymap::create_keymap_table(lua, Arc::clone(&plugin))?,

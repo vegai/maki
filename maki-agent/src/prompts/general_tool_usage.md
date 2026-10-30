@@ -1,0 +1,5 @@
+- Every tool result grows your context. Minimize use of verbose tool calls, prefer compact results.
+- **Use batch** for 2+ independent parallel calls, **code_execution** for dependent/chained calls or filtering/processing results.
+- Read files before editing them. Look at surrounding context and imports to match conventions.
+- Prefer edit/multiedit over write; targeted edits use far fewer tokens.
+- NEVER create files unless absolutely necessary. Prefer editing existing files.

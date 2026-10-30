@@ -1,6 +1,41 @@
--- Every backend here is an MCP server that answers tools/call with a text
--- content block, so one SSE parser serves them all. What changes is the
--- endpoint, the tool name, the argument names, and how a key rides along.
+-- The MCP backends answer tools/call with a text content block, so one SSE
+-- parser serves them all; what changes is the endpoint, the tool name, the
+-- argument names, and how a key rides along. searxng is the exception: a
+-- plain GET /search?format=json, built and read in searxng.lua.
+
+local MAX_CODEPOINT = 0x10FFFF
+local SURROGATE_MIN, SURROGATE_MAX = 0xD800, 0xDFFF
+local NAMED_ENTITIES = { amp = "&", lt = "<", gt = ">", quot = '"', apos = "'", nbsp = " " }
+
+-- Luau's utf8.char encodes surrogates and NUL without complaint, and either
+-- byte sequence fails the UTF-8 check on the way to Rust, taking the whole
+-- result with it. Such an entity stays as written, like an unknown one.
+local function codepoint(code)
+  if code == 0 or code > MAX_CODEPOINT or (code >= SURROGATE_MIN and code <= SURROGATE_MAX) then
+    return nil
+  end
+  return utf8.char(code)
+end
+
+local function decode_entities(text)
+  return (
+    text
+      :gsub("&#[xX](%x+);", function(hex)
+        return codepoint(tonumber(hex, 16))
+      end)
+      :gsub("&#(%d+);", function(dec)
+        return codepoint(tonumber(dec))
+      end)
+      :gsub("&(%a+);", NAMED_ENTITIES)
+  )
+end
+
+-- Kagi's markdown keeps the HTML of its search page: every query term wrapped
+-- in <strong> and entity-encoded titles, plus a URL line repeating the link
+-- in the heading above it. Together about a third of the response.
+local function clean_kagi(text)
+  return decode_entities(text:gsub("</?strong>", ""):gsub("\n%*%*URL:%*%* [^\n]*", ""))
+end
 
 return {
   exa = {
@@ -33,5 +68,27 @@ return {
         count = num_results,
       }
     end,
+  },
+  kagi = {
+    label = "Kagi",
+    endpoint = "https://mcp.kagi.com/mcp",
+    -- No free tier: without a key the server answers a bodiless 401.
+    key_required = true,
+    env = "KAGI_API_KEY",
+    auth_header = "Authorization",
+    auth_prefix = "Bearer ",
+    tool = "kagi_search_fetch",
+    arguments = function(query, num_results)
+      return {
+        query = query,
+        limit = num_results,
+      }
+    end,
+    clean = clean_kagi,
+  },
+  searxng = {
+    label = "SearXNG",
+    transport = "get", -- plain GET /search?format=json, no MCP
+    env = "SEARXNG_BASE_URL",
   },
 }

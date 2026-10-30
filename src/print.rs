@@ -4,8 +4,8 @@
 //! unchanged. Keep `PrintResult` fields a strict subset of theirs. `StreamJson`
 //! is JSONL with the same shape, `Text` prints the raw response only.
 //!
-//! We adopt new fields when Claude Code adds them but never invent our own.
-//! Check their docs before changing anything here.
+//! Keep Claude Code fields compatible with its wire format. Maki adds `thinking` to init
+//! metadata so scripted callers can inspect the effective, model-clamped setting.
 
 use std::io::{self, Read};
 use std::path::PathBuf;
@@ -14,24 +14,29 @@ use std::time::Instant;
 
 use clap::ValueEnum;
 use color_eyre::Result;
-use color_eyre::eyre::{Context, eyre};
-use maki_agent::headless::{self, HeadlessHandle, HeadlessParams};
+use color_eyre::eyre::{Context, bail, eyre};
+use maki_agent::headless::{self, HeadlessHandle, HeadlessParams, Ready};
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::session::Resumed;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
-    AgentConfig, AgentEvent, DoneReason, Envelope, ImageSource, PermissionsConfig, SteerKind,
+    AgentConfig, AgentEvent, CancelToken, DoneReason, Envelope, ImageSource, PermissionsConfig,
+    SteerKind,
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
 use maki_lua::{EventHandle, SessionEndReason};
 use maki_providers::model::Model;
 use maki_providers::{TokenUsage, add_cost};
-use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
 use serde::Serialize;
 use serde_json::Value;
+
+use crate::headless_startup::{start_mcp, startup};
+use crate::notice::{NOTIFICATION, ProviderNotice};
+use crate::shutdown::watch;
+use crate::wire::{ERROR_DURING_EXECUTION, SUCCESS, failure_subtype, system_event};
 
 const SESSION_LINE_PREFIX: &str = "session: ";
 
@@ -71,6 +76,23 @@ struct PrintResult {
     usage: TokenUsage,
 }
 
+impl PrintResult {
+    fn error(session_id: SessionRef, duration_ms: u128, result: String) -> Self {
+        Self {
+            result_type: "result",
+            subtype: ERROR_DURING_EXECUTION,
+            is_error: true,
+            duration_ms,
+            num_turns: 0,
+            result,
+            stop_reason: None,
+            session_id,
+            total_cost_usd: 0.0,
+            usage: TokenUsage::default(),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct InitEvent<'a> {
     #[serde(rename = "type")]
@@ -80,6 +102,7 @@ struct InitEvent<'a> {
     session_id: &'a SessionRef,
     tools: &'a [String],
     model: &'a str,
+    thinking: String,
 }
 
 #[derive(Serialize)]
@@ -143,6 +166,7 @@ impl VerboseOutput {
 }
 
 pub struct PrintParams {
+    pub dry_run: bool,
     pub model: Model,
     pub prompt: Option<String>,
     pub image_paths: Vec<PathBuf>,
@@ -162,11 +186,11 @@ pub struct PrintParams {
     /// The right to write [`Self::resumed`]'s session, taken when it was
     /// resolved and held for the whole run.
     pub claim: SessionClaim,
-    pub storage: StateDir,
 }
 
 pub fn run(params: PrintParams) -> Result<()> {
     let PrintParams {
+        dry_run,
         model,
         prompt,
         image_paths,
@@ -182,11 +206,11 @@ pub fn run(params: PrintParams) -> Result<()> {
         project_config,
         resumed,
         claim,
-        storage,
     } = params;
 
     let prompt = match prompt {
         Some(p) => p,
+        None if dry_run => String::new(),
         None => {
             let mut buf = String::new();
             io::stdin().read_to_string(&mut buf).context("read stdin")?;
@@ -199,16 +223,14 @@ pub fn run(params: PrintParams) -> Result<()> {
     let prompt_slots = lua_handle.collect_prompt_slots();
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    let (mcp_handle, mcp_config_errors) = smol::block_on(maki_agent::mcp::start_connected(
-        &cwd,
-        project_config.clone(),
-    ));
-    if !mcp_config_errors.is_empty() {
-        eprintln!("MCP config error: {mcp_config_errors}");
-    }
+    let mcp_handle = start_mcp(&cwd, project_config.clone());
 
-    let (handle, mut events) = maki_agent::headless::spawn(HeadlessParams {
-        model: model.clone(),
+    let (trigger, shutdown) = CancelToken::new();
+    watch(trigger).context("watch termination signals")?;
+    let (handle, mut events) = headless::spawn(HeadlessParams {
+        shutdown,
+        dry_run,
+        model,
         config,
         permissions_config,
         timeouts,
@@ -220,7 +242,6 @@ pub fn run(params: PrintParams) -> Result<()> {
         initial_wd: cwd,
         resumed,
         claim,
-        storage,
         defaults,
         model_policy,
         plugin_rules,
@@ -228,18 +249,54 @@ pub fn run(params: PrintParams) -> Result<()> {
     });
 
     let HeadlessHandle {
-        tool_names,
+        ready,
         session_id,
         cwd,
         task,
     } = handle;
     let start = Instant::now();
-
     let mut verbose_out = match format {
         OutputFormat::StreamJson => Some(VerboseOutput::StreamJson),
         _ if verbose => Some(VerboseOutput::Json(Vec::new())),
         _ => None,
     };
+
+    let (Ready { model, tool_names }, thinking) =
+        match startup(&ready, &mut events, defaults.thinking) {
+            Ok(started) => started,
+            Err(error) => {
+                smol::block_on(headless::await_shutdown(task));
+                if !matches!(format, OutputFormat::Text) {
+                    write_result(
+                        format,
+                        verbose_out,
+                        PrintResult::error(
+                            session_id,
+                            start.elapsed().as_millis(),
+                            error.to_string(),
+                        ),
+                    )?;
+                }
+                return Err(error);
+            }
+        };
+
+    if dry_run {
+        smol::block_on(headless::await_shutdown(task));
+        println!(
+            "{}",
+            serde_json::to_string(&InitEvent {
+                event_type: "system",
+                subtype: "init",
+                cwd: &cwd,
+                session_id: &session_id,
+                tools: &tool_names,
+                model: &model.id,
+                thinking
+            })?
+        );
+        return Ok(());
+    }
 
     match &mut verbose_out {
         Some(out) => out.emit(&InitEvent {
@@ -249,6 +306,7 @@ pub fn run(params: PrintParams) -> Result<()> {
             session_id: &session_id,
             tools: &tool_names,
             model: &model.id,
+            thinking,
         })?,
         // Text mode never says which session it wrote, and a later `-r`
         // needs it. On stderr so a pipe reading the answer is unaffected.
@@ -310,18 +368,35 @@ pub fn run(params: PrintParams) -> Result<()> {
             | AgentEvent::AutoCompacting { .. }
             | AgentEvent::CompactionDone { .. }
             | AgentEvent::AuthRequired
+            | AgentEvent::AllowedByPlugin { .. }
             | AgentEvent::PermissionRequest { .. }
             | AgentEvent::SubagentHistory { .. }
             | AgentEvent::ToolSnapshot { .. }
             | AgentEvent::ToolHeaderSnapshot { .. }
             | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::Nudge
+            | AgentEvent::Notice { .. }
+            | AgentEvent::ObservationLine { .. }
             | AgentEvent::PromptProgress { .. }
             | AgentEvent::StreamClosed => {}
             AgentEvent::Steered { .. } => {
                 if let Some(reason) = dropped_prompt(event, parent_tool_use_id) {
                     is_error = true;
                     result_text = reason.to_owned();
+                }
+            }
+            AgentEvent::ProviderWaiting { message } => {
+                if let Some(out) = &mut verbose_out {
+                    out.emit(&system_event(
+                        &session_id,
+                        NOTIFICATION,
+                        ProviderNotice::new(message.as_deref(), parent_tool_use_id),
+                    ))?;
+                } else if let Some(message) = message {
+                    match &subagent {
+                        Some(info) => eprintln!("{}: {message}", info.name),
+                        None => eprintln!("{message}"),
+                    }
                 }
             }
             AgentEvent::Retry {
@@ -378,19 +453,24 @@ pub fn run(params: PrintParams) -> Result<()> {
                 cost: dcost,
                 ..
             } => {
+                if parent_tool_use_id.is_some() {
+                    continue;
+                }
                 num_turns = *turns;
                 usage = *u;
                 // The agent's own ledger also counts compaction spend, which
                 // summing the turns misses.
                 cost = (*dcost).or(cost);
                 stop_reason = Some(*reason);
+                is_error |= failure_subtype(*reason).is_some();
                 break;
             }
-            AgentEvent::Error { message } => {
+            AgentEvent::Error { message, .. } if parent_tool_use_id.is_none() => {
                 is_error = true;
                 result_text = message.clone();
                 break;
             }
+            AgentEvent::Error { .. } => {}
         }
     }
     smol::block_on(headless::await_shutdown(task));
@@ -400,33 +480,51 @@ pub fn run(params: PrintParams) -> Result<()> {
     // Zero on an unpriced model, which is what its turns reported too.
     let total_cost_usd = cost.unwrap_or_default();
 
-    match format {
-        OutputFormat::Text => {
-            print!("{result_text}");
-        }
-        OutputFormat::Json | OutputFormat::StreamJson => {
-            let result = PrintResult {
-                result_type: "result",
-                subtype: if is_error { "error" } else { "success" },
-                is_error,
-                duration_ms,
-                num_turns,
-                result: result_text,
-                stop_reason,
-                session_id,
-                total_cost_usd,
-                usage,
-            };
-            match verbose_out {
-                Some(VerboseOutput::Json(mut events)) => {
-                    events.push(serde_json::to_value(&result)?);
-                    println!("{}", serde_json::to_string(&events)?);
-                }
-                _ => println!("{}", serde_json::to_string(&result)?),
-            }
-        }
-    }
+    let subtype = stop_reason
+        .and_then(failure_subtype)
+        .unwrap_or(if is_error {
+            ERROR_DURING_EXECUTION
+        } else {
+            SUCCESS
+        });
+    write_result(
+        format,
+        verbose_out,
+        PrintResult {
+            result_type: "result",
+            subtype,
+            is_error,
+            duration_ms,
+            num_turns,
+            result: result_text,
+            stop_reason,
+            session_id,
+            total_cost_usd,
+            usage,
+        },
+    )?;
 
+    if is_error {
+        bail!("headless run ended with {subtype}");
+    }
+    Ok(())
+}
+
+fn write_result(
+    format: OutputFormat,
+    verbose_out: Option<VerboseOutput>,
+    result: PrintResult,
+) -> Result<()> {
+    match format {
+        OutputFormat::Text => print!("{}", result.result),
+        OutputFormat::Json | OutputFormat::StreamJson => match verbose_out {
+            Some(VerboseOutput::Json(mut events)) => {
+                events.push(serde_json::to_value(&result)?);
+                println!("{}", serde_json::to_string(&events)?);
+            }
+            _ => println!("{}", serde_json::to_string(&result)?),
+        },
+    }
     Ok(())
 }
 
@@ -445,7 +543,7 @@ fn dropped_prompt<'a>(event: &'a AgentEvent, parent_tool_use_id: Option<&str>) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maki_providers::TokenUsage;
+    use maki_providers::{ThinkingConfig, TokenUsage};
     use test_case::test_case;
 
     const DROP_REASON: &str = "blocked by a plugin";
@@ -478,7 +576,15 @@ mod tests {
         "usage",
         "duration_ms",
     ];
-    const INIT_EVENT_FIELDS: &[&str] = &["type", "subtype", "cwd", "session_id", "tools", "model"];
+    const INIT_EVENT_FIELDS: &[&str] = &[
+        "type",
+        "subtype",
+        "cwd",
+        "session_id",
+        "tools",
+        "model",
+        "thinking",
+    ];
     const RETRY_EVENT_FIELDS: &[&str] = &[
         "type",
         "subtype",
@@ -492,7 +598,7 @@ mod tests {
     fn wire_format_required_fields() {
         let result = PrintResult {
             result_type: "result",
-            subtype: "success",
+            subtype: SUCCESS,
             is_error: false,
             duration_ms: 1234,
             num_turns: 2,
@@ -515,6 +621,7 @@ mod tests {
             session_id: &sid,
             tools: &["bash".into(), "read".into()],
             model: "test-model",
+            thinking: ThinkingConfig::Off.to_string(),
         };
         let json: Value = serde_json::to_value(&init).unwrap();
         for field in INIT_EVENT_FIELDS {

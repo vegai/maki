@@ -20,7 +20,7 @@ local function memories_path_suffix()
   return "projects/" .. helpers.project_id(root) .. "/memories"
 end
 
-local function legacy_dir_if_exists(suffix)
+local function legacy_dir_if_exists(suffix): string?
   local legacy = maki.env.legacy_dir()
   if not legacy then
     return nil
@@ -120,7 +120,7 @@ local function cmd_read(path, dir, ctx)
     return nil, "read error: " .. err
   end
   local formatted =
-    helpers.cap_read_output(helpers.format_read_entry(path, #content, content), helpers.CAP_HINT_REWRITE)
+    helpers.cap_read_output(helpers.format_read_entry(path, #content, content), helpers.CAP_HINT_REWRITE, ctx)
   return {
     llm_output = formatted,
     body = render_content(formatted, path, ctx),
@@ -234,22 +234,22 @@ maki.api.register_tool({
     if type(input.tags) == "string" then
       input.tags = { input.tags }
     end
-    local verr = helpers.validate_input(input)
+    local cmd = input.command
+    local dir, dir_err = resolve_dir(cmd ~= "write" and cmd ~= "delete")
+    local verr = helpers.validate_input(input, dir)
     if verr then
       return { llm_output = "error: " .. verr, is_error = true }
     end
-    local cmd = input.command
-    local dir, dir_err = resolve_dir(cmd == "list" or cmd == "read")
     if not dir then
       return { llm_output = "error: " .. dir_err, is_error = true }
     end
 
     local result, err
     if cmd == "list" then
-      result, err = helpers.format_list(dir, input.tags)
+      result, err = helpers.format_list(dir, input.tags, ctx)
     elseif cmd == "read" then
       if input.tags and #input.tags > 0 then
-        result, err = helpers.format_read(dir, input.tags)
+        result, err = helpers.format_read(dir, input.tags, ctx)
       else
         result, err = cmd_read(input.path, dir, ctx)
       end

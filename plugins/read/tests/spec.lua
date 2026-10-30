@@ -16,6 +16,11 @@ case("truncate_ascii", function()
   eq(truncate_bytes("ab", 1), "a...")
 end)
 
+case("zero_byte_limit_preserves_long_lines", function()
+  local line = string.rep("caf\xC3\xA9", 200)
+  eq(truncate_bytes(line, 0), line)
+end)
+
 case("truncate_utf8_boundary_safety", function()
   -- 2-byte: é = \xC3\xA9
   eq(truncate_bytes("caf\xC3\xA9", 10), "caf\xC3\xA9")

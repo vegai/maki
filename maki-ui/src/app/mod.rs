@@ -17,7 +17,7 @@ pub(crate) mod tasks;
 pub(crate) mod tests;
 pub(crate) mod view;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::mem;
 use std::path::PathBuf;
@@ -30,6 +30,7 @@ use crate::app::tasks::TaskOutcome;
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
+use crate::components::alert_modal::AlertModal;
 use crate::components::btw_modal::BtwModal;
 use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
@@ -55,7 +56,7 @@ use crate::components::{
 use crate::markdown::TRUNCATION_PREFIX;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::ArcSwapOption;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::{PermissionManager, TaggedAnswer};
 use maki_agent::{
@@ -64,14 +65,19 @@ use maki_agent::{
 };
 use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
+use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, InputEdit, Key, KeymapReader,
     LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, PackCommand,
-    PackPreparation, PlanActionOutcome, PlanMenu, PlanRowAction, WinView, is_reserved,
+    PackPreparation, PlanActionOutcome, PlanMenu, PlanRowAction, PluginReach, WinView, is_reserved,
 };
-use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, add_cost};
+use maki_providers::models_cache::ModelList;
+use maki_providers::provider::ModelListing;
+use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, TokenUsage, add_cost};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
+use maki_storage::model::persist_thinking;
+use maki_storage::sessions::StoredTokenUsage;
 
 use crate::storage_writer::StorageWriter;
 use ratatui::layout::{Position, Rect};
@@ -86,6 +92,8 @@ pub(crate) use session::session_has_content;
 use session_state::SessionState;
 
 const CANCEL_MSG: &str = "Cancelled.";
+const MAIN_CHAT: usize = 0;
+const EXIT_WORD: &str = "exit";
 /// Bypasses the per-run staleness filter because re-bake replies
 /// don't belong to any real agent run.
 pub(crate) const RESTORE_RUN_ID: u64 = u64::MAX;
@@ -126,8 +134,9 @@ const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
 pub(crate) const NOTHING_TO_TRUST_MSG: &str = "nothing to trust in this folder";
 const TRUSTED_PREFIX: &str = "Trusted this folder: ";
+const PROVIDER_FOLDED_SUFFIX: &str = ": folded away";
+const PROVIDER_UNFOLDED_SUFFIX: &str = ": unfolded";
 const PACK_CHANGES_DECLINED: &str = "Package changes declined";
-const PACK_USER_ONLY_SUFFIX: &str = " can only be run by you";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
 
@@ -204,12 +213,23 @@ pub(crate) enum Notification {
     AuthenticationRequired,
     QuestionRequested,
     PlanReady,
+    AgentError { message: String },
 }
-
 impl Notification {
     /// Prompts blocking the agent outrank turn completions.
     pub(crate) fn is_urgent(&self) -> bool {
-        !matches!(self, Self::TurnComplete { .. })
+        !matches!(self, Self::TurnComplete { .. } | Self::AgentError { .. })
+    }
+
+    pub(crate) fn reason(&self) -> &'static str {
+        match self {
+            Self::TurnComplete { .. } => "Turn complete",
+            Self::PermissionRequested { .. } => "Permission requested",
+            Self::AuthenticationRequired => "Authentication required",
+            Self::QuestionRequested => "Question requested",
+            Self::PlanReady => "Plan ready",
+            Self::AgentError { .. } => "Agent error",
+        }
     }
 
     pub(crate) fn message(&self) -> String {
@@ -224,12 +244,13 @@ impl Notification {
             Self::AuthenticationRequired => "Authentication required".into(),
             Self::QuestionRequested => "Question requested".into(),
             Self::PlanReady => "Plan ready".into(),
+            Self::AgentError { message } => message.clone(),
         }
     }
 
     pub(crate) fn error_completion() -> Self {
-        Self::TurnComplete {
-            response: Some("Agent stopped with an error".into()),
+        Self::AgentError {
+            message: "Agent stopped with an error".into(),
         }
     }
 }
@@ -338,6 +359,10 @@ pub struct App {
     pub(super) chats: Vec<Chat>,
     pub(super) active_chat: usize,
     pub(super) chat_index: HashMap<String, usize>,
+    /// Cancel marks a task finished while its agent is still shutting down,
+    /// so the user can delete it before its last events arrive. Those events
+    /// would bring it back, so we drop them.
+    pub(super) deleted_tasks: HashSet<String>,
     pub(crate) input_box: InputBox,
     pub(super) command_palette: CommandPalette,
     pub(super) theme_picker: ThemePicker,
@@ -345,6 +370,7 @@ pub struct App {
     pub(super) login_picker: LoginPicker,
     pub(super) mcp_picker: McpPicker,
     pub(super) rewind_picker: RewindPicker,
+    pub(super) alert_modal: AlertModal,
     pub(super) help_modal: HelpModal,
     pub(super) usage_modal: UsageModal,
     pub(super) btw_modal: BtwModal,
@@ -378,7 +404,6 @@ pub struct App {
     pub(crate) trust_question: Option<TrustQuestion>,
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
     pub(crate) shared_history: Option<SharedMessages>,
-    pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
     pub(crate) primary_paste_rx: Vec<flume::Receiver<Option<String>>>,
     storage_writer: Arc<StorageWriter>,
@@ -423,7 +448,7 @@ impl App {
         model: &Model,
         session: OpenSession,
         storage: StateDir,
-        available_models: Arc<ArcSwapOption<Vec<String>>>,
+        available_models: Arc<ArcSwapOption<ModelList>>,
         mcp_reader: McpSnapshotReader,
         mcp_config_errors: McpConfigErrors,
         lua_command_reader: LuaCommandReader,
@@ -459,6 +484,7 @@ impl App {
             )],
             active_chat: 0,
             chat_index: HashMap::new(),
+            deleted_tasks: HashSet::new(),
             input_box,
             command_palette: CommandPalette::new(
                 custom_commands,
@@ -470,9 +496,10 @@ impl App {
             login_picker: LoginPicker::new(),
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             rewind_picker: RewindPicker::new(),
+            alert_modal: AlertModal::new(),
             help_modal: HelpModal::new(),
             usage_modal: UsageModal::new(),
-            btw_modal: BtwModal::new(typewriter, ui_config.show_thinking),
+            btw_modal: BtwModal::new(typewriter, ui_config.thinking_lines),
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
             file_picker: FilePickerModal::new(),
@@ -498,7 +525,6 @@ impl App {
             trust_question: None,
             usage_slot: Arc::new(ArcSwapOption::empty()),
             shared_history: None,
-            btw_system: None,
             image_paste_rx: vec![],
             primary_paste_rx: vec![],
             storage_writer,
@@ -528,6 +554,8 @@ impl App {
                 .filter(|spec| model_policy.allows(spec))
                 .collect(),
         );
+        app.model_picker
+            .set_collapsed(maki_storage::model::read_collapsed_providers(&app.storage));
         // The manager arrives forked from the prototype the process was
         // started with, so a tab that resumes or spawns blank runs on
         // `--yolo` until its own meta is read back here.
@@ -536,11 +564,11 @@ impl App {
     }
 
     pub(crate) fn main_chat(&mut self) -> &mut Chat {
-        &mut self.chats[0]
+        &mut self.chats[MAIN_CHAT]
     }
 
     fn is_main_chat(&self) -> bool {
-        self.active_chat == 0
+        self.active_chat == MAIN_CHAT
     }
 
     /// Whether the chat in front shows the input box. A running subagent's
@@ -560,6 +588,16 @@ impl App {
         let draft = mem::take(&mut self.chats[idx].draft);
         self.chats[self.active_chat].draft = self.input_box.swap_draft(draft);
         self.active_chat = idx;
+    }
+
+    /// The session's draft is the main agent's, which the box only holds while
+    /// the main chat is in front.
+    pub(super) fn main_draft(&self) -> String {
+        if self.is_main_chat() {
+            self.input_box.draft_text()
+        } else {
+            self.chats[MAIN_CHAT].draft.text.clone()
+        }
     }
 
     fn plan_form_open(&self) -> bool {
@@ -582,10 +620,10 @@ impl App {
             return;
         }
         let previous_spec = std::mem::replace(&mut self.announced_model_spec, spec);
-        self.fire_session_autocmd(
-            "ModelChanged",
-            serde_json::json!({ "model": self.model_state(), "previous_spec": previous_spec }),
-        );
+        self.fire_session_event(HostEvent::ModelChanged {
+            model: self.model_state(),
+            previous_spec,
+        });
     }
 
     /// Takes the spelling `maki.model.set` accepts, which is what the
@@ -593,6 +631,11 @@ impl App {
     ///
     /// Stores the clamped value rather than the typed one, so the status bar
     /// can never read `off` on a model that is really sending minimal effort.
+    ///
+    /// The value is also written to disk here, and only here: the next run
+    /// seeds its sessions from it (`SessionDefaults`), the same way the model
+    /// is remembered. A clamp on model change is not the user's choice, so it
+    /// does not overwrite the file.
     pub(crate) fn set_thinking(&mut self, input: &str) -> Result<ThinkingConfig, String> {
         if !self.state.model.supports_thinking() {
             return Err(THINKING_UNSUPPORTED_MSG.into());
@@ -600,6 +643,8 @@ impl App {
         self.state.thinking = ThinkingConfig::parse(input.trim(), self.state.thinking)
             .map_err(str::to_owned)?
             .clamped(&self.state.model);
+        self.state.pending_thinking = None;
+        persist_thinking(&self.storage, self.state.thinking.into());
         Ok(self.state.thinking)
     }
 
@@ -620,6 +665,7 @@ impl App {
             "id": model.id,
             "provider": model.provider.to_string(),
             "thinking": self.state.thinking.to_string(),
+            "thinking_shown": self.state.thinking.shown(model).to_string(),
             "thinking_options": model.thinking_options(),
             "fast": self.state.fast,
             "supports_thinking": model.supports_thinking(),
@@ -683,13 +729,11 @@ impl App {
         Ok(serde_json::json!(true))
     }
 
-    /// The paths that keep the command palette in step with the input, and
-    /// the only ones that can name a writer. Submit, discard, history recall
+    /// The only paths that can name a writer. Submit, discard, history recall
     /// and `$EDITOR` change the value without coming through here, and the
     /// tick diff reports those unlabelled: the version stamped here no longer
     /// matches what they left.
     fn input_changed(&mut self, writer: InputWriter) {
-        self.command_palette.sync(&self.input_box.buffer.value());
         self.input_writer = self.input_writer.take().merge(writer);
     }
 
@@ -751,16 +795,13 @@ impl App {
     }
 
     fn fire_input_changed(&mut self, source: Option<Arc<str>>, cursor_only: bool) {
-        self.fire_session_autocmd(
-            "InputChanged",
-            serde_json::json!({
-                "text": self.announced_input,
-                "cursor": self.announced_cursor,
-                "version": self.input_box.buffer.version(),
-                "source": source,
-                "cursor_only": cursor_only,
-            }),
-        );
+        self.fire_session_event(HostEvent::InputChanged {
+            text: &self.announced_input,
+            cursor: self.announced_cursor,
+            version: self.input_box.buffer.version(),
+            source: source.as_deref(),
+            cursor_only,
+        });
     }
 
     pub(crate) fn record_recent_model(&mut self, spec: &str) {
@@ -781,14 +822,9 @@ impl App {
         self.status_bar.queue_flash(msg);
     }
 
-    pub(crate) fn fire_session_autocmd(&self, event: &str, mut data: serde_json::Value) {
-        if let Some(map) = data.as_object_mut() {
-            map.insert(
-                "session_id".into(),
-                serde_json::Value::String(self.state.session.id.to_string()),
-            );
-        }
-        self.lua_event_handle.fire_autocmd(event, data);
+    pub(crate) fn fire_session_event(&self, event: HostEvent<'_>) {
+        self.lua_event_handle
+            .fire(Some(&self.state.session.id), event);
     }
 
     pub fn tick_error_expiry(&mut self) -> Dirty {
@@ -930,14 +966,16 @@ impl App {
             self.active_chat().scroll_to_top();
             return Some(vec![]);
         }
-        if key::SCROLL_BOTTOM.matches(key) {
-            self.active_chat().enable_auto_scroll();
-            return Some(vec![]);
-        }
         None
     }
 
     fn dispatch_overlay(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
+        // Drawn above everything else, so it answers keys before anything else.
+        if self.alert_modal.is_open() {
+            self.alert_modal.handle_key(key);
+            return Some(vec![]);
+        }
+
         // With both up the permission prompt goes first: a tool is blocked on
         // it and it owns the bottom panel. The pack review waits on nothing.
         if self.permission_prompt.is_open() {
@@ -1058,6 +1096,7 @@ impl App {
             return Some(match self.rewind_picker.handle_key(key) {
                 RewindPickerAction::Consumed => vec![],
                 RewindPickerAction::Select(entry) => self.rewind_to(entry),
+                RewindPickerAction::Fork(entry) => self.fork_to(entry),
                 RewindPickerAction::Close => vec![],
             });
         }
@@ -1072,6 +1111,7 @@ impl App {
         if self.model_picker.is_open() {
             return Some(match self.model_picker.handle_key(key) {
                 ModelPickerAction::Consumed => vec![],
+                ModelPickerAction::Refresh => vec![Action::RefreshModels(ModelListing::Refresh)],
                 ModelPickerAction::Select(spec) => {
                     vec![Action::ChangeModel(spec)]
                 }
@@ -1080,6 +1120,21 @@ impl App {
                 }
                 ModelPickerAction::UnassignTier(spec, tier) => {
                     vec![Action::UnassignTier(spec, tier)]
+                }
+                // Saved right here instead of going through an `Action`. A fold
+                // only changes how the picker looks, and the state dir lives here.
+                ModelPickerAction::Collapse(slug, folded) => {
+                    maki_storage::model::persist_collapsed_providers(
+                        &self.storage,
+                        self.model_picker.collapsed_providers(),
+                    );
+                    let suffix = if folded {
+                        PROVIDER_FOLDED_SUFFIX
+                    } else {
+                        PROVIDER_UNFOLDED_SUFFIX
+                    };
+                    self.flash(format!("{slug}{suffix}"));
+                    vec![]
                 }
                 ModelPickerAction::Close => vec![],
             });
@@ -1090,10 +1145,16 @@ impl App {
                 LoginPickerAction::Consumed => vec![],
                 LoginPickerAction::Close => vec![],
                 LoginPickerAction::Authenticated { model_spec } => {
-                    vec![Action::ChangeModel(model_spec), Action::RefreshModels]
+                    vec![
+                        Action::ChangeModel(model_spec),
+                        Action::RefreshModels(ModelListing::Cached),
+                    ]
                 }
                 LoginPickerAction::Configured { slug } => {
-                    vec![Action::RefreshProvider { slug }, Action::RefreshModels]
+                    vec![
+                        Action::RefreshProvider { slug },
+                        Action::RefreshModels(ModelListing::Cached),
+                    ]
                 }
             });
         }
@@ -1122,17 +1183,16 @@ impl App {
         // modal above is drawn over it.
         //
         // Ctrl keys pass it by, as they always did: `Ctrl+C` closes it and the
-        // rest belong to the input box and the built-in bindings. So does every
-        // key in a subagent chat, where the text is for the subagent and slash
-        // commands would act on the session behind it.
-        if self.is_main_chat() && !is_ctrl(&key) {
-            match self
-                .command_palette
-                .handle_key(key, &self.input_box.buffer.value())
-            {
+        // rest belong to the input box and the built-in bindings.
+        if self.chat_accepts_input() && !is_ctrl(&key) {
+            match self.command_palette.handle_key(key, &self.input_box.buffer) {
                 CommandAction::Consumed => return Some(vec![]),
                 CommandAction::Execute(cmd) => {
+                    // Commands act on the session, so the main chat comes to
+                    // front. Clear the box first, or the command would stay
+                    // behind as the subagent chat's draft.
                     self.input_box.discard();
+                    self.set_active_chat(MAIN_CHAT);
                     return Some(self.execute_command(cmd, 0));
                 }
                 CommandAction::Complete(text) => {
@@ -1188,7 +1248,7 @@ impl App {
             }
             BuiltinAction::ModelPicker => {
                 self.model_picker.open(&self.state.model.spec());
-                return vec![Action::RefreshModels];
+                return vec![Action::RefreshModels(ModelListing::Cached)];
             }
         }
         vec![]
@@ -1241,6 +1301,10 @@ impl App {
         if key::SCROLL_PAGE_DOWN.matches(key) {
             let page = self.chats[self.active_chat].page();
             self.active_chat().scroll(-page);
+            return vec![];
+        }
+        if key::SCROLL_BOTTOM.matches(key) {
+            self.active_chat().enable_auto_scroll();
             return vec![];
         }
 
@@ -1306,6 +1370,12 @@ impl App {
         }
         if key::MODEL_PICKER.matches(key) {
             return self.run_builtin(BuiltinAction::ModelPicker);
+        }
+        if key::UNDO.matches(key) {
+            if let InputAction::Changed = self.input_box.undo() {
+                self.input_changed(InputWriter::Anyone);
+            }
+            return vec![];
         }
         if is_ctrl(&key) {
             if key::POP_QUEUE.matches(key) {
@@ -1419,29 +1489,33 @@ impl App {
         if sub.is_empty() {
             return vec![];
         }
-        if !self.is_main_chat() {
-            return self.queue_for_subagent(sub.into());
-        }
-        if sub.text.trim() == "exit" {
+        if sub.text.trim() == EXIT_WORD {
             return self.quit();
         }
 
-        if let Some(prefix) = shell::parse_shell_prefix(&sub.text) {
-            let cmd = prefix.command.trim();
-            if cmd == "cd" || cmd.starts_with("cd ") {
-                self.flash("Only /cd can change the working directory".into());
-            }
-            let id = self.shell.reserve_id();
-            let sigil = if prefix.visible { "!" } else { "!!" };
-            let display = format!("{sigil} {}", prefix.command);
-            self.main_chat().show_user_message(display, Vec::new());
-            return vec![Action::ShellCommand {
-                id,
-                command: prefix.command,
-                visible: prefix.visible,
-            }];
+        let Some(prefix) = shell::parse_shell_prefix(&sub.text) else {
+            return if self.is_main_chat() {
+                self.submit_or_queue(sub.into())
+            } else {
+                self.queue_for_subagent(sub.into())
+            };
+        };
+        // The shell belongs to the session, not to the subagent being watched,
+        // so the main chat comes to front where the output lands.
+        self.set_active_chat(MAIN_CHAT);
+        let cmd = prefix.command.trim();
+        if cmd == "cd" || cmd.starts_with("cd ") {
+            self.flash("Only /cd can change the working directory".into());
         }
-        self.submit_or_queue(sub.into())
+        let id = self.shell.reserve_id();
+        let sigil = if prefix.visible { "!" } else { "!!" };
+        let display = format!("{sigil} {}", prefix.command);
+        self.main_chat().show_user_message(display, Vec::new());
+        vec![Action::ShellCommand {
+            id,
+            command: prefix.command,
+            visible: prefix.visible,
+        }]
     }
 
     fn handle_cancel(&mut self) -> Vec<Action> {
@@ -1453,7 +1527,7 @@ impl App {
         self.finish_subagents(TaskOutcome::Error, CANCELLED_TEXT);
         self.subagent_answers.clear();
         self.shell.cancel_all();
-        for chat in &mut self.chats {
+        for chat in self.chats.iter_mut().filter(|c| c.plugin.is_none()) {
             chat.flush();
             chat.cancel_in_progress();
         }
@@ -1468,25 +1542,32 @@ impl App {
     }
 
     fn handle_subagent_cancel(&mut self) -> Vec<Action> {
-        let tool_use_id = self
-            .chat_index
-            .iter()
-            .find(|&(_, &idx)| idx == self.active_chat)
-            .map(|(id, _)| id.clone());
-
-        let Some(tool_use_id) = tool_use_id else {
-            return vec![];
-        };
-
-        self.chats[self.active_chat].flush();
-        self.chats[self.active_chat].cancel_in_progress();
-        self.chats[self.active_chat].mark_finished(TaskOutcome::Error, CANCELLED_TEXT);
-        self.subagent_answers.remove(&tool_use_id);
-        self.permission_prompt.drop_subagent(&tool_use_id);
-
-        vec![Action::CancelSubagent { tool_use_id }]
+        let id = self.active_task_id();
+        self.stop_task(&id).into_iter().collect()
     }
 
+    fn bill(&mut self, chat_idx: usize, model: &str, usage: StoredTokenUsage) {
+        self.state.token_usage += TokenUsage::from(usage);
+        add_cost(&mut self.state.cost, usage.cost);
+        add_cost(&mut self.chats[chat_idx].cost, usage.cost);
+        add_cost(
+            &mut self.state.subsidised_list_cost,
+            usage.subsidised_list_cost,
+        );
+        add_cost(
+            &mut self.chats[chat_idx].list_cost,
+            usage.subsidised_list_cost,
+        );
+        self.state.session_mut().add_model_usage(model, usage);
+        // A task's cost outlives it on disk, and nothing else writes the meta
+        // between a plugin task's turns.
+        if chat_idx != MAIN_CHAT {
+            self.sync_subagents();
+        }
+    }
+
+    /// Run-scoped delivery for the tab's own agent: restore snapshots fan out
+    /// to every chat, stale runs are dropped, the rest goes to [`Self::deliver`].
     fn handle_agent_event(&mut self, envelope: Envelope) -> Vec<Action> {
         if envelope.run_id == RESTORE_RUN_ID {
             let (id, snapshot, theme_gen, is_header) = match envelope.event {
@@ -1526,6 +1607,21 @@ impl App {
             }
             return vec![];
         }
+        self.deliver(envelope, None)
+    }
+
+    /// `plugin` names the plugin whose session sent the event, which the chat
+    /// shows as a task of that plugin. Those events skip the run gate above:
+    /// the session outlives turns, Esc and rewinds, so the only gate is the
+    /// chat session, which the event loop already matched.
+    pub(crate) fn deliver(&mut self, envelope: Envelope, plugin: Option<Arc<str>>) -> Vec<Action> {
+        let task_id = match &envelope.event {
+            AgentEvent::SubagentHistory { tool_use_id, .. } => Some(tool_use_id),
+            _ => envelope.subagent.as_ref().map(|s| &s.parent_tool_use_id),
+        };
+        if task_id.is_some_and(|id| self.deleted_tasks.contains(id)) {
+            return vec![];
+        }
 
         if let AgentEvent::SubagentHistory {
             tool_use_id,
@@ -1535,7 +1631,9 @@ impl App {
             // Workflow sessions use synthetic ids that no ToolDone will match,
             // so we finish them here on SubagentHistory. This event only knows
             // that the transcript closed, so say Unknown and leave the verdict
-            // to the ToolDone that follows elsewhere.
+            // to the ToolDone that follows elsewhere. A plugin task is never in
+            // `chat_index`, and rightly stays open here: it writes its
+            // transcript after every prompt, and its close is `StreamClosed`.
             if let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str()) {
                 self.chats[sub_idx].mark_finished(TaskOutcome::Unknown, DONE_TEXT);
             }
@@ -1557,10 +1655,21 @@ impl App {
             .as_ref()
             .map(|s| s.parent_tool_use_id.clone());
 
+        let is_plugin_task = plugin.is_some();
         let chat_idx = match envelope.subagent {
-            Some(ref subagent) => self.resolve_or_create_chat(subagent),
-            None => 0,
+            Some(ref subagent) => self.resolve_or_create_chat(subagent, &plugin),
+            // A plugin event without its task must never land in the main chat.
+            None if is_plugin_task => return vec![],
+            None => MAIN_CHAT,
         };
+        if is_plugin_task && matches!(envelope.event, AgentEvent::StreamClosed) {
+            // The session is gone. If Esc already ended the task, this `Done`
+            // leaves its `Error` in place. A close mid-prompt leaves tools
+            // without a result, and nothing after this would settle them.
+            self.chats[chat_idx].cancel_in_progress();
+            self.chats[chat_idx].mark_finished(TaskOutcome::Done, DONE_TEXT);
+            return vec![];
+        }
 
         if let AgentEvent::ToolDone(ref e) = envelope.event {
             if self.state.mode == Mode::Plan
@@ -1598,18 +1707,14 @@ impl App {
             return vec![];
         }
 
-        self.retry_info = None;
+        // A plugin task streams while the main chat may be mid-retry.
+        if chat_idx == MAIN_CHAT {
+            self.retry_info = None;
+        }
 
         if let AgentEvent::TurnComplete(ref tc) = envelope.event {
-            self.state.token_usage += tc.usage;
-            add_cost(&mut self.state.cost, tc.cost);
-            add_cost(&mut self.chats[chat_idx].cost, tc.cost);
-            add_cost(
-                &mut self.state.subsidised_list_cost,
-                tc.subsidised_list_cost,
-            );
-            add_cost(&mut self.chats[chat_idx].list_cost, tc.subsidised_list_cost);
-            self.state.session_mut().add_model_usage(
+            self.bill(
+                chat_idx,
                 &tc.model,
                 tc.usage
                     .billed_with_subsidised_list_cost(tc.cost, tc.subsidised_list_cost),
@@ -1619,7 +1724,7 @@ impl App {
             self.chats[chat_idx].set_pending_turn_usage(tc.usage.format(tc.cost));
             if let Some(tool_id) = &subagent_id {
                 let formatted = tc.usage.format_sum_cost(self.chats[chat_idx].cost);
-                self.chats[0].set_tool_turn_usage(tool_id, formatted);
+                self.chats[MAIN_CHAT].set_tool_turn_usage(tool_id, formatted);
             }
         }
 
@@ -1645,6 +1750,7 @@ impl App {
             if chat_idx == 0 {
                 self.on_queue_item_consumed(text, images);
             } else {
+                self.chats[chat_idx].idle = false;
                 self.chats[chat_idx].show_user_message(text, images);
             }
             return vec![];
@@ -1674,6 +1780,11 @@ impl App {
                 DisplayRole::Error,
                 AUTH_EXPIRED_MSG.into(),
             ));
+            // No retry is offered for a plugin task. Its plugin hears the
+            // error from `:prompt()` and decides whether to prompt again.
+            if is_plugin_task {
+                return vec![];
+            }
             if chat_idx != 0 {
                 self.main_chat().push(DisplayMessage::new(
                     DisplayRole::Error,
@@ -1681,6 +1792,32 @@ impl App {
                 ));
             }
             self.pending_input = PendingInput::AuthRetry { subagent_id };
+            return vec![];
+        }
+
+        if is_plugin_task {
+            // Either way the prompt has returned, and the session waits for
+            // the next one. A run its Lua task's end cut short mid-tool has no
+            // `handle_cancel` to settle the tool, so it is settled here.
+            match result {
+                ChatEventResult::Done => {
+                    self.chats[chat_idx].cancel_in_progress();
+                    self.chats[chat_idx].idle = true;
+                }
+                ChatEventResult::Error(message) => {
+                    self.chats[chat_idx].cancel_in_progress();
+                    self.chats[chat_idx].idle = true;
+                    // Esc in the tab already wrote the task's ending, and the
+                    // error its cut short run sends after that would say it twice.
+                    if !self.chats[chat_idx].is_finished() {
+                        self.chats[chat_idx].push(DisplayMessage::new(
+                            DisplayRole::Error,
+                            cap_error_text(&message),
+                        ));
+                    }
+                }
+                _ => {}
+            }
             return vec![];
         }
 
@@ -1697,12 +1834,12 @@ impl App {
                     }
                 }
                 ChatEventResult::Error(message) => {
+                    let displayed = cap_error_text(&message);
+                    Arc::make_mut(&mut self.state.session).record_error(displayed.clone());
                     self.status = Status::error(message.clone());
                     self.status_bar.clear_flash();
-                    self.main_chat().push(DisplayMessage::new(
-                        DisplayRole::Error,
-                        cap_error_text(&message),
-                    ));
+                    self.main_chat()
+                        .push(DisplayMessage::new(DisplayRole::Error, displayed));
                     self.subagent_answers.clear();
                     self.terminalize_turn(&message);
                     self.recoverable_queue = self.queue.text_messages();
@@ -1730,19 +1867,32 @@ impl App {
         }
     }
 
-    fn resolve_or_create_chat(&mut self, subagent: &SubagentInfo) -> usize {
+    /// A tool task is found through `chat_index`, a plugin task by id: the
+    /// index is wiped every turn, and a plugin task would come back as a
+    /// second chat at the main chat's next turn end.
+    fn resolve_or_create_chat(
+        &mut self,
+        subagent: &SubagentInfo,
+        plugin: &Option<Arc<str>>,
+    ) -> usize {
         let id = &subagent.parent_tool_use_id;
-        if let Some(&idx) = self.chat_index.get(id.as_str()) {
+        let known = match plugin {
+            None => self.chat_index.get(id.as_str()).copied(),
+            Some(_) => self.chat_of_task(id).ok(),
+        };
+        if let Some(idx) = known {
             return idx;
         }
         let idx = self.chats.len();
-        self.chat_index.insert(id.clone(), idx);
+        if plugin.is_none() {
+            self.chat_index.insert(id.clone(), idx);
+            self.chats[MAIN_CHAT].update_tool_summary(id, &subagent.name);
+            if let Some(ref model) = subagent.model {
+                self.chats[MAIN_CHAT].update_tool_model(id, model);
+            }
+        }
         if let Some(ref tx) = subagent.answer_tx {
             self.subagent_answers.insert(id.clone(), tx.clone());
-        }
-        self.chats[0].update_tool_summary(id, &subagent.name);
-        if let Some(ref model) = subagent.model {
-            self.chats[0].update_tool_model(id, model);
         }
         let mut chat = Chat::new(
             self.state.session.id,
@@ -1752,6 +1902,7 @@ impl App {
             self.lua_event_handle.clone(),
         );
         chat.set_restore_channel(self.restore_event_tx.clone());
+        chat.plugin = plugin.clone();
         chat.model_id = subagent.model.clone();
         chat.opts = subagent.opts;
         chat.inbox = subagent.inbox.clone();
@@ -1763,10 +1914,26 @@ impl App {
         idx
     }
 
+    /// A chat this task already has, maybe one the user just stopped, stays as
+    /// it is rather than turning idle again.
+    pub(crate) fn open_plugin_task(&mut self, info: &SubagentInfo, plugin: Arc<str>) {
+        let id = &info.parent_tool_use_id;
+        if self.deleted_tasks.contains(id) || self.chat_of_task(id).is_ok() {
+            return;
+        }
+        let idx = self.resolve_or_create_chat(info, &Some(plugin));
+        self.chats[idx].idle = true;
+    }
+
     /// Entry point for `maki.api.run_command`: splits a command line into the
     /// name and args the input bar would hand over, leading slash optional.
     /// `Err` means nothing ran at all, so the Lua caller can say why.
-    pub(crate) fn run_cmdline(&mut self, cmdline: &str, depth: u8) -> Result<Vec<Action>, String> {
+    pub(crate) fn run_cmdline(
+        &mut self,
+        cmdline: &str,
+        depth: u8,
+        caller: &PluginReach,
+    ) -> Result<Vec<Action>, String> {
         if depth > MAX_COMMAND_DEPTH {
             return Err(COMMAND_DEPTH_MSG.to_string());
         }
@@ -1776,8 +1943,7 @@ impl App {
             .unwrap_or((trimmed, ""));
         let resolved = self
             .command_palette
-            .resolve(&format!("/{}", name.trim_start_matches('/')))
-            .ok_or_else(|| format!("unknown command '{name}'"))?;
+            .resolve_for_plugin(&format!("/{}", name.trim_start_matches('/')), caller)?;
         Ok(self.execute_command(
             ParsedCommand {
                 name: resolved,
@@ -1823,13 +1989,14 @@ impl App {
                 }
             }
             "/new" => self.reset_session(),
+            "/fork" => self.fork_session(),
             "/queue" => {
                 self.queue.set_focus();
                 vec![]
             }
             "/model" => {
                 self.model_picker.open(&self.state.model.spec());
-                vec![Action::RefreshModels]
+                vec![Action::RefreshModels(ModelListing::Cached)]
             }
             "/theme" => {
                 self.theme_picker.open();
@@ -1888,10 +2055,6 @@ impl App {
             // --yes`, so there is no second question to ask here.
             "/trust" => self.trust_folder(),
             name @ ("/packupdate" | "/packdel") => {
-                if depth > 0 {
-                    self.flash(format!("{name}{PACK_USER_ONLY_SUFFIX}"));
-                    return vec![];
-                }
                 match PackCommand::parse(name, &cmd.args, cmd.bang) {
                     Ok(command) => vec![Action::PreparePack(command)],
                     Err(message) => {
@@ -2042,6 +2205,9 @@ impl App {
                     self.state
                         .session_mut()
                         .set_cwd(canonical.to_string_lossy().into_owned());
+                    self.fire_session_event(HostEvent::SessionCwdChanged {
+                        cwd: &canonical.to_string_lossy(),
+                    });
                 }
                 self.status_bar.refresh_cwd();
                 self.flash(format!("cd {}", path.display()))
@@ -2051,8 +2217,9 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 13] {
+    fn overlays(&self) -> [&dyn Overlay; 14] {
         [
+            &self.alert_modal,
             &self.help_modal,
             &self.usage_modal,
             &self.btw_modal,
@@ -2069,8 +2236,9 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 13] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
         [
+            &mut self.alert_modal,
             &mut self.help_modal,
             &mut self.usage_modal,
             &mut self.btw_modal,
@@ -2336,15 +2504,14 @@ impl App {
     /// shell commands that outlive the agent.
     fn terminalize_turn(&mut self, message: &str) {
         self.retain_resolved_subagents(TaskOutcome::Error, ERROR_TEXT);
-        self.chats[0].fail_in_progress_except(message.into(), self.shell.active_ids());
-        for chat in self.chats.iter_mut().skip(1) {
+        self.chats[MAIN_CHAT].fail_in_progress_except(message.into(), self.shell.active_ids());
+        for chat in self.chats.iter_mut().skip(1).filter(|c| c.plugin.is_none()) {
             chat.fail_in_progress_with_message(message.into());
         }
     }
 
     /// Marks unfinished subagent chats as ended and drops them from
-    /// `chat_index`, so the session records only the children that really
-    /// completed.
+    /// `chat_index`, then mirrors the tabs into the session meta.
     fn retain_resolved_subagents(&mut self, outcome: TaskOutcome, text: &str) {
         self.chat_index.retain(|_, &mut sub_idx| {
             if self.chats[sub_idx].is_finished() {

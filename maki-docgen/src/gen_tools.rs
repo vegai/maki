@@ -92,10 +92,7 @@ fn extract_params(schema: &Value) -> Vec<Param> {
 
     let mut params = Vec::new();
     for (name, prop) in properties {
-        let raw_type = prop
-            .get("type")
-            .and_then(|t| t.as_str())
-            .unwrap_or("string");
+        let raw_type = prop.get("type").and_then(|t| t.as_str()).unwrap_or("any");
         let raw_desc = prop
             .get("description")
             .and_then(|d| d.as_str())
@@ -171,10 +168,9 @@ fn redact_path(input: &str, target: &str, placeholder: &str) -> String {
     }
 }
 
-/// Plugins bake env-specific values into their `description` at registration:
-/// `bash` interpolates `maki.uv.cwd()` and `websearch` interpolates
-/// `os.date("%Y-%m-%d")`. Scrub both so `gen-docs-check` is stable across
-/// machines and days. CWD is replaced before HOME so a cwd nested under ~
+/// A plugin may bake env-specific values (the cwd, today's date) into its
+/// `description` at registration. Scrub both so `gen-docs-check` is stable
+/// across machines and days. CWD is replaced before HOME so a cwd nested under ~
 /// doesn't get partially mangled.
 fn redact_env_and_dates(input: &str) -> String {
     let cwd = std::env::current_dir()
@@ -264,7 +260,8 @@ pub fn generate() -> String {
     let defs = registry.definitions(
         &vars,
         &DescriptionContext {
-            filter: &ToolFilter::All,
+            local_tools: None,
+            filter: &ToolFilter::default(),
             audience: ToolAudience::MAIN,
             workflow: false,
             mcp: false,

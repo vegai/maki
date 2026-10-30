@@ -3,21 +3,21 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
-use maki_config::providers::{OverrideFields, Protocol, ProviderOverride};
+use maki_config::providers::{OverrideFields, Protocol, ProviderOverride, ProvidersConfig};
 use serde_json::Value;
 use tracing::warn;
 
 use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, Provider, RequestScope};
 use crate::spec::{
     AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, NO_CURATED_MODELS, Native,
     ProviderRegistry, ProviderSpec,
 };
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
-use maki_storage::id::SessionRef;
+use crate::types::ThinkingFallback;
+use crate::{AgentError, Effort, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{ResolvedAuth, Timeouts, google, plugin};
+use super::{ResolvedAuth, Timeouts, endpoint, google, plugin};
 
 const HOST_ENV: &str = "APERTURE_HOST";
 const PER_MILLION: f64 = 1_000_000.0;
@@ -27,7 +27,7 @@ pub(crate) const GEMINI_PATH_PREFIX: &str = "/v1beta";
 /// For upstreams whose base url already carries its own path.
 pub(crate) const NO_PATH_PREFIX: &str = "";
 
-const SLUG: &str = "aperture";
+pub(super) const SLUG: &str = "aperture";
 const DISPLAY_NAME: &str = "Aperture";
 /// Tailscale handles auth, so there is no key and no login URL.
 const NO_ENV_VAR: &str = "";
@@ -55,14 +55,18 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     api_key_env: NO_ENV_VAR,
     family: ModelFamily::Generic,
     supports_thinking: false,
+    supports_deferred_tools: false,
+    adaptive_effort,
+    thinking_fields_fallback,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(16_384),
     fallback_context_window: 128_000,
     models_toml: NO_CURATED_MODELS,
+    models_of: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
-        with_auth: create_with_auth,
+        with_auth: Some(create_with_auth),
     }),
     aperture: None,
     login: Some(LoginConfig {
@@ -101,12 +105,51 @@ type Overrides = HashMap<String, ProviderOverride>;
 /// Load per-gateway-provider overrides from the `aperture` entry's `overrides`
 /// table in `providers.toml`.
 fn load_overrides() -> Overrides {
-    let overrides = maki_config::providers::ProvidersConfig::load()
+    let overrides = ProvidersConfig::load()
         .get("aperture")
         .map(|d| d.overrides.clone())
         .unwrap_or_default();
     validate_overrides(&overrides);
     overrides
+}
+
+/// Runs on every frame of the status bar, so a broken `providers.toml` reads
+/// as no overrides instead of exiting.
+fn adaptive_effort(model: &Model) -> Option<Effort> {
+    let config = ProvidersConfig::load_or_default();
+    let overrides = config.get(SLUG).map(|def| &def.overrides);
+    routed_adaptive_effort(overrides.unwrap_or(&Overrides::new()), model)
+}
+
+/// The routed provider builds the request, so it answers, about the model as
+/// its own: a plugin codec finds its declaration and discovery by its slug.
+/// A model that routes nowhere takes the generic path, which sends no effort.
+fn routed_adaptive_effort(overrides: &Overrides, model: &Model) -> Option<Effort> {
+    let (spec, routed) = routed_model(overrides, model)?;
+    (spec.adaptive_effort)(&routed)
+}
+
+fn thinking_fields_fallback(model: &Model) -> Option<ThinkingFallback> {
+    let config = ProvidersConfig::load_or_default();
+    let overrides = config.get(SLUG).map(|def| &def.overrides);
+    let (spec, routed) = routed_model(overrides.unwrap_or(&Overrides::new()), model)?;
+    (spec.thinking_fields_fallback)(&routed)
+}
+
+fn routed_model(overrides: &Overrides, model: &Model) -> Option<(&'static ProviderSpec, Model)> {
+    let (provider_id, model_id) = model.id.split_once('/')?;
+    let spec = routed_spec(
+        provider_id,
+        &merged_override(overrides, provider_id, model_id),
+    )?;
+    if spec.native().is_none() && plugin::base_spec(spec.slug).is_some() {
+        return None;
+    }
+    let routed = Model {
+        provider: Arc::from(spec.slug),
+        ..native_route_model(model, spec, model_id)
+    };
+    Some((spec, routed))
 }
 
 /// Warn about `base` values that don't name an OpenAI-compatible provider, so a
@@ -185,7 +228,7 @@ fn routed_auth(auth: &Arc<Mutex<ResolvedAuth>>, prefix: &str) -> Arc<Mutex<Resol
     if !prefix.is_empty()
         && let Some(base) = cloned.base_url.as_deref()
     {
-        cloned.base_url = Some(format!("{}{prefix}", base.trim_end_matches('/')));
+        cloned.base_url = Some(endpoint(base, prefix));
     }
     Arc::new(Mutex::new(cloned))
 }
@@ -248,11 +291,6 @@ impl Aperture {
         self
     }
 
-    /// The provider a route streams through, from whichever mechanism owns the
-    /// slug now. A built-in that has been ported to a declaration has no
-    /// `native` constructor left, and without the first lookup Aperture would
-    /// quietly stop routing onto it and send all of its models down the generic
-    /// gateway path. The second lookup goes when the last provider ports.
     fn routed_provider(
         &self,
         spec: &'static ProviderSpec,
@@ -266,7 +304,8 @@ impl Aperture {
         )
         .or_else(|| {
             spec.native()
-                .map(|n| (n.with_auth)(auth, self.timeouts, self.system_prefix.clone()))
+                .and_then(|n| n.with_auth)
+                .map(|with_auth| with_auth(auth, self.timeouts, self.system_prefix.clone()))
         })
     }
 }
@@ -277,7 +316,7 @@ fn resolve_base_url() -> Result<String, AgentError> {
     {
         return Ok(trim_slash(url));
     }
-    if let Some(url) = maki_config::providers::ProvidersConfig::load()
+    if let Some(url) = ProvidersConfig::load()
         .get("aperture")
         .and_then(|d| d.base_url.clone())
         .filter(|u| !u.trim().is_empty())
@@ -379,7 +418,7 @@ impl Provider for Aperture {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let (provider_id, model_id) = model.id.split_once('/').unwrap_or(("", &model.id));
@@ -398,14 +437,16 @@ impl Provider for Aperture {
                         tools,
                         event_tx,
                         opts,
-                        session_id,
+                        scope,
                     )
                     .await;
             }
             let auth = auth.lock().unwrap().clone();
             let mut buf = String::new();
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let body = self.compat.build_body(model, messages, system, tools);
+            let body =
+                self.compat
+                    .build_body(model, messages, system, tools, opts.thinking, auth.top_p);
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
                 .await
@@ -446,15 +487,36 @@ impl Provider for Aperture {
 mod tests {
     use super::*;
     use crate::model::ModelFamily;
+    use crate::test_support::register_bundled;
     use serde_json::json;
     use test_case::test_case;
+
+    const ROUTED_SLUG: &str = "routed-plugin";
+    const ROUTED_HOST: &str = "routed.example";
+    const ROUTED_VISION_MODEL: &str = "routed-vision";
+    /// No row describes it, so it takes the openai codec's thinking support.
+    const ROUTED_CHAT_SPEC: &str = "aperture/routed-plugin/routed-chat";
+
+    fn register_routed() {
+        register_bundled(
+            json!({
+                "slug": ROUTED_SLUG,
+                "display_name": "Routed",
+                "codec": "openai",
+                "openai": { "thinking": { "dialect": "high-only" } },
+                "aperture": { "path_prefix": DEFAULT_PATH_PREFIX },
+                "models": [{ "prefixes": [ROUTED_VISION_MODEL], "supports_vision": true }],
+            }),
+            ROUTED_HOST,
+        );
+    }
 
     fn spec_slug(provider_id: &str, merged: &OverrideFields) -> Option<&'static str> {
         routed_spec(provider_id, merged).map(|spec| spec.slug)
     }
 
     #[test_case("zai", Some("zai") ; "known_zai")]
-    #[test_case("synthetic", Some("synthetic") ; "known_synthetic")]
+    #[test_case(ROUTED_SLUG, Some(ROUTED_SLUG) ; "declared_route")]
     #[test_case("openai", None ; "openai_excluded")]
     #[test_case("llama-cpp", Some("llama-cpp") ; "known_llama_cpp")]
     #[test_case("ikora-openai", None ; "unknown_vendor_no_override")]
@@ -464,6 +526,7 @@ mod tests {
     #[test_case("aperture", None ; "aperture_no_recurse")]
     #[test_case("gemini", None ; "gemini_vendor_unparsable_without_override")]
     fn routed_spec_without_overrides(provider_id: &str, expected: Option<&str>) {
+        register_routed();
         assert_eq!(spec_slug(provider_id, &OverrideFields::default()), expected);
     }
 
@@ -497,7 +560,7 @@ mod tests {
     }
 
     fn route(slug: &str) -> &'static ProviderSpec {
-        ProviderRegistry::get(slug).expect("routable builtin")
+        ProviderRegistry::get(slug).expect("routable provider")
     }
 
     #[test_case("google", "aperture/gemini/gemini-pro-latest", "gemini-pro-latest" ; "native_google_strips_vendor_prefix")]
@@ -513,19 +576,48 @@ mod tests {
         );
     }
 
+    /// The route answers as it sends: a plugin codec by its own declaration,
+    /// which it only finds under its own slug, not under `aperture`.
+    #[test_case("aperture/zai/glm-5.3", None, Some(Effort::High) ; "zai_route_sends_high")]
+    #[test_case("aperture/ollama/qwen3", None, Some(Effort::Medium) ; "ollama_route_sends_medium")]
+    #[test_case("aperture/anthropic/claude-sonnet-4-5", None, None ; "anthropic_route_keeps_the_mode")]
+    #[test_case(ROUTED_CHAT_SPEC, None, Some(Effort::High) ; "codec_route_sends_its_dialect_level")]
+    #[test_case("aperture/ikora-openai/gemma4", None, None ; "unrouted_sends_no_effort")]
+    #[test_case("aperture/ikora-openai/gemma4", Some("zai"), Some(Effort::High) ; "base_override_answers_for_its_route")]
+    #[test_case("aperture/zai/glm-5.3", Some("anthropic"), None ; "base_override_wins_over_the_vendor")]
+    fn adaptive_effort_is_the_routed_providers(
+        spec: &str,
+        base: Option<&str>,
+        expected: Option<Effort>,
+    ) {
+        register_routed();
+        let model = Model::from_spec(spec).unwrap();
+        let vendor = model.id.split_once('/').unwrap().0;
+        let overrides = Overrides::from_iter(base.map(|base| {
+            (
+                vendor.to_string(),
+                ProviderOverride {
+                    default: base_override(base),
+                    models: HashMap::new(),
+                },
+            )
+        }));
+        assert_eq!(routed_adaptive_effort(&overrides, &model), expected);
+    }
+
     #[test]
     fn routed_spec_model_base_wins_over_provider_base() {
         let vendor = "ikora-openai";
         let overrides = Overrides::from([(
             vendor.into(),
             ProviderOverride {
-                default: base_override("mistral"),
+                default: base_override("zai"),
                 models: HashMap::from([("special".into(), base_override("llama-cpp"))]),
             },
         )]);
         let slug = |model| spec_slug(vendor, &merged_override(&overrides, vendor, model));
         assert_eq!(slug("special"), Some("llama-cpp"));
-        assert_eq!(slug("other"), Some("mistral"));
+        assert_eq!(slug("other"), Some("zai"));
     }
 
     fn test_auth() -> Arc<Mutex<ResolvedAuth>> {
@@ -537,11 +629,12 @@ mod tests {
 
     #[test_case(Some("ollama"), Some("https://aperture.example.com/v1") ; "ollama_appends_v1")]
     #[test_case(Some("zai"), Some("https://aperture.example.com") ; "zai_keeps_bare_host")]
-    #[test_case(Some("deepseek"), Some("https://aperture.example.com/v1") ; "deepseek_appends_v1")]
+    #[test_case(Some(ROUTED_SLUG), Some("https://aperture.example.com/v1") ; "declared_route_appends_v1")]
     #[test_case(None, Some("https://aperture.example.com/v1") ; "unrouted_appends_v1")]
     #[test_case(Some("google"), Some("https://aperture.example.com/v1beta") ; "google_appends_v1beta")]
     #[test_case(Some("anthropic"), Some("https://aperture.example.com") ; "anthropic_keeps_bare_host")]
     fn routed_auth_prefix_per_route(slug: Option<&str>, expected: Option<&str>) {
+        register_routed();
         let prefix = path_prefix(slug.map(route), &OverrideFields::default());
         let auth = routed_auth(&test_auth(), &prefix);
         assert_eq!(auth.lock().unwrap().base_url.as_deref(), expected);
@@ -687,7 +780,9 @@ mod tests {
 
     #[test]
     fn apply_adjustments_vision_uses_routed_static_table() {
-        let mut model = Model::from_spec("aperture/mistral/mistral-medium-latest").unwrap();
+        register_routed();
+        let spec = format!("aperture/{ROUTED_SLUG}/{ROUTED_VISION_MODEL}");
+        let mut model = Model::from_spec(&spec).unwrap();
         assert!(model.supports_vision_override.is_none());
         apply_adjustments(&mut model, &Overrides::new());
         assert_eq!(model.supports_vision_override, Some(true));
@@ -718,9 +813,10 @@ mod tests {
 
     #[test]
     fn apply_adjustments_vision_override_disables_static_vision_model() {
+        register_routed();
         let mut overrides = Overrides::new();
         overrides.insert(
-            "mistral".into(),
+            ROUTED_SLUG.into(),
             ProviderOverride {
                 default: OverrideFields {
                     supports_vision: Some(false),
@@ -729,7 +825,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let mut model = Model::from_spec("aperture/mistral/mistral-medium-latest").unwrap();
+        let spec = format!("aperture/{ROUTED_SLUG}/{ROUTED_VISION_MODEL}");
+        let mut model = Model::from_spec(&spec).unwrap();
         apply_adjustments(&mut model, &overrides);
         assert_eq!(model.supports_vision_override, Some(false));
         assert!(!model.supports_vision());
@@ -750,9 +847,10 @@ mod tests {
     /// The routed provider answers, not Aperture, which declares no thinking of
     /// its own. Expectations are spelled out rather than read back out of the
     /// spec table, or the test would agree with whatever the code found.
-    #[test_case("aperture/deepseek/deepseek-chat", true ; "routed_thinking_capable")]
+    #[test_case(ROUTED_CHAT_SPEC, true ; "routed_thinking_capable")]
     #[test_case("aperture/ollama/qwen3", false ; "routed_non_thinking")]
     fn apply_adjustments_thinking_follows_routed_spec(spec: &str, expected: bool) {
+        register_routed();
         let mut model = Model::from_spec(spec).unwrap();
         assert!(model.thinking_override.is_none());
         apply_adjustments(&mut model, &Overrides::new());
@@ -804,9 +902,10 @@ mod tests {
 
     #[test]
     fn apply_adjustments_thinking_override_disables_routed_capable_model() {
+        register_routed();
         let mut overrides = Overrides::new();
         overrides.insert(
-            "deepseek".into(),
+            ROUTED_SLUG.into(),
             ProviderOverride {
                 default: OverrideFields {
                     supports_thinking: Some(false),
@@ -815,7 +914,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let mut model = Model::from_spec("aperture/deepseek/deepseek-chat").unwrap();
+        let mut model = Model::from_spec(ROUTED_CHAT_SPEC).unwrap();
         apply_adjustments(&mut model, &overrides);
         assert_eq!(
             model.thinking_override,

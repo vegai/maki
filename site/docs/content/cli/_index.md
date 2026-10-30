@@ -21,6 +21,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | Flag | TUI | `--print` | SDK (`stream-json`) |
 |------|-----|-----------|---------------------|
 | `-m` / `--model` | yes | yes | yes |
+| `--thinking` / `--effort`, `--max-thinking-tokens` | yes | yes | yes |
 | `--yolo` | yes | yes | yes (or `--permission-mode bypassPermissions`) |
 | `--no-plugins` / `--no-commands` / `--no-jit` | yes | yes | yes |
 | `--allowed-tools` / `--disallowed-tools` | yes | yes | yes |
@@ -30,7 +31,8 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--verbose`, `--output-format` | no | yes | stream only |
 | `--system-prompt`, `--append-system-prompt` | no | no | yes |
 | `--session-id`, `--fork-session` | yes | yes | yes |
-| `--max-turns` | no | no | yes |
+| `--max-turns`, `--final-answer` | yes | yes | yes |
+| `--dry-run` | no | yes | no |
 | `--permission-mode` | no | no | yes |
 | `--include-partial-messages` | no | no | yes |
 
@@ -41,6 +43,9 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `-p`, `--print` | Non-interactive run. See [Headless Mode](/docs/headless/) |
 | `--image <PATH>` | Attach an image in `--print` mode (repeatable). Paths must be png, jpeg, gif, or webp |
 | `-m`, `--model <SPEC>` | Model as `provider/model-id`. Fallback: last used (skipped with a warning when its provider is gone or has no key) → `provider.default_model` in config → auto-detect from available providers |
+| `--thinking <SETTING>` | Thinking for this launch: `off`, `adaptive`, `minimal` through `max`, or a positive token budget. Accepts SDK spellings `disabled` and `enabled`. Overrides `always_thinking` and the saved `/thinking` level |
+| `--effort <LEVEL>` | Thinking effort for this launch: `minimal` through `max`. See [precedence](/docs/headless/#thinking) when combined with other thinking flags |
+| `--max-thinking-tokens <N>` | Thinking-token budget for this launch. `0` disables thinking. Takes precedence over effort unless thinking is explicitly disabled |
 | `--verbose` | Full turn-by-turn messages in `--print` output |
 | `-c`, `--continue` | Resume the most recent session in this directory |
 | `-r`, `--resume <ID>` | Resume a specific session (aliases: `-s`, `--session`) |
@@ -56,15 +61,27 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--disallowed-tools <LIST>` | Comma-separated deny list |
 | `--session-id <ID>` | Write this run under a chosen id. Errors if a session already exists under it, unless `-r` / `-c` is continuing that same session |
 | `--fork-session` | Copy the resumed session's history under a new id, leaving the original untouched. See [Sessions](/docs/headless/#sessions) |
-| `--max-turns <N>` | Cap agent turns (SDK) |
+| `--max-turns <N>` | Cap model turns. See [bounded runs](/docs/headless/#bounded-runs-and-recovery) |
+| `--final-answer` | Ask for a final report on the last allowed turn and prevent further tool execution. Requires `--max-turns` |
+| `--dry-run` | With `-p`, print effective startup metadata without inference |
 | `--system-prompt <TEXT>` | Replace the system prompt (SDK only) |
 | `--append-system-prompt <TEXT>` | Append to the built-in system prompt (SDK only) |
 | `--permission-mode <MODE>` | SDK: `default`, `acceptEdits`, `plan`, or `bypassPermissions` |
 | `--include-partial-messages` | Stream partial deltas in SDK mode |
 
+Thinking flags applied when resuming a TUI session are saved in that session. A later resume without a flag keeps the level. The global `/thinking` default is unchanged.
+
 ### Tool name lists
 
-`--allowed-tools` / `--disallowed-tools` accept Claude Code PascalCase (`Read,Edit,Bash`) or snake_case (`read,edit,bash`). Maki lowercases PascalCase to snake_case and checks the result against the built-in tool names, so `CodeExecution` works but `MultiEdit` errors: it normalizes to `multi_edit`, and the tool is called `multiedit`. Write `multiedit` or `edit_lines` as-is. Unknown names error out with the list of valid names. The edit plugin's sub-tools (`multiedit`, `edit_lines`, `insert_lines`) are valid names here even when disabled. Listing a disabled tool has no effect until you enable it in config.
+`--allowed-tools` / `--disallowed-tools` accept built-in, plugin and MCP tool names. Claude Code names map to maki names (`WebFetch` becomes `webfetch`, and `MultiEdit` becomes `multiedit`). Other PascalCase names become snake_case (`CodeExecution` becomes `code_execution`). Names with underscores, dots or hyphens keep their spelling and case. Use the exact name for plugin sub-tools such as `edit_lines`.
+
+MCP names accept `server.tool`, `server__tool` and Claude Code's `mcp__server__tool` spelling. Use the dotted form for a server named `mcp` when its tool name contains `__`.
+
+Maki retains qualified MCP names even if their tools have not loaded yet. An allow list that matches no loaded tool and contains no qualified MCP name stops startup with an error. This lets a filter apply to an MCP tool that connects later. After plugins load, Maki warns about other unmatched names. Check the spelling if the tool should already be loaded. A name that never loads has no effect. Filters control both the advertised tools and dispatch, including calls through `batch`, `code_execution` and `maki.agent.call_tool`.
+
+Allow lists apply to built-in, plugin and MCP tools. Session-local tools, such as a task's `structured_output` and ACP client tools, remain available under an allow list. Deny lists and audience limits still apply to these local tools.
+
+For example, `--allowed-tools read,grep` excludes every MCP tool. Add each required MCP name, such as `github.search_code` or `github__search_code`. Include `tool_search` to keep MCP deferral active. Excluding `tool_search` loads the permitted MCP tools directly at the start of a frame. With native deferral, tools from servers that connect later become available in the next frame. Maki logs a warning about these tools when they arrive.
 
 ### Permission modes (SDK)
 
@@ -107,11 +124,66 @@ One spec per line, warnings on stderr. Built-in and script providers are listed 
 ```bash
 maki session list            # sessions for the current directory
 maki session list --global   # sessions from all projects
+maki session list --json     # machine-readable JSON array
 maki session delete <id>     # asks first, -f skips
+maki session export <id>     # JSON transcript to stdout
+maki session import [FILE|-] # store a transcript, print the new id
 ```
 
-Prints stored sessions as a table (id, title, project directory with `$HOME` collapsed to `~`, last update as a relative age), newest first. A listed id works with `maki --resume <id>` to resume it. `delete` removes the session log along with its archives and index entries, and asks for confirmation first unless you pass `-f` / `--force`; without a terminal to ask on it refuses outright. A maki that already has the session open will not notice the delete and will lose the rest of that conversation, so close it first. Inside the TUI the same data lives behind `/sessions` (`Ctrl+P`), where `Ctrl+D` deletes.
+Prints stored sessions as a table (id, title, project directory with `$HOME` collapsed to `~`, last update as a relative age), newest first. `--json` prints one JSON array of the same summaries instead, for scripts. A listed id works with `maki -r <id>` to resume it. `delete` removes the session log along with its archives and index entries, and asks for confirmation first unless you pass `-f` / `--force`. Without a terminal to ask on, it refuses outright. A maki that already has the session open will not notice the delete and will lose the rest of that conversation, so close it first. Inside the TUI the same data lives behind `/sessions` (`Ctrl+P`), where `Ctrl+D` deletes.
 
+#### Export and import
+
+`export <SESSION_ID>` prints one JSON document to stdout. It reads the session without claiming it, so it also works for a session whose model this machine cannot run. When another maki has the session open, you get the session as last saved, and a notice on stderr says so.
+
+`import` reads the document from `FILE`, or from stdin when `FILE` is omitted or `-`. It stores the result as a new session in the current directory's project. It prints only the new id on stdout, so `id=$(maki session import < file.json)` works. Continue it with `maki -r <id>`.
+
+On failure, `import` stores nothing and exits non-zero. The error names the place in the document, such as `messages[12].content[2]`. Indexes start at 0, as in the JSON. A document with no messages left after repair is refused, such as one whose only message holds an orphan tool result.
+
+The document has these fields:
+
+| Field | Meaning |
+|-------|---------|
+| `format` | Version of the document format, currently `1` |
+| `model` | Model spec as stored. Import keeps any string and resolves it when the session opens. When it is missing or blank, no model is stored and the session opens on the default model. In the TUI, `maki.session.new` uses the focused tab's model instead |
+| `mode` | `build` or `plan` |
+| `thinking` | Thinking setting, spelled as in `/thinking` |
+| `fast` | Fast mode on or off. Off when missing |
+| `title` | Session title. Import keeps a given title and only collapses its whitespace to single spaces. When it is missing or blank, import generates one from the history |
+| `facts` | The date, working directory, model, instructions and hints the model was last told. On import the model is told what changed |
+| `messages` | The conversation in the same shape [`maki.session.messages`](/docs/lua-api/#maki-session-messages) returns |
+
+Import drops top-level fields it does not know, so keep your own metadata outside the document. A `format` newer than the importer supports fails with "exported by a newer maki". Thinking blocks and their signatures are dropped on import, because they are bound to a system prompt the new session will not have. Orphan tool results and a dangling final tool call are repaired the way a resume repairs them. A content block of a known type that does not parse, or one without a `type`, is refused. A block of a type this maki does not know is kept as it is.
+
+#### Move a session
+
+To continue a session on another machine, export it and import the file there:
+
+```bash
+maki session export <id> > session.json
+scp session.json server:
+ssh -t server 'cd ~/code/my-app && id=$(maki session import ~/session.json) && maki -r "$id"'
+```
+
+The import stores the session under the directory you run it in, with a new id. The first run there tells the model the new working directory and date, so it does not keep acting on the old ones. If the `model` in the file is not available on the target machine, the session opens with a warning and falls back like any other resume.
+
+A plugin can do the same without the CLI. `maki.session.export` returns the document as a table, and `maki.session.new` takes it back. This sends the focused session to a server and pulls it back later, with the `upload` and `download` helpers left to you:
+
+```lua
+-- hand off from the focused session
+local id = maki.session.current()
+local doc = assert(maki.session.export({ session = id }))
+doc.messages = redact(doc.messages)
+local url = assert(upload(maki.json.encode(doc)))
+maki.notify("continued at " .. url)
+
+-- pull it back
+local back = maki.json.decode(assert(download(url)))
+back.focus = true
+assert(maki.session.new(back))
+```
+
+`export` needs the `session_read` permission and `new` needs `session_write`. Let `redact` edit a copy made with [`maki.deepcopy`](/docs/lua-api/#maki-deepcopy), which keeps `maki.NIL` and empty arrays intact. Without `prompt` or `focus`, `new` only stores the session. Where settings come from and which frontends can open it are in the [`maki.session.new` reference](/docs/lua-api/#maki-session-new).
 ### `maki mcp`
 
 ```bash
@@ -138,10 +210,11 @@ Uses the same install locations as the install scripts.
 maki acp
 maki acp -m anthropic/claude-sonnet-4-6
 maki acp --yolo
+maki acp --thinking xhigh
 maki --no-jit acp
 ```
 
-Starts an [ACP](/docs/acp/) server on stdio for editors like Zed. Subcommand flags are only `-m` / `--model` and `--yolo`. Global flags like `--no-jit` must come before the subcommand.
+Starts an [ACP](/docs/acp/) server on stdio for editors like Zed. Subcommand flags are `-m` / `--model` and `--yolo`. Thinking flags work before or after `acp`. Other global flags like `--no-jit` must come before the subcommand.
 
 ### `maki index`
 

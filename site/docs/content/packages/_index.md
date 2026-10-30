@@ -14,7 +14,9 @@ on disk, or it can install one from a Git repository and lock it to one commit.
 A package directory holds sorted `plugin/*.lua` entry files, modules at
 `lua/<module>.lua` or `lua/<module>/init.lua`, and a `plugin.toml` manifest.
 The entry files share one environment and use the API the
-[plugin guide](/docs/plugins/) describes.
+[plugin guide](/docs/plugins/) describes. A global set in one file is visible
+to the others. Built-in globals such as `string` or `print` stay fixed, so
+defining your own `print` in one file does not change it in another.
 
 ## Install from Git
 
@@ -150,6 +152,10 @@ fs_write = true
 net = true
 run = true
 env = true
+agent = true
+session_read = true
+session_write = true
+session_settings = true
 ```
 
 The manifest states what the package wants, and Maki asks about new permissions
@@ -172,6 +178,14 @@ trust on this machine and must not be committed with `pack-lock.json`.
 Only the interactive UI can ask. `--print`, SDK mode, the ACP server, and the
 other subcommands never prompt, so a package waiting for a decision comes back
 as a startup warning instead of loading.
+
+## Upgrading plugins
+
+A plugin written for an older Maki may need these changes:
+
+- JSON null now decodes to [`maki.NIL`](/docs/lua-api/#maki-NIL), which is truthy. Pass `{ luanil = { object = true, array = true } }` to [`maki.json.decode`](/docs/lua-api/#maki-json-decode) to get nil back.
+- Messages from [`maki.session.messages`](/docs/lua-api/#maki-session-messages) changed shape. `hidden` is gone, and `display_text = ""` now marks a hidden message. A thinking block keeps its text in `thinking` instead of `text`. An image block has a `source`, which is a [`maki.image.Image`](/docs/lua-api/#maki-image-Image), instead of `media_type`.
+- A package that calls session APIs or layers a tool or agent slot must list the `session_read`, `session_write` and `session_settings` keys it uses in its `plugin.toml`. The [session permissions](/docs/permissions/#session-permissions) and the [layer price table](/docs/hooks/#rules) say which. A `plugin.toml` you wrote yourself grants every key it does not list. An `init.lua` without a `plugin.toml` is denied every guarded call, the session APIs included.
 
 ## Install by hand
 

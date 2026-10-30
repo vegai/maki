@@ -1,0 +1,2 @@
+- Return a concise summary of what you did and any findings.
+- If you cannot complete what was asked for, say so clearly and explain why.

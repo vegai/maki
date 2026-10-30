@@ -1,4 +1,5 @@
 use crate::components::Overlay;
+use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::Cadence;
 
@@ -10,10 +11,12 @@ use ratatui::layout::{Position, Rect};
 const TITLE: &str = " Rewind ";
 const PREVIEW_MAX_LEN: usize = 80;
 pub(crate) const NO_TURNS_MSG: &str = "No user turns to rewind to";
+const FOOTER: &[(&str, &str)] = &[("Enter", "rewind"), (key::FORK.label, "fork")];
 
 pub enum RewindPickerAction {
     Consumed,
     Select(RewindEntry),
+    Fork(RewindEntry),
     Close,
 }
 
@@ -36,15 +39,24 @@ pub struct RewindPicker {
 impl RewindPicker {
     pub fn new() -> Self {
         Self {
-            picker: ListPicker::new(),
+            picker: ListPicker::new().with_footer(FOOTER),
         }
     }
 
     pub fn open(&mut self, messages: &[Message]) -> Result<(), String> {
         let mut turn_num = 0usize;
         let mut entries: Vec<RewindEntry> = Vec::new();
+        // Context updates go out right before the prompt they came with, so
+        // rewinding to the prompt takes them too, leaving the transcript as
+        // it was before the prompt was sent.
+        let mut updates_from = None;
         for (msg_idx, msg) in messages.iter().enumerate() {
-            if !matches!(msg.role, Role::User) || msg.is_observation() {
+            if msg.is_context_update() {
+                updates_from.get_or_insert(msg_idx);
+                continue;
+            }
+            let sent_from = updates_from.take().unwrap_or(msg_idx);
+            if !matches!(msg.role, Role::User) || msg.is_from_host() {
                 continue;
             }
             let Some(full_text) = msg.user_text() else {
@@ -61,7 +73,7 @@ impl RewindPicker {
                 format!("{turn_num}: {first_line}")
             };
             entries.push(RewindEntry {
-                turn_index: msg_idx,
+                turn_index: sent_from,
                 prompt_preview: preview,
                 prompt_text: full_text.to_owned(),
             });
@@ -95,6 +107,12 @@ impl RewindPicker {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> RewindPickerAction {
+        if key::FORK.matches(key) {
+            return self
+                .picker
+                .take_selected()
+                .map_or(RewindPickerAction::Consumed, RewindPickerAction::Fork);
+        }
         match self.picker.handle_key(key) {
             PickerAction::Consumed => RewindPickerAction::Consumed,
             PickerAction::Select(entry) => RewindPickerAction::Select(entry),
@@ -212,6 +230,21 @@ mod tests {
         assert_eq!(item.turn_index, 1);
     }
 
+    fn context_update() -> Message {
+        Message::context_update("plan mode".into(), Default::default())
+    }
+
+    /// Left behind, an update would sit in front of whatever is sent next,
+    /// and rewinding to the first prompt would not empty the session.
+    #[test_case(vec![context_update(), user_msg("first")], 0 ; "first_prompt")]
+    #[test_case(vec![user_msg("first"), assistant_msg(), Message::observation("note".into()), context_update(), context_update(), user_msg("second")], 3 ; "after_an_observation")]
+    #[test_case(vec![context_update(), user_msg("first"), assistant_msg(), user_msg("second")], 3 ; "earlier_update_stays")]
+    fn rewind_takes_the_updates_sent_with_the_prompt(msgs: Vec<Message>, expected: usize) {
+        let mut picker = RewindPicker::new();
+        picker.open(&msgs).unwrap();
+        assert_eq!(picker.picker.selected_item().unwrap().turn_index, expected);
+    }
+
     #[test]
     fn turn_numbers_skip_synthetic() {
         let mut picker = RewindPicker::new();
@@ -225,5 +258,18 @@ mod tests {
         picker.open(&msgs).unwrap();
         let top = picker.picker.selected_item().unwrap();
         assert!(top.label().starts_with("2: second"));
+    }
+
+    #[test]
+    fn fork_key_takes_the_selected_entry_and_closes() {
+        let mut picker = RewindPicker::new();
+        picker
+            .open(&[user_msg("first"), assistant_msg(), user_msg("second")])
+            .unwrap();
+        let RewindPickerAction::Fork(entry) = picker.handle_key(key::FORK.to_key_event()) else {
+            panic!("the fork key commits the selection as a fork");
+        };
+        assert_eq!(entry.turn_index, 2);
+        assert!(!picker.is_open());
     }
 }

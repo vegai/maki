@@ -3,17 +3,18 @@ use std::sync::{Arc, Mutex};
 
 use flume::Sender;
 use maki_storage::StateDir;
+use maki_storage::auth::OAuthTokens;
 use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
-use tracing::{debug, warn};
+use tracing::debug;
 
-use crate::model::Model;
-use crate::provider::{BoxFuture, Provider};
+use crate::model::{Model, ModelInfo};
+use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use crate::providers::openai::responses;
 use crate::providers::openai_compat::{
     DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiCompatProvider,
 };
-use crate::providers::{ResolvedAuth, refreshed_tokens};
+use crate::providers::{ResolvedAuth, UNAUTHORIZED_STATUS, needs_refresh, refreshed_tokens};
 use crate::{
     AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, dialect,
 };
@@ -34,6 +35,8 @@ const ENCRYPTED_REASONING: &str = "reasoning.encrypted_content";
 pub struct Xai {
     compat: OpenAiCompatProvider,
     auth: Arc<Mutex<ResolvedAuth>>,
+    /// The stored OAuth tokens `auth` was built from, `None` for an API key.
+    tokens: Arc<Mutex<Option<OAuthTokens>>>,
     storage: Option<StateDir>,
     system_prefix: Option<String>,
 }
@@ -41,10 +44,11 @@ pub struct Xai {
 impl Xai {
     pub fn new(timeouts: crate::providers::Timeouts) -> Result<Self, AgentError> {
         let storage = StateDir::resolve()?;
-        let resolved = auth::resolve(&storage)?;
+        let (resolved, tokens) = auth::resolve(&storage)?;
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
             auth: Arc::new(Mutex::new(resolved)),
+            tokens: Arc::new(Mutex::new(tokens)),
             storage: Some(storage),
             system_prefix: None,
         })
@@ -57,6 +61,7 @@ impl Xai {
         Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
             auth,
+            tokens: Arc::default(),
             storage: None,
             system_prefix: None,
         }
@@ -75,31 +80,56 @@ impl Xai {
         self.storage.as_ref().is_some_and(auth::is_oauth)
     }
 
+    /// Installs the result inside the closure so a dropped caller still leaves it in use.
     async fn refresh_oauth(&self) -> Result<(), AgentError> {
         let storage = self.storage.clone().ok_or_else(|| AgentError::Config {
             message: "OAuth refresh not available for externally-managed auth".into(),
         })?;
         let rejected = self.auth.lock().unwrap().access_token().map(str::to_owned);
-        let resolved = smol::unblock(move || {
+        let shared = Arc::clone(&self.auth);
+        let held = Arc::clone(&self.tokens);
+        smol::unblock(move || {
             match refreshed_tokens(
                 &storage,
                 auth::PROVIDER,
                 rejected.as_deref(),
                 auth::refresh_tokens,
             ) {
-                Ok(fresh) => auth::build_oauth_resolved(&fresh),
+                Ok(fresh) => {
+                    *shared.lock().unwrap() = auth::build_oauth_resolved(&fresh)?;
+                    *held.lock().unwrap() = Some(fresh);
+                    Ok(())
+                }
+                Err(e) if e.is_retryable() => Err(e),
                 Err(e) => {
-                    warn!(error = %e, "xAI OAuth refresh failed, clearing stale tokens");
-                    let _ = maki_storage::auth::delete_tokens(&storage, auth::PROVIDER);
                     catalog::invalidate();
+                    if let Ok((fallback, tokens)) = auth::resolve(&storage) {
+                        *shared.lock().unwrap() = fallback;
+                        *held.lock().unwrap() = tokens;
+                    }
                     Err(e)
                 }
             }
         })
         .await?;
-        *self.auth.lock().unwrap() = resolved;
         debug!("refreshed xAI OAuth token");
         Ok(())
+    }
+
+    async fn refresh_if_stale(&self) -> Result<(), AgentError> {
+        let Some(storage) = self
+            .storage
+            .as_ref()
+            .filter(|s| needs_refresh(s, auth::PROVIDER, self.tokens.lock().unwrap().as_ref()))
+        else {
+            return Ok(());
+        };
+        match self.refresh_oauth().await {
+            Err(e) if !e.is_retryable() => auth::resolve(storage)
+                .map(drop)
+                .map_err(|e| AgentError::api(UNAUTHORIZED_STATUS, e.to_string())),
+            result => result,
+        }
     }
 
     async fn with_oauth_retry<T, F, Fut>(&self, f: F) -> Result<T, AgentError>
@@ -108,11 +138,12 @@ impl Xai {
         Fut: std::future::Future<Output = Result<T, AgentError>>,
     {
         let result = f().await;
-        if self.is_oauth()
-            && matches!(&result, Err(e) if e.is_auth_error())
-            && self.refresh_oauth().await.is_ok()
-        {
-            return f().await;
+        if self.is_oauth() && matches!(&result, Err(e) if e.is_auth_error()) {
+            match self.refresh_oauth().await {
+                Ok(()) => return f().await,
+                Err(e) if e.is_retryable() => return Err(e),
+                Err(_) => {}
+            }
         }
         result
     }
@@ -165,9 +196,11 @@ impl Provider for Xai {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        let session_id = scope.session_id;
         Box::pin(async move {
+            self.refresh_if_stale().await?;
             let mut buf = String::new();
             let system = super::super::with_prefix(&self.system_prefix, system, &mut buf);
 
@@ -196,7 +229,10 @@ impl Provider for Xai {
                     .await;
             }
 
-            let mut body = self.compat.build_body(model, messages, system, tools);
+            let top_p = self.current_auth().top_p;
+            let mut body =
+                self.compat
+                    .build_body(model, messages, system, tools, opts.thinking, top_p);
             opts.thinking
                 .apply_reasoning_effort(&mut body, &dialect::GROK, model);
             self.with_oauth_retry(|| async {
@@ -209,8 +245,16 @@ impl Provider for Xai {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
-        Box::pin(async {
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        self.list_models_for(ModelListing::Cached)
+    }
+
+    fn list_models_for(
+        &self,
+        listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async move {
+            self.refresh_if_stale().await?;
             if self.is_oauth() {
                 return self
                     .with_oauth_retry(|| async {
@@ -218,7 +262,10 @@ impl Provider for Xai {
                         let access = bearer_token(&auth).ok_or_else(|| AgentError::Config {
                             message: "xAI OAuth token missing from resolved auth".into(),
                         })?;
-                        smol::unblock(move || catalog::list_models(&access, false)).await
+                        smol::unblock(move || {
+                            catalog::list_models(&access, listing == ModelListing::Refresh)
+                        })
+                        .await
                     })
                     .await;
             }
@@ -249,8 +296,9 @@ impl Provider for Xai {
             let Some(storage) = self.storage.clone() else {
                 return Ok(());
             };
-            let resolved = smol::unblock(move || auth::resolve(&storage)).await?;
+            let (resolved, tokens) = smol::unblock(move || auth::resolve(&storage)).await?;
             *self.auth.lock().unwrap() = resolved;
+            *self.tokens.lock().unwrap() = tokens;
             debug!("reloaded xAI auth from storage");
             Ok(())
         })

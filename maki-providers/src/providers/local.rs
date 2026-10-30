@@ -3,17 +3,16 @@ use std::sync::{Arc, Mutex};
 
 use flume::Sender;
 use futures::future::join_all;
-use maki_storage::id::SessionRef;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
 
-use maki_config::providers::Protocol;
+use maki_config::providers::{Protocol, ProvidersConfig};
 
 use crate::model::Model;
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, Provider, RequestScope};
 use crate::types::ThinkingFallback;
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{AgentError, Effort, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::openai::responses;
 use super::openai_compat::{DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiCompatProvider};
@@ -30,6 +29,20 @@ pub(crate) struct LocalEndpointConfig {
     pub discovery_mode: DiscoveryMode,
     pub compat: OpenAiCompatConfig,
     pub thinking_fallback: ThinkingFallback,
+}
+
+impl LocalEndpointConfig {
+    pub(crate) fn adaptive_effort(&self, model: &Model) -> Option<Effort> {
+        self.thinking_fallback.adaptive_effort(model)
+    }
+
+    pub(crate) fn fields_fallback(&self) -> Option<ThinkingFallback> {
+        (maki_config::providers::resolve_protocol(
+            self.slug,
+            ProvidersConfig::load_or_default().get(self.slug),
+        ) != Some(Protocol::OpenaiResponses))
+        .then_some(self.thinking_fallback)
+    }
 }
 
 fn resolve_protocol_for_local(slug: &str) -> Option<Protocol> {
@@ -135,7 +148,7 @@ impl Provider for LocalEndpoint {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
@@ -159,7 +172,9 @@ impl Provider for LocalEndpoint {
 
             let mut buf = String::new();
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let mut body = self.compat.build_body(model, messages, system, tools);
+            let mut body =
+                self.compat
+                    .build_body(model, messages, system, tools, opts.thinking, auth.top_p);
 
             opts.thinking
                 .apply_thinking(&mut body, model, self.thinking_fallback);

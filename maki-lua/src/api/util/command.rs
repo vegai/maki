@@ -5,15 +5,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
-use maki_agent::SharedBuf;
+use maki_agent::agent::SessionExport;
+use maki_agent::{Envelope, SharedBuf, SubagentInfo, Transcript};
+use maki_storage::id::MakiId;
 use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
 use strum::{EnumString, VariantNames};
 
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::pair::{Pair, try_pair};
 use crate::key::Key;
+use crate::plugin_permissions::{Permission, PluginReach};
 
-pub(crate) const NO_UI_ERR: &str = "no interactive UI attached";
+pub const NO_UI_ERR: &str = "no interactive UI attached";
 pub(crate) const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
 
 const ROW_REFINE: &str = "refine";
@@ -25,6 +28,10 @@ pub struct LuaCommandInfo {
     pub name: Arc<str>,
     pub description: Arc<str>,
     pub plugin: Arc<str>,
+    /// The handler runs with this, so a plugin calling it through
+    /// `maki.api.run_command` must reach as far. Otherwise it could borrow
+    /// this plugin's reach and pick the arguments.
+    pub reach: PluginReach,
     pub max_args: usize,
 }
 
@@ -135,6 +142,7 @@ impl HintWriter {
 pub(crate) struct CommandEntry {
     pub handler: RegistryKey,
     pub description: Arc<str>,
+    pub reach: PluginReach,
     pub max_args: usize,
 }
 
@@ -148,6 +156,7 @@ pub(crate) fn publish_command_snapshot(map: &CommandHandlerMap, writer: &LuaComm
                 name: Arc::clone(name),
                 description: Arc::clone(&entry.description),
                 plugin: Arc::clone(plugin),
+                reach: entry.reach.clone(),
                 max_args: entry.max_args,
             })
         })
@@ -431,12 +440,18 @@ pub enum SessionRequest {
     Current,
     /// UI-mode fallback for `maki.session.read` when no snapshot slot is
     /// installed — the UI resolves the id and returns a `session_snapshot_json`
-    /// payload. Headless drivers install a `SessionSnapshotSlot` instead
-    /// so `read` doesn't need a UI.
+    /// payload, or [`crate::SessionSnapshot::stored`] for an id no tab has
+    /// open. Headless drivers install a `SessionSnapshotSlot` instead so
+    /// `read` doesn't need a UI.
     Read {
         id: Option<String>,
     },
+    /// {transcript} is parsed but not validated yet. The UI lays it over the
+    /// focused tab's blank session, the one place that decides a new
+    /// session's defaults, and answers what is wrong with it. Without
+    /// {prompt} or {focus} it is only stored, otherwise it opens in a tab.
     New {
+        transcript: Box<Transcript>,
         prompt: Option<String>,
         focus: bool,
     },
@@ -466,6 +481,8 @@ pub enum SessionRequest {
 pub enum TaskRequest {
     List,
     Focus { id: String },
+    Remove { id: String },
+    Stop { id: String, session: String },
 }
 
 pub enum ModelRequest {
@@ -619,6 +636,31 @@ pub enum BuiltinAction {
     ModelPicker,
 }
 
+impl BuiltinAction {
+    /// What a plugin needs to run this through `maki.ui.action`, the same
+    /// price as the API that does the same thing. Matched without a fallback,
+    /// so a new action has to be priced before it builds.
+    ///
+    /// Most actions open something the user then sees and drives, or move
+    /// focus like `maki.task.focus`, so they are open. The plan form only
+    /// shows, and the user decides there. Popping the queue throws away a
+    /// prompt the user wrote, with nobody asked.
+    pub fn needs(self) -> &'static [Permission] {
+        match self {
+            Self::FilePicker
+            | Self::Search
+            | Self::Help
+            | Self::PlanToggle
+            | Self::PlanEditor
+            | Self::EditInput
+            | Self::PrevChat
+            | Self::NextChat
+            | Self::ModelPicker => &[],
+            Self::PopQueue => &[Permission::SessionWrite],
+        }
+    }
+}
+
 pub enum UiAction {
     OpenWin {
         buf: Arc<SharedBuf>,
@@ -636,6 +678,14 @@ pub enum UiAction {
     Session {
         req: SessionRequest,
         reply_tx: flume::Sender<UiReply>,
+    },
+    /// `maki.session.export` and `messages`: a live tab answers from memory,
+    /// unsaved messages included, any other id from disk. Typed rather than
+    /// JSON, with the messages shared, so neither the UI thread nor the Lua
+    /// thread copies them.
+    ExportSession {
+        id: MakiId,
+        reply_tx: flume::Sender<Result<SessionExport, String>>,
     },
     Model {
         req: ModelRequest,
@@ -666,7 +716,24 @@ pub enum UiAction {
     RunCommand {
         cmdline: String,
         depth: u8,
+        /// Checked on the UI side, since only the UI knows what each command
+        /// can reach.
+        caller: PluginReach,
         reply_tx: flume::Sender<Result<(), String>>,
+    },
+    /// An event from a subagent session a plugin opened on a chat session,
+    /// which shows it as a task. A tab keeps its channels across `/new`, so
+    /// the chat session id is the only way to tell if the tab still shows the
+    /// session that owns it.
+    PluginTaskEvent {
+        session: MakiId,
+        plugin: Arc<str>,
+        envelope: Box<Envelope>,
+    },
+    PluginTaskOpened {
+        session: MakiId,
+        plugin: Arc<str>,
+        info: Box<SubagentInfo>,
     },
 }
 
@@ -678,8 +745,9 @@ pub enum UiAction {
 pub struct UiAttachment(Arc<AtomicBool>);
 
 impl Default for UiAttachment {
-    /// Attached until a loop says otherwise. Headless runs and ACP hand Lua no
-    /// sender at all, so the bit only ever describes a loop that went away.
+    /// Starts attached, so what a TUI host sends before its loop is up gets
+    /// answered once it is. A headless host has no sender at all, so this bit
+    /// only ever tells of a loop that went away.
     fn default() -> Self {
         Self(Arc::new(AtomicBool::new(true)))
     }
@@ -730,6 +798,12 @@ pub(crate) fn ui_send(
     tx.ok_or(NO_UI_ERR)?.try_send(action).map_err(|_| NO_UI_ERR)
 }
 
+/// Whether an action sent now would reach an event loop, for a call that must
+/// refuse before doing anything a missing UI would leave half done.
+pub(crate) fn ui_reachable(tx: Option<&flume::Sender<UiAction>>) -> bool {
+    ui_attached() && tx.is_some_and(|tx| !tx.is_disconnected())
+}
+
 /// Send an action carrying a reply channel and await the answer. Only
 /// works from a callback: the loop drains `UiAction` between frames, so a
 /// call at config load time would wait forever.
@@ -762,6 +836,7 @@ pub(crate) async fn ui_json_roundtrip(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin_permissions::PluginPermissions;
     use mlua::Lua;
     use test_case::test_case;
 
@@ -771,6 +846,7 @@ mod tests {
         CommandEntry {
             handler: key,
             description: Arc::from(desc),
+            reach: PluginReach::new(PluginPermissions::trusted()),
             max_args: 0,
         }
     }
