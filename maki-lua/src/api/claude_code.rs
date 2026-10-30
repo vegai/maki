@@ -25,7 +25,7 @@ use rustix::fs::OFlags;
 use rustix::io::Errno;
 use serde_json::Value;
 
-use super::claude_code_common::MODULE;
+use super::claude_code_common::{MODULE, add_defaults};
 use crate::api::fs::path_text;
 use crate::api::util::convert::{TableExt, json_to_lua};
 use crate::api::util::pair::{Pair, pair, try_pair};
@@ -55,7 +55,7 @@ pub(crate) fn create_private_module(
 ) -> LuaResult<(&'static str, Table)> {
     let table = create_claude_code_table(lua, perms)?;
     table.set("handshake_input", validation::handshake_input())?;
-    super::claude_code_common::add_defaults(&table)?;
+    add_defaults(&table)?;
     Ok((MODULE, table))
 }
 
@@ -503,18 +503,13 @@ fn classify(lua: &Lua, line: String, mode: Table) -> LuaResult<Pair<Table>> {
         }
     }
     let result = lua.create_table()?;
-    let kind = classified.kind.map(|kind| match kind {
-        EventKind::ControlResponse => "control_response",
-        EventKind::RateLimit => "rate_limit",
-        EventKind::Alive => "alive",
-        EventKind::Init => "init",
-        EventKind::System => "system",
-        EventKind::Assistant => "assistant",
-        EventKind::Stream => "stream",
-        EventKind::User => "user",
-        EventKind::Result => "result",
-    });
-    result.set("kind", kind)?;
+    result.set(
+        "kind",
+        classified
+            .kind
+            .map(|kind| lua.to_value(&kind))
+            .transpose()?,
+    )?;
     result.set("event", json_to_lua(lua, event)?)?;
     result.set("model_checked", classified.model_checked)?;
     result.set("problem", classified.problem.map(|error| error.to_string()))?;

@@ -76,7 +76,7 @@ const WINDOW_FULL_STOP: &str = "model_context_window_exceeded";
 const CUT_STOPS: [&str; 2] = [MAX_TOKENS_STOP, WINDOW_FULL_STOP];
 const TOOL_RESULT: &str = "tool_result";
 pub(super) const API_ERROR_STATUS: &str = "api_error_status";
-pub const API_ERROR_MARK: &str = "is_api_error_message";
+pub(super) const API_ERROR_MARK: &str = "is_api_error_message";
 /// The plan status of a `rate_limit_event` once the plan's limit is used up.
 const PLAN_REJECTED: &str = "rejected";
 /// As 2.1.280 words it.
@@ -119,7 +119,8 @@ pub enum StreamMode {
     Worker,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EventKind {
     ControlResponse,
     RateLimit,

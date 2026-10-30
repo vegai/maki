@@ -847,13 +847,12 @@ lua_table! {
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
-    use super::{create_fn_table, with_jobs};
-    #[cfg(unix)]
+    use super::with_jobs;
+    use super::{ZERO_LINE_LIMIT_ERR, create_fn_table};
     use crate::plugin_permissions::PluginPermissions;
     use flume::Sender;
     #[cfg(unix)]
     use futures_lite::{FutureExt, future::poll_once};
-    #[cfg(unix)]
     use mlua::Function;
     use mlua::{Lua, Table, Value};
     #[cfg(unix)]
@@ -869,11 +868,35 @@ mod tests {
     };
     use crate::api::util::command::{NO_UI_ERR, UiAction, WinView};
 
+    const UNREACHABLE_COMMAND: &str = "maki-unused-line-limit-command";
     const CALLBACK_LINE: &str = "output";
     const FIRST_LINE: &[u8] = b"first";
     const NOT_UTF8_LINE: &[u8] = b"latin\xe9";
     const LINE_WITH_NEWLINE: &[u8] = b"two\nparts";
     const LINE_WITH_NUL: &[u8] = b"two\0parts";
+
+    #[test]
+    fn a_zero_output_line_limit_is_rejected_before_starting_a_job() {
+        let lua = Lua::new();
+        let table = create_fn_table(
+            &lua,
+            "line-limit-test".into(),
+            &PluginPermissions::trusted(),
+            false,
+            None,
+        )
+        .unwrap();
+        let start: Function = table.get("jobstart").unwrap();
+        let options = lua.create_table().unwrap();
+        options.set("max_line_bytes", 0).unwrap();
+        options.set("scope", "plugin").unwrap();
+        let error = smol::block_on(start.call_async::<Value>((
+            lua.create_sequence_from([UNREACHABLE_COMMAND]).unwrap(),
+            options,
+        )))
+        .unwrap_err();
+        assert!(error.to_string().contains(ZERO_LINE_LIMIT_ERR), "{error}");
+    }
 
     #[cfg(unix)]
     #[test]

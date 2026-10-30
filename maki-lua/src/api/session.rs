@@ -1172,7 +1172,6 @@ mod tests {
             .unwrap();
         maki.set("base64", create_base64_table(&lua).unwrap())
             .unwrap();
-        maki.set("NIL", Value::NULL).unwrap();
         add_top_methods(&maki, &lua, PLUGIN.into()).unwrap();
         lua.globals().set("maki", maki).unwrap();
         lua.load(format!("one_message = {ONE_MESSAGE}"))

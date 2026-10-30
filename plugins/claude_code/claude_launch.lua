@@ -434,7 +434,7 @@ function M.preflight(input, ctx, call, opts)
     if not dir then
       return nil, dir_err
     end
-    local output, output_err = call:run_quick({ executable, "--version" }, {
+    local output, output_err = call:run_lines({ executable, "--version" }, {
       cwd = dir,
       env = env,
       leftover = function()
@@ -444,7 +444,7 @@ function M.preflight(input, ctx, call, opts)
     if not output then
       return nil, output_err
     end
-    version, version_err = check:save(output)
+    version, version_err = check:save(table.concat(output, "\n"))
   end
   if not version then
     return nil, version_err

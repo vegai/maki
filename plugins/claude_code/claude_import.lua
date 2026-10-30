@@ -215,7 +215,7 @@ local function stage_blobs(call, artifact, todo, stage, timeout)
     return true
   end
   local batch = maki.fs.joinpath(stage, "batch")
-  local output, err = call:run_quick(git_utils.git({ "--git-dir=" .. artifact.git, "cat-file", "--batch" }), {
+  local output, err = call:run_lines(git_utils.git({ "--git-dir=" .. artifact.git, "cat-file", "--batch" }), {
     cwd = artifact.manifest.project,
     env = git_utils.snapshot_git_env({}, artifact.git, artifact.manifest.project),
     stdin = table.concat(hashes, "\n") .. "\n",
@@ -263,9 +263,7 @@ local function apply_import(ctx, call, artifact, todo)
   end
   -- This also runs after a cancel, so the cleanup and the read must survive
   -- it.
-  local ran, code = pcall(
-    call.run_to_end,
-    call,
+  local code = call:run_to_end(
     { "bash", "-c", import_scripts.leftovers_script(todo, project, stage, made) },
     { cwd = project },
     { keep_on_cancel = true },
@@ -275,7 +273,7 @@ local function apply_import(ctx, call, artifact, todo)
   if first then
     err = err:sub(1, first - 1) .. IMPORT_COMMAND .. err:sub(last + 1)
   end
-  if not ran or code ~= 0 then
+  if code ~= 0 then
     err = err .. "\n" .. LEFTOVERS_REMAIN:format(import_scripts.temp_name(stage))
   end
   local now, now_err = checkout_state(call, artifact, todo, true)

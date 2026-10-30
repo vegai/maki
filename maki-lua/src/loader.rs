@@ -11,6 +11,7 @@ use maki_agent::SessionEndReason;
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::{ToolRegistry, ToolSource};
 use maki_config::{GatedFile, PluginFileConfig, PluginsConfig, ProjectConfig, RawConfig};
+use maki_providers::claude_code::PLUGIN;
 use maki_providers::plugin::DeclAuthority;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
@@ -150,7 +151,7 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         include_dir!("$CARGO_MANIFEST_DIR/../plugins/completion"),
     ),
     BundledPlugin {
-        name: maki_providers::claude_code::PLUGIN,
+        name: PLUGIN,
         private_api: Some(crate::api::claude_code::create_private_module),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/claude_code"),
     },
@@ -1402,7 +1403,7 @@ mod tests {
     const PROJECT_TRUST_PATH: &str = "**";
 
     #[test_case("ordinary")]
-    #[test_case("claude_code")]
+    #[test_case(PLUGIN ; "bundled_name")]
     fn private_claude_helpers_require_bundled_authority(name: &str) {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(
@@ -1420,7 +1421,7 @@ mod tests {
     #[test_case(include_str!("../../plugins/claude_code/tests/jobs.lua") ; "job_spec")]
     fn claude_code_bundled_spec(source: &str) {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-        host.load_bundled_source(maki_providers::claude_code::PLUGIN, source, JsonMap::new())
+        host.load_bundled_source(PLUGIN, source, JsonMap::new())
             .unwrap();
     }
 
@@ -1450,7 +1451,7 @@ mod tests {
             serde_json::to_string(&names).unwrap()
         );
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-        host.load_bundled_source("claude_code", &source, JsonMap::new())
+        host.load_bundled_source(PLUGIN, &source, JsonMap::new())
             .unwrap();
     }
 
@@ -1460,7 +1461,7 @@ mod tests {
         let mut host = PluginHost::new(Arc::clone(&registry)).unwrap();
         let bundled = BUNDLED_PLUGINS
             .iter()
-            .find(|plugin| plugin.name == "claude_code")
+            .find(|plugin| plugin.name == PLUGIN)
             .unwrap();
         let unsupported = BundledPlugin {
             name: bundled.name,
@@ -1485,7 +1486,7 @@ mod tests {
         assert!(loaded.iter().any(|name| name == "openrouter"));
         let ctx = stub_ctx(&AgentMode::Build);
         for (name, input) in [
-            ("claude_code", json!({"prompt": "inspect"})),
+            (PLUGIN, json!({"prompt": "inspect"})),
             ("claude_code_import", json!({"id": "Ab12Cd34"})),
         ] {
             let invocation = registry.get(name).unwrap().try_parse(&input).unwrap();

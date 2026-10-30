@@ -409,17 +409,12 @@ fn resolve_abs_with_cwd(path: String, cwd: &Path) -> PathBuf {
 mod tests {
     use std::collections::HashMap;
 
-    use maki_agent::tools::test_support::{stub_ctx_in, stub_ctx_with};
+    use maki_agent::tools::test_support::stub_ctx_with;
     use maki_agent::tools::{LocalTool, ToolAudience};
     use maki_agent::{AgentMode, InstructionBlock};
-    use mlua::Lua;
-    use std::fs;
-    use tempfile::tempdir;
     use test_case::test_case;
 
     use super::*;
-    use crate::api::agent::create_agent_table;
-    use crate::plugin_permissions::PluginPermissions;
 
     const TOOL_USE_ID: &str = "tu-1";
     const INSTRUCTION_PATH: &str = "/tmp/nested/AGENTS.md";
@@ -427,8 +422,6 @@ mod tests {
     /// Arbitrary ids are rejected: `SessionRef` parses base58 or a uuid.
     const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
     const SUBAGENT_TASK_ID: &str = "toolu_task";
-    const CWD_IN_START_ERR: &str = "maki.agent.cwd not available in start ctx";
-    const INSTRUCTIONS_IN_START_ERR: &str = "maki.agent.instructions not available in start ctx";
 
     fn session_ref() -> SessionRef {
         SESSION_ID.parse().expect("valid session id")
@@ -460,49 +453,6 @@ mod tests {
         ctx.local_tools = Arc::new(tools);
         ctx.live_sink = Some(flume::unbounded().0);
         ctx
-    }
-
-    #[test_case("cwd", CWD_IN_START_ERR ; "cwd")]
-    #[test_case("instructions", INSTRUCTIONS_IN_START_ERR ; "instructions")]
-    fn a_session_location_outside_a_call_is_a_capability_error(method: &str, expected: &str) {
-        let lua = Lua::new();
-        lua.globals()
-            .set("ctx", LuaCtx::start(&populated_ctx()))
-            .unwrap();
-        lua.globals()
-            .set(
-                "agent",
-                create_agent_table(&lua, "test".into(), PluginPermissions::trusted()).unwrap(),
-            )
-            .unwrap();
-        let (value, err): (Option<String>, Option<String>) =
-            smol::block_on(lua.load(format!("return agent.{method}(ctx)")).eval_async()).unwrap();
-        assert_eq!(value, None);
-        assert_eq!(err.as_deref(), Some(expected));
-    }
-
-    #[test]
-    fn session_instructions_and_prompts_use_the_calling_checkout() {
-        const INSTRUCTIONS: &str = "Unique session checkout instructions.";
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join("AGENTS.md"), INSTRUCTIONS).unwrap();
-        let lua = Lua::new();
-        let ctx = stub_ctx_in(dir.path(), None, None);
-        lua.globals().set("ctx", LuaCtx::handler(&ctx)).unwrap();
-        lua.globals()
-            .set(
-                "agent",
-                create_agent_table(&lua, "test".into(), PluginPermissions::trusted()).unwrap(),
-            )
-            .unwrap();
-        let (instructions, prompt, cwd): (String, String, String) = smol::block_on(lua.load(r#"
-            local text = assert(agent.instructions(ctx))
-            local prompt = assert(agent.system_prompt(ctx, { prompt_id = "research", instructions = true }))
-            return text, prompt, assert(agent.cwd(ctx))
-        "#).eval_async()).unwrap();
-        assert!(instructions.contains(INSTRUCTIONS));
-        assert!(prompt.contains(INSTRUCTIONS), "{prompt}");
-        assert_eq!(Path::new(&cwd), dir.path().canonicalize().unwrap());
     }
 
     #[test]

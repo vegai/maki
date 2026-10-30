@@ -14,10 +14,11 @@ use self::private_files::{PrivateDir, private_dir, private_file};
 use self::supervision::{
     Group, Next, ReadDeadline, SHUTDOWN_GRACE, send, send_handshake, supervised, unreadable,
 };
+use super::super::STARTUP_TIMEOUT_SECS;
 use super::checks::InitExpect;
 use super::error::Error;
 use super::mcp::{self, Handoff};
-use super::settings::{MCP_CONFIG_FLAG, STARTUP_TIMEOUT_SECS};
+use super::settings::MCP_CONFIG_FLAG;
 use super::stream::{Step, Turn, Wait, user_message};
 use super::transcript::{Catalog, SERVER, system_prompt, transcript};
 use super::within;

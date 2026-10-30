@@ -188,6 +188,7 @@ const CANNOT_LOCK_CHECKOUT: &str = "cannot lock checkout";
 const EXITS_AS_A_TIMEOUT_WOULD: &str = "exit 124";
 const EXITED_WITH_124: &str = "exited with code 124";
 const PREPARE_STARTED: &str = "prepare-started";
+const SANITIZE_STARTED: &str = "sanitize-started";
 const LINKED_PROJECT: &str = "linked";
 const PREPARE_TOLD: &str = "could not prepare the dependencies";
 const VENV_NOTE: &str = ".venv is a Python virtual environment";
@@ -1467,15 +1468,16 @@ fn a_failed_dependency_scan_stops_the_worker() {
 fn a_cancel_during_sanitization_discards_the_idle_artifact() {
     let coding = Coding::new();
     let started = tempdir().unwrap();
-    let marker = started.path().join(PREPARE_STARTED);
+    let marker = started.path().join(SANITIZE_STARTED);
     let (reg, host) = coding.host(&[]);
     let mut opts = coding.fake.opts(ONE_SLOT);
     opts.insert("artifact_dir".into(), json!(coding.artifacts.path()));
     let source = format!(
         r#"local native = require("maki.claude_code.internal")
+        local pending
         native.sanitize_git = function()
             assert(maki.fs.write({marker}, ""))
-            maki.async.await(1, function() end)
+            maki.async.await(1, function(done) pending = done end)
         end
         {plugin}"#,
         marker = json!(marker),

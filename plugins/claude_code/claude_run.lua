@@ -160,6 +160,7 @@ function Run:on_answer()
   self.stream:set_model(model)
   local sent, err, queued = jobs.feed_stdin(self.job_id, launch.user_message(self.task, self.spec.instructions))
   if queued then
+    -- The worker can act on a queued prompt even if closing stdin fails. Keep its snapshot.
     self.prompted = true
     self.call.artifact = nil
   end

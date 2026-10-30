@@ -42,6 +42,8 @@ function M.keep_tail(tail, line)
   end
 end
 
+--- Returns close status, an error, and whether the complete input was queued.
+--- A close error can follow a complete prompt, so callers may need to keep its artifact.
 function M.feed_stdin(id, data)
   local limits = maki.fn.chansend_limits
   local chunk_bytes = math.min(STDIN_CHUNK_BYTES, limits.max_bytes)
@@ -245,11 +247,6 @@ function Call:run_lines(argv, spec)
     return nil, M.with_stderr(shown .. " exited with code " .. code, stderr_tail)
   end
   return lines
-end
-
-function Call:run_quick(argv, spec)
-  local lines, err, timed_out = self:run_lines(argv, spec)
-  return lines and table.concat(lines, "\n"), err, timed_out
 end
 
 return M

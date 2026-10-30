@@ -29,7 +29,6 @@ pub use super::super::MAX_EVENT_BYTES;
 pub use super::checks::{GIT_ENTRY, git_directory};
 use super::run::private_dir_async;
 pub use super::run::{VersionCheck, invalidate_version, version_check};
-pub use super::settings::STARTUP_TIMEOUT_SECS;
 use super::settings::{self, base_settings};
 use super::stream::usage_of as plan_usage;
 pub use super::stream::{EventKind, TOOL_USE_BLOCK, user_message};
@@ -605,8 +604,8 @@ fn worker_problem(effective: &Value, expected: &Value) -> Option<Problem> {
 mod tests {
     use super::Problem;
     use super::{
-        PERMISSIONS_KEY, SANDBOX, TMPDIR_ENV, WorkerPaths, WorkerPolicy, prepare_launch,
-        sandbox_problem, worker_problem,
+        SANDBOX, TMPDIR_ENV, WorkerPaths, WorkerPolicy, prepare_launch, sandbox_problem,
+        worker_problem,
     };
     use serde_json::{Value, json};
     use std::env;
@@ -685,14 +684,23 @@ mod tests {
         assert_eq!(actual, want);
     }
 
-    #[test]
-    fn null_additional_directories_are_not_an_empty_list() {
+    #[test_case("", json!(null), Problem::NoEffectiveSettings ; "missing_effective_settings")]
+    #[test_case("/permissions/blockReadsOutsideWorkingDirectories", json!(false), Problem::OutsideProjectReads ; "reads_outside_project")]
+    #[test_case("/permissions/additionalDirectories", json!([null]), Problem::AdditionalDirectories(String::new()) ; "null_additional_directories")]
+    #[test_case("/permissions/deny", json!([]), Problem::MissingDenyRule(READ_RULE.into()) ; "missing_deny_rule")]
+    fn effective_worker_permissions_report_the_rule(path: &str, value: Value, want: Problem) {
         let expected = expected();
         let mut effective = expected.clone();
-        effective[PERMISSIONS_KEY]["additionalDirectories"] = json!([null]);
-        assert!(matches!(
-            worker_problem(&effective, &expected),
-            Some(Problem::AdditionalDirectories(_))
-        ));
+        if let Some((parent, key)) = path.rsplit_once('/') {
+            effective
+                .pointer_mut(parent)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert(key.to_owned(), value);
+        } else {
+            effective = value;
+        }
+        assert_eq!(worker_problem(&effective, &expected), Some(want));
     }
 }

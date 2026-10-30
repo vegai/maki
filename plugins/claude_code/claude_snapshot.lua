@@ -74,7 +74,7 @@ local function copy_into(call, artifact, spec, paths, reflink)
   argv[#argv + 1] = "--"
   local env = table.clone(spec.env)
   env.LC_ALL = C_LOCALE
-  return call:run_quick(argv, {
+  return call:run_lines(argv, {
     env = env,
     cwd = spec.cwd,
     stdin = table.concat(paths, "\0"),
@@ -377,6 +377,7 @@ local function unsettled_dependencies(call, artifact, spec, dependencies, marker
   if #dependencies == 0 then
     return {}
   end
+  -- Prefix paths so dependency names cannot become find expressions.
   local argv = { "find" }
   for _, dir in ipairs(dependencies) do
     argv[#argv + 1] = "./" .. dir
@@ -700,7 +701,7 @@ end
 --- hard-linked files private before the worker starts.
 --- Records a command error and returns any fatal sanitation or baseline error.
 function M.prepare(call, artifact, command, env, timeout_ms)
-  local _, err = call:run_quick({ "sh", "-c", git_utils.without_local_git_env(command) }, {
+  local _, err = call:run_lines({ "sh", "-c", git_utils.without_local_git_env(command) }, {
     display = command,
     env = { TMPDIR = env.TMPDIR },
     inherit_env = true,

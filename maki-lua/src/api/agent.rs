@@ -378,7 +378,7 @@ async fn relay_session_events(
 #[lua_fn]
 async fn resolve_model(
     lua: Lua,
-    ctx: mlua::UserDataRef<LuaCtx>,
+    ctx: UserDataRef<LuaCtx>,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Table>> {
     let agent = try_pair!(dispatch_ctx(&ctx, "resolve_model"));
@@ -435,7 +435,7 @@ async fn instructions(_lua: Lua, ctx: UserDataRef<LuaCtx>) -> LuaResult<Pair<Str
 /// Optional fields:
 ///   `instructions` (string|boolean?) - text inserted at the template's
 ///     `{{instructions}}` marker.
-///     `true` loads project instruction files.
+///     `true` loads project instruction files and requires `fs_read`.
 ///     `false` or nil omits them.
 /// @return (string?, string?) The assembled prompt string, or `(nil, err)` on failure.
 /// @example
@@ -444,10 +444,11 @@ async fn instructions(_lua: Lua, ctx: UserDataRef<LuaCtx>) -> LuaResult<Pair<Str
 ///   instructions = true,
 /// })
 /// if err then error(err) end
-#[lua_fn(guard = FsRead)]
+#[lua_fn]
 async fn system_prompt(
     _lua: Lua,
-    ctx: mlua::UserDataRef<LuaCtx>,
+    #[ctx] perms: PluginPermissions,
+    ctx: UserDataRef<LuaCtx>,
     opts: Table,
 ) -> LuaResult<Pair<String>> {
     let slots = Arc::clone(&try_pair!(dispatch_ctx(&ctx, "system_prompt")).prompt_slots);
@@ -463,11 +464,14 @@ async fn system_prompt(
         other => return Ok(err_pair(format!("unknown prompt_id: {other}"))),
     };
 
-    let cwd = try_pair!(canonical_path(cwd).await);
-    let vars = maki_agent::template::env_vars_for(&cwd);
+    let vars = maki_agent::template::env_vars_for(&cwd.to_string_lossy());
     let instructions_val: LuaValue = opts.get("instructions")?;
     let instructions = match instructions_val {
         LuaValue::Boolean(true) => {
+            if !perms.is_allowed(Permission::FsRead) {
+                return Err(denied_error(Permission::FsRead));
+            }
+            let cwd = try_pair!(canonical_path(cwd).await);
             smol::unblock(move || maki_agent::agent::load_instruction_text(&cwd)).await
         }
         LuaValue::Boolean(false) | LuaValue::Nil => String::new(),
@@ -643,7 +647,7 @@ async fn callable_tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<P
 #[lua_fn]
 async fn call_tool(
     lua: Lua,
-    ctx: mlua::UserDataRef<LuaCtx>,
+    ctx: UserDataRef<LuaCtx>,
     name: String,
     input: LuaValue,
     opts: Option<Table>,
@@ -1748,7 +1752,7 @@ fn call_local_tool(
 #[cfg(test)]
 mod tests {
     use maki_agent::prompt::{PromptId, ResolvedPrompts};
-    use maki_agent::tools::test_support::stub_ctx_with;
+    use maki_agent::tools::test_support::{stub_ctx_in, stub_ctx_with};
     use maki_agent::{DoneReason, TurnCompleteEvent};
     use maki_providers::model::ThinkingSupport;
     use maki_providers::provider::{BoxFuture, Provider, RequestScope};
@@ -1759,6 +1763,9 @@ mod tests {
     use maki_storage::sessions::Effort;
     use mlua::AnyUserData;
     use serde_json::json;
+    use std::fs;
+    use std::path::Path;
+    use tempfile::tempdir;
     use test_case::test_case;
 
     use super::*;
@@ -1770,6 +1777,82 @@ mod tests {
     const SESSION_TIMEOUT: Duration = Duration::from_secs(5);
     const CLOSE_SESSION: &str = "function(sess) sess:close() end";
     const THINKING_BUDGET: u32 = 2048;
+
+    const CWD_IN_START_ERR: &str = "maki.agent.cwd not available in start ctx";
+    const INSTRUCTIONS_IN_START_ERR: &str = "maki.agent.instructions not available in start ctx";
+    const PROMPT_IN_START_ERR: &str = "maki.agent.system_prompt not available in start ctx";
+
+    #[test_case("cwd", CWD_IN_START_ERR ; "cwd")]
+    #[test_case("instructions", INSTRUCTIONS_IN_START_ERR ; "instructions")]
+    #[test_case("system_prompt", PROMPT_IN_START_ERR ; "system_prompt")]
+    fn a_session_location_outside_a_call_is_a_capability_error(method: &str, expected: &str) {
+        let lua = Lua::new();
+        lua.globals()
+            .set(
+                "ctx",
+                LuaCtx::start(&stub_ctx_with(&AgentMode::Build, None, None)),
+            )
+            .unwrap();
+        lua.globals()
+            .set(
+                "agent",
+                create_agent_table(&lua, PLUGIN.into(), PluginPermissions::trusted()).unwrap(),
+            )
+            .unwrap();
+        let (value, err): (Option<String>, Option<String>) = smol::block_on(
+            lua.load(format!(
+                r#"return agent.{method}(ctx, {{ prompt_id = "research", instructions = false }})"#
+            ))
+            .eval_async(),
+        )
+        .unwrap();
+        assert_eq!(value, None);
+        assert_eq!(err.as_deref(), Some(expected));
+    }
+
+    #[test]
+    fn session_instructions_and_prompts_use_the_calling_checkout() {
+        const INSTRUCTIONS: &str = "Unique session checkout instructions.";
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("AGENTS.md"), INSTRUCTIONS).unwrap();
+        let lua = Lua::new();
+        let ctx = stub_ctx_in(dir.path(), None, None);
+        lua.globals().set("ctx", LuaCtx::handler(&ctx)).unwrap();
+        lua.globals()
+            .set(
+                "agent",
+                create_agent_table(&lua, PLUGIN.into(), PluginPermissions::trusted()).unwrap(),
+            )
+            .unwrap();
+        let (instructions, prompt, cwd): (String, String, String) = smol::block_on(lua.load(r#"
+            local text = assert(agent.instructions(ctx))
+            local prompt = assert(agent.system_prompt(ctx, { prompt_id = "research", instructions = true }))
+            return text, prompt, assert(agent.cwd(ctx))
+        "#).eval_async()).unwrap();
+        assert!(instructions.contains(INSTRUCTIONS));
+        assert!(prompt.contains(INSTRUCTIONS), "{prompt}");
+        assert_eq!(Path::new(&cwd), dir.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn a_prompt_without_file_reads_accepts_a_missing_session_directory() {
+        let root = tempdir().unwrap();
+        let missing = root.path().join("missing");
+        let lua = Lua::new();
+        let ctx = stub_ctx_in(&missing, None, None);
+        lua.globals().set("ctx", LuaCtx::handler(&ctx)).unwrap();
+        lua.globals()
+            .set(
+                "agent",
+                create_agent_table(&lua, PLUGIN.into(), PluginPermissions::denied()).unwrap(),
+            )
+            .unwrap();
+        let prompt: String = smol::block_on(lua.load(r#"return assert(agent.system_prompt(ctx, { prompt_id = "research", instructions = false }))"#).eval_async()).unwrap();
+        assert!(
+            prompt.contains(missing.to_string_lossy().as_ref()),
+            "{prompt}"
+        );
+    }
 
     #[test_case(ThinkingConfig::Effort(Effort::Low), json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Effort::Low) ; "toggle_keeps_ancestor_effort_ceiling")]
     #[test_case(ThinkingConfig::Adaptive, json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Effort::Max) ; "explicit_adaptive_stays_unbounded")]
@@ -2016,9 +2099,14 @@ mod tests {
             let opts = lua.create_table().unwrap();
             opts.set("prompt_id", name).unwrap();
             opts.set("instructions", CHILD_INSTRUCTIONS).unwrap();
-            let (system, error) = system_prompt(lua.clone(), ctx.borrow().unwrap(), opts)
-                .await
-                .unwrap();
+            let (system, error) = system_prompt(
+                lua.clone(),
+                PluginPermissions::trusted(),
+                ctx.borrow().unwrap(),
+                opts,
+            )
+            .await
+            .unwrap();
             assert!(error.is_none(), "{error:?}");
             let opts = lua.create_table().unwrap();
             opts.set("system", system.unwrap()).unwrap();

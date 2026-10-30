@@ -36,7 +36,7 @@ use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -88,8 +88,6 @@ const CLAUDE_CODE: EffortDialect = EffortDialect {
 const WAIT: Duration = Duration::from_secs(30);
 const PLUGIN_OFF: &str =
     "enable the claude_code plugin in init.lua: `plugins = { claude_code = { enabled = true } }`";
-// The provider reads these plugin options too, so the plugin and the
-// provider run the same `claude` with the same login.
 /// The login lives in Claude Code's config directory, so there is no key
 /// variable.
 const WAITING_FOR_SLOT: &str = "waiting for a Claude Code request slot";
@@ -302,7 +300,7 @@ fn saved_models(
     max_age: Duration,
     executable: &Path,
     config_dir: &Path,
-) -> Option<(SystemTime, SavedModels)> {
+) -> Option<SavedModels> {
     let keyed = keyed_models_path(path, executable, config_dir);
     let at = fs::metadata(&keyed).ok()?.modified().ok()?;
     let age = at.elapsed().ok()?;
@@ -313,7 +311,7 @@ fn saved_models(
     if saved.executable != executable || saved.config_dir != config_dir {
         return None;
     }
-    Some((at, saved))
+    Some(saved)
 }
 
 fn prune_model_caches(base: &Path, current: &Path) {
@@ -503,7 +501,7 @@ impl ClaudeCode {
         let saved = async || {
             let path = self.models_cache.clone()?;
             let (executable, config_dir) = key.clone();
-            let (_, saved) = smol::unblock(move || {
+            let saved = smol::unblock(move || {
                 saved_models(&path, MODELS_CACHE_TTL, &executable, &config_dir)
             })
             .await?;
@@ -554,7 +552,7 @@ impl ClaudeCode {
     }
 
     fn window_of(&self, id: &str) -> Option<u32> {
-        let (_, saved) = saved_models(
+        let saved = saved_models(
             self.models_cache.as_deref()?,
             Duration::MAX,
             &self.executable,
@@ -973,7 +971,7 @@ mod tests {
             );
         }
         for (executable, config_dir) in keys {
-            let (_, saved) = saved_models(
+            let saved = saved_models(
                 &cache,
                 Duration::from_secs(60),
                 Path::new(executable),

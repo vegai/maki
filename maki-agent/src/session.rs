@@ -267,17 +267,8 @@ impl Drop for SessionTurn<'_> {
             store,
         } = &mut *self.track;
         let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
-        if history.has_unsaved() || store.session.token_usage != store.current_usage() {
-            match store.record_turn(&history.snapshot(), gauge.size()) {
-                Ok(()) => history.mark_saved(),
-                // Only headless runs save through here (the TUI has its own
-                // writer), so printing cannot tear a drawn frame.
-                Err(e) => {
-                    warn!(error = %e, session_id = %store.session.id, "failed to persist session");
-                    eprintln!("{SAVE_FAILED}{}: {e}", store.session.id);
-                }
-            }
-        }
+        let saved = store.save(&history.snapshot(), gauge.size(), history.has_unsaved());
+        history.mark_save_result(saved);
         store.publish_header(false);
     }
 }
@@ -285,21 +276,20 @@ impl Drop for SessionTurn<'_> {
 pub(crate) struct SessionCheckpoint(Arc<Mutex<SessionStore>>);
 
 impl SessionCheckpoint {
-    pub(crate) async fn persist(&self, snapshot: HistorySnapshot, context_size: u32) -> bool {
+    pub(crate) async fn persist(
+        &self,
+        snapshot: HistorySnapshot,
+        context_size: u32,
+        unsaved: bool,
+    ) -> bool {
         let store = Arc::clone(&self.0);
         smol::unblock(move || {
             let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
-            match store.record_turn(&snapshot, context_size) {
-                Ok(()) => {
-                    store.publish_header(true);
-                    true
-                }
-                Err(error) => {
-                    warn!(%error, session_id = %store.session.id, "failed to checkpoint session");
-                    eprintln!("{SAVE_FAILED}{}: {error}", store.session.id);
-                    false
-                }
+            let saved = store.save(&snapshot, context_size, unsaved);
+            if saved {
+                store.publish_header(true);
             }
+            saved
         })
         .await
     }
@@ -317,7 +307,7 @@ struct SessionStore {
 impl SessionStore {
     /// Opening touches no file: the driver either read the session already or
     /// there is nothing under the id to read. A session nothing was written for
-    /// yet is held in memory until [`Self::record_turn`] has something to
+    /// yet is held in memory until [`Self::save`] has something to
     /// store, so every file on disk has a transcript in it. The blank model
     /// spec is [`SessionTrack::turn`]'s to fill, and it runs before any write.
     fn open(claim: SessionClaim, stored: Option<StoredSession>, cwd: &str) -> Self {
@@ -357,19 +347,23 @@ impl SessionStore {
     /// resolves to, so a run killed before its first turn would leave a dead
     /// entry behind for good. The same guard stops a history that sanitized
     /// down to nothing from replacing the copy it was restored from.
-    fn record_turn(
-        &mut self,
-        snapshot: &HistorySnapshot,
-        context_size: u32,
-    ) -> Result<(), SessionError> {
-        if snapshot.messages.is_empty() {
-            return Ok(());
+    fn save(&mut self, snapshot: &HistorySnapshot, context_size: u32, unsaved: bool) -> bool {
+        let usage = self.current_usage();
+        if snapshot.messages.is_empty() || !unsaved && self.session.token_usage == usage {
+            return true;
         }
         self.session.set_history(snapshot);
-        self.session.token_usage = self.current_usage();
+        self.session.token_usage = usage;
         self.session.meta.context_size = context_size;
         self.session.update_title_if_default();
-        self.claim.persist(&self.session)
+        match self.claim.persist(&self.session) {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(%error, session_id = %self.session.id, "failed to persist session");
+                eprintln!("{SAVE_FAILED}{}: {error}", self.session.id);
+                false
+            }
+        }
     }
 }
 
@@ -506,6 +500,67 @@ mod tests {
         push_turn(track, spec, |params| {
             params.history.push(Message::user(text.into()))
         });
+    }
+
+    #[test_case(false ; "on_drop")]
+    #[test_case(true ; "mid_run_checkpoint")]
+    fn usage_without_history_changes_is_saved_once(checkpoint: bool) {
+        let tmp = TempDir::new().unwrap();
+        let mut track = track_on(&tmp);
+        push_prompt(&mut track, MODEL_SPEC, PROMPT);
+        let mut turn = track.turn(MODEL_SPEC.into(), &input(AgentMode::Build));
+        turn.ledger().add(
+            TokenUsage {
+                input: TURN_INPUT_TOKENS,
+                ..Default::default()
+            },
+            None,
+            None,
+        );
+        let params = run_params(&mut turn);
+        assert!(!params.history.has_unsaved());
+        if checkpoint {
+            smol::block_on(params.history.checkpoint(CONTEXT_SIZE));
+            assert_eq!(load(&tmp).token_usage.input, TURN_INPUT_TOKENS);
+            let saved = fs::read(log_path(&tmp)).unwrap();
+            smol::block_on(params.history.checkpoint(CONTEXT_SIZE));
+            assert_eq!(fs::read(log_path(&tmp)).unwrap(), saved, "{UNTOUCHED}");
+        }
+        drop(turn);
+        assert_eq!(load(&tmp).token_usage.input, TURN_INPUT_TOKENS);
+        assert_eq!(load(&tmp).messages().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_usage_only_checkpoint_is_retried() {
+        let tmp = TempDir::new().unwrap();
+        push_prompt(&mut track_on(&tmp), MODEL_SPEC, PROMPT);
+        let mut track = SessionTrack::open(
+            Resumed::stored(SessionRef::from(session_id()), load(&tmp)),
+            claim(&tmp),
+            CWD,
+        );
+        let blocker = log_path(&tmp).with_extension("jsonl.tmp");
+        fs::create_dir(&blocker).unwrap();
+        let mut turn = track.turn(MODEL_SPEC.into(), &input(AgentMode::Build));
+        turn.ledger().add(
+            TokenUsage {
+                input: TURN_INPUT_TOKENS,
+                ..Default::default()
+            },
+            None,
+            None,
+        );
+        let params = run_params(&mut turn);
+        assert!(!params.history.has_unsaved());
+        smol::block_on(params.history.checkpoint(CONTEXT_SIZE));
+        assert!(params.history.has_unsaved(), "{RETRIED}");
+        fs::remove_dir(blocker).unwrap();
+        smol::block_on(params.history.checkpoint(CONTEXT_SIZE));
+        assert!(!params.history.has_unsaved());
+        assert_eq!(load(&tmp).token_usage.input, TURN_INPUT_TOKENS);
+        drop(turn);
+        assert_eq!(load(&tmp).token_usage.input, TURN_INPUT_TOKENS);
     }
 
     #[test]

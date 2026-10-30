@@ -1460,8 +1460,6 @@ Plugin template and section replacements apply. Environment variables like
 `{cwd}` are substituted automatically. Use this when you need a ready-made
 prompt for a subagent session.
 
-Requires the `fs_read` [plugin permission](#plugin-permissions).
-
 **Parameters:**
 
 - `{ctx}` (`LuaCtx`) Agent context.
@@ -1472,7 +1470,7 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 
   - `instructions` (`string|boolean?`) text inserted at the template's
     `{{instructions}}` marker.
-    `true` loads project instruction files.
+    `true` loads project instruction files and requires `fs_read`.
     `false` or nil omits them.
 
 **Returns:** (`string?`, `string?`) The assembled prompt string, or `(nil, err)` on failure.

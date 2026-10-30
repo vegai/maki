@@ -10,7 +10,6 @@ Stream.__index = Stream
 local ASSISTANT = "assistant"
 local RESULT = "result"
 local CONTROL_RESPONSE = "control_response"
-local RATE_LIMIT_EVENT = "rate_limit"
 local INIT = "init"
 local TOOL_USE = "tool_use"
 -- Each step's output count is a placeholder, so only the result has the
@@ -107,7 +106,7 @@ function Stream:feed(line)
   if kind == CONTROL_RESPONSE and type(ev.response) == "table" then
     return { control = line }
   end
-  if kind == RATE_LIMIT_EVENT and type(ev.rate_limit_info) == "table" then
+  if classified.rate_limit then
     self.rate_limit = classified.rate_limit
     return nil
   end

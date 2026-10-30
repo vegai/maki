@@ -5970,6 +5970,7 @@ fn user_plugin_with_fs_read_can_read_but_not_write() {
 #[test_case(r#"maki.fn.executable("ls")"# ; "executable")]
 #[test_case("maki.agent.cwd(ctx)" ; "session_dir")]
 #[test_case("maki.agent.instructions(ctx)" ; "session_instructions")]
+#[test_case(r#"maki.agent.system_prompt(ctx, { prompt_id = "research", instructions = true })"# ; "system_prompt_instructions")]
 fn location_queries_cost_fs_read(call: &str) {
     const TOOL: &str = "location_test";
     let src = perm_tool_src(
@@ -5994,6 +5995,23 @@ fn location_queries_cost_fs_read(call: &str) {
     .unwrap();
     assert!(refused.contains(PERMISSION_DENIED_MSG), "got: {refused}");
     assert!(refused.contains("fs_read"), "got: {refused}");
+}
+
+#[test_case("nil" ; "omitted_instructions")]
+#[test_case("false" ; "no_instructions")]
+#[test_case(r#""supplied instructions""# ; "provided_text")]
+fn system_prompts_without_file_reads_do_not_need_fs_read(instructions: &str) {
+    const TOOL: &str = "prompt_test";
+    let src = perm_tool_src(
+        TOOL,
+        &format!(
+            r#"return assert(maki.agent.system_prompt(ctx, {{ prompt_id = "research", instructions = {instructions} }}))"#
+        ),
+    );
+    let mut perms = PluginPermissions::denied();
+    perms.set(maki_lua::Permission::Agent, true);
+    let prompt = exec_tool_with_perms(perms, &src, TOOL, serde_json::json!({})).unwrap();
+    assert!(!prompt.trim().is_empty());
 }
 
 const PATH_FIELD_SCHEMA: &str = r#"{
