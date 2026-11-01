@@ -39,7 +39,7 @@ use tracing::warn;
 use crate::cli::Cli;
 use crate::notice::{NOTIFICATION, ProviderNotice};
 use crate::tool_names::maki_to_claude_tool_name;
-use crate::wire::{ERROR_DURING_EXECUTION, SUCCESS, system_event, wire_uuid};
+use crate::wire::{API_RETRY, ERROR_DURING_EXECUTION, INIT, SUCCESS, system_event, wire_uuid};
 
 const NOTICE_SUBTYPE: &str = "notice";
 
@@ -525,10 +525,9 @@ pub fn run(params: SdkParams) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let working_dir = cwd.to_string_lossy().into_owned();
 
-    let mcp_handle = crate::headless_startup::start_mcp(&cwd, project_config.clone());
-
     let (trigger, shutdown) = CancelToken::new();
     crate::shutdown::watch(trigger).context("watch termination signals")?;
+    let mcp_handle = crate::headless_startup::start_mcp(&cwd, project_config.clone());
     let (handle, mut events) = headless::spawn_interactive(InteractiveParams {
         shutdown: shutdown.clone(),
         model,
@@ -599,7 +598,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         .map(|t| maki_to_claude_tool_name(t))
         .collect();
     writer.emit_system(
-        "init",
+        INIT,
         serde_json::json!({
             "cwd": working_dir,
             "tools": tools,
@@ -1091,7 +1090,7 @@ impl EventPump {
                 delay_ms,
             } => {
                 self.writer.emit_system(
-                    "api_retry",
+                    API_RETRY,
                     serde_json::json!({
                         "attempt": attempt,
                         "retry_delay_ms": delay_ms,
@@ -1446,7 +1445,7 @@ mod tests {
         let session_id = SessionRef::generate();
         let msg = system_event(
             &session_id,
-            "init",
+            INIT,
             serde_json::json!({
                 "cwd": "/tmp", "tools": ["Read"], "model": "test", "permissionMode": "default",
             }),

@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::checks::launch_env;
 use rustix::process::{Pid, Signal, kill_process, test_kill_process_group};
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
@@ -94,10 +95,12 @@ impl Fake {
     }
 
     pub(super) fn env() -> Vec<(String, String)> {
-        ["PATH", "HOME"]
-            .into_iter()
-            .filter_map(|name| Some((name.to_owned(), env::var(name).ok()?)))
-            .collect()
+        launch_env(
+            ["PATH", "HOME"]
+                .into_iter()
+                .filter_map(|name| Some((name.to_owned(), env::var(name).ok()?))),
+        )
+        .0
     }
 
     pub(super) async fn request(&self) -> (Result<StreamResponse, Error>, Vec<ProviderEvent>) {

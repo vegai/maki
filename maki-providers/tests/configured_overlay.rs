@@ -11,7 +11,7 @@ use maki_config::providers::{Protocol, ProvidersConfig};
 use maki_providers::plugin::{
     self, DeclAuthority, PlanDecl, ProviderDecl, RegisterError, Registration,
 };
-use maki_providers::provider::provider_for_slug;
+use maki_providers::provider::{ModelListing, provider_for_slug};
 use maki_providers::spec::Owner;
 use maki_providers::{Timeouts, catalog_provider_if_available, warm_catalog};
 use maki_storage::StateDir;
@@ -294,7 +294,7 @@ fn selection_changes_take_effect_only_after_reload() {
     plugin::commit_load();
     assert!(!matches!(Owner::of(CATALOG_SLUG), Owner::Plugin));
     let fallback = provider_for_slug(CATALOG_SLUG, Timeouts::default()).unwrap();
-    let models = smol::block_on(fallback.list_models()).unwrap();
+    let models = smol::block_on(fallback.list_models(ModelListing::Cached)).unwrap();
     assert_eq!(
         models
             .iter()

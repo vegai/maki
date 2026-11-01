@@ -213,10 +213,6 @@ impl History {
         self.unsaved = !saved;
     }
 
-    pub fn mark_saved(&mut self) {
-        self.unsaved = false;
-    }
-
     pub fn with_mirror(mut self, mirror: SharedMessages) -> Self {
         self.mirror = Some(mirror);
         self.publish();

@@ -14,6 +14,7 @@ use serde_json::{Map, Value};
 
 use super::OAUTH_TOKEN_ENV;
 use super::error::{Error, Problem};
+use super::stream::INITIALIZE;
 use super::validation::{CONFIG_DIR_ENV, HOME_ENV, TMPDIR_ENV};
 
 pub(crate) const MINIMUM_VERSION: [u64; 3] = [2, 1, 284];
@@ -23,7 +24,7 @@ pub(crate) const HOOKS_ANSWER: &str = "hooks";
 pub(crate) const HANDSHAKE: &[HandshakeStep] = &[
     HandshakeStep {
         id: ACCOUNT_ANSWER,
-        subtype: "initialize",
+        subtype: INITIALIZE,
     },
     HandshakeStep {
         id: SETTINGS_ANSWER,
@@ -37,6 +38,7 @@ pub(crate) const HANDSHAKE: &[HandshakeStep] = &[
 const NO_PROXY: &str = "NO_PROXY";
 const LOOPBACK: &str = "127.0.0.1";
 const ESSENTIAL_TRAFFIC_ONLY: (&str, &str) = ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+const NO_ATTACHMENTS: (&str, &str) = ("CLAUDE_CODE_DISABLE_ATTACHMENTS", "1");
 pub(super) const PROXY_ENV: &[&str] = &["HTTP_PROXY", "HTTPS_PROXY"];
 const PASSED_ENV: &[&str] = &[
     "PATH",
@@ -248,10 +250,9 @@ pub(crate) fn launch_env(
     {
         env.push((NO_PROXY.to_owned(), LOOPBACK.to_owned()));
     }
-    env.push((
-        ESSENTIAL_TRAFFIC_ONLY.0.to_owned(),
-        ESSENTIAL_TRAFFIC_ONLY.1.to_owned(),
-    ));
+    for (name, value) in [ESSENTIAL_TRAFFIC_ONLY, NO_ATTACHMENTS] {
+        env.push((name.to_owned(), value.to_owned()));
+    }
     withheld.sort();
     (env, withheld)
 }
@@ -653,10 +654,10 @@ mod tests {
     use super::{
         ACCOUNT_ANSWER, COMMONDIR_FILE, CONNECTED, DEFAULT_MODE, ESSENTIAL_TRAFFIC_ONLY,
         FLAG_SOURCE, GIT_ENTRY, HANDSHAKE, HOOKS_ANSWER, InitExpect, MAX_GIT_PATH_BYTES,
-        MAX_SETTINGS_BYTES, NO_KEY_SOURCE, NOT_AN_OBJECT, POLICY_SOURCE, SETTINGS_ANSWER,
-        SETTINGS_TOO_LARGE, UNREADABLE_FILE, account_problem, config_dir, file_conflicts,
-        init_problem, launch_env, local_settings_dirs, minimum_version, plugins_problem,
-        policy_problem, profile, settings_conflicts,
+        MAX_SETTINGS_BYTES, NO_ATTACHMENTS, NO_KEY_SOURCE, NOT_AN_OBJECT, POLICY_SOURCE,
+        SETTINGS_ANSWER, SETTINGS_TOO_LARGE, UNREADABLE_FILE, account_problem, config_dir,
+        file_conflicts, init_problem, launch_env, local_settings_dirs, minimum_version,
+        plugins_problem, policy_problem, profile, settings_conflicts,
     };
 
     const VERSION: &str = "2.1.284";
@@ -740,24 +741,27 @@ mod tests {
                 PROXY_ENV,
                 LOCALE_ENV,
                 "NO_PROXY",
-                ESSENTIAL_TRAFFIC_ONLY.0
+                ESSENTIAL_TRAFFIC_ONLY.0,
+                NO_ATTACHMENTS.0
             ]
         );
         assert_eq!(withheld, [API_KEY_ENV, BEDROCK_ENV]);
     }
 
-    #[test_case(None ; "unset")]
-    #[test_case(Some("") ; "empty")]
-    #[test_case(Some(ESSENTIAL_TRAFFIC_ONLY.1) ; "already_disabled")]
-    fn children_disable_nonessential_traffic(setting: Option<&str>) {
-        let environ = setting.map(|value| (ESSENTIAL_TRAFFIC_ONLY.0.to_owned(), value.to_owned()));
-        let (env, _) = launch_env(environ);
-        let settings: Vec<_> = env
-            .iter()
-            .filter(|(name, _)| name == ESSENTIAL_TRAFFIC_ONLY.0)
-            .map(|(_, value)| value.as_str())
-            .collect();
-        assert_eq!(settings, [ESSENTIAL_TRAFFIC_ONLY.1]);
+    #[test_case(ESSENTIAL_TRAFFIC_ONLY ; "nonessential_traffic")]
+    #[test_case(NO_ATTACHMENTS ; "attachments")]
+    fn children_always_disable_unsafe_defaults((name, disabled): (&str, &str)) {
+        const ENABLED: &str = "0";
+        for setting in [None, Some(""), Some(ENABLED), Some(disabled)] {
+            let environ = setting.map(|value| (name.to_owned(), value.to_owned()));
+            let (env, _) = launch_env(environ);
+            let settings: Vec<_> = env
+                .iter()
+                .filter(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+                .collect();
+            assert_eq!(settings, [disabled]);
+        }
     }
 
     #[test_case("2.1.285 (Claude Code)" => matches Ok(version) if version == "2.1.285" ; "newer_patch")]

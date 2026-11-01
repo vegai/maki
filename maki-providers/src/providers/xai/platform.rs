@@ -245,11 +245,7 @@ impl Provider for Xai {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        self.list_models_for(ModelListing::Cached)
-    }
-
-    fn list_models_for(
+    fn list_models(
         &self,
         listing: ModelListing,
     ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {

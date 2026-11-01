@@ -126,7 +126,7 @@ local function symlinked_parent(cwd, path, checked)
   for part in path:gmatch("([^/]+)/") do
     parent = maki.fs.joinpath(parent, part)
     if checked[parent] == nil then
-      local meta = maki.fs.metadata(parent, false)
+      local meta = maki.fs.metadata(parent, { follow = false })
       checked[parent] = meta and meta.is_symlink or false
     end
     if checked[parent] then
@@ -230,7 +230,7 @@ local function copy_dependencies(call, artifact, spec, paths)
     local source = maki.fs.joinpath(spec.cwd, dir)
     local target = maki.fs.joinpath(artifact.snapshot, dir)
     local parent = symlinked_parent(spec.cwd, dir, checked)
-    local meta = maki.fs.metadata(source, false)
+    local meta = maki.fs.metadata(source, { follow = false })
     if parent then
       artifact.notes[#artifact.notes + 1] = "the dependency "
         .. dir
@@ -397,8 +397,7 @@ local function unsettled_dependencies(call, artifact, spec, dependencies, marker
 end
 
 --- {spec} has `cwd` (resolved), `env`, `deny_read`, `include` and
---- `dependencies`. A dependency that changed during the copy sets
---- `artifact.unsettled`.
+--- `dependencies`. Reports dependencies that changed during the copy.
 function M.fill(call, artifact, spec)
   spec.excluded_pathspecs = git_utils.excluded_pathspecs(spec.deny_read)
   artifact.excluded_pathspecs = git_utils.collection_pathspecs(spec.dependencies)
@@ -425,9 +424,8 @@ function M.fill(call, artifact, spec)
     return unsettled_err
   end
   if #unsettled > 0 then
-    artifact.unsettled = path_utils.shown(unsettled)
     artifact.notes[#artifact.notes + 1] = "dependencies changed during the copy, so they may mix two versions: "
-      .. artifact.unsettled
+      .. path_utils.shown(unsettled)
       .. ". Mention this for every check that uses them."
   end
   return commit_base(call, artifact, paths, spec.dependencies) or consistency_problem(call, artifact, spec)
@@ -521,7 +519,7 @@ function M.resolve_root(root, spec)
       return nil, "maki cannot read " .. existing .. ": " .. meta_err
     end
     local name, parent = maki.fs.basename(existing), maki.fs.dirname(existing)
-    local entry, entry_err = maki.fs.metadata(existing, false)
+    local entry, entry_err = maki.fs.metadata(existing, { follow = false })
     if entry then
       return nil, existing .. LINK_TO_NOWHERE
     elseif entry_err then

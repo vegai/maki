@@ -1,7 +1,8 @@
 //! On-disk cache of discovered model specs, so the model picker shows the last
 //! discovery instantly instead of waiting on every provider's /models
-//! endpoint. Live discovery always runs right after, and each provider's live
-//! answer replaces what the cache said about it.
+//! endpoint. Live discovery always runs right after. Each successful provider
+//! answer replaces its cached models. A failed probe without a static fallback
+//! keeps the cached models available.
 //!
 //! The cache only ever feeds the picker list. It never touches the model
 //! registry, so pricing, context windows, tier picks and
@@ -70,6 +71,14 @@ impl Listing {
     /// last run leaves the picker instead of failing when picked.
     fn add_live(&mut self, batch: &ModelBatch) {
         self.degraded |= !batch.warnings.is_empty();
+        if batch.models.is_empty()
+            && let Some(provider) = batch.failed_provider
+        {
+            self.live.extend(
+                self.replayed
+                    .extract_if(.., |spec| provider_of(spec) == provider),
+            );
+        }
         self.replayed.retain(|old| {
             !batch
                 .models
@@ -249,7 +258,7 @@ fn store_discovery(path: &Path, listing: &Listing, fingerprint: String, now_ms: 
 /// Like [`fetch_all_models`], but the first `on_update` comes straight from
 /// the on-disk cache. Every call carries the whole list to show, not a delta,
 /// plus the warnings of the batch that changed it. The last call has
-/// `loading` off and holds only this run's live answer.
+/// `loading` off and retains cached models only for failed probes without a fallback.
 pub async fn fetch_all_models_cached(
     policy: &ModelPolicy,
     mut on_update: impl FnMut(ModelList, Vec<String>),
@@ -293,9 +302,14 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::providers::claude_code::SLUG;
 
     const FINGERPRINT: &str = "fingerprint-a";
     const NOW: u64 = 1_700_000_000_000;
+    const CACHED_CLAUDE: &str = "claude-code/cached";
+    const LIVE_CLAUDE: &str = "claude-code/live";
+    const OTHER_LIVE: &str = "other/live";
+    const LISTING_FAILED: &str = "provider is busy or offline";
 
     fn specs(specs: &[&str]) -> Vec<String> {
         specs.iter().map(|s| s.to_string()).collect()
@@ -320,6 +334,7 @@ mod tests {
         ModelBatch {
             models: specs(models),
             warnings: specs(warnings),
+            failed_provider: None,
         }
     }
 
@@ -371,6 +386,35 @@ mod tests {
             ["a/kept", "a/new"],
             "a provider that never answered live must not keep its cached specs"
         );
+    }
+
+    #[test_case(true, &[], &[OTHER_LIVE, CACHED_CLAUDE] ; "failed_refresh_keeps_cached_models")]
+    #[test_case(false, &[], &[OTHER_LIVE] ; "successful_empty_refresh_removes_cached_models")]
+    #[test_case(true, &[LIVE_CLAUDE], &[OTHER_LIVE, LIVE_CLAUDE] ; "static_fallback_replaces_cached_models")]
+    #[test_case(false, &[LIVE_CLAUDE], &[OTHER_LIVE, LIVE_CLAUDE] ; "successful_refresh_replaces_cached_models")]
+    fn a_failed_provider_survives_mixed_discovery_in_the_picker_and_on_disk(
+        failed: bool,
+        models: &[&str],
+        expected: &[&str],
+    ) {
+        let (_dir, path) = cache_file(&[CACHED_CLAUDE, "removed/cached"]);
+        let mut listing = Listing {
+            replayed: load_from(&path).unwrap().specs,
+            ..Listing::default()
+        };
+        listing.add_live(&batch(&[OTHER_LIVE], &[]));
+        listing.add_live(&ModelBatch {
+            models: specs(models),
+            warnings: if failed {
+                specs(&[LISTING_FAILED])
+            } else {
+                Vec::new()
+            },
+            failed_provider: failed.then_some(SLUG),
+        });
+        store_discovery(&path, &listing, FINGERPRINT.into(), NOW);
+        assert_eq!(listing.finish().specs, expected);
+        assert_eq!(load_from(&path).unwrap().specs, expected);
     }
 
     #[test_case(&[],            true,  &["good/model"] ; "degraded_empty_keeps_cache")]

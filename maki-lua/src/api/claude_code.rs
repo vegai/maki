@@ -389,16 +389,19 @@ async fn sanitize_git(
     .await;
     let paths = try_pair!(result);
     let result = lua.create_table()?;
-    result.set("git_metadata", paths.git_metadata)?;
-    result.set("repositories", paths.repositories)?;
+    result.set("git_metadata", path_list(&lua, &paths.git_metadata)?)?;
+    result.set("repositories", path_list(&lua, &paths.repositories)?)?;
     result.set("private_files", paths.private_files)?;
-    let dropped_links = paths
-        .dropped_links
+    result.set("dropped_links", path_list(&lua, &paths.dropped_links)?)?;
+    Ok((Some(result), None))
+}
+
+fn path_list(lua: &Lua, paths: &[PathBuf]) -> LuaResult<Table> {
+    let paths = paths
         .iter()
         .map(|path| lua.create_string(path.as_os_str().as_bytes()))
         .collect::<LuaResult<Vec<_>>>()?;
-    result.set("dropped_links", lua.create_sequence_from(dropped_links)?)?;
-    Ok((Some(result), None))
+    lua.create_sequence_from(paths)
 }
 
 /// Unpack a supervised git cat-file batch into private stage files.
@@ -534,11 +537,14 @@ lua_table! {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::fs::{self, Permissions};
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::path::PathBuf;
     use std::process::Command;
 
-    use mlua::{AnyUserData, Function, Lua, ObjectLike, Table, Value as LuaValue};
+    use mlua::{AnyUserData, Function, Lua, LuaString, ObjectLike, Table, Value as LuaValue};
     use serde_json::{Value, json};
     use tempfile::tempdir;
     use test_case::test_case;
@@ -552,6 +558,42 @@ mod tests {
     const NESTED: &str = "src";
     const FILE_CONTENT: &str = "file";
     const PRINT_PATH: &str = "printf %s ";
+    const NON_UTF8_DIR: &[u8] = b"nested\xff";
+
+    #[test_case(false ; "git_metadata")]
+    #[test_case(true ; "repository")]
+    fn quarantined_paths_keep_their_filename_bytes_in_lua(repository: bool) {
+        let root = tempdir().unwrap();
+        let snapshot = root.path().join("snapshot");
+        let quarantine = root.path().join("quarantine");
+        let git = root.path().join("git");
+        let relative = PathBuf::from(OsStr::from_bytes(NON_UTF8_DIR));
+        let directory = snapshot.join(&relative);
+        fs::create_dir_all(&directory).unwrap();
+        let (field, expected) = if repository {
+            fs::create_dir(directory.join("objects")).unwrap();
+            fs::write(directory.join("HEAD"), FILE_CONTENT).unwrap();
+            ("repositories", relative)
+        } else {
+            fs::write(directory.join(GIT_ENTRY), FILE_CONTENT).unwrap();
+            ("git_metadata", relative.join(GIT_ENTRY))
+        };
+        let lua = Lua::new();
+        let table = create_claude_code_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let sanitize: Function = table.get("sanitize_git").unwrap();
+        let (result, error): (Option<Table>, Option<String>) =
+            smol::block_on(sanitize.call_async((
+                snapshot.to_str().unwrap(),
+                quarantine.to_str().unwrap(),
+                git.to_str().unwrap(),
+                true,
+            )))
+            .unwrap();
+        assert_eq!(error, None);
+        let paths: Vec<LuaString> = result.unwrap().get(field).unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(&*paths[0].as_bytes(), expected.as_os_str().as_bytes());
+    }
 
     #[test_case(b"a'\\\n\xff\xc3\xa9", "a'\\\\\\012\\377é" ; "mixed_valid_and_invalid_utf8")]
     #[test_case(b"a\xe2\x80\xae\xff", "a\\u202e\\377" ; "bidi_and_invalid_byte")]

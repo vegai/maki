@@ -88,8 +88,6 @@ const CLAUDE_CODE: EffortDialect = EffortDialect {
 const WAIT: Duration = Duration::from_secs(30);
 const PLUGIN_OFF: &str =
     "enable the claude_code plugin in init.lua: `plugins = { claude_code = { enabled = true } }`";
-/// The login lives in Claude Code's config directory, so there is no key
-/// variable.
 const WAITING_FOR_SLOT: &str = "waiting for a Claude Code request slot";
 const MODELS_CACHE_FILE: &str = "claude-code-models.json";
 /// Same as the models.dev catalog, because a listing starts several `claude`
@@ -121,10 +119,7 @@ type PlanUsage = Arc<Mutex<Option<ProviderUsage>>>;
 static PLAN_USAGE: Mutex<BTreeMap<(PathBuf, PathBuf), PlanUsage>> = Mutex::new(BTreeMap::new());
 /// `None` when the provider is off.
 static PLUGIN_OPTIONS: Mutex<Option<PluginOptions>> = Mutex::new(None);
-#[derive(Default)]
-struct ListingState {
-    completed: Option<(Instant, Result<Vec<Listed>, String>)>,
-}
+type ListingState = Option<(Instant, Result<Vec<Listed>, String>)>;
 
 type ListingLocks = BTreeMap<(PathBuf, PathBuf), Arc<AsyncMutex<ListingState>>>;
 
@@ -529,7 +524,7 @@ impl ClaudeCode {
         {
             return Ok(models);
         }
-        if let Some((at, result)) = &state.completed {
+        if let Some((at, result)) = &*state {
             let age = at.elapsed();
             if *at >= started
                 || (listing == ModelListing::Cached && result.is_err() && age < FAILED_LISTING_TTL)
@@ -541,7 +536,7 @@ impl ClaudeCode {
             }
         }
         let listed = self.ask_models(cwd, vars, listing).await;
-        state.completed = match &listed {
+        *state = match &listed {
             Err(error) if error.is_version_error() || matches!(error, Error::ListingBusy) => None,
             _ => Some((
                 Instant::now(),
@@ -668,11 +663,7 @@ impl Provider for ClaudeCode {
 
     /// Asks Claude Code which models the account can use, so a new model
     /// shows up without a maki update.
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        self.list_models_for(ModelListing::Cached)
-    }
-
-    fn list_models_for(
+    fn list_models(
         &self,
         listing: ModelListing,
     ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {

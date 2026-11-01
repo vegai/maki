@@ -207,27 +207,29 @@ impl SessionTrack {
         session.meta.workflow = input.workflow;
         store.base_usage = store.session.token_usage;
         store.ledger = Arc::default();
-        let ledger = Arc::clone(&store.ledger);
         store.publish_header(true);
         drop(store);
-        SessionTurn {
-            track: self,
-            ledger,
-        }
+        SessionTurn { track: self }
     }
 }
 
 /// A turn in progress. See [`SessionTrack::turn`].
 pub struct SessionTurn<'a> {
     track: &'a mut SessionTrack,
-    ledger: Arc<RunLedger>,
 }
 
 impl SessionTurn<'_> {
     /// What the turn's agent bills to. The turn adds it to the session's
     /// usage when it ends, so the agent must be built with this one.
     pub fn ledger(&self) -> Arc<RunLedger> {
-        Arc::clone(&self.ledger)
+        Arc::clone(
+            &self
+                .track
+                .store
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .ledger,
+        )
     }
 
     pub fn record_error(&mut self, message: String) {
@@ -282,6 +284,11 @@ impl SessionCheckpoint {
         context_size: u32,
         unsaved: bool,
     ) -> bool {
+        if let Ok(store) = self.0.try_lock()
+            && !store.needs_save(&snapshot, unsaved)
+        {
+            return true;
+        }
         let store = Arc::clone(&self.0);
         smol::unblock(move || {
             let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
@@ -338,22 +345,25 @@ impl SessionStore {
         }));
     }
 
-    /// `context_size` travels with the messages, since a resumed session seeds
-    /// its gauge from it. Stored without one, the next process is back to
-    /// estimating a transcript this one had measured.
-    ///
     /// An empty transcript is not a session, the same rule [`save_new`]
     /// holds a new one to. An empty log is one the picker offers and `--continue`
     /// resolves to, so a run killed before its first turn would leave a dead
     /// entry behind for good. The same guard stops a history that sanitized
     /// down to nothing from replacing the copy it was restored from.
+    fn needs_save(&self, snapshot: &HistorySnapshot, unsaved: bool) -> bool {
+        !snapshot.messages.is_empty()
+            && (unsaved || self.session.token_usage != self.current_usage())
+    }
+
+    /// `context_size` travels with the messages, since a resumed session seeds
+    /// its gauge from it. Stored without one, the next process is back to
+    /// estimating a transcript this one had measured.
     fn save(&mut self, snapshot: &HistorySnapshot, context_size: u32, unsaved: bool) -> bool {
-        let usage = self.current_usage();
-        if snapshot.messages.is_empty() || !unsaved && self.session.token_usage == usage {
+        if !self.needs_save(snapshot, unsaved) {
             return true;
         }
         self.session.set_history(snapshot);
-        self.session.token_usage = usage;
+        self.session.token_usage = self.current_usage();
         self.session.meta.context_size = context_size;
         self.session.update_title_if_default();
         match self.claim.persist(&self.session) {

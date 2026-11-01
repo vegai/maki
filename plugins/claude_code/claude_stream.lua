@@ -42,8 +42,6 @@ function Stream.new(expect)
     accepted = false,
     model_checked = false,
     usage_by_message = {},
-    result = nil,
-    rate_limit = nil,
   }, Stream)
 end
 

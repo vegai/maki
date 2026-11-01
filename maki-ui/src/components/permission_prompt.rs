@@ -10,9 +10,11 @@ use ratatui::widgets::{Paragraph, Wrap};
 use maki_agent::permissions::{DEFAULT_DENY_GUIDANCE, PermissionAnswer, generalized_scopes};
 use maki_config::ToolKey;
 
-use crate::components::form::render_form;
+use crate::components::form::{content_rows, render_form};
 use crate::components::hint_line;
 use crate::components::is_ctrl;
+use crate::components::keybindings::key;
+use crate::components::modal::BORDER;
 use crate::components::{ModalScroll, Overlay};
 use crate::text_buffer::TextBuffer;
 use crate::theme;
@@ -77,7 +79,14 @@ const CONFIRM_DENY_PROJECT_SESSION_HINTS: &[(&str, &str)] = &[
 const DENY_GUIDANCE_HINTS: &[(&str, &str)] = &[("Enter", "Deny"), ("Esc", "Cancel")];
 const QUEUED_NOTICE: &str = "more request(s) waiting";
 const TITLE: &str = " Permission Required ";
-const SCROLL_TITLE: &str = " Permission Required (PgUp/PgDn: scroll) ";
+
+fn scroll_title() -> String {
+    format!(
+        "{TITLE}({}/{}: scroll) ",
+        key::SCROLL_PAGE_UP.label,
+        key::SCROLL_PAGE_DOWN.label
+    )
+}
 
 fn aligned_hint_rows(rows: &[&[(&str, &str)]]) -> Vec<Line<'static>> {
     let t = theme::current();
@@ -465,27 +474,34 @@ impl PermissionPrompt {
         if !self.is_open() {
             return;
         }
-        let paragraph = Paragraph::new(self.build_lines()).wrap(Wrap { trim: false });
-        let total =
-            u16::try_from(paragraph.line_count(area.width.saturating_sub(2))).unwrap_or(u16::MAX);
-        let viewport = area.height.saturating_sub(2);
+        let paragraph = self.paragraph();
+        let total = content_rows(&paragraph, area.width);
+        let viewport = area.height.saturating_sub(BORDER);
         self.scroll.update_dimensions(total, viewport);
         let title = if total > viewport {
-            SCROLL_TITLE
+            scroll_title()
         } else {
-            TITLE
+            TITLE.to_owned()
         };
         let t = theme::current();
-        render_form(&t, title, frame, area, paragraph, (self.scroll.offset(), 0));
+        let clipped = total > viewport.saturating_add(self.scroll.offset());
+        render_form(
+            &t,
+            &title,
+            frame,
+            area,
+            paragraph,
+            (self.scroll.offset(), 0),
+            clipped,
+        );
     }
 
     pub fn height(&self, width: u16) -> u16 {
-        let inner_width = width.saturating_sub(2);
-        let lines = self.build_lines();
-        let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-        u16::try_from(para.line_count(inner_width))
-            .unwrap_or(u16::MAX)
-            .saturating_add(2)
+        content_rows(&self.paragraph(), width).saturating_add(BORDER)
+    }
+
+    fn paragraph(&self) -> Paragraph<'static> {
+        Paragraph::new(self.build_lines()).wrap(Wrap { trim: false })
     }
 }
 
@@ -502,8 +518,8 @@ mod tests {
     use super::{
         CONFIRM_ALLOW_ALL_HINTS, CONFIRM_ALLOW_PROJECT_HINTS, CONFIRM_ALLOW_PROJECT_SESSION_HINTS,
         CONFIRM_DENY_ALL_HINTS, CONFIRM_DENY_PROJECT_HINTS, CONFIRM_DENY_PROJECT_SESSION_HINTS,
-        CONFIRM_SESSION_HINTS, Overlay, PermissionPrompt, PromptState, QUEUED_NOTICE, SCROLL_TITLE,
-        UNTRUSTED_DURABLE_ANSWER, UNTRUSTED_NOTICE,
+        CONFIRM_SESSION_HINTS, Overlay, PermissionPrompt, PromptState, QUEUED_NOTICE,
+        UNTRUSTED_DURABLE_ANSWER, UNTRUSTED_NOTICE, scroll_title,
     };
 
     const MAIN_ID: &str = "id";
@@ -694,7 +710,7 @@ mod tests {
                 None,
             );
         }
-        assert!(draw(&mut prompt, VIEW_WIDTH).contains(SCROLL_TITLE));
+        assert!(draw(&mut prompt, VIEW_WIDTH).contains(&scroll_title()));
         prompt.handle_key(binding::SCROLL_BOTTOM.to_key_event());
         assert!(prompt.scroll.offset() > 0);
         if cancelled {

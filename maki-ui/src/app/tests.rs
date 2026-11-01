@@ -850,11 +850,12 @@ fn agent_error_lands_in_chat(message: String, expected: String) {
     let mut app = test_app();
     app.run_id = 1;
     app.update(agent_msg(AgentEvent::Error {
-        message,
+        message: message.clone(),
         auth: false,
     }));
     assert_eq!(app.chats[0].last_message_role(), Some(&DisplayRole::Error));
     assert_eq!(app.chats[0].last_message_text(), expected);
+    assert_eq!(app.state.session.errors()[0].message, message);
 }
 
 #[test_case(error_app as fn(&mut App) ; "error")]

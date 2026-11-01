@@ -1,3 +1,4 @@
+use crate::components::modal::BORDER;
 use crate::theme::Theme;
 
 use ratatui::Frame;
@@ -8,6 +9,10 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 
 pub(crate) const CLIPPED_CONTENT: &str = " more content below ";
 
+pub(crate) fn content_rows(paragraph: &Paragraph<'_>, width: u16) -> u16 {
+    u16::try_from(paragraph.line_count(width.saturating_sub(BORDER))).unwrap_or(u16::MAX)
+}
+
 pub(crate) fn render_form(
     t: &Theme,
     title: &str,
@@ -15,6 +20,7 @@ pub(crate) fn render_form(
     area: Rect,
     paragraph: Paragraph<'static>,
     scroll: (u16, u16),
+    clipped: bool,
 ) {
     let mut block = Block::default()
         .borders(Borders::ALL)
@@ -27,8 +33,7 @@ pub(crate) fn render_form(
         .style(Style::new().fg(t.foreground))
         .wrap(Wrap { trim: false })
         .scroll(scroll);
-    let visible_rows = usize::from(area.height.saturating_sub(2)) + usize::from(scroll.0);
-    if paragraph.line_count(area.width.saturating_sub(2)) > visible_rows {
+    if clipped {
         block = block.title_bottom(Line::from(CLIPPED_CONTENT).right_aligned());
     }
     frame.render_widget(paragraph.block(block), area);

@@ -50,7 +50,6 @@ const SYSTEM_PROMPT_FILE_FLAG: &str = "--system-prompt-file";
 const THINKING_BUDGET_ENV: &str = "MAX_THINKING_TOKENS";
 const NO_THINKING: (&str, &str) = ("CLAUDE_CODE_DISABLE_THINKING", "1");
 const SHOWN_THINKING: (&str, &str) = ("--thinking-display", "summarized");
-const NO_ATTACHMENTS: (&str, &str) = ("CLAUDE_CODE_DISABLE_ATTACHMENTS", "1");
 const NO_AUTO_COMPACT: (&str, &str) = ("DISABLE_AUTO_COMPACT", "1");
 const NO_NONSTREAMING_FALLBACK: (&str, &str) = ("CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK", "1");
 // A CLI retry starts a second generation inside one stream. maki retries the whole request.
@@ -262,7 +261,6 @@ fn run_args(
     ]);
     let mut env = req.launch.env.to_vec();
     for (name, value) in [
-        NO_ATTACHMENTS,
         NO_AUTO_COMPACT,
         NO_NONSTREAMING_FALLBACK,
         NO_CLI_RETRIES,

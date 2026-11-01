@@ -386,6 +386,7 @@ fn error_description(error: &AgentError) -> String {
 
 #[cfg(test)]
 mod tests {
+    use maki_providers::provider::ModelListing;
     use std::path::Path;
     use std::sync::Mutex;
 
@@ -635,6 +636,7 @@ mod tests {
 
         fn list_models(
             &self,
+            _listing: ModelListing,
         ) -> maki_providers::provider::BoxFuture<
             '_,
             Result<Vec<maki_providers::ModelInfo>, AgentError>,
@@ -902,6 +904,7 @@ mod tests {
 
         fn list_models(
             &self,
+            _listing: ModelListing,
         ) -> maki_providers::provider::BoxFuture<
             '_,
             Result<Vec<maki_providers::ModelInfo>, AgentError>,

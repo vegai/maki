@@ -1835,7 +1835,7 @@ impl App {
                 }
                 ChatEventResult::Error(message) => {
                     let displayed = cap_error_text(&message);
-                    Arc::make_mut(&mut self.state.session).record_error(displayed.clone());
+                    Arc::make_mut(&mut self.state.session).record_error(message.clone());
                     self.status = Status::error(message.clone());
                     self.status_bar.clear_flash();
                     self.main_chat()

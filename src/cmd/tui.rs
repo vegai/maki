@@ -18,7 +18,7 @@ use maki_storage::StateDir;
 use maki_storage::sessions::StoredThinking;
 use maki_ui::{OpenSession, RunOutcome};
 
-use crate::cli::{Cli, TOOL_ARGUMENT_PATTERNS_UNSUPPORTED, is_tool_argument_pattern};
+use crate::cli::Cli;
 use crate::provider_scripts;
 use crate::resume::{self, Resolved};
 use crate::setup;
@@ -41,22 +41,14 @@ fn tool_filter_warnings(cli: &Cli, registry: &ToolRegistry, startup: bool) -> Re
         ));
     }
     let mut warnings = Vec::new();
-    for name in cli
-        .disallowed_tools
-        .iter()
-        .filter(|name| is_tool_argument_pattern(name))
-    {
-        warnings.push(format!(
-            "--disallowed-tools: {TOOL_ARGUMENT_PATTERNS_UNSUPPORTED}: '{name}'"
-        ));
-    }
     for (flag, names) in [
         ("--allowed-tools", &cli.allowed_tools),
         ("--disallowed-tools", &cli.disallowed_tools),
     ] {
-        for name in names.iter().filter(|name| {
-            *name != TOOL_SEARCH_TOOL_NAME && !known(name) && !is_tool_argument_pattern(name)
-        }) {
+        for name in names
+            .iter()
+            .filter(|name| *name != TOOL_SEARCH_TOOL_NAME && !known(name))
+        {
             let mut warning = format!("no loaded tool matches '{name}' in {flag}.");
             let suggestion = name.replace('-', "_");
             if suggestion != *name && registry.get(&suggestion).is_some() {
@@ -704,16 +696,6 @@ mod tests {
             assert_eq!(warnings.len(), 1);
             assert!(warnings[0].contains(MISSING_TOOL));
         }
-    }
-
-    #[test_case("Bash(git log:*)")]
-    #[test_case("srv.probe(argument:*)")]
-    fn tool_filter_warnings_explain_unsupported_argument_patterns(name: &str) {
-        let cli = Cli::parse_from(["maki", "--disallowed-tools", name]);
-        let warnings = tool_filter_warnings(&cli, &ToolRegistry::new(), true).unwrap();
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains(TOOL_ARGUMENT_PATTERNS_UNSUPPORTED));
-        assert!(!warnings[0].contains("load later"));
     }
 
     fn no_names(_: &PluginHost) -> Result<Vec<String>> {

@@ -36,7 +36,9 @@ use serde_json::Value;
 use crate::headless_startup::{start_mcp, startup};
 use crate::notice::{NOTIFICATION, ProviderNotice};
 use crate::shutdown::watch;
-use crate::wire::{ERROR_DURING_EXECUTION, SUCCESS, failure_subtype, system_event};
+use crate::wire::{
+    API_RETRY, ERROR_DURING_EXECUTION, INIT, SUCCESS, failure_subtype, system_event,
+};
 
 const SESSION_LINE_PREFIX: &str = "session: ";
 
@@ -95,11 +97,7 @@ impl PrintResult {
 
 #[derive(Serialize)]
 struct InitEvent<'a> {
-    #[serde(rename = "type")]
-    event_type: &'static str,
-    subtype: &'static str,
     cwd: &'a str,
-    session_id: &'a SessionRef,
     tools: &'a [String],
     model: &'a str,
     thinking: String,
@@ -141,13 +139,9 @@ struct UserMessage<'a> {
 
 #[derive(Serialize)]
 struct RetryEvent<'a> {
-    #[serde(rename = "type")]
-    event_type: &'static str,
-    subtype: &'static str,
     attempt: u32,
     retry_delay_ms: u64,
     error: &'a str,
-    session_id: &'a SessionRef,
 }
 
 enum VerboseOutput {
@@ -223,10 +217,9 @@ pub fn run(params: PrintParams) -> Result<()> {
     let prompt_slots = lua_handle.collect_prompt_slots();
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    let mcp_handle = start_mcp(&cwd, project_config.clone());
-
     let (trigger, shutdown) = CancelToken::new();
     watch(trigger).context("watch termination signals")?;
+    let mcp_handle = start_mcp(&cwd, project_config.clone());
     let (handle, mut events) = headless::spawn(HeadlessParams {
         shutdown,
         dry_run,
@@ -266,6 +259,7 @@ pub fn run(params: PrintParams) -> Result<()> {
             Ok(started) => started,
             Err(error) => {
                 smol::block_on(headless::await_shutdown(task));
+                lua_handle.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
                 if !matches!(format, OutputFormat::Text) {
                     write_result(
                         format,
@@ -281,38 +275,31 @@ pub fn run(params: PrintParams) -> Result<()> {
             }
         };
 
-    if dry_run {
-        smol::block_on(headless::await_shutdown(task));
-        println!(
-            "{}",
-            serde_json::to_string(&InitEvent {
-                event_type: "system",
-                subtype: "init",
+    {
+        let init = system_event(
+            &session_id,
+            INIT,
+            InitEvent {
                 cwd: &cwd,
-                session_id: &session_id,
                 tools: &tool_names,
                 model: &model.id,
-                thinking
-            })?
+                thinking,
+            },
         );
-        return Ok(());
-    }
+        if dry_run {
+            smol::block_on(headless::await_shutdown(task));
+            lua_handle.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
+            println!("{}", serde_json::to_string(&init)?);
+            return Ok(());
+        }
 
-    match &mut verbose_out {
-        Some(out) => out.emit(&InitEvent {
-            event_type: "system",
-            subtype: "init",
-            cwd: &cwd,
-            session_id: &session_id,
-            tools: &tool_names,
-            model: &model.id,
-            thinking,
-        })?,
-        // Text mode never says which session it wrote, and a later `-r`
-        // needs it. On stderr so a pipe reading the answer is unaffected.
-        None => eprintln!("{SESSION_LINE_PREFIX}{session_id}"),
+        match &mut verbose_out {
+            Some(out) => out.emit(&init)?,
+            // Text mode never says which session it wrote, and a later `-r`
+            // needs it. On stderr so a pipe reading the answer is unaffected.
+            None => eprintln!("{SESSION_LINE_PREFIX}{session_id}"),
+        }
     }
-
     let mut result_text = String::new();
     let mut is_error = false;
     let mut num_turns: u32 = 0;
@@ -405,14 +392,15 @@ pub fn run(params: PrintParams) -> Result<()> {
                 delay_ms,
             } => {
                 if let Some(out) = &mut verbose_out {
-                    out.emit(&RetryEvent {
-                        event_type: "system",
-                        subtype: "api_retry",
-                        attempt: *attempt,
-                        retry_delay_ms: *delay_ms,
-                        error: message,
-                        session_id: &session_id,
-                    })?;
+                    out.emit(&system_event(
+                        &session_id,
+                        API_RETRY,
+                        RetryEvent {
+                            attempt: *attempt,
+                            retry_delay_ms: *delay_ms,
+                            error: message,
+                        },
+                    ))?;
                 }
             }
             AgentEvent::TurnComplete(tc) => {
@@ -577,6 +565,7 @@ mod tests {
         "duration_ms",
     ];
     const INIT_EVENT_FIELDS: &[&str] = &[
+        "uuid",
         "type",
         "subtype",
         "cwd",
@@ -586,6 +575,7 @@ mod tests {
         "thinking",
     ];
     const RETRY_EVENT_FIELDS: &[&str] = &[
+        "uuid",
         "type",
         "subtype",
         "attempt",
@@ -614,28 +604,31 @@ mod tests {
         }
 
         let sid = SessionRef::generate();
-        let init = InitEvent {
-            event_type: "system",
-            subtype: "init",
-            cwd: "/tmp",
-            session_id: &sid,
-            tools: &["bash".into(), "read".into()],
-            model: "test-model",
-            thinking: ThinkingConfig::Off.to_string(),
-        };
+        let tools = ["bash".into(), "read".into()];
+        let init = system_event(
+            &sid,
+            INIT,
+            InitEvent {
+                cwd: "/tmp",
+                tools: &tools,
+                model: "test-model",
+                thinking: ThinkingConfig::Off.to_string(),
+            },
+        );
         let json: Value = serde_json::to_value(&init).unwrap();
         for field in INIT_EVENT_FIELDS {
             assert!(json.get(field).is_some(), "InitEvent missing: {field}");
         }
 
-        let retry = RetryEvent {
-            event_type: "system",
-            subtype: "api_retry",
-            attempt: 2,
-            retry_delay_ms: 3000,
-            error: "rate_limit",
-            session_id: &sid,
-        };
+        let retry = system_event(
+            &sid,
+            API_RETRY,
+            RetryEvent {
+                attempt: 2,
+                retry_delay_ms: 3000,
+                error: "rate_limit",
+            },
+        );
         let json: Value = serde_json::to_value(&retry).unwrap();
         for field in RETRY_EVENT_FIELDS {
             assert!(json.get(field).is_some(), "RetryEvent missing: {field}");

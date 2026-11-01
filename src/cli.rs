@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::builder::{PossibleValuesParser, StringValueParser, TypedValueParser};
+use clap::builder::{PossibleValuesParser, TypedValueParser};
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use maki_agent::mcp::WIRE_SEPARATOR;
 use maki_storage::sessions::{Effort, StoredThinking, ThinkingParseError};
@@ -13,12 +13,8 @@ const CLAUDE_MCP_PREFIX: &str = "mcp__";
 pub(crate) const TOOL_ARGUMENT_PATTERNS_UNSUPPORTED: &str =
     "tool argument patterns are not supported; use tool names";
 
-pub(crate) fn is_tool_argument_pattern(name: &str) -> bool {
-    name.contains(['(', ')'])
-}
-
-fn parse_allowed_tool(name: &str) -> Result<String, &'static str> {
-    if is_tool_argument_pattern(name) {
+fn parse_tool_name(name: &str) -> Result<String, &'static str> {
+    if name.contains(['(', ')']) {
         return Err(TOOL_ARGUMENT_PATTERNS_UNSUPPORTED);
     }
     Ok(normalize_tool_name(name))
@@ -141,11 +137,11 @@ pub struct Cli {
     pub exit_on_done: bool,
 
     /// Allowed tools (comma-separated). Accepts PascalCase (Claude Code) or snake_case.
-    #[arg(long, value_delimiter = ',', visible_alias = "allowedTools", value_parser = parse_allowed_tool)]
+    #[arg(long, value_delimiter = ',', visible_alias = "allowedTools", value_parser = parse_tool_name)]
     pub allowed_tools: Vec<String>,
 
     /// Disallowed tools (comma-separated).
-    #[arg(long, value_delimiter = ',', visible_alias = "disallowedTools", value_parser = StringValueParser::new().map(|name| normalize_tool_name(&name)))]
+    #[arg(long, value_delimiter = ',', visible_alias = "disallowedTools", value_parser = parse_tool_name)]
     pub disallowed_tools: Vec<String>,
 
     /// Write this run under a chosen session ID, unless one already exists there
@@ -456,7 +452,9 @@ mod tests {
 
     #[test_case("--allowed-tools")]
     #[test_case("--allowedTools")]
-    fn allowed_tool_argument_patterns_fail_before_startup(flag: &str) {
+    #[test_case("--disallowed-tools")]
+    #[test_case("--disallowedTools")]
+    fn tool_argument_patterns_fail_before_startup(flag: &str) {
         let error = Cli::try_parse_from(["maki", "-p", flag, "Bash(git log:*)"])
             .err()
             .unwrap();

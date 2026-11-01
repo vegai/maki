@@ -18,6 +18,7 @@ use maki_agent::tools::test_support::stub_ctx_in;
 use maki_agent::tools::{ToolContext, ToolRegistry};
 use maki_agent::{AgentEvent, Envelope, EventSender, ToolOutput, ToolOutputLines};
 use maki_lua::{MAX_INFLIGHT_TOOLS, PluginHost, RestoreItem, RestoreReason};
+use maki_providers::claude_code::STARTUP_TIMEOUT_SECS;
 use serde_json::{Map, Value, json};
 use tempfile::{TempDir, tempdir};
 use test_case::test_case;
@@ -485,12 +486,12 @@ impl FakeClaude {
         load(self.opts(max_concurrent))
     }
 
-    fn host_with_short_deadlines(&self) -> (Arc<ToolRegistry>, PluginHost) {
+    fn host_with_deadlines(&self, startup_timeout_secs: u64) -> (Arc<ToolRegistry>, PluginHost) {
         use_fixture_user();
         let registry = Arc::new(ToolRegistry::new());
         let host = PluginHost::new(Arc::clone(&registry)).unwrap();
         let source = format!(
-            "local launch = require(\"claude_launch\")\nlaunch.STARTUP_TIMEOUT_SECS = {TEST_TIMEOUT_SECS}\nlaunch.STARTUP_MS = {TEST_TIMEOUT_SECS} * require(\"claude_jobs\").MS_PER_SEC\nlaunch.MIN_TIMEOUT_SECS = {TEST_TIMEOUT_SECS}\n{}",
+            "require(\"maki.claude_code.internal\").startup_timeout_secs = {startup_timeout_secs}\nrequire(\"claude_launch\").MIN_TIMEOUT_SECS = {TEST_TIMEOUT_SECS}\n{}",
             include_str!("../../../plugins/claude_code/init.lua"),
         );
         host.load_bundled_source(TOOL, &source, self.opts(ONE_SLOT))
@@ -850,7 +851,7 @@ fn a_settings_file_must_be_a_json_object(text: &str, refused: Option<&str>) {
 #[test]
 fn a_run_past_its_timeout_is_killed_and_frees_its_slot() {
     let fake = FakeClaude::new();
-    let (reg, _host) = fake.host_with_short_deadlines();
+    let (reg, _host) = fake.host_with_deadlines(STARTUP_TIMEOUT_SECS);
     let ctx = fake.ctx(None, None);
     let input =
         json!({ "prompt": USAGE_THEN_HANG, "model": MODEL_ALIAS, "timeout": TEST_TIMEOUT_SECS });
@@ -959,7 +960,7 @@ fn a_stopped_run_keeps_what_it_spent() {
 #[test]
 fn the_startup_limit_holds_with_every_slot_taken() {
     let fake = FakeClaude::new();
-    let (reg, host) = fake.host_with_short_deadlines();
+    let (reg, host) = fake.host_with_deadlines(TEST_TIMEOUT_SECS);
     let slot_holder = SLOT_HOLDER.replace(
         "@HANG_MS@",
         &Duration::from_secs(HANG_SECS).as_millis().to_string(),

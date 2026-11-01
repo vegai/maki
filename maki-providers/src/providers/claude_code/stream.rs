@@ -8,7 +8,7 @@ use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use serde::Serialize;
-use serde_json::{Deserializer, Value, json};
+use serde_json::{Value, json};
 use tracing::debug;
 
 use super::checks::{self, ACCOUNT_ANSWER, HANDSHAKE, HOOKS_ANSWER, InitExpect, SETTINGS_ANSWER};
@@ -88,7 +88,6 @@ const REJECTIONS: [&str; 2] = [INPUT_REJECTED, NO_SUCH_TOOL];
 const SHOWN_LINE_CHARS: usize = 80;
 const SHOWN_TOOL_ERROR_CHARS: usize = 1024;
 const MCP_CLOSED: &str = "MCP server \"maki\" connection closed before the tool call";
-const INVOKE_END: &str = "</invoke>";
 /// How many event kinds the trace keeps for a failed request's log.
 const TRACE_LEN: usize = 32;
 const UNNAMED_HOOK: &str = "startup";
@@ -478,9 +477,11 @@ impl Handshake {
                 }
             }
             EventKind::RateLimit => {
-                self.plan_rejected = event["rate_limit_info"]["status"] == PLAN_REJECTED;
-                *plan_usage.lock().unwrap_or_else(PoisonError::into_inner) =
-                    Some(usage_of(&event["rate_limit_info"]));
+                if event["rate_limit_info"].is_object() {
+                    self.plan_rejected = event["rate_limit_info"]["status"] == PLAN_REJECTED;
+                    *plan_usage.lock().unwrap_or_else(PoisonError::into_inner) =
+                        Some(usage_of(&event["rate_limit_info"]));
+                }
                 Step::Nothing
             }
             EventKind::Alive => Step::Alive,
@@ -1141,37 +1142,25 @@ impl<'a> Turn<'a> {
 /// The model names a batch's calls as Claude Code shows the tools, but maki
 /// runs them by its own names. An unknown name stays, so maki reports it.
 fn unexpose_batch(catalog: &Catalog, input: &mut Value) {
-    if let Some(Value::String(encoded)) = input.get(BATCH_CALLS)
-        && let Some(calls) = batch_calls(encoded)
-    {
-        input[BATCH_CALLS] = calls;
-    }
-    if let Some(call) = input.get_mut(BATCH_CALLS)
-        && call.is_object()
-    {
-        *call = Value::Array(vec![call.take()]);
-    }
-    let Some(calls) = input.get_mut(BATCH_CALLS).and_then(Value::as_array_mut) else {
+    let Some(calls) = input.get_mut(BATCH_CALLS) else {
         return;
     };
-    for call in calls {
+    if let Value::String(encoded) = calls
+        && let Ok(decoded) = serde_json::from_str::<Value>(encoded)
+        && (decoded.is_array() || decoded.is_object())
+    {
+        *calls = decoded;
+    }
+    let unexpose = |call: &mut Value| {
         if let Some(exposed) = call[BATCH_CALL_TOOL].as_str() {
             call[BATCH_CALL_TOOL] = Value::from(catalog.maki_name_or_made_up(exposed));
         }
+    };
+    if let Value::Array(calls) = calls {
+        calls.iter_mut().for_each(unexpose);
+    } else if calls.is_object() {
+        unexpose(calls);
     }
-}
-
-fn batch_calls(encoded: &str) -> Option<Value> {
-    let mut values = Deserializer::from_str(encoded).into_iter::<Value>();
-    let calls = values.next()?.ok()?;
-    if !calls.is_array() && !calls.is_object() {
-        return None;
-    }
-    let tail = encoded[values.byte_offset()..].trim_ascii();
-    let tail = tail.strip_suffix(INVOKE_END).unwrap_or(tail);
-    tail.bytes()
-        .all(|byte| byte.is_ascii_whitespace() || matches!(byte, b'}' | b']'))
-        .then_some(calls)
 }
 
 struct Refusal {
@@ -1253,10 +1242,11 @@ mod tests {
     use super::{
         ACCOUNT_ANSWER, API_ERROR_MARK, API_ERROR_STATUS, BATCH_CALL_TOOL, BATCH_CALLS, BATCH_TOOL,
         EXTRA_USAGE, EXTRA_USAGE_IN_USE, EventKind, HOOKS_ANSWER, Handshake, INPUT_REJECTED,
-        MAX_TOKENS_STOP, MAX_TURNS_ERROR, MCP_CLOSED, NO_SUCH_TOOL, PLAN_REJECTED, RATE_LIMITED,
-        REFUSAL_STOP, RESULT_EVENT, SETTINGS_ANSWER, SHOWN_TOOL_ERROR_CHARS, SUCCESS, Step,
-        StreamMode, StreamedText, TOOL_RESULT, TOOL_USE_STOP, Turn, WINDOW_FULL_STOP, answered,
-        classify, result_failure, unexpose_batch, usage_of, user_message,
+        MAX_TOKENS_STOP, MAX_TURNS_ERROR, MCP_CLOSED, NO_SUCH_TOOL, PLAN_REJECTED,
+        RATE_LIMIT_EVENT, RATE_LIMITED, REFUSAL_STOP, RESULT_EVENT, SETTINGS_ANSWER,
+        SHOWN_TOOL_ERROR_CHARS, SUCCESS, Step, StreamMode, StreamedText, TOOL_RESULT,
+        TOOL_USE_STOP, Turn, WINDOW_FULL_STOP, answered, classify, result_failure, unexpose_batch,
+        usage_of, user_message,
     };
     use crate::{ContentBlock, StopReason, StreamResponse};
 
@@ -1849,6 +1839,21 @@ mod tests {
         json!({ "type": "rate_limit_event", "rate_limit_info": { "status": status, "unifiedWindows": {} } }).to_string()
     }
 
+    #[test_case(json!({}) ; "missing_info")]
+    #[test_case(json!({"rate_limit_info": null}) ; "null_info")]
+    #[test_case(json!({"rate_limit_info": []}) ; "array_info")]
+    fn a_rate_limit_event_without_info_keeps_the_previous_plan_usage(mut event: Value) {
+        with_turn(|mut turn| {
+            turn.feed(&plan_report(PLAN_REJECTED)).unwrap();
+            let previous = turn.plan_usage.lock().unwrap().clone();
+            assert!(previous.is_some());
+            event["type"] = RATE_LIMIT_EVENT.into();
+            turn.feed(&event.to_string()).unwrap();
+            assert_eq!(*turn.plan_usage.lock().unwrap(), previous);
+            assert!(turn.handshake.plan_rejected);
+        });
+    }
+
     /// An API error as Claude Code reports it: a reply outside any
     /// generation, and a result that carries the status. An error in the
     /// middle of a reply has kind "unknown" and no status on the reply.
@@ -1964,17 +1969,11 @@ mod tests {
     #[test_case("}</invoke>" ; "brace_then_invoke")]
     #[test_case("}\n] }\t</invoke>\n" ; "closing_delimiters_and_whitespace")]
     #[test_case("</invoke>" ; "invoke_only")]
-    fn batch_containers_accept_only_structural_tails(tail: &str) {
-        let calls = json!([{ BATCH_CALL_TOOL: EXPOSED, "parameters": { "path": "a" } }]);
-        check_batch_input(json!({ BATCH_CALLS: format!("{calls}{tail}") }), TOOL);
-        check_batch_input(json!({ BATCH_CALLS: format!("{}{tail}", calls[0]) }), TOOL);
-    }
-
     #[test_case(",{}" ; "second_value")]
     #[test_case("</invoke>extra" ; "text_after_invoke")]
     #[test_case("</invoke></invoke>" ; "two_invoke_markers")]
     #[test_case("null" ; "another_json_value")]
-    fn other_batch_tails_stay_unmodified(tail: &str) {
+    fn malformed_batch_tails_stay_unmodified(tail: &str) {
         let encoded = format!("{}{tail}", json!([{ BATCH_CALL_TOOL: EXPOSED }]));
         let mut input = json!({ BATCH_CALLS: encoded });
         unexpose_batch(&catalog(), &mut input);
@@ -2019,7 +2018,9 @@ mod tests {
         assert!(matches!(step, Ok(Step::Done)), "{step:?}");
         let response = response.unwrap().unwrap();
         let (_, _, input) = response.message.tool_uses().next().unwrap();
-        assert_eq!(input[BATCH_CALLS][0][BATCH_CALL_TOOL], expected);
+        let calls = &input[BATCH_CALLS];
+        let call = calls.as_array().map_or(calls, |calls| &calls[0]);
+        assert_eq!(call[BATCH_CALL_TOOL], expected);
     }
 
     /// A batch reaches maki once its generation is complete and its call is

@@ -1121,22 +1121,12 @@ async fn execute_mcp_tool(mcp: &McpSession, tool: Arc<str>, call: Call<'_>) -> T
 
 /// Deduplicates doom-loop repeats, then runs remaining calls in parallel.
 pub(super) async fn process_tool_calls(
-    response: maki_providers::StreamResponse,
+    tool_uses: Vec<(String, String, Value)>,
     recent_calls: &mut RecentCalls,
     history: &mut super::history::History,
     event_tx: &crate::EventSender,
     ctx: &ToolContext,
-    context_size: u32,
 ) -> Result<(), AgentError> {
-    let tool_uses: Vec<(String, String, Value)> = response
-        .message
-        .tool_uses()
-        .map(|(id, name, input)| (id.to_owned(), name.to_owned(), input.clone()))
-        .collect();
-
-    history.push(response.message);
-    history.checkpoint(context_size).await;
-
     let mut immediate_errors: Vec<ToolDoneEvent> = Vec::new();
     let mut runnable: Vec<(String, String, Value)> = Vec::new();
 

@@ -164,10 +164,10 @@ All options live under `plugins.claude_code` in [configuration](/docs/configurat
 - The plugin and provider run only on Linux. They need Claude Code 2.1.284 or newer.
 - maki cannot see how Anthropic bills a call or a turn. Past your plan's limits, Anthropic can bill it as extra usage, which `/usage` shows. The USD value maki shows is the API list price of the tokens.
 - Startup checks have a 60-second limit. The call's `timeout` defaults to 600 seconds and includes snapshot and preparation work. Claude Code tools can run for a long time without output.
-- If your organization policy keeps a hook on, the hook runs once in the empty directory before maki stops the call. The hook's output remains there. The reply names the directory.
-- Stdout event lines are limited to 8 MiB. A larger event stops the call with a size-limit error.
+- If your organization policy keeps a hook on, the hook runs once in the empty directory before maki stops the call. For plugin calls, the hook's output remains there and the reply names the directory. The provider removes its probe directory after the request.
+- Plugin stdout and stderr lines are limited to 8 MiB. A larger line stops the call with a size-limit error. The provider uses the same stdout limit and truncates stderr lines to 4 KiB.
 - maki cannot send images to Claude Code.
-- The provider requests that Claude Code disable `@path` file attachments.
+- The plugin, provider and their probes request that Claude Code disable `@path` file attachments.
 - Multi-turn provider tasks can be slower than native Claude Code. Each request starts a new `claude` and replays the conversation without earlier thinking blocks. Repeated reasoning may add latency, but account contention and network delays can also affect it. High thinking levels allow large outputs. See [headless defaults and turn limits](/docs/headless/#thinking).
 - When Anthropic's safety classifier stops a provider reply, the turn stops with its explanation. maki does not retry it.
 - In a plugin call Claude uses Claude Code's own tools, so maki's [token economy](/docs/token-economy/) does not apply. Each call starts a fresh `claude`. The prompt must contain all data necessary for the task.

@@ -78,7 +78,7 @@ declare maki: {
   fs: {
     read: @checked (path: string, opts: any) -> (string?, string?),
     read_bytes: @checked (path: string, opts: any) -> (buffer?, string?),
-    metadata: @checked (path: string, follow: boolean?) -> (any, string?),
+    metadata: @checked (path: string, opts: any) -> (any, string?),
     realpath: @checked (path: string) -> (string?, string?),
     mkdtemp: @checked (template: string) -> (string?, string?),
     rename: @checked (path: string, new_path: string) -> (boolean?, string?),

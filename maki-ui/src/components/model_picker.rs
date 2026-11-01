@@ -25,7 +25,7 @@ const PRICE_SEPARATOR: &str = " · ";
 const PRICE_WIDTH: usize = 7;
 const LOADING_NOTICE: &str = "loading models...";
 const FOOTER: &[(&str, &str)] = &[
-    ("Ctrl+r", "refresh"),
+    (key::REFRESH.label, "refresh"),
     ("Enter", "select"),
     ("!", "strong"),
     ("@", "medium"),

@@ -2956,7 +2956,7 @@ local header = maki.fs.read_bytes("image.png", { len = 8 })
 ### `maki.fs.metadata()` {#maki-fs-metadata}
 
 ```lua
-maki.fs.metadata({path}, {follow?})
+maki.fs.metadata({path}, {opts?})
 ```
 
 Get metadata for the file or directory at {path}.
@@ -2970,7 +2970,7 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{path}` (`string`) Absolute or relative path.
-- `{follow?}` (`boolean?`) Follow symlinks (default true).
+- `{opts?}` (`table?`) `follow` (boolean, default true): follow symlinks.
 
 **Returns:** (`table?`, `string?`) Metadata table, nil if missing, or nil plus an error message.
 

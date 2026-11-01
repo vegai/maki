@@ -3,6 +3,8 @@ use maki_storage::id::SessionRef;
 use serde::Serialize;
 use uuid::Uuid;
 
+pub const INIT: &str = "init";
+pub const API_RETRY: &str = "api_retry";
 pub const SUCCESS: &str = "success";
 pub const ERROR_DURING_EXECUTION: &str = "error_during_execution";
 

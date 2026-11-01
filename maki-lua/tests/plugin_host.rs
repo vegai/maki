@@ -28,7 +28,7 @@ use maki_lua::{
     PERMISSION_NAME_WARNING, PluginError, PluginHost, PluginPermissions, SKIPPED_PLUGIN_WARNING,
     SessionEndReason, WARM_TOOL_CAP, set_allowed_private_hosts,
 };
-use maki_providers::provider::{BoxFuture, Provider, RequestScope};
+use maki_providers::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use maki_providers::{
     AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
     StopReason, StreamResponse, ThinkingConfig, TokenUsage,
@@ -7849,7 +7849,10 @@ impl Provider for TurnThenPark {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }
@@ -8201,7 +8204,10 @@ impl Provider for OptsRecorder {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }
@@ -8358,7 +8364,10 @@ impl Provider for CallOnce {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }

@@ -45,7 +45,7 @@ use crate::{AgentConfig, AgentMode, EventSender, RunLedger, SharedBuf};
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_providers::Model;
 use maki_providers::RequestOptions;
-use maki_providers::provider::{Provider, RequestScope};
+use maki_providers::provider::{ModelListing, Provider, RequestScope};
 use maki_storage::id::{MakiId, SessionRef};
 
 pub(crate) const TOOL_NAME_FIELD: &str = "name";
@@ -628,6 +628,7 @@ impl Provider for NullProvider {
 
     fn list_models(
         &self,
+        _listing: ModelListing,
     ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, crate::AgentError>> {
         Box::pin(async { unimplemented!() })
     }

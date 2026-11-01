@@ -38,7 +38,7 @@ use maki_lua::PluginHost;
 use maki_providers::model::ModelInfo;
 use maki_providers::model_registry;
 use maki_providers::plugin;
-use maki_providers::provider::Provider;
+use maki_providers::provider::{ModelListing, Provider};
 use maki_providers::test_support::{Canned, Recorded, Requests, is_routed, serve};
 use maki_providers::{
     AgentError, Message, Model, ProviderEvent, RequestOptions, StreamResponse, ThinkingSupport,
@@ -366,7 +366,7 @@ impl Replay {
     }
 
     fn models(&self) -> Value {
-        let listed = smol::block_on(self.provider.list_models());
+        let listed = smol::block_on(self.provider.list_models(ModelListing::Cached));
         json!({
             REQUESTS_KEY: self.recorded(),
             OUTCOME_KEY: listing(&listed),
@@ -378,7 +378,7 @@ impl Replay {
     /// through the request path alone.
     fn discovered(&self, slug: &str, turn: &Turn) -> Value {
         let model = turn.model();
-        let listed = smol::block_on(self.provider.list_models());
+        let listed = smol::block_on(self.provider.list_models(ModelListing::Cached));
         if let Ok(models) = &listed {
             model_registry::set_known_models(slug, models.clone());
         }

@@ -35,8 +35,8 @@ const ROOT_CHANGED: &str = "snapshot directory changed during sanitization";
 
 #[derive(Default)]
 pub struct SnapshotMetadata {
-    pub git_metadata: Vec<String>,
-    pub repositories: Vec<String>,
+    pub git_metadata: Vec<PathBuf>,
+    pub repositories: Vec<PathBuf>,
     pub private_files: usize,
     pub dropped_links: Vec<PathBuf>,
 }
@@ -357,9 +357,7 @@ pub fn sanitize_snapshot(
         }
         if name.to_bytes().eq_ignore_ascii_case(GIT_ENTRY.as_bytes()) {
             quarantine_entry(parent, name, quarantine, path.components().count())?;
-            relocated
-                .git_metadata
-                .push(path.to_string_lossy().into_owned());
+            relocated.git_metadata.push(path.to_path_buf());
             return Ok(Visit::Skip);
         }
         let kind = FileType::from_raw_mode(metadata.st_mode);
@@ -377,9 +375,7 @@ pub fn sanitize_snapshot(
             let child = directory(parent, name)?;
             if repository(&child) {
                 quarantine_entry(parent, name, quarantine, path.components().count())?;
-                relocated
-                    .repositories
-                    .push(path.to_string_lossy().into_owned());
+                relocated.repositories.push(path.to_path_buf());
                 return Ok(Visit::Skip);
             }
             return Ok(Visit::Open(child));
@@ -746,7 +742,7 @@ mod tests {
             sanitize_snapshot(&snapshot, &quarantine, &git, true)
                 .unwrap()
                 .git_metadata,
-            [format!("nested/{name}")]
+            [PathBuf::from(format!("nested/{name}"))]
         );
         assert_eq!(
             fs::read_to_string(snapshot.join(GIT_ENTRY)).unwrap(),
@@ -807,7 +803,7 @@ mod tests {
         fs::write(repository.join(HEAD), CONTENT).unwrap();
         fs::write(repository.join(CONFIG), CONTENT).unwrap();
         let paths = sanitize_snapshot(&snapshot, &quarantine, &git, true).unwrap();
-        assert_eq!(paths.repositories, [REPOSITORY]);
+        assert_eq!(paths.repositories, [PathBuf::from(REPOSITORY)]);
         assert!(!repository.exists());
         let entries: Vec<_> = fs::read_dir(&quarantine)
             .unwrap()
@@ -1036,7 +1032,7 @@ mod tests {
         fs::write(snapshot.join(CONFIG), CONTENT).unwrap();
         fs::write(snapshot.join("work.txt"), CONTENT).unwrap();
         let result = sanitize_snapshot(&snapshot, &quarantine, &git, true).unwrap();
-        assert_eq!(result.repositories, ["."]);
+        assert_eq!(result.repositories, [PathBuf::from(".")]);
         assert!(!snapshot.join(HEAD).exists());
         assert!(!snapshot.join(CONFIG).exists());
         assert_eq!(

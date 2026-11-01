@@ -54,6 +54,7 @@ const RELEASE_POLL_MS: u128 = 10;
 const RELEASE_LOOKS: u128 = DEADLINE.as_millis() / RELEASE_POLL_MS;
 const DOT_GIT: &str = ".git";
 const POLL: Duration = Duration::from_millis(10);
+const MODE_BITS_SKIP: &str = "skipping mode-bit assertion: root bypasses filesystem permissions";
 /// The user's home and XDG directories in every test process, all in this
 /// one shared folder.
 const FIXTURE_USER_DIR: &str = concat!(env!("CARGO_TARGET_TMPDIR"), "/claude_code_user");
@@ -125,7 +126,11 @@ impl Drop for WorkingDir {
 /// Root can bypass mode restrictions. Skip tests that depend on those restrictions when
 /// they do not apply.
 pub fn mode_bits_hold() -> bool {
-    !geteuid().is_root()
+    let applies = !geteuid().is_root();
+    if !applies {
+        eprintln!("{MODE_BITS_SKIP}");
+    }
+    applies
 }
 
 /// Returns git's output when run in `dir` without user or system config, so

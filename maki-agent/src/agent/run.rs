@@ -971,13 +971,19 @@ impl<'h> Agent<'h> {
             .map(|live| Arc::clone(live.tools.filter()))
             .ok_or_else(no_frame)?;
         let ctx = self.tool_context(filter);
+        let tool_uses = response
+            .message
+            .tool_uses()
+            .map(|(id, name, input)| (id.to_owned(), name.to_owned(), input.clone()))
+            .collect();
+        self.history.push(response.message);
+        self.history.checkpoint(self.gauge.size()).await;
         tool_dispatch::process_tool_calls(
-            response,
+            tool_uses,
             &mut self.recent_calls,
             self.history,
             &self.event_tx,
             &ctx,
-            self.gauge.size(),
         )
         .await
     }
@@ -1216,7 +1222,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use maki_config::ProjectConfig;
-    use maki_providers::provider::{BoxFuture, Provider, RequestScope};
+    use maki_providers::provider::{BoxFuture, ModelListing, Provider, RequestScope};
     use maki_providers::{
         ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
         StreamResponse, ThinkingSupport, TokenUsage,
@@ -1338,7 +1344,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
             Box::pin(async { unimplemented!() })
         }
     }
@@ -1378,7 +1387,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
             Box::pin(async { unimplemented!() })
         }
     }
@@ -3431,7 +3443,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
             Box::pin(async { unimplemented!() })
         }
     }
@@ -3513,7 +3528,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
             Box::pin(async { unimplemented!() })
         }
     }

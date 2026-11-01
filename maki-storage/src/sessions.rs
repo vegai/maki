@@ -752,10 +752,7 @@ enum LogRecord<M, U, T> {
     #[serde(rename = "msg")]
     Msg { d: M },
     #[serde(rename = "error")]
-    Error {
-        #[serde(flatten)]
-        d: RecordedError,
-    },
+    Error { d: RecordedError },
     #[serde(rename = "out")]
     Out { id: String, d: T },
     #[serde(rename = "sub_msg")]
@@ -1305,6 +1302,10 @@ enum RawTag {
     Header {
         id: String,
     },
+    Error {
+        #[serde(flatten)]
+        d: RecordedError,
+    },
     #[serde(other)]
     Other,
 }
@@ -1358,6 +1359,10 @@ where
         let record: LogRecord<M, U, T> = match serde_json::from_slice(line) {
             Ok(r) => r,
             Err(e) => {
+                if let Ok(RawTag::Error { d }) = serde_json::from_slice(line) {
+                    errors.push(d);
+                    continue;
+                }
                 if !got_header
                     && let Ok(RawTag::Header { id: raw_id }) = serde_json::from_slice(line)
                     && let Err(source) = raw_id.parse::<MakiId>()
@@ -2561,9 +2566,11 @@ mod tests {
         assert_eq!(outputs, ["monitor-tool", "sub-tool", "task-live"]);
     }
 
-    #[test_case(false ; "append")]
-    #[test_case(true ; "rewrite")]
-    fn recorded_errors_keep_their_time_and_transcript_position(rewrite: bool) {
+    #[test_case(false, false ; "append")]
+    #[test_case(true, false ; "rewrite")]
+    #[test_case(false, true ; "legacy_append")]
+    #[test_case(true, true ; "legacy_rewrite")]
+    fn recorded_errors_keep_their_time_and_transcript_position(rewrite: bool, legacy: bool) {
         let root = TempDir::new().unwrap();
         let dir = root.path();
         let mut session: TestSession = Session::new("model", "/project");
@@ -2583,7 +2590,7 @@ mod tests {
         assert_eq!(loaded.errors()[0].message_count, 1);
         assert_eq!(loaded.errors()[1].message_count, 2);
         assert!(loaded.errors().iter().all(|error| error.timestamp > 0));
-        let records: Vec<Value> = fs::read_to_string(jsonl_path(dir, session.id))
+        let mut records: Vec<Value> = fs::read_to_string(jsonl_path(dir, session.id))
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
@@ -2594,6 +2601,27 @@ mod tests {
             .filter(|tag| matches!(*tag, "msg" | "error"))
             .collect();
         assert_eq!(tags, ["msg", "msg", "error", "error"]);
+        for record in records.iter_mut().filter(|record| record["t"] == "error") {
+            assert!(record["d"]["timestamp"].as_u64().is_some());
+            assert!(record.get("message").is_none());
+            if legacy {
+                let mut flattened = record["d"].take();
+                flattened["t"] = "error".into();
+                *record = flattened;
+            }
+        }
+        if legacy {
+            let data = records
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            fs::write(jsonl_path(dir, session.id), data).unwrap();
+            assert_eq!(
+                TestSession::load_from(session.id, dir).unwrap().errors(),
+                session.errors()
+            );
+        }
     }
 
     #[test]

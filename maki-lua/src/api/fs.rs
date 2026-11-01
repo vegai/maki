@@ -6,6 +6,7 @@ use std::fs::Permissions;
 use std::fs::{self, File, FileType, TryLockError};
 use std::io::{
     BufRead, BufReader, Error as IoError, ErrorKind, Read, Result as IoResult, Seek, SeekFrom,
+    Write,
 };
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -80,12 +81,12 @@ async fn mkdtemp(_lua: Lua, template: String) -> LuaResult<Pair<String>> {
             builder.permissions(Permissions::from_mode(PRIVATE_DIR_MODE));
             let dir = builder.tempdir_in(path.parent().unwrap_or_else(|| Path::new(".")))?;
             let name = path_text(dir.path().to_owned())?;
+            touched(dir.path(), true);
             let _ = dir.keep();
             Ok(name)
         })
         .await
     );
-    touched(PathBuf::from(&directory), true).await;
     Ok((Some(directory), None))
 }
 
@@ -134,7 +135,6 @@ impl UserData for FileLock {
 #[lua_fn(guard = FsWrite)]
 async fn try_lock(_lua: Lua, path: String) -> LuaResult<Pair<FileLock>> {
     let path = try_pair!(make_absolute(&path));
-    let lock_path = path.clone();
     let result = smol::unblock(move || {
         let mut options = File::options();
         options.read(true).write(true).create_new(true);
@@ -142,19 +142,19 @@ async fn try_lock(_lua: Lua, path: String) -> LuaResult<Pair<FileLock>> {
         options
             .mode(PRIVATE_FILE_MODE)
             .custom_flags(OFlags::NOFOLLOW.bits() as i32);
-        let (file, created) = match options.open(&lock_path) {
+        let (file, created) = match options.open(&path) {
             Ok(file) => (file, true),
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                (options.create_new(false).open(lock_path)?, false)
+                (options.create_new(false).open(&path)?, false)
             }
             Err(error) => return Err(error),
         };
-        Ok((FileLock::try_lock(file)?, created))
+        let lock = FileLock::try_lock(file)?;
+        touched(&path, created);
+        Ok(lock)
     })
     .await;
-    let (lock, created) = try_pair!(result);
-    touched(path, created).await;
-    Ok((Some(lock), None))
+    Ok(pair(result))
 }
 
 pub(crate) fn expand_tilde(path: &str) -> PathBuf {
@@ -173,9 +173,7 @@ fn make_absolute(path: &str) -> Result<PathBuf, String> {
 }
 
 fn path_to_string(p: &Path) -> LuaResult<String> {
-    p.to_str()
-        .map(|s| s.to_owned())
-        .ok_or_else(|| mlua::Error::runtime("non-utf8 path"))
+    path_text(p.to_owned()).map_err(mlua::Error::external)
 }
 
 fn filetype_str(ft: &FileType) -> &'static str {
@@ -422,7 +420,7 @@ async fn read_bytes(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pa
 /// If {path} does not exist, returns nil with no error.
 ///
 /// @param path string Absolute or relative path.
-/// @param follow boolean? Follow symlinks (default true).
+/// @param opts table? `follow` (boolean, default true): follow symlinks.
 /// @return (table?, string?) Metadata table, nil if missing, or nil plus an error message.
 /// @example
 /// local meta = maki.fs.metadata("src/main.rs")
@@ -430,9 +428,13 @@ async fn read_bytes(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pa
 ///   print("size: " .. meta.size)
 /// end
 #[lua_fn(guard = FsRead)]
-async fn metadata(lua: Lua, path: String, follow: Option<bool>) -> LuaResult<Pair<Table>> {
+async fn metadata(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Table>> {
     let abs = try_pair!(make_absolute(&path));
-    let metadata = if follow.unwrap_or(true) {
+    let follow = opts
+        .as_ref()
+        .and_then(|opts| opts.opt_bool("follow"))
+        .unwrap_or(true);
+    let metadata = if follow {
         smol::fs::metadata(&abs).await
     } else {
         smol::fs::symlink_metadata(&abs).await
@@ -713,8 +715,12 @@ async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Tabl
 #[lua_fn(guard = FsWrite)]
 async fn write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
     let abs = try_pair!(make_absolute(&path));
-    let result = smol::fs::write(&abs, content).await;
-    touched(abs, result.is_ok()).await;
+    let result = smol::unblock(move || {
+        let result = fs::write(&abs, content);
+        touched(&abs, result.is_ok());
+        result
+    })
+    .await;
     Ok(pair(result.map(|()| true)))
 }
 
@@ -730,19 +736,18 @@ async fn write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>
 #[lua_fn(guard = FsWrite)]
 async fn append(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
     let abs = try_pair!(make_absolute(&path));
-    let appended = abs.clone();
     // `smol::fs::File` writes through a background task and answers before
     // the bytes reach the file, so a plain `unblock` keeps append ordered.
     let result = smol::unblock(move || {
-        use std::io::Write;
-        std::fs::OpenOptions::new()
+        let result = File::options()
             .create(true)
             .append(true)
             .open(&abs)
-            .and_then(|mut f| f.write_all(content.as_bytes()))
+            .and_then(|mut f| f.write_all(content.as_bytes()));
+        touched(&abs, result.is_ok());
+        result
     })
     .await;
-    touched(appended, result.is_ok()).await;
     Ok(pair(result.map(|()| true)))
 }
 
@@ -759,9 +764,12 @@ async fn append(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool
 #[lua_fn(guard = FsWrite)]
 async fn atomic_write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
     let abs = try_pair!(make_absolute(&path));
-    let written = abs.clone();
-    let result = smol::unblock(move || maki_storage::atomic_write(&abs, content.as_bytes())).await;
-    touched(written, result.is_ok()).await;
+    let result = smol::unblock(move || {
+        let result = maki_storage::atomic_write(&abs, content.as_bytes());
+        touched(&abs, result.is_ok());
+        result
+    })
+    .await;
     Ok(pair(result.map(|()| true)))
 }
 
@@ -788,14 +796,16 @@ async fn rm(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool
         .as_ref()
         .and_then(|t| t.opt_bool("force"))
         .unwrap_or(false);
-    let removed = abs.clone();
     let result = smol::unblock(move || -> std::io::Result<()> {
         let meta = match std::fs::symlink_metadata(&abs) {
             Ok(m) => m,
-            Err(e) if force && e.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(e) if force && e.kind() == ErrorKind::NotFound => {
+                touched(&abs, true);
+                return Ok(());
+            }
             Err(e) => return Err(e),
         };
-        if meta.is_dir() {
+        let result = if meta.is_dir() {
             if recursive {
                 std::fs::remove_dir_all(&abs)
             } else {
@@ -807,10 +817,11 @@ async fn rm(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool
                 Err(e) if meta.file_type().is_symlink() => std::fs::remove_dir(&abs).map_err(|_| e),
                 Err(e) => Err(e),
             }
-        }
+        };
+        touched(&abs, result.is_ok());
+        result
     })
     .await;
-    touched(removed, result.is_ok()).await;
     Ok(pair(result.map(|()| true)))
 }
 
@@ -829,12 +840,16 @@ async fn mkdir(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<b
         .as_ref()
         .and_then(|t| t.opt_bool("parents"))
         .unwrap_or(false);
-    let result = if parents {
-        smol::fs::create_dir_all(&abs).await
-    } else {
-        smol::fs::create_dir(&abs).await
-    };
-    touched(abs, result.is_ok()).await;
+    let result = smol::unblock(move || {
+        let result = if parents {
+            fs::create_dir_all(&abs)
+        } else {
+            fs::create_dir(&abs)
+        };
+        touched(&abs, result.is_ok());
+        result
+    })
+    .await;
     Ok(pair(result.map(|()| true)))
 }
 
@@ -902,12 +917,11 @@ fn descend(mut base: PathBuf, component: &Component<'_>) -> PathBuf {
 /// the picker would not offer a file the agent just wrote, and would offer
 /// one it just deleted. A failed call changed nothing, so it says nothing.
 ///
-/// Resolving the path is a realpath per ancestor and one more per `..` left
-/// in the tail, and this runs on the one executor every plugin shares, so it
-/// waits for a blocking thread the way the call it follows did.
-async fn touched(path: PathBuf, succeeded: bool) {
+/// Resolving the path reads the filesystem, so callers run this with the
+/// mutation on a blocking thread.
+fn touched(path: &Path, succeeded: bool) {
     if succeeded {
-        smol::unblock(move || maki_agent::invalidate_for(&resolved(&path))).await;
+        maki_agent::invalidate_for(&resolved(path));
     }
 }
 
@@ -1764,8 +1778,10 @@ mod tests {
         let table =
             create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
         let metadata: Function = table.get("metadata").unwrap();
+        let options = lua.create_table().unwrap();
+        options.set("follow", follow).unwrap();
         let (value, error): (Option<Table>, Option<String>) =
-            smol::block_on(metadata.call_async((link.to_str().unwrap(), follow))).unwrap();
+            smol::block_on(metadata.call_async((link.to_str().unwrap(), options.clone()))).unwrap();
         assert_eq!(error, None);
         let value = value.unwrap();
         assert_eq!(value.get::<bool>("is_file").unwrap(), follow);
@@ -1773,7 +1789,7 @@ mod tests {
         if !follow {
             std::fs::remove_file(target).unwrap();
             let (value, error): (Option<Table>, Option<String>) =
-                smol::block_on(metadata.call_async((link.to_str().unwrap(), follow))).unwrap();
+                smol::block_on(metadata.call_async((link.to_str().unwrap(), options))).unwrap();
             assert_eq!(error, None);
             assert!(value.unwrap().get::<bool>("is_symlink").unwrap());
         }

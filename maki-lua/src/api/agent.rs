@@ -1755,7 +1755,7 @@ mod tests {
     use maki_agent::tools::test_support::{stub_ctx_in, stub_ctx_with};
     use maki_agent::{DoneReason, TurnCompleteEvent};
     use maki_providers::model::ThinkingSupport;
-    use maki_providers::provider::{BoxFuture, Provider, RequestScope};
+    use maki_providers::provider::{BoxFuture, ModelListing, Provider, RequestScope};
     use maki_providers::{
         AgentError, ContentBlock, Message, ModelInfo, ProviderEvent, Role, StopReason,
         StreamResponse, TokenUsage,
@@ -1913,7 +1913,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
     }
@@ -2077,7 +2080,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
     }
