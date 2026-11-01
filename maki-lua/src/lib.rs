@@ -1,5 +1,6 @@
 pub mod agent_autocmd;
 mod api;
+mod background;
 pub mod docs;
 pub mod docs_render;
 mod error;
@@ -13,6 +14,7 @@ pub(crate) mod plugin_permissions;
 mod runtime;
 pub mod session_snapshot;
 
+pub use api::r#fn::set_shell_preference;
 pub use api::keymap::{KeybindTicket, KeymapEntry, KeymapReader, KeymapSnapshot};
 pub use api::net::set_allowed_private_hosts;
 pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
@@ -21,7 +23,7 @@ pub use api::session::SessionSnapshotFn;
 pub use api::util::command::{
     Anchor, Axis, Border, BuiltinAction, Dimension, Edge, FloatConfig, FloatConfigPatch,
     HintReader, HintSnapshot, InputEdit, InputRequest, LuaCommandInfo, LuaCommandReader,
-    ModelRequest, PlanActionOutcome, PlanFormRow, PlanMenu, PlanRequest, PlanRowAction,
+    ModelRequest, NO_UI_ERR, PlanActionOutcome, PlanFormRow, PlanMenu, PlanRequest, PlanRowAction,
     SessionRequest, Split, TaskRequest, TitlePos, UiAction, UiAttachment, UiReply, WinCommand,
     WinEvent, WinView,
 };
@@ -39,7 +41,7 @@ pub use pack::{
     UpdateTarget, apply_pack_plan, discover, discover_installed, install_declared, installed_names,
     lockfile_path, prepare_pack_command, sanitize_message, site_dir,
 };
-pub use plugin_permissions::{Permission, PluginPermissions, Requested};
+pub use plugin_permissions::{Missing, Permission, PluginPermissions, PluginReach, Requested};
 pub use runtime::{
     KILL_GRACE, MAX_INFLIGHT_TOOLS, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE,
     RestoreItem, RestoreReason, WARM_TOOL_CAP,
@@ -51,12 +53,14 @@ pub mod test_support {
 
     use crate::KeymapReader;
     use crate::SessionEndReason;
+    pub use crate::api::autocmd::content_omitted_message;
     use crate::api::keymap::KeymapWriter;
     use crate::api::util::command::{
         HintEntries, HintReader, HintWriter, LuaCommandInfo, LuaCommandReader, LuaCommandWriter,
     };
     pub use crate::api::util::dispatch::MAX_HOOK_DEPTH;
     use crate::key::Key;
+    pub use crate::runtime::layer_skipped_message;
     use maki_storage::id::MakiId;
 
     const TEST_PLUGIN: &str = "test-plugin";

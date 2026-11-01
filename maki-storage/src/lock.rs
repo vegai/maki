@@ -4,12 +4,10 @@
 //! kernel lock across a full read-modify-write keeps concurrent updates from
 //! replacing each other. The kernel releases the lock when the process exits.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
-
-use fs4::{FileExt, TryLockError};
 
 /// How hard [`Lock::acquire_retrying`] retries before reporting a legitimately
 /// held lock. A close-then-reacquire can transiently report as held if a
@@ -45,11 +43,11 @@ impl Lock {
     /// who is in the way instead of hanging on a lock nobody is watching.
     /// Callers that treat `Held` as ordinary control flow want this one.
     pub fn acquire(path: &Path) -> Result<Self, LockError> {
-        Self::open_and_lock(path, FileExt::try_lock)
+        Self::open_and_lock(path, File::try_lock)
     }
 
     pub fn acquire_shared(path: &Path) -> Result<Self, LockError> {
-        Self::open_and_lock(path, FileExt::try_lock_shared)
+        Self::open_and_lock(path, File::try_lock_shared)
     }
 
     /// For the paths where a `Held` is a failure rather than a skip and that run

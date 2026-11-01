@@ -18,7 +18,7 @@
   "expected": {
     "events": [],
     "outcome": {
-      "error": "Api { status: 500, retry_after: None, overflow: None, quota_exhausted: false, auth_error: false }",
+      "error": "Api { status: 500, retry_after: None, overflow: None, quota_exhausted: false, auth_error: false, thinking_unbound: false }",
       "message": "API error (500): {\"error\":{\"message\":\"internal error\"}}"
     },
     "requests": [

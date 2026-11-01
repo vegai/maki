@@ -12,6 +12,8 @@ Maki uses a permission system to decide what each tool is allowed to do and when
 Whether a project's `.maki` configuration loads at all is a separate question,
 answered once per folder. See [folder trust](/docs/folder-trust/).
 
+CLI [tool name lists](/docs/cli/#tool-name-lists) control which tools are available before permission rules run.
+
 ## Rule Layers
 
 Rules come from four layers, combined for resolution:
@@ -45,6 +47,9 @@ plan file write?    ── yes ──►  runs
     ▼
 default: prompt / allow / deny
 ```
+
+A plugin can answer the prompt in the user's place through the
+[`permission.prompt` slot](/docs/hooks/#permission-prompt).
 
 Deny rules are checked across all layers before anything else, so a deny cannot be bypassed by YOLO or the plan-file auto-allow. In plan mode, writes to any path other than the plan file are rejected before this flow; this applies to the file-write tools only. All other tools, including MCP tools, follow the check flow below as usual. `default` resolves per-tool first, then global; the built-in default is `"prompt"`.
 
@@ -109,7 +114,7 @@ deny = ["admin_delete"]
 
 Each tool gets its own section with `allow` and `deny` arrays. Values are glob-like scope patterns.
 
-> **Note:** In MCP server sections (`[mcp.*]`), the boolean forms `allow = true` and `deny = true` are deprecated and ignored. Use `default = "allow"` or `default = "deny"` instead. For native tool sections (e.g. `[bash]`), `allow = true` still works.
+> **Note:** In MCP server sections (`[mcp.*]`), `allow` and `deny` take tool names only. Set a server-wide default with `default = "allow"` or `default = "deny"`. Native tool sections (e.g. `[bash]`) also accept `allow = true`.
 
 ### The `default` key
 
@@ -182,6 +187,11 @@ ACP clients offer the four options the protocol defines. "Allow always" lasts
 for the session, and "Reject always" is a project answer that follows folder
 trust like the TUI, reading "Reject for this session" in an untrusted folder.
 
+Plugin [background subagents](/docs/lua-api/#maki-agent-session) follow these
+rules, but nobody can answer their prompts, so a call that would prompt is
+denied. Give them allow rules for what they run. In plan mode their file writes
+are denied too.
+
 ### Scope Generalization
 
 When you pick "always allow" (or always deny for MCP), the saved scope is generalized so it stays useful beyond that one call:
@@ -226,6 +236,20 @@ Lua plugins have a separate, unrelated gate. A `plugin.toml` manifest next to th
 It runs after [folder trust](/docs/folder-trust/) has let the Lua file load, and
 limits which APIs the file reaches rather than sandboxing the file.
 
+### Session permissions
+
+Three keys cover the session APIs, split by what a call does to the transcript:
+
+- `session_read`: any call that reads what the conversation says, such as `maki.session.export`, `maki.session.messages` and `maki.ui.input`.
+- `session_write`: any call that adds to, removes, or creates conversation content, such as `new`, `prompt`, `notify`, `delete` and `maki.task.remove`.
+- `session_settings`: any call that changes how a session runs without touching its content, such as `set_mode`, `set_title` and `maki.model.set`.
+
+`maki.session.read`, `list`, `live`, `current` and `focus` need none of them. A call that also starts a turn, such as `prompt`, needs `agent` as well. `maki.api.run_command` follows the same rules. The [commands page](/docs/commands/#plugin-access) lists what each command needs.
+
+A plugin without `session_read` still receives events, with only their metadata fields. That leaves out `data.text` on `TurnStart` and `InputChanged`, `data.input` on `ToolDone`, and `data.summary` on `CompactionDone`. Maki warns once per plugin and event, naming the event and the keys left out. Events a plugin fires under its own names arrive as fired.
+
+A layer on a tool call or on `permission.prompt` sees the call, so it needs session permissions as well as the tool's own capability. The [price table](/docs/hooks/#rules) on the hooks page lists them.
+
 ### Plugin egress: net_hosts
 
 `net = true` lets a plugin reach any public host. `net_hosts` in the same
@@ -234,17 +258,28 @@ table narrows that to an allowlist:
 ```toml
 [permissions]
 net = true
-net_hosts = ["api.acme.com", "*.acme.dev"]
+net_hosts = ["api.acme.com", "*.acme.dev", "127.0.0.1:7777"]
 ```
 
 A pattern is an exact host or a single leading `*.` label. `*.acme.dev` matches
 `api.acme.dev`, and it does not match `acme.dev` or `evilacme.dev`. An empty
 list reaches no host at all, which differs from leaving the key out.
 
+Add `:port` to allow one port only, as in `api.acme.com:443` or
+`*.acme.dev:8443`. Write an IPv6 address in brackets when it has a port, as in
+`[::1]:7777`. A pattern without a port allows every port on that host. Maki
+ignores a pattern it cannot read, such as `acme.com:x` or a bare `*`, and logs a
+warning naming the plugin.
+
 The list covers the plugin's `maki.net` calls and the `base_url` of any
 [provider it registers](/docs/providers/#plugin-providers), so an auth hook
 cannot send credentials to a host the manifest does not name. A plugin that
 calls `maki.provider.register` must declare a non-empty list.
+
+`maki.net.connect` opens raw TCP and only reaches hosts in `net_hosts`, so
+`net = true` alone is not enough for it. Give these entries a port, as in
+`127.0.0.1:7777`. A loopback or LAN address also needs
+`net.allowed_private_hosts`, as described below.
 
 For an installed [package](/docs/packages/#package-permissions), Maki stores
 the hosts with the approval and asks again when an update widens or drops the
@@ -257,6 +292,10 @@ list.
 To reach a service on your own machine or network, list it in [`net.allowed_private_hosts`](/docs/configuration/#net). An allowed host also keeps plain `http://` instead of being upgraded to `https://`, since a service on your LAN rarely has a certificate.
 
 A provider plugin calling its own origin also skips the guard, since chat requests already go there. This covers an origin you set with `<SLUG>_BASE_URL` or `providers.toml`, and a built-in provider's default. It does not cover a `base_url` that a third-party plugin declares.
+
+Maki reads proxy variables the way curl does: `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` in either case, and `http_proxy` (lowercase only) for plain `http://`.
+
+A host Maki cannot resolve is left to the proxy. Sandboxes such as nono need this, because they block DNS and only let traffic out through their proxy. A host that resolves to a private address is still refused. Two cases always resolve locally: `maki.net.connect`, which skips the proxy, and `socks4://` or `socks5://` proxies, which take an address. Use `socks4a://` or `socks5h://` to let the proxy resolve names.
 
 ## Session Persistence
 

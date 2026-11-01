@@ -21,7 +21,7 @@ jobs:
     name: Ruff
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: .github/scripts/retry.sh pip install "ruff==${RUFF_VERSION}"
       - run: ruff check scripts/
 
@@ -29,6 +29,6 @@ jobs:
     name: ty
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: .github/scripts/retry.sh pip install "ty==${TY_VERSION}"
       - run: ty check scripts/

@@ -1,12 +1,15 @@
 mod cli;
 mod cmd;
+mod headless_startup;
 mod print;
 mod project_trust;
 mod provider_scripts;
 mod resume;
 mod sdk_mode;
 mod setup;
+mod shutdown;
 mod update;
+mod wire;
 
 use std::time::Duration;
 

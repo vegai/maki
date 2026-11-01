@@ -20,10 +20,8 @@ local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed
 - Call in parallel when reading multiple files.
 - Avoid tiny repeated slices - read a larger window if you need more context.]]
 
-local DEFAULT_MAX_OUTPUT_LINES = 2000
-
 local opts = maki.api.register_options({
-  max_line_bytes = { default = 500, min = 80, desc = "Truncate lines longer than this many bytes." },
+  max_line_bytes = { default = 500, min = 80, desc = "Truncate lines the model sees at this many bytes." },
   max_output_lines = output_limits.specs.max_output_lines,
 })
 
@@ -46,6 +44,15 @@ local function apply_highlights(view, lines, ext, prefix)
     view:update_line(i, { plain[1], table.unpack(hl_spans) })
   end
   view:flush()
+end
+
+-- Lines above `start` give the highlighter context, so a window that
+-- opens inside a block comment or string is coloured right.
+local function highlight_prefix(all_lines, start)
+  if start <= 1 then
+    return nil
+  end
+  return table.concat(all_lines, "\n", 1, math.min(start - 1, #all_lines))
 end
 
 local function build_file_view(lines, start_line, total_lines, path, ctx, prefix)
@@ -94,9 +101,12 @@ local function read_file(path, offset, limit, ctx)
   local total_lines = #all_lines
 
   local start = math.max(math.floor(offset), 1)
-  local default_max = opts.max_output_lines or ctx:config("max_output_lines", DEFAULT_MAX_OUTPUT_LINES)
-  local max_lines = limit == 0 and default_max or math.min(limit, default_max)
-  local max_line_bytes = opts.max_line_bytes
+  local max_output_lines = output_limits.resolve(opts, ctx)
+  local max_lines = limit == 0 and total_lines or limit
+  if max_output_lines then
+    max_lines = math.min(max_lines, max_output_lines)
+  end
+  local max_line_bytes = output_limits.line_bytes(opts, ctx)
 
   local lines = {}
   for i = start, math.min(start + max_lines - 1, total_lines) do
@@ -127,7 +137,7 @@ local function read_file(path, offset, limit, ctx)
   local annotation = shown < total_lines and string.format("%d of %d lines", shown, total_lines)
     or string.format("%d lines", shown)
 
-  local prefix = start > 1 and table.concat(all_lines, "\n", 1, math.min(start - 1, total_lines)) or nil
+  local prefix = highlight_prefix(all_lines, start)
 
   local basename = path:match("([^/]+)$")
   local parent = maki.fs.dirname(path)
@@ -151,6 +161,7 @@ maki.api.register_prompt_hint({
 
 maki.api.register_tool({
   name = "read",
+  permission = "fs_read",
   kind = "read",
   description = DESCRIPTION,
 
@@ -208,7 +219,14 @@ maki.api.register_tool({
     end
     start_line = start_line or 1
     total_lines = total_lines or (start_line + #lines - 1)
-    return build_file_view(lines, start_line, total_lines, input.path or "", ctx)
+    local path = input.path or ""
+    -- The llm text starts at `offset`, so the context above it can only
+    -- come from the file as it is now, and a file edited since the call may
+    -- colour the window differently than the live call did. Restore runs on
+    -- every load and re-render, so read just those lines and not a whole log.
+    local content = start_line > 1 and maki.fs.read(path, { limit = start_line - 1 })
+    local prefix = content and highlight_prefix(split_lines(content), start_line)
+    return build_file_view(lines, start_line, total_lines, path, ctx, prefix)
   end,
 
   handler = function(input, ctx)

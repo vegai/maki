@@ -18,7 +18,7 @@ use crate::{BufferSnapshot, ToolOutput};
 
 use super::hook::ToolHook;
 use super::schema::sanitize_tool_input_schema;
-use super::{DescriptionContext, ToolContext};
+use super::{DescriptionContext, LocalTools, ToolContext, ToolKind};
 use crate::agent::AgentHook;
 
 bitflags! {
@@ -34,6 +34,17 @@ bitflags! {
         /// being called by a script.
         const MODEL = Self::MAIN.bits() | Self::RESEARCH_SUB.bits() | Self::GENERAL_SUB.bits();
     }
+}
+
+/// What a tool declares it reaches. `permission` is the capability it exposes
+/// to the model, and the price of hooking it, pre-approving it or handing it
+/// to a session. `prompted` tells whether a call ever meets the permission
+/// prompt, because a rule pre-approving a tool that never prompts would never
+/// be consulted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolReach {
+    pub permission: Permission,
+    pub prompted: bool,
 }
 
 impl Default for ToolAudience {
@@ -234,10 +245,8 @@ pub trait Tool: Send + Sync + 'static {
     fn tool_kind(&self) -> Option<&str> {
         None
     }
-    /// The plugin permission a rule pre-approving this tool requires. `None`
-    /// means the tool is never permission checked, so a rule naming it would
-    /// never be consulted.
-    fn required_permission(&self) -> Option<Permission> {
+    /// `None` is undeclared reach, which every consumer prices as everything.
+    fn reach(&self) -> Option<ToolReach> {
         None
     }
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError>;
@@ -490,15 +499,18 @@ impl ToolRegistry {
         &self,
         vars: &Vars,
         ctx: &DescriptionContext,
+        local_tools: Option<&LocalTools>,
         supports_examples: bool,
     ) -> Value {
         let snapshot = self.tools.load();
         let mut out = Vec::with_capacity(snapshot.len());
         for entry in snapshot.iter() {
-            if !entry.tool.audience().contains(ctx.audience) {
-                continue;
-            }
-            if !ctx.filter.matches(entry.name()) {
+            let admitted = ctx.filter.admits(
+                entry.name(),
+                ToolKind::of(entry.name(), Some(entry.tool.audience()), local_tools),
+                ctx.audience,
+            );
+            if !admitted {
                 continue;
             }
             let description = vars.apply(&entry.tool.description(ctx)).into_owned();
@@ -562,6 +574,7 @@ fn format_examples_as_text(examples: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use crate::template::Vars;
+    use std::sync::Weak;
     use test_case::test_case;
 
     use crate::tools::test_support::{mock_tool, mock_tool_with_schema};
@@ -578,6 +591,57 @@ mod tests {
         ToolSource::Lua {
             plugin: plugin.into(),
         }
+    }
+
+    struct ReloadDuringDescription {
+        registry: Weak<ToolRegistry>,
+        tool: Arc<dyn Tool>,
+    }
+
+    impl Tool for ReloadDuringDescription {
+        fn name(&self) -> &str {
+            self.tool.name()
+        }
+        fn description(&self, ctx: &DescriptionContext) -> Cow<'_, str> {
+            self.registry.upgrade().unwrap().clear_lua();
+            self.tool.description(ctx)
+        }
+        fn schema(&self) -> Value {
+            self.tool.schema()
+        }
+        fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            self.tool.parse(input)
+        }
+    }
+
+    #[test]
+    fn definition_audiences_come_from_the_captured_registry_snapshot() {
+        const MAIN: &str = "first_main";
+        const SUB: &str = "second_sub";
+        let registry = Arc::new(ToolRegistry::new());
+        registry
+            .register(
+                Arc::new(ReloadDuringDescription {
+                    registry: Arc::downgrade(&registry),
+                    tool: mock_tool(MAIN, ToolAudience::MAIN),
+                }),
+                lua_source(MAIN),
+            )
+            .unwrap();
+        registry
+            .register(mock_tool(SUB, ToolAudience::RESEARCH_SUB), lua_source(SUB))
+            .unwrap();
+        let filter = crate::tools::ToolFilter::default();
+        let context = DescriptionContext {
+            filter: &filter,
+            audience: ToolAudience::MAIN,
+            workflow: false,
+            mcp: false,
+        };
+        let definitions = registry.definitions(&Vars::new(), &context, None, false);
+        assert_eq!(definitions.as_array().unwrap().len(), 1);
+        assert_eq!(definitions[0]["name"], MAIN);
+        assert!(registry.iter().iter().next().is_none());
     }
 
     #[test]
@@ -597,14 +661,14 @@ mod tests {
         )
         .unwrap();
 
-        let filter = crate::tools::ToolFilter::All;
+        let filter = crate::tools::ToolFilter::default();
         let ctx = DescriptionContext {
             filter: &filter,
             audience: ToolAudience::MAIN,
             workflow: false,
             mcp: false,
         };
-        let defs = reg.definitions(&Vars::new(), &ctx, false);
+        let defs = reg.definitions(&Vars::new(), &ctx, None, false);
         assert_eq!(
             defs[0]["input_schema"],
             json!({"type": "object", "properties": {}}),
@@ -625,7 +689,7 @@ mod tests {
         )
         .unwrap();
 
-        let filter = crate::tools::ToolFilter::All;
+        let filter = crate::tools::ToolFilter::default();
         let ctx = DescriptionContext {
             filter: &filter,
             audience: ToolAudience::MAIN,
@@ -633,7 +697,7 @@ mod tests {
             mcp: false,
         };
         let vars = Vars::new();
-        let defs = reg.definitions(&vars, &ctx, false);
+        let defs = reg.definitions(&vars, &ctx, None, false);
         let arr = defs.as_array().expect("definitions returns array");
         assert!(
             arr.iter()
@@ -789,7 +853,7 @@ mod tests {
         reg.register(mock("everywhere"), lua_source("p")).unwrap();
 
         let vars = Vars::new();
-        let filter = crate::tools::ToolFilter::All;
+        let filter = crate::tools::ToolFilter::default();
         let names_for = |audience: ToolAudience| -> Vec<String> {
             let ctx = DescriptionContext {
                 filter: &filter,
@@ -797,7 +861,7 @@ mod tests {
                 workflow: false,
                 mcp: false,
             };
-            reg.definitions(&vars, &ctx, false)
+            reg.definitions(&vars, &ctx, None, false)
                 .as_array()
                 .unwrap()
                 .iter()

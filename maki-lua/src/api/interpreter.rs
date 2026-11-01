@@ -16,13 +16,16 @@ use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table};
 use serde_json::Value;
 
-use crate::api::util::convert::{json_to_lua, lua_tool_result};
+use crate::api::util::convert::{TableExt, json_to_lua, lua_tool_result};
 use crate::api::util::pair::Pair;
 use crate::plugin_permissions::PluginPermissions;
 use crate::runtime::{TaskHandle, lock_cell};
 
 const BRIDGE_CLOSED: &str = "tool bridge closed (cancelled)";
 const FILE_OP_DENIED: &str = "not permitted in this sandbox";
+/// A backlog of lines is ready on every recv, so the loop must yield on its
+/// own or a chatty script holds the Lua thread until the watchdog kills it.
+const LINES_PER_YIELD: usize = 256;
 
 type CallResults = Vec<(u32, Result<Value, String>)>;
 type FileResult = Result<String, String>;
@@ -34,7 +37,7 @@ enum BridgeMsg {
 }
 
 fn required<T: mlua::FromLua>(opts: &Table, key: &str) -> LuaResult<T> {
-    opts.get::<Option<T>>(key)?
+    opts.opt::<T>(key)?
         .ok_or_else(|| mlua::Error::runtime(format!("interpreter.run: '{key}' is required")))
 }
 
@@ -116,11 +119,11 @@ async fn interpreter_run(lua: Lua, code: String, opts: Table) -> LuaResult<Pair<
     let timeout_secs: u64 = required(&opts, "timeout")?;
     let max_memory_mb: usize = required(&opts, "max_memory_mb")?;
     let on_output: Function = required(&opts, "on_output")?;
-    let preamble: String = opts.get::<Option<String>>("preamble")?.unwrap_or_default();
-    let tools_tbl: Option<Table> = opts.get("tools")?;
+    let preamble: String = opts.opt::<String>("preamble")?.unwrap_or_default();
+    let tools_tbl: Option<Table> = opts.opt("tools")?;
     let (read_fn, write_fn): (Option<Function>, Option<Function>) =
-        match opts.get::<Option<Table>>("files")? {
-            Some(t) => (t.get("read")?, t.get("write")?),
+        match opts.opt::<Table>("files")? {
+            Some(t) => (t.opt("read")?, t.opt("write")?),
             None => (None, None),
         };
 
@@ -204,9 +207,16 @@ async fn interpreter_run(lua: Lua, code: String, opts: Table) -> LuaResult<Pair<
     });
 
     let recv_loop = async {
+        let mut lines = 0usize;
         while let Ok(msg) = rx.recv_async().await {
             match msg {
-                BridgeMsg::Line(line) => on_output.call::<()>(line)?,
+                BridgeMsg::Line(line) => {
+                    on_output.call::<()>(line)?;
+                    lines += 1;
+                    if lines.is_multiple_of(LINES_PER_YIELD) {
+                        smol::future::yield_now().await;
+                    }
+                }
                 BridgeMsg::Calls(batch, reply) => {
                     let futs = batch.into_iter().map(|pc| {
                         let f = fns.get(&pc.name).cloned();

@@ -2,23 +2,34 @@
 //!
 //! `CancelTrigger` fires on Drop, so cleanup happens even if the trigger is forgotten.
 //! `cancelled()` uses a double-check around the listener to close the TOCTOU window between flag read and listener registration.
+//! A parent holds its children weakly and fires them itself, so propagation needs no background task and a dropped child leaves nothing behind.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use event_listener::Event;
 
+#[derive(Default)]
 struct Shared {
     cancelled: AtomicBool,
     event: Event,
+    children: Mutex<Vec<Weak<Shared>>>,
 }
 
 impl Shared {
     fn fire(&self) {
         self.cancelled.store(true, Ordering::Release);
         self.event.notify(usize::MAX);
+        let children = std::mem::take(&mut *self.children());
+        for child in children.iter().filter_map(Weak::upgrade) {
+            child.fire();
+        }
+    }
+
+    fn children(&self) -> MutexGuard<'_, Vec<Weak<Shared>>> {
+        self.children.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -29,18 +40,12 @@ pub struct CancelTrigger(Arc<Shared>);
 
 impl CancelToken {
     pub fn new() -> (CancelTrigger, Self) {
-        let shared = Arc::new(Shared {
-            cancelled: AtomicBool::new(false),
-            event: Event::new(),
-        });
+        let shared = Arc::<Shared>::default();
         (CancelTrigger(Arc::clone(&shared)), Self(shared))
     }
 
     pub fn none() -> Self {
-        Self(Arc::new(Shared {
-            cancelled: AtomicBool::new(false),
-            event: Event::new(),
-        }))
+        Self(Arc::default())
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -71,15 +76,18 @@ impl CancelToken {
         }
     }
 
+    /// The flag is checked under the children lock, and `fire` raises the
+    /// flag before it takes that lock. So a child born while the parent is
+    /// firing is either in the list `fire` drains or sees the flag here.
     pub fn child(&self) -> (CancelTrigger, Self) {
         let (child_trigger, child_token) = Self::new();
-        let parent = self.clone();
-        let child_shared = Arc::clone(&child_token.0);
-        smol::spawn(async move {
-            parent.cancelled().await;
-            child_shared.fire();
-        })
-        .detach();
+        let mut children = self.0.children();
+        if self.is_cancelled() {
+            child_token.0.fire();
+        } else {
+            children.retain(|child| child.strong_count() > 0);
+            children.push(Arc::downgrade(&child_token.0));
+        }
         (child_trigger, child_token)
     }
 }
@@ -121,11 +129,11 @@ struct Entry {
 /// and cancelling that id has to reach all of them, even the ones opened after
 /// the cancel.
 ///
-/// So the mark lives on the id until the whole map is drained by
-/// [`cancel_all`](Self::cancel_all). Clearing it when the last sibling retires
-/// would lose the cancels that land while the id sits empty, which it does
-/// before the first session registers and again between two sessions one tool
-/// call opens back to back.
+/// So the mark lives on the id until [`cancel_all`](Self::cancel_all) drains
+/// the whole map or [`revive`](Self::revive) lifts it. Clearing it when the
+/// last sibling retires would lose the cancels that land while the id sits
+/// empty, which it does before the first session registers and again between
+/// two sessions one tool call opens back to back.
 pub struct CancelMap<K> {
     entries: Mutex<HashMap<K, Entry>>,
     next_slot: AtomicU64,
@@ -178,6 +186,14 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
         let entry = map.entry(id).or_default();
         entry.cancelled = true;
         entry.registrations.clear();
+    }
+
+    /// A plugin that loads again needs this, or every task it starts would be
+    /// born cancelled.
+    pub fn revive(&self, id: &K) {
+        if let Some(entry) = self.lock().get_mut(id) {
+            entry.cancelled = false;
+        }
     }
 
     /// The run that owned these is over: stop what is still registered and drop
@@ -233,6 +249,39 @@ mod tests {
             child_token.cancelled().await;
             assert!(child_token.is_cancelled());
             assert!(!parent_token.is_cancelled());
+        });
+    }
+
+    #[test]
+    fn child_of_cancelled_parent_is_born_cancelled() {
+        let (trigger, parent) = CancelToken::new();
+        trigger.cancel();
+        let (_child_trigger, child) = parent.child();
+        assert!(child.is_cancelled());
+    }
+
+    #[test]
+    fn dropped_child_leaves_nothing_behind() {
+        let parent = CancelToken::none();
+        let (trigger, child) = parent.child();
+        let child_state = Arc::downgrade(&child.0);
+        drop((trigger, child));
+        assert_eq!(child_state.strong_count(), 0);
+
+        let _live = parent.child();
+        assert_eq!(parent.0.children().len(), 1);
+        assert!(!parent.is_cancelled());
+    }
+
+    #[test]
+    fn grandchild_cancelled_by_root() {
+        smol::block_on(async {
+            let (root_trigger, root) = CancelToken::new();
+            let (_child_trigger, child) = root.child();
+            let (_grandchild_trigger, grandchild) = child.child();
+            root_trigger.cancel();
+            grandchild.cancelled().await;
+            assert!(child.is_cancelled());
         });
     }
 
@@ -378,5 +427,30 @@ mod tests {
 
         map.cancel(key());
         assert!(tok2.is_cancelled());
+    }
+
+    /// After a reload, handles from the old instance can still retire their
+    /// slots, and they must not touch the new ones.
+    #[test]
+    fn cancel_map_revive_survives_stale_retires_and_cancels_again() {
+        let map = CancelMap::new();
+        map.revive(&key());
+        assert!(!map.has_key(&key()), "reviving an unknown id must not leak");
+
+        let (stale_trigger, _stale) = CancelToken::new();
+        let stale_slot = map.insert(key(), stale_trigger);
+        map.cancel(key());
+        map.revive(&key());
+        let (trigger, token) = CancelToken::new();
+        map.insert(key(), trigger);
+
+        map.retire(&key(), stale_slot);
+        assert!(
+            !token.is_cancelled(),
+            "a stale slot must not retire a new one"
+        );
+
+        map.cancel(key());
+        assert!(token.is_cancelled(), "a revived id can be cancelled again");
     }
 }

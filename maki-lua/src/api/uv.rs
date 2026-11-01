@@ -1,5 +1,7 @@
+use std::env;
+
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{Lua, Result as LuaResult};
+use mlua::{Lua, Result as LuaResult, Table};
 
 use crate::plugin_permissions::PluginPermissions;
 
@@ -11,7 +13,7 @@ use crate::plugin_permissions::PluginPermissions;
 /// if cwd then print("working in: " .. cwd) end
 #[lua_fn(guard = FsRead)]
 fn cwd(_lua: &Lua) -> LuaResult<Option<String>> {
-    Ok(std::env::current_dir()
+    Ok(env::current_dir()
         .ok()
         .and_then(|p| p.to_str().map(String::from)))
 }
@@ -35,7 +37,23 @@ fn os_homedir(_lua: &Lua) -> LuaResult<Option<String>> {
 /// local editor = maki.uv.os_getenv("EDITOR") or "vi"
 #[lua_fn(guard = Env)]
 fn os_getenv(_lua: &Lua, name: String) -> LuaResult<Option<String>> {
-    Ok(std::env::var(&name).ok())
+    Ok(env::var(&name).ok())
+}
+
+/// Return every environment variable as a `{ NAME = value }` table, like
+/// `vim.uv.os_environ`. Variables whose name or value is not UTF-8 are left
+/// out.
+///
+/// @return (table) Environment variables, with the name as the key.
+/// @example
+/// for name in pairs(maki.uv.os_environ()) do print(name) end
+#[lua_fn(guard = Env)]
+fn os_environ(lua: &Lua) -> LuaResult<Table> {
+    lua.create_table_from(
+        env::vars_os().filter_map(|(name, value)| {
+            Some((name.into_string().ok()?, value.into_string().ok()?))
+        }),
+    )
 }
 
 lua_table! {
@@ -45,13 +63,13 @@ lua_table! {
     /// variables. None of these functions throw.
     ///
     /// Filesystem location queries (`cwd`, `os_homedir`) need `fs_read`, while
-    /// `os_getenv` reads the process environment, where secrets live, so it needs
-    /// `env`.
+    /// `os_getenv` and `os_environ` read the process environment, which can
+    /// hold secrets, so they need `env`.
     ///
     /// ```lua
     /// local home = maki.uv.os_homedir()
     /// ```
     "maki.uv" => pub(crate) fn create_uv_table(perms: &PluginPermissions), DOCS [
-        cwd(perms), os_homedir(perms), os_getenv(perms),
+        cwd(perms), os_homedir(perms), os_getenv(perms), os_environ(perms),
     ]
 }

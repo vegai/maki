@@ -77,6 +77,9 @@ impl QueuedInput {
 pub(crate) struct Compaction {
     pub(crate) run_id: u64,
     pub(crate) instructions: Option<String>,
+    /// The session's workflow mode when it was asked for: the frame left
+    /// behind must carry the tools the next run sends.
+    pub(crate) workflow: bool,
 }
 
 impl Compaction {
@@ -368,6 +371,7 @@ mod tests {
         QueueItem::Compact(Compaction {
             run_id: 0,
             instructions: instructions.map(str::to_string),
+            workflow: false,
         })
     }
 

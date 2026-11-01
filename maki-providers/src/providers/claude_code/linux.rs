@@ -1,0 +1,1830 @@
+//! Experimental Claude Code provider for maki's agent loop. The handoff server holds tool
+//! calls until maki stops Claude Code.
+//!
+//! maki executes the calls with its own tools and permissions. The plugin setting enables
+//! both the plugin and the provider.
+
+use std::any::Any;
+use std::collections::BTreeMap;
+use std::env;
+use std::ffi::OsString;
+use std::fmt::Display;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
+
+use super::slots::{Permit, Slots};
+pub(super) use crate::process::within;
+use crate::providers::plugin::{NativeFactory, create_native, native_factory, register_native};
+use flume::Sender;
+use maki_storage::auth::now_millis;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use smol::lock::Mutex as AsyncMutex;
+use tracing::{debug, info, warn};
+
+use super::Error;
+use super::SLUG;
+use super::SPEC;
+#[cfg(test)]
+use super::error;
+#[cfg(test)]
+use super::fake;
+use super::worker::LaunchPreparation;
+use super::{CONFIG_DIR_OPTION, EXECUTABLE_OPTION, MAX_CONCURRENT_OPTION};
+use super::{run, worker};
+use crate::model::{Model, ModelInfo, is_same_model};
+use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
+use crate::providers::anthropic::shared::{
+    LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, long_context_window,
+};
+use crate::providers::{Timeouts, catalog};
+use crate::types::requires_adaptive;
+use crate::{
+    AgentError, Effort, EffortDialect, Message, ProviderEvent, ProviderUsage, RequestOptions,
+    StreamResponse, ThinkingConfig,
+};
+use maki_storage::atomic_write;
+use run::{Exchange, Launch, Limits, Listed, Request, Thinking};
+use worker::{DEFAULT_EXECUTABLE, DEFAULT_MAX_CONCURRENT, MIN_MAX_CONCURRENT};
+
+const CLAUDE_CODE: EffortDialect = EffortDialect {
+    name: None,
+    supported: &[
+        Effort::Low,
+        Effort::Medium,
+        Effort::High,
+        Effort::XHigh,
+        Effort::Max,
+    ],
+    adaptive: None,
+    off: None,
+};
+
+#[cfg(test)]
+pub(super) const WAIT: Duration = Duration::from_secs(30);
+const PLUGIN_OFF: &str =
+    "enable the claude_code plugin in init.lua: `plugins = { claude_code = { enabled = true } }`";
+const WAITING_FOR_SLOT: &str = "waiting for a Claude Code request slot";
+const MODELS_CACHE_FILE: &str = "claude-code-models.json";
+/// Same as the models.dev catalog, because a listing starts several `claude`
+/// processes.
+const MODELS_CACHE_TTL: Duration = Duration::from_secs(86_400);
+const MAX_MODEL_CACHES: usize = 16;
+/// Transient listing failures suppress repeat process launches for this long.
+const FAILED_LISTING_TTL: Duration = Duration::from_secs(300);
+const ERROR_PREFIX: &str = "claude-code: ";
+/// Each turn runs on the subscription login, so maki counts it as `$0` and
+/// shows the list price only as a reference.
+const SUBSIDY: &str = "Claude subscription";
+const BAD_REQUEST: u16 = 400;
+const CONTEXT_OVERFLOW_STATUS: u16 = 413;
+
+type PlanUsage = Arc<Mutex<Option<ProviderUsage>>>;
+static PLAN_USAGE: Mutex<BTreeMap<(PathBuf, PathBuf), PlanUsage>> = Mutex::new(BTreeMap::new());
+type ListingState = Option<(Instant, Result<Vec<Listed>, String>)>;
+
+type ListingLocks = BTreeMap<(PathBuf, PathBuf), Arc<AsyncMutex<ListingState>>>;
+
+static LISTINGS: Mutex<ListingLocks> = Mutex::new(BTreeMap::new());
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct PluginOptions {
+    executable: Option<String>,
+    config_dir: Option<PathBuf>,
+    max_concurrent: Option<usize>,
+}
+
+impl PluginOptions {
+    /// A missing, empty or invalid option is `None`.
+    fn from_table(table: Option<&Map<String, Value>>) -> Self {
+        let value = |key: &str| table.and_then(|table| table.get(key));
+        let text = |key: &str| {
+            value(key)
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+        };
+        Self {
+            executable: text(EXECUTABLE_OPTION).map(str::to_owned),
+            config_dir: text(CONFIG_DIR_OPTION).map(PathBuf::from),
+            max_concurrent: value(MAX_CONCURRENT_OPTION)
+                .and_then(Value::as_u64)
+                .and_then(|n| usize::try_from(n).ok())
+                .filter(|&n| n >= MIN_MAX_CONCURRENT),
+        }
+    }
+}
+
+fn reusable_listing(
+    state: &ListingState,
+    started: Instant,
+    listing: ModelListing,
+) -> Option<Result<Vec<Listed>, Error>> {
+    let (at, result) = state.as_ref()?;
+    let age = at.elapsed();
+    (*at >= started
+        || (listing == ModelListing::Cached && result.is_err() && age < FAILED_LISTING_TTL))
+        .then(|| {
+            result.clone().map_err(|message| Error::ListedRecently {
+                message,
+                wait: FAILED_LISTING_TTL.saturating_sub(age),
+            })
+        })
+}
+
+struct Factory {
+    options: PluginOptions,
+    slots: Arc<Slots>,
+    models_cache: Option<PathBuf>,
+    known_models: Arc<Mutex<Vec<TimedModels>>>,
+}
+
+impl Factory {
+    fn new(options: PluginOptions, models_cache: Option<PathBuf>, previous: Option<&Self>) -> Self {
+        let limit = options.max_concurrent.unwrap_or(DEFAULT_MAX_CONCURRENT);
+        let slots = previous
+            .map(|factory| Arc::clone(&factory.slots))
+            .unwrap_or_else(|| Arc::new(Slots::new(limit)));
+        slots.set_limit(limit);
+        let known_models = previous
+            .filter(|factory| factory.models_cache == models_cache)
+            .map(|factory| Arc::clone(&factory.known_models))
+            .unwrap_or_else(|| {
+                Arc::new(Mutex::new(
+                    models_cache.as_deref().map(read_models).unwrap_or_default(),
+                ))
+            });
+        Self {
+            options,
+            slots,
+            models_cache,
+            known_models,
+        }
+    }
+}
+
+impl NativeFactory for Factory {
+    fn create(&self, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+        let vars = [worker::HOME_ENV, worker::CONFIG_DIR_ENV]
+            .into_iter()
+            .filter_map(|name| env::var(name).ok().map(|value| (name.to_owned(), value)))
+            .collect::<Vec<_>>();
+        Ok(Box::new(ClaudeCode::new(self, timeouts, &vars)?))
+    }
+}
+
+pub fn configure_plugin(enabled: bool, options: Option<&Map<String, Value>>) {
+    let factory = enabled.then(|| {
+        let previous = native_factory(SLUG);
+        let previous = previous
+            .as_deref()
+            .and_then(|factory| (factory as &dyn Any).downcast_ref::<Factory>());
+        Arc::new(Factory::new(
+            PluginOptions::from_table(options),
+            models_cache_path(),
+            previous,
+        )) as Arc<dyn NativeFactory>
+    });
+    register_native(SLUG, factory);
+}
+
+async fn request_slot<'a>(slots: &'a Slots, events: &Sender<ProviderEvent>) -> Permit<'a> {
+    if let Some(slot) = slots.try_acquire() {
+        return slot;
+    }
+    info!("claude-code: every request slot is taken, so the request waits");
+    let _ = events.send(ProviderEvent::Waiting {
+        message: Some(WAITING_FOR_SLOT.to_owned()),
+    });
+    let _waiting = Waiting(events);
+    slots.acquire().await
+}
+
+struct Waiting<'a>(&'a Sender<ProviderEvent>);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.send(ProviderEvent::Waiting { message: None });
+    }
+}
+
+fn config_error(message: impl Display) -> AgentError {
+    AgentError::Config {
+        message: format!("{ERROR_PREFIX}{message}"),
+    }
+}
+
+/// Temporary API errors and stalled replies enter maki's retry loop. Oversized
+/// conversations remain overflow errors so maki can compact them.
+///
+/// Login, policy and invariant failures stop the request. Held calls do not run when a
+/// generation fails, so an interrupted reply can use the normal retry limit.
+pub(super) fn agent_error(error: Error) -> AgentError {
+    if matches!(error.cause(), Error::ContextOverflow) {
+        return AgentError::Api {
+            status: CONTEXT_OVERFLOW_STATUS,
+            message: error.to_string(),
+            retry_after: None,
+        };
+    }
+    if let Some(secs) = error.stalled() {
+        warn!(%error, "claude-code: the reply stalled");
+        return AgentError::Timeout { secs };
+    }
+    if let Some((status, retry_after)) = error.temporary() {
+        return AgentError::Api {
+            status,
+            message: format!("{ERROR_PREFIX}{error}"),
+            retry_after,
+        };
+    }
+    match error.invalid_request() {
+        Some(text) => AgentError::Api {
+            status: BAD_REQUEST,
+            message: format!("{ERROR_PREFIX}{text}"),
+            retry_after: None,
+        },
+        None => config_error(error),
+    }
+}
+
+pub(super) fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    create_native(SLUG, timeouts).unwrap_or_else(|| Err(config_error(PLUGIN_OFF)))
+}
+
+fn models_cache_path() -> Option<PathBuf> {
+    maki_storage::paths::cache_dir()
+        .ok()
+        .map(|dir| dir.join(MODELS_CACHE_FILE))
+}
+
+/// maki's working directory, as `getcwd` gives it. A model listing has no
+/// session, so its checks run here.
+fn working_dir() -> Result<PathBuf, AgentError> {
+    env::current_dir()
+        .and_then(|dir| dir.canonicalize())
+        .map_err(config_error)
+}
+
+/// A model list, saved with its `claude` and config dir, because another
+/// `claude` or login can offer different models. A new login in the same
+/// config dir keeps the list until it expires, while each request probes
+/// the account again.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct SavedModels {
+    executable: PathBuf,
+    config_dir: PathBuf,
+    models: Vec<Listed>,
+}
+
+type TimedModels = (u64, SavedModels);
+
+fn read_models(path: &Path) -> Vec<TimedModels> {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn saved_models(
+    path: &Path,
+    max_age: Duration,
+    executable: &Path,
+    config_dir: &Path,
+) -> Option<SavedModels> {
+    let now = now_millis();
+    read_models(path).into_iter().find_map(|(at, saved)| {
+        (Duration::from_millis(now.saturating_sub(at)) <= max_age
+            && saved.executable == executable
+            && saved.config_dir == config_dir)
+            .then_some(saved)
+    })
+}
+
+fn remember_models(entries: &mut Vec<TimedModels>, saved: &SavedModels) {
+    let now = now_millis();
+    entries.retain(|(at, entry)| {
+        Duration::from_millis(now.saturating_sub(*at)) <= MODELS_CACHE_TTL
+            && (entry.executable != saved.executable || entry.config_dir != saved.config_dir)
+    });
+    entries.insert(0, (now, saved.clone()));
+    entries.truncate(MAX_MODEL_CACHES);
+}
+
+fn save_models(path: &Path, saved: &SavedModels) -> bool {
+    let mut entries = read_models(path);
+    remember_models(&mut entries, saved);
+    let result = serde_json::to_vec(&entries)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| atomic_write(path, &bytes).map_err(|error| error.to_string()));
+    if let Err(error) = result {
+        warn!(path = %path.display(), %error, "claude-code: maki cannot save the model list");
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+fn backdate_models(path: &Path, age: Duration) {
+    let mut entries = read_models(path);
+    for (at, _) in &mut entries {
+        *at = now_millis().saturating_sub(age.as_millis() as u64);
+    }
+    fs::write(path, serde_json::to_vec(&entries).unwrap()).unwrap();
+}
+
+/// Returns true if models.dev gives the model a 1M window.
+fn takes_a_million(id: &str) -> bool {
+    catalog::model_meta_if_available(SPEC.models_slug(), id)
+        .and_then(|meta| meta.context)
+        .is_some_and(|window| window >= LONG_CONTEXT_WINDOW)
+}
+
+/// Returns each model with the window Claude Code opens for it. When that
+/// window is below the 1M that `can_open` allows, the `-1m` id comes first,
+/// as in the anthropic provider.
+fn with_long_context(models: Vec<Listed>, can_open: impl Fn(&str) -> bool) -> Vec<ModelInfo> {
+    models
+        .into_iter()
+        .flat_map(|Listed { id, window }| {
+            let short = window.is_none_or(|window| window < LONG_CONTEXT_WINDOW);
+            let wide = (short && can_open(&id)).then(|| ModelInfo {
+                id: format!("{id}{LONG_CONTEXT_SUFFIX}"),
+                context_window: Some(LONG_CONTEXT_WINDOW),
+                ..Default::default()
+            });
+            wide.into_iter().chain([ModelInfo {
+                id,
+                context_window: window,
+                ..Default::default()
+            }])
+        })
+        .collect()
+}
+
+/// Models with adaptive thinking run at an effort level, the rest on a
+/// budget.
+fn thinking_for(thinking: ThinkingConfig, model: &Model) -> Thinking {
+    match thinking {
+        ThinkingConfig::Off => Thinking::Off,
+        _ if requires_adaptive(&model.id) => thinking
+            .effort_str(&CLAUDE_CODE, model)
+            .map_or(Thinking::Default, Thinking::Effort),
+        _ => thinking
+            .request_thinking(model)
+            .map_or(Thinking::Default, Thinking::Budget),
+    }
+}
+
+/// Returns the variables whose name and value are UTF-8, the same set that
+/// `maki.uv.os_environ` gives the plugin.
+pub(super) fn utf8_vars(vars: impl Iterator<Item = (OsString, OsString)>) -> Vec<(String, String)> {
+    vars.filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .collect()
+}
+
+struct ClaudeCode {
+    executable: PathBuf,
+    limits: Limits,
+    slots: Arc<Slots>,
+    known_models: Arc<Mutex<Vec<TimedModels>>>,
+    login: Option<PathBuf>,
+    models_cache: Option<PathBuf>,
+    /// Takes precedence over `$CLAUDE_CONFIG_DIR`.
+    config_dir: Option<PathBuf>,
+}
+
+impl ClaudeCode {
+    fn new(
+        factory: &Factory,
+        timeouts: Timeouts,
+        vars: &[(String, String)],
+    ) -> Result<Self, AgentError> {
+        let options = &factory.options;
+        let name = options.executable.as_deref().unwrap_or(DEFAULT_EXECUTABLE);
+        let cwd = env::current_dir().map_err(config_error)?;
+        let executable = worker::executable(name, &cwd).map_err(config_error)?;
+        let login = worker::login_dir(vars, options.config_dir.as_deref()).ok();
+        Ok(Self {
+            executable,
+            limits: Limits::new(timeouts.stream),
+            slots: Arc::clone(&factory.slots),
+            known_models: Arc::clone(&factory.known_models),
+            login,
+            models_cache: factory.models_cache.clone(),
+            config_dir: options.config_dir.clone(),
+        })
+    }
+
+    fn plan_usage(&self, config_dir: &Path) -> PlanUsage {
+        Arc::clone(
+            PLAN_USAGE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry((self.executable.clone(), config_dir.to_owned()))
+                .or_default(),
+        )
+    }
+
+    fn launch<'a>(&'a self, prepared: &'a LaunchPreparation, cwd: &'a Path) -> Launch<'a> {
+        Launch {
+            executable: &self.executable,
+            env: &prepared.env,
+            project: cwd,
+            denied: &prepared.denied,
+            temp_dir: &prepared.temp_dir,
+            limits: &self.limits,
+        }
+    }
+
+    async fn prepare_async(
+        &self,
+        cwd: &Path,
+        vars: Vec<(String, String)>,
+    ) -> Result<LaunchPreparation, Error> {
+        let config_dir = self.config_dir.clone();
+        let cwd = cwd.to_owned();
+        let prepared =
+            smol::unblock(move || worker::prepare_launch(vars, config_dir, &cwd)).await?;
+        if !prepared.withheld.is_empty() {
+            info!(withheld = ?prepared.withheld, "claude-code: maki did not give the route variables to Claude Code");
+        }
+        Ok(prepared)
+    }
+
+    /// Model discovery starts up to six processes. Cache successful lists for 24 hours
+    /// and failures for five minutes. An explicit refresh bypasses both caches.
+    async fn list(
+        &self,
+        cwd: &Path,
+        listing: ModelListing,
+        vars: Vec<(String, String)>,
+    ) -> Result<Vec<Listed>, Error> {
+        let key = (
+            self.executable.clone(),
+            worker::login_dir(&vars, self.config_dir.as_deref())?,
+        );
+        let saved = async || {
+            let path = self.models_cache.clone()?;
+            let (executable, config_dir) = key.clone();
+            let saved = smol::unblock(move || {
+                saved_models(&path, MODELS_CACHE_TTL, &executable, &config_dir)
+            })
+            .await?;
+            self.remember(&saved);
+            Some(saved.models)
+        };
+        if listing == ModelListing::Cached
+            && let Some(models) = saved().await
+        {
+            return Ok(models);
+        }
+        let started = Instant::now();
+        let listing_lock = Arc::clone(
+            LISTINGS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(key.clone())
+                .or_default(),
+        );
+        let deadline = started + self.limits.startup;
+        let mut state = within(deadline, listing_lock.lock())
+            .await
+            .ok_or(Error::ListingBusy)?;
+        if listing == ModelListing::Cached
+            && let Some(models) = saved().await
+        {
+            return Ok(models);
+        }
+        if let Some(result) = reusable_listing(&state, started, listing) {
+            return result;
+        }
+        let _slot = match self.slots.try_acquire() {
+            Some(slot) => slot,
+            None if listing == ModelListing::Refresh => return Err(Error::ListingBusy),
+            None => {
+                drop(state);
+                let slot = within(deadline, self.slots.acquire())
+                    .await
+                    .ok_or(Error::ListingBusy)?;
+                state = within(deadline, listing_lock.lock())
+                    .await
+                    .ok_or(Error::ListingBusy)?;
+                if let Some(result) = reusable_listing(&state, started, listing) {
+                    return result;
+                }
+                slot
+            }
+        };
+        let listed = self.ask_models(cwd, vars).await;
+        *state = match &listed {
+            Err(error) if error.is_version_error() => None,
+            _ => Some((
+                Instant::now(),
+                listed.as_ref().cloned().map_err(ToString::to_string),
+            )),
+        };
+        listed
+    }
+
+    fn remember(&self, saved: &SavedModels) {
+        let mut known = self
+            .known_models
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        remember_models(&mut known, saved);
+    }
+
+    fn window_of(&self, id: &str) -> Option<u32> {
+        let known = self
+            .known_models
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        known
+            .iter()
+            .find(|(_, saved)| {
+                saved.executable == self.executable
+                    && Some(&saved.config_dir) == self.login.as_ref()
+            })?
+            .1
+            .models
+            .iter()
+            .find(|listed| is_same_model(&listed.id, id))?
+            .window
+    }
+
+    /// A listing holds one slot and probes context windows with up to four child processes at once.
+    async fn ask_models(
+        &self,
+        cwd: &Path,
+        vars: Vec<(String, String)>,
+    ) -> Result<Vec<Listed>, Error> {
+        let prepared = self.prepare_async(cwd, vars).await?;
+        let usage = self.plan_usage(&prepared.config_dir);
+        let models = run::models(&self.launch(&prepared, cwd), &usage)
+            .await
+            .inspect_err(|error| self.invalidate_version_on_error(error))?;
+        let saved = SavedModels {
+            executable: self.executable.clone(),
+            config_dir: prepared.config_dir,
+            models,
+        };
+        self.remember(&saved);
+        if let Some(path) = &self.models_cache {
+            let path = path.to_owned();
+            return Ok(smol::unblock(move || {
+                save_models(&path, &saved);
+                saved.models
+            })
+            .await);
+        }
+        Ok(saved.models)
+    }
+
+    async fn request(
+        &self,
+        model: &Model,
+        thinking: Thinking,
+        exchange: Exchange<'_>,
+        cwd: &Path,
+        vars: Vec<(String, String)>,
+    ) -> Result<StreamResponse, Error> {
+        // Claude Code reports its directory as `getcwd` does.
+        let cwd = smol::fs::canonicalize(cwd)
+            .await
+            .map_err(Error::path("resolve the directory of the session", cwd))?;
+        let waiting = Instant::now();
+        let _slot = request_slot(&self.slots, exchange.events).await;
+        debug!(
+            slot_wait_ms = run::millis(waiting.elapsed()),
+            "claude-code: request slot acquired"
+        );
+        let prepared = self.prepare_async(&cwd, vars).await?;
+        let usage = self.plan_usage(&prepared.config_dir);
+        run::request(Request {
+            launch: self.launch(&prepared, &cwd),
+            model: &model.id,
+            exchange,
+            plan_usage: &usage,
+            max_output: model.output_tokens(),
+            thinking,
+        })
+        .await
+        .inspect_err(|error| self.invalidate_version_on_error(error))
+    }
+
+    fn invalidate_version_on_error(&self, error: &Error) {
+        worker::invalidate_on_error(&self.executable, error);
+    }
+}
+
+impl Provider for ClaudeCode {
+    fn stream_message<'a>(
+        &'a self,
+        model: &'a Model,
+        messages: &'a [Message],
+        system: &'a str,
+        tools: &'a Value,
+        event_tx: &'a Sender<ProviderEvent>,
+        opts: RequestOptions,
+        scope: RequestScope<'a>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        let thinking = thinking_for(opts.thinking, model);
+        Box::pin(async move {
+            let exchange = Exchange {
+                system,
+                messages,
+                tools,
+                events: event_tx,
+            };
+            self.request(
+                model,
+                thinking,
+                exchange,
+                scope.cwd,
+                utf8_vars(env::vars_os()),
+            )
+            .await
+            .map_err(agent_error)
+        })
+    }
+
+    /// Asks Claude Code which models the account can use, so a new model
+    /// shows up without a maki update.
+    fn list_models(
+        &self,
+        listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async move {
+            let cwd = smol::unblock(working_dir).await?;
+            let models = self
+                .list(&cwd, listing, utf8_vars(env::vars_os()))
+                .await
+                .map_err(config_error)?;
+            Ok(with_long_context(models, takes_a_million))
+        })
+    }
+
+    /// The last request's usage, because Claude Code has no endpoint maki can
+    /// ask.
+    fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
+        Box::pin(async {
+            Ok(self.login.as_ref().and_then(|login| {
+                self.plan_usage(login)
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone()
+            }))
+        })
+    }
+
+    /// The window is the one Claude Code opens for the name, and a model keeps the standard
+    /// window until a listing reports it. models.dev gives the 1M a model can
+    /// open, but Claude Code opens it only for `[1m]`.
+    fn adjust_model(&self, model: &mut Model) {
+        model.supports_vision_override = Some(false);
+        model.subsidised_by = Some(Arc::from(SUBSIDY));
+        if long_context_window(&model.id).is_none() {
+            model.context_window = self
+                .window_of(&model.id)
+                .unwrap_or(model.context_window.min(SPEC.fallback_context_window));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::any::Any;
+    use std::env;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::os::unix::ffi::OsStringExt;
+    use std::path::Path;
+    use std::pin::pin;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::Slots;
+    use futures_lite::future::poll_once;
+    use serde_json::{Value, json};
+    use tempfile::tempdir;
+    use test_case::test_case;
+
+    use super::error::{Error, RATE_LIMITED};
+    use super::run::Thinking;
+    use super::utf8_vars;
+    use super::{
+        ClaudeCode, LONG_CONTEXT_WINDOW, Listed, MAX_MODEL_CACHES, MODELS_CACHE_FILE,
+        MODELS_CACHE_TTL, PLUGIN_OFF, PluginOptions, SLUG, SUBSIDY, SavedModels, WAITING_FOR_SLOT,
+        agent_error, backdate_models, create, read_models, request_slot, save_models, saved_models,
+        thinking_for, with_long_context,
+    };
+    use crate::ThinkingConfig;
+    use crate::provider::Provider;
+    use crate::providers::Timeouts;
+    use crate::providers::claude_code::stream::Wait;
+    use crate::retry::RetryKind;
+    use crate::types::Effort::{High, Max, Minimal};
+    use crate::{Model, ProviderEvent, TokenUsage};
+
+    const ANTHROPIC: &str = "anthropic";
+
+    #[test]
+    fn waiting_for_a_request_slot_is_reported_and_cleared_on_acquisition() {
+        smol::block_on(async {
+            let slots = Slots::new(1);
+            let held = slots.acquire().await;
+            let (events, received) = flume::unbounded();
+            let mut queued = pin!(request_slot(&slots, &events));
+            assert!(poll_once(&mut queued).await.is_none());
+            assert_eq!(
+                received.try_recv().unwrap(),
+                ProviderEvent::Waiting {
+                    message: Some(WAITING_FOR_SLOT.to_owned())
+                }
+            );
+            drop(held);
+            let _slot = queued.await;
+            assert_eq!(
+                received.try_recv().unwrap(),
+                ProviderEvent::Waiting { message: None }
+            );
+        });
+    }
+    #[test]
+    fn cancelling_a_queued_request_clears_its_waiting_status() {
+        smol::block_on(async {
+            let slots = Slots::new(1);
+            let _held = slots.acquire().await;
+            let (events, received) = flume::unbounded();
+            {
+                let mut queued = pin!(request_slot(&slots, &events));
+                assert!(poll_once(&mut queued).await.is_none());
+                assert_eq!(
+                    received.try_recv().unwrap(),
+                    ProviderEvent::Waiting {
+                        message: Some(WAITING_FOR_SLOT.to_owned())
+                    }
+                );
+            }
+            assert_eq!(
+                received.try_recv().unwrap(),
+                ProviderEvent::Waiting { message: None }
+            );
+        });
+    }
+
+    /// A row with vision in the anthropic table.
+    const VISION_ROW: &str = "claude-opus-5-5";
+    /// A release with no row in the anthropic table.
+    const RELEASE_WITHOUT_ROW: &str = "claude-sonnet-5-5";
+    const LONG_CONTEXT_ID: &str = "claude-sonnet-5-5-1m";
+    /// Anthropic's strong default, which Claude Code opens at 1M.
+    const DEFAULT_ROW: &str = "claude-opus-5";
+    /// Claude Code opens it at 200K, and at 1M only with `[1m]`.
+    const OLDER_RELEASE: &str = "claude-opus-4-6";
+    const OLDER_RELEASE_1M: &str = "claude-opus-4-6-1m";
+    const STANDARD_ONLY: &str = "claude-haiku-4-5";
+    /// Anthropic's medium default, and a dated snapshot of it.
+    const MEDIUM_ROW: &str = "claude-sonnet-5";
+    const DATED_MEDIUM_ROW: &str = "claude-sonnet-5-20261001";
+    const STANDARD_WINDOW: u32 = 200_000;
+    const INVALID: &str = "invalid_request";
+    const TOO_LONG: &str = "Prompt is too long";
+    const OVERLOADED_KIND: &str = "overloaded";
+    const UNKNOWN_KIND: &str = "unknown";
+    const LOGIN_FAILED: &str = "authentication_failed";
+    const REFUSAL_TEXT: &str = "Refused";
+    /// Uses adaptive thinking, at an effort level.
+    const ADAPTIVE: &str = "claude-code/claude-sonnet-5";
+    /// Thinks on a token budget.
+    const BUDGETED: &str = "claude-code/claude-haiku-4-5";
+    const PATH: (&str, &str) = ("PATH", "/usr/bin");
+    /// Not UTF-8, which a variable maki never uses can still hold.
+    const LATIN1: &[u8] = b"caf\xe9";
+
+    /// Each effort level maps to the nearest one Claude Code accepts.
+    /// Adaptive keeps Claude Code's default.
+    #[test_case(ADAPTIVE, ThinkingConfig::Off => Thinking::Off ; "adaptive_off")]
+    #[test_case(ADAPTIVE, ThinkingConfig::Adaptive => Thinking::Default ; "adaptive_default")]
+    #[test_case(ADAPTIVE, ThinkingConfig::Effort(High) => Thinking::Effort("high") ; "adaptive_high")]
+    #[test_case(ADAPTIVE, ThinkingConfig::Effort(Minimal) => Thinking::Effort("low") ; "adaptive_minimal_snaps_to_low")]
+    #[test_case(ADAPTIVE, ThinkingConfig::Effort(Max) => Thinking::Effort("max") ; "adaptive_max")]
+    #[test_case(BUDGETED, ThinkingConfig::Off => Thinking::Off ; "budgeted_off")]
+    #[test_case(BUDGETED, ThinkingConfig::Adaptive => Thinking::Default ; "budgeted_default")]
+    #[test_case(BUDGETED, ThinkingConfig::Effort(High) => matches Thinking::Budget(_) ; "budgeted_effort_becomes_a_budget")]
+    fn thinking_maps_to_what_claude_code_takes(spec: &str, thinking: ThinkingConfig) -> Thinking {
+        thinking_for(thinking, &Model::from_spec(spec).unwrap())
+    }
+
+    fn refused(kind: &str, status: Option<u16>) -> Error {
+        let text = if kind == INVALID {
+            TOO_LONG
+        } else {
+            REFUSAL_TEXT
+        };
+        Error::ApiRefused {
+            kind: kind.into(),
+            text: text.into(),
+            status,
+        }
+    }
+
+    /// Preserve overflow errors regardless of stderr. Retry temporary API errors and
+    /// empty tool-call turns. Login errors must stop the request.
+    #[test_case(Error::ContextOverflow => (true, false) ; "an_exhausted_context_window")]
+    #[test_case(refused(INVALID, None) => (true, false) ; "an_overflow")]
+    #[test_case(refused(INVALID, None).with_stderr("noise".into()) => (true, false) ; "an_overflow_with_stderr")]
+    #[test_case(refused(RATE_LIMITED, None) => (false, true) ; "a_rate_limit")]
+    #[test_case(refused(OVERLOADED_KIND, Some(529)) => (false, true) ; "an_overload_with_its_status")]
+    #[test_case(refused(UNKNOWN_KIND, Some(503)) => (false, true) ; "an_unknown_kind_with_a_server_status")]
+    #[test_case(refused(LOGIN_FAILED, Some(401)) => (false, false) ; "a_login_error")]
+    #[test_case(refused(UNKNOWN_KIND, None) => (false, false) ; "an_unknown_kind_without_a_status")]
+    #[test_case(Error::CliRetry { kind: OVERLOADED_KIND.into(), status: Some(401), delay: None } => (false, false) ; "retry_with_bad_login") ]
+    #[test_case(Error::CliRetry { kind: OVERLOADED_KIND.into(), status: Some(403), delay: None } => (false, false) ; "retry_with_forbidden_status") ]
+    #[test_case(Error::CliRetry { kind: OVERLOADED_KIND.into(), status: None, delay: None } => (false, true) ; "a_retry_that_claude_code_wanted")]
+    #[test_case(Error::WentQuiet.after_start(true) => (false, true) ; "interrupted_after_init")]
+    #[test_case(Error::WentQuiet.after_start(false) => (false, false) ; "interrupted_before_init")]
+    #[test_case(Error::ApiRefused { kind: UNKNOWN_KIND.into(), text: "API Error: Stream idle timeout".into(), status: None } => (false, true) ; "a_reported_stream_idle_timeout")]
+    #[test_case(Error::NoCallsToRun => (false, true) ; "a_tool_stop_without_calls")]
+    #[test_case(Error::StoppedFor("end_turn".into()) => (false, true) ; "calls_with_an_end_turn_stop")]
+    fn a_refused_request_reads_as_the_anthropic_provider_reports_it(error: Error) -> (bool, bool) {
+        let error = agent_error(error);
+        (error.is_context_overflow(), error.is_retryable())
+    }
+
+    /// Stalled replies use the normal stream timeout. Startup and handoff failures must
+    /// stop without a retry.
+    #[test_case(Error::Late(Wait::Idle, 300) => Some(RetryKind::Timeout) ; "a_stalled_reply")]
+    #[test_case(Error::Late(Wait::Idle, 300).with_stderr("noise".into()) => Some(RetryKind::Timeout) ; "a_stalled_reply_with_stderr")]
+    #[test_case(Error::Late(Wait::Startup, 60) => None ; "a_late_startup")]
+    #[test_case(Error::Late(Wait::Handoff, 30) => None ; "a_late_handoff")]
+    #[test_case(Error::Late(Wait::Result, 30) => None ; "a_late_result")]
+    #[test_case(Error::ServerLate => None ; "a_late_server")]
+    #[test_case(Error::ReapLate => None ; "an_unreaped_process")]
+    fn only_a_stalled_reply_is_retried_as_a_timeout(error: Error) -> Option<RetryKind> {
+        agent_error(error.after_start(true)).retry_kind()
+    }
+
+    #[test_case(json!({ "executable": "/opt/claude", "config_dir": "/cfg", "provider_max_concurrent": 3 }) => PluginOptions { executable: Some("/opt/claude".into()), config_dir: Some("/cfg".into()), max_concurrent: Some(3) } ; "all_given")]
+    #[test_case(json!({ "executable": "", "config_dir": "", "provider_max_concurrent": 0 }) => PluginOptions::default() ; "empty_or_zero")]
+    #[test_case(json!({ "max_concurrent": 1 }) => PluginOptions::default() ; "plugin_limit_is_independent")]
+    #[test_case(json!({ "model": "sonnet" }) => PluginOptions::default() ; "none_it_shares")]
+    fn the_provider_shares_the_plugins_options(table: Value) -> PluginOptions {
+        PluginOptions::from_table(table.as_object())
+    }
+
+    /// An unloaded plugin must disable the provider before executable discovery.
+    #[test]
+    fn it_is_off_without_the_plugin() {
+        let err = create(Timeouts::default()).err().unwrap();
+        assert!(err.to_string().contains(PLUGIN_OFF), "got: {err}");
+    }
+
+    /// Resolve models and prices through the anthropic provider so dated snapshots share
+    /// their source model metadata.
+    #[test_case("claude-opus-5-5" ; "a_release")]
+    #[test_case("claude-haiku-4-5-20251001" ; "a_dated_snapshot")]
+    fn a_model_reads_as_the_anthropic_provider_reads_it(id: &str) {
+        let described = |slug: &str| {
+            let model = Model::from_spec(&format!("{slug}/{id}")).unwrap();
+            let rates = &model.pricing;
+            (
+                model.tier,
+                model.context_window,
+                model.max_output_tokens,
+                [
+                    rates.input,
+                    rates.output,
+                    rates.cache_write,
+                    rates.cache_read,
+                ],
+            )
+        };
+        assert_eq!(described(SLUG), described(ANTHROPIC));
+    }
+
+    /// Returns the provider as maki builds it, with an executable no test
+    /// runs. The login and the saved model list live in `dir`, and the saved
+    /// list is `listed`.
+    fn provider_in(dir: &Path, listed: Vec<Listed>) -> ClaudeCode {
+        let executable = env::current_exe().unwrap();
+        let options = PluginOptions {
+            executable: Some(executable.display().to_string()),
+            config_dir: Some(dir.to_owned()),
+            ..PluginOptions::default()
+        };
+        let cache = dir.join(MODELS_CACHE_FILE);
+        save_models(
+            &cache,
+            &SavedModels {
+                executable,
+                config_dir: dir.to_owned(),
+                models: listed,
+            },
+        );
+        ClaudeCode::new(
+            &super::Factory::new(options, Some(cache), None),
+            Timeouts::default(),
+            &[],
+        )
+        .unwrap()
+    }
+
+    fn listed(id: &str, window: Option<u32>) -> Listed {
+        Listed {
+            id: id.to_owned(),
+            window,
+        }
+    }
+
+    #[test]
+    fn disk_model_caches_preserve_each_executable_and_login() {
+        let root = tempdir().unwrap();
+        let cache = root.path().join(MODELS_CACHE_FILE);
+        let keys = [
+            ("claude-a", "login-a"),
+            ("claude-a", "login-b"),
+            ("claude-b", "login-a"),
+        ];
+        for (executable, config_dir) in keys {
+            save_models(
+                &cache,
+                &SavedModels {
+                    executable: executable.into(),
+                    config_dir: config_dir.into(),
+                    models: vec![listed(config_dir, Some(42))],
+                },
+            );
+        }
+        for (executable, config_dir) in keys {
+            let saved = saved_models(
+                &cache,
+                Duration::from_secs(60),
+                Path::new(executable),
+                Path::new(config_dir),
+            )
+            .unwrap();
+            assert_eq!(saved.models[0].id, config_dir);
+            assert_eq!(saved.models[0].window, Some(42));
+        }
+    }
+
+    #[test]
+    fn saving_a_model_list_prunes_expired_and_excess_keys() {
+        let root = tempdir().unwrap();
+        let base = root.path().join(MODELS_CACHE_FILE);
+        let saved = SavedModels {
+            executable: "claude".into(),
+            config_dir: "old-login".into(),
+            models: vec![],
+        };
+        assert!(save_models(&base, &saved));
+        backdate_models(&base, MODELS_CACHE_TTL + Duration::from_secs(1));
+        assert!(save_models(
+            &base,
+            &SavedModels {
+                config_dir: "new-login".into(),
+                ..saved.clone()
+            }
+        ));
+        assert!(
+            read_models(&base)
+                .iter()
+                .all(|(_, entry)| entry.config_dir != saved.config_dir)
+        );
+        for index in 0..=MAX_MODEL_CACHES {
+            assert!(save_models(
+                &base,
+                &SavedModels {
+                    config_dir: format!("login-{index}").into(),
+                    ..saved.clone()
+                }
+            ));
+        }
+        let entries = read_models(&base);
+        assert!(
+            entries
+                .iter()
+                .all(|(_, saved)| saved.config_dir != Path::new("old-login"))
+        );
+        assert_eq!(entries.len(), MAX_MODEL_CACHES);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    /// maki counts a turn on the subscription login as `$0`, and the list
+    /// price stays as a reference next to it.
+    #[test]
+    fn a_turn_counts_as_nothing_and_keeps_the_list_price() {
+        let dir = tempdir().unwrap();
+        let mut model = Model::from_spec(&format!("{SLUG}/{DEFAULT_ROW}")).unwrap();
+        provider_in(dir.path(), Vec::new()).adjust_model(&mut model);
+        let usage = TokenUsage {
+            input: 1_000,
+            output: 1_000,
+            ..Default::default()
+        };
+
+        assert_eq!(model.billed_cost(&usage, false), Some(0.0));
+        assert!(
+            model
+                .subsidised_list_cost(&usage, false)
+                .is_some_and(|cost| cost > 0.0)
+        );
+        assert_eq!(model.subsidy_source(), Some(SUBSIDY));
+    }
+
+    #[test]
+    fn a_model_it_runs_takes_no_images() {
+        let dir = tempdir().unwrap();
+        let mut model = Model::from_spec(&format!("{SLUG}/{VISION_ROW}")).unwrap();
+        model.supports_vision_override = Some(true);
+        provider_in(dir.path(), Vec::new()).adjust_model(&mut model);
+        assert!(!model.supports_vision());
+    }
+
+    /// A model gets the window Claude Code listed for its name, dated
+    /// snapshots too. An unlisted model keeps the standard window even when
+    /// models.dev says 1M, so maki compacts before Claude Code rejects the
+    /// conversation. A `-1m` id keeps its 1M.
+    #[test_case(DEFAULT_ROW => LONG_CONTEXT_WINDOW ; "a_model_claude_code_opens_at_1m")]
+    #[test_case(OLDER_RELEASE => STANDARD_WINDOW ; "a_model_it_opens_at_200k")]
+    #[test_case(MEDIUM_ROW => LONG_CONTEXT_WINDOW ; "a_model_listed_by_its_dated_snapshot")]
+    #[test_case(RELEASE_WITHOUT_ROW => STANDARD_WINDOW ; "a_model_no_listing_named")]
+    #[test_case(LONG_CONTEXT_ID => LONG_CONTEXT_WINDOW ; "a_1m_id")]
+    fn a_model_takes_the_window_claude_code_opens(id: &str) -> u32 {
+        let dir = tempdir().unwrap();
+        let provider = provider_in(
+            dir.path(),
+            vec![
+                listed(DEFAULT_ROW, Some(LONG_CONTEXT_WINDOW)),
+                listed(OLDER_RELEASE, Some(STANDARD_WINDOW)),
+                listed(DATED_MEDIUM_ROW, Some(LONG_CONTEXT_WINDOW)),
+            ],
+        );
+        let mut model = Model::from_spec(&format!("{SLUG}/{id}")).unwrap();
+        model.context_window = LONG_CONTEXT_WINDOW;
+        provider.adjust_model(&mut model);
+        model.context_window
+    }
+
+    #[test]
+    fn listed_windows_survive_other_logins_and_executables() {
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        let provider = provider_in(
+            first.path(),
+            vec![listed(DEFAULT_ROW, Some(LONG_CONTEXT_WINDOW))],
+        );
+        let other_login = provider_in(
+            second.path(),
+            vec![listed(DEFAULT_ROW, Some(STANDARD_WINDOW))],
+        );
+        assert_eq!(other_login.window_of(DEFAULT_ROW), Some(STANDARD_WINDOW));
+        let mut other_executable = other_login;
+        other_executable.executable = second.path().join("another-claude");
+        let saved = SavedModels {
+            executable: other_executable.executable.clone(),
+            config_dir: second.path().to_owned(),
+            models: vec![listed(OLDER_RELEASE, Some(STANDARD_WINDOW))],
+        };
+        other_executable.remember(&saved);
+        save_models(
+            &second.path().join(MODELS_CACHE_FILE),
+            &SavedModels {
+                executable: other_executable.executable.clone(),
+                config_dir: second.path().to_owned(),
+                models: vec![listed(OLDER_RELEASE, Some(STANDARD_WINDOW))],
+            },
+        );
+        assert_eq!(provider.window_of(DEFAULT_ROW), Some(LONG_CONTEXT_WINDOW));
+        assert_eq!(other_executable.window_of(DEFAULT_ROW), None);
+        assert_eq!(
+            other_executable.window_of(OLDER_RELEASE),
+            Some(STANDARD_WINDOW)
+        );
+    }
+
+    /// Each model shows with the window Claude Code opens for it. Below the
+    /// 1M the model can open, the `-1m` id comes first, as in the anthropic
+    /// provider. A model already at 1M has no second id.
+    #[test]
+    fn a_model_short_of_its_1m_window_also_lists_its_1m_id() {
+        let listed = with_long_context(
+            vec![
+                listed(RELEASE_WITHOUT_ROW, Some(LONG_CONTEXT_WINDOW)),
+                listed(OLDER_RELEASE, Some(STANDARD_WINDOW)),
+                listed(STANDARD_ONLY, Some(STANDARD_WINDOW)),
+            ],
+            |id| id != STANDARD_ONLY,
+        );
+        let windows: Vec<(&str, Option<u32>)> = listed
+            .iter()
+            .map(|info| (info.id.as_str(), info.context_window))
+            .collect();
+        assert_eq!(
+            windows,
+            [
+                (RELEASE_WITHOUT_ROW, Some(LONG_CONTEXT_WINDOW)),
+                (OLDER_RELEASE_1M, Some(LONG_CONTEXT_WINDOW)),
+                (OLDER_RELEASE, Some(STANDARD_WINDOW)),
+                (STANDARD_ONLY, Some(STANDARD_WINDOW)),
+            ]
+        );
+    }
+
+    /// A variable whose name or value is not UTF-8 is left out rather than
+    /// failing every request.
+    #[test]
+    fn a_variable_that_is_not_utf8_is_left_out() {
+        let vars = [
+            (OsString::from(PATH.0), OsString::from(PATH.1)),
+            (
+                OsString::from("ODD_VALUE"),
+                OsString::from_vec(LATIN1.to_vec()),
+            ),
+            (
+                OsString::from_vec(LATIN1.to_vec()),
+                OsString::from("odd name"),
+            ),
+        ];
+        assert_eq!(
+            utf8_vars(vars.into_iter()),
+            [(PATH.0.to_owned(), PATH.1.to_owned())]
+        );
+    }
+
+    #[test_case(None ; "missing_home")]
+    #[test_case(Some("relative-login") ; "relative_login")]
+    fn invalid_login_configuration_is_reported_by_listing_not_construction(login: Option<&str>) {
+        let options = PluginOptions {
+            executable: Some(env::current_exe().unwrap().display().to_string()),
+            config_dir: login.map(Into::into),
+            ..PluginOptions::default()
+        };
+        let factory = super::Factory::new(options, None, None);
+        let provider = ClaudeCode::new(&factory, Timeouts::default(), &[]).unwrap();
+        assert!(provider.login.is_none());
+        assert!(
+            smol::block_on(provider.list(
+                Path::new("/"),
+                crate::provider::ModelListing::Refresh,
+                Vec::new()
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn registrations_share_slots_across_reload_and_apply_new_limits() {
+        let executable = env::current_exe().unwrap();
+        let options = |limit| json!({(super::EXECUTABLE_OPTION):executable, (super::MAX_CONCURRENT_OPTION):limit});
+        let load = |limit| {
+            crate::providers::plugin::begin_load();
+            super::configure_plugin(true, options(limit).as_object());
+            crate::providers::plugin::commit_load();
+            let factory = super::native_factory(SLUG).unwrap();
+            Arc::clone(
+                &(factory.as_ref() as &dyn Any)
+                    .downcast_ref::<super::Factory>()
+                    .unwrap()
+                    .slots,
+            )
+        };
+        let slots = load(1);
+        let running = slots.try_acquire().unwrap();
+        let first = super::create(Timeouts::default()).unwrap();
+        let second = super::create(Timeouts::default()).unwrap();
+        for provider in [first, second] {
+            let error =
+                smol::block_on(provider.list_models(crate::provider::ModelListing::Refresh))
+                    .unwrap_err();
+            assert!(error.to_string().contains(&Error::ListingBusy.to_string()));
+        }
+        let reloaded = load(2);
+        assert!(Arc::ptr_eq(&slots, &reloaded));
+        let additional = reloaded.try_acquire().unwrap();
+        assert!(slots.try_acquire().is_none());
+        load(1);
+        drop(running);
+        assert!(reloaded.try_acquire().is_none());
+        drop(additional);
+        assert!(reloaded.try_acquire().is_some());
+    }
+}
+
+/// The provider as maki builds it, on the fake `claude`.
+#[cfg(test)]
+mod on_the_fake {
+    use crate::providers::Timeouts;
+    use std::env;
+    use std::fs;
+    use std::iter;
+    use std::ops::{Deref, DerefMut};
+    use std::os::unix::fs::symlink;
+    use std::path::{Path, PathBuf};
+    use std::pin::pin;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use futures_lite::future::poll_once;
+    use futures_lite::{FutureExt, future};
+    use serde_json::json;
+    use smol::Timer;
+    use tempfile::tempdir;
+    use test_case::test_case;
+
+    use super::error::{Error, Problem};
+    use super::fake::{Fake, HAIKU, IDLE, MARKER, OPUS, SYSTEM, VERSION_ERROR, tools};
+    use super::run::{Listed, Thinking};
+    use super::{
+        ClaudeCode, Exchange, LISTINGS, SPEC, SavedModels, WAIT, backdate_models, save_models,
+    };
+    use crate::provider::{ModelListing, Provider};
+    use crate::{Message, Model, ProviderUsage, StreamResponse};
+
+    const HAIKU_SPEC: &str = "claude-code/claude-haiku-4-5";
+    /// Haiku's output limit in the model table.
+    const HAIKU_MAX_OUTPUT: &str = "64000";
+    const COMPACTION_BUDGET: u32 = 16_384;
+    const FITTED_BUDGET: u32 = 500;
+    const INSIDE_TEMP: &str = "tmp";
+    const PLUGIN_LOGIN: &str = "/plugin/claude-config";
+    const CONFIG_DIR_VAR: &str = "CLAUDE_CONFIG_DIR";
+    const CLAUDE_DIR: &str = ".claude";
+    /// A model only a saved list has. The list is older than 24 hours.
+    const SAVED_MODEL: &str = "claude-saved-1";
+    const SAVED_LIST: &str = "models.json";
+    const OTHER_LOGIN: &str = "/elsewhere/.claude";
+    const STALE_LIST: Duration = Duration::from_secs(2 * 86_400);
+    const PATH: &str = "PATH";
+    const HOME: &str = "HOME";
+    const TMPDIR: &str = "TMPDIR";
+    const OLD_VERSION: &str = "2.1.283 (Claude Code)";
+
+    /// maki's output budget for a request reaches Claude Code as its limit,
+    /// through the provider as maki calls it, wherever the budget came from.
+    #[test_case(None => HAIKU_MAX_OUTPUT.to_owned() ; "the_model_limit")]
+    #[test_case(Some(COMPACTION_BUDGET) => COMPACTION_BUDGET.to_string() ; "a_compaction_budget")]
+    #[test_case(Some(FITTED_BUDGET) => FITTED_BUDGET.to_string() ; "a_budget_cut_to_fit")]
+    fn the_output_budget_reaches_claude_code(turn_budget: Option<u32>) -> String {
+        let fake = Fake::new("text");
+        let spec = Model::from_spec(HAIKU_SPEC).unwrap();
+        let model =
+            turn_budget.map_or_else(|| spec.clone(), |budget| spec.with_turn_output(budget));
+        through_the_provider(&fake, &model, &fake.project(), &env::temp_dir()).unwrap();
+        fake.log("max_output")
+    }
+
+    /// An ACP client can pass the directory through a link, while Claude Code
+    /// reports the resolved directory it runs in.
+    #[test]
+    fn a_session_dir_named_through_a_link_is_accepted() {
+        let fake = Fake::new("text");
+        let links = tempdir().unwrap();
+        let linked = links.path().join("project");
+        symlink(fake.project(), &linked).unwrap();
+        let model = Model::from_spec(HAIKU_SPEC).unwrap();
+
+        through_the_provider(&fake, &model, &linked, &env::temp_dir()).unwrap();
+    }
+
+    /// A linked TMPDIR must not run policy hooks from the checkout.
+    #[test_case(false, false ; "repository_root")]
+    #[test_case(true, false ; "session_subdirectory")]
+    #[test_case(false, true ; "repository_policy_hook")]
+    #[test_case(true, true ; "subdirectory_policy_hook")]
+    fn a_temp_dir_that_leads_into_the_project_uses_a_safe_fallback(subdirectory: bool, hook: bool) {
+        let fake = Fake::new("text");
+        if hook {
+            fs::write(fake.dir.path().join("policy_hook"), "").unwrap();
+        }
+        let inside = fake.project().join(INSIDE_TEMP);
+        fs::create_dir(&inside).unwrap();
+        let links = tempdir().unwrap();
+        let temp = links.path().join(INSIDE_TEMP);
+        symlink(&inside, &temp).unwrap();
+        let model = Model::from_spec(HAIKU_SPEC).unwrap();
+
+        fs::create_dir(fake.project().join(".git")).unwrap();
+        let cwd = if subdirectory {
+            fake.project().join("sub")
+        } else {
+            fake.project()
+        };
+        fs::create_dir_all(&cwd).unwrap();
+        let result = through_the_provider(&fake, &model, &cwd, &temp);
+        if hook {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error.cause(), Error::Check(Problem::Hook(_))),
+                "{error}"
+            );
+        } else {
+            result.unwrap();
+        }
+        assert!(fs::read_dir(&inside).unwrap().next().is_none());
+        for hook_cwd in fake.log("hook_ran_in").lines() {
+            assert!(!Path::new(hook_cwd).starts_with(fake.project()));
+        }
+    }
+
+    /// Returns the provider as maki builds it, on the fake, with `home` and
+    /// `temp` as `$HOME` and `$TMPDIR`, keeping its model list at
+    /// `models_cache`.
+    struct Fixture {
+        provider: ClaudeCode,
+        vars: Vec<(String, String)>,
+    }
+
+    impl Deref for Fixture {
+        type Target = ClaudeCode;
+        fn deref(&self) -> &ClaudeCode {
+            &self.provider
+        }
+    }
+    impl DerefMut for Fixture {
+        fn deref_mut(&mut self) -> &mut ClaudeCode {
+            &mut self.provider
+        }
+    }
+    impl Fixture {
+        async fn list(&self, cwd: &Path, listing: ModelListing) -> Result<Vec<Listed>, Error> {
+            self.provider.list(cwd, listing, self.vars.clone()).await
+        }
+        async fn request(
+            &self,
+            model: &Model,
+            thinking: Thinking,
+            exchange: Exchange<'_>,
+            cwd: &Path,
+        ) -> Result<StreamResponse, Error> {
+            self.provider
+                .request(model, thinking, exchange, cwd, self.vars.clone())
+                .await
+        }
+    }
+
+    fn provider_for(
+        fake: &Fake,
+        home: &Path,
+        temp: &Path,
+        models_cache: Option<PathBuf>,
+    ) -> Fixture {
+        let vars = [
+            (PATH.to_owned(), env::var(PATH).unwrap()),
+            (HOME.to_owned(), home.display().to_string()),
+            (TMPDIR.to_owned(), temp.display().to_string()),
+        ];
+        let options = super::PluginOptions {
+            executable: Some(fake.executable().display().to_string()),
+            ..super::PluginOptions::default()
+        };
+        let factory = super::Factory::new(options, models_cache, None);
+        let provider = ClaudeCode::new(
+            &factory,
+            Timeouts {
+                stream: IDLE,
+                ..Timeouts::default()
+            },
+            &vars,
+        )
+        .unwrap();
+        Fixture {
+            vars: vars.to_vec(),
+            provider,
+        }
+    }
+
+    #[test]
+    fn plan_usage_is_shared_by_login_even_after_the_reporting_instance_is_dropped() {
+        let fake = Fake::new("text");
+        let home = tempdir().unwrap();
+        let first = provider_for(&fake, home.path(), &env::temp_dir(), None);
+        let usage = ProviderUsage {
+            plan: Some("Claude Pro".into()),
+            ..Default::default()
+        };
+        *first
+            .plan_usage(first.login.as_deref().unwrap())
+            .lock()
+            .unwrap() = Some(usage.clone());
+        let second = provider_for(&fake, home.path(), &env::temp_dir(), None);
+        assert_eq!(
+            smol::block_on(second.fetch_usage()).unwrap(),
+            Some(usage.clone())
+        );
+        drop(first);
+        drop(second);
+        let later = provider_for(&fake, home.path(), &env::temp_dir(), None);
+        assert_eq!(smol::block_on(later.fetch_usage()).unwrap(), Some(usage));
+    }
+
+    #[test_case(false ; "another_login")]
+    #[test_case(true ; "another_executable")]
+    fn plan_usage_cannot_cross_login_or_executable_boundaries(executable: bool) {
+        let fake = Fake::new("text");
+        let home = tempdir().unwrap();
+        let other_home = tempdir().unwrap();
+        let other_fake = Fake::new("text");
+        let first = provider_for(&fake, home.path(), &env::temp_dir(), None);
+        *first
+            .plan_usage(first.login.as_deref().unwrap())
+            .lock()
+            .unwrap() = Some(ProviderUsage::default());
+        let other = if executable {
+            provider_for(&other_fake, home.path(), &env::temp_dir(), None)
+        } else {
+            provider_for(&fake, other_home.path(), &env::temp_dir(), None)
+        };
+        assert_eq!(smol::block_on(other.fetch_usage()).unwrap(), None);
+    }
+
+    /// The plugin's `config_dir` picks the login, and Claude Code gets it as
+    /// its only `CLAUDE_CONFIG_DIR`.
+    #[test]
+    fn the_plugins_config_dir_names_the_login() {
+        let fake = Fake::new("text");
+        let home = tempdir().unwrap();
+        let mut provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
+        provider.config_dir = Some(PathBuf::from(PLUGIN_LOGIN));
+
+        let prepared =
+            smol::block_on(provider.prepare_async(&fake.project(), provider.vars.clone())).unwrap();
+        let given: Vec<&str> = prepared
+            .env
+            .iter()
+            .filter(|(name, _)| name == CONFIG_DIR_VAR)
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(given, [PLUGIN_LOGIN]);
+    }
+
+    /// Claude Code and the checks treat an empty `CLAUDE_CONFIG_DIR` as unset,
+    /// so the child never gets it.
+    #[test]
+    fn an_empty_config_dir_stays_out_of_the_child() {
+        let fake = Fake::new("text");
+        let home = tempdir().unwrap();
+        let mut provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
+        let mut vars = provider.vars.clone();
+        vars.push((CONFIG_DIR_VAR.to_owned(), String::new()));
+        provider.vars = vars;
+
+        let prepared =
+            smol::block_on(provider.prepare_async(&fake.project(), provider.vars.clone())).unwrap();
+        assert!(
+            prepared.env.iter().all(|(name, _)| name != CONFIG_DIR_VAR),
+            "{:?}",
+            prepared.env
+        );
+        assert_eq!(prepared.config_dir, home.path().join(CLAUDE_DIR));
+    }
+
+    /// Cache reuse must depend on age, executable and login. A cache hit must start no
+    /// Claude Code process.
+    #[test_case(Duration::ZERO, None, false ; "a_fresh_list")]
+    #[test_case(STALE_LIST, None, true ; "a_stale_list")]
+    #[test_case(Duration::ZERO, Some(OTHER_LOGIN), true ; "a_list_of_another_login")]
+    fn a_listing_answers_from_a_list_saved_within_a_day(
+        age: Duration,
+        login: Option<&str>,
+        asks: bool,
+    ) {
+        let fake = Fake::new("text");
+        let home = tempdir().unwrap();
+        let cache = home.path().join(SAVED_LIST);
+        let login = login.map_or_else(|| home.path().join(CLAUDE_DIR), PathBuf::from);
+        let saved = json!({ "executable": fake.executable(), "config_dir": login, "models": [{ "id": SAVED_MODEL, "window": null }] });
+        let saved = serde_json::from_value(saved).unwrap();
+        assert!(save_models(&cache, &saved));
+        backdate_models(&cache, age);
+        let provider = provider_for(&fake, home.path(), &env::temp_dir(), Some(cache.clone()));
+
+        let listed = smol::block_on(provider.list(&fake.project(), ModelListing::Cached)).unwrap();
+        let want = if asks {
+            vec![OPUS, HAIKU]
+        } else {
+            vec![SAVED_MODEL]
+        };
+        let ids: Vec<&str> = listed.iter().map(|model| model.id.as_str()).collect();
+        assert_eq!(ids, want);
+        assert_eq!(
+            fake.dir.path().join("pid").exists(),
+            asks,
+            "Claude Code started"
+        );
+        let saved = super::saved_models(
+            &cache,
+            Duration::MAX,
+            &fake.executable(),
+            &home.path().join(CLAUDE_DIR),
+        )
+        .unwrap();
+        let saved = serde_json::to_value(saved).unwrap();
+        let saved_ids: Vec<&str> = saved["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(saved_ids, want);
+    }
+
+    #[test]
+    fn a_busy_refresh_answers_immediately_and_keeps_the_saved_list() {
+        let fake = Fake::new("text");
+        let home = tempdir().unwrap();
+        let cache = home.path().join(SAVED_LIST);
+        let login = home.path().join(CLAUDE_DIR);
+        let saved = SavedModels {
+            executable: fake.executable(),
+            config_dir: login,
+            models: vec![Listed {
+                id: SAVED_MODEL.to_owned(),
+                window: None,
+            }],
+        };
+        assert!(save_models(&cache, &saved));
+        let provider = provider_for(&fake, home.path(), &env::temp_dir(), Some(cache.clone()));
+        let cwd = fake.project();
+        let slots = Arc::clone(&provider.slots);
+        let held: Vec<_> = iter::from_fn(|| slots.try_acquire()).collect();
+        smol::block_on(async {
+            let error = provider
+                .list(&cwd, ModelListing::Refresh)
+                .or(async {
+                    Timer::after(WAIT).await;
+                    panic!("model refresh waited for a busy request slot")
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::ListingBusy), "{error}");
+            let listed = provider.list(&cwd, ModelListing::Cached).await.unwrap();
+            assert_eq!(listed, saved.models);
+            assert!(!fake.dir.path().join("pid").exists());
+            fs::remove_file(&cache).unwrap();
+            drop(held);
+            assert!(
+                !provider
+                    .list(&cwd, ModelListing::Cached)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn cached_listing_slot_wait_is_bounded() {
+        let fake = Fake::new("text");
+        let home = tempdir().unwrap();
+        let mut provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
+        provider.limits.startup = Duration::ZERO;
+        provider.slots.set_limit(1);
+        let slots = Arc::clone(&provider.slots);
+        let _held = slots.try_acquire().unwrap();
+        let error =
+            smol::block_on(provider.list(&fake.project(), ModelListing::Cached)).unwrap_err();
+        assert!(matches!(error, Error::ListingBusy));
+        assert!(fake.log("calls").is_empty());
+    }
+
+    #[test]
+    fn a_cached_listing_waits_for_a_busy_slot() {
+        let fake = Fake::new("text");
+        let home = tempdir().unwrap();
+        let provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
+        smol::block_on(async {
+            let slots = Arc::clone(&provider.slots);
+            let held: Vec<_> = iter::from_fn(|| slots.try_acquire()).collect();
+            let cwd = fake.project();
+            let mut listed = pin!(provider.list(&cwd, ModelListing::Cached));
+            assert!(poll_once(&mut listed).await.is_none());
+            assert!(fake.log("calls").is_empty());
+            let mut refresh = pin!(provider.list(&cwd, ModelListing::Refresh));
+            assert!(matches!(
+                poll_once(&mut refresh).await,
+                Some(Err(Error::ListingBusy))
+            ));
+            drop(held);
+            let models = listed
+                .or(async {
+                    Timer::after(WAIT).await;
+                    panic!("a cached listing did not resume after a slot was released")
+                })
+                .await
+                .unwrap();
+            assert!(!models.is_empty());
+            assert!(models.iter().all(|model| model.id != SAVED_MODEL));
+        });
+    }
+
+    #[test]
+    fn a_stale_context_window_does_not_make_an_expired_listing_fresh() {
+        let fake = Fake::new("text");
+        let home = tempdir().unwrap();
+        let cache = home.path().join(SAVED_LIST);
+        let login = home.path().join(CLAUDE_DIR);
+        let saved = SavedModels {
+            executable: fake.executable(),
+            config_dir: login.clone(),
+            models: vec![Listed {
+                id: SAVED_MODEL.to_owned(),
+                window: Some(SPEC.fallback_context_window),
+            }],
+        };
+        assert!(save_models(&cache, &saved));
+        backdate_models(&cache, STALE_LIST);
+        let provider = provider_for(&fake, home.path(), &env::temp_dir(), Some(cache));
+        assert_eq!(
+            provider.window_of(SAVED_MODEL),
+            Some(SPEC.fallback_context_window)
+        );
+        let listed = smol::block_on(provider.list(&fake.project(), ModelListing::Cached)).unwrap();
+        assert!(listed.iter().all(|model| model.id != SAVED_MODEL));
+        assert!(!fake.log("calls").is_empty());
+    }
+
+    /// Two listings at once start Claude Code once, and the second reads what
+    /// the first saved.
+    #[test_case(ModelListing::Cached, ModelListing::Cached ; "cached")]
+    #[test_case(ModelListing::Cached, ModelListing::Refresh ; "refresh_joins_cached")]
+    #[test_case(ModelListing::Refresh, ModelListing::Refresh ; "refreshes_coalesce")]
+    fn two_listings_at_once_ask_claude_code_once(first: ModelListing, second: ModelListing) {
+        let fake = Fake::new("text");
+        let home = tempdir().unwrap();
+        let cache = Some(home.path().join(SAVED_LIST));
+        let provider = provider_for(&fake, home.path(), &env::temp_dir(), cache);
+        let cwd = fake.project();
+
+        let (first, second) = smol::block_on(future::zip(
+            provider.list(&cwd, first),
+            provider.list(&cwd, second),
+        ));
+        let ids = |listed: Vec<Listed>| -> Vec<String> {
+            listed.into_iter().map(|model| model.id).collect()
+        };
+        assert_eq!(ids(first.unwrap()), [OPUS, HAIKU]);
+        assert_eq!(ids(second.unwrap()), [OPUS, HAIKU]);
+        assert_eq!(fake.log("versions").lines().count(), 1);
+        assert_eq!(fake.log("calls").lines().count(), 3);
+    }
+
+    #[test]
+    fn a_listing_for_one_login_does_not_block_another() {
+        let blocked = Fake::new("text");
+        let other = Fake::new("text");
+        let home = tempdir().unwrap();
+        let first = provider_for(&blocked, home.path(), &env::temp_dir(), None);
+        let second = provider_for(&other, home.path(), &env::temp_dir(), None);
+        let key = (first.executable.clone(), first.login.clone().unwrap());
+        let state = Arc::clone(LISTINGS.lock().unwrap().entry(key).or_default());
+        smol::block_on(async {
+            let _held = state.lock().await;
+            let cwd = blocked.project();
+            let mut pending = pin!(first.list(&cwd, ModelListing::Cached));
+            assert!(poll_once(&mut pending).await.is_none());
+            let listed = second
+                .list(&other.project(), ModelListing::Cached)
+                .or(async {
+                    Timer::after(WAIT).await;
+                    panic!("an unrelated login was blocked by model discovery");
+                })
+                .await
+                .unwrap();
+            assert!(!listed.is_empty());
+        });
+    }
+
+    /// A failed discovery must suppress repeat CLI launches until expiry or an explicit
+    /// refresh.
+    #[test]
+    fn a_failed_listing_is_remembered_until_a_refresh() {
+        let fake = Fake::new("text");
+        fs::write(fake.dir.path().join("probe_error"), VERSION_ERROR).unwrap();
+        let home = tempdir().unwrap();
+        let cache = Some(home.path().join(SAVED_LIST));
+        let provider = provider_for(&fake, home.path(), &env::temp_dir(), cache);
+        let cwd = fake.project();
+
+        let first = smol::block_on(provider.list(&cwd, ModelListing::Cached)).unwrap_err();
+        let again = smol::block_on(provider.list(&cwd, ModelListing::Cached)).unwrap_err();
+        assert!(!matches!(first, Error::ListedRecently { .. }), "{first}");
+        assert!(
+            matches!(again, Error::ListedRecently { wait, .. } if wait < super::FAILED_LISTING_TTL),
+            "{again}"
+        );
+        assert_eq!(fake.log("versions").lines().count(), 1);
+        assert_eq!(fake.log("calls").lines().count(), 1);
+
+        let _ = smol::block_on(provider.list(&cwd, ModelListing::Refresh));
+        assert_eq!(fake.log("versions").lines().count(), 1);
+        assert_eq!(fake.log("calls").lines().count(), 2);
+    }
+
+    #[test_case("version_error", VERSION_ERROR ; "version_check_failed")]
+    #[test_case("version", OLD_VERSION ; "outdated_version")]
+    fn version_failures_do_not_delay_a_cached_listing_retry(file: &str, output: &str) {
+        let fake = Fake::new("text");
+        let home = tempdir().unwrap();
+        let provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
+        let marker = fake.dir.path().join(file);
+        fs::write(&marker, output).unwrap();
+        let list = || smol::block_on(provider.list(&fake.project(), ModelListing::Cached));
+        assert!(list().unwrap_err().invalidates_version());
+        fs::remove_file(marker).unwrap();
+        assert!(!list().unwrap().is_empty());
+        assert_eq!(fake.log("versions").lines().count(), 2);
+    }
+
+    #[test]
+    fn a_listing_check_failure_invalidates_the_cached_version() {
+        let fake = Fake::new("text");
+        let home = tempdir().unwrap();
+        let provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
+        let list = || smol::block_on(provider.list(&fake.project(), ModelListing::Refresh));
+        list().unwrap();
+        let hook = fake.dir.path().join("policy_hook");
+        fs::write(&hook, "").unwrap();
+        let error = list().unwrap_err();
+        assert!(matches!(error.cause(), Error::Check(_)), "{error}");
+        fs::remove_file(hook).unwrap();
+        list().unwrap();
+        assert_eq!(fake.log("versions").lines().count(), 2);
+    }
+
+    #[test_case("policy_hook" ; "policy")]
+    #[test_case("logged_out" ; "login")]
+    fn failed_account_or_policy_checks_are_cached_until_refresh(marker: &str) {
+        let fake = Fake::new("text");
+        let home = tempdir().unwrap();
+        let provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
+        let path = fake.dir.path().join(marker);
+        fs::write(&path, "").unwrap();
+        let cwd = fake.project();
+        let error = smol::block_on(provider.list(&cwd, ModelListing::Cached)).unwrap_err();
+        assert!(matches!(error.cause(), Error::Check(_)), "{error}");
+        fs::remove_file(path).unwrap();
+        let again = smol::block_on(provider.list(&cwd, ModelListing::Cached)).unwrap_err();
+        assert!(matches!(again, Error::ListedRecently { .. }), "{again}");
+        assert_eq!(fake.log("versions").lines().count(), 1);
+        assert!(
+            !smol::block_on(provider.list(&cwd, ModelListing::Refresh))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fake.log("versions").lines().count(), 2);
+    }
+
+    #[test]
+    fn transient_errors_keep_the_validated_executable_version() {
+        let fake = Fake::new("overloaded");
+        let home = tempdir().unwrap();
+        let provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
+        let model = Model::from_spec(HAIKU_SPEC).unwrap();
+        let tools = tools();
+        let (events, _received) = flume::unbounded();
+        for _ in 0..2 {
+            let exchange = Exchange {
+                system: SYSTEM,
+                messages: &[],
+                tools: &tools,
+                events: &events,
+            };
+            let error = smol::block_on(provider.request(
+                &model,
+                Thinking::Default,
+                exchange,
+                &fake.project(),
+            ))
+            .unwrap_err();
+            assert!(error.temporary().is_some(), "{error}");
+        }
+        assert_eq!(fake.log("versions").lines().count(), 1);
+        assert_eq!(fake.log("calls").lines().count(), 4);
+    }
+
+    /// Sends one request through the provider as maki calls it, from `cwd`,
+    /// with a separate home directory and `temp` as `$TMPDIR`.
+    fn through_the_provider(
+        fake: &Fake,
+        model: &Model,
+        cwd: &Path,
+        temp: &Path,
+    ) -> Result<StreamResponse, Error> {
+        let home = tempdir().unwrap();
+        let provider = provider_for(fake, home.path(), temp, None);
+        let tools = tools();
+        let messages = [Message::user(format!("find {MARKER}"))];
+        let (events, _received) = flume::unbounded();
+        let exchange = Exchange {
+            system: SYSTEM,
+            messages: &messages,
+            tools: &tools,
+            events: &events,
+        };
+        smol::block_on(provider.request(model, Thinking::Default, exchange, cwd))
+    }
+}

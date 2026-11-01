@@ -1,5 +1,13 @@
 [profile.default]
 fail-fast = false
 status-level = "slow"
-test-threads = 64
+test-threads = "num-cpus"
 slow-timeout = { period = "60s", terminate-after = 5 }
+
+[profile.ci]
+test-threads = 64
+
+# 2001-line restore, ~200ms slices that 63 neighbours on 4 cores stretch past the Lua watchdog's 5s.
+[[profile.ci.overrides]]
+filter = 'test(=restore_expanded_shows_full_script_beyond_cap)'
+threads-required = 'num-test-threads'

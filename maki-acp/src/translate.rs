@@ -1,14 +1,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use agent_client_protocol_schema::{
-    Content, ContentBlock, ContentChunk, Cost, Diff, ImageContent, SessionUpdate, StopReason,
-    TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
+use agent_client_protocol_schema::v1::{
+    Content, ContentBlock, ContentChunk, Cost, Diff, ImageContent, Notice, NoticeSeverity,
+    SessionUpdate, StopReason, TextContent, ToolCall, ToolCallContent, ToolCallId,
+    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
-use maki_agent::DoneReason;
 use maki_agent::tools::ToolRegistry;
 use maki_agent::types::{ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent};
+use maki_agent::{DisplayItem, DoneReason, display_order};
 use maki_providers::{ContentBlock as MsgBlock, ImageMediaType, Message, Role as MsgRole};
 
 const MIN_FENCE_LEN: usize = 3;
@@ -18,6 +18,7 @@ const WRITE_TOOL: &str = "write";
 const MAX_DIFF_OLD_TEXT_BYTES: u64 = 256 * 1024;
 /// Model pricing is quoted in US dollars, so that is the reported currency.
 const CURRENCY: &str = "USD";
+const NOTICE_ID_PREFIX: &str = "notice-";
 
 /// File-level tools report a location so the client can follow along. Directory
 /// scoped tools (glob, grep, list) and commands (bash) target no single file.
@@ -78,10 +79,32 @@ pub fn text_delta(text: &str) -> SessionUpdate {
     ))))
 }
 
+/// An accepted observation's line, such as a background result, as a
+/// finished card, so it stands apart from the reply. The card has no
+/// content: the body the model read is never shown.
+pub fn notice(id: &str, line: &str) -> SessionUpdate {
+    SessionUpdate::ToolCall(
+        ToolCall::new(
+            ToolCallId::from(format!("{NOTICE_ID_PREFIX}{id}")),
+            line.to_owned(),
+        )
+        .kind(ToolKind::Other)
+        .status(ToolCallStatus::Completed),
+    )
+}
+
 pub fn thinking_delta(text: &str) -> SessionUpdate {
     SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
         text.to_string(),
     ))))
+}
+
+pub fn provider_waiting(message: String, notices: bool) -> SessionUpdate {
+    if notices {
+        SessionUpdate::Notice(Notice::new(NoticeSeverity::Info, message))
+    } else {
+        thinking_delta(&format!("{message}\n\n"))
+    }
 }
 
 pub fn tool_pending(id: &str, name: &str) -> SessionUpdate {
@@ -372,19 +395,26 @@ pub fn usage_update(event: &TurnCompleteEvent, cost_total: Option<f64>) -> Sessi
     SessionUpdate::UsageUpdate(update)
 }
 
+/// A replayed card is named by its observation's place in history, which
+/// a live card's random id can never take.
 pub fn replay_history(messages: &[Message], cwd: &Path, home: Option<&Path>) -> Vec<SessionUpdate> {
     let mut updates = Vec::new();
-    for msg in messages {
-        match msg.role {
-            MsgRole::User => replay_user(msg, &mut updates),
-            MsgRole::Assistant => replay_assistant(msg, &mut updates, cwd, home),
+    for item in display_order(messages) {
+        match item {
+            DisplayItem::ObservationLine { index, text } => {
+                updates.push(notice(&index.to_string(), text));
+            }
+            DisplayItem::Message(msg) => match msg.role {
+                MsgRole::User => replay_user(msg, &mut updates),
+                MsgRole::Assistant => replay_assistant(msg, &mut updates, cwd, home),
+            },
         }
     }
     updates
 }
 
 fn replay_user(msg: &Message, updates: &mut Vec<SessionUpdate>) {
-    if msg.is_observation() {
+    if msg.is_from_host() {
         return;
     }
     if let Some(text) = msg.user_text() {
@@ -398,6 +428,7 @@ fn replay_user(msg: &Message, updates: &mut Vec<SessionUpdate>) {
                 tool_use_id,
                 content,
                 is_error,
+                ..
             } => updates.push(replay_tool_result(tool_use_id, content, *is_error)),
             MsgBlock::Image { source } => {
                 updates.push(SessionUpdate::UserMessageChunk(ContentChunk::new(
@@ -494,6 +525,11 @@ mod tests {
     const ABS_PATH: &str = "/home/user/project/src/main.rs";
     const OLD_TEXT: &str = "fn main() {}\n";
     const NEW_TEXT: &str = "fn main() { run() }\n";
+    const MONITOR_NOTE: &str = "[monitor] build failed";
+    const NOTICE_LINE: &str = "Background agent finished: find auth";
+    const PROMPT: &str = "what changed";
+    const REPLY: &str = "the build is green";
+    const CONTEXT_UPDATE_TEXT: &str = "<context-update>date: tomorrow</context-update>";
 
     #[test_case("1: mod render\n2: mod segment", "```\n1: mod render\n2: mod segment\n```" ; "plain_text_gets_default_fence")]
     #[test_case("has ```rust\ncode\n``` inside", "````\nhas ```rust\ncode\n``` inside\n````" ; "fence_longer_than_inner_backticks")]
@@ -542,11 +578,7 @@ mod tests {
             ]),
             Message {
                 role: MsgRole::User,
-                content: vec![MsgBlock::ToolResult {
-                    tool_use_id: "tu-1".into(),
-                    content: "file.rs".into(),
-                    is_error: false,
-                }],
+                content: vec![MsgBlock::tool_result("tu-1", "file.rs", false)],
                 display_text: None,
                 ..Default::default()
             },
@@ -586,26 +618,58 @@ mod tests {
         assert_eq!(json[0]["content"]["text"], "what user typed");
     }
 
+    fn observation_with(line: Option<&str>) -> Message {
+        let mut observation = Message::observation(MONITOR_NOTE.into());
+        observation.display_text = line.map(str::to_owned);
+        observation
+    }
+
+    /// A restored result line replays as the same finished card the client
+    /// saw live, named by its observation's place in history, and the body
+    /// the model read never reaches the client. Where it goes is
+    /// `display_order`'s call.
+    #[test]
+    fn replay_shows_an_observation_line_as_a_finished_card() {
+        let messages = [
+            observation_with(Some(NOTICE_LINE)),
+            Message::user(PROMPT.into()),
+            assistant(vec![MsgBlock::Text { text: REPLY.into() }]),
+        ];
+
+        let json = updates_json(&messages);
+
+        assert_eq!(json.len(), 3);
+        assert_eq!(json[0]["sessionUpdate"], "user_message_chunk");
+        assert_eq!(json[1]["sessionUpdate"], "tool_call");
+        assert_eq!(json[1]["toolCallId"], format!("{NOTICE_ID_PREFIX}0"));
+        assert_eq!(json[1]["title"], NOTICE_LINE);
+        assert_eq!(json[1]["status"], "completed");
+        assert_eq!(json[2], serde_json::to_value(text_delta(REPLY)).unwrap());
+        assert!(!serde_json::to_string(&json).unwrap().contains(MONITOR_NOTE));
+    }
+
+    #[test_case(None ; "absent")]
+    #[test_case(Some("") ; "blank")]
+    fn replay_hides_an_observation_without_a_line(line: Option<&str>) {
+        assert!(updates_json(&[observation_with(line)]).is_empty());
+    }
+
     #[test]
     fn replay_hides_synthetic_messages() {
         assert!(updates_json(&[Message::synthetic("injected".into())]).is_empty());
     }
 
-    #[test]
-    fn replay_never_speaks_an_observation_as_the_user() {
-        let obs = Message::observation("[monitor] build failed".into());
-        assert!(updates_json(&[obs]).is_empty());
+    #[test_case(Message::observation(MONITOR_NOTE.into()) ; "observation")]
+    #[test_case(Message::context_update(CONTEXT_UPDATE_TEXT.into(), Default::default()) ; "context_update")]
+    fn replay_never_speaks_host_text_as_the_user(msg: Message) {
+        assert!(updates_json(&[msg]).is_empty());
     }
 
     #[test]
     fn replay_failed_tool_result_maps_to_failed_status() {
         let msg = Message {
             role: MsgRole::User,
-            content: vec![MsgBlock::ToolResult {
-                tool_use_id: "tu-err".into(),
-                content: "boom".into(),
-                is_error: true,
-            }],
+            content: vec![MsgBlock::tool_result("tu-err", "boom", true)],
             display_text: None,
             ..Default::default()
         };

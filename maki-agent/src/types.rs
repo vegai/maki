@@ -147,6 +147,10 @@ pub struct TextOutput {
     /// has to re-parse its own llm output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<serde_json::Value>,
+    /// Deferred MCP tools this call loaded, by wire name; copied into the
+    /// [`ContentBlock::ToolResult`] for providers to expand.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loaded_tools: Vec<String>,
 }
 
 impl From<String> for TextOutput {
@@ -155,17 +159,14 @@ impl From<String> for TextOutput {
             text,
             instructions: None,
             state: None,
+            loaded_tools: Vec::new(),
         }
     }
 }
 
 impl From<&str> for TextOutput {
     fn from(text: &str) -> Self {
-        Self {
-            text: text.to_owned(),
-            instructions: None,
-            state: None,
-        }
+        text.to_owned().into()
     }
 }
 
@@ -181,6 +182,8 @@ impl<'de> Deserialize<'de> for TextOutput {
                 instructions: Option<Vec<InstructionBlock>>,
                 #[serde(default)]
                 state: Option<serde_json::Value>,
+                #[serde(default)]
+                loaded_tools: Vec<String>,
             },
         }
         match Raw::deserialize(deserializer)? {
@@ -189,10 +192,12 @@ impl<'de> Deserialize<'de> for TextOutput {
                 text,
                 instructions,
                 state,
+                loaded_tools,
             } => Ok(Self {
                 text,
                 instructions,
                 state,
+                loaded_tools,
             }),
         }
     }
@@ -306,6 +311,13 @@ impl ToolOutput {
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => t.instructions.as_deref(),
             Self::ReadCode { instructions, .. } => instructions.as_deref(),
             _ => None,
+        }
+    }
+
+    pub fn loaded_tools(&self) -> &[String] {
+        match self {
+            Self::Plain(t) | Self::Markdown(t) => &t.loaded_tools,
+            _ => &[],
         }
     }
 
@@ -542,6 +554,7 @@ pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
             tool_use_id: r.id,
             content: r.output.as_text(),
             is_error: r.is_error,
+            loaded_tools: r.output.loaded_tools().to_vec(),
         });
         if let ToolOutput::Image { source, .. } = r.output.as_ref() {
             images.push(ContentBlock::Image {
@@ -620,6 +633,10 @@ pub enum SessionEndReason {
     Completed,
 }
 
+/// One spelling for the mark, whether the UI draws it on a row or
+/// `maki.agent.call_tool` hands it to a caller's `on_annotation`.
+pub const ALLOWED_BY: &str = "allowed by";
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -682,6 +699,8 @@ pub enum AgentEvent {
     },
     Error {
         message: String,
+        /// The provider rejected the credentials, so a re-login is what fixes it.
+        auth: bool,
     },
     PermissionRequest {
         id: String,
@@ -691,8 +710,28 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// A `permission.prompt` layer allowed a call that would have prompted.
+    /// The prompt is where the user learns what the agent is about to do, so
+    /// a frontend marks the row instead. `id` is the closest row the user can
+    /// see: for a call inside `code_execution` that is the script's row.
+    AllowedByPlugin {
+        id: String,
+        plugin: String,
+    },
     AuthRequired,
     Nudge,
+    /// One line for the user about something the host did that the transcript
+    /// won't show, like telling the model the date changed or rebuilding the
+    /// prompt.
+    Notice {
+        text: String,
+    },
+    /// The transcript line of an observation the loop just accepted, such as
+    /// a background result. History keeps the observation, so a restore
+    /// shows the same line.
+    ObservationLine {
+        text: String,
+    },
     /// A plugin changed the run in a way the transcript alone would not show.
     /// `text` is the message as sent, the reason for a drop, or the message
     /// that kept the run going.
@@ -726,10 +765,22 @@ pub enum AgentEvent {
         total: u32,
         cache: u32,
     },
+    ProviderWaiting {
+        message: Option<String>,
+    },
     /// End of a session's event stream. Emitted only by
     /// [`EventStreamGuard::drop`] and swallowed by [`SessionEvents::next`], so
     /// a consumer sees `None` and never this variant.
     StreamClosed,
+}
+
+impl AgentEvent {
+    pub fn error(error: &AgentError) -> Self {
+        Self::Error {
+            message: error.user_message(),
+            auth: error.is_auth_error(),
+        }
+    }
 }
 
 /// Wakes the UI loop so a change made on another thread is painted now, not on
@@ -1250,6 +1301,7 @@ mod tests {
             text: FILTERABLE_TEXT.into(),
             instructions: None,
             state: Some(serde_json::json!({ "text": FILTERABLE_TEXT })),
+            loaded_tools: Vec::new(),
         }
     }
 
@@ -1692,33 +1744,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_event_tool_snapshot_theme_gen_backwards_compat() {
-        const OMIT_MSG: &str = "theme_gen: None must not appear in serialized JSON";
-        const COMPAT_MSG: &str = "missing theme_gen must deserialize as None (backwards compat)";
-
-        let event = AgentEvent::ToolSnapshot {
-            id: "t1".into(),
-            snapshot: BufferSnapshot {
-                lines: Arc::new(vec![]),
-            },
-            theme_gen: None,
-        };
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(!json.contains("theme_gen"), "{OMIT_MSG}");
-
-        #[derive(Deserialize)]
-        struct ToolSnapshotFields {
-            #[allow(dead_code)]
-            id: String,
-            #[serde(default)]
-            theme_gen: Option<u64>,
-        }
-        let json_without = r#"{"id":"t1"}"#;
-        let parsed: ToolSnapshotFields = serde_json::from_str(json_without).unwrap();
-        assert_eq!(parsed.theme_gen, None, "{COMPAT_MSG}");
-    }
-
-    #[test]
     fn text_output_serde_legacy_bare_string() {
         const MSG: &str = "old sessions store Plain as a bare string";
         let json = r#"{"Plain":"hello world"}"#;
@@ -1743,6 +1768,7 @@ mod tests {
             text: "file contents".into(),
             instructions: Some(blocks),
             state: None,
+            loaded_tools: Vec::new(),
         });
         let json = serde_json::to_string(&output).unwrap();
         let parsed: ToolOutput = serde_json::from_str(&json).unwrap();
@@ -1801,6 +1827,7 @@ mod tests {
                 content: "do stuff".into(),
             }]),
             state: None,
+            loaded_tools: Vec::new(),
         });
         let text = output.as_text();
         assert!(text.contains("fn main()"), "{INCLUDES_MSG}");

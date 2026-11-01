@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::highlight::TAB_SPACES;
@@ -24,7 +26,45 @@ pub struct TextBuffer {
     raw_x: usize,
     cursor_y: usize,
     version: u64,
+    undo: VecDeque<Snapshot>,
+    last_edit: Option<LastEdit>,
 }
+
+/// The buffer before one undoable step. Restoring also restores the cursor,
+/// because an undo that leaves the caret somewhere else is a search for where
+/// the text went.
+#[derive(Clone)]
+struct Snapshot {
+    lines: Vec<String>,
+    raw_x: usize,
+    cursor_y: usize,
+}
+
+/// What one user action does to the text, for grouping undo steps. A run of
+/// typing or of backspaces rewinds a word at a time. Anything else is a step
+/// of its own: a paste, a word kill or a plugin write is already a step the
+/// user meant.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum EditKind {
+    Typing,
+    Deleting,
+    Other,
+}
+
+/// Where the last recorded edit left the buffer. The next edit joins its step
+/// only when it is the same kind, starts right there, and nothing else wrote
+/// the value in between.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LastEdit {
+    kind: EditKind,
+    cursor_y: usize,
+    x: usize,
+    version: u64,
+}
+
+/// Enough history for a long paste session typed over, and small enough that
+/// the buffer cannot grow without bound on a held key.
+const MAX_UNDO: usize = 64;
 
 /// Refuses an offset that splits a character. Rounding it would move an edit
 /// a plugin asked for onto text it never read.
@@ -63,6 +103,8 @@ impl TextBuffer {
             raw_x: 0,
             cursor_y: 0,
             version: 0,
+            undo: VecDeque::new(),
+            last_edit: None,
         }
     }
 
@@ -80,6 +122,68 @@ impl TextBuffer {
         self.raw_x = 0;
         self.cursor_y = 0;
         self.version += 1;
+        self.clear_undo();
+    }
+
+    /// Runs one user action as one undo step, however many lines it touches,
+    /// so a multi-line paste rewinds in one press. Typing or backspacing on
+    /// from where the last edit of that kind stopped joins its step until a
+    /// new word starts, and an action that changed nothing leaves no step.
+    pub fn edit<R>(&mut self, kind: EditKind, apply: impl FnOnce(&mut Self) -> R) -> R {
+        let before = (!self.joins_last_edit(kind)).then(|| Snapshot {
+            lines: self.lines.clone(),
+            raw_x: self.raw_x,
+            cursor_y: self.cursor_y,
+        });
+        let out = apply(self);
+        if let Some(snap) = before {
+            if snap.lines == self.lines {
+                return out;
+            }
+            if self.undo.len() == MAX_UNDO {
+                self.undo.pop_front();
+            }
+            self.undo.push_back(snap);
+        }
+        self.last_edit = Some(self.edit_here(kind));
+        out
+    }
+
+    fn edit_here(&self, kind: EditKind) -> LastEdit {
+        LastEdit {
+            kind,
+            cursor_y: self.cursor_y,
+            x: self.x(),
+            version: self.version,
+        }
+    }
+
+    fn joins_last_edit(&self, kind: EditKind) -> bool {
+        let after_space = self
+            .x()
+            .checked_sub(1)
+            .and_then(|i| self.current_line().chars().nth(i))
+            .is_some_and(char::is_whitespace);
+        kind != EditKind::Other && self.last_edit == Some(self.edit_here(kind)) && !after_space
+    }
+
+    fn clear_undo(&mut self) {
+        self.undo.clear();
+        self.last_edit = None;
+    }
+
+    /// Undoes the last step: one paste, one typed word, one word of backspaces.
+    /// `false` when there is nothing left to undo.
+    pub fn undo(&mut self) -> bool {
+        let Some(snap) = self.undo.pop_back() else {
+            return false;
+        };
+        self.lines = snap.lines;
+        self.raw_x = snap.raw_x;
+        self.cursor_y = snap.cursor_y;
+        self.version += 1;
+        self.last_edit = None;
+        true
     }
 
     /// Counts every change to the value, never a cursor move. `maki.ui.input`
@@ -132,17 +236,23 @@ impl TextBuffer {
 
     pub fn insert_text(&mut self, text: &str) {
         let sanitized = sanitize(text);
-        for (i, chunk) in sanitized.split('\n').enumerate() {
-            if i > 0 {
-                self.add_line();
-            }
-            if !chunk.is_empty() {
-                let bx = self.byte_x();
-                self.lines[self.cursor_y].insert_str(bx, chunk);
-                self.raw_x = self.x() + chunk.chars().count();
-                self.version += 1;
-            }
+        if sanitized.is_empty() {
+            return;
         }
+        // Spliced in one go: inserting line by line shifts every line below
+        // the cursor once per pasted line.
+        let bx = self.byte_x();
+        let tail = self.lines[self.cursor_y].split_off(bx);
+        let mut chunks = sanitized.split('\n');
+        if let Some(first) = chunks.next() {
+            self.lines[self.cursor_y].push_str(first);
+        }
+        let below = self.cursor_y + 1;
+        self.lines.splice(below..below, chunks.map(str::to_string));
+        self.cursor_y += sanitized.matches('\n').count();
+        self.raw_x = self.current_line_len();
+        self.lines[self.cursor_y].push_str(&tail);
+        self.version += 1;
     }
 
     pub fn add_line(&mut self) {
@@ -314,11 +424,15 @@ impl TextBuffer {
         self.raw_x = self.current_line_len();
     }
 
+    /// Drops the value and the undo history with it: a submit, a swap or a
+    /// reset is the user putting the text down, and an undo that reaches back
+    /// past it would resurrect a prompt already sent.
     pub fn clear(&mut self) {
         self.lines = vec![String::new()];
         self.raw_x = 0;
         self.cursor_y = 0;
         self.version += 1;
+        self.clear_undo();
     }
 
     /// Bytes in the whole buffer, newlines counted as one each. The unit
@@ -449,15 +563,15 @@ impl TextBuffer {
                     EditResult::Moved
                 }
                 KeyCode::Backspace | KeyCode::Char('w') => {
-                    self.remove_word_before_cursor();
+                    self.edit(EditKind::Other, Self::remove_word_before_cursor);
                     EditResult::Changed
                 }
                 KeyCode::Delete => {
-                    self.delete_word_after_cursor();
+                    self.edit(EditKind::Other, Self::delete_word_after_cursor);
                     EditResult::Changed
                 }
                 KeyCode::Char('k') => {
-                    self.kill_to_end_of_line();
+                    self.edit(EditKind::Other, Self::kill_to_end_of_line);
                     EditResult::Changed
                 }
                 KeyCode::Char('a') => {
@@ -483,11 +597,11 @@ impl TextBuffer {
                     EditResult::Moved
                 }
                 KeyCode::Backspace => {
-                    self.remove_word_before_cursor();
+                    self.edit(EditKind::Other, Self::remove_word_before_cursor);
                     EditResult::Changed
                 }
                 KeyCode::Delete | KeyCode::Char('d') => {
-                    self.delete_word_after_cursor();
+                    self.edit(EditKind::Other, Self::delete_word_after_cursor);
                     EditResult::Changed
                 }
                 _ => EditResult::Ignored,
@@ -505,8 +619,18 @@ impl TextBuffer {
                     EditResult::Moved
                 }
                 KeyCode::Backspace => {
-                    self.kill_to_start_of_line();
+                    self.edit(EditKind::Other, Self::kill_to_start_of_line);
                     EditResult::Changed
+                }
+                // Cmd+Z where the terminal delivers it (kitty-protocol).
+                // Ctrl+Z is suspend and reserved; there is no notation for
+                // SUPER, so no plugin can want this key for itself.
+                KeyCode::Char('z') => {
+                    if self.undo() {
+                        EditResult::Changed
+                    } else {
+                        EditResult::Ignored
+                    }
                 }
                 _ => EditResult::Ignored,
             };
@@ -514,15 +638,15 @@ impl TextBuffer {
 
         match key.code {
             KeyCode::Char(c) => {
-                self.push_char(c);
+                self.edit(EditKind::Typing, |buf| buf.push_char(c));
                 EditResult::Changed
             }
             KeyCode::Backspace => {
-                self.remove_char();
+                self.edit(EditKind::Deleting, Self::remove_char);
                 EditResult::Changed
             }
             KeyCode::Delete => {
-                self.delete_char();
+                self.edit(EditKind::Other, Self::delete_char);
                 EditResult::Changed
             }
             KeyCode::Left => {
@@ -556,7 +680,7 @@ impl TextBuffer {
 
 #[cfg(test)]
 mod tests {
-    use super::{EditResult, TAB_SPACES, TextBuffer};
+    use super::{EditKind, EditResult, MAX_UNDO, TAB_SPACES, TextBuffer};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use test_case::test_case;
 
@@ -990,5 +1114,134 @@ mod tests {
             buf.version() > typed,
             "a whole-value swap has to keep the counter climbing"
         );
+    }
+
+    fn type_text(buf: &mut TextBuffer, text: &str) {
+        for c in text.chars() {
+            buf.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+    }
+
+    fn paste(buf: &mut TextBuffer, text: &str) {
+        buf.edit(EditKind::Other, |buf| buf.insert_text(text));
+    }
+
+    #[test_case("pasted text" ; "one line")]
+    #[test_case("one\ntwo\nthree" ; "many lines")]
+    fn undo_restores_a_paste_in_one_step(text: &str) {
+        let mut buf = TextBuffer::new("keep ".into());
+        buf.move_to_end();
+        paste(&mut buf, text);
+        assert!(buf.undo());
+        assert_eq!(buf.value(), "keep ");
+        assert!(
+            !buf.undo(),
+            "the fresh buffer has nothing older to give back"
+        );
+    }
+
+    #[test]
+    fn undo_rewinds_typing_word_by_word() {
+        let mut buf = TextBuffer::new(String::new());
+        type_text(&mut buf, "hello world");
+        buf.undo();
+        assert_eq!(buf.value(), "hello ");
+        buf.undo();
+        assert_eq!(buf.value(), "");
+    }
+
+    #[test]
+    fn backspaces_undo_word_by_word() {
+        let mut buf = TextBuffer::new("hello world".into());
+        buf.move_to_end();
+        for _ in 0..6 {
+            buf.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        assert_eq!(buf.value(), "hello");
+        buf.undo();
+        assert_eq!(buf.value(), "hello ");
+        buf.undo();
+        assert_eq!(buf.value(), "hello world");
+    }
+
+    #[test]
+    fn typing_somewhere_else_is_a_new_step() {
+        let mut buf = TextBuffer::new(String::new());
+        type_text(&mut buf, "ab");
+        buf.handle_key(key(KeyCode::Left, KeyModifiers::NONE));
+        type_text(&mut buf, "x");
+        assert_eq!(buf.value(), "axb");
+        buf.undo();
+        assert_eq!(buf.value(), "ab");
+        assert_eq!(
+            (buf.x(), buf.y()),
+            (1, 0),
+            "undo restores where the caret was"
+        );
+        buf.undo();
+        assert_eq!(buf.value(), "");
+    }
+
+    #[test]
+    fn typing_after_a_paste_is_a_new_step() {
+        let mut buf = TextBuffer::new(String::new());
+        paste(&mut buf, "pasted");
+        type_text(&mut buf, "x");
+        buf.undo();
+        assert_eq!(buf.value(), "pasted");
+    }
+
+    #[test]
+    fn a_plugin_write_undoes_in_one_step() {
+        let mut buf = TextBuffer::new("pick a file".into());
+        buf.edit(EditKind::Other, |buf| {
+            buf.replace_byte_range(7, 11, "/tmp/x.rs", None)
+        })
+        .unwrap();
+        assert!(buf.undo());
+        assert_eq!(buf.value(), "pick a file");
+    }
+
+    #[test]
+    fn clear_forgets_the_history() {
+        let mut buf = TextBuffer::new("sent".into());
+        paste(&mut buf, " again");
+        buf.clear();
+        assert!(!buf.undo(), "a submitted prompt does not come back");
+    }
+
+    #[test]
+    fn an_edit_that_changes_nothing_leaves_no_step() {
+        let mut buf = TextBuffer::new("word".into());
+        buf.move_to_end();
+        let kill_word = key(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        buf.handle_key(kill_word);
+        buf.handle_key(kill_word);
+        assert!(buf.undo());
+        assert_eq!(buf.value(), "word");
+        assert!(!buf.undo(), "the second kill had nothing left to take");
+    }
+
+    #[test]
+    fn history_is_capped() {
+        let mut buf = TextBuffer::new(String::new());
+        for _ in 0..(MAX_UNDO + 10) {
+            paste(&mut buf, "a ");
+        }
+        let mut undos = 0;
+        while buf.undo() {
+            undos += 1;
+        }
+        assert_eq!(undos, MAX_UNDO, "history must not grow without bound");
+    }
+
+    #[test]
+    fn super_z_undoes_through_handle_key() {
+        let mut buf = TextBuffer::new("hi".into());
+        buf.move_to_end();
+        paste(&mut buf, " there");
+        let result = buf.handle_key(key(KeyCode::Char('z'), KeyModifiers::SUPER));
+        assert_eq!(result, EditResult::Changed);
+        assert_eq!(buf.value(), "hi");
     }
 }

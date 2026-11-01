@@ -25,7 +25,6 @@ arboard = { workspace = true }
 jiff = { workspace = true }
 smol = { workspace = true }
 flume = { workspace = true }
-async-lock = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 arc-swap = { workspace = true }
@@ -36,7 +35,6 @@ image = { workspace = true, features = ["jpeg", "gif", "webp"] }
 base64 = { workspace = true }
 nucleo = { workspace = true }
 nucleo-matcher = { workspace = true }
-async-process = { workspace = true }
 libc = { workspace = true }
 strum = { workspace = true }
 termini = { workspace = true }
@@ -44,7 +42,13 @@ notify = { workspace = true }
 tempfile = { workspace = true }
 shell-words = { workspace = true }
 open = { workspace = true }
+notify-rust = { workspace = true }
 
+[target.'cfg(not(target_os = "haiku"))'.dependencies]
+arboard = { workspace = true, features = ["wayland-data-control"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
@@ -66,3 +70,6 @@ harness = false
 [[bench]]
 name = "reflow"
 harness = false
+
+[lints]
+workspace = true

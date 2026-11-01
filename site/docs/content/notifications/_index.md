@@ -46,6 +46,7 @@ maki.setup({
 | `auto` | Use OSC 9 in a supported terminal. Use BEL otherwise. |
 | `osc9` | Always send an OSC 9 notification. |
 | `bell` | Always send the terminal bell. |
+| `notify` | Show a desktop notification. |
 | `off` | Do not send notifications. |
 
 `auto` supports Ghostty, iTerm2, Kitty, Warp, and WezTerm. An unknown terminal
@@ -54,6 +55,10 @@ visual alert.
 
 Maki also recognizes `xterm-ghostty` and `xterm-kitty` from `TERM`. This lets
 OSC 9 work when an SSH connection does not preserve `TERM_PROGRAM`.
+
+`notify` works on Linux, macOS, BSD, and Windows. On Linux it needs a D-Bus
+session bus. The notification appears on the machine that runs Maki, so it
+does not reach you over SSH.
 
 ## tmux
 

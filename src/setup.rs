@@ -6,14 +6,15 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use color_eyre::Result;
 use color_eyre::eyre::{Context, bail, eyre};
 
-use maki_config::{ModelPolicy, ProviderConfig};
+use maki_config::{ModelPolicy, ProviderConfig, SessionDefaults};
 use maki_providers::model::{Model, ModelError, ModelTier};
 use maki_providers::provider::provider_for_slug;
 use maki_providers::spec::ProviderRegistry;
 use maki_providers::{AgentError, Timeouts, custom, plugin};
 use maki_storage::StateDir;
 use maki_storage::log::RotatingFileWriter;
-use maki_storage::model::read_model;
+use maki_storage::model::{read_model, read_thinking};
+use maki_storage::sessions::{Effort, StoredThinking};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
@@ -107,6 +108,25 @@ fn provider_ready(slug: &str) -> Result<(), AgentError> {
     provider_for_slug(slug, Timeouts::default()).map(drop)
 }
 
+/// A launch flag overrides config, then the saved `/thinking` level supplies
+/// the fallback. The model reconciles the chosen setting before each request.
+pub fn resolve_thinking(
+    defaults: &mut SessionDefaults,
+    storage: &StateDir,
+    explicit: Option<StoredThinking>,
+) {
+    defaults.thinking = explicit
+        .or(defaults.thinking)
+        .or_else(|| read_thinking(storage));
+}
+
+/// Headless launches have a stable default independent of the TUI's state.
+pub fn resolve_headless_thinking(defaults: &mut SessionDefaults, explicit: Option<StoredThinking>) {
+    defaults.thinking = explicit
+        .or(defaults.thinking)
+        .or(Some(StoredThinking::Effort { level: Effort::Low }));
+}
+
 /// An unknown slug may just mean the models.dev catalog has not been loaded
 /// yet, so retry once with a warm catalog. `Model::from_spec` itself must stay
 /// non-blocking: the UI draws with it.
@@ -145,16 +165,13 @@ fn auto_detect_model(policy: &ModelPolicy) -> Option<Model> {
         })
 }
 
-/// Lua plugin providers that claim no built-in slug, then `providers.toml`
-/// entries. They come after the built-ins so a key in the environment still
-/// wins, as it always did. Sorted by slug, since the registry is a map and
-/// startup should pick the same provider every run.
+/// Lua plugin providers, then `providers.toml` entries. They come after the
+/// prioritised slugs so a key in the environment still wins. Plugins come
+/// sorted by slug, so startup picks the same provider every run.
 fn user_provider_models() -> impl Iterator<Item = Model> {
-    let mut plugin_slugs = plugin::unclaimed_slugs();
-    plugin_slugs.sort_unstable();
-    let plugins = plugin_slugs
+    let plugins = plugin::specs()
         .into_iter()
-        .flat_map(|slug| STARTUP_TIERS.map(|tier| Model::from_tier_dynamic(&slug, tier)));
+        .flat_map(|spec| STARTUP_TIERS.map(|tier| Model::from_tier_dynamic(spec.slug, tier)));
     let custom = custom::startup_specs(&STARTUP_TIERS)
         .into_iter()
         .map(|spec| Model::from_spec(&spec));
@@ -163,11 +180,13 @@ fn user_provider_models() -> impl Iterator<Item = Model> {
 
 /// Built-in slugs keep their compiled protocol, model catalog and auth wiring,
 /// so a `providers.toml` entry setting those fields is only partly honored
-/// (#597). Call this after `init_logging`, otherwise the warning has no
-/// subscriber to reach.
+/// (#597). A bundled plugin's slug counts once its declaration registered,
+/// since it keeps the slug over a `protocol` the same way. Call this after
+/// `init_logging` and the bundled load, or the warning has nowhere to go and
+/// no declaration to check.
 pub fn warn_ignored_provider_fields() {
     for (slug, def) in &maki_config::providers::ProvidersConfig::load().providers {
-        if ProviderRegistry::get(slug).is_none() {
+        if !ProviderRegistry::is_shipped(slug) || ProviderRegistry::get(slug).is_none() {
             continue;
         }
         let ignored = maki_config::providers::ignored_builtin_fields(slug, def);
@@ -311,13 +330,50 @@ pub fn init_logging(storage_config: &maki_config::StorageConfig) {
 
 #[cfg(test)]
 mod tests {
+    use maki_config::SessionDefaults;
+    use maki_storage::StateDir;
+    use maki_storage::model::{persist_thinking, read_thinking};
+    use maki_storage::sessions::{Effort, StoredThinking};
+    use tempfile::tempdir;
     use test_case::test_case;
 
-    use super::{DEFAULT_LOG_LEVEL, build_log_filter};
+    use super::{DEFAULT_LOG_LEVEL, build_log_filter, resolve_thinking};
 
     const FOREIGN: &str = "other_crate=debug";
     const FOREIGN_EMPTY_PIECES: &str = ",other_crate=debug,,";
     const BROKEN: &str = "not a directive=!!";
+    const SAVED: StoredThinking = StoredThinking::Effort { level: Effort::Max };
+    const CONFIGURED: StoredThinking = StoredThinking::Effort {
+        level: Effort::High,
+    };
+    const EXPLICIT: StoredThinking = StoredThinking::Effort {
+        level: Effort::XHigh,
+    };
+
+    #[test_case(Some(EXPLICIT), Some(CONFIGURED), Some(SAVED), Some(EXPLICIT) ; "flag_overrides_config_and_state")]
+    #[test_case(Some(StoredThinking::Off), Some(CONFIGURED), Some(SAVED), Some(StoredThinking::Off) ; "explicit_off_overrides_enabled_defaults")]
+    #[test_case(None, Some(CONFIGURED), Some(SAVED), Some(CONFIGURED) ; "config_overrides_state")]
+    #[test_case(None, None, Some(SAVED), Some(SAVED) ; "state_is_the_fallback")]
+    #[test_case(None, None, None, None ; "no_saved_choice")]
+    fn launch_thinking_precedence_does_not_change_saved_state(
+        explicit: Option<StoredThinking>,
+        configured: Option<StoredThinking>,
+        saved: Option<StoredThinking>,
+        expected: Option<StoredThinking>,
+    ) {
+        let root = tempdir().unwrap();
+        let storage = StateDir::from_path(root.path().to_path_buf());
+        if let Some(saved) = saved {
+            persist_thinking(&storage, saved);
+        }
+        let mut defaults = SessionDefaults {
+            thinking: configured,
+            ..SessionDefaults::default()
+        };
+        resolve_thinking(&mut defaults, &storage, explicit);
+        assert_eq!(defaults.thinking, expected);
+        assert_eq!(read_thinking(&storage), saved);
+    }
 
     #[test_case(None, None, "info" ; "nothing_set_logs_at_info")]
     #[test_case(Some("warn"), None, "warn" ; "our_variable_wins")]

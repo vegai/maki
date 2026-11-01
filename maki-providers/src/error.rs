@@ -26,12 +26,16 @@ const OPENAI_LIMIT: &str = "maximum context length is ";
 const CONNECT_FAILED_MESSAGE: &str =
     "could not connect, check the server is running and the base URL is correct";
 const NETWORK_ERROR_MESSAGE: &str = "connection error, check your network";
+const THINKING_UNBOUND: &str = "bound to a different conversation";
 const UNREADABLE_BODY_MESSAGE: &str = "unable to read error body";
 const RETRY_AFTER_HEADER: &str = "retry-after";
 /// The request field a server names when it refuses reasoning summaries. Every
 /// Responses implementation spells the rejection with a different `code`, so
 /// the field is the only stable part of the answer.
 const REASONING_SUMMARY_PARAM: &str = "reasoning.summary";
+/// OpenAI, Azure and LiteLLM refuse a field with a 400. Servers that validate
+/// with pydantic, like vLLM, answer 422 instead.
+const REJECTED_PARAM_STATUSES: [u16; 2] = [400, 422];
 
 /// Why a provider refused a request for size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,11 +145,12 @@ pub enum ErrorProjection {
     Api {
         status: u16,
         retry_after: Option<Duration>,
-        /// The body is read only through these three answers, so two wordings
-        /// that classify alike are the same error here.
+        /// The body is read only through these answers, so two wordings that
+        /// classify alike are the same error here.
         overflow: Option<Overflow>,
         quota_exhausted: bool,
         auth_error: bool,
+        thinking_unbound: bool,
     },
     Config,
     Tool,
@@ -176,6 +181,7 @@ impl AgentError {
                 overflow: self.overflow(),
                 quota_exhausted: self.is_quota_exhausted(),
                 auth_error: self.is_auth_error(),
+                thinking_unbound: self.is_thinking_unbound(),
             },
             Self::Config { .. } => ErrorProjection::Config,
             Self::Tool { .. } => ErrorProjection::Tool,
@@ -294,6 +300,15 @@ impl AgentError {
         (is_scope && is_overflow).then_some(Overflow::Prompt)
     }
 
+    /// A thinking block was sent back under a prefix other than the one it
+    /// was written under, and the account enforces that. The same body fails
+    /// the same way every time, so only dropping the thinking gets past it.
+    /// Anthropic, Bedrock and gateways in front of either all word it so:
+    /// <https://platform.claude.com/docs/en/build-with-claude/preserved-thinking>
+    pub fn is_thinking_unbound(&self) -> bool {
+        matches!(self, Self::Api { status: 400, message, .. } if message.contains(THINKING_UNBOUND))
+    }
+
     pub fn is_auth_error(&self) -> bool {
         matches!(self, Self::Api { status: 401, .. }) && self.non_login_error().is_none()
     }
@@ -314,6 +329,23 @@ impl AgentError {
     /// reprints the same message until the user cancels.
     fn is_quota_exhausted(&self) -> bool {
         self.non_login_error().is_some_and(|error| error.is_quota)
+    }
+
+    /// Every server words the refusal its own way (`parameters: ['thinking']`,
+    /// `argument supplied: thinking`, `["body","thinking"]`), so we look for
+    /// the name as a whole word. `-` and `_` count as part of a word, or the
+    /// `kimi-k2-thinking` model id that servers echo back would match too.
+    pub fn rejects_param(&self, param: &str) -> bool {
+        let Self::Api {
+            status, message, ..
+        } = self
+        else {
+            return false;
+        };
+        REJECTED_PARAM_STATUSES.contains(status)
+            && message
+                .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
+                .any(|word| word == param)
     }
 
     pub fn is_unsupported_reasoning_summary(&self) -> bool {
@@ -527,6 +559,21 @@ mod tests {
             expected
         );
         assert!(!api(400).is_unsupported_reasoning_summary());
+    }
+
+    const THINKING_PARAM: &str = "thinking";
+
+    #[test_case(400, r#"{"error":{"message":"litellm.UnsupportedParamsError: azure does not support parameters: ['thinking'], for model=gpt-5.6-terra."}}"#, true ; "litellm")]
+    #[test_case(400, r#"{"error":{"message":"Unrecognized request argument supplied: thinking","param":null}}"#, true ; "azure_openai")]
+    #[test_case(422, r#"{"detail":[{"type":"extra_forbidden","loc":["body","thinking"]}]}"#, true ; "pydantic_extra_forbidden")]
+    #[test_case(400, r#"{"error":{"message":"model kimi-k2-thinking does not exist"}}"#, false ; "model_id_containing_the_name")]
+    #[test_case(400, r#"{"error":{"message":"unknown field reasoning_thinking_budget"}}"#, false ; "longer_field_name")]
+    #[test_case(500, r#"{"error":{"message":"unsupported parameter: thinking"}}"#, false ; "server_error")]
+    fn rejects_param_finds_the_name_as_a_token(status: u16, body: &str, expected: bool) {
+        assert_eq!(
+            api_msg(status, body).rejects_param(THINKING_PARAM),
+            expected
+        );
     }
 
     fn opencode_body(error_type: &str, message: &str) -> String {
@@ -749,6 +796,17 @@ mod tests {
         assert_eq!(api_msg(status, message).is_context_overflow(), expected);
     }
 
+    /// A tampered signature is a different 400 that dropping thinking under
+    /// a fresh prefix would only hide.
+    #[test_case(400, THINKING_UNBOUND_MESSAGE, true ; "prefix_mismatch")]
+    #[test_case(400, "messages.1.content.0: Invalid `signature` in `thinking` block", false ; "tampered_signature")]
+    #[test_case(500, THINKING_UNBOUND_MESSAGE, false ; "server_error")]
+    fn is_thinking_unbound(status: u16, message: &str, expected: bool) {
+        let err = api_msg(status, message);
+        assert_eq!(err.is_thinking_unbound(), expected);
+        assert!(!err.is_retryable() || status >= 500);
+    }
+
     #[test]
     fn context_overflow_is_not_retryable() {
         let err = api_msg(400, "request exceeds the available context size");
@@ -756,6 +814,7 @@ mod tests {
         assert!(!err.is_retryable());
     }
 
+    const THINKING_UNBOUND_MESSAGE: &str = "messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to \"drop_block\". The `tools` list differs from when the block was created.";
     const ANTHROPIC_BUDGET: &str = "input length and `max_tokens` exceed context limit: 199773 + 8192 > 200000, decrease input length or max_tokens and try again";
     const VLLM_BUDGET: &str = "This model's maximum context length is 1048576 tokens. However, you requested 1051000 tokens (100000 in the messages, 951000 in the completion). Please reduce the length of the messages or completion.";
     const VLLM_PROMPT_ONLY: &str = "This model's maximum context length is 8192 tokens. However, you requested 9000 tokens (9000 in the messages, 0 in the completion).";
@@ -809,6 +868,7 @@ mod tests {
             OVERFLOW_MESSAGE,
             OVERFLOW_ALIAS,
             ANTHROPIC_BUDGET,
+            THINKING_UNBOUND_MESSAGE,
             quota.as_str(),
             model.as_str(),
         ];
@@ -874,6 +934,7 @@ mod tests {
         overflow: Option<Overflow>,
         quota_exhausted: bool,
         auth_error: bool,
+        thinking_unbound: bool,
         rotate_key: bool,
     }
 
@@ -885,6 +946,7 @@ mod tests {
                 overflow: error.overflow(),
                 quota_exhausted: error.is_quota_exhausted(),
                 auth_error: error.is_auth_error(),
+                thinking_unbound: error.is_thinking_unbound(),
                 rotate_key: error.should_rotate_key(),
             }
         }

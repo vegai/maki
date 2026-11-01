@@ -1,5 +1,7 @@
 use maki_lua_macro::lua_fn;
-use mlua::{Function, Lua, Result as LuaResult, Table, Value};
+use mlua::{Function, Lua, LuaString, Result as LuaResult, Table, Value};
+
+use crate::api::util::convert::TableExt;
 
 const OPTS_TYPE_MSG: &str = "split: opts must be a table or boolean";
 const INFINITE_LOOP_MSG: &str = "split: separator matched an empty string (infinite loop)";
@@ -20,10 +22,10 @@ const INFINITE_LOOP_MSG: &str = "split: separator matched an empty string (infin
 /// maki.split("x*y*z", "*", { plain = true }) -- { "x", "y", "z" }
 /// maki.split("\nhello\nworld\n", "\n", { trimempty = true }) -- { "hello", "world" }
 #[lua_fn]
-fn split(lua: &Lua, s: mlua::String, sep: mlua::String, opts: Option<Value>) -> LuaResult<Table> {
+fn split(lua: &Lua, s: LuaString, sep: LuaString, opts: Option<Value>) -> LuaResult<Table> {
     let (plain, trimempty) = parse_opts(opts)?;
     let bytes = s.as_bytes();
-    let mut parts: Vec<mlua::String> = Vec::new();
+    let mut parts: Vec<LuaString> = Vec::new();
 
     if sep.as_bytes().is_empty() {
         for i in 0..bytes.len() {
@@ -60,8 +62,8 @@ fn parse_opts(opts: Option<Value>) -> LuaResult<(bool, bool)> {
         None | Some(Value::Nil) => Ok((false, false)),
         Some(Value::Boolean(plain)) => Ok((plain, false)),
         Some(Value::Table(t)) => Ok((
-            t.get::<bool>("plain").unwrap_or(false),
-            t.get::<bool>("trimempty").unwrap_or(false),
+            t.opt_bool("plain").unwrap_or(false),
+            t.opt_bool("trimempty").unwrap_or(false),
         )),
         Some(_) => Err(mlua::Error::runtime(OPTS_TYPE_MSG)),
     }

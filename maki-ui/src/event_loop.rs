@@ -7,6 +7,7 @@
 //! waits on every event source at once and wakes the moment a plugin action,
 //! agent event, or keypress arrives instead of sleeping in `event::poll`.
 
+use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,18 +15,22 @@ use std::time::{Duration, Instant};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
+use futures_lite::FutureExt;
 
 use crossterm::event::{
     Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
+use maki_agent::agent::SessionExport;
 use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::session::Resumed;
 use maki_agent::{
-    AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
+    AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle,
+    Transcript, mcp,
 };
 use maki_config::project::TrustQuestion;
 use maki_config::{ModelPolicy, ProjectConfig, UiConfig};
+use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::session_snapshot::{
     MODE_BUILD, MODE_PLAN, STATUS_IDLE, STATUS_NEEDS_INPUT, STATUS_WORKING, SessionQueueSnapshot,
     SessionSnapshot,
@@ -36,7 +41,9 @@ use maki_lua::{
     UiAction, UiAttachment, UiReply,
 };
 use maki_providers::Timeouts;
-use maki_providers::provider::{Provider, fetch_all_models, from_model};
+use maki_providers::models_cache::{ModelList, fetch_all_models_cached};
+use maki_providers::provider::ModelListing;
+use maki_providers::provider::{Provider, from_model};
 use maki_providers::{Message, Model};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
@@ -45,6 +52,7 @@ use maki_storage::sessions::normalize_title;
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 use serde_json::json;
+use smol::Task;
 use tracing::{info, warn};
 
 use crate::agent::{
@@ -57,10 +65,12 @@ use crate::app::tasks::{TaskStatus, diff_task_states};
 use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_response};
 use crate::color_compat;
 use crate::components::input::Submission;
+use crate::components::keybindings::key;
 use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest, Status};
 use crate::input::InputReader;
 use crate::repaint::{Dirty, IDLE_POLL};
+use crate::theme;
 use crate::{AppSession, OpenSession};
 
 use crate::storage_writer::StorageWriter;
@@ -75,6 +85,7 @@ const PACK_PREPARING: &str = "Checking packages...";
 const PACK_BUSY_ERR: &str = "a package command is already running";
 const UNKNOWN_MODE_ERR: &str = "unknown mode; expected \"build\" or \"plan\"";
 const PACK_PANIC_ERR: &str = "the package command stopped unexpectedly";
+const FORKED_MSG: &str = "Forked, {key} to switch back";
 
 /// Tabs carry their in-memory sessions so `/reload` reopens them without a
 /// disk round-trip; `session_has_content` tells which ones were saved.
@@ -96,6 +107,8 @@ pub struct EventLoopParams {
     pub focused: usize,
     pub startup_warnings: Vec<String>,
     pub startup_notice: Option<String>,
+    /// Shown in a popup that stays up until dismissed, not a flash.
+    pub startup_alert: Option<String>,
     pub storage: StateDir,
     pub config: AgentConfig,
     pub ui_config: UiConfig,
@@ -345,6 +358,7 @@ struct SessionRuntime {
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
     last_status: SessionStatus,
+    last_title: String,
     /// Keyed by task id, never by position: a session reset reuses positions,
     /// so a new task would inherit the old one's status.
     last_tasks: Vec<(Arc<str>, TaskStatus)>,
@@ -399,7 +413,7 @@ struct SpawnCtx {
     lua_event_handle: EventHandle,
     mcp_handle: Option<McpHandle>,
     mcp_config_errors: McpConfigErrors,
-    available_models: Arc<ArcSwapOption<Vec<String>>>,
+    available_models: Arc<ArcSwapOption<ModelList>>,
     storage_writer: Arc<StorageWriter>,
     model_policy: Arc<ModelPolicy>,
     trust_question: Option<TrustQuestion>,
@@ -417,8 +431,10 @@ impl SpawnCtx {
                 id: SessionRef::from(session.id),
                 history: session.messages().to_vec(),
                 context_size: session.meta.context_size,
+                frame: session.frame().cloned(),
                 // The tab owns the session and persists it through
-                // `StorageWriter`, so the agent gets the transcript only.
+                // `StorageWriter`, so the agent only gets the transcript and
+                // the frame it was sent under.
                 session: None,
             },
             self.config.clone(),
@@ -454,12 +470,14 @@ impl SpawnCtx {
             app.restore_resumed_session();
         }
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
+        let last_title = app.state.session.title.clone();
         SessionRuntime {
             app,
             handles,
             shell_tx,
             shell_rx,
             last_status: SessionStatus::Idle,
+            last_title,
             last_tasks: Vec::new(),
             notifications: RunNotificationState::default(),
             slot: cell,
@@ -491,7 +509,7 @@ pub(crate) struct EventLoop<'t> {
     /// without this a second `/packupdate` would race the first over the same
     /// clones and locks.
     pack_running: bool,
-    _model_fetch_task: smol::Task<()>,
+    model_fetch: ModelFetch,
 }
 
 /// One item from any of the event loop's sources; `None` from `next_wake`
@@ -511,74 +529,91 @@ enum Wake {
 }
 
 struct BackgroundModels {
-    available: Arc<ArcSwapOption<Vec<String>>>,
+    available: Arc<ArcSwapOption<ModelList>>,
     warn_rx: flume::Receiver<String>,
     warn_tx: flume::Sender<String>,
     models_rx: flume::Receiver<()>,
     models_tx: flume::Sender<()>,
-    task: smol::Task<()>,
+    fetch: ModelFetch,
 }
 
-fn merge_batch(
-    available: &Arc<ArcSwapOption<Vec<String>>>,
-    batch: maki_providers::provider::ModelBatch,
-    warn_tx: &flume::Sender<String>,
-) {
-    for w in batch.warnings {
-        let _ = warn_tx.try_send(w);
-    }
-    if batch.models.is_empty() {
-        return;
-    }
-    let mut merged = available.load().as_deref().cloned().unwrap_or_default();
-    for spec in &batch.models {
-        if !merged.contains(spec) {
-            merged.push(spec.clone());
+#[derive(Default)]
+struct ModelFetch {
+    task: Option<Task<()>>,
+    pending: Option<ModelListing>,
+}
+
+impl ModelFetch {
+    fn request(&mut self, listing: ModelListing, start: impl FnOnce(ModelListing) -> Task<()>) {
+        if self.task.is_some() {
+            self.pending = Some(self.pending.unwrap_or(listing).max(listing));
+        } else {
+            self.task = Some(start(listing));
         }
     }
-    available.store(Some(Arc::new(merged)));
+
+    fn finished(&mut self) -> Option<ModelListing> {
+        self.task = None;
+        self.pending.take()
+    }
 }
 
-/// The one way discovery starts, so startup and `/models refresh` cannot drift
-/// apart. It only reports that it finished and leaves rebuilding to the UI
-/// thread, over a channel so the loop wakes on it instead of noticing at the
-/// next tick. The channel holds one slot, which collapses overlapping fetches
-/// into a single rebuild.
+/// ModelFetch serializes discovery and coalesces queued refreshes. Completion wakes the UI
+/// thread to rebuild the model list, including when discovery panics.
 fn fetch_models(
-    available: Arc<ArcSwapOption<Vec<String>>>,
+    available: Arc<ArcSwapOption<ModelList>>,
     policy: Arc<ModelPolicy>,
     warn_tx: flume::Sender<String>,
     models_tx: flume::Sender<()>,
-) -> smol::Task<()> {
+    listing: ModelListing,
+) -> Task<()> {
     smol::spawn(async move {
-        fetch_all_models(
+        let fetch = fetch_all_models_cached(
             &policy,
-            |batch| merge_batch(&available, batch, &warn_tx),
-            Some(Box::new(move || {
-                let _ = models_tx.try_send(());
-            })),
-        )
-        .await;
+            |list, warnings| {
+                for w in warnings {
+                    let _ = warn_tx.try_send(w);
+                }
+                available.store(Some(Arc::new(list)));
+            },
+            listing,
+        );
+        complete_model_fetch(fetch, &warn_tx, models_tx).await;
     })
 }
 
+async fn complete_model_fetch(
+    fetch: impl Future<Output = ()>,
+    warn_tx: &flume::Sender<String>,
+    models_tx: flume::Sender<()>,
+) {
+    if AssertUnwindSafe(fetch).catch_unwind().await.is_err() {
+        let _ = warn_tx.try_send("model discovery panicked; refresh to try again".to_owned());
+    }
+    let _ = models_tx.try_send(());
+}
+
 fn spawn_model_fetch(policy: Arc<ModelPolicy>) -> BackgroundModels {
-    let available: Arc<ArcSwapOption<Vec<String>>> = Arc::new(ArcSwapOption::empty());
+    let available: Arc<ArcSwapOption<ModelList>> = Arc::new(ArcSwapOption::empty());
     let (warn_tx, warn_rx) = flume::unbounded::<String>();
     let (models_tx, models_rx) = flume::bounded::<()>(1);
-    let task = fetch_models(
-        Arc::clone(&available),
-        policy,
-        warn_tx.clone(),
-        models_tx.clone(),
-    );
+    let mut fetch = ModelFetch::default();
+    fetch.request(ModelListing::Cached, |listing| {
+        fetch_models(
+            Arc::clone(&available),
+            policy,
+            warn_tx.clone(),
+            models_tx.clone(),
+            listing,
+        )
+    });
     BackgroundModels {
         available,
         warn_rx,
         warn_tx,
         models_rx,
         models_tx,
-        task,
+        fetch,
     }
 }
 
@@ -595,6 +630,7 @@ impl<'t> EventLoop<'t> {
             focused,
             mut startup_warnings,
             startup_notice,
+            startup_alert,
             storage,
             config,
             ui_config,
@@ -705,6 +741,9 @@ impl<'t> EventLoop<'t> {
         for warning in startup_warnings {
             app.queue_flash(warning);
         }
+        if let Some(alert) = startup_alert {
+            app.alert_modal.open(alert);
+        }
 
         let (pack_tx, pack_rx) = flume::unbounded();
         Ok(Self {
@@ -727,7 +766,7 @@ impl<'t> EventLoop<'t> {
             pack_tx,
             pack_rx,
             pack_running: false,
-            _model_fetch_task: bg.task,
+            model_fetch: bg.fetch,
         })
     }
 
@@ -779,6 +818,9 @@ impl<'t> EventLoop<'t> {
                 Err(e) => break Err(e),
             }
             self.checkpoint_all();
+            for rt in &self.sessions {
+                rt.handles.publish_chat_settings(&rt.app);
+            }
             if dirty.take()
                 && let Err(e) = self.paint()
             {
@@ -864,7 +906,12 @@ impl<'t> EventLoop<'t> {
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
             Wake::Warn(warning) => self.focused_app().flash(warning),
             Wake::Pack(preparation) => self.finish_pack(*preparation),
-            Wake::ModelsDiscovered => self.rebuild_models(),
+            Wake::ModelsDiscovered => {
+                self.rebuild_models();
+                if let Some(listing) = self.model_fetch.finished() {
+                    self.refresh_models(listing);
+                }
+            }
         }
         Ok(())
     }
@@ -950,6 +997,7 @@ impl<'t> EventLoop<'t> {
         self.emit_focus_changes();
         dirty |= self.start_mailbox_runs();
         self.emit_status_changes();
+        self.emit_title_changes();
         self.emit_task_changes();
         self.emit_notifications();
         // An `exit_on_done` exit waits on `QueueDrained`; a dead agent loop
@@ -998,6 +1046,13 @@ impl<'t> EventLoop<'t> {
             UiAction::Session { req, reply_tx } => {
                 self.handle_session_request(req, reply_tx);
             }
+            UiAction::ExportSession { id, reply_tx } => match self.position(id) {
+                Some(idx) => {
+                    let _ = reply_tx.send(Ok(self.sessions[idx].app.export()));
+                }
+                None => self
+                    .answer_from_disk(id, reply_tx, |session| Ok(SessionExport::stored(session))),
+            },
             UiAction::Model { req, reply_tx } => {
                 let _ = reply_tx.send(self.handle_model_request(req));
             }
@@ -1023,18 +1078,40 @@ impl<'t> EventLoop<'t> {
             UiAction::RunCommand {
                 cmdline,
                 depth,
+                caller,
                 reply_tx,
             } => {
                 // Answer before dispatching: the caller only waits on the name
                 // resolving, and dispatch may take a while (or exit the app).
-                match self.focused_app().run_cmdline(&cmdline, depth) {
+                match self.focused_app().run_cmdline(&cmdline, depth, &caller) {
                     Ok(actions) => {
                         let _ = reply_tx.send(Ok(()));
                         self.dispatch(self.focused, actions);
                     }
                     Err(e) => {
+                        warn!(cmdline, depth, error = %e, "run_command refused");
                         let _ = reply_tx.send(Err(e));
                     }
+                }
+            }
+            UiAction::PluginTaskEvent {
+                session,
+                plugin,
+                envelope,
+            } => {
+                // A straggler after `/new` finds no tab and is dropped.
+                if let Some(idx) = self.sessions.iter().position(|rt| rt.id() == session) {
+                    let actions = self.sessions[idx].app.deliver(*envelope, Some(plugin));
+                    self.dispatch(idx, actions);
+                }
+            }
+            UiAction::PluginTaskOpened {
+                session,
+                plugin,
+                info,
+            } => {
+                if let Some(rt) = self.sessions.iter_mut().find(|rt| rt.id() == session) {
+                    rt.app.open_plugin_task(&info, plugin);
                 }
             }
         }
@@ -1065,14 +1142,32 @@ impl<'t> EventLoop<'t> {
                 continue;
             }
             rt.last_status = status;
-            handle.fire_autocmd(
-                "SessionStatusChanged",
-                json!({
-                    "session_id": rt.id(),
-                    "title": rt.app.state.session.title,
-                    "status": status.as_str(),
-                    "focused": i == self.focused,
-                }),
+            handle.fire(
+                Some(&rt.id()),
+                HostEvent::SessionStatusChanged {
+                    title: &rt.app.state.session.title,
+                    status: status.as_str(),
+                    focused: i == self.focused,
+                },
+            );
+        }
+    }
+
+    /// `/rename` and title auto-generation change the title without touching
+    /// the status diff above, so the title gets its own diff per frame.
+    fn emit_title_changes(&mut self) {
+        let handle = &self.ctx.lua_event_handle;
+        for (i, rt) in self.sessions.iter_mut().enumerate() {
+            if rt.app.state.session.title == rt.last_title {
+                continue;
+            }
+            rt.last_title = rt.app.state.session.title.clone();
+            handle.fire(
+                Some(&rt.id()),
+                HostEvent::SessionTitleChanged {
+                    title: &rt.last_title,
+                    focused: i == self.focused,
+                },
             );
         }
     }
@@ -1084,17 +1179,34 @@ impl<'t> EventLoop<'t> {
         for rt in &mut self.sessions {
             let session_id = rt.app.state.session.id;
             diff_task_states(&mut rt.last_tasks, rt.app.task_states(), |task| {
-                handle.fire_autocmd(
-                    "TaskStatusChanged",
-                    json!({
-                        "session_id": session_id,
-                        "id": task.id,
-                        "name": task.name,
-                        "status": task.status,
-                    }),
+                handle.fire(
+                    Some(&session_id),
+                    HostEvent::TaskStatusChanged {
+                        id: task.id,
+                        name: task.name,
+                        status: task.status.into(),
+                        plugin: task.plugin.map(|plugin| &**plugin),
+                    },
                 );
             });
         }
+    }
+
+    /// Called only after the cancel went out, so a handler that checks
+    /// `maki.agent.list()` already finds a stopped plugin task gone.
+    fn emit_task_stopped(&self, idx: usize, id: &str) {
+        let app = &self.sessions[idx].app;
+        let plugin = app
+            .task_states()
+            .find(|task| &**task.id == id)
+            .and_then(|task| task.plugin);
+        self.ctx.lua_event_handle.fire(
+            Some(&app.state.session.id),
+            HostEvent::TaskStopped {
+                id,
+                plugin: plugin.map(|plugin| &**plugin),
+            },
+        );
     }
 
     fn emit_notifications(&mut self) {
@@ -1111,7 +1223,7 @@ impl<'t> EventLoop<'t> {
             selected = select_notification(selected, candidate);
         }
         if let Some(notification) = selected.filter(|n| self.focus.allows(n))
-            && let Err(error) = notifier.notify(&notification.message())
+            && let Err(error) = notifier.notify(&notification.message(), notification.reason())
         {
             warn!(notifier = ?notifier.notifier(), %error, "terminal notifications disabled after write failure");
             self.notifier = None;
@@ -1138,15 +1250,16 @@ impl<'t> EventLoop<'t> {
         let switched = previous_session.is_some() && previous_session != Some(session_id);
         let eh = &self.ctx.lua_event_handle;
         if previous_session != Some(session_id) {
-            let mut data = json!({ "session_id": session_id });
-            if let Some(id) = previous_session {
-                data["previous_session_id"] = json!(id.to_string());
-            }
-            eh.fire_autocmd("SessionFocusChanged", data);
+            eh.fire(
+                Some(&session_id),
+                HostEvent::SessionFocusChanged {
+                    previous_session_id: previous_session.map(|id| id.to_string()),
+                },
+            );
         }
-        eh.fire_autocmd(
-            "TaskFocusChanged",
-            json!({ "session_id": session_id, "id": task_id }),
+        eh.fire(
+            Some(&session_id),
+            HostEvent::TaskFocusChanged { id: &task_id },
         );
         if switched {
             self.focused_app().announce_input();
@@ -1244,32 +1357,34 @@ impl<'t> EventLoop<'t> {
             SessionRequest::Current => {
                 let _ = reply_tx.send(Ok(json!(self.sessions[self.focused].id())));
             }
+            // A stored session is read from disk, off the loop like `List`.
             SessionRequest::Read { id } => {
-                let reply = match self.resolve_session_index(id.as_deref()) {
-                    Ok(idx) => Ok(self.session_snapshot_json(idx)),
-                    Err(e) => Err(e),
+                let id = match id.as_deref().map(parse_session_id).transpose() {
+                    Ok(id) => id,
+                    Err(e) => {
+                        let _ = reply_tx.send(Err(e));
+                        return;
+                    }
                 };
-                let _ = reply_tx.send(reply);
-            }
-            SessionRequest::New { prompt, focus } => {
-                let open = self.focused_app().blank_session();
-                // A blank session inherits the focused tab's model, whose slot
-                // is already built and sitting right here.
-                let slot = self.sessions[self.focused].slot.load_full();
-                let idx = self.push_runtime(self.ctx.spawn_runtime(open, slot));
-                let id = self.sessions[idx].id();
-                maki_otel::emit::session_started(
-                    maki_otel::emit::START_FRESH,
-                    Some(&id.to_string()),
-                );
-                if let Some(prompt) = prompt {
-                    let _ = self.submit_text(idx, prompt);
+                let live = match id {
+                    None => Ok(self.focused),
+                    Some(id) => self.position(id).ok_or(id),
+                };
+                match live {
+                    Ok(idx) => {
+                        let _ = reply_tx.send(Ok(self.session_snapshot_json(idx)));
+                    }
+                    Err(id) => self.answer_from_disk(id, reply_tx, |session| {
+                        serde_json::to_value(SessionSnapshot::stored(&session))
+                            .map_err(|e| e.to_string())
+                    }),
                 }
-                if focus {
-                    self.focused = idx;
-                }
-                let _ = reply_tx.send(Ok(json!(id)));
             }
+            SessionRequest::New {
+                transcript,
+                prompt,
+                focus,
+            } => self.create_session(*transcript, prompt, focus, reply_tx),
             SessionRequest::Prompt { id, text } => {
                 let idx = match id {
                     None => Ok(self.focused),
@@ -1339,7 +1454,10 @@ impl<'t> EventLoop<'t> {
             ModelRequest::Available => {
                 let available = self.ctx.available_models.load();
                 Ok(json!(
-                    available.as_deref().map(Vec::as_slice).unwrap_or(&[])
+                    available
+                        .as_deref()
+                        .map(|list| list.specs.as_slice())
+                        .unwrap_or(&[])
                 ))
             }
             ModelRequest::Set {
@@ -1376,6 +1494,12 @@ impl<'t> EventLoop<'t> {
         match req {
             TaskRequest::List => Ok(json!(self.focused_app().tasks())),
             TaskRequest::Focus { id } => self.focused_app().focus_task(&id).map(|()| json!(true)),
+            TaskRequest::Remove { id } => self.focused_app().remove_task(&id).map(|()| json!(true)),
+            TaskRequest::Stop { id, session } => {
+                let action = self.focused_app().stop_task_in_session(&id, &session)?;
+                self.dispatch(self.focused, vec![action]);
+                Ok(json!(true))
+            }
         }
     }
 
@@ -1392,6 +1516,72 @@ impl<'t> EventLoop<'t> {
             SubmitOutcome::Queued => Ok(json!("queued")),
             SubmitOutcome::Rejected(e) => Err(e.into()),
         }
+    }
+
+    /// Without `prompt` or `focus` the session is only stored, and the reply
+    /// waits for the write. Otherwise it opens in a tab, which saves it on its
+    /// first checkpoint.
+    fn create_session(
+        &mut self,
+        transcript: Transcript,
+        prompt: Option<String>,
+        focus: bool,
+        reply_tx: flume::Sender<UiReply>,
+    ) {
+        let inherits_model = transcript.model.is_none();
+        let open = match self.sessions[self.focused].app.session_from(transcript) {
+            Ok(open) => open,
+            Err(e) => {
+                let _ = reply_tx.send(Err(e));
+                return;
+            }
+        };
+        if prompt.is_none() && !focus {
+            let storage = self.ctx.storage.clone();
+            smol::unblock(move || {
+                let reply = open.store(&storage).map(|id| json!(id));
+                let _ = reply_tx.send(reply.map_err(|e| e.to_string()));
+            })
+            .detach();
+            return;
+        }
+        // An inherited model's slot is already built and sitting right here.
+        let (slot, fallback) = if inherits_model {
+            (self.sessions[self.focused].slot.load_full(), None)
+        } else {
+            self.slots.get_or_fallback(&open.session.model)
+        };
+        let idx = self.push_runtime(self.ctx.spawn_runtime(open, slot));
+        let id = self.sessions[idx].id();
+        maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(&id.to_string()));
+        if let Some(reason) = fallback {
+            self.sessions[idx].app.flash(reason);
+        }
+        if let Some(prompt) = prompt {
+            let _ = self.submit_text(idx, prompt);
+        }
+        if focus {
+            self.focused = idx;
+        }
+        let _ = reply_tx.send(Ok(json!(id)));
+    }
+
+    /// Reads a session no tab has open off the loop, without claiming it, so
+    /// one another maki holds still answers.
+    fn answer_from_disk<T: Send + 'static>(
+        &self,
+        id: MakiId,
+        reply_tx: flume::Sender<Result<T, String>>,
+        answer: impl FnOnce(AppSession) -> Result<T, String> + Send + 'static,
+    ) {
+        let storage = self.ctx.storage.clone();
+        smol::unblock(move || {
+            let reply = AppSession::read_only(id, &storage)
+                .map_err(|e| e.to_string())
+                .and_then(answer);
+            let _ = reply_tx.send(reply);
+        })
+        .detach();
     }
 
     fn position(&self, id: MakiId) -> Option<usize> {
@@ -1423,6 +1613,8 @@ impl<'t> EventLoop<'t> {
             } else {
                 MODE_BUILD
             },
+            thinking: Some(app.state.thinking.to_string()),
+            fast: Some(app.state.fast),
             status: SessionStatus::of(app).as_str(),
             focused: idx == self.focused,
             updated_at: app.state.session.updated_at,
@@ -1431,7 +1623,7 @@ impl<'t> EventLoop<'t> {
             }),
             usage: app.state.token_usage,
             context_size: app.state.context_size,
-            context_window: app.state.model.context_window,
+            context_window: Some(app.state.model.context_window),
             cost: app.state.cost,
         };
         json!(snapshot)
@@ -1498,14 +1690,22 @@ impl<'t> EventLoop<'t> {
         }
     }
 
+    /// Only a real focus report may recolor the caret: resume heuristics and
+    /// stray input prove nothing, and no FocusGained follows $EDITOR or fg.
+    fn sync_cursor(&self) {
+        theme::set_cursor_focused(self.focus != Focus::Unfocused);
+    }
+
     fn translate(&mut self, raw: Event) -> (Option<Msg>, Option<Event>) {
         match raw {
             Event::FocusGained => {
                 self.focus.report(Focus::Focused);
+                self.sync_cursor();
                 (None, None)
             }
             Event::FocusLost => {
                 self.focus.report(Focus::Unfocused);
+                self.sync_cursor();
                 (None, None)
             }
             // The one place the host's view of a keypress is normalized, so
@@ -1644,6 +1844,17 @@ impl<'t> EventLoop<'t> {
         );
     }
 
+    /// The fork runs on the model of the session it came from, whose slot is
+    /// already built.
+    fn open_fork(&mut self, idx: usize, open: OpenSession) {
+        let slot = self.sessions[idx].slot.load_full();
+        self.focused = self.push_runtime(self.ctx.spawn_runtime(open, slot));
+        let id = self.sessions[self.focused].id();
+        maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(&id.to_string()));
+        self.focused_app()
+            .flash(FORKED_MSG.replace("{key}", key::SESSIONS.label));
+    }
+
     fn handle_action(&mut self, idx: usize, action: Action) {
         match action {
             Action::SendMessage(input) => {
@@ -1665,9 +1876,17 @@ impl<'t> EventLoop<'t> {
                 rt.handles.cancel_run(run_id);
             }
             Action::CancelSubagent { tool_use_id } => {
-                self.sessions[idx].handles.cancel_subagent(tool_use_id);
+                self.sessions[idx]
+                    .handles
+                    .cancel_subagent(tool_use_id.clone());
+                self.emit_task_stopped(idx, &tool_use_id);
+            }
+            Action::CancelPluginTask { id } => {
+                self.ctx.lua_event_handle.cancel_plugin_session(&id);
+                self.emit_task_stopped(idx, &id);
             }
             Action::RestartAgent(history) => self.respawn_agent(idx, history),
+            Action::OpenFork(open) => self.open_fork(idx, *open),
             Action::ChangeModel(spec) => {
                 if let Err(e) = self.change_model(&spec) {
                     self.focused_app().flash(e);
@@ -1684,9 +1903,11 @@ impl<'t> EventLoop<'t> {
                 let rt = &mut self.sessions[idx];
                 rt.reset_run_notifications();
                 let run_id = rt.app.run_id;
+                let workflow = rt.app.state.workflow;
                 rt.handles.queue.push(QueueItem::Compact(Compaction {
                     run_id,
                     instructions,
+                    workflow,
                 }));
             }
             Action::ToggleMcp(server_name, enabled) => {
@@ -1741,7 +1962,7 @@ impl<'t> EventLoop<'t> {
                 terminal::suspend(self.terminal);
                 self.focus.on_resume();
             }
-            Action::RefreshModels => self.refresh_models(),
+            Action::RefreshModels(listing) => self.refresh_models(listing),
             Action::RefreshUsage => self.refresh_usage(),
             Action::ManualExit => self.sessions[idx].notifications.on_manual_exit(),
         }
@@ -1795,15 +2016,16 @@ impl<'t> EventLoop<'t> {
         self.dispatch(self.focused, actions);
     }
 
-    fn refresh_models(&self) {
-        self.ctx.available_models.store(None);
-        fetch_models(
-            Arc::clone(&self.ctx.available_models),
-            Arc::clone(&self.ctx.model_policy),
-            self.warn_tx.clone(),
-            self.models_tx.clone(),
-        )
-        .detach();
+    fn refresh_models(&mut self, listing: ModelListing) {
+        self.model_fetch.request(listing, |listing| {
+            fetch_models(
+                Arc::clone(&self.ctx.available_models),
+                Arc::clone(&self.ctx.model_policy),
+                self.warn_tx.clone(),
+                self.models_tx.clone(),
+                listing,
+            )
+        });
     }
 
     fn refresh_usage(&mut self) {
@@ -1832,8 +2054,9 @@ impl<'t> EventLoop<'t> {
             .any(|rt| *rt.app.state.model.provider == *slug)
         {
             self.rebuild_models();
-        } else if let Some(builtin) = maki_config::providers::builtin_provider(&slug)
-            && let Err(e) = self.change_model(builtin.default_model)
+        } else if let Some(default_model) =
+            maki_config::providers::builtin_provider(&slug).and_then(|b| b.default_model)
+            && let Err(e) = self.change_model(default_model)
         {
             self.focused_app().flash(e);
         }
@@ -1933,10 +2156,63 @@ mod tests {
     use super::*;
     use maki_agent::DoneReason;
     use maki_providers::TokenUsage;
+    use std::future::pending;
     use test_case::test_case;
 
     const OBSERVATION: &str = "failed";
     const SHELL_RESULT: &str = "command finished";
+
+    #[test]
+    fn a_panicked_model_fetch_completes_and_allows_the_queued_refresh() {
+        let (models_tx, models_rx) = flume::bounded(1);
+        let (warn_tx, warn_rx) = flume::unbounded();
+        let mut fetch = ModelFetch {
+            task: None,
+            pending: None,
+        };
+        fetch.request(ModelListing::Cached, |_| {
+            smol::spawn(async move {
+                complete_model_fetch(async { panic!("discovery failed") }, &warn_tx, models_tx)
+                    .await;
+            })
+        });
+        fetch.request(ModelListing::Refresh, |_| unreachable!());
+        smol::block_on(models_rx.recv_async()).unwrap();
+        assert!(warn_rx.recv().unwrap().contains("model discovery panicked"));
+        let next = fetch.finished().unwrap();
+        assert_eq!(next, ModelListing::Refresh);
+        fetch.request(next, |_| smol::spawn(pending()));
+        assert!(fetch.task.is_some());
+    }
+
+    #[test]
+    fn model_refresh_waits_for_discovery_and_coalesces_with_priority() {
+        let mut fetch = ModelFetch {
+            task: None,
+            pending: None,
+        };
+        let mut started = Vec::new();
+        for listing in [
+            ModelListing::Cached,
+            ModelListing::Refresh,
+            ModelListing::Cached,
+            ModelListing::Refresh,
+        ] {
+            fetch.request(listing, |listing| {
+                started.push(listing);
+                smol::spawn(pending())
+            });
+        }
+        assert_eq!(started, [ModelListing::Cached]);
+        let next = fetch.finished().unwrap();
+        assert_eq!(next, ModelListing::Refresh);
+        fetch.request(next, |listing| {
+            started.push(listing);
+            smol::spawn(pending())
+        });
+        assert_eq!(started, [ModelListing::Cached, ModelListing::Refresh]);
+        assert_eq!(fetch.finished(), None);
+    }
 
     fn done_event() -> AgentEvent {
         AgentEvent::Done {

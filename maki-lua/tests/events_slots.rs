@@ -2,13 +2,18 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use maki_agent::AgentMode;
 use maki_agent::agent::{AgentCall, AgentSlot};
 use maki_agent::cancel::CancelToken;
+use maki_agent::permissions::{LayerAnswer, LayerVerdict};
 use maki_agent::tools::hook::{self, Authority, HookCall, HookStage, Verdict};
-use maki_agent::tools::{CallOrigin, ToolRegistry};
+use maki_agent::tools::test_support::stub_ctx;
+use maki_agent::tools::{CallOrigin, ToolOutputMode, ToolRegistry};
+use maki_lua::agent_autocmd::host_event_fields;
+use maki_lua::test_support::{content_omitted_message, layer_skipped_message};
 use maki_lua::{
     Permission, PlanActionOutcome, PlanFormRow, PlanMenu, PlanRowAction, PluginHost,
-    PluginPermissions, SessionEndReason,
+    PluginPermissions, SessionEndReason, UiAction,
 };
 use maki_storage::id::MakiId;
 use test_case::test_case;
@@ -65,6 +70,203 @@ maki.api.register_tool({{
 }
 
 // ---------------------------------------------------------------- events
+
+const CONTENT_READER: &str = "content_reader";
+const CONTENT_BLIND: &str = "content_blind";
+const SENTINEL_EVENT: &str = "User";
+const SENTINEL_FLASH: &str = "sentinel";
+const PAYLOAD_VALUE: &str = "x";
+
+/// Flashes `<plugin>:<sorted data keys>` for each {event} it receives.
+fn key_reporter(plugin: &str, event: &str) -> String {
+    format!(
+        r#"
+maki.api.create_autocmd("{event}", {{
+    callback = function(ev)
+        local keys = {{}}
+        for key in pairs(ev.data) do keys[#keys + 1] = key end
+        table.sort(keys)
+        maki.ui.flash("{plugin}:" .. table.concat(keys, ","))
+    end,
+}})
+maki.api.create_autocmd("{SENTINEL_EVENT}", {{
+    callback = function() maki.ui.flash("{SENTINEL_FLASH}") end,
+    once = true,
+}})
+"#
+    )
+}
+
+fn sorted_keys<'a>(keys: impl Iterator<Item = &'a &'static str>) -> String {
+    let mut keys: Vec<&str> = keys.copied().collect();
+    keys.sort_unstable();
+    keys.join(",")
+}
+
+/// Everything flashed up to the first sentinel. Dispatch is sequential on the
+/// Lua thread, so whatever the events before it caused is already in.
+fn flashes_until_sentinel(ui: &flume::Receiver<UiAction>) -> Vec<String> {
+    let mut out = Vec::new();
+    loop {
+        match ui.recv_timeout(DISPATCH_TIMEOUT) {
+            Ok(UiAction::Flash(msg)) if msg == SENTINEL_FLASH => return out,
+            Ok(UiAction::Flash(msg)) => out.push(msg),
+            Ok(_) => {}
+            Err(e) => panic!("sentinel never flashed: {e}, got {out:?}"),
+        }
+    }
+}
+
+/// A plugin without `session_read` still hears the event, minus the content,
+/// and is told so once rather than on every event.
+#[test_case("TurnStart" ; "turn_start")]
+#[test_case("ToolDone" ; "tool_done")]
+#[test_case("CompactionDone" ; "compaction_done")]
+#[test_case("InputChanged" ; "input_changed")]
+fn content_fields_are_left_out_without_session_read(event: &str) {
+    let fields = host_event_fields(event).expect("a content event is classified");
+    let (_reg, host) = host();
+    let ui = host.ui_action_rx();
+    load(&host, CONTENT_READER, &key_reporter(CONTENT_READER, event));
+    load_granted(
+        &host,
+        CONTENT_BLIND,
+        &key_reporter(CONTENT_BLIND, event),
+        without_session_read(),
+    );
+
+    let payload: serde_json::Map<String, serde_json::Value> = fields
+        .content
+        .iter()
+        .chain(fields.metadata)
+        .map(|key| ((*key).to_owned(), PAYLOAD_VALUE.into()))
+        .collect();
+    let events = host.event_handle();
+    events.fire_autocmd(event, payload.clone().into());
+    events.fire_autocmd(event, payload.into());
+    events.fire_autocmd(SENTINEL_EVENT, serde_json::json!({}));
+
+    let everything = format!(
+        "{CONTENT_READER}:{}",
+        sorted_keys(fields.content.iter().chain(fields.metadata))
+    );
+    let metadata = format!("{CONTENT_BLIND}:{}", sorted_keys(fields.metadata.iter()));
+    let warning = content_omitted_message(CONTENT_BLIND, event, fields.content);
+    assert_eq!(
+        flashes_until_sentinel(&ui),
+        [
+            everything.clone(),
+            warning,
+            metadata.clone(),
+            everything,
+            metadata
+        ]
+    );
+}
+
+fn without_session_read() -> PluginPermissions {
+    let mut blind = PluginPermissions::trusted();
+    blind.set(Permission::SessionRead, false);
+    blind
+}
+
+const UNCLASSIFIED_KEY: &str = "unclassified";
+const SESSION_ID_KEY: &str = "session_id";
+const CUSTOM_EVENT: &str = "MyPluginEvent";
+
+/// What a plugin without `session_read` gets of a host event is an allowlist:
+/// a key the host sends that nobody classified is left out like content. An
+/// event a plugin names itself is nobody's to classify and arrives whole.
+#[test_case("TurnEnd", false ; "an_unclassified_host_key_is_left_out")]
+#[test_case(CUSTOM_EVENT, true ; "a_plugin_event_arrives_whole")]
+fn only_classified_metadata_reaches_a_plugin_without_session_read(event: &str, whole: bool) {
+    let (_reg, host) = host();
+    let ui = host.ui_action_rx();
+    load_granted(
+        &host,
+        CONTENT_BLIND,
+        &key_reporter(CONTENT_BLIND, event),
+        without_session_read(),
+    );
+
+    let events = host.event_handle();
+    events.fire_autocmd(
+        event,
+        serde_json::json!({ SESSION_ID_KEY: PAYLOAD_VALUE, UNCLASSIFIED_KEY: PAYLOAD_VALUE }),
+    );
+    events.fire_autocmd(SENTINEL_EVENT, serde_json::json!({}));
+
+    let expected = if whole {
+        vec![format!(
+            "{CONTENT_BLIND}:{SESSION_ID_KEY},{UNCLASSIFIED_KEY}"
+        )]
+    } else {
+        vec![
+            content_omitted_message(CONTENT_BLIND, event, &[UNCLASSIFIED_KEY]),
+            format!("{CONTENT_BLIND}:{SESSION_ID_KEY}"),
+        ]
+    };
+    assert_eq!(flashes_until_sentinel(&ui), expected);
+}
+
+const KEY_FIRER: &str = "key_firer";
+const UNNAMEABLE_KEY: &str = "[table]";
+
+/// Flashes `<plugin>:<number of data keys>` for each {event} it receives.
+fn key_counter(plugin: &str, event: &str) -> String {
+    format!(
+        r#"
+maki.api.create_autocmd("{event}", {{
+    callback = function(ev)
+        local n = 0
+        for _ in pairs(ev.data) do n = n + 1 end
+        maki.ui.flash("{plugin}:" .. n)
+    end,
+}})
+maki.api.create_autocmd("{SENTINEL_EVENT}", {{
+    callback = function() maki.ui.flash("{SENTINEL_FLASH}") end,
+    once = true,
+}})
+"#
+    )
+}
+
+/// Any plugin may fire a host event with any key. A key that throws when
+/// named must not cost anyone the event, least of all a subscriber that
+/// would have read it whole.
+#[test]
+fn a_key_that_cannot_be_named_does_not_drop_the_event() {
+    let event = "TurnEnd";
+    let (_reg, host) = host();
+    let ui = host.ui_action_rx();
+    load(&host, CONTENT_READER, &key_counter(CONTENT_READER, event));
+    load_granted(
+        &host,
+        CONTENT_BLIND,
+        &key_counter(CONTENT_BLIND, event),
+        without_session_read(),
+    );
+    load(
+        &host,
+        KEY_FIRER,
+        &format!(
+            r#"
+local unnameable = setmetatable({{}}, {{ __tostring = function() error("no name") end }})
+maki.api.exec_autocmds("{event}", {{ data = {{ [unnameable] = true, {SESSION_ID_KEY} = "{PAYLOAD_VALUE}" }} }})
+maki.api.exec_autocmds("{SENTINEL_EVENT}")
+"#
+        ),
+    );
+
+    assert_eq!(
+        flashes_until_sentinel(&ui),
+        [
+            format!("{CONTENT_READER}:2"),
+            content_omitted_message(CONTENT_BLIND, event, &[UNNAMEABLE_KEY]),
+            format!("{CONTENT_BLIND}:1"),
+        ]
+    );
+}
 
 #[test]
 fn exec_autocmds_pattern_routing_and_ev_shape() {
@@ -339,6 +541,7 @@ const LAYER_PLUGIN: &str = "policy_layer";
 const HIJACKED: &str = "hijacked";
 const COMMAND: &str = "ls";
 const PASS_THROUGH: (Option<String>, Option<String>) = (None, None);
+const REDACTED_OUTPUT: &str = "[redacted]";
 const NEVER_ANSWERED: &str = "the chain never answered";
 const INNER_LAYER: &str = "inner_layer";
 const OUTER_LAYER: &str = "outer_layer";
@@ -384,6 +587,7 @@ fn call_of<'a>(
         input: None,
         session_id: None,
         origin,
+        output_mode: ToolOutputMode::Compact,
         authority,
         cancel,
         deadline: Instant::now() + DISPATCH_TIMEOUT,
@@ -427,13 +631,14 @@ fn fire(
     value: serde_json::Value,
 ) -> Verdict {
     let entry = reg.get(tool).expect("tool registered");
-    let authority = entry
-        .tool
-        .required_permission()
-        .map_or(Authority::Unbounded, Authority::Capability);
     fire_call(
         reg,
-        &call_of(tool, authority, origin, &CancelToken::none()),
+        &call_of(
+            tool,
+            Authority::from(entry.tool.reach()),
+            origin,
+            &CancelToken::none(),
+        ),
         stage,
         value,
     )
@@ -549,6 +754,20 @@ fn only_run() -> PluginPermissions {
     permissions
 }
 
+/// Half of what a layer on a `run` tool costs, for a gap that narrows.
+fn run_and_read() -> PluginPermissions {
+    let mut permissions = only_run();
+    permissions.set(Permission::SessionRead, true);
+    permissions
+}
+
+/// `run` plus conversation content, what a layer on a `run` tool costs.
+fn run_read_and_write() -> PluginPermissions {
+    let mut permissions = run_and_read();
+    permissions.set(Permission::SessionWrite, true);
+    permissions
+}
+
 fn only_net() -> PluginPermissions {
     let mut permissions = PluginPermissions::denied();
     permissions.set(Permission::Net, true);
@@ -559,6 +778,12 @@ fn only_net() -> PluginPermissions {
 fn all_but_run() -> PluginPermissions {
     let mut permissions = PluginPermissions::trusted();
     permissions.set(Permission::Run, false);
+    permissions
+}
+
+fn all_but_agent() -> PluginPermissions {
+    let mut permissions = PluginPermissions::trusted();
+    permissions.set(Permission::Agent, false);
     permissions
 }
 
@@ -592,12 +817,16 @@ fn marking_layer(tool: &str, mark: &str) -> String {
 }
 
 /// The price list. A tool that declares a capability sells its layers exactly
-/// that one. A tool declaring none, like an MCP server's tool, has said nothing
-/// about how far it reaches, so layering it costs every capability.
+/// that one, plus the conversation both ways, since a layer reads what the
+/// model wrote and decides what it reads back. A tool
+/// declaring none, like an MCP server's tool, has said nothing about how far it
+/// reaches, so layering it costs every capability.
 ///
 /// The layer is registered before its target exists, because nobody guarantees
 /// load order between a layer and the tool it wraps.
-#[test_case(GUARDED_TOOL, only_run,                   true  ; "the_declared_capability_is_enough")]
+#[test_case(GUARDED_TOOL, run_read_and_write,         true  ; "the_declared_capability_and_content_are_enough")]
+#[test_case(GUARDED_TOOL, run_and_read,               false ; "reading_alone_cannot_answer_the_model")]
+#[test_case(GUARDED_TOOL, only_run,                   false ; "the_capability_alone_does_not_read_the_call")]
 #[test_case(SLOT_TOOL,    only_run,                   false ; "an_undeclared_reach_takes_more_than_one")]
 #[test_case(SLOT_TOOL,    all_but_run,                false ; "almost_every_capability_is_not_every_one")]
 #[test_case(SLOT_TOOL,    PluginPermissions::trusted, true  ; "full_trust_layers_anything")]
@@ -613,6 +842,84 @@ fn a_layer_pays_the_authority_of_the_call_it_filters(
 
     let expected = runs.then(|| HIJACKED.to_owned());
     assert_eq!(input(&reg, tool, COMMAND), (expected, None));
+}
+
+fn redacting_layer(tool: &str) -> String {
+    layer(
+        tool,
+        HookStage::Output,
+        &format!(
+            r#"value.{text} = "{REDACTED_OUTPUT}"; return value"#,
+            text = hook::OUTPUT_TEXT
+        ),
+    )
+}
+
+/// Rewriting an output changes what the model reads back, so on top of the
+/// call's capability it takes `session_read` and `session_write`.
+#[test_case(run_and_read,       false ; "reading_is_not_rewriting")]
+#[test_case(run_read_and_write, true  ; "read_and_write_rewrite")]
+fn an_output_layer_pays_for_the_content_it_changes(granted: fn() -> PluginPermissions, runs: bool) {
+    let (reg, host) = host();
+    guarded_tool(&host);
+    load_granted(
+        &host,
+        LAYER_PLUGIN,
+        &redacting_layer(GUARDED_TOOL),
+        granted(),
+    );
+
+    let expected = runs.then(|| (REDACTED_OUTPUT.to_owned(), false));
+    assert_eq!(output(&reg, GUARDED_TOOL, "secret", false), expected);
+}
+
+/// Skipping is decided on every call, so only the first one may tell the
+/// user, naming the whole gap. A gap that narrows is news: granting half of it
+/// must not leave the other half unreported.
+#[test]
+fn a_skipped_layer_warns_once_per_gap() {
+    let (reg, host) = host();
+    let ui = host.ui_action_rx();
+    guarded_tool(&host);
+    let slot = format!("tool.{GUARDED_TOOL}.{}", HookStage::Output.as_str());
+
+    load_granted(
+        &host,
+        LAYER_PLUGIN,
+        &redacting_layer(GUARDED_TOOL),
+        only_run(),
+    );
+    assert_eq!(output(&reg, GUARDED_TOOL, "secret", false), None);
+    assert_eq!(output(&reg, GUARDED_TOOL, "secret", false), None);
+    load_granted(
+        &host,
+        LAYER_PLUGIN,
+        &redacting_layer(GUARDED_TOOL),
+        run_and_read(),
+    );
+    assert_eq!(output(&reg, GUARDED_TOOL, "secret", false), None);
+
+    let both = [Permission::SessionRead, Permission::SessionWrite];
+    let about_the_slot: Vec<String> = flashes(&ui)
+        .into_iter()
+        .filter(|msg| msg.contains(&slot))
+        .collect();
+    assert_eq!(
+        about_the_slot,
+        [
+            layer_skipped_message(LAYER_PLUGIN, &slot, &both),
+            layer_skipped_message(LAYER_PLUGIN, &slot, &[Permission::SessionWrite]),
+        ]
+    );
+}
+
+fn flashes(ui: &flume::Receiver<UiAction>) -> Vec<String> {
+    ui.try_iter()
+        .filter_map(|action| match action {
+            UiAction::Flash(msg) => Some(msg),
+            _ => None,
+        })
+        .collect()
 }
 
 #[test]
@@ -827,6 +1134,7 @@ fn a_parked_layer_ends_at_the_window_it_was_given() {
 #[test_case("ui.plan_form" ; "ui_surface")]
 #[test_case("ui.plan_form.actions" ; "ui_menu")]
 #[test_case("agent.stop" ; "agent_slot")]
+#[test_case("permission.prompt" ; "permission_prompt")]
 fn host_slot_names_are_reserved(name: &str) {
     let (_reg, host) = host();
     let err = host
@@ -841,6 +1149,115 @@ fn host_slot_names_are_reserved(name: &str) {
     for expected in ["host owned", "reserved", "set_slot"] {
         assert!(err.contains(expected), "{err}");
     }
+}
+
+// -------------------------------------------------- permission.prompt slot
+
+const PROMPT_ALLOW: &str = r#"return { decision = "allow" }"#;
+const PROMPT_PASS: &str = "return prev(req, ctx)";
+const PROMPT_GUIDANCE: &str = "use trash instead";
+
+fn prompt_layer(body: &str) -> String {
+    format!(r#"maki.api.set_slot("permission.prompt", function(prev, req, ctx) {body} end)"#)
+}
+
+/// Asks the chain what `enforce` asks it about a call to {SLOT_TOOL} that
+/// would otherwise prompt.
+fn ask_prompt(reg: &ToolRegistry, authority: Authority) -> Option<LayerAnswer> {
+    let hook = reg.hook().expect("the plugin host installs one at boot");
+    let cancel = CancelToken::none();
+    let call = call_of(SLOT_TOOL, authority, CallOrigin::Model, &cancel);
+    let input = serde_json::json!({ COMMAND_FIELD: COMMAND });
+    let scopes = [COMMAND.to_owned()];
+    let ctx = stub_ctx(&AgentMode::Build);
+    within(hook.prompt(&input, &scopes, &call, &ctx))
+}
+
+#[test_case(PROMPT_ALLOW, Some(LayerVerdict::Allow) ; "answers_for_the_user")]
+#[test_case(PROMPT_PASS, None ; "passing_it_on_leaves_it_to_the_prompt")]
+// The prompt's own answers save rules, so a layer may not give them.
+#[test_case(r#"return { decision = "allow_session" }"#, None ; "a_rule_recording_answer_prompts")]
+#[test_case(r#"error("boom")"#, None ; "a_throwing_layer_prompts")]
+#[test_case(
+    r#"if req.tool == "slotted" and req.tool_id == "t1" and req.input.command == "ls"
+        and req.scopes[1] == "ls" and ctx:task_id() == "main" then
+        return { decision = "allow" }
+    end
+    return prev(req, ctx)"#,
+    Some(LayerVerdict::Allow) ;
+    "req_and_ctx_describe_the_call"
+)]
+#[test_case(
+    r#"local judge = maki.agent.session(ctx, { name = "judge" })
+    if not judge then return prev(req, ctx) end
+    judge:close()
+    return { decision = "allow" }"#,
+    Some(LayerVerdict::Allow) ;
+    "ctx_can_open_a_session_to_ask_a_model"
+)]
+#[test_case(
+    r#"assert(maki.agent.cwd(ctx))
+    assert(maki.agent.instructions(ctx))
+    return { decision = "allow" }"#,
+    Some(LayerVerdict::Allow) ; "session_location_is_available_in_a_prompt_layer"
+)]
+fn a_prompt_layer_answers_allow_or_deny(body: &str, expected: Option<LayerVerdict>) {
+    let (reg, host) = host();
+    load(&host, LAYER_PLUGIN, &prompt_layer(body));
+
+    let answered = ask_prompt(&reg, Authority::Unbounded);
+
+    assert_eq!(
+        answered,
+        expected.map(|verdict| LayerAnswer {
+            plugin: Arc::from(LAYER_PLUGIN),
+            verdict,
+        })
+    );
+}
+
+/// The tool row names the plugin that allowed a call and a deny speaks in
+/// its voice, so the answer has to be pinned on the layer that built it, not
+/// on whichever one handed it up last.
+#[test_case(PROMPT_PASS, INNER_LAYER, LayerVerdict::Allow ; "passed_up")]
+#[test_case(
+    &format!(r#"prev(req, ctx); return {{ decision = "deny", guidance = "{PROMPT_GUIDANCE}" }}"#),
+    OUTER_LAYER,
+    LayerVerdict::Deny { guidance: Some(PROMPT_GUIDANCE.to_owned()) } ;
+    "overruled"
+)]
+fn the_layer_that_built_the_answer_is_named(outer: &str, decider: &str, verdict: LayerVerdict) {
+    let (reg, host) = host();
+    load(&host, INNER_LAYER, &prompt_layer(PROMPT_ALLOW));
+    load(&host, OUTER_LAYER, &prompt_layer(outer));
+
+    let answered = ask_prompt(&reg, Authority::Unbounded);
+
+    assert_eq!(
+        answered,
+        Some(LayerAnswer {
+            plugin: Arc::from(decider),
+            verdict,
+        })
+    );
+}
+
+/// Allowing a call lends the call's reach, shows the layer its input, and a
+/// deny hands the model its guidance, so a layer pays what a
+/// `tool.<name>.input` layer does.
+#[test_case(Authority::Capability(Permission::Run), run_read_and_write, true  ; "the_calls_capability_and_content_are_enough")]
+#[test_case(Authority::Capability(Permission::Run), run_and_read,       false ; "reading_alone_cannot_answer_the_model")]
+#[test_case(Authority::Capability(Permission::Run), only_run,           false ; "the_capability_alone_does_not_read_the_call")]
+#[test_case(Authority::Unbounded,                   run_read_and_write, false ; "an_undeclared_reach_takes_every_one")]
+fn a_prompt_layer_pays_for_the_call(
+    authority: Authority,
+    granted: fn() -> PluginPermissions,
+    answers: bool,
+) {
+    let (reg, host) = host();
+    load_granted(&host, LAYER_PLUGIN, &prompt_layer(PROMPT_ALLOW), granted());
+
+    assert_eq!(ask_prompt(&reg, authority).is_some(), answers);
 }
 
 // ------------------------------------------------------ ui.plan_form slots
@@ -1557,10 +1974,11 @@ end)"#
     )
 }
 
-/// Steering the agent is priced like a tool with no declared reach, so only a
-/// fully trusted plugin's layer runs.
+/// Steering the agent can start turns, so unlike a tool with no declared reach
+/// it costs `agent` too and only a fully trusted plugin's layer runs.
 #[test_case(PluginPermissions::trusted, true  ; "trusted_layer_runs")]
-#[test_case(all_but_run,                false ; "almost_trusted_is_skipped")]
+#[test_case(all_but_run,                false ; "denied_run_is_skipped")]
+#[test_case(all_but_agent,              false ; "denied_agent_is_skipped")]
 fn agent_slot_layers_need_full_trust(granted: fn() -> PluginPermissions, runs: bool) {
     let (reg, host) = host();
     let hook = reg
@@ -1607,7 +2025,7 @@ fn only_the_entitled_layer_of_two_runs() {
         &host,
         OUTER_LAYER,
         &marking_layer(GUARDED_TOOL, OUTER_MARK),
-        only_run(),
+        run_read_and_write(),
     );
 
     assert_eq!(
@@ -1666,7 +2084,12 @@ local inner_ran = false
 fn a_reload_that_narrows_permissions_applies_to_the_next_call() {
     let (reg, host) = host();
     guarded_tool(&host);
-    load_granted(&host, LAYER_PLUGIN, &hijack_layer(GUARDED_TOOL), only_run());
+    load_granted(
+        &host,
+        LAYER_PLUGIN,
+        &hijack_layer(GUARDED_TOOL),
+        run_read_and_write(),
+    );
     assert_eq!(
         input(&reg, GUARDED_TOOL, COMMAND),
         (Some(HIJACKED.to_owned()), None)

@@ -8,6 +8,8 @@
 //! everything for maki-docgen, and the drift test below asserts docs match
 //! the real `maki` global.
 
+use crate::plugin_permissions::Permission;
+
 pub struct ModuleDoc {
     /// Dotted path, e.g. "maki.base64". Classes use a type name, e.g.
     /// "maki.treesitter.Node".
@@ -35,10 +37,12 @@ pub struct FnDoc {
     pub returns: &'static str,
     /// Lua snippet rendered as a fenced code block, or "" when absent.
     pub example: &'static str,
-    /// Manifest key of the plugin permission gating this function, from the
-    /// `guard =` attribute. Rendered into the docs so the reference can
-    /// never drift from the actual gate.
-    pub guard: Option<&'static str>,
+    /// The plugin permissions gating this function, all of them required,
+    /// from the `guard =` attribute. Rendered into the docs so the reference
+    /// can never drift from the actual gate.
+    pub guard: Option<&'static [Permission]>,
+    /// A plain value such as `maki.NIL`, documented without a call signature.
+    pub value: bool,
 }
 
 pub struct ParamDoc {
@@ -63,6 +67,7 @@ pub fn api_docs() -> Vec<&'static ModuleDoc> {
         &api::r#async::DOCS,
         &api::r#async::SEMAPHORE_DOCS,
         &api::r#async::PERMIT_DOCS,
+        &api::r#async::TASK_DOCS,
         &api::base64::DOCS,
         &api::env::DOCS,
         &api::r#fn::DOCS,
@@ -76,6 +81,7 @@ pub fn api_docs() -> Vec<&'static ModuleDoc> {
         &api::log::DOCS,
         &api::model::DOCS,
         &api::net::DOCS,
+        &api::net::CONN_DOCS,
         &api::provider::DOCS,
         &api::provider::AUTH_DOCS,
         &api::session::DOCS,

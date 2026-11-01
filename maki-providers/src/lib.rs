@@ -4,7 +4,9 @@ pub(crate) mod image;
 pub(crate) mod manifest;
 pub mod model;
 pub mod model_registry;
+pub mod models_cache;
 pub mod pricing;
+pub mod process;
 pub mod provider;
 pub(crate) mod providers;
 pub mod retry;
@@ -16,7 +18,7 @@ pub mod test_support;
 pub mod tokens;
 pub(crate) mod types;
 
-pub use child_env::strip_provider_keys;
+pub use child_env::{shell_command, strip_provider_keys};
 pub use error::{AgentError, Overflow};
 pub use maki_storage::sessions::add_cost;
 pub use model::{
@@ -29,6 +31,7 @@ pub use providers::catalog::{
     catalog_provider, catalog_provider_if_available, catalog_providers,
     catalog_providers_if_available, refresh_catalog, warm_catalog,
 };
+pub use providers::claude_code;
 pub use providers::copilot::auth as copilot_auth;
 pub use providers::custom;
 pub use providers::openai::auth as openai_auth;
@@ -38,9 +41,11 @@ pub use providers::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
 pub use providers::{Timeouts, user_agent};
 pub use tokens::{ContextGauge, estimate_message_tokens, estimate_prompt_tokens};
 pub use types::{
-    ContentBlock, EMPTY_RESPONSE_MARKER, Effort, EffortDialect, IMAGE_EVICTED_NOTE,
-    IMAGE_OMITTED_NOTE, IMAGE_PLACEHOLDER, IMAGE_UNUSABLE_NOTE, ImageMediaType, ImageSource,
+    CONTEXT_UPDATE_WITHOUT_FACTS, ContentBlock, DEFER_LOADING_KEY, EMPTY_RESPONSE_MARKER, Effort,
+    EffortDialect, FACTS_WITHOUT_CONTEXT_UPDATE, IMAGE_EVICTED_NOTE, IMAGE_OMITTED_NOTE,
+    IMAGE_PLACEHOLDER, IMAGE_UNUSABLE_NOTE, ImageMediaType, ImageSource, InputTransformation,
     Message, MessageKind, ModelUsageRow, ProviderEvent, ProviderUsage, RequestOptions, Role,
-    StopReason, StreamResponse, THINKING_USAGE, ThinkingConfig, ThinkingFallback, UsageLimit,
-    adapt_images_for_model, dialect,
+    StopReason, StreamResponse, THINKING_USAGE, ThinkingConfig, ThinkingFallback,
+    UNKNOWN_IMAGE_MEDIA_TYPE, UNTYPED_BLOCK, UsageLimit, adapt_images_for_model, dialect,
+    is_deferred_tool,
 };

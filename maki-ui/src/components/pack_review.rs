@@ -6,9 +6,10 @@ use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::components::Overlay;
-use crate::components::form::render_form;
+use crate::components::form::{content_rows, render_form};
 use crate::components::hint_line;
 use crate::components::is_ctrl;
+use crate::components::modal::BORDER;
 use crate::theme;
 
 const REVIEW_HINTS: &[(&str, &str)] = &[("Enter / y", "Apply"), ("Esc / n", "Decline")];
@@ -86,22 +87,29 @@ impl PackReview {
         lines
     }
 
+    fn paragraph(&self) -> Paragraph<'static> {
+        Paragraph::new(self.lines()).wrap(Wrap { trim: false })
+    }
+
     pub fn view(&self, frame: &mut Frame, area: Rect) {
         if !self.is_open() {
             return;
         }
+        let paragraph = self.paragraph();
+        let total = content_rows(&paragraph, area.width);
         render_form(
             &theme::current(),
             PACK_REVIEW_TITLE,
             frame,
             area,
-            self.lines(),
+            paragraph,
             (0, 0),
+            total,
         );
     }
 
     pub fn height(&self, width: u16) -> u16 {
-        let paragraph = Paragraph::new(self.lines()).wrap(Wrap { trim: false });
-        paragraph.line_count(width.saturating_sub(2)) as u16 + 2
+        let paragraph = self.paragraph();
+        content_rows(&paragraph, width).saturating_add(BORDER)
     }
 }

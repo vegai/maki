@@ -18,7 +18,7 @@ jobs:
     outputs:
       code: ${{ steps.filter.outputs.code }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v3
         id: filter
         with:
@@ -39,7 +39,7 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: cargo fmt --all -- --check
 
   fmt-lua:
@@ -50,7 +50,7 @@ jobs:
     env:
       STYLUA_VERSION: v2.4.1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install stylua
         run: |
           .github/scripts/retry.sh curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors -o stylua.zip \
@@ -59,17 +59,35 @@ jobs:
           rm stylua.zip
       - run: ./stylua --check plugins/
 
+  check-lua:
+    name: Type check (Lua)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    env:
+      # Definition files in `lute check` (luau-lang/lute#1234) are not in a release yet.
+      LUTE_VERSION: v1.0.1-nightly.20261007
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install lute
+        run: |
+          .github/scripts/retry.sh curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors -o lute.zip \
+            "https://github.com/luau-lang/lute/releases/download/${LUTE_VERSION}/lute-linux-x86_64.zip"
+          unzip -o lute.zip lute
+          rm lute.zip
+      # lute looks for `.config.luau` upward from the working directory, not from the checked files.
+      - run: cd plugins && ../lute check $(find . -name '*.lua')
+
   lint:
     name: Lint
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    env:
-      # The runner ships libssl-dev, so skip the two minute vendored OpenSSL
-      # build on a cache miss. Windows has none and keeps vendoring.
-      OPENSSL_NO_VENDOR: 1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
@@ -82,9 +100,12 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     env:
-      OPENSSL_NO_VENDOR: 1
+      NEXTEST_PROFILE: ci
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
@@ -100,7 +121,7 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-machete
@@ -111,10 +132,11 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    env:
-      OPENSSL_NO_VENDOR: 1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
@@ -122,23 +144,27 @@ jobs:
       - run: just build
 
   windows:
-    name: Lint + Build (Windows)
+    name: Lint + Build + Shutdown Test (Windows)
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
           tool: just
       - run: just lint
       - run: just build
+      - run: "cargo test -p maki --bin maki shutdown::"
 
   ci-pass:
     name: CI
     if: always()
-    needs: [fmt, fmt-lua, lint, test, machete, build, windows]
+    needs: [fmt, fmt-lua, check-lua, lint, test, machete, build, windows]
     runs-on: ubuntu-latest
     steps:
       - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')

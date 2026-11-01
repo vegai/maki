@@ -1,0 +1,29 @@
+use std::path::Path;
+
+use color_eyre::Result;
+use color_eyre::eyre::eyre;
+use flume::Receiver;
+use maki_agent::headless::Ready;
+use maki_agent::mcp::{self, McpHandle};
+use maki_agent::{AgentEvent, SessionEvents};
+use maki_config::ProjectConfig;
+
+pub fn start_mcp(cwd: &Path, project_config: ProjectConfig) -> Option<McpHandle> {
+    let (handle, errors) = smol::block_on(mcp::start_connected(cwd, project_config));
+    if !errors.is_empty() {
+        eprintln!("MCP config error: {errors}");
+    }
+    handle
+}
+
+pub fn startup(receiver: &Receiver<Ready>, events: &mut SessionEvents) -> Result<Ready> {
+    if let Ok(ready) = smol::block_on(receiver.recv_async()) {
+        return Ok(ready);
+    }
+    while let Some(envelope) = smol::block_on(events.next()) {
+        if let AgentEvent::Error { message, .. } = envelope.event {
+            return Err(eyre!(message));
+        }
+    }
+    Err(eyre!("provider startup ended before it was ready"))
+}

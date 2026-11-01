@@ -1,0 +1,5 @@
+- Never assume a library is available. Check the project's dependency files first.
+- Match existing code style, naming conventions, and patterns.
+- Follow security best practices. Never expose secrets or keys.
+- Do NOT commit or push changes.
+- When referencing code, use `file_path:line_number` format.

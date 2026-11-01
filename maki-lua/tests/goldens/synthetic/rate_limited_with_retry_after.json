@@ -19,7 +19,7 @@
   "expected": {
     "events": [],
     "outcome": {
-      "error": "Api { status: 429, retry_after: Some(7s), overflow: None, quota_exhausted: false, auth_error: false }",
+      "error": "Api { status: 429, retry_after: Some(7s), overflow: None, quota_exhausted: false, auth_error: false, thinking_unbound: false }",
       "message": "API error (429): {\"error\":{\"message\":\"too many requests\"}}"
     },
     "requests": [

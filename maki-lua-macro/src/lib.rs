@@ -121,27 +121,56 @@ fn last_segment_is(ty: &Type, name: &str) -> bool {
     }
 }
 
+fn option_inner(ty: &Type) -> Option<&Type> {
+    let Type::Path(p) = ty else { return None };
+    let seg = p.path.segments.last().filter(|s| s.ident == "Option")?;
+    let syn::PathArguments::AngleBracketed(ab) = &seg.arguments else {
+        return None;
+    };
+    match ab.args.first() {
+        Some(syn::GenericArgument::Type(inner)) => Some(inner),
+        _ => None,
+    }
+}
+
 struct LuaFnArgs {
-    guard: Option<Path>,
+    guard: Vec<Path>,
     name: Option<String>,
+}
+
+fn guard_path(expr: &Expr) -> syn::Result<Path> {
+    match expr {
+        Expr::Path(p) => Ok(p.path.clone()),
+        other => Err(syn::Error::new(
+            other.span(),
+            "guard expects a Permission variant or a [list] of them",
+        )),
+    }
 }
 
 fn parse_lua_fn_args(attr: TokenStream) -> syn::Result<LuaFnArgs> {
     let metas = syn::parse::Parser::parse(Punctuated::<Meta, Token![,]>::parse_terminated, attr)?;
     let mut out = LuaFnArgs {
-        guard: None,
+        guard: Vec::new(),
         name: None,
     };
     for meta in metas {
         match &meta {
             Meta::NameValue(nv) if nv.path.is_ident("guard") => {
-                let Expr::Path(p) = &nv.value else {
+                out.guard = match &nv.value {
+                    Expr::Array(list) => list
+                        .elems
+                        .iter()
+                        .map(guard_path)
+                        .collect::<syn::Result<_>>()?,
+                    single => vec![guard_path(single)?],
+                };
+                if out.guard.is_empty() {
                     return Err(syn::Error::new(
                         nv.value.span(),
-                        "guard expects a Permission variant",
+                        "guard needs at least one Permission variant",
                     ));
-                };
-                out.guard = Some(p.path.clone());
+                }
             }
             Meta::NameValue(nv) if nv.path.is_ident("name") => {
                 out.name = Some(str_lit(&nv.value).ok_or_else(|| {
@@ -154,15 +183,27 @@ fn parse_lua_fn_args(attr: TokenStream) -> syn::Result<LuaFnArgs> {
     Ok(out)
 }
 
-/// See crate docs. Options: `guard = <Permission variant>`, `name = "<lua name>"`.
+/// See crate docs. Options: `guard = <Permission variant>` or
+/// `guard = [<variant>, ...]` when the call needs every one of them,
+/// `name = "<lua name>"`.
 #[proc_macro_attribute]
 pub fn lua_fn(attr: TokenStream, item: TokenStream) -> TokenStream {
+    expand_attribute(attr, item, false)
+}
+
+/// Register a synchronous value and its documentation in `lua_table!`.
+#[proc_macro_attribute]
+pub fn lua_value(attr: TokenStream, item: TokenStream) -> TokenStream {
+    expand_attribute(attr, item, true)
+}
+
+fn expand_attribute(attr: TokenStream, item: TokenStream, value: bool) -> TokenStream {
     let args = match parse_lua_fn_args(attr) {
         Ok(a) => a,
         Err(e) => return e.to_compile_error().into(),
     };
     let mut func = parse_macro_input!(item as ItemFn);
-    match expand_lua_fn(args, &mut func) {
+    match expand_lua_fn(args, &mut func, value) {
         Ok(ts) => ts.into(),
         Err(e) => {
             let err = e.to_compile_error();
@@ -232,7 +273,7 @@ fn classify_params(func: &mut ItemFn) -> syn::Result<FnParams> {
     Ok(out)
 }
 
-fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2> {
+fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn, value: bool) -> syn::Result<TokenStream2> {
     let fn_ident = func.sig.ident.clone();
     let span = fn_ident.span();
     let is_async = func.sig.asyncness.is_some();
@@ -256,7 +297,7 @@ fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2
             let ident = ident.unraw();
             if last_segment_is(ty, "Variadic") {
                 "{...}".to_owned()
-            } else if last_segment_is(ty, "Option") {
+            } else if option_inner(ty).is_some() {
                 format!("{{{ident}?}}")
             } else {
                 format!("{{{ident}}}")
@@ -278,9 +319,12 @@ fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2
         doc.params.iter().zip(&rendered).map(
             |((_, ty, d), name)| quote!(crate::docs::ParamDoc { name: #name, ty: #ty, desc: #d }),
         );
-    let guard_doc = match &args.guard {
-        Some(g) => quote!(Some(crate::plugin_permissions::Permission::#g.manifest_key())),
-        None => quote!(None),
+    let guard = &args.guard;
+    let guard_list = quote!(&[#(crate::plugin_permissions::Permission::#guard),*]);
+    let guard_doc = if guard.is_empty() {
+        quote!(None)
+    } else {
+        quote!(Some(#guard_list))
     };
     let doc_const = quote! {
         #[allow(non_upper_case_globals)]
@@ -292,24 +336,54 @@ fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2
             returns: #returns,
             example: #example,
             guard: #guard_doc,
+            value: #value,
         };
     };
+
+    if value {
+        if is_async || method.is_some() || !ctx.is_empty() || !real.is_empty() || !guard.is_empty()
+        {
+            return Err(syn::Error::new(
+                span,
+                "lua_value takes only the Lua handle and cannot yield or have a guard",
+            ));
+        }
+        return Ok(quote! {
+            #func
+            #doc_const
+            pub(crate) fn #reg_ident(t: &mlua::Table, lua: &mlua::Lua) -> mlua::Result<()> {
+                t.set(#lua_name, #fn_ident(lua)?)
+            }
+        });
+    }
 
     let ctx_idents: Vec<&Ident> = ctx.iter().map(|(i, _)| i).collect();
     let ctx_tys: Vec<&Type> = ctx.iter().map(|(_, t)| t).collect();
     // Fresh binding names so closure params can never shadow the target fn.
     let arg_idents: Vec<Ident> = (0..real.len()).map(|i| format_ident!("__arg{i}")).collect();
-    let real_tys: Vec<&Type> = real.iter().map(|(_, t)| t).collect();
-    let arg_pat = quote!((#(#arg_idents,)*): (#(#real_tys,)*));
+    // An optional parameter reads `maki.NIL` as absent, like `TableExt::opt`
+    // does for option tables, so a value straight from `maki.json.decode` works.
+    let (arg_tys, arg_vals): (Vec<TokenStream2>, Vec<TokenStream2>) = real
+        .iter()
+        .zip(&arg_idents)
+        .map(|((_, ty), arg)| match option_inner(ty) {
+            Some(inner) => (
+                quote!(crate::api::util::convert::NilAsNone<#inner>),
+                quote!(#arg.0),
+            ),
+            None => (quote!(#ty), quote!(#arg)),
+        })
+        .unzip();
+    let arg_pat = quote!((#(#arg_idents,)*): (#(#arg_tys,)*));
 
     if let Some((self_ty, add_fn)) = method {
-        if args.guard.is_some() || !ctx.is_empty() {
+        if !args.guard.is_empty() || !ctx.is_empty() {
             return Err(syn::Error::new(
                 span,
                 "guard and #[ctx] are not supported on methods",
             ));
         }
-        let closure = quote!(move |lua, this, #arg_pat| #fn_ident(lua, this #(, #arg_idents)*));
+        let closure = quote!(move |lua, this, #arg_pat| #fn_ident(lua, this #(, #arg_vals)*));
         return Ok(quote! {
             #func
             #doc_const
@@ -320,21 +394,18 @@ fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2
     }
 
     let closure =
-        quote!(move |lua, #arg_pat| #fn_ident(lua #(, #ctx_idents.clone())* #(, #arg_idents)*));
-    let create = match (&args.guard, is_async) {
-        (Some(g), false) => {
-            quote!(perms.guard(crate::plugin_permissions::Permission::#g, lua, #closure)?)
-        }
-        (Some(g), true) => {
-            quote!(perms.guard_async(crate::plugin_permissions::Permission::#g, lua, #closure)?)
-        }
-        (None, false) => quote!(lua.create_function(#closure)?),
-        (None, true) => quote!(lua.create_async_function(#closure)?),
+        quote!(move |lua, #arg_pat| #fn_ident(lua #(, #ctx_idents.clone())* #(, #arg_vals)*));
+    let guarded = !args.guard.is_empty();
+    let create = match (guarded, is_async) {
+        (true, false) => quote!(perms.guard(#guard_list, lua, #closure)?),
+        (true, true) => quote!(perms.guard_async(#guard_list, lua, #closure)?),
+        (false, false) => quote!(lua.create_function(#closure)?),
+        (false, true) => quote!(lua.create_async_function(#closure)?),
     };
-    let perms_param = args
-        .guard
-        .is_some()
-        .then(|| quote!(, perms: &crate::plugin_permissions::PluginPermissions));
+    let perms_param = guarded.then(
+        || quote!(, perms: impl std::borrow::Borrow<crate::plugin_permissions::PluginPermissions>),
+    );
+    let borrow_perms = guarded.then(|| quote!(let perms: &crate::plugin_permissions::PluginPermissions = std::borrow::Borrow::borrow(&perms);));
 
     Ok(quote! {
         #func
@@ -345,6 +416,7 @@ fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2
             #perms_param
             #(, #ctx_idents: #ctx_tys)*
         ) -> mlua::Result<()> {
+            #borrow_perms
             t.set(#lua_name, #create)
         }
     })

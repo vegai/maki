@@ -21,7 +21,7 @@ use self::callback::{CallbackResult, CallbackServer};
 use self::discovery::{
     AuthServerMetadata, ResourceMetadata, WwwAuthenticateInfo, parse_www_authenticate,
 };
-use super::config::OauthClientConfig;
+use super::config::{CallbackScheme, OauthClientConfig};
 use super::error::McpError;
 use super::http::build_client;
 
@@ -84,7 +84,7 @@ pub async fn authenticate(
     let (resource_meta, auth_server) =
         discover_auth_server_for(&client, server_url, www_auth.as_ref())
             .await
-            .map_err(&wrap)?;
+            .map_err(wrap)?;
 
     if !auth_server.code_challenge_methods_supported.is_empty()
         && !auth_server
@@ -97,23 +97,25 @@ pub async fn authenticate(
         )));
     }
 
-    let callback = CallbackServer::bind(
-        static_client.as_ref().and_then(|c| c.callback_port),
-        static_client
-            .as_ref()
-            .and_then(|c| c.callback_path.as_deref()),
-        static_client
-            .as_ref()
-            .and_then(|c| c.callback_hostname.as_deref()),
-    )
-    .await
-    .map_err(|e| wrap(OAuthError::Other(e)))?;
+    let OauthClientConfig {
+        client_id,
+        client_secret,
+        callback_port: port,
+        callback_path,
+        callback_hostname,
+        callback_scheme,
+    } = static_client.unwrap_or_default();
+    let (path, hostname) = (callback_path.as_deref(), callback_hostname.as_deref());
+
+    let callback = CallbackServer::bind(port, path, hostname, callback_scheme)
+        .await
+        .map_err(|e| wrap(OAuthError::Other(e)))?;
     let redirect_uri = callback.redirect_uri();
 
-    let reg = if let Some(c) = static_client {
+    let reg = if let Some(client_id) = client_id {
         registration::ClientRegistration {
-            client_id: c.client_id,
-            client_secret: c.client_secret,
+            client_id,
+            client_secret,
             client_secret_expires_at: None,
         }
     } else if let Some(existing) = load_mcp_auth(storage, server_name, server_url)
@@ -127,14 +129,14 @@ pub async fn authenticate(
     } else if let Some(endpoint) = &auth_server.registration_endpoint {
         registration::register_client(&client, endpoint, &redirect_uri)
             .await
-            .map_err(&wrap)?
+            .map_err(wrap)?
     } else {
         return Err(wrap(OAuthError::Other(
             "no stored client and server has no registration endpoint".into(),
         )));
     };
 
-    let pkce = pkce::generate().map_err(&wrap)?;
+    let pkce = pkce::generate().map_err(wrap)?;
 
     let mut state_buf = [0u8; 16];
     getrandom::fill(&mut state_buf)
@@ -156,9 +158,10 @@ pub async fn authenticate(
         scope.as_deref(),
         server_url,
     )
-    .map_err(&wrap)?;
+    .map_err(wrap)?;
 
     info!(server = server_name, endpoint = %auth_server.authorization_endpoint, "starting OAuth authorization");
+    let wait_callback = callback.wait_for_callback(&state);
     let result = match interaction {
         Interaction::Cli => {
             eprintln!("\nOpen this URL in your browser:\n\n  {auth_url}\n");
@@ -173,14 +176,13 @@ pub async fn authenticate(
             }
 
             eprintln!("Waiting for callback on {redirect_uri}...");
+            if callback_scheme == CallbackScheme::Https {
+                eprintln!("Your browser will warn about Maki's self-signed certificate for this login; proceed past it.");
+            }
             eprintln!("If this machine has no browser, log in on another device and paste");
             eprintln!("the full redirect URL ({redirect_uri}?...) here:");
 
-            let callback_or_paste = future::race(
-                callback.wait_for_callback(&state),
-                manual::wait_for_paste(&state),
-            );
-
+            let callback_or_paste = future::race(wait_callback, manual::wait_for_paste(&state));
             future::race(callback_or_paste, auth_timeout()).await
         }
         Interaction::Background => {
@@ -193,7 +195,7 @@ pub async fn authenticate(
             };
             match cause {
                 Some(cause) => Err(format!("{cause}; run 'maki mcp auth {server_name}'")),
-                None => future::race(callback.wait_for_callback(&state), auth_timeout()).await,
+                None => future::race(wait_callback, auth_timeout()).await,
             }
         }
     }
@@ -210,7 +212,7 @@ pub async fn authenticate(
         server_url,
     )
     .await
-    .map_err(&wrap)?;
+    .map_err(wrap)?;
 
     let data = McpAuthData {
         server_url: server_url.to_string(),

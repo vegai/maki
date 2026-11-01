@@ -185,6 +185,7 @@ impl App {
             layout.msg_area,
             self.selection_state.is_some(),
             images_visible,
+            self.command_palette.lua_commands(),
         );
     }
 
@@ -250,7 +251,8 @@ impl App {
                 self.input_has_keyboard(),
                 panel_hint,
             );
-            self.command_palette.view(frame, layout.input_area);
+            self.command_palette
+                .view(frame, layout.input_area, &self.input_box.buffer);
             return caret;
         }
         None
@@ -329,14 +331,20 @@ impl App {
         if r.width > 0 {
             overlay_rect = r;
         }
+        let r = self.alert_modal.view(frame, full);
+        if r.width > 0 {
+            overlay_rect = r;
+        }
         overlay_rect
     }
 
     fn render_status_bar(&mut self, frame: &mut Frame, status_area: Rect, render_chat: usize) {
         let chat = &self.chats[render_chat];
         let chat_name = (self.chats.len() > 1).then_some(chat.name.as_str());
+        // Only the session's model is at hand here, and a subagent may run on
+        // another, so a subagent's options are shown as stored.
         let opts = chat.opts.unwrap_or(RequestOptions {
-            thinking: self.state.thinking,
+            thinking: self.state.thinking.shown(&self.state.model),
             fast: self.state.fast,
         });
         let (mode_label, mode_style) = self.mode_label();
@@ -471,7 +479,7 @@ impl App {
     }
 
     #[cfg(test)]
-    pub(super) fn active_keybind_contexts(&self) -> Vec<KeybindContext> {
+    pub(super) fn active_keybind_contexts(&mut self) -> Vec<KeybindContext> {
         let mut contexts = vec![KeybindContext::General];
         if self.pack_review.is_open() || self.plan_form_active() {
             contexts.push(KeybindContext::FormInput);
@@ -483,7 +491,7 @@ impl App {
             contexts.push(KeybindContext::ThemePicker);
         } else if self.model_picker.is_open() {
             contexts.push(KeybindContext::ModelPicker);
-        } else if self.command_palette.is_active() {
+        } else if self.command_palette.is_active(&self.input_box.buffer) {
             contexts.push(KeybindContext::CommandPalette);
         } else if self.search_modal.is_open() {
             contexts.push(KeybindContext::Search);

@@ -2,6 +2,7 @@ use crate::components::keybindings::key;
 use crate::repaint::{Cadence, Dirty};
 use crate::theme::{self, lerp_u8};
 use crate::update;
+use maki_lua::LuaCommandInfo;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -18,16 +19,72 @@ const HELP_SEGMENTS: &[(&str, bool)] = &[
     (" in chat", false),
 ];
 
-const TIPS: &[(&str, &str)] = &[
+/// Label, description, and the plugin command the tip relies on. When that
+/// plugin is turned off, the tip would point at nothing, so we skip it.
+type Tip = (&'static str, &'static str, Option<&'static str>);
+
+const TIPS: &[Tip] = &[
     (
         key::FILE_PICKER.label,
         "to grab file paths with fuzzy search",
+        None,
     ),
-    ("/tasks", "to see what your subagents are up to"),
-    (key::SEARCH.label, "to find things in the conversation"),
-    ("/btw", "to ask something without interrupting the session"),
-    ("/memory", "to view, edit, and delete persistent notes"),
-    ("/cd", "to switch to a different directory"),
+    (
+        key::SEARCH.label,
+        "to find things in the conversation",
+        None,
+    ),
+    (
+        key::MODEL_PICKER.label,
+        "to switch models mid-session",
+        None,
+    ),
+    (
+        key::EDIT_INPUT.label,
+        "to write your prompt in $EDITOR",
+        None,
+    ),
+    ("Tab", "to toggle plan mode", None),
+    ("Esc Esc", "to rewind to an earlier prompt", None),
+    ("!cmd", "to run a shell command and share its output", None),
+    (
+        "!!cmd",
+        "to run a shell command without telling the agent",
+        None,
+    ),
+    (
+        key::TASKS.label,
+        "to see what your subagents are up to",
+        Some("/tasks"),
+    ),
+    (
+        "/btw",
+        "to ask something without interrupting the session",
+        None,
+    ),
+    (
+        "/memory",
+        "to view, edit, and delete persistent notes",
+        Some("/memory"),
+    ),
+    ("/cd", "to switch to a different directory", None),
+    (
+        key::SESSIONS.label,
+        "to pick up where you left off",
+        Some("/sessions"),
+    ),
+    ("/compact", "with a hint to steer what gets kept", None),
+    (
+        "/thinking",
+        "to set how hard the model thinks",
+        Some("/thinking"),
+    ),
+    (
+        "/workflow",
+        "to let code_execution spawn subagents",
+        Some("/tasks"),
+    ),
+    ("/reload", "to apply plugin and config changes", None),
 ];
 
 const COLOR_TRANSITION_SECS: f32 = 0.4;
@@ -132,7 +189,7 @@ pub struct Splash {
     start: Instant,
     field_offset: f32,
     animate: bool,
-    tip_idx: usize,
+    tip_seed: usize,
     latest_version: Option<&'static str>,
 }
 
@@ -146,12 +203,12 @@ impl Splash {
     pub fn new(animate: bool) -> Self {
         let mut rng = [0u8; 8];
         getrandom::fill(&mut rng).ok();
-        let tip_idx = u32::from_le_bytes([rng[4], rng[5], rng[6], rng[7]]) as usize % TIPS.len();
+        let tip_seed = u32::from_le_bytes([rng[4], rng[5], rng[6], rng[7]]) as usize;
         Self {
             start: Instant::now(),
             field_offset: (u64::from_le_bytes(rng) % 10_000) as f32,
             animate,
-            tip_idx,
+            tip_seed,
             latest_version: None,
         }
     }
@@ -178,7 +235,13 @@ impl Splash {
         )
     }
 
-    pub fn render(&self, area: Rect, buf: &mut Buffer, accent: Color) {
+    pub fn render(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        accent: Color,
+        lua_commands: &[LuaCommandInfo],
+    ) {
         if area.width < 20 || area.height < 5 {
             return;
         }
@@ -202,21 +265,11 @@ impl Splash {
         self.render_logo(area, buf, t, fade, top_y, accent);
         render_centered_faded(area, buf, fade, 0.75, tag_y, TAGLINE);
         self.render_help(area, buf, fade, help_y, accent);
-        self.render_tip(area, buf, fade, tip_y, accent);
+        self.render_tip(area, buf, fade, tip_y, accent, lua_commands);
         render_version(area, buf, fade, area.y, self.latest_version);
     }
 
-    /// The field is a gradient of intensities between the background and the
-    /// accent, so it needs both as numbers. On a palette theme there is
-    /// nothing to interpolate and the splash simply draws without it.
     fn render_field(&self, area: Rect, buf: &mut Buffer, t: f32, fade: f32, accent: Color) {
-        let theme = theme::current();
-        let (Color::Rgb(ac_r, ac_g, ac_b), Color::Rgb(bg_r, bg_g, bg_b)) =
-            (accent, theme.background)
-        else {
-            return;
-        };
-
         let w = area.width as usize;
         let h = area.height as usize;
         if w == 0 || h == 0 {
@@ -239,17 +292,14 @@ impl Splash {
         let half_weight_sum = weight_sum * 0.5;
         let val_scale = (fade * INTENSITY_SCALE) / half_weight_sum;
 
+        let theme = theme::current();
+        let muted = theme.status_dim.fg.unwrap_or(Color::DarkGray);
         let style_lut: [(&str, Style); 4] = std::array::from_fn(|i| {
             let idx = i + 1;
             let frac = idx as f32 / FIELD_CHAR_MAX;
-            let t = FIELD_BASE_OPACITY + frac * (1.0 - FIELD_BASE_OPACITY);
             (
                 FIELD_SYMS[idx],
-                Style::new().fg(Color::Rgb(
-                    lerp_u8(bg_r, ac_r, t * 0.25),
-                    lerp_u8(bg_g, ac_g, t * 0.175),
-                    lerp_u8(bg_b, ac_b, t * 0.325),
-                )),
+                field_style(accent, theme.background, muted, frac),
             )
         });
 
@@ -405,16 +455,25 @@ impl Splash {
         render_segments(area, buf, help_y, x_start, &segments);
     }
 
-    fn render_tip(&self, area: Rect, buf: &mut Buffer, fade: f32, tip_y: u16, accent: Color) {
+    fn render_tip(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        fade: f32,
+        tip_y: u16,
+        accent: Color,
+        lua_commands: &[LuaCommandInfo],
+    ) {
         if tip_y >= area.y + area.height {
             return;
         }
-
+        let Some(&(label, desc, _)) = pick_tip(self.tip_seed, lua_commands) else {
+            return;
+        };
         let theme = theme::current();
         let bg = theme.background;
         let tip_fg = theme.todo_in_progress.fg.unwrap_or(Color::Yellow);
 
-        let (label, desc) = TIPS[self.tip_idx];
         let total_width = (5 + label.len() + 1 + desc.len()) as u16;
         let x_start = area.x + area.width.saturating_sub(total_width) / 2;
 
@@ -430,6 +489,15 @@ impl Splash {
 
         render_segments(area, buf, tip_y, x_start, segments);
     }
+}
+
+fn pick_tip(seed: usize, lua_commands: &[LuaCommandInfo]) -> Option<&'static Tip> {
+    let available = || {
+        TIPS.iter().filter(|(_, _, needs)| {
+            needs.is_none_or(|name| lua_commands.iter().any(|c| c.name.as_ref() == name))
+        })
+    };
+    available().nth(seed % available().count().max(1))
 }
 
 fn render_version(area: Rect, buf: &mut Buffer, fade: f32, y: u16, new_version: Option<&str>) {
@@ -463,6 +531,19 @@ fn render_centered_faded(
     let style = faded_style(theme.foreground, bg, intensity * fade);
     let x_start = area.x + area.width.saturating_sub(text.chars().count() as u16) / 2;
     render_segments(area, buf, y, x_start, &[(text, style)]);
+}
+
+/// A palette color cannot blend, so use the muted color and no DIM.
+fn field_style(accent: Color, bg: Color, muted: Color, frac: f32) -> Style {
+    let (Color::Rgb(ac_r, ac_g, ac_b), Color::Rgb(bg_r, bg_g, bg_b)) = (accent, bg) else {
+        return Style::new().fg(muted);
+    };
+    let t = FIELD_BASE_OPACITY + frac * (1.0 - FIELD_BASE_OPACITY);
+    Style::new().fg(Color::Rgb(
+        lerp_u8(bg_r, ac_r, t * 0.25),
+        lerp_u8(bg_g, ac_g, t * 0.175),
+        lerp_u8(bg_b, ac_b, t * 0.325),
+    ))
 }
 
 /// Fading means blending toward the background, which needs both ends as
@@ -506,6 +587,7 @@ mod tests {
     use super::*;
     use crate::components::buffer_text;
     use crate::repaint::expect::{OWED, QUIET};
+    use maki_lua::{PluginPermissions, PluginReach};
     use std::time::Duration;
     use test_case::test_case;
 
@@ -545,11 +627,30 @@ mod tests {
     const UNPOLLED: &str = "an unpolled version must not appear on screen";
     const POLLED: &str = "a polled version must appear on screen";
 
+    const THINKING_COMMAND: &str = "/thinking";
+
     fn rendered(splash: &Splash) -> String {
         let area = Rect::new(0, 0, 80, 20);
         let mut buf = Buffer::empty(area);
-        splash.render(area, &mut buf, Color::Blue);
+        splash.render(area, &mut buf, Color::Blue, &[]);
         buffer_text(&buf)
+    }
+
+    #[test_case(false ; "hidden_while_its_plugin_is_disabled")]
+    #[test_case(true  ; "shown_once_its_plugin_registered_the_command")]
+    fn plugin_tip_follows_its_command(loaded: bool) {
+        let thinking = [LuaCommandInfo {
+            name: THINKING_COMMAND.into(),
+            description: "".into(),
+            plugin: "thinking".into(),
+            reach: PluginReach::new(PluginPermissions::trusted()),
+            max_args: 0,
+        }];
+        let lua_commands: &[LuaCommandInfo] = if loaded { &thinking } else { &[] };
+        let shown = (0..TIPS.len()).any(|seed| {
+            pick_tip(seed, lua_commands).is_some_and(|(label, ..)| *label == THINKING_COMMAND)
+        });
+        assert_eq!(shown, loaded);
     }
 
     /// The check answers on its own, so the notice only reaches the screen
@@ -617,29 +718,35 @@ foreground = "white"
 background = { bg = "background" }
 foreground = { fg = "foreground" }
 todo_in_progress = { fg = "yellow" }
+status_dim = { fg = "magenta" }
 "#;
 
-    /// The starfield needs numbers to build its gradient; on a palette theme
-    /// the splash draws flat rather than inventing truecolor for it. The theme
-    /// is installed here rather than inherited, because the default one is
-    /// truecolor and would make this pass or fail on test ordering.
+    const NO_TRUECOLOR: &str = "a palette theme must not produce rgb cells";
+    const FIELD_DRAWN: &str = "a palette theme must draw the field in its muted color";
+
+    /// The test sets its theme because the default theme uses RGB colors.
     #[test]
-    fn a_palette_accent_keeps_the_splash_free_of_truecolor() {
+    fn a_palette_theme_draws_the_field_without_truecolor() {
         theme::set(theme::Theme::from_toml(ANSI_THEME).expect(ANSI_THEME_NAME));
 
         let mut splash = Splash::new(true);
         // At t=0 the entry fade has not started painting, so the assertion
         // below would hold no matter what the field did.
         splash.start -= Duration::from_secs_f32(FADE_DURATION);
+        // A fixed offset makes the drawn field the same on every run.
+        splash.field_offset = 0.0;
         let area = Rect::new(0, 0, 80, 20);
         let mut buf = Buffer::empty(area);
-        splash.render(area, &mut buf, Color::Blue);
+        splash.render(area, &mut buf, Color::Blue, &[]);
 
-        let rgb = buf
-            .content
-            .iter()
-            .filter_map(|c| c.style().fg)
-            .find(|fg| matches!(fg, Color::Rgb(..)));
-        assert_eq!(rgb, None, "a palette theme must not produce rgb cells");
+        let cells = || buf.content.iter();
+        assert!(
+            !cells().any(|c| matches!(c.fg, Color::Rgb(..))),
+            "{NO_TRUECOLOR}"
+        );
+        assert!(
+            cells().any(|c| c.fg == Color::Magenta && FIELD_SYMS.contains(&c.symbol())),
+            "{FIELD_DRAWN}"
+        );
     }
 }

@@ -4,6 +4,7 @@
 //! one: a table replaces the value, nothing leaves it alone, and `nil, reason`
 //! stops where stopping makes sense.
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use maki_providers::Model;
@@ -73,6 +74,7 @@ pub struct AgentHooks<'a> {
     pub model: &'a Model,
     pub cancel: &'a CancelToken,
     pub context_size: u32,
+    pub cwd: &'a Path,
 }
 
 impl AgentHooks<'_> {

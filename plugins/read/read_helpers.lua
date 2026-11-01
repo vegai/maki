@@ -1,7 +1,7 @@
 local M = {}
 
 function M.truncate_bytes(line, max_bytes)
-  if #line <= max_bytes then
+  if max_bytes == 0 or #line <= max_bytes then
     return line
   end
   local i = max_bytes

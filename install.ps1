@@ -86,9 +86,22 @@ function Install-Maki([string]$Tag) {
         }
 
         $dest = Join-Path $InstallDir $exeName
+        # `maki update` runs this script while maki.exe is still running. Windows
+        # won't let us overwrite a running exe, but it does let us rename it, so we
+        # park the old one as maki.exe.old and put it back if the install fails.
+        $oldDest = "$dest.old"
+        $movedAside = $false
         try {
+            if (Test-Path -LiteralPath $dest) {
+                Remove-Item -LiteralPath $oldDest -Force -ErrorAction SilentlyContinue
+                Move-Item -LiteralPath $dest -Destination $oldDest -Force
+                $movedAside = $true
+            }
             Move-Item -LiteralPath $src -Destination $dest -Force
         } catch {
+            if ($movedAside) {
+                Move-Item -LiteralPath $oldDest -Destination $dest -Force -ErrorAction SilentlyContinue
+            }
             Write-Err "failed to install to $dest (try running as Administrator or set MAKI_INSTALL_DIR): $_"
         }
 

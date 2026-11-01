@@ -1,4 +1,12 @@
+--- require("maki.truncate")(text, max_lines, max_bytes)
+--- Cuts {text} to the limits and notes how many bytes it dropped. A nil limit
+--- is unlimited.
 local function truncate(text, max_lines, max_bytes)
+  if not max_lines and not max_bytes then
+    return text
+  end
+  max_lines = max_lines or math.huge
+  max_bytes = max_bytes or #text
   if #text <= max_bytes then
     local n = 0
     for _ in text:gmatch("\n") do

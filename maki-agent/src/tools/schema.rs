@@ -9,9 +9,8 @@
 use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter, Write};
 
-use jsonrepair::{Options as RepairOpts, loads as repair_loads};
 use serde_json::{Value, json};
-use tracing::{debug, warn};
+use tracing::warn;
 
 pub(crate) const PARAM_PREVIEW_MAX: usize = 120;
 
@@ -87,6 +86,12 @@ pub enum ParamSchema {
         properties: &'static [Property],
         description: &'static str,
     },
+    /// `{"type": "object"}` with no `properties`: any object, keys kept as
+    /// they come. Unlike `Any`, the model sees the type and a stringified
+    /// object still gets decoded.
+    OpenObject {
+        description: &'static str,
+    },
     Any {
         description: &'static str,
     },
@@ -141,6 +146,13 @@ pub fn to_json_schema(s: &ParamSchema) -> Value {
             if !required.is_empty() {
                 v["required"] = json!(required);
             }
+            if !description.is_empty() {
+                v["description"] = json!(description);
+            }
+            v
+        }
+        ParamSchema::OpenObject { description } => {
+            let mut v = json!({ "type": "object" });
             if !description.is_empty() {
                 v["description"] = json!(description);
             }
@@ -207,6 +219,7 @@ pub fn try_from_json(v: &Value) -> Result<&'static ParamSchema, String> {
             let items: &'static ParamSchema = try_from_json(items_val)?;
             ParamSchema::Array { items, description }
         }
+        Some("object") if v.get("properties").is_none() => ParamSchema::OpenObject { description },
         Some("object") => parse_object_schema(v, description)?,
         // A schema that spells out `properties` but forgets `type` is an object
         // and nothing else. Reading it as "any value" used to throw the whole
@@ -445,6 +458,7 @@ fn walk(schema: &ParamSchema, value: Value, path: &mut JsonPath) -> Result<Value
         ParamSchema::Enum { variants, .. } => validate_enum(variants, value, path),
         ParamSchema::Array { items, .. } => validate_array(items, value, path),
         ParamSchema::Object { properties, .. } => validate_object(properties, value, path),
+        ParamSchema::OpenObject { .. } => coerce_container(value, ParamKind::Object, path),
     }
 }
 
@@ -524,7 +538,7 @@ fn schema_type_name(schema: &ParamSchema) -> &'static str {
         ParamSchema::Primitive { kind, .. } => kind.as_str(),
         ParamSchema::Enum { .. } => "string (enum)",
         ParamSchema::Array { .. } => "array",
-        ParamSchema::Object { .. } => "object",
+        ParamSchema::Object { .. } | ParamSchema::OpenObject { .. } => "object",
         ParamSchema::Any { .. } => "any",
     }
 }
@@ -661,13 +675,7 @@ fn coerce_str_to(s: &str, expected: ParamKind) -> Option<Value> {
         return Some(parsed);
     }
 
-    let repaired = repair_loads(s, &RepairOpts::default()).ok()?;
-    if ParamKind::of(&repaired) == expected {
-        debug!(input = %preview(s), "repaired malformed JSON");
-        Some(repaired)
-    } else {
-        None
-    }
+    None
 }
 
 fn log_coercion(
@@ -1112,10 +1120,9 @@ mod tests {
         assert!(validate(schema, json!({})).is_err());
     }
 
-    #[test_case(json!({"type": "object"}) ; "nested_object_without_properties")]
-    #[test_case(json!({"type": "array"}) ; "nested_array_without_items")]
-    fn try_from_json_typeless_root_with_broken_property_degrades_to_any(broken: Value) {
-        let properties = json!({ ANY_PROP: broken });
+    #[test]
+    fn try_from_json_typeless_root_with_broken_property_degrades_to_any() {
+        let properties = json!({ ANY_PROP: {"type": "array"} });
         let typeless = try_from_json(&json!({ "properties": properties })).unwrap();
         assert!(
             matches!(typeless, ParamSchema::Any { .. }),
@@ -1126,6 +1133,15 @@ mod tests {
         assert!(explicit.is_err(), "{EXPLICIT_OBJECT_STILL_FAILS}");
     }
 
+    #[test_case(json!({"a": 1}) ; "object_passes_through")]
+    #[test_case(json!("{\"a\": 1}") ; "stringified_object_is_decoded")]
+    fn open_object_keeps_keys_and_decodes_strings(value: Value) {
+        let schema = try_from_json(&json!({ "type": "object" })).unwrap();
+        assert_eq!(to_json_schema(schema), json!({ "type": "object" }));
+        assert_eq!(validate(schema, value).unwrap(), json!({"a": 1}));
+        assert!(validate(schema, json!([1])).is_err());
+    }
+
     #[test_case(json!({}) ; "empty_schema")]
     #[test_case(json!({"description": ANY_DESCRIPTION}) ; "description_only")]
     fn try_from_json_without_properties_is_any(schema_json: Value) {
@@ -1134,10 +1150,17 @@ mod tests {
         assert!(validate(schema, json!({"anything": 1})).is_ok());
     }
 
+    #[test_case(r#"[{"old_string":"sed -n '1,130p' file" "new_string":"fixed"}]"# ; "missing_separator")]
+    #[test_case(r#"[{"old_string":"grep "needle" file","new_string":"fixed"}]"# ; "unescaped_command_quotes")]
+    fn malformed_stringified_parameters_are_rejected(encoded: &str) {
+        let input = json!({"path": "/x", "edits": encoded});
+        assert!(validate(&MULTIEDIT_LIKE, input).is_err());
+    }
+
     #[test]
-    fn coerce_stringified_array_with_unescaped_inner_quotes_via_repair() {
-        let broken = r#"[{"old_string": "const x = { \"color\": 1 };", "new_string": "fixed"}]"#;
-        let input = json!({"path": "/x", "edits": broken});
+    fn valid_stringified_array_preserves_inner_quotes() {
+        let encoded = r#"[{"old_string": "const x = { \"color\": 1 };", "new_string": "fixed"}]"#;
+        let input = json!({"path": "/x", "edits": encoded});
         let out = validate(&MULTIEDIT_LIKE, input).unwrap();
         assert_eq!(out["edits"][0]["new_string"], "fixed");
     }

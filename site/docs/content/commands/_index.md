@@ -15,6 +15,7 @@ Type `/` in the input box to open the command palette.
 |---------|-------------|
 | `/compact` | Summarize and compact conversation history (optional guidance) |
 | `/new` | Start a new session |
+| `/fork` | Fork this session and switch to the copy |
 | `/help` | Show keybindings |
 | `/usage` | Show token usage breakdown |
 | `/queue` | Remove items from queue |
@@ -40,12 +41,12 @@ Type `/` in the input box to open the command palette.
 
 ## Sessions
 
-Sessions run concurrently. `/new` starts a fresh session while the old one keeps working in the background, and `/sessions` shows the live status of each (working, needs input, idle) so you can jump between them. When a background session finishes or needs input, Maki flashes a note in the status bar. `/rename` renames the current session; in the session picker, `Ctrl+N` / `Ctrl+R` / `Ctrl+D` create, rename, and delete.
+Sessions run concurrently. `/new` starts a fresh session while the old one keeps working in the background, and `/sessions` shows the live status of each (working, needs input, idle) so you can jump between them. When a background session finishes or needs input, Maki flashes a note in the status bar. `/rename` renames the current session; in the session picker, `Ctrl+N` / `Ctrl+R` / `Ctrl+D` create, rename, and delete. Deleting the current session starts a fresh one and keeps the picker open.
 
 ## Modes and toggles
 
 - **`/yolo`**: skip permission prompts for this session (deny rules still apply). The toggle survives a resume, and `--yolo` only sets the starting value. Config: `always_yolo = true`.
-- **`/thinking`**: extended thinking. Bare, or `Alt+T`, it opens a picker of the effort levels with what each one costs in tokens; `Enter` applies the selected level and `Esc` closes without changing anything. With an argument it sets the level directly: `off`, `adaptive`, an effort level (`minimal` … `max`), or a token budget number. Config: `always_thinking`.
+- **`/thinking`**: extended thinking. Bare, or `Alt+T`, it opens a picker that shows what each level costs in tokens. With an argument it sets the level directly: `off`, `adaptive`, `minimal` to `max`, or a token budget. A model whose API has no adaptive mode does not offer `adaptive`. A session set to it shows and sends the level the provider uses instead. New TUI and ACP sessions start at the last level you set. Headless and SDK runs use `low` by default. `always_thinking` overrides these defaults, and `--thinking` / `--effort` or `--max-thinking-tokens` overrides config for one launch.
 - **`/fast`**: faster responses on Anthropic Opus, and on eligible Codex models when you sign in with a ChatGPT subscription. OpenAI API keys and every other model ignore it. Config: `always_fast = true`.
 - **`/workflow`**: let `code_execution` call the `task` tool (and other workflow-only tools) from inside the Python sandbox. Config: `always_workflow = true`.
 - **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only).
@@ -112,6 +113,28 @@ for _, alias in ipairs(aliases) do
 end
 ```
 
-Both names stay in the palette: aliasing adds a name, it does not rename or hide the original. It works for any command listed above, plus plugin commands and MCP prompts. See [`maki.api.run_command`](/docs/lua-api/#maki-api-run_command) for matching and error handling, or [`maki.ui.action`](/docs/lua-api/#maki-ui-action) to bind a key instead of a name.
+Aliasing adds a name, so both stay in the palette. Any command works as a target, including MCP prompts and other plugins' commands. See [`maki.api.run_command`](/docs/lua-api/#maki-api-run_command) for matching and error handling, or [`maki.ui.action`](/docs/lua-api/#maki-ui-action) to bind a key instead of a name.
+
+### What a plugin may run {#plugin-access}
+
+`run_command` only runs what the calling plugin's grants cover. Your `init.lua` counts as a plugin, and its grants come from `~/.config/maki/plugin.toml` (see [plugin permissions](/docs/lua-api/#plugin-permissions)). Commands not listed here run for any plugin.
+
+- Needs `fs_read`, `fs_write`: `/memory`.
+- Needs `fs_read`, `fs_write`, `net`, `run`, `env`, `agent`, `session_read`, `session_write`, `session_settings`: `/tasks`.
+- Needs `agent`: `/btw`.
+- Needs `agent`, `session_write`: `/compact`, custom commands, MCP prompts.
+- Needs `session_write`: `/new`, `/fork`.
+- Needs `session_write`, `session_settings`: `/rename`, `/sessions`.
+- Needs `session_settings`: `/model`, `/cd`, `/fast`, `/workflow`, `/thinking`.
+- Needs what its owner holds: every other plugin command, as described below.
+- Only when you type it: `/yolo`, `/trust`, `/packupdate`, `/packdel`. These change permissions, folder trust, or installed packages.
+
+A plugin command's handler runs with the grants of the plugin that registered it. The caller picks the arguments, so it must hold at least the same reach:
+
+- Every permission the owner holds.
+- Host access as wide as the owner's. A caller without `net_hosts` has it. A caller with a list needs the owner to have one too, and must contain each of its entries exactly as written, so `*.example.com` does not cover `api.example.com`.
+- Its own provider on the address of each provider the owner registered. That address may be on your LAN, which `net_hosts` cannot grant.
+
+A caller granted `run` skips both address checks, since a process it starts can reach any host.
 
 Related: [CLI](/docs/cli/) for shell flags and subcommands, [Skills](/docs/skills/) for on-demand playbooks.

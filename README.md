@@ -64,8 +64,6 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 
 **Plugin providers** - a Lua plugin can register a provider with `maki.provider.register`, and its models behave like any built-in provider's. See [docs](https://maki.sh/docs/providers/#plugin-providers) for details.
 
-> Providers as Lua plugins WIP!
-
 ## Installation
 
 ### Linux / macOS
@@ -86,6 +84,12 @@ curl -fsSL https://maki.sh/install.sh | sh
 ```
 
 Installs to `~/.local/bin`. Override with `MAKI_INSTALL_DIR`.
+
+### Homebrew
+
+```sh
+brew install maki
+```
 
 ### Windows (PowerShell)
 
@@ -150,7 +154,7 @@ More info at the [official docs](https://maki.sh/docs).
 
 ## Community
 
-[![Discord](https://img.shields.io/discord/1543246528876126218?logo=discord&logoColor=white&label=discord&color=5865F2)](https://discord.gg/dEBhANTbX)
+[![Discord](https://img.shields.io/discord/1543246528876126218?logo=discord&logoColor=white&label=discord&color=5865F2)](https://discord.gg/8VKuA4naC3)
 
 ## Example config
 

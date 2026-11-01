@@ -9,7 +9,7 @@ local U32_MAX = 4294967295
 local U64_MAX = 2 ^ 64
 local PER_MILLION = 1000000
 
-local function whole(value, max)
+local function whole(value: unknown, max)
   if type(value) ~= "number" or value ~= math.floor(value) or value < 0 or value > max then
     return nil
   end

@@ -17,6 +17,7 @@ local MAX_BATCH_SIZE = 25
 local SEPARATOR = "──────────────────"
 local BODY_INDENT = "  "
 local ANNOTATION_SEP = " · "
+local MARKDOWN_FORMAT = "markdown"
 local ERROR_PREFIX = "[ERROR] "
 local EMPTY_ERROR = "provide at least one tool call"
 local NESTED_ERROR = "cannot nest batch inside batch"
@@ -133,9 +134,8 @@ end
 
 --- Child presentation ------------------------------------------------------
 
--- Let the child tool draw its own header. Some tools have none (MCP
--- ones, for example) and a broken one comes back nil; either way the
--- plain tool name is enough.
+-- Let the child tool draw its own header. A tool with none, or a broken
+-- one, comes back nil; either way the plain tool name is enough.
 local function header_spans(tool, params)
   local t = maki.api.get_tool(tool)
   local spans = t and t.header and t.header(params)
@@ -143,7 +143,7 @@ local function header_spans(tool, params)
 end
 
 -- The chat and the reason travel along so a child keying per-chat state
--- (todo_write) files the call where it would standalone. From the handler
+-- files the call where it would standalone. From the handler
 -- `restore_reason` is nil, which reads as a rerender: the child's own
 -- handler already ran.
 local function child_ctx(ctx)
@@ -158,20 +158,26 @@ end
 -- The child's own restore fn builds the body, fed the real is_error, so
 -- a failed child looks exactly like the same tool run standalone. When
 -- restore is missing, throws, or returns no buf, the ToolView fallback
--- matches the standalone plain rendering too.
+-- follows the tool's `format`, so it still matches standalone.
 -- The pcall is for the cancel sweep, which runs outside the coroutine,
 -- where a restore that awaits raises instead of yielding. One child's
 -- body must not stop the sweep from repainting the rest.
 local function child_body_buf(c, cctx)
   local output = c.output or ""
+  local is_error = c.status == STATUS.ERROR
   local t = maki.api.get_tool(c.tool)
-  local buf
   if t and t.restore then
-    local ok, res = pcall(t.restore, c.params, output, c.status == STATUS.ERROR, cctx)
-    buf = ok and res or nil
+    local ok, buf = pcall(t.restore, c.params, output, is_error, cctx)
+    if ok and buf then
+      return buf
+    end
   end
   local tol = cctx.tool_output_lines
-  return buf or ToolView.restore(output, { max_lines = tol[c.tool] or tol.other, keep = "head" })
+  local opts = { max_lines = tol[c.tool] or tol.other, keep = "head" }
+  if t and t.format == MARKDOWN_FORMAT then
+    return ToolView.restore_markdown(output, is_error, opts)
+  end
+  return ToolView.restore(output, opts)
 end
 
 -- Parsing plus per-entry policy: entries past MAX_BATCH_SIZE and nested
@@ -430,9 +436,15 @@ end
 
 -- Live annotations (say, a task child's model) arrive before the done
 -- annotation ("12 lines"), so append rather than replace, with the same
--- separator the standalone header uses.
+-- separator the standalone header uses. A note already shown is skipped, the
+-- same as the standalone header does: a code_execution child sends one
+-- "allowed by" mark for every call a plugin let through.
 function Batch:annotate(c, ann)
-  c.annotation = c.annotation and (c.annotation .. ANNOTATION_SEP .. ann) or ann
+  local sep = ANNOTATION_SEP
+  if c.annotation and (sep .. c.annotation .. sep):find(sep .. ann .. sep, 1, true) then
+    return
+  end
+  c.annotation = c.annotation and (c.annotation .. sep .. ann) or ann
   self:rerender()
 end
 
@@ -440,7 +452,8 @@ end
 -- comes back with the partial output the sweep could not know about.
 function Batch:settle(c, status, output)
   if TERMINAL[c.status] and not c.swept then
-    error(string.format(RESETTLE_FMT, c.tool, c.status, status))
+    -- tostring only placates Luau nonstrict: a non-literal format string rejects generic arguments.
+    error(string.format(RESETTLE_FMT, tostring(c.tool), c.status, status))
   end
   c.swept = nil
   c.status = status
@@ -458,6 +471,7 @@ function Batch:run_child(c, ctx)
   c.status = STATUS.RUNNING
   self:rerender()
   local text, err = maki.agent.call_tool(ctx, c.tool, c.params, {
+    output_mode = ctx:output_mode(),
     -- Clicks on a still-streaming child are a no-op: its click handler
     -- lives on the child's own handle, not on this wrapper buf.
     on_live_buf = function(b)
