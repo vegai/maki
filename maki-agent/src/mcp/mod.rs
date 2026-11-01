@@ -24,7 +24,6 @@ pub mod stdio;
 pub mod transport;
 
 #[cfg(unix)]
-use crate::tools::{ToolAudience, ToolKind};
 use maki_providers::process::kill_group;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -48,7 +47,7 @@ use self::http::HttpTransport;
 use self::stdio::StdioTransport;
 use self::transport::McpTransport;
 use crate::tools::schema::sanitize_tool_input_schema;
-use crate::tools::{CallOrigin, ToolFilter};
+use crate::tools::{CallOrigin, ToolAudience, ToolFilter, ToolKind};
 use crate::types::TextOutput;
 
 const SEPARATOR: &str = ".";
