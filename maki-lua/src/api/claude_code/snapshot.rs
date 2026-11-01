@@ -77,7 +77,7 @@ fn resolve_links(root: &Path, path: &Path, remaining: &mut usize) -> io::Result<
                 match fs::read_link(&resolved) {
                     Ok(target) => {
                         if !active.insert(resolved.clone()) {
-                            continue;
+                            return Err(Errno::LOOP.into());
                         }
                         *remaining = remaining
                             .checked_sub(target.components().count() + 1)
@@ -436,7 +436,6 @@ mod tests {
     #[test_case(b"escape/../inside/file" ; "parent_after_external_link")]
     #[test_case(b"escape/back/file" ; "external_link_returns_inside")]
     #[test_case(b"dot/dot/inside/file" ; "repeated_finite_link")]
-    #[test_case(b"loop" ; "cyclic_link")]
     #[test_case(b"chain0" ; "long_link_chain")]
     #[test_case(b"missing/\xff" ; "non_utf8_target")]
     fn link_resolution_and_removal_match_realpath(target: &[u8]) {
@@ -498,22 +497,39 @@ mod tests {
         );
         assert_eq!(fs::symlink_metadata(link).is_err(), dropped);
     }
-    #[test]
-    fn growing_cycles_resolve_without_following_the_unresolvable_tail() {
-        const GROWING: &str = "growing";
-        const TARGET: &str = "growing/again";
+    #[test_case("loop" ; "self_cycle")]
+    #[test_case("loop/again" ; "growing_cycle")]
+    fn cyclic_links_are_unresolved_and_pruned(target: &str) {
+        const LOOP: &str = "loop";
         let dir = tempdir().unwrap();
-        symlink(TARGET, dir.path().join(GROWING)).unwrap();
+        let snapshot = dir.path().join("snapshot");
+        fs::create_dir(&snapshot).unwrap();
+        symlink(target, snapshot.join(LOOP)).unwrap();
+        symlink(LOOP, snapshot.join(RESOLUTION_LINK)).unwrap();
         let mut remaining = BASE_RESOLUTION_STEPS;
-        assert_eq!(
-            resolve_links(
-                &dir.path().canonicalize().unwrap(),
-                Path::new(GROWING),
-                &mut remaining
-            )
-            .unwrap(),
-            dir.path().join(TARGET)
-        );
+        let error = resolve_links(
+            &snapshot.canonicalize().unwrap(),
+            Path::new(RESOLUTION_LINK),
+            &mut remaining,
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(Errno::LOOP.raw_os_error()));
+        let metadata = sanitize_snapshot(
+            &snapshot,
+            &dir.path().join("quarantine"),
+            &dir.path().join("repository"),
+            true,
+        )
+        .unwrap();
+        for name in [LOOP, RESOLUTION_LINK] {
+            assert!(metadata.dropped_links.contains(&PathBuf::from(name)));
+            assert_eq!(
+                fs::symlink_metadata(snapshot.join(name))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::NotFound
+            );
+        }
     }
 
     #[test]
