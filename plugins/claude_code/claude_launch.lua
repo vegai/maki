@@ -7,6 +7,7 @@ local native = require("maki.claude_code.internal")
 local jobs = require("claude_jobs")
 local Stream = require("claude_stream")
 local path_utils = require("claude_paths")
+local confine = require("claude_confine")
 
 local M = {}
 
@@ -16,9 +17,7 @@ M.STARTUP_TIMEOUT_SECS = native.startup_timeout_secs
 M.STARTUP_MS = M.STARTUP_TIMEOUT_SECS * jobs.MS_PER_SEC
 M.READ_PROFILE = "read"
 M.CODE_PROFILE = "code"
-M.DENY_HOME_OUTSIDE = "a deny_read_home path must stay inside the home directory"
 M.NO_SESSION_DIR = "maki cannot find the session's working directory: "
-local PROBE_RUN = "Claude Code started a run during its checks, before maki sent a prompt"
 
 local READ_CONTRACT = "You are a read-only worker for another coding agent. You can read and search the "
   .. "project, but you cannot edit files or run commands. Reply only with your results. Keep them short, with "
@@ -59,220 +58,8 @@ M.HANDSHAKE_INPUT = native.handshake_input
 
 local INSTRUCTIONS_HEADING = "The instructions maki loaded for this task, from the project and the user:"
 
--- Claude Code passes its environment to Bash, in the sandbox too (tested on
--- 2.1.284), and the sandbox cannot drop a variable.
-local SHELL_TOOL = "Bash"
--- Logins and keys under the home directory that the sandboxed shell cannot
--- read. Without `CLAUDE_CONFIG_DIR`, Claude Code keeps its login in
--- `.claude`, and its global state, MCP server `env` included, in
--- `.claude.json`. maki's own config can hold keys in `init.lua` and
--- `mcp.toml`.
-local HOME_CREDENTIALS = {
-  ".claude",
-  ".claude.json",
-  ".maki",
-  ".config/maki",
-  ".ssh",
-  ".aws",
-  ".gnupg",
-  ".netrc",
-  ".git-credentials",
-  ".gitconfig",
-  ".config/git",
-  ".Xauthority",
-  ".local/share/keyrings",
-  ".password-store",
-  ".config/containers/auth.json",
-  ".m2/settings.xml",
-  ".gradle/gradle.properties",
-  ".terraform.d",
-  ".azure",
-  ".config/gh",
-  ".config/gcloud",
-  ".docker",
-  ".kube",
-  ".npmrc",
-  ".pypirc",
-  ".cargo/credentials.toml",
-  ".cargo/credentials",
-  ".bashrc",
-  ".bash_profile",
-  ".zshrc",
-  ".zshenv",
-  ".zprofile",
-  ".profile",
-  ".config/environment.d",
-  ".bash_history",
-  ".zsh_history",
-  ".python_history",
-  ".node_repl_history",
-  ".mysql_history",
-  ".psql_history",
-  ".sqlite_history",
-  ".viminfo",
-  ".lesshst",
-  ".config/fish",
-  ".local/share/fish/fish_history",
-  ".vault-token",
-  ".pgpass",
-  ".config/rclone",
-  ".mozilla",
-  ".config/google-chrome",
-  ".config/chromium",
-  ".config/BraveSoftware",
-  ".config/microsoft-edge",
-  ".var/app",
-  "snap",
-}
-
-M.NO_HOME = "maki cannot find your home directory, so it cannot keep the coding worker's shell away from "
-  .. "the logins and keys there. Set HOME, or use the read profile."
-
---- Returns why {worker} cannot run with {env}: its shell could read the
---- login token, or a proxy URL with a user or password in it. Names compare
---- in upper case, because `https_proxy` and the like reach the child too.
-function M.shell_secret_problem(worker, env)
-  if not path_utils.set_of(worker.tools)[SHELL_TOOL] then
-    return nil
-  end
-  return native.shell_secret_problem(env)
-end
-
-function M.denied_home_paths(extra)
-  return path_utils.comma_list(extra, function(path)
-    if path:sub(1, 1) == "/" or path:sub(1, 1) == "~" or path_utils.climbs(path) then
-      return nil, M.DENY_HOME_OUTSIDE
-    end
-    return path
-  end)
-end
-
---- Returns the logins and keys under {home} that a coding worker's shell
---- cannot read, or nil and the reason when there is no home directory.
-function M.home_credentials(home, extra, environ)
-  if not home or home == "" then
-    return nil, M.NO_HOME
-  end
-  local cwd, cwd_err = maki.uv.cwd()
-  if not cwd then
-    return nil, "maki cannot resolve relocated credential paths: " .. tostring(cwd_err)
-  end
-  local paths, seen = {}, {}
-  local resolved_home = maki.fs.realpath(home) or home
-  local function add(path)
-    if not seen[path] then
-      seen[path] = true
-      paths[#paths + 1] = path
-    end
-  end
-  local function deny(path)
-    add(maki.fs.joinpath(home, path))
-    local absolute = maki.fs.joinpath(resolved_home, path)
-    add(absolute)
-    local resolved = maki.fs.realpath(absolute)
-    if resolved then
-      add(resolved)
-    end
-  end
-  for _, path in ipairs(HOME_CREDENTIALS) do
-    deny(path)
-  end
-  local state_files, state_err = native.home_state_files(home)
-  if not state_files then
-    return nil, "maki cannot inspect Claude Code state copies: " .. tostring(state_err)
-  end
-  add(maki.fs.joinpath(home, ".claude.json*"))
-  add(maki.fs.joinpath(resolved_home, ".claude.json*"))
-  for _, path in ipairs(state_files) do
-    local resolved = maki.fs.realpath(maki.fs.joinpath(resolved_home, path))
-    if resolved and not path_utils.within(resolved, resolved_home) then
-      add(resolved)
-    end
-  end
-  for _, path in ipairs(extra or {}) do
-    deny(path)
-  end
-  local env = environ or {}
-  local function relocated(path: string?)
-    if path and path ~= "" then
-      if path:sub(1, 1) ~= "/" then
-        path = maki.fs.joinpath(cwd, path)
-      end
-      add(path)
-      local resolved = maki.fs.realpath(path)
-      if resolved then
-        add(resolved)
-      end
-    end
-  end
-  for _, location in ipairs({ { "%.config", env.XDG_CONFIG_HOME }, { "%.local/share", env.XDG_DATA_HOME } }) do
-    local prefix, directory = location[1], location[2]
-    if directory and directory ~= "" then
-      for _, path in ipairs(HOME_CREDENTIALS) do
-        local relative = path:match("^" .. prefix .. "/(.+)$")
-        if relative then
-          relocated(maki.fs.joinpath(directory, relative))
-        end
-      end
-    end
-  end
-  if env.CARGO_HOME and env.CARGO_HOME ~= "" then
-    relocated(maki.fs.joinpath(env.CARGO_HOME, "credentials"))
-    relocated(maki.fs.joinpath(env.CARGO_HOME, "credentials.toml"))
-  end
-  for _, name in ipairs({
-    "GNUPGHOME",
-    "DOCKER_CONFIG",
-    "CLAUDE_CONFIG_DIR",
-    "AWS_SHARED_CREDENTIALS_FILE",
-    "AWS_CONFIG_FILE",
-    "GH_CONFIG_DIR",
-    "PASSWORD_STORE_DIR",
-    "ZDOTDIR",
-    "PGPASSFILE",
-    "AZURE_CONFIG_DIR",
-    "CLOUDSDK_CONFIG",
-    "RCLONE_CONFIG",
-  }) do
-    relocated(env[name])
-  end
-  for path in (env.KUBECONFIG or ""):gmatch("[^:]+") do
-    relocated(path)
-  end
-  return paths
-end
-
---- Returns true if {path} is in the checkout of {spec}, which reaches past
---- the session's directory when that is a subdirectory or a worktree.
-function M.in_checkout(path, spec)
-  for _, dir in ipairs(spec.denied) do
-    if path_utils.within(path, dir) then
-      return true
-    end
-  end
-  return false
-end
-
-function M.deny_rules(extra)
-  local rules = {}
-  for i, pattern in ipairs(extra) do
-    rules[i] = "Read(./" .. pattern .. ")"
-  end
-  return rules
-end
-
-local function worker_policy(spec)
-  if not spec.policy then
-    spec.policy = native.worker_policy({
-      deny = spec.deny,
-      sandbox = spec.worker.sandboxed and assert(spec.confine, "a sandboxed worker needs confinement paths") or nil,
-    })
-  end
-  return spec.policy
-end
-
 function M.worker_handshake(spec)
-  return native.worker_handshake(spec.worker.reported_modes, worker_policy(spec))
+  return native.worker_handshake(spec.worker.reported_modes, spec.policy)
 end
 
 --- Returns how many whole seconds a call can run: {requested} or
@@ -296,14 +83,13 @@ end
 --- for a sandboxed worker.
 function M.argv(spec)
   local worker = spec.worker
-  local args =
-    native.worker_args(spec.model, worker.tools, worker.permission_mode, worker_policy(spec), worker.contract)
+  local args = native.worker_args(spec.model, worker.tools, worker.permission_mode, spec.policy, worker.contract)
   table.insert(args, 1, spec.executable)
   return args
 end
 
 function M.checked_step(stream, line, handshake)
-  local step = stream:feed(line)
+  local step = stream:feed(line, handshake)
   if not step then
     return nil
   end
@@ -311,8 +97,7 @@ function M.checked_step(stream, line, handshake)
     return step, step.stop
   end
   if step.control then
-    local complete, problem = handshake:answer(step.control)
-    return step, problem, complete
+    return step, nil, step.complete
   end
   return step
 end
@@ -321,16 +106,13 @@ local function probe_dir(env, spec)
   return native.private_dir(env.TMPDIR, spec.cwd, spec.denied)
 end
 
-function M.job_opts(cwd, env, stderr_tail)
+function M.job_opts(cwd, env)
   return {
     max_line_bytes = native.max_event_bytes,
     cwd = cwd,
     env = env,
     clear_env = true,
     stdin = "pipe",
-    on_stderr = function(_, line)
-      jobs.keep_tail(stderr_tail, line)
-    end,
   }
 end
 
@@ -347,7 +129,11 @@ function M.probe(call, spec, argv, env)
   local stream = Stream.new({ cwd = dir, worker = spec.worker, cli = spec.cli })
   local handshake = M.worker_handshake(spec)
   local problem, stderr_tail = nil, {}
-  local code, _, run_error = call:run_to_end(argv, M.job_opts(dir, env, stderr_tail), {
+  local code, _, run_error = call:run_to_end(argv, M.job_opts(dir, env), {
+    timeout_ms = M.STARTUP_MS,
+    on_stderr_tail = function(tail)
+      stderr_tail = tail
+    end,
     leftover = function()
       return dir
     end,
@@ -356,7 +142,7 @@ function M.probe(call, spec, argv, env)
         return
       end
       local step, failure = M.checked_step(stream, line, handshake)
-      problem = failure or step and not step.control and PROBE_RUN or nil
+      problem = failure or step and not step.control and native.unchecked_start() or nil
       if problem then
         maki.fn.jobstop(id)
       end
@@ -364,20 +150,14 @@ function M.probe(call, spec, argv, env)
     started = function(id)
       return jobs.feed_stdin(id, M.HANDSHAKE_INPUT)
     end,
-  }, M.STARTUP_MS)
+  })
   if run_error then
     return jobs.with_stderr("maki cannot run Claude Code checks: " .. run_error, stderr_tail)
   end
   if problem then
     return jobs.with_stderr(problem, stderr_tail)
   end
-  if not code then
-    return "Claude Code did not send the responses to its checks in " .. M.STARTUP_TIMEOUT_SECS .. " s"
-  end
-  if code ~= 0 then
-    return jobs.with_stderr("Claude Code exited with code " .. code .. " during its checks", stderr_tail)
-  end
-  local _, incomplete = handshake:finish()
+  local _, incomplete = handshake:probe_exit(code, M.STARTUP_TIMEOUT_SECS)
   if incomplete then
     return jobs.with_stderr(incomplete, stderr_tail)
   end
@@ -390,7 +170,7 @@ function M.preflight(input, ctx, call, opts)
   local home = maki.uv.os_homedir()
   local plan_err, home_credentials
   if worker == M.WORKERS[M.CODE_PROFILE] then
-    home_credentials, plan_err = M.home_credentials(home, opts.deny_read_home, environ)
+    home_credentials, plan_err = confine.home_credentials(home, opts.deny_read_home, environ)
     if not home_credentials then
       return nil, plan_err
     end
@@ -398,9 +178,9 @@ function M.preflight(input, ctx, call, opts)
     return nil, "only the " .. M.CODE_PROFILE .. " profile can use `include`, because it works in a snapshot"
   end
   -- Resolved once here, because the probe runs from another directory.
-  local executable = maki.fn.exepath(opts.executable)
-  if executable == "" then
-    return nil, "Claude Code (`" .. opts.executable .. "`) is not installed, or it is not on PATH"
+  local executable, executable_err = native.executable(opts.executable)
+  if not executable then
+    return nil, executable_err
   end
 
   -- Under ACP, the session can work in a different checkout from maki's.
@@ -417,35 +197,14 @@ function M.preflight(input, ctx, call, opts)
     return nil, prepare_err
   end
   local env, withheld = prepared.env, prepared.withheld
-  local secret_err = M.shell_secret_problem(worker, env)
+  local secret_err = confine.shell_secret_problem(worker, env)
   if secret_err then
     return nil, secret_err
   end
   local config_dir = prepared.config_dir
 
-  -- Keep the version job in Call so cancellation reaps it before the slot is released.
-  local check, version_err = native.version_check(executable)
-  if not check then
-    return nil, version_err
-  end
-  local version = check:version()
-  if not version then
-    local dir, dir_err = probe_dir(env, { cwd = cwd, denied = prepared.denied })
-    if not dir then
-      return nil, dir_err
-    end
-    local output, output_err = call:run_lines({ executable, "--version" }, {
-      cwd = dir,
-      env = env,
-      leftover = function()
-        return dir
-      end,
-    })
-    if not output then
-      return nil, output_err
-    end
-    version, version_err = check:save(table.concat(output, "\n"))
-  end
+  local version, version_err =
+    call:wait(native.checked_profile, executable, env, cwd, prepared.denied, M.STARTUP_TIMEOUT_SECS)
   if not version then
     return nil, version_err
   end
@@ -453,7 +212,7 @@ function M.preflight(input, ctx, call, opts)
   return {
     model = model,
     worker = worker,
-    deny = M.deny_rules(opts.deny_read),
+    deny = confine.deny_rules(opts.deny_read),
     executable = executable,
     cwd = cwd,
     instructions = instructions,
@@ -463,6 +222,7 @@ function M.preflight(input, ctx, call, opts)
     home_credentials = home_credentials,
     denied = prepared.denied,
     cli = cli,
+    environ = environ,
   }
 end
 

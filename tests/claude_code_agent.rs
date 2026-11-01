@@ -8,17 +8,18 @@
 
 use std::env;
 use std::fs::{self, Permissions};
-use std::io::Read;
 use std::iter;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::thread;
-use std::time::Duration;
 
 use serde_json::Value;
 use test_case::test_case;
-use wait_timeout::ChildExt;
+
+#[path = "support/process.rs"]
+#[allow(dead_code)]
+mod process;
+use process::{finish, ndjson};
 
 #[path = "support/isolation.rs"]
 mod isolation;
@@ -41,7 +42,6 @@ give the text for the word alpha there.\n\
 Then tell if the command ran, and give the text that the subagent found, without a change.";
 const DENIED: &str = "denied";
 const MODEL: &str = "claude-code/claude-haiku-4-5";
-const RUN_LIMIT: Duration = Duration::from_secs(300);
 /// The global `init.lua` with the plugin on and @OPTIONS@ beside `enabled`.
 const PLUGIN_ON: &str = "maki.setup({ plugins = { claude_code = { enabled = true@OPTIONS@ } } })\n";
 /// A `claude` older than any version maki runs, so the provider stops at the
@@ -174,41 +174,11 @@ fn run_maki(model: &str) -> Run {
         env::var_os(CLAUDE_CONFIG_ENV).map_or_else(|| real_home.join(".claude"), PathBuf::from);
     let mut command = fixture.maki(model, PROMPT, STREAM_FORMAT);
     command.env(CLAUDE_CONFIG_ENV, claude_config);
-    let Output { stdout, stderr, .. } = finish(command);
+    let Output { stdout, stderr, .. } = finish(&mut command);
     let stderr = String::from_utf8(stderr).unwrap();
-    let events: Vec<Value> = stdout
-        .split(|&byte| byte == b'\n')
-        .filter_map(|line| serde_json::from_slice(line).ok())
-        .collect();
+    let events = ndjson(&stdout);
     assert!(!events.is_empty(), "maki printed no events: {stderr}");
     Run { events }
-}
-
-/// Read both output streams concurrently so stderr cannot fill its pipe and block maki.
-fn finish(mut command: Command) -> Output {
-    let mut child = command.spawn().unwrap();
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-    let out = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stdout.read_to_end(&mut bytes);
-        bytes
-    });
-    let err = thread::spawn(move || {
-        let mut text = String::new();
-        let _ = stderr.read_to_string(&mut text);
-        text
-    });
-    let status = child.wait_timeout(RUN_LIMIT).unwrap().unwrap_or_else(|| {
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!("maki did not complete in {RUN_LIMIT:?}");
-    });
-    Output {
-        status,
-        stdout: out.join().unwrap(),
-        stderr: err.join().unwrap().into_bytes(),
-    }
 }
 
 #[test]
@@ -223,7 +193,7 @@ fn dry_run_uses_provider_capabilities_and_filters_without_starting_claude() {
         "--disallowed-tools",
         "claude_code,claude_code_import",
     ]);
-    let output = finish(command);
+    let output = finish(&mut command);
     assert!(
         output.status.success(),
         "{}",
@@ -259,13 +229,9 @@ fn unavailable_scratch_fails_per_request_without_starting_claude() {
     fixture.enable_plugin(Some(&claude));
     let mut command = fixture.maki(MODEL, PROMPT, STREAM_FORMAT);
     command.current_dir("/");
-    let output = finish(command);
+    let output = finish(&mut command);
     assert!(!output.status.success());
-    let events: Vec<Value> = String::from_utf8(output.stdout)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
+    let events = ndjson(&output.stdout);
     assert_eq!(events[0]["subtype"], INIT);
     let result = events.last().unwrap();
     assert_eq!(result["type"], RESULT);
@@ -289,7 +255,7 @@ fn request_policy_does_not_prevent_provider_creation_or_dry_run() {
     .unwrap();
     let mut command = fixture.maki(MODEL, PROMPT, STREAM_FORMAT);
     command.arg("--dry-run");
-    let output = finish(command);
+    let output = finish(&mut command);
     assert!(
         output.status.success(),
         "{}",
@@ -298,13 +264,9 @@ fn request_policy_does_not_prevent_provider_creation_or_dry_run() {
     let init: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(init["subtype"], INIT);
     assert!(!claude.with_extension(RAN_EXTENSION).exists());
-    let output = finish(fixture.maki(MODEL, PROMPT, STREAM_FORMAT));
+    let output = finish(&mut fixture.maki(MODEL, PROMPT, STREAM_FORMAT));
     assert!(!output.status.success());
-    let events: Vec<Value> = String::from_utf8(output.stdout)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
+    let events = ndjson(&output.stdout);
     assert_eq!(events[0]["subtype"], INIT);
     assert_eq!(events.last().unwrap()["is_error"], true);
     assert!(!claude.with_extension(RAN_EXTENSION).exists());
@@ -323,7 +285,7 @@ fn startup_errors_keep_the_output_format(format: &str, verbose: bool) {
     if format == STREAM_FORMAT {
         command.args(["--input-format", STREAM_FORMAT]);
     }
-    let output = finish(command);
+    let output = finish(&mut command);
     assert!(!output.status.success());
     if format == "text" {
         assert!(output.stdout.is_empty());
@@ -413,7 +375,7 @@ fn the_provider_is_on_with_the_plugin(plugin: bool, want: &str) {
     let path = env::join_paths(iter::once(bin).chain(env::split_paths(&caller_path))).unwrap();
     let mut command = fixture.maki(MODEL, PROMPT, JSON_FORMAT);
     command.env(PATH, path);
-    let Output { stdout, stderr, .. } = finish(command);
+    let Output { stdout, stderr, .. } = finish(&mut command);
     let stderr = String::from_utf8(stderr).unwrap();
     assert_eq!(
         claude.with_extension(RAN_EXTENSION).exists(),
@@ -446,7 +408,7 @@ fn cli_filters_plugin_tools_in_the_init_event(
     fs::write(fixture.isolation.dir("config/maki").join("init.lua"), init).unwrap();
     let mut command = fixture.maki(MODEL, PROMPT, STREAM_FORMAT);
     command.args([flag, names]);
-    let Output { stdout, stderr, .. } = finish(command);
+    let Output { stdout, stderr, .. } = finish(&mut command);
     let stderr = String::from_utf8(stderr).unwrap();
     assert_eq!(
         stderr.contains(UNMATCHED_TOOL_WARNING),
@@ -456,13 +418,7 @@ fn cli_filters_plugin_tools_in_the_init_event(
     if let Some(warning) = warning {
         assert!(stderr.contains(warning), "{stderr}");
     }
-    let events: Vec<Value> = String::from_utf8(stdout)
-        .unwrap()
-        .lines()
-        .map(|line| {
-            serde_json::from_str(line).unwrap_or_else(|error| panic!("{error}: {line}\n{stderr}"))
-        })
-        .collect();
+    let events = ndjson(&stdout);
     let init = events
         .iter()
         .find(|event| event["type"] == SYSTEM && event["subtype"] == INIT)
@@ -489,7 +445,7 @@ fn a_misspelled_allow_list_stops_before_starting_the_provider() {
     fixture.enable_plugin(Some(&claude));
     let mut command = fixture.maki(MODEL, PROMPT, STREAM_FORMAT);
     command.args(["--allowed-tools", "raed"]);
-    let output = finish(command);
+    let output = finish(&mut command);
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(!output.status.success(), "unexpected success: {stderr}");
     assert!(

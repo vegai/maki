@@ -1,7 +1,7 @@
-mod blobs;
-mod snapshot;
+use super::{blobs, snapshot};
 
 use std::collections::HashMap;
+use std::env;
 use std::fmt::{self, Write};
 use std::fs;
 use std::io::{Error as IoError, ErrorKind};
@@ -12,26 +12,26 @@ use std::path::{Path, PathBuf};
 use std::str::from_utf8;
 use std::sync::Arc;
 
+use maki_agent::cancel::CancelToken;
 use maki_lua_macro::{lua_fn, lua_table};
-use maki_providers::claude_code::Error as ClaudeError;
-use maki_providers::claude_code::validation::{
+use maki_providers::claude_code::worker::{
     self, EventKind, WorkerHandshake as NativeHandshake, WorkerPolicy,
 };
 use mlua::{
     Error as LuaError, Lua, LuaSerdeExt, LuaString, Result as LuaResult, Table, UserData,
-    UserDataMethods, UserDataRef, Value as LuaValue,
+    UserDataMethods, UserDataRef, UserDataRefMut, Value as LuaValue,
 };
 use rustix::fs::OFlags;
 use rustix::io::Errno;
 use serde_json::Value;
 
-use super::claude_code_common::{MODULE, add_defaults};
 use crate::api::fs::path_text;
-use crate::api::util::convert::{TableExt, json_to_lua};
+use crate::api::util::convert::json_to_lua;
 use crate::api::util::pair::{Pair, pair, try_pair};
 use crate::plugin_permissions::PluginPermissions;
+use crate::runtime::{TaskHandle, lock_cell};
 
-const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
+pub(super) const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
@@ -49,14 +49,10 @@ const VARIATION_SELECTORS: &[RangeInclusive<u32>] = &[
     0xe0100..=0xe01ef,
 ];
 
-pub(crate) fn create_private_module(
-    lua: &Lua,
-    perms: &PluginPermissions,
-) -> LuaResult<(&'static str, Table)> {
+pub(super) fn create_table(lua: &Lua, perms: &PluginPermissions) -> LuaResult<Table> {
     let table = create_claude_code_table(lua, perms)?;
-    table.set("handshake_input", validation::handshake_input())?;
-    add_defaults(&table)?;
-    Ok((MODULE, table))
+    table.set("handshake_input", worker::handshake_input())?;
+    Ok(table)
 }
 
 fn is_printable(character: char) -> bool {
@@ -147,7 +143,7 @@ fn escape_path(lua: &Lua, text: LuaString, shell: Option<bool>) -> LuaResult<Lua
 /// @return (string?) Reason to refuse the coding call.
 #[lua_fn]
 fn shell_secret_problem(_lua: &Lua, env: HashMap<String, String>) -> LuaResult<Option<String>> {
-    Ok(validation::shell_secret_problem(&env))
+    Ok(worker::shell_secret_problem(&env))
 }
 
 /// Resolve the checkout's Git directory for the shared import lock.
@@ -157,8 +153,8 @@ fn shell_secret_problem(_lua: &Lua, env: HashMap<String, String>) -> LuaResult<O
 async fn project_git_dir(_lua: Lua, project: String) -> LuaResult<Pair<String>> {
     Ok(pair(
         smol::unblock(move || {
-            let project = validation::checkout_root(Path::new(&project)).map_err(IoError::other)?;
-            validation::git_directory(&project.join(validation::GIT_ENTRY)).and_then(path_text)
+            let project = worker::checkout_root(Path::new(&project)).map_err(IoError::other)?;
+            worker::git_directory(&project.join(worker::GIT_ENTRY)).and_then(path_text)
         })
         .await,
     ))
@@ -177,7 +173,7 @@ async fn private_dir(
     denied: Vec<String>,
 ) -> LuaResult<Pair<String>> {
     Ok(pair(
-        validation::private_dir(
+        worker::private_dir(
             PathBuf::from(base),
             PathBuf::from(project),
             denied.into_iter().map(PathBuf::from).collect(),
@@ -234,6 +230,9 @@ impl UserData for WorkerHandshake {
             let event = try_pair!(serde_json::from_str::<Value>(&line));
             Ok(pair(this.0.answer(&event["response"])))
         });
+        methods.add_method("probe_exit", |_, this, (code, secs): (Option<i32>, u64)| {
+            Ok(pair(this.0.probe_exit(code, secs).map(|()| true)))
+        });
         methods.add_method("finish", |_, this, ()| {
             Ok(pair(this.0.finish().map(|()| true)))
         });
@@ -278,13 +277,7 @@ fn worker_args(
     policy: UserDataRef<Policy>,
     contract: String,
 ) -> LuaResult<Vec<String>> {
-    Ok(validation::worker_args(
-        &model,
-        &tools.join(","),
-        &mode,
-        &policy.0,
-        &contract,
-    ))
+    Ok(policy.0.args(&model, &tools.join(","), &mode, &contract))
 }
 
 /// Encode prompt blocks in the shared worker protocol.
@@ -292,7 +285,7 @@ fn worker_args(
 /// @return (string) NDJSON user message.
 #[lua_fn]
 fn user_message(_lua: &Lua, blocks: Vec<String>) -> LuaResult<String> {
-    validation::user_message(&blocks).map_err(LuaError::external)
+    worker::user_message(&blocks).map_err(LuaError::external)
 }
 
 /// Prepare the login environment and validate every skipped settings file.
@@ -308,7 +301,7 @@ async fn prepare_launch(
     cwd: String,
 ) -> LuaResult<Pair<Table>> {
     let prepared = try_pair!(
-        smol::unblock(move || validation::prepare_launch(
+        smol::unblock(move || worker::prepare_launch(
             environ.into_iter().collect(),
             configured.map(PathBuf::from),
             Path::new(&cwd)
@@ -332,26 +325,36 @@ async fn prepare_launch(
     Ok((Some(result), None))
 }
 
-struct VersionCheck(validation::VersionCheck);
-
-impl UserData for VersionCheck {
-    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("version", |_, this, ()| Ok(this.0.version.clone()));
-        methods.add_method("save", |_, this, output: String| {
-            Ok(pair(this.0.save(&output)))
-        });
-    }
-}
-
-/// Capture the executable identity before reading its version.
+/// Validate the executable version with the shared process supervisor and cache.
 /// @param executable string Absolute CLI path.
-/// @return (userdata?, string?) Check with version() and save(output).
-#[lua_fn(guard = FsRead)]
-async fn version_check(_lua: Lua, executable: String) -> LuaResult<Pair<VersionCheck>> {
+/// @param env table Validated child environment.
+/// @param cwd string Session directory.
+/// @param denied table Protected paths.
+/// @param startup_secs integer Startup timeout.
+/// @return (string?, string?) Validated version, or nil and the error.
+#[lua_fn(guard = FsWrite)]
+async fn checked_profile(
+    lua: Lua,
+    executable: String,
+    env: HashMap<String, String>,
+    cwd: String,
+    denied: Vec<String>,
+    startup_secs: u64,
+) -> LuaResult<Pair<String>> {
+    let cancel = lua
+        .app_data_ref::<TaskHandle>()
+        .map(|handle| lock_cell(&handle).cancel.clone())
+        .unwrap_or_else(CancelToken::none);
     Ok(pair(
-        validation::version_check(Path::new(&executable))
-            .await
-            .map(VersionCheck),
+        worker::checked_profile(
+            Path::new(&executable),
+            &env.into_iter().collect::<Vec<_>>(),
+            Path::new(&cwd),
+            &denied.into_iter().map(PathBuf::from).collect::<Vec<_>>(),
+            startup_secs,
+            cancel.cancelled(),
+        )
+        .await,
     ))
 }
 
@@ -359,7 +362,7 @@ async fn version_check(_lua: Lua, executable: String) -> LuaResult<Pair<VersionC
 /// @param executable string Absolute CLI path.
 #[lua_fn]
 fn invalidate_version(_lua: &Lua, executable: String) -> LuaResult<()> {
-    validation::invalidate_version(Path::new(&executable));
+    worker::invalidate_version(Path::new(&executable));
     Ok(())
 }
 
@@ -451,36 +454,57 @@ async fn checkout_file(lua: Lua, path: String) -> LuaResult<Pair<Table>> {
     Ok((value, None))
 }
 
-/// Classify a worker event with the provider's protocol rules before conversion to Lua.
-/// @param line string Raw stream-json event.
-/// @param mode table Accepted-init and expected-model state. Init events require mode.init with cwd, cli and worker.
-/// @return (table?, string?) Event and normalized usage, or nil and the protocol error.
-#[lua_fn]
-fn classify(lua: &Lua, line: String, mode: Table) -> LuaResult<Pair<Table>> {
-    let model: Option<String> = mode.opt("model")?;
-    let mut classified = try_pair!(validation::classify(
-        &line,
-        mode.opt::<bool>("accepted")?.unwrap_or(false),
-        model.as_deref(),
-        mode.opt::<bool>("model_checked")?.unwrap_or(false),
-    ));
-    let event = &classified.event;
-    if classified.problem.is_none() && classified.kind == Some(EventKind::Init) {
-        let expect: Table = mode.get("init")?;
-        let version: String = expect.get::<Table>("cli")?.get("version")?;
-        let cwd: String = expect.get("cwd")?;
-        let worker: Table = expect.get("worker")?;
-        let tools: Vec<String> = worker.get("tools")?;
-        let modes: Vec<String> = worker.get("reported_modes")?;
-        classified.problem = validation::init_problem(
-            event,
-            &version,
-            Path::new(&cwd),
-            tools.into_iter().collect(),
-            &modes,
-        )
-        .map(ClaudeError::from);
+struct WorkerStream(worker::WorkerStream);
+
+impl UserData for WorkerStream {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method_mut("set_model", |_, this, model: String| {
+            this.0.set_model(model);
+            Ok(())
+        });
+        methods.add_method("accepted", |_, this, ()| Ok(this.0.accepted()));
+        methods.add_method_mut(
+            "feed",
+            |lua, this, (line, handshake): (String, Option<UserDataRefMut<WorkerHandshake>>)| {
+                let mut classified = try_pair!(this.0.feed(&line));
+                let control = classified.kind == Some(EventKind::ControlResponse)
+                    && classified.event["response"].is_object();
+                let complete = if control {
+                    try_pair!(
+                        handshake
+                            .map(|mut handshake| handshake.0.answer(&classified.event["response"]))
+                            .transpose()
+                    )
+                } else {
+                    None
+                };
+                event_table(lua, &mut classified, control, complete)
+            },
+        );
     }
+}
+
+/// Own worker init and model checks for one process.
+/// @param expect table Expected cwd, cli version and worker profile.
+/// @return (userdata) Stateful event classifier.
+#[lua_fn]
+fn worker_stream(_lua: &Lua, expect: Table) -> LuaResult<WorkerStream> {
+    let cli: Table = expect.get("cli")?;
+    let worker: Table = expect.get("worker")?;
+    Ok(WorkerStream(worker::WorkerStream::new(
+        cli.get("version")?,
+        PathBuf::from(expect.get::<String>("cwd")?),
+        worker.get("tools")?,
+        worker.get("reported_modes")?,
+    )))
+}
+
+fn event_table(
+    lua: &Lua,
+    classified: &mut worker::WorkerEvent,
+    control: bool,
+    complete: Option<bool>,
+) -> LuaResult<Pair<Table>> {
     let event = &mut classified.event;
     match classified.kind {
         Some(EventKind::Assistant) => {
@@ -488,7 +512,7 @@ fn classify(lua: &Lua, line: String, mode: Table) -> LuaResult<Pair<Table>> {
                 .get_mut("content")
                 .and_then(Value::as_array_mut)
             {
-                content.retain(|block| block["type"] == validation::TOOL_USE_BLOCK);
+                content.retain(|block| block["type"] == worker::TOOL_USE_BLOCK);
                 for block in content {
                     if let Some(input) = block.get_mut("input").and_then(Value::as_object_mut) {
                         input.retain(|key, _| TOOL_PROGRESS_FIELDS.contains(&key.as_str()));
@@ -514,9 +538,13 @@ fn classify(lua: &Lua, line: String, mode: Table) -> LuaResult<Pair<Table>> {
             .transpose()?,
     )?;
     result.set("event", json_to_lua(lua, event)?)?;
-    result.set("model_checked", classified.model_checked)?;
-    result.set("problem", classified.problem.map(|error| error.to_string()))?;
-    result.set("failure", classified.failure)?;
+    result.set("control", control)?;
+    result.set("complete", complete)?;
+    result.set(
+        "problem",
+        classified.problem.as_ref().map(|error| error.to_string()),
+    )?;
+    result.set("failure", classified.failure.as_deref())?;
     if let Some(usage) = &classified.usage {
         result.set("usage", json_to_lua(lua, usage)?)?;
     }
@@ -526,12 +554,28 @@ fn classify(lua: &Lua, line: String, mode: Table) -> LuaResult<Pair<Table>> {
     Ok((Some(result), None))
 }
 
+/// Find the configured worker executable.
+/// @param name string Executable name or path.
+#[lua_fn]
+fn executable(_lua: &Lua, name: String) -> LuaResult<Pair<String>> {
+    let cwd = try_pair!(env::current_dir());
+    Ok(pair(
+        worker::executable(&name, &cwd).map(|path| path.display().to_string()),
+    ))
+}
+
+/// Diagnostic for a worker that runs before checks pass.
+#[lua_fn]
+fn unchecked_start(_lua: &Lua) -> LuaResult<String> {
+    Ok(worker::unchecked_start())
+}
+
 lua_table! {
     /// Private helpers for the bundled Claude Code plugin. JSON inputs retain
     /// the distinction between null, objects and arrays.
     "maki.claude_code.internal" => pub(crate) fn create_claude_code_table(perms: &PluginPermissions), DOCS [
-        shell_secret_problem, escape_path, worker_policy, worker_handshake, worker_args, user_message, prepare_launch(perms), private_dir(perms), home_state_files(perms),
-        classify, checkout_file(perms), version_check(perms), invalidate_version, sanitize_git(perms), project_git_dir(perms), unpack_blobs(perms),
+        executable, unchecked_start, shell_secret_problem, escape_path, worker_policy, worker_handshake, worker_args, user_message, prepare_launch(perms), private_dir(perms), home_state_files(perms),
+        worker_stream, checkout_file(perms), checked_profile(perms), invalidate_version, sanitize_git(perms), project_git_dir(perms), unpack_blobs(perms),
     ]
 }
 
@@ -552,13 +596,18 @@ mod tests {
     use super::{create_claude_code_table, is_printable};
     use crate::api::util::convert::json_to_lua;
     use crate::plugin_permissions::PluginPermissions;
-    use maki_providers::claude_code::validation::GIT_ENTRY;
+    use maki_providers::claude_code::worker::GIT_ENTRY;
 
     const LINKED: &str = "linked";
     const NESTED: &str = "src";
     const FILE_CONTENT: &str = "file";
     const PRINT_PATH: &str = "printf %s ";
     const NON_UTF8_DIR: &[u8] = b"nested\xff";
+
+    fn classifier(lua: &Lua, table: &Table) -> AnyUserData {
+        let create: Function = table.get("worker_stream").unwrap();
+        create.call(json_to_lua(lua, &json!({ "cwd": "/workspace", "cli": { "version": "2.1.284" }, "worker": { "tools": [], "reported_modes": [] } })).unwrap()).unwrap()
+    }
 
     #[test_case(false ; "git_metadata")]
     #[test_case(true ; "repository")]
@@ -664,10 +713,9 @@ mod tests {
             handshake.call_method("answer", INVALID_JSON).unwrap();
         assert_eq!(complete, None);
         assert_eq!(error, Some(expected.clone()));
-        let classify: Function = table.get("classify").unwrap();
-        let (event, error): (Option<Table>, Option<String>) = classify
-            .call((INVALID_JSON, lua.create_table().unwrap()))
-            .unwrap();
+        let classify = classifier(&lua, &table);
+        let (event, error): (Option<Table>, Option<String>) =
+            classify.call_method("feed", INVALID_JSON).unwrap();
         assert!(event.is_none());
         assert!(error.unwrap().contains(&expected));
     }
@@ -715,12 +763,10 @@ mod tests {
     fn ignored_worker_events_do_not_copy_payloads_into_lua() {
         let lua = Lua::new();
         let table = create_claude_code_table(&lua, &PluginPermissions::trusted()).unwrap();
-        let classify: Function = table.get("classify").unwrap();
+        let classify = classifier(&lua, &table);
         let input = json!({ "type": "user", "message": {"content": "x".repeat(4096)} }).to_string();
-        let mode = lua.create_table().unwrap();
-        mode.set("accepted", true).unwrap();
         let (result, error): (Option<Table>, Option<String>) =
-            classify.call((input, mode)).unwrap();
+            classify.call_method("feed", input).unwrap();
         assert_eq!(error, None);
         let event: Table = result.unwrap().get("event").unwrap();
         assert_eq!(event.get::<String>("type").unwrap(), "user");
@@ -731,10 +777,10 @@ mod tests {
     fn oversized_worker_events_return_a_bounded_error() {
         let lua = Lua::new();
         let table = create_claude_code_table(&lua, &PluginPermissions::trusted()).unwrap();
-        let classify: Function = table.get("classify").unwrap();
-        let input = "x".repeat(maki_providers::claude_code::validation::MAX_EVENT_BYTES + 1);
+        let classify = classifier(&lua, &table);
+        let input = "x".repeat(maki_providers::claude_code::worker::MAX_EVENT_BYTES + 1);
         let (result, error): (Option<Table>, Option<String>) =
-            classify.call((input, lua.create_table().unwrap())).unwrap();
+            classify.call_method("feed", input).unwrap();
         assert!(result.is_none());
         assert!(error.unwrap().contains("limit"));
     }

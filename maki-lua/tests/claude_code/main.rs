@@ -2,6 +2,7 @@
 //! tests are ignored by default.
 #![cfg(target_os = "linux")]
 
+mod environment;
 mod import;
 mod policy;
 mod qualify;

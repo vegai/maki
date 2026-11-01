@@ -442,8 +442,13 @@ struct PluginEntry {
     auth: Arc<AuthState>,
 }
 
+#[cfg(target_os = "linux")]
+type NativeFactory = dyn Fn(Timeouts) -> Result<Box<dyn Provider>, AgentError> + Send + Sync;
+
 #[derive(Default)]
 struct Registry {
+    #[cfg(target_os = "linux")]
+    native: BTreeMap<Box<str>, Arc<NativeFactory>>,
     entries: BTreeMap<Box<str>, Arc<PluginEntry>>,
     selected: BTreeMap<Box<str>, String>,
 }
@@ -485,6 +490,27 @@ static AUTH: LazyLock<RwLock<HashMap<Box<str>, AuthCell>>> = LazyLock::new(RwLoc
 /// instead.
 pub fn begin_load() {
     *STAGING.lock().unwrap() = Some(Registry::for_load());
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn register_native(slug: &str, factory: Option<Arc<NativeFactory>>) {
+    let mut staging = STAGING.lock().unwrap();
+    if let Some(staged) = staging.as_mut() {
+        if let Some(factory) = factory {
+            staged.native.insert(slug.into(), factory);
+        } else {
+            staged.native.remove(slug);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn create_native(
+    slug: &str,
+    timeouts: Timeouts,
+) -> Option<Result<Box<dyn Provider>, AgentError>> {
+    let factory = entries().native.get(slug).cloned()?;
+    Some(factory(timeouts))
 }
 
 /// Publishes what this load registered. A load that registered nothing

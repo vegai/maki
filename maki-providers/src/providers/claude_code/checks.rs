@@ -15,7 +15,7 @@ use serde_json::{Map, Value};
 use super::OAUTH_TOKEN_ENV;
 use super::error::{Error, Problem};
 use super::stream::INITIALIZE;
-use super::validation::{CONFIG_DIR_ENV, HOME_ENV, TMPDIR_ENV};
+use super::worker::{CONFIG_DIR_ENV, HOME_ENV, TMPDIR_ENV};
 
 pub(crate) const MINIMUM_VERSION: [u64; 3] = [2, 1, 284];
 pub(crate) const ACCOUNT_ANSWER: &str = "account";
@@ -310,11 +310,8 @@ pub(crate) fn local_settings_dirs(cwd: &Path) -> Result<(Vec<PathBuf>, Option<Pa
             dirs.push(root);
         }
         if !meta.is_dir() {
-            let (main, external_git) = main_checkout(&git).map_err(|source| Error::Path {
-                what: "examine the worktree of",
-                path: git.clone(),
-                source,
-            })?;
+            let (main, external_git) =
+                main_checkout(&git).map_err(Error::path("examine the worktree of", &git))?;
             git_dir = external_git;
             if let Some(main) = main
                 && !dirs.contains(&main)

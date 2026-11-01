@@ -302,7 +302,7 @@ pub(crate) struct Turn<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Wait {
+pub enum Wait {
     Startup,
     Idle,
     Handoff,
@@ -558,7 +558,6 @@ fn call_id(block: &Value) -> Result<&str, Error> {
 pub(crate) fn parse_event(line: &str) -> Result<Value, Error> {
     let event = serde_json::from_str::<Value>(line).map_err(|source| Error::NotAnEvent {
         preview: line_preview(line),
-        category: source.classify(),
         bytes: line.len(),
         source,
     })?;
@@ -1410,7 +1409,16 @@ mod tests {
             assert!(matches!(&error, Error::InvalidEvent(preview) if preview == line));
             assert!(!super::super::agent_error(error.after_start(accepted)).is_retryable());
         }
-        assert!(super::super::validation::classify(line, false, None, false).is_err());
+        assert!(
+            super::super::worker::WorkerStream::new(
+                VERSION.into(),
+                Path::new(CWD).to_owned(),
+                Vec::new(),
+                Vec::new()
+            )
+            .feed(line)
+            .is_err()
+        );
     }
 
     /// Returns the first error, `Done` once the reply is done, or else the

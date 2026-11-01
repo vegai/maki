@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use flume::Receiver;
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
-use maki_providers::Timeouts;
 use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
+use maki_providers::{ThinkingConfig, Timeouts};
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
 use serde_json::Value;
@@ -78,6 +78,7 @@ pub struct HeadlessParams {
 pub struct Ready {
     pub model: Model,
     pub tool_names: Vec<String>,
+    pub thinking: String,
 }
 
 pub struct HeadlessHandle {
@@ -126,11 +127,14 @@ impl ContextSpec {
         }
     }
 
-    fn ready(&self, model: &Model, workflow: bool, mcp: Option<&McpSession>) -> Ready {
-        let tools = self.tools(model, workflow);
+    fn ready(&self, model: &Model, defaults: SessionDefaults, mcp: Option<&McpSession>) -> Ready {
+        let tools = self.tools(model, defaults.workflow);
         Ready {
             model: model.clone(),
             tool_names: advertised_tool_names(&tools, mcp),
+            thinking: ThinkingConfig::from(defaults.thinking)
+                .clamped(model)
+                .to_string(),
         }
     }
 
@@ -214,7 +218,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
         let Some(provider) = provider else {
             return;
         };
-        let _ = ready_tx.send(spec.ready(&model, params.defaults.workflow, mcp.as_ref()));
+        let _ = ready_tx.send(spec.ready(&model, params.defaults, mcp.as_ref()));
         if params.dry_run {
             return;
         }
@@ -374,7 +378,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
         let Some(mut provider) = provider else {
             return;
         };
-        let _ = ready_tx.send(spec.ready(&model, params.defaults.workflow, mcp.as_ref()));
+        let _ = ready_tx.send(spec.ready(&model, params.defaults, mcp.as_ref()));
         let context = spec.builder();
         let mut track = SessionTrack::open(params.resumed, params.claim, &working_dir);
         let mut run_id: u64 = 0;

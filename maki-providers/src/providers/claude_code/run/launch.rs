@@ -10,15 +10,15 @@ use super::supervision::{Group, Next, ReadDeadline, send, send_handshake, superv
 use super::{Limits, Listed};
 use crate::ProviderUsage;
 use futures::future::join_all;
-use futures_lite::Stream;
+use futures_lite::{Stream, future};
 use serde_json::{Value, json};
 use smol::process::ChildStdin;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::Metadata;
+use std::future::Future;
 use std::io;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::{LazyLock, Mutex, PoisonError};
@@ -95,7 +95,6 @@ pub(super) fn command(
         .current_dir(cwd)
         .env_clear()
         .envs(env.iter().map(|(name, value)| (name, value)));
-    command.process_group(0);
     command
 }
 
@@ -166,57 +165,23 @@ pub(super) async fn probe(
 async fn executable_identity(executable: &Path) -> Result<ExecutableIdentity, Error> {
     let metadata = smol::fs::metadata(executable)
         .await
-        .map_err(|source| Error::Path {
-            what: "inspect Claude Code",
-            path: executable.to_owned(),
-            source,
-        })?;
+        .map_err(Error::path("inspect Claude Code", executable))?;
     Ok(ExecutableIdentity::new(&metadata))
 }
 
-pub struct VersionCheck {
-    executable: PathBuf,
-    identity: ExecutableIdentity,
-    pub version: Option<String>,
-}
-
-impl VersionCheck {
-    fn remember(&self, version: &str) {
-        VERSION_CACHE
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(
-                self.executable.clone(),
-                (self.identity.clone(), version.to_owned()),
-            );
-    }
-
-    pub fn save(&self, output: &str) -> Result<String, String> {
-        let profile = checks::profile(output).map_err(|error| error.to_string())?;
-        self.remember(&profile);
-        Ok(profile)
-    }
-}
-
-pub async fn version_check(executable: &Path) -> Result<VersionCheck, Error> {
-    let identity = executable_identity(executable).await?;
-    let version = VERSION_CACHE
+pub(crate) async fn checked_profile(
+    launch: &Launch<'_>,
+    cancel: impl Future<Output = ()> + Send,
+) -> Result<String, Error> {
+    let identity = executable_identity(launch.executable).await?;
+    if let Some(version) = VERSION_CACHE
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .get(executable)
+        .get(launch.executable)
         .filter(|(saved, _)| *saved == identity)
-        .map(|(_, version)| version.clone());
-    Ok(VersionCheck {
-        executable: executable.to_owned(),
-        identity,
-        version,
-    })
-}
-
-pub(super) async fn checked_profile(launch: &Launch<'_>) -> Result<String, Error> {
-    let check = version_check(launch.executable).await?;
-    if let Some(version) = &check.version {
-        return Ok(version.clone());
+        .map(|(_, version)| version.clone())
+    {
+        return Ok(version);
     }
     let (dir, dir_path) = private_dir_async(launch.temp_dir, launch.project, launch.denied).await?;
     let output = version(
@@ -224,11 +189,15 @@ pub(super) async fn checked_profile(launch: &Launch<'_>) -> Result<String, Error
         launch.env,
         &dir_path,
         launch.limits.startup,
+        cancel,
     )
     .await;
     dir.close().await;
     let profile = checks::profile(&output?)?;
-    check.remember(&profile);
+    VERSION_CACHE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(launch.executable.to_owned(), (identity, profile.clone()));
     Ok(profile)
 }
 
@@ -238,7 +207,7 @@ pub(crate) async fn models(
     launch: &Launch<'_>,
     plan_usage: &Mutex<Option<ProviderUsage>>,
 ) -> Result<Vec<Listed>, Error> {
-    checked_profile(launch).await?;
+    checked_profile(launch, future::pending()).await?;
     let offered = probe(launch, plan_usage).await?;
     let mut seen = HashSet::new();
     let ids: Vec<_> = offered
@@ -325,25 +294,35 @@ async fn version(
     env: &[(String, String)],
     cwd: &Path,
     startup: Duration,
+    cancel: impl Future<Output = ()> + Send,
 ) -> Result<String, Error> {
     let args = [VERSION_FLAG.to_owned()];
     supervised(command(executable, env, cwd, &args), async |group| {
-        let (stdin, mut lines) = group.pipes()?;
-        drop(stdin);
-        let deadline = Instant::now() + startup;
-        let first = match ReadDeadline::new(deadline)
-            .next(&mut lines, None, deadline)
-            .await
-        {
-            Next::Line(Some(Ok(line))) => Some(line),
-            Next::Line(Some(Err(source))) => return Err(Error::UnreadableVersion(source)),
-            _ => None,
-        };
-        let status = group.wait(deadline).await?;
-        if !status.success() {
-            return Err(Error::VersionFailed(status));
-        }
-        first.ok_or(Error::NoVersion)
+        future::or(
+            async {
+                let (stdin, mut lines) = group.pipes()?;
+                drop(stdin);
+                let deadline = Instant::now() + startup;
+                let first = match ReadDeadline::new(deadline)
+                    .next(&mut lines, None, deadline)
+                    .await
+                {
+                    Next::Line(Some(Ok(line))) => Some(line),
+                    Next::Line(Some(Err(source))) => return Err(Error::UnreadableVersion(source)),
+                    _ => None,
+                };
+                let status = group.wait(deadline).await?;
+                if !status.success() {
+                    return Err(Error::VersionFailed(status));
+                }
+                first.ok_or(Error::NoVersion)
+            },
+            async {
+                cancel.await;
+                Err(Error::Cancelled)
+            },
+        )
+        .await
     })
     .await
 }

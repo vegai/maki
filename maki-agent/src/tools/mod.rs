@@ -121,10 +121,30 @@ pub struct ToolFilter {
     pub excluded: Vec<String>,
 }
 
-enum ToolLocation {
-    Registry,
-    Local,
+pub enum ToolKind {
+    Registry(ToolAudience),
+    Local(ToolAudience),
     External,
+}
+
+impl ToolKind {
+    fn unresolved(name: &str) -> Self {
+        if is_wire_name(name) || is_qualified_name(name) || name == TOOL_SEARCH_TOOL_NAME {
+            Self::External
+        } else {
+            Self::Registry(ToolAudience::all())
+        }
+    }
+
+    pub fn of(name: &str, registry: &ToolRegistry, local: Option<&LocalTools>) -> Self {
+        if let Some(tool) = local.and_then(|tools| tools.get(name)) {
+            Self::Local(tool.audience)
+        } else if let Some(entry) = registry.get(name) {
+            Self::Registry(entry.tool.audience())
+        } else {
+            Self::unresolved(name)
+        }
+    }
 }
 
 impl ToolFilter {
@@ -133,9 +153,7 @@ impl ToolFilter {
             let mut names: Vec<&str> = names
                 .iter()
                 .map(String::as_str)
-                .filter(|name| {
-                    is_wire_name(name) || is_qualified_name(name) || *name == TOOL_SEARCH_TOOL_NAME
-                })
+                .filter(|name| matches!(ToolKind::unresolved(name), ToolKind::External))
                 .collect();
             names.sort_unstable();
             names.dedup();
@@ -149,56 +167,24 @@ impl ToolFilter {
         }
     }
 
-    fn matches_where(&self, matches: impl Fn(&str) -> bool, location: ToolLocation) -> bool {
+    pub fn admits(&self, name: &str, kind: ToolKind, caller: ToolAudience) -> bool {
+        let matches = |candidate: &str| match kind {
+            ToolKind::External => same_tool_name(name, candidate),
+            _ => name == candidate,
+        };
         let includes = |names: &Option<Vec<String>>| {
             names
                 .as_ref()
                 .is_none_or(|names| names.iter().any(|name| matches(name)))
         };
-        let included = match location {
-            ToolLocation::Local => true,
-            ToolLocation::Registry => includes(&self.allowed) && includes(&self.published),
-            ToolLocation::External => includes(&self.allowed),
+        let included = match kind {
+            ToolKind::Registry(audience) => {
+                audience.contains(caller) && includes(&self.allowed) && includes(&self.published)
+            }
+            ToolKind::Local(audience) => audience.contains(caller),
+            ToolKind::External => includes(&self.allowed),
         };
         included && !self.excluded.iter().any(|name| matches(name))
-    }
-
-    pub fn matches(&self, name: &str) -> bool {
-        self.matches_where(|candidate| candidate == name, ToolLocation::Registry)
-    }
-
-    pub fn admits(&self, name: &str, audience: ToolAudience, caller: ToolAudience) -> bool {
-        audience.contains(caller) && self.matches(name)
-    }
-
-    pub(crate) fn admits_definition(
-        &self,
-        name: &str,
-        audience: ToolAudience,
-        caller: ToolAudience,
-        local_audience: Option<ToolAudience>,
-    ) -> bool {
-        match local_audience {
-            Some(audience) => self.admits_local(name, audience, caller),
-            None => self.admits(name, audience, caller),
-        }
-    }
-
-    pub(crate) fn admits_local(
-        &self,
-        name: &str,
-        audience: ToolAudience,
-        caller: ToolAudience,
-    ) -> bool {
-        audience.contains(caller)
-            && self.matches_where(|candidate| candidate == name, ToolLocation::Local)
-    }
-
-    pub fn matches_external(&self, name: &str) -> bool {
-        self.matches_where(
-            |candidate| same_tool_name(name, candidate),
-            ToolLocation::External,
-        )
     }
 
     pub fn publishing(mut self, names: Vec<String>) -> Self {
@@ -301,14 +287,10 @@ impl RequestTools {
         if let Some(defs) = definitions.as_array_mut() {
             defs.retain(|def| {
                 def[TOOL_NAME_FIELD].as_str().is_none_or(|name| {
-                    let registered = registry
-                        .get(name)
-                        .map_or(ToolAudience::all(), |entry| entry.tool.audience());
-                    filter.admits_definition(
+                    filter.admits(
                         name,
-                        registered,
+                        ToolKind::of(name, registry, Some(local_tools)),
                         audience,
-                        local_tools.get(name).map(|tool| tool.audience),
                     )
                 })
             });
@@ -972,8 +954,22 @@ mod tests {
             &model,
             ToolAudience::MAIN,
         );
-        assert_eq!(tools.filter().matches(READ_TOOL_NAME), read_matches);
-        assert_eq!(tools.filter().matches(WRITE_TOOL_NAME), write_matches);
+        assert_eq!(
+            tools.filter().admits(
+                READ_TOOL_NAME,
+                ToolKind::Registry(ToolAudience::all()),
+                ToolAudience::MAIN
+            ),
+            read_matches
+        );
+        assert_eq!(
+            tools.filter().admits(
+                WRITE_TOOL_NAME,
+                ToolKind::Registry(ToolAudience::all()),
+                ToolAudience::MAIN
+            ),
+            write_matches
+        );
     }
 
     #[test_case(ToolAudience::MAIN, ToolAudience::RESEARCH_SUB, false ; "main_tool_hidden_from_research")]
@@ -1023,9 +1019,20 @@ mod tests {
         let mut model = Model::from_spec(TEST_MODEL_SPEC).unwrap();
         model.supports_vision_override = Some(vision);
         let filter = ToolFilter::from_config(&AgentConfig::default(), &model, &[]);
-        assert_eq!(filter.matches(VIEW_IMAGE_TOOL_NAME), vision);
+        assert_eq!(
+            filter.admits(
+                VIEW_IMAGE_TOOL_NAME,
+                ToolKind::Registry(ToolAudience::all()),
+                ToolAudience::MAIN
+            ),
+            vision
+        );
         assert!(
-            filter.matches(READ_TOOL_NAME),
+            filter.admits(
+                READ_TOOL_NAME,
+                ToolKind::Registry(ToolAudience::all()),
+                ToolAudience::MAIN
+            ),
             "unrelated tools stay enabled"
         );
     }
@@ -1041,8 +1048,16 @@ mod tests {
             ..Default::default()
         };
         let filter = ToolFilter::from_config(&config, &model, &[]);
-        assert!(filter.matches(name));
-        assert!(!filter.matches(READ_TOOL_NAME));
+        assert!(filter.admits(
+            name,
+            ToolKind::Registry(ToolAudience::all()),
+            ToolAudience::MAIN
+        ));
+        assert!(!filter.admits(
+            READ_TOOL_NAME,
+            ToolKind::Registry(ToolAudience::all()),
+            ToolAudience::MAIN
+        ));
     }
 
     #[test_case(false ; "local_override_bypasses_the_registry_allowlist")]
@@ -1083,15 +1098,17 @@ mod tests {
             ToolAudience::MAIN,
         );
         assert_eq!(
-            built
-                .filter()
-                .admits_local(WRITE_TOOL_NAME, ToolAudience::all(), ToolAudience::MAIN),
+            built.filter().admits(
+                WRITE_TOOL_NAME,
+                ToolKind::Local(ToolAudience::all()),
+                ToolAudience::MAIN
+            ),
             !denied
         );
         assert_eq!(
-            assembled.filter().admits_local(
+            assembled.filter().admits(
                 WRITE_TOOL_NAME,
-                ToolAudience::all(),
+                ToolKind::Local(ToolAudience::all()),
                 ToolAudience::MAIN
             ),
             !denied
@@ -1134,7 +1151,7 @@ mod tests {
         assert_eq!(
             tools
                 .filter()
-                .admits_local(WRITE_TOOL_NAME, tool_audience, caller),
+                .admits(WRITE_TOOL_NAME, ToolKind::Local(tool_audience), caller),
             offered
         );
     }
@@ -1154,9 +1171,17 @@ mod tests {
             &model,
             ToolAudience::MAIN,
         );
-        assert!(!tools.filter().matches(WRITE_TOOL_NAME));
+        assert!(!tools.filter().admits(
+            WRITE_TOOL_NAME,
+            ToolKind::Registry(ToolAudience::all()),
+            ToolAudience::MAIN
+        ));
         assert!(tools.definitions().as_array().unwrap().is_empty());
-        assert!(tools.filter().matches_external("srv__probe"));
+        assert!(
+            tools
+                .filter()
+                .admits("srv__probe", ToolKind::External, ToolAudience::MAIN)
+        );
     }
 
     #[test_case(30,  "30s timeout"   ; "seconds_only")]

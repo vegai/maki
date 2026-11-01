@@ -5,7 +5,7 @@ use std::str::from_utf8;
 
 use rustix::fs::{Mode, OFlags, open, openat};
 
-use super::DIRECTORY_FLAGS;
+use super::native::DIRECTORY_FLAGS;
 
 const OBJECT_ID_LENGTHS: &[usize] = &[40, 64];
 const MAX_HEADER_BYTES: u64 = 128;

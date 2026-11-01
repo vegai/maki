@@ -266,8 +266,7 @@ local function apply_import(ctx, call, artifact, todo)
   local code = call:run_to_end(
     { "bash", "-c", import_scripts.leftovers_script(todo, project, stage, made) },
     { cwd = project },
-    { keep_on_cancel = true },
-    call.startup_ms
+    { keep_on_cancel = true, timeout_ms = call.startup_ms }
   )
   local first, last = err:find(script, 1, true)
   if first then

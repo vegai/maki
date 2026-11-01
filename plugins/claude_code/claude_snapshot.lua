@@ -1,10 +1,7 @@
 local native = require("maki.claude_code.internal")
 
--- The private snapshot a coding worker runs in, and the import of its
--- changes. Each step runs as a job of the call, so a cancel or a time limit
--- stops it.
+-- Builds the private snapshot and records the worker's changes.
 
-local launch = require("claude_launch")
 local jobs = require("claude_jobs")
 local workspace = require("claude_workspace")
 local git_utils = require("claude_git")
@@ -12,29 +9,10 @@ local path_utils = require("claude_paths")
 
 local M = {}
 
-local TRASH_PREFIX = ".trash-"
-local SWEEP_LOCK = ".sweep.lock"
-M.CANNOT_SWEEP = jobs.ERROR_PREFIX .. "maki cannot lock artifact cleanup in "
-local SWEEP_CONTENTS = [[
-set -e
-cd -P -- "$1"
-[ "$(pwd -P)" = "$1" ]
-find -P . -type d ! -perm -u=rx -exec chmod u+rwx -- {} \;
-find -P . -type d ! -perm -u=w -exec chmod u+w -- {} +
-find . -mindepth 1 -maxdepth 1 ! -name "$2" -exec rm -rf -- {} +
-rm -f -- "./$2"
-rmdir -- "$1"
-]]
-local ARTIFACT_TEMPLATE = "XXXXXX"
-local LINK_TO_NOWHERE = " is a link to a missing target"
-local TMP_DIR = "tmp"
 local QUARANTINE_DIR = "git-metadata"
 
 local CHECK_INDEX = "consistency-index"
 local COPY_STARTED = "copy-started"
--- The artifact directory can be a folder that holds other things, so the
--- sweep removes only folders with this marker.
-local OWNER_MARKER = ".maki-claude-code-artifact"
 local VENV_MARKER = "pyvenv.cfg"
 local C_LOCALE = "C"
 -- What `cp --reflink=always` reports when the filesystem cannot clone:
@@ -44,13 +22,34 @@ local CLONE_UNSUPPORTED = {
   ["Invalid cross-device link"] = true,
   ["Invalid argument"] = true,
 }
-local SECS_PER_HOUR = 3600
 
 local NON_UTF8_PATH = "the file name %s is not UTF-8, and maki cannot give it to a process"
 local NOT_UTF8_CHANGES = "the names of %s are not UTF-8, so the manifest cannot hold these changes. "
   .. "Apply them manually from %s"
-local SUBMODULES_LEFT_OUT = "the snapshot has no submodules, so the worker did not see "
 local PREPARED = "the prepare command changed %s, and the changes for import do not include these files"
+
+local INCLUDED_REPOSITORIES = "maki did not copy the repositories under include: %s"
+local SUBMODULES = "the snapshot has no submodules, so the worker did not see %s"
+local SYMLINKED_DEPENDENCY = "the dependency %s is under the symlink %s, so maki did not copy it"
+local MISSING_DEPENDENCY = "the dependency %s is not a directory here, so maki did not copy it"
+local TRACKED_DEPENDENCY =
+  "the dependency %s contains tracked files, so maki copied only those. List only untracked directories."
+local VIRTUAL_ENVIRONMENT =
+  "the dependency %s is a Python virtual environment, and its scripts hard-code its path in the checkout, so maki did not copy it. Recreate it with the `prepare` command."
+local FULL_COPY = "maki copied the dependency %s as a full copy, because the filesystem cannot clone it: %s"
+local DEPENDENCY_REPOSITORIES = "maki did not copy the repositories in the dependency %s: %s"
+local UNSETTLED_DEPENDENCIES =
+  "dependencies changed during the copy, so they may mix two versions: %s. Mention this for every check that uses them."
+local PRESERVED_GIT = "maki preserved the Git metadata for %s in %s. Their ordinary files remain in the snapshot."
+local QUARANTINED_REPOSITORIES =
+  "maki quarantined the embedded repository metadata for %s in %s. Apply these changes manually."
+local PRIVATE_COPIES = "maki made private copies of %s hard-linked files in the snapshot"
+local DROPPED_LINKS = "maki removed external or unresolved symlinks from the snapshot: %s"
+local IGNORED_OUTPUT = "gitignored output stays in the snapshot and is outside the import: %s"
+
+local function note(artifact, format, ...)
+  artifact.notes[#artifact.notes + 1] = format:format(...)
+end
 
 local function checkout_git(call, spec, args)
   return call:run_lines(git_utils.git(args), { env = spec.env, cwd = spec.cwd })
@@ -60,7 +59,7 @@ local function list_files(call, spec, args, pathspecs)
   for _, pathspec in ipairs(pathspecs) do
     args[#args + 1] = pathspec
   end
-  for _, pathspec in ipairs(spec.excluded_pathspecs) do
+  for _, pathspec in ipairs(spec.denied_pathspecs) do
     args[#args + 1] = pathspec
   end
   return checkout_git(call, spec, args)
@@ -193,8 +192,7 @@ local function snapshot_paths(call, artifact, spec)
     end
     local included, repositories = git_utils.untracked_paths(untracked)
     if #repositories > 0 then
-      artifact.notes[#artifact.notes + 1] = "maki did not copy the repositories under include: "
-        .. path_utils.shown(repositories)
+      note(artifact, INCLUDED_REPOSITORIES, path_utils.shown(repositories))
     end
     for _, path in ipairs(included) do
       local dependency = false
@@ -211,7 +209,7 @@ local function snapshot_paths(call, artifact, spec)
     return nil, NON_UTF8_PATH:format(path_utils.printable(unusual))
   end
   if #submodules > 0 then
-    artifact.notes[#artifact.notes + 1] = SUBMODULES_LEFT_OUT .. path_utils.shown(submodules)
+    note(artifact, SUBMODULES, path_utils.shown(submodules))
   end
   return paths, nil, files
 end
@@ -232,24 +230,13 @@ local function copy_dependencies(call, artifact, spec, paths)
     local parent = symlinked_parent(spec.cwd, dir, checked)
     local meta = maki.fs.metadata(source, { follow = false })
     if parent then
-      artifact.notes[#artifact.notes + 1] = "the dependency "
-        .. dir
-        .. " is under the symlink "
-        .. path_utils.printable(parent)
-        .. ", so maki did not copy it"
+      note(artifact, SYMLINKED_DEPENDENCY, dir, path_utils.printable(parent))
     elseif not (meta and meta.is_dir) then
-      artifact.notes[#artifact.notes + 1] = "the dependency "
-        .. dir
-        .. " is not a directory here, so maki did not copy it"
+      note(artifact, MISSING_DEPENDENCY, dir)
     elseif tracked_folders[dir] then
-      artifact.notes[#artifact.notes + 1] = "the dependency "
-        .. dir
-        .. " contains tracked files, so maki copied only those. List only untracked directories."
+      note(artifact, TRACKED_DEPENDENCY, dir)
     elseif maki.fs.metadata(maki.fs.joinpath(source, VENV_MARKER)) then
-      artifact.notes[#artifact.notes + 1] = "the dependency "
-        .. dir
-        .. " is a Python virtual environment, and its scripts hard-code its path in the checkout, so maki did not "
-        .. "copy it. Recreate it with the `prepare` command."
+      note(artifact, VIRTUAL_ENVIRONMENT, dir)
     else
       local listed, list_err = list_files(call, spec, { "ls-files", "-o", "--" }, { ":(literal)" .. dir })
       if not listed then
@@ -274,16 +261,10 @@ local function copy_dependencies(call, artifact, spec, paths)
         if copy_err then
           return nil, "maki cannot copy the dependency " .. dir .. ": " .. copy_err
         end
-        artifact.notes[#artifact.notes + 1] = "maki copied the dependency "
-          .. dir
-          .. " as a full copy, because the filesystem cannot clone it: "
-          .. cause
+        note(artifact, FULL_COPY, dir, cause)
       end
       if #nested > 0 then
-        artifact.notes[#artifact.notes + 1] = "maki did not copy the repositories in the dependency "
-          .. dir
-          .. ": "
-          .. path_utils.shown(nested)
+        note(artifact, DEPENDENCY_REPOSITORIES, dir, path_utils.shown(nested))
       end
       copied[#copied + 1] = dir
     end
@@ -399,8 +380,8 @@ end
 --- {spec} has `cwd` (resolved), `env`, `deny_read`, `include` and
 --- `dependencies`. Reports dependencies that changed during the copy.
 function M.fill(call, artifact, spec)
-  spec.excluded_pathspecs = git_utils.excluded_pathspecs(spec.deny_read)
-  artifact.excluded_pathspecs = git_utils.collection_pathspecs(spec.dependencies)
+  spec.denied_pathspecs = git_utils.excluded_pathspecs(spec.deny_read)
+  artifact.collection_pathspecs = git_utils.collection_pathspecs(spec.dependencies)
   local paths, paths_err, tracked = snapshot_paths(call, artifact, spec)
   if not paths then
     return paths_err
@@ -424,172 +405,9 @@ function M.fill(call, artifact, spec)
     return unsettled_err
   end
   if #unsettled > 0 then
-    artifact.notes[#artifact.notes + 1] = "dependencies changed during the copy, so they may mix two versions: "
-      .. path_utils.shown(unsettled)
-      .. ". Mention this for every check that uses them."
+    note(artifact, UNSETTLED_DEPENDENCIES, path_utils.shown(unsettled))
   end
   return commit_base(call, artifact, paths, spec.dependencies) or consistency_problem(call, artifact, spec)
-end
-
-local function remove_artifact(call, dir, released)
-  local function finished(_, code)
-    if code ~= 0 then
-      call:leave(dir)
-    end
-    if released then
-      released()
-    end
-  end
-  if not call:start({ "sh", "-c", SWEEP_CONTENTS, "sh", dir, OWNER_MARKER }, {}, finished) then
-    finished()
-  end
-end
-
-local function discard_failed_allocation(call, dir)
-  maki.async.await(1, function(done)
-    remove_artifact(call, dir, function()
-      done(true)
-    end)
-  end)
-end
-
---- An import rewrites the manifest, so the sweep keeps the artifact of an
---- unfinished import. An artifact that stopped before the collect step is
---- dated by its marker.
-function M.sweep(call, root, ttl_hours)
-  -- Artifact locks are unlinked during deletion. Keep this lock outside the deleted tree.
-  local sweep_lock, lock_err = maki.fs.try_lock(maki.fs.joinpath(root, SWEEP_LOCK))
-  if not sweep_lock then
-    if lock_err == maki.fs.lock_busy then
-      return
-    end
-    local meta, meta_err = maki.fs.metadata(root)
-    if meta or meta_err then
-      maki.notify(M.CANNOT_SWEEP .. root .. ": " .. lock_err, "warn")
-    end
-    return
-  end
-  local entries = maki.fs.dir(root)
-  local cutoff = os.time() - ttl_hours * SECS_PER_HOUR
-  for _, entry in ipairs(entries or {}) do
-    local name, kind = entry[1], entry[2]
-    local dir = maki.fs.joinpath(root, name)
-    local marker = kind == "directory" and maki.fs.metadata(maki.fs.joinpath(dir, OWNER_MARKER))
-    local meta = marker and (maki.fs.metadata(maki.fs.joinpath(dir, path_utils.MANIFEST)) or marker)
-    if meta and meta.mtime and meta.mtime < cutoff then
-      local lock = maki.fs.try_lock(maki.fs.joinpath(dir, path_utils.IMPORT_LOCK))
-      if lock then
-        local current = maki.fs.metadata(maki.fs.joinpath(dir, path_utils.MANIFEST)) or marker
-        if current.mtime and current.mtime < cutoff then
-          local trash = maki.fs.joinpath(root, TRASH_PREFIX .. name)
-          local already_trash = name:sub(1, #TRASH_PREFIX) == TRASH_PREFIX
-          local renamed = already_trash or maki.fs.rename(dir, trash)
-          if already_trash then
-            trash = dir
-          end
-          if renamed then
-            remove_artifact(call, trash, function()
-              lock:close()
-            end)
-          else
-            call:leave(dir)
-            lock:close()
-          end
-        else
-          lock:close()
-        end
-      end
-    end
-  end
-  call:when_idle(function()
-    sweep_lock:close()
-  end)
-end
-
---- Returns {root} resolved on disk, even when it is missing. It must lie
---- outside the checkout, so maki creates or removes nothing there until this
---- function accepts it.
-function M.resolve_root(root, spec)
-  local existing, missing = root, {}
-  while true do
-    local meta, meta_err = maki.fs.metadata(existing)
-    if meta then
-      break
-    elseif meta_err then
-      return nil, "maki cannot read " .. existing .. ": " .. meta_err
-    end
-    local name, parent = maki.fs.basename(existing), maki.fs.dirname(existing)
-    local entry, entry_err = maki.fs.metadata(existing, { follow = false })
-    if entry then
-      return nil, existing .. LINK_TO_NOWHERE
-    elseif entry_err then
-      return nil, "maki cannot read " .. existing .. ": " .. entry_err
-    end
-    table.insert(missing, 1, name)
-    existing = parent
-  end
-  local resolved, err = maki.fs.realpath(existing)
-  if not resolved then
-    return nil, err
-  end
-  resolved = maki.fs.joinpath(resolved, unpack(missing))
-  if launch.in_checkout(resolved, spec) then
-    return nil, "the artifact directory " .. resolved .. " is in the project"
-  end
-  return resolved
-end
-
---- `tmp` is the only other place the worker's shell can write.
-function M.allocate(call, root, env, timeout_ms)
-  local _, root_err = maki.fs.mkdir(root, { parents = true })
-  if root_err then
-    return nil, "maki cannot make " .. root .. ": " .. root_err
-  end
-  local dir, dir_err = maki.fs.mkdtemp(maki.fs.joinpath(root, ARTIFACT_TEMPLATE))
-  if not dir then
-    return nil, dir_err
-  end
-  local _, mark_err = maki.fs.write(maki.fs.joinpath(dir, OWNER_MARKER), "")
-  if mark_err then
-    discard_failed_allocation(call, dir)
-    return nil, "maki cannot mark " .. dir .. " as an artifact: " .. mark_err
-  end
-  local lock, lock_err = maki.fs.try_lock(maki.fs.joinpath(dir, path_utils.IMPORT_LOCK))
-  if not lock then
-    discard_failed_allocation(call, dir)
-    return nil, "maki cannot lock its coding artifact: " .. lock_err
-  end
-  local released = call.released
-  call.released = function()
-    lock:close()
-    if released then
-      released()
-    end
-  end
-  local snapshot = maki.fs.joinpath(dir, path_utils.SNAPSHOT_DIR)
-  local git = maki.fs.joinpath(dir, path_utils.GIT_DIR)
-  local artifact = {
-    id = maki.fs.basename(dir),
-    dir = dir,
-    snapshot = snapshot,
-    git = git,
-    tmp = maki.fs.joinpath(dir, TMP_DIR),
-    git_env = git_utils.snapshot_git_env(env, git, snapshot),
-    timeout_ms = timeout_ms,
-    notes = {},
-  }
-  for _, sub in ipairs({ artifact.snapshot, artifact.tmp }) do
-    local _, mkdir_err = maki.fs.mkdir(sub)
-    if mkdir_err then
-      discard_failed_allocation(call, artifact.dir)
-      return nil, "maki cannot make " .. sub .. ": " .. mkdir_err
-    end
-  end
-  return artifact
-end
-
-function M.discard(call, artifact, removed)
-  remove_artifact(call, artifact.dir, removed)
 end
 
 -- Git traverses nested repositories during ordinary status commands. Keep their metadata
@@ -602,31 +420,20 @@ function M.sanitize(artifact, keep_links)
     return nil, err
   end
   if #paths.git_metadata > 0 then
-    artifact.notes[#artifact.notes + 1] = "maki preserved the Git metadata for "
-      .. path_utils.shown(paths.git_metadata)
-      .. " in "
-      .. quarantine
-      .. ". Their ordinary files remain in the snapshot."
+    note(artifact, PRESERVED_GIT, path_utils.shown(paths.git_metadata), quarantine)
   end
   if #paths.repositories > 0 then
     artifact.repositories = artifact.repositories or {}
     for _, path in ipairs(paths.repositories) do
       artifact.repositories[path] = true
     end
-    artifact.notes[#artifact.notes + 1] = "maki quarantined the embedded repository metadata for "
-      .. path_utils.shown(paths.repositories)
-      .. " in "
-      .. quarantine
-      .. ". Apply these changes manually."
+    note(artifact, QUARANTINED_REPOSITORIES, path_utils.shown(paths.repositories), quarantine)
   end
   if paths.private_files > 0 then
-    artifact.notes[#artifact.notes + 1] = "maki made private copies of "
-      .. paths.private_files
-      .. " hard-linked files in the snapshot"
+    note(artifact, PRIVATE_COPIES, paths.private_files)
   end
   if #paths.dropped_links > 0 then
-    artifact.notes[#artifact.notes + 1] = "maki removed external or unresolved symlinks from the snapshot: "
-      .. path_utils.shown(paths.dropped_links)
+    note(artifact, DROPPED_LINKS, path_utils.shown(paths.dropped_links))
   end
   return path_utils.set_of(paths.dropped_links)
 end
@@ -637,7 +444,7 @@ local function stage_changes(call, artifact)
     return nil, update_err
   end
   local args = { "ls-files", "--others", "--exclude-standard", "--", "." }
-  for _, pathspec in ipairs(artifact.excluded_pathspecs) do
+  for _, pathspec in ipairs(artifact.collection_pathspecs) do
     args[#args + 1] = pathspec
   end
   local listed, list_err = snapshot_git(call, artifact, args)
@@ -689,7 +496,7 @@ local function commit_prepared(call, artifact)
   end
   local paths = git_utils.listed_paths(changed)
   if #paths > 0 then
-    artifact.notes[#artifact.notes + 1] = PREPARED:format(path_utils.shown(paths))
+    note(artifact, PREPARED, path_utils.shown(paths))
   end
   artifact.base = prepared
 end
@@ -728,8 +535,7 @@ function M.collect(call, artifact, project)
     end
   end
   if #unrecorded > 0 then
-    artifact.notes[#artifact.notes + 1] = "gitignored output stays in the snapshot and is outside the import: "
-      .. path_utils.shown(unrecorded)
+    note(artifact, IGNORED_OUTPUT, path_utils.shown(unrecorded))
   end
   local tree_lines, tree_err = snapshot_git(call, artifact, { "write-tree" })
   local tree = tree_lines and tree_lines[1]
@@ -759,7 +565,7 @@ function M.collect(call, artifact, project)
       or workspace.kind(change, binary)
   end
   if #unnamed > 0 then
-    artifact.notes[#artifact.notes + 1] = NOT_UTF8_CHANGES:format(path_utils.shown(unnamed), artifact.snapshot)
+    note(artifact, NOT_UTF8_CHANGES, path_utils.shown(unnamed), artifact.snapshot)
   end
   local manifest = {
     version = workspace.MANIFEST_VERSION,

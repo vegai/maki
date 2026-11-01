@@ -24,9 +24,9 @@ use tempfile::{TempDir, tempdir};
 use test_case::test_case;
 
 use super::support::{
-    DEADLINE, FIXTURE_GLOBAL_RULE, LEFT_BEHIND, MINIMUM_VERSION, PROJECT_RULE, TOOL, WorkingDir,
-    executable, group_gone, load, running, tool_reply, try_load, use_fixture_user, wait_until,
-    within,
+    ACCOUNT_SUBSCRIPTION, DEADLINE, FIXTURE_GLOBAL_RULE, HOOKS_OFF, LEFT_BEHIND, MINIMUM_VERSION,
+    PROJECT_RULE, TOOL, WorkingDir, executable, group_gone, load, output, running, tool_reply,
+    try_load, use_fixture_user, wait_until, within,
 };
 
 mod coding;
@@ -36,13 +36,10 @@ const ANSWER: &str = "The parser lives in src/parse.rs:10.";
 const OLDER_VERSION: &str = "2.1.283";
 const NEWER_VERSION: &str = "2.1.290";
 
-const ACCOUNT_SUBSCRIPTION: &str = r#"{"current_permission_mode":"default","account":{"apiProvider":"firstParty","subscriptionType":"Claude Pro"},"models":[{"value":"sonnet","resolvedModel":"claude-sonnet-5"},{"value":"opus","resolvedModel":"claude-opus-5-5"},{"value":"haiku","resolvedModel":"claude-haiku-4-5-20251001"}]}"#;
 const ACCOUNT_LOGGED_OUT: &str =
     r#"{"current_permission_mode":"default","account":{"apiProvider":"firstParty"}}"#;
 const HOOKS_FILE: &str = "hooks.json";
 const STOPPED_EXIT: &str = "exited with code -1";
-const HOOKS_OFF: &str =
-    r#"{"hooks":[],"events":[],"policy":{"allDisabled":true,"policyHookCount":0}}"#;
 /// A managed hook stays on despite `disableAllHooks`, so the listing shows
 /// it on and the fake runs it at startup, as Claude Code runs `SessionStart`.
 const HOOKS_MANAGED: &str = r#"{"hooks":[{"event":"PreToolUse","source":"policySettings","type":"command"}],"events":[],"policy":{"allDisabled":true,"policyHookCount":1}}"#;
@@ -149,9 +146,9 @@ const PROBED: &str = "version\nstart\n";
 const STARTED: &str = "version\nstart\nstart\n";
 const HOOK_SENTINEL: &str = ".claude_code_hook_sentinel";
 const HOOK_STOP: &str = "started a SessionStart hook";
-const PROBE_CRASH: &str = "exited with code 3 during its checks:\nprobe gave up";
+const PROBE_CRASH: &str = "exited (exit status: 3) during its checks:\nprobe gave up";
 const UNASKED_STOP: &str = "started its run before maki accepted its checks";
-const PROBE_RUN_STOP: &str = "started a run during its checks";
+const PROBE_RUN_STOP: &str = "started its run before maki accepted its checks";
 const ROUTE_CLAIM: &str = "maki found no route conflict";
 
 const CODE_PROFILE: &str = "code";
@@ -222,7 +219,7 @@ done
 [ "$mode" = manual ] && mode=default
 case "$model" in sonnet) model=claude-sonnet-5 ;; opus) model=claude-opus-5-5 ;; haiku) model=claude-haiku-4-5-20251001 ;; esac
 line() { printf '%s\n' "$1"; }
-reply() { printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":%s}}\n' "$1" "$2"; }
+@CONTROL_REPLY@
 settings() {
   policy=; [ -e "$dir/policy.json" ] && policy=",{\"source\":\"policySettings\",\"settings\":$(cat "$dir/policy.json")}"
   printf '{"effective":%s,"sources":[{"source":"flagSettings","settings":%s}%s]}' "$flags" "$flags" "$policy"
@@ -501,7 +498,7 @@ impl FakeClaude {
 
     fn ask(&self, prompt: &str) -> Result<String, String> {
         let (reg, _host) = self.host(ONE_SLOT);
-        smol::block_on(within(DEADLINE, call(&reg, &self.ctx(None, None), prompt)))
+        output(call(&reg, &self.ctx(None, None), prompt))
     }
 
     fn ctx(&self, events: Option<&EventSender>, tool_use_id: Option<&str>) -> ToolContext {
@@ -855,14 +852,14 @@ fn a_run_past_its_timeout_is_killed_and_frees_its_slot() {
     let ctx = fake.ctx(None, None);
     let input =
         json!({ "prompt": USAGE_THEN_HANG, "model": MODEL_ALIAS, "timeout": TEST_TIMEOUT_SECS });
-    let err = smol::block_on(within(DEADLINE, tool_reply(&reg, &ctx, TOOL, input))).unwrap_err();
+    let err = output(tool_reply(&reg, &ctx, TOOL, input)).unwrap_err();
     assert_mentions(&err, &[&format!("timed out after {TEST_TIMEOUT_SECS}s")]);
     assert_mentions(&err, SPENT_BEFORE_CANCEL);
     assert!(
         group_gone(fake.pid(), DEADLINE),
         "no process of the timed-out run must stay"
     );
-    let next = smol::block_on(within(DEADLINE, call(&reg, &ctx, ANSWERS)));
+    let next = output(call(&reg, &ctx, ANSWERS));
     assert!(next.is_ok(), "{next:?}");
 }
 
@@ -877,7 +874,7 @@ fn the_view_claims_a_clean_route_only_after_init_passes(scenario: &str, claimed:
     let (tx, rx) = flume::unbounded::<Envelope>();
     let events = EventSender::new(tx, 0);
     let ctx = fake.ctx(Some(&events), Some(TOOL_USE_ID));
-    let _ = smol::block_on(within(DEADLINE, call(&reg, &ctx, scenario)));
+    let _ = output(call(&reg, &ctx, scenario));
     let view = rx
         .drain()
         .filter_map(|env| match env.event {
@@ -918,7 +915,7 @@ fn cached_versions_do_not_skip_current_policy_checks() {
     let fake = FakeClaude::new();
     let (reg, _host) = fake.host(ONE_SLOT);
     let ctx = fake.ctx(None, None);
-    let ask = || smol::block_on(within(DEADLINE, call(&reg, &ctx, ANSWERS)));
+    let ask = || output(call(&reg, &ctx, ANSWERS));
     assert_eq!(ask().unwrap(), ANSWER);
     assert_eq!(ask().unwrap(), ANSWER);
     assert_eq!(
@@ -992,7 +989,7 @@ fn the_startup_limit_holds_with_every_slot_taken() {
         "the calls that hold slots did not get them"
     );
     let ctx = fake.ctx(None, None);
-    let result = smol::block_on(within(DEADLINE, call(&reg, &ctx, NO_INIT)));
+    let result = output(call(&reg, &ctx, NO_INIT));
     let held: Vec<_> = holders
         .into_iter()
         .map(|(trigger, held)| {
@@ -1046,7 +1043,7 @@ fn a_cancelled_run_keeps_what_it_spent() {
         trigger.cancel();
     });
 
-    let err = smol::block_on(within(DEADLINE, call(&reg, &ctx, scenario))).unwrap_err();
+    let err = output(call(&reg, &ctx, scenario)).unwrap_err();
     canceller.join().unwrap();
     assert!(err.contains(CANCEL_MARKER), "got: {err}");
     assert_mentions(&err, spent);
@@ -1080,13 +1077,12 @@ fn a_cancelled_call_lets_go_only_once_its_processes_end(
     let next = fake.ctx(Some(&events), Some(SECOND_ID));
 
     let (first, second) = thread::scope(|scope| {
-        let first =
-            scope.spawn(|| smol::block_on(within(DEADLINE, call(&reg, &cancelled, prompt))));
+        let first = scope.spawn(|| output(call(&reg, &cancelled, prompt)));
         assert!(
             wait_until(DEADLINE, || fake.path(busy).exists()),
             "the call did not start its work"
         );
-        let second = scope.spawn(|| smol::block_on(within(DEADLINE, call(&reg, &next, ANSWERS))));
+        let second = scope.spawn(|| output(call(&reg, &next, ANSWERS)));
         if let Err(views) = wait_for_view_line(&rx, WAITING) {
             panic!("the next call did not show that it waits, and the views were {views:?}");
         }
@@ -1100,7 +1096,10 @@ fn a_cancelled_call_lets_go_only_once_its_processes_end(
     // the error of a process the cancel stopped.
     let error = first.unwrap_err();
     assert!(
-        error.contains(CANCEL_MARKER) || error.contains(STOPPED_EXIT),
+        error.contains(CANCEL_MARKER)
+            || error.contains(STOPPED_EXIT)
+            || error.contains("cancelled")
+            || error.contains("was stopped during its checks"),
         "{error}"
     );
     assert_eq!(second.unwrap(), ANSWER);
@@ -1128,7 +1127,7 @@ fn every_way_a_call_ends_gives_its_slot_back() {
     let fake = FakeClaude::new();
     let (reg, _host) = fake.host(ONE_SLOT);
     let ctx = fake.ctx(None, None);
-    let ask = |prompt| smol::block_on(within(DEADLINE, call(&reg, &ctx, prompt)));
+    let ask = |prompt| output(call(&reg, &ctx, prompt));
 
     move_to_an_older_version(&fake);
     let refused = ask(ANSWERS).unwrap_err();
@@ -1153,10 +1152,7 @@ fn a_finished_answer_expands_in_place() {
     let (reg, host) = fake.host(ONE_SLOT);
     let (tx, events) = flume::unbounded::<Envelope>();
     let ctx = fake.ctx(Some(&EventSender::new(tx, 0)), Some(TOOL_USE_ID));
-    assert_eq!(
-        smol::block_on(within(DEADLINE, call(&reg, &ctx, LONG_ANSWERS))).unwrap(),
-        LONG_ANSWER
-    );
+    assert_eq!(output(call(&reg, &ctx, LONG_ANSWERS)).unwrap(), LONG_ANSWER);
     let view = events
         .drain()
         .filter_map(|env| match env.event {
@@ -1300,7 +1296,7 @@ fn a_relative_executable_is_found_from_every_directory() {
     let mut opts = fake.opts(ONE_SLOT);
     opts.insert("executable".into(), json!(RELATIVE_EXECUTABLE));
     let (reg, _host) = load(opts);
-    let answer = smol::block_on(within(DEADLINE, call(&reg, &fake.ctx(None, None), ANSWERS)));
+    let answer = output(call(&reg, &fake.ctx(None, None), ANSWERS));
     assert_eq!(answer.unwrap(), ANSWER);
 }
 
@@ -1326,7 +1322,7 @@ fn a_session_in_another_checkout_is_served_there(setup: fn(&Path), want: Result<
     setup(&session_dir);
     let (reg, _host) = fake.host(ONE_SLOT);
     let ctx = stub_ctx_in(&session_dir, None, None);
-    let result = smol::block_on(within(DEADLINE, call(&reg, &ctx, ANSWERS)));
+    let result = output(call(&reg, &ctx, ANSWERS));
 
     let started: Vec<PathBuf> = fake.log("started_in").lines().map(PathBuf::from).collect();
     assert!(

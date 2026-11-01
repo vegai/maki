@@ -1,11 +1,14 @@
 //! Held tool calls cannot run before a complete reply, so interrupted generations can retry.
 
+use super::stream::Wait;
+use std::error::Error as StdError;
+use std::fmt;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::time::Duration;
 
-use serde_json::{Value, error::Category};
+use serde_json::Value;
 use thiserror::Error;
 
 const INVALID_REQUEST: &str = "invalid_request";
@@ -79,20 +82,20 @@ pub enum Error {
         what: &'static str,
         source: io::Error,
     },
+    #[error("Claude Code ({0}) is not installed, or it is not on PATH")]
+    ExecutableMissing(String),
+    #[error("cancelled")]
+    Cancelled,
+    #[error("Claude Code was stopped during its checks")]
+    StoppedInChecks,
     #[error("Claude Code did not read its input in time")]
     InputNotTaken,
-    #[error("Claude Code did not finish its startup checks within {0} s")]
-    StartupLate(u64),
+    #[error("{}", timeout(.0, *.1))]
+    Late(Wait, u64),
     #[error("Claude Code did not answer its checks within {0} s")]
     ProbeLate(u64),
     #[error("Claude Code stopped its output before its reply was complete")]
     WentQuiet,
-    #[error("Claude Code sent nothing for {0} s during its reply")]
-    Stalled(u64),
-    #[error("Claude Code did not hand the reply's tool calls to maki within {0} s")]
-    HandoffLate(u64),
-    #[error("Claude Code did not send its result within {0} s of the reply's end")]
-    ResultLate(u64),
     #[error("Claude Code did not exit in time")]
     ExitLate,
     #[error("Claude Code could not be reaped within the shutdown grace")]
@@ -128,11 +131,10 @@ pub enum Error {
     #[error("Claude Code closed its stdin")]
     NoStdin,
     #[error(
-        "Claude Code printed a line that is not an event: {preview} ({category:?}, {bytes} bytes): {source}"
+        "Claude Code printed a line that is not an event: {preview} ({:?}, {bytes} bytes): {source}", .source.classify()
     )]
     NotAnEvent {
         preview: String,
-        category: Category,
         bytes: usize,
         source: serde_json::Error,
     },
@@ -142,8 +144,6 @@ pub enum Error {
     InvalidEvent(String),
     #[error("Claude Code did not report the model that ran")]
     NoModel,
-    #[error(transparent)]
-    Interrupted(Box<Error>),
     #[error("Claude Code exhausted the context window")]
     ContextOverflow,
     #[error("Claude Code sent an unknown event type: {}", shown(.0))]
@@ -230,15 +230,8 @@ pub enum Error {
     #[error("an image reached the transcript, which holds only text")]
     Image,
 
-    #[error("{error}; claude {status}")]
-    WithExit {
-        error: Box<Error>,
-        status: ExitStatus,
-    },
-
-    /// Any error above, with the last lines Claude Code printed on stderr.
-    #[error("{error}:\n{stderr}")]
-    WithStderr { error: Box<Error>, stderr: String },
+    #[error(transparent)]
+    Context(Failure),
 }
 
 impl Error {
@@ -246,22 +239,60 @@ impl Error {
         move |source| Self::Io { what, source }
     }
 
-    pub(crate) fn cause(&self) -> &Self {
-        match self {
-            Self::WithStderr { error, .. } | Self::WithExit { error, .. } => error.cause(),
-            _ => self,
+    pub(super) fn path<'a>(
+        what: &'static str,
+        path: &'a Path,
+    ) -> impl FnOnce(io::Error) -> Self + 'a {
+        move |source| Self::Path {
+            what,
+            path: path.to_owned(),
+            source,
         }
     }
 
-    pub(crate) fn has_exit_status(&self) -> bool {
+    pub(crate) fn cause(&self) -> &Self {
         match self {
-            Self::WithStderr { error, .. } | Self::Interrupted(error) => error.has_exit_status(),
-            Self::WithExit { .. }
-            | Self::VersionFailed(_)
-            | Self::ExitedEarly(_)
-            | Self::ExitedInChecks(_) => true,
-            _ => false,
+            Self::Context(failure) => &failure.cause,
+            cause => cause,
         }
+    }
+
+    fn into_failure(self) -> Failure {
+        match self {
+            Self::Context(failure) => failure,
+            cause => Failure {
+                cause: Box::new(cause),
+                stderr: String::new(),
+                exit: None,
+                interrupted: false,
+            },
+        }
+    }
+
+    pub(crate) fn with_exit(self, status: ExitStatus) -> Self {
+        let mut failure = self.into_failure();
+        failure.exit = Some(status);
+        Self::Context(failure)
+    }
+
+    pub(crate) fn with_stderr(self, stderr: String) -> Self {
+        if stderr.is_empty() {
+            return self;
+        }
+        let mut failure = self.into_failure();
+        if !failure.stderr.is_empty() {
+            failure.stderr.push_str(":\n");
+        }
+        failure.stderr.push_str(&stderr);
+        Self::Context(failure)
+    }
+
+    pub(crate) fn has_exit_status(&self) -> bool {
+        matches!(self, Self::Context(failure) if failure.exit.is_some())
+            || matches!(
+                self.cause(),
+                Self::VersionFailed(_) | Self::ExitedEarly(_) | Self::ExitedInChecks(_)
+            )
     }
 
     pub(crate) fn invalidates_version(&self) -> bool {
@@ -291,13 +322,16 @@ impl Error {
     /// loop treats as the anthropic provider's stalled stream.
     pub(crate) fn stalled(&self) -> Option<u64> {
         match self.cause() {
-            Self::Stalled(secs) => Some(*secs),
+            Self::Late(Wait::Idle, secs) => Some(*secs),
             _ => None,
         }
     }
 
     /// Login, policy and protocol invariant failures stay terminal.
     pub(crate) fn temporary(&self) -> Option<(u16, Option<Duration>)> {
+        if matches!(self, Self::Context(failure) if failure.interrupted) {
+            return Some((SERVER_ERROR, None));
+        }
         match self.cause() {
             Self::ApiRefused { kind, status, text } => match status {
                 Some(status) if is_temporary_status(*status) => Some((*status, None)),
@@ -314,16 +348,14 @@ impl Error {
                 let status = status.unwrap_or(SERVER_ERROR);
                 is_temporary_status(status).then_some((status, *delay))
             }
-            Self::NoCallsToRun | Self::StoppedFor(_) | Self::Interrupted(_) => {
-                Some((SERVER_ERROR, None))
-            }
+            Self::NoCallsToRun | Self::StoppedFor(_) => Some((SERVER_ERROR, None)),
             _ => None,
         }
     }
 
     pub(crate) fn after_start(self, accepted: bool) -> Self {
         let interrupted = matches!(
-            &self,
+            self.cause(),
             Self::WentQuiet
                 | Self::ExitedEarly(_)
                 | Self::NotAnEvent { .. }
@@ -333,9 +365,53 @@ impl Error {
                 | Self::MalformedArguments(_)
         );
         if accepted && interrupted {
-            Self::Interrupted(Box::new(self))
+            let mut failure = self.into_failure();
+            failure.interrupted = true;
+            Self::Context(failure)
         } else {
             self
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Failure {
+    pub(crate) cause: Box<Error>,
+    pub(crate) stderr: String,
+    pub(crate) exit: Option<ExitStatus>,
+    pub(crate) interrupted: bool,
+}
+
+impl fmt::Display for Failure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.cause)?;
+        if let Some(status) = self.exit {
+            write!(f, "; claude {status}")?;
+        }
+        if !self.stderr.is_empty() {
+            write!(f, ":\n{}", self.stderr)?;
+        }
+        Ok(())
+    }
+}
+
+impl StdError for Failure {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(&*self.cause)
+    }
+}
+
+fn timeout(wait: &Wait, seconds: u64) -> String {
+    match wait {
+        Wait::Startup => {
+            format!("Claude Code did not finish its startup checks within {seconds} s")
+        }
+        Wait::Idle => format!("Claude Code sent nothing for {seconds} s during its reply"),
+        Wait::Handoff => {
+            format!("Claude Code did not hand the reply's tool calls to maki within {seconds} s")
+        }
+        Wait::Result => {
+            format!("Claude Code did not send its result within {seconds} s of the reply's end")
         }
     }
 }
@@ -442,7 +518,6 @@ mod tests {
         let source = serde_json::from_str::<Value>(MALFORMED).unwrap_err();
         let error = Error::NotAnEvent {
             preview: MALFORMED.into(),
-            category: source.classify(),
             bytes: MALFORMED.len(),
             source,
         }

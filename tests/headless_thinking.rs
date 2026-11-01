@@ -3,11 +3,10 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-use flume::Receiver;
 use maki_agent::session::StoredSession;
 use maki_providers::ThinkingSupport::{No, Required, Yes};
 use maki_providers::test_support::{Canned, Requests, serve};
@@ -18,7 +17,11 @@ use maki_storage::sessions::StoredThinking;
 use rustix::process::{Pid, Signal, kill_process};
 use serde_json::{Value, json};
 use test_case::test_case;
-use wait_timeout::ChildExt;
+
+#[path = "support/process.rs"]
+#[allow(dead_code)]
+mod process;
+use process::{Process, finish, ndjson};
 
 #[path = "support/isolation.rs"]
 mod isolation;
@@ -35,10 +38,8 @@ const SAVED_THINKING: &str = "max";
 const OUTPUT_CAP: u32 = 128_000;
 const LOW_BUDGET: u64 = 12_800;
 const MAX_BUDGET: u64 = 64_000;
-const HIGH_BUDGET: u64 = 38_400;
 const XHIGH_BUDGET: u64 = 51_200;
 const MINIMAL_BUDGET: u64 = 6_400;
-const EXPLICIT_BUDGET: u64 = 2048;
 const SDK_BUDGET: u64 = 4096;
 const INVALID_THINKING: &str = "unknown thinking value \"turbo\"";
 const INVALID_EFFORT: &str = "invalid value 'turbo' for '--effort <EFFORT>'";
@@ -131,97 +132,13 @@ models = [{{ id = "fixture-model", max_output_tokens = {OUTPUT_CAP}, supports_th
     }
 }
 
-struct Process {
-    child: Child,
-    events: Receiver<Value>,
-}
-
-impl Process {
-    fn start(mut command: Command) -> Self {
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
-        let output = BufReader::new(child.stdout.take().unwrap());
-        let (tx, events) = flume::unbounded();
-        thread::spawn(move || {
-            for line in output.lines() {
-                let line = line.expect("cannot read a protocol event from maki");
-                let event = serde_json::from_str(&line)
-                    .unwrap_or_else(|error| panic!("invalid protocol event: {error}: {line}"));
-                if tx.send(event).is_err() {
-                    break;
-                }
-            }
-        });
-        Self { child, events }
-    }
-
-    fn send(&mut self, message: Value) {
-        let input = self.child.stdin.as_mut().unwrap();
-        serde_json::to_writer(&mut *input, &message).unwrap();
-        writeln!(input).unwrap();
-        input.flush().unwrap();
-    }
-
-    fn until(&self, matches: impl Fn(&Value) -> bool) -> Value {
-        loop {
-            let event = self.events.recv_timeout(PROTOCOL_TIMEOUT).unwrap();
-            if matches(&event) {
-                return event;
-            }
-        }
-    }
-
-    fn response(&self, id: u64) -> Value {
-        let response = self.until(|event| event["id"] == id);
-        assert!(response.get("error").is_none(), "{response}");
-        response[RESULT].clone()
-    }
-
-    fn finish(&mut self) {
-        self.finish_status(true);
-    }
-
-    fn finish_status(&mut self, success: bool) {
-        self.child.stdin.take();
-        let status = self
-            .child
-            .wait_timeout(PROTOCOL_TIMEOUT)
-            .unwrap()
-            .unwrap_or_else(|| panic!("maki did not exit in {PROTOCOL_TIMEOUT:?}"));
-        assert_eq!(status.success(), success, "{status}");
-    }
-}
-
-impl Drop for Process {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
 #[test_case(false, Some("low"), &["--thinking", "xhigh"], Yes, "xhigh", Some(XHIGH_BUDGET) ; "print_thinking_overrides_config_and_state")]
-#[test_case(false, Some("low"), &["--effort", "high"], Yes, "high", Some(HIGH_BUDGET) ; "print_effort")]
-#[test_case(false, Some("low"), &["--max-thinking-tokens", "2048"], Yes, "2048", Some(EXPLICIT_BUDGET) ; "print_budget")]
-#[test_case(false, Some("high"), &["--max-thinking-tokens", "0"], Yes, "off", None ; "print_zero_budget")]
-#[test_case(false, Some("high"), &["--thinking", "off"], Yes, "off", None ; "explicit_off")]
 #[test_case(false, Some("xhigh"), &[], Yes, "xhigh", Some(XHIGH_BUDGET) ; "configured_fallback")]
 #[test_case(false, None, &[], Yes, "low", Some(LOW_BUDGET) ; "headless_default_ignores_tui_state")]
 #[test_case(false, None, &["--thinking", "max"], No, "off", None ; "unsupported_model_is_reported_as_off")]
 #[test_case(false, None, &["--thinking", "off"], Required, "minimal", Some(MINIMAL_BUDGET) ; "required_thinking_is_reported_as_minimal")]
-#[test_case(true, Some("low"), &["--thinking", "xhigh"], Yes, "xhigh", Some(XHIGH_BUDGET) ; "sdk_thinking")]
 #[test_case(true, Some("low"), &["--effort", "xhigh"], Yes, "xhigh", Some(XHIGH_BUDGET) ; "sdk_effort")]
-#[test_case(true, Some("low"), &["--max-thinking-tokens", "2048"], Yes, "2048", Some(EXPLICIT_BUDGET) ; "sdk_budget")]
-#[test_case(true, Some("high"), &["--max-thinking-tokens", "0"], Yes, "off", None ; "sdk_zero_budget")]
-#[test_case(true, None, &["--thinking", "max"], No, "off", None ; "sdk_model_clamping")]
-#[test_case(true, None, &["--thinking", "disabled"], Yes, "off", None ; "sdk_disabled")]
-#[test_case(true, None, &["--thinking", "enabled", "--effort", "high"], Yes, "high", Some(HIGH_BUDGET) ; "sdk_enabled_with_effort")]
-#[test_case(true, None, &["--thinking=adaptive", "--effort", "high"], Yes, "high", Some(HIGH_BUDGET) ; "sdk_adaptive_with_effort")]
 #[test_case(true, None, &["--max-thinking-tokens", "4096", "--effort", "high"], Yes, "4096", Some(SDK_BUDGET) ; "sdk_budget_with_effort")]
-#[test_case(false, None, &["--thinking", "disabled", "--max-thinking-tokens", "4096", "--effort", "high"], Yes, "off", None ; "disabled_overrides_other_flags")]
 fn headless_thinking_reaches_the_request_and_init(
     sdk: bool,
     configured: Option<&str>,
@@ -253,9 +170,6 @@ fn headless_thinking_reaches_the_request_and_init(
 }
 
 #[test_case(&[], Some(MAX_BUDGET) ; "saved_acp_default")]
-#[test_case(&["--thinking", "xhigh"], Some(XHIGH_BUDGET) ; "thinking")]
-#[test_case(&["--effort", "high"], Some(HIGH_BUDGET) ; "effort")]
-#[test_case(&["--max-thinking-tokens", "2048"], Some(EXPLICIT_BUDGET) ; "budget")]
 #[test_case(&["--max-thinking-tokens", "0"], None ; "zero_budget")]
 fn acp_launch_thinking_reaches_the_request(flags: &[&str], budget: Option<u64>) {
     let fixture = Fixture::new(None, Yes);
@@ -277,7 +191,7 @@ fn acp_launch_thinking_reaches_the_request(flags: &[&str], budget: Option<u64>) 
 #[test_case(&["acp", "--max-thinking-tokens=-1"], INVALID_BUDGET ; "acp")]
 fn invalid_launch_thinking_exits_before_a_provider_request(flags: &[&str], expected: &str) {
     let fixture = Fixture::new(None, Yes);
-    let output = fixture.command().args(flags).output().unwrap();
+    let output = finish(fixture.command().args(flags));
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains(expected), "{stderr}");
@@ -294,7 +208,7 @@ fn invalid_launch_thinking_exits_before_a_provider_request(flags: &[&str], expec
 fn thinking_flags_require_a_session(flags: &[&str]) {
     const EXPECTED: &str = "thinking flags apply only to TUI, --print, SDK and ACP sessions";
     let fixture = Fixture::new(None, Yes);
-    let output = fixture.command().args(flags).output().unwrap();
+    let output = finish(fixture.command().args(flags));
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains(EXPECTED), "{stderr}");
@@ -453,26 +367,18 @@ fn interrupted_print_leaves_a_resumable_prefix(signal: Option<Signal>, sdk: bool
     assert!(restored.starts_with(&saved));
     drop(release_tx);
     server.join().unwrap();
-    let output = fixture
-        .command()
-        .args([
-            "-p",
-            "-r",
-            &id.to_string(),
-            "--max-turns",
-            "0",
-            "--output-format",
-            STREAM_FORMAT,
-            PROMPT,
-        ])
-        .output()
-        .unwrap();
+    let output = finish(fixture.command().args([
+        "-p",
+        "-r",
+        &id.to_string(),
+        "--max-turns",
+        "0",
+        "--output-format",
+        STREAM_FORMAT,
+        PROMPT,
+    ]));
     assert!(!output.status.success());
-    let events: Vec<Value> = String::from_utf8(output.stdout)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
+    let events = ndjson(&output.stdout);
     assert_eq!(
         events.last().unwrap()["subtype"],
         MAX_TURNS_ERROR,

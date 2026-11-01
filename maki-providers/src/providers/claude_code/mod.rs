@@ -1,14 +1,42 @@
 //! Experimental Claude Code provider and shared protocol metadata.
 
 #[cfg(target_os = "linux")]
+mod checks;
+#[cfg(target_os = "linux")]
+mod error;
+#[cfg(all(test, target_os = "linux"))]
+mod fake;
+#[cfg(all(test, target_os = "linux"))]
+mod live;
+#[cfg(target_os = "linux")]
+mod mcp;
+#[cfg(target_os = "linux")]
+mod run;
+#[cfg(target_os = "linux")]
+mod settings;
+#[cfg(target_os = "linux")]
+mod stream;
+#[cfg(target_os = "linux")]
+mod transcript;
+#[cfg(target_os = "linux")]
+pub mod worker;
+#[cfg(all(test, target_os = "linux"))]
+use linux::WAIT;
+#[cfg(target_os = "linux")]
+use linux::within;
+#[cfg(all(test, target_os = "linux"))]
+use linux::{agent_error, utf8_vars};
+#[cfg(target_os = "linux")]
 mod linux;
 #[cfg(not(target_os = "linux"))]
 mod unsupported;
 
 #[cfg(target_os = "linux")]
-use linux::create;
+pub use error::Error;
 #[cfg(target_os = "linux")]
-pub use linux::{Error, configure_plugin, validation};
+pub use linux::configure_plugin;
+#[cfg(target_os = "linux")]
+use linux::create;
 #[cfg(not(target_os = "linux"))]
 use unsupported::create;
 #[cfg(not(target_os = "linux"))]

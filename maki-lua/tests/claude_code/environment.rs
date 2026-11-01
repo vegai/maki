@@ -6,32 +6,25 @@
 
 use std::env;
 use std::ffi::OsStr;
-use std::fs::{self, File};
+use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
 
 use maki_agent::tools::test_support::stub_ctx_in;
 use maki_agent::tools::{ToolContext, ToolRegistry};
 use maki_lua::PluginHost;
-use maki_providers::claude_code::validation;
+use maki_providers::claude_code::worker;
 use serde_json::{Map, Value, json};
 use tempfile::{TempDir, tempdir};
 use test_case::test_case;
 
-/// This binary uses only some of the items shared with the claude_code
-/// binary.
-#[path = "claude_code/support.rs"]
-#[allow(dead_code)]
-mod support;
+use super::support::environment::EnvVar;
 
-use support::environment::EnvVar;
-
-use support::{
-    DEADLINE, MINIMUM_VERSION, TOOL, WorkingDir, artifact_listing, commit_all, executable, git,
-    listing, load, on_path, tool_reply, use_fixture_user, wait_for_release, wait_until, within,
+use super::support::{
+    DEADLINE, MINIMUM_VERSION, TOOL, WorkingDir, artifact_listing, backdate, commit_all,
+    executable, git, listing, load, on_path, reply, use_fixture_user, wait_for_release, wait_until,
     write,
 };
 
@@ -52,14 +45,14 @@ for arg; do
 done
 [ "$mode" = manual ] && mode=default
 printf '%s' "$flags" > "$(dirname "$0")/settings"
-reply() { printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":%s}}\n' "$1" "$2"; }
+@CONTROL_REPLY@
 while IFS= read -r msg; do
   id=$(printf '%s' "$msg" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
   case "$msg" in
     *'"type":"user"'*) printf '%s\n' "$msg" > "$(dirname "$0")/prompt" ;;
-    *'"initialize"'*) reply "$id" "{\"current_permission_mode\":\"$mode\",\"account\":{\"apiProvider\":\"firstParty\",\"subscriptionType\":\"Claude Pro\"},\"models\":[{\"value\":\"sonnet\",\"resolvedModel\":\"claude-sonnet-5\"}]}" ;;
+    *'"initialize"'*) reply "$id" "$(printf '%s' '@ACCOUNT_SUBSCRIPTION@' | sed "s/\"current_permission_mode\":\"default\"/\"current_permission_mode\":\"$mode\"/")" ;;
     *'"get_settings"'*) reply "$id" "{\"effective\":$flags,\"sources\":[{\"source\":\"flagSettings\",\"settings\":$flags}]}" ;;
-    *'"get_hooks_listing"'*) reply "$id" '{"hooks":[],"events":[],"policy":{"allDisabled":true,"policyHookCount":0}}' ;;
+    *'"get_hooks_listing"'*) reply "$id" '@HOOKS_OFF@' ;;
   esac
 done
 "#;
@@ -108,7 +101,6 @@ const ARTIFACT_MARKER: &str = ".maki-claude-code-artifact";
 const MANIFEST: &str = "manifest.json";
 const SWEEP_TRASH: &str = ".trash-old";
 /// Older than the default artifact time limit of a day.
-const STALE_AGE: Duration = Duration::from_secs(48 * 60 * 60);
 const NO_STATE_DIR: &str =
     "maki cannot find its state directory as a UTF-8 path for the coding sandbox";
 
@@ -118,17 +110,17 @@ fn the_plugin_schema_uses_the_provider_defaults() {
     let schemas = host.plugin_options().unwrap();
     let schema = schemas.get(TOOL).unwrap();
     for (name, default) in [
-        ("executable", json!(validation::DEFAULT_EXECUTABLE)),
+        ("executable", json!(worker::DEFAULT_EXECUTABLE)),
         ("config_dir", json!("")),
         (
             "provider_max_concurrent",
-            json!(validation::DEFAULT_MAX_CONCURRENT),
+            json!(worker::DEFAULT_MAX_CONCURRENT),
         ),
     ] {
         let option = schema.iter().find(|option| option.name == name).unwrap();
         assert_eq!(option.default.as_ref(), Some(&default), "{name}");
         if name == "provider_max_concurrent" {
-            assert_eq!(option.min, Some(validation::MIN_MAX_CONCURRENT as f64));
+            assert_eq!(option.min, Some(worker::MIN_MAX_CONCURRENT as f64));
         }
     }
 }
@@ -142,7 +134,7 @@ struct Scenario {
 
 impl Scenario {
     fn enter() -> Self {
-        support::environment::require_nextest();
+        super::support::environment::require_nextest();
         use_fixture_user();
         let project = tempdir().unwrap();
         fs::create_dir(project.path().join(".git")).unwrap();
@@ -223,7 +215,7 @@ fn ask(reg: &ToolRegistry, ctx: &ToolContext) -> Result<String, String> {
 }
 
 fn ask_with(reg: &ToolRegistry, ctx: &ToolContext, input: Value) -> Result<String, String> {
-    smol::block_on(within(DEADLINE, tool_reply(reg, ctx, TOOL, input)))
+    reply(reg, ctx, TOOL, input)
 }
 
 /// An overlapping TMPDIR uses a scratch base outside the checkout. The
@@ -244,7 +236,7 @@ fn a_temp_dir_that_leads_into_the_project_uses_a_safe_fallback(linked: bool) {
     let (reg, _host) = fake_host(&claude, outside.path());
     let err = ask(&reg, &session_ctx()).unwrap_err();
     assert!(err.contains(NO_EVENT_STOP), "got: {err}");
-    let prepared = validation::prepare_launch(
+    let prepared = worker::prepare_launch(
         vec![(TMPDIR.to_owned(), tmpdir.to_string_lossy().into_owned())],
         Some(outside.path().to_owned()),
         &project,
@@ -264,7 +256,7 @@ fn an_empty_tmpdir_uses_a_safe_default_for_launch_and_worker_checks() {
     let outside = tempdir().unwrap();
     let claude = fake_claude(outside.path(), VERSION_ONLY);
     let _tmpdir = EnvVar::set(TMPDIR, "");
-    let prepared = validation::prepare_launch(
+    let prepared = worker::prepare_launch(
         vec![(TMPDIR.to_owned(), String::new())],
         Some(outside.path().to_owned()),
         &env::current_dir().unwrap(),
@@ -300,10 +292,7 @@ fn a_call_does_not_wait_for_the_sweep() {
     for name in [ARTIFACT_MARKER, MANIFEST] {
         let file = old.join(name);
         fs::write(&file, "{}").unwrap();
-        File::open(&file)
-            .unwrap()
-            .set_modified(SystemTime::now() - STALE_AGE)
-            .unwrap();
+        backdate(&file);
     }
     let removing = tools.path().join("removing");
     let never = tools.path().join("never");
@@ -351,7 +340,7 @@ fn a_temp_dir_elsewhere_in_the_checkout_uses_a_safe_fallback() {
     let (reg, _host) = fake_host(&claude, outside.path());
     let err = ask(&reg, &stub_ctx_in(&sub, None, None)).unwrap_err();
     assert!(err.contains(NO_EVENT_STOP), "got: {err}");
-    let prepared = validation::prepare_launch(
+    let prepared = worker::prepare_launch(
         vec![(TMPDIR.to_owned(), elsewhere.to_string_lossy().into_owned())],
         Some(outside.path().to_owned()),
         &sub,
@@ -395,7 +384,7 @@ fn a_startup_exit_keeps_its_stderr_and_status() {
     let error = ask(&reg, &session_ctx()).unwrap_err();
     assert!(error.contains(STARTUP_STDERR), "{error}");
     assert!(
-        error.contains(&format!("exited with code {STARTUP_ERROR_CODE}")),
+        error.contains(&format!("exit status: {STARTUP_ERROR_CODE}")),
         "{error}"
     );
     assert!(listing(base.path()).is_empty());

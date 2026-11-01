@@ -34,11 +34,11 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::headless_startup::{start_mcp, startup};
-use crate::notice::{NOTIFICATION, ProviderNotice};
 use crate::shutdown::watch;
 use crate::wire::{
     API_RETRY, ERROR_DURING_EXECUTION, INIT, SUCCESS, failure_subtype, system_event,
 };
+use crate::wire::{NOTIFICATION, ProviderNotice};
 
 const SESSION_LINE_PREFIX: &str = "session: ";
 
@@ -254,26 +254,25 @@ pub fn run(params: PrintParams) -> Result<()> {
         _ => None,
     };
 
-    let (Ready { model, tool_names }, thinking) =
-        match startup(&ready, &mut events, defaults.thinking) {
-            Ok(started) => started,
-            Err(error) => {
-                smol::block_on(headless::await_shutdown(task));
-                lua_handle.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
-                if !matches!(format, OutputFormat::Text) {
-                    write_result(
-                        format,
-                        verbose_out,
-                        PrintResult::error(
-                            session_id,
-                            start.elapsed().as_millis(),
-                            error.to_string(),
-                        ),
-                    )?;
-                }
-                return Err(error);
+    let Ready {
+        model,
+        tool_names,
+        thinking,
+    } = match startup(&ready, &mut events) {
+        Ok(started) => started,
+        Err(error) => {
+            smol::block_on(headless::await_shutdown(task));
+            lua_handle.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
+            if !matches!(format, OutputFormat::Text) {
+                write_result(
+                    format,
+                    verbose_out,
+                    PrintResult::error(session_id, start.elapsed().as_millis(), error.to_string()),
+                )?;
             }
-        };
+            return Err(error);
+        }
+    };
 
     {
         let init = system_event(

@@ -13,7 +13,6 @@ local ABANDONED = "The worker's snapshot stays in %s until maki removes it."
 local CHECKING = "Validate the login and policy of Claude Code %s"
 local ROUTE_OK = "claude.ai subscription%s on Claude Code %s, maki found no route conflict"
 local ROUTE_UNCONFIRMED = "maki could not confirm the route on Claude Code %s"
-local UNCHECKED_START = "Claude Code started its run before maki accepted its checks"
 local ERROR_PREFIX = jobs.ERROR_PREFIX
 
 local function view_opts(ctx, keep)
@@ -162,7 +161,7 @@ function Run:on_answer()
   if queued then
     -- The worker can act on a queued prompt even if closing stdin fails. Keep its snapshot.
     self.prompted = true
-    self.call.artifact = nil
+    self.call:keep_artifact()
   end
   if not sent then
     self:stop("maki cannot send the task to Claude Code: " .. tostring(err))
@@ -187,7 +186,7 @@ function Run:on_line(line)
       self:on_answer()
     end
   elseif step.init and not self.prompted then
-    self:stop(UNCHECKED_START)
+    self:stop(require("maki.claude_code.internal").unchecked_start())
   elseif step.init then
     self.clock:stop()
     local subscription = " (" .. self.handshake:subscription_type() .. ")"
@@ -254,12 +253,13 @@ end
 function Run:start(argv, cwd, env, task)
   self.task = task
   self.stream = Stream.new({ cwd = cwd, worker = self.spec.worker, cli = self.spec.cli })
-  local job_opts = launch.job_opts(cwd, env, self.stderr_tail)
+  local job_opts = launch.job_opts(cwd, env)
   job_opts.on_stdout = function(_, line)
     self:on_line(line)
   end
   local id, err = self.call:spawn(argv, job_opts, {
-    on_exit = function(_, code)
+    on_exit = function(_, code, _, stderr_tail)
+      self.stderr_tail = stderr_tail
       self:on_exit(code)
     end,
   })
@@ -272,7 +272,7 @@ function Run:start(argv, cwd, env, task)
     self:on_cancel(reason)
   end)
   self.clock = maki.defer_fn(function()
-    if not self.stream.accepted then
+    if not self.stream:accepted() then
       self:stop("no init event in " .. launch.STARTUP_TIMEOUT_SECS .. " s")
     end
   end, launch.STARTUP_MS)

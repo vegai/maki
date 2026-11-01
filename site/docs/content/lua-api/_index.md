@@ -2432,8 +2432,8 @@ Requires the `run` [plugin permission](#plugin-permissions).
     stdout line. Bytes that are not UTF-8 become U+FFFD, where Neovim
     passes the raw bytes.
   - `on_stderr` (`function?`) the same for each stderr line, with `"stderr"`.
-  - `on_exit` (`function?`) called with `(job_id, code, "exit", timed_out)` when the
-    process stops.
+  - `on_exit` (`function?`) called with `(job_id, code, "exit", timed_out, stderr_tail)` when the
+    process stops. `stderr_tail` holds up to 10 lines, each capped at 4096 bytes.
   - `stdout` (`string|false?`) append stdout to this path, or `false` to
     discard it.
   - `stderr` (`string|false?`) same for stderr; both may name one path.
@@ -2699,9 +2699,8 @@ The final item has no newline suffix.
 Unread data stays in memory. A descendant can retain stdin after the job
 exits. Use `guard` to stop that descendant and release the data.
 
-`chansend_limits.max_bytes` bounds the queue, including a write in progress.
-`chansend_limits.full_error` means wait for the child to consume input and retry.
-`chansend_limits.oversized_error` means split the write into smaller chunks.
+Waits for queue capacity while the child consumes input. Large writes are
+split internally, and the queue includes bytes being written to the pipe.
 
 Requires the `run` [plugin permission](#plugin-permissions).
 
@@ -2719,17 +2718,6 @@ local id = maki.fn.jobstart({ "cat" }, { stdin = "pipe" })
 maki.fn.chansend(id, "hello\n")
 maki.fn.chanclose(id, "stdin")
 ```
-
----
-
-### `maki.fn.chansend_limits` {#maki-fn-chansend_limits}
-
-```lua
-maki.fn.chansend_limits
-```
-
-Stdin queue limits: `max_bytes` includes a write in progress, `full_error`
-means retry later, and `oversized_error` means split the write.
 
 ---
 

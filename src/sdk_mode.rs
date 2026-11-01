@@ -8,10 +8,12 @@
 //! `MakiId` canonical form.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::{self, BufRead, Write};
 use std::mem;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 use color_eyre::Result;
@@ -27,6 +29,7 @@ use maki_agent::{
     PermissionsConfig, SessionEndReason, SessionEvents, SteerKind,
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
+use maki_lua::EventHandle;
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
 use maki_providers::model::Model;
 use maki_providers::{ImageSource, StopReason, Timeouts, TokenUsage, add_cost};
@@ -37,9 +40,9 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::cli::Cli;
-use crate::notice::{NOTIFICATION, ProviderNotice};
-use crate::tool_names::maki_to_claude_tool_name;
+use crate::wire::maki_to_claude_tool_name;
 use crate::wire::{API_RETRY, ERROR_DURING_EXECUTION, INIT, SUCCESS, system_event, wire_uuid};
+use crate::wire::{NOTIFICATION, ProviderNotice};
 
 const NOTICE_SUBTYPE: &str = "notice";
 
@@ -151,6 +154,22 @@ struct ResultPayload {
     usage: TokenUsage,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     permission_denials: Vec<Value>,
+}
+
+impl ResultPayload {
+    fn error(result: String) -> Self {
+        Self {
+            subtype: ERROR_DURING_EXECUTION,
+            is_error: true,
+            duration_ms: 0,
+            duration_api_ms: 0,
+            num_turns: 0,
+            result,
+            total_cost_usd: 0.0,
+            usage: TokenUsage::default(),
+            permission_denials: Vec::new(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -563,31 +582,15 @@ pub fn run(params: SdkParams) -> Result<()> {
         session_id: handle.session_id.clone(),
         out_tx,
     };
-    let (
-        Ready {
-            model: startup_model,
-            tool_names,
-        },
+    let Ready {
+        model: startup_model,
+        tool_names,
         thinking,
-    ) = match crate::headless_startup::startup(&handle.ready, &mut events, defaults.thinking) {
+    } = match crate::headless_startup::startup(&handle.ready, &mut events) {
         Ok(started) => started,
         Err(error) => {
-            let emitted = writer.emit(WireInner::Result(ResultPayload {
-                subtype: ERROR_DURING_EXECUTION,
-                is_error: true,
-                duration_ms: 0,
-                duration_api_ms: 0,
-                num_turns: 0,
-                result: error.to_string(),
-                total_cost_usd: 0.0,
-                usage: TokenUsage::default(),
-                permission_denials: Vec::new(),
-            }));
-            drop(handle.input_tx);
-            smol::block_on(headless::await_shutdown(handle.task));
-            lua_handle.end_sessions_blocking([handle.session_id.id()], SessionEndReason::Completed);
-            drop(writer);
-            let _ = writer_thread.join();
+            let emitted = writer.emit(WireInner::Result(ResultPayload::error(error.to_string())));
+            finish(handle, &lua_handle, writer, writer_thread, async {});
             emitted?;
             return Err(error);
         }
@@ -749,29 +752,30 @@ pub fn run(params: SdkParams) -> Result<()> {
         shared.lock().unwrap().failed = true;
     }
 
-    let InteractiveHandle {
-        input_tx,
-        task,
-        session_id,
-        ..
-    } = handle;
-    drop(input_tx);
-    smol::block_on(async {
-        // Unbounded: the pump ends at the stream marker, which the session
-        // emits once it has answered every prompt stdin queued.
+    finish(handle, &lua_handle, writer, writer_thread, async {
         pump.await;
-        headless::await_shutdown(task).await;
     });
-    // Reaps session-owned plugin jobs before the writer thread joins: an
-    // orphan inheriting stdout would keep an orchestrator's read blocked
-    // after maki exits.
-    lua_handle.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
-    drop(writer);
-    let _ = writer_thread.join();
     if shared.lock().unwrap().failed {
         bail!("one or more SDK turns failed");
     }
     Ok(())
+}
+
+fn finish(
+    handle: InteractiveHandle,
+    lua: &EventHandle,
+    writer: SdkWriter,
+    thread: JoinHandle<()>,
+    pump: impl Future<Output = ()>,
+) {
+    drop(handle.input_tx);
+    smol::block_on(async {
+        pump.await;
+        headless::await_shutdown(handle.task).await;
+    });
+    lua.end_sessions_blocking([handle.session_id.id()], SessionEndReason::Completed);
+    drop(writer);
+    let _ = thread.join();
 }
 
 fn parse_or_warn<T: serde::de::DeserializeOwned>(payload: Value, what: &str) -> Option<T> {

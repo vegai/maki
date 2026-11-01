@@ -131,11 +131,11 @@ fn load_plugins(
     // still sees the generation that was serving, so a `/reload` never opens a
     // window in which a registered provider answers "unknown".
     let loaded = host.loaded_plugins()?;
-    maki_providers::plugin::commit_load();
     claude_code::configure_plugin(
         loaded.iter().any(|name| name == claude_code::PLUGIN),
         config.plugins.opts.get(claude_code::PLUGIN),
     );
+    maki_providers::plugin::commit_load();
 
     Ok((config, sanitize_warnings(&warnings)))
 }
@@ -342,9 +342,8 @@ mod tests {
     const MODEL: &str = "claude-code/claude-haiku-4-5";
     const EXECUTABLE: &str = "executable";
 
-    /// The provider reads the plugin's options from process-wide state, so
-    /// the cases take turns under a threaded harness.
-    static PLUGIN_OPTIONS: Mutex<()> = Mutex::new(());
+    /// Plugin loads publish one registry generation, so the cases take turns under cargo test.
+    static PROVIDER_LOADS: Mutex<()> = Mutex::new(());
 
     /// A failed builtin load stops later builtins. Enable the provider only if its own plugin
     /// completed its load.
@@ -355,7 +354,7 @@ mod tests {
         options: Value,
         other: Option<(&str, Value)>,
     ) -> bool {
-        let _turn = PLUGIN_OPTIONS
+        let _turn = PROVIDER_LOADS
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();

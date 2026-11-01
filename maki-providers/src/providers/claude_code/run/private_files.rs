@@ -62,11 +62,9 @@ pub(in crate::providers::claude_code) fn private_dir(
     project: &Path,
     denied: &[PathBuf],
 ) -> Result<(PrivateDir, PathBuf), Error> {
-    let base = base.canonicalize().map_err(|source| Error::Path {
-        what: "resolve the temporary directory",
-        path: base.to_owned(),
-        source,
-    })?;
+    let base = base
+        .canonicalize()
+        .map_err(Error::path("resolve the temporary directory", base))?;
     if inside_checkout(&base, project, denied) {
         return Err(Error::TempInProject(base));
     }
@@ -75,16 +73,13 @@ pub(in crate::providers::claude_code) fn private_dir(
     let mut builder = tempfile::Builder::new();
     builder.prefix(&prefix);
     builder.permissions(Permissions::from_mode(PRIVATE_DIR_MODE));
-    let dir = builder.tempdir_in(&base).map_err(|source| Error::Path {
-        what: "make a private directory in",
-        path: base.to_owned(),
-        source,
-    })?;
-    let path = dir.path().canonicalize().map_err(|source| Error::Path {
-        what: "resolve",
-        path: dir.path().to_owned(),
-        source,
-    })?;
+    let dir = builder
+        .tempdir_in(&base)
+        .map_err(Error::path("make a private directory in", &base))?;
+    let path = dir
+        .path()
+        .canonicalize()
+        .map_err(Error::path("resolve", dir.path()))?;
     if inside_checkout(&path, project, denied) {
         return Err(Error::TempInProject(path));
     }

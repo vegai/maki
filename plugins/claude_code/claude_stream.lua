@@ -9,7 +9,6 @@ Stream.__index = Stream
 
 local ASSISTANT = "assistant"
 local RESULT = "result"
-local CONTROL_RESPONSE = "control_response"
 local INIT = "init"
 local TOOL_USE = "tool_use"
 -- Each step's output count is a placeholder, so only the result has the
@@ -39,15 +38,13 @@ end
 function Stream.new(expect)
   return setmetatable({
     expect = expect,
-    accepted = false,
-    model_checked = false,
+    native = native.worker_stream(expect),
     usage_by_message = {},
   }, Stream)
 end
 
 function Stream:set_model(model)
-  self.model = model
-  self.model_checked = false
+  self.native:set_model(model)
 end
 
 -- Relative inside the project and absolute outside it, where a run of `..`
@@ -79,44 +76,38 @@ end
 ---   `{ stop = reason }`  kill the child, the run is unusable
 ---   `{ init = event }`   the checks found no problem in the child
 ---   `{ lines = {...} }`  status lines for the view
-function Stream:feed(line)
-  local classified, problem = native.classify(line, {
-    init = self.expect,
-    accepted = self.accepted,
-    model = self.model,
-    model_checked = self.model_checked,
-  })
+function Stream:accepted()
+  return self.native:accepted()
+end
+
+function Stream:feed(line, handshake)
+  local classified, problem = self.native:feed(line, handshake)
   if not classified then
     return { stop = problem }
   end
   local ev, kind = classified.event, classified.kind
-  self.model_checked = classified.model_checked
   if kind == ASSISTANT and type(ev.message) == "table" and type(ev.message.id) == "string" and classified.usage then
     self.usage_by_message[ev.message.id] = classified.usage
   end
   if classified.problem then
     local init = kind == INIT
-    if init then
-      self.accepted = false
-    end
     return { stop = classified.problem, init = init and ev or nil }
   end
-  if kind == CONTROL_RESPONSE and type(ev.response) == "table" then
-    return { control = line }
+  if classified.control then
+    return { control = true, complete = classified.complete }
   end
   if classified.rate_limit then
     self.rate_limit = classified.rate_limit
     return nil
   end
   if kind == INIT then
-    self.accepted = true
     return { init = ev }
   end
   if kind == RESULT then
     self.result = ev
     self.failure = classified.failure
     ev.usage = classified.usage
-    if not self.accepted then
+    if not self:accepted() then
       return { stop = self:outcome() }
     end
     return nil

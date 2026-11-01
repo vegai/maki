@@ -1,12 +1,9 @@
 -- Plugin jobs report exit after cancellation, so a slot must wait for every process.
-local truncate = require("maki.truncate")
 local M = {}
 
 M.ERROR_PREFIX = "claude_code: "
 M.LEFT_BEHIND = "maki did not remove: "
 M.CANCELLED = "cancelled"
-local STDIN_CHUNK_BYTES = 64 * 1024
-local STDIN_RETRY_MS = 10
 local STDERR_TAIL_LINES = 10
 local STDERR_LINE_BYTES = 4096
 M.ERROR_BYTES = STDERR_TAIL_LINES * STDERR_LINE_BYTES
@@ -31,37 +28,19 @@ function M.new(startup_ms, released)
     answered = false,
     left_behind = {},
     startup_ms = startup_ms,
-    released = released,
+    release_hooks = released and { released } or {},
   }, Call)
-end
-
-function M.keep_tail(tail, line)
-  tail[#tail + 1] = truncate(line, nil, STDERR_LINE_BYTES)
-  if #tail > STDERR_TAIL_LINES then
-    table.remove(tail, 1)
-  end
 end
 
 --- Returns close status, an error, and whether the complete input was queued.
 --- A close error can follow a complete prompt, so callers may need to keep its artifact.
 function M.feed_stdin(id, data)
-  local limits = maki.fn.chansend_limits
-  local chunk_bytes = math.min(STDIN_CHUNK_BYTES, limits.max_bytes)
-  for offset = 1, #data, chunk_bytes do
-    local chunk = data:sub(offset, offset + chunk_bytes - 1)
-    while true do
-      local sent, err = maki.fn.chansend(id, chunk)
-      if sent then
-        break
-      end
-      if err ~= limits.full_error then
-        return nil, err
-      end
-      maki.async.sleep(STDIN_RETRY_MS)
-    end
+  local sent, err = maki.fn.chansend(id, data)
+  if not sent then
+    return nil, err, false
   end
-  local closed, err = maki.fn.chanclose(id, "stdin")
-  return closed, err, true
+  local closed, close_err = maki.fn.chanclose(id, "stdin")
+  return closed, close_err, true
 end
 
 function Call:settle()
@@ -72,11 +51,32 @@ function Call:settle()
       run()
     end
   end
-  local released = self.released
-  if self.answered and self.alive == 0 and released then
-    self.released = nil
-    released()
+  if self.answered and self.alive == 0 then
+    local hooks = self.release_hooks
+    self.release_hooks = {}
+    for _, hook in ipairs(hooks) do
+      hook()
+    end
   end
+end
+
+function Call:wait(operation, ...)
+  self.alive = self.alive + 1
+  local result = table.pack(pcall(operation, ...))
+  self.alive = self.alive - 1
+  self:settle()
+  if not result[1] then
+    error(result[2], 0)
+  end
+  return table.unpack(result, 2, result.n)
+end
+
+function Call:on_released(hook)
+  self.release_hooks[#self.release_hooks + 1] = hook
+end
+
+function Call:keep_artifact()
+  self.artifact_kept = true
 end
 
 function Call:answer()
@@ -92,9 +92,9 @@ end
 function Call:start(argv, job_opts, on_exit)
   job_opts.scope = "plugin"
   job_opts.guard = true
-  job_opts.on_exit = function(id, code, _, timed_out)
+  job_opts.on_exit = function(id, code, _, timed_out, stderr_tail)
     self.alive = self.alive - 1
-    local ok, err = pcall(on_exit, id, code, timed_out)
+    local ok, err = pcall(on_exit, id, code, timed_out, stderr_tail or {})
     self:settle()
     if not ok then
       error(err, 0)
@@ -152,21 +152,18 @@ function Call:leave(dir)
   end
 end
 
-function Call:remove_dir(dir, removed)
+function Call:remove_dir(dir)
   local ok = maki.fs.rm(dir)
   if not ok and maki.fs.metadata(dir) then
     self:leave(dir)
-  end
-  if removed then
-    removed()
   end
 end
 
 --- Returns the exit code, stdout lines, and any input error.
 --- The code is nil after a timeout. Waits for `on_exit`, because a cancel can stop a coroutine that calls `jobwait`.
 --- {how} has `started(id)` returning `(ok, err)`, `on_line(id, line)`, `keep_on_cancel`,
---- and `leftover(lines)`, which names a directory to remove first.
-function Call:run_to_end(argv, job_opts, how, timeout_ms)
+--- and `leftover()`, which names a directory to remove first.
+function Call:run_to_end(argv, job_opts, how)
   local lines = {}
   local input_error
   if job_opts.stdout == nil then
@@ -178,20 +175,20 @@ function Call:run_to_end(argv, job_opts, how, timeout_ms)
     end
   end
   local code = maki.async.await(1, function(done)
-    local function finished(_, exit_code, timed_out)
-      local result = not timed_out and exit_code or nil
-      local leftover = how.leftover and how.leftover(lines)
-      if leftover then
-        self:remove_dir(leftover, function()
-          done(result, timed_out)
-        end)
-      else
-        done(result, timed_out)
+    local function finished(_, exit_code, timed_out, stderr_tail)
+      if how.on_stderr_tail then
+        how.on_stderr_tail(stderr_tail or {})
       end
+      local result = not timed_out and exit_code or nil
+      local leftover = how.leftover and how.leftover()
+      if leftover then
+        self:remove_dir(leftover)
+      end
+      done(result, timed_out)
     end
     local id, err = self:spawn(argv, job_opts, {
       keep_on_cancel = how.keep_on_cancel,
-      timeout_ms = timeout_ms,
+      timeout_ms = how.timeout_ms,
       on_exit = finished,
     })
     if not id then
@@ -226,17 +223,21 @@ function Call:run_lines(argv, spec)
     clear_env = not spec.inherit_env,
     stdin = spec.stdin and "pipe" or nil,
     stdout = spec.stdout,
-    on_stderr = function(_, line)
-      M.keep_tail(stderr_tail, line)
+  }
+  local how = {
+    keep_on_cancel = spec.keep_on_cancel,
+    leftover = spec.leftover,
+    timeout_ms = spec.timeout_ms or self.startup_ms,
+    on_stderr_tail = function(tail)
+      stderr_tail = tail
     end,
   }
-  local how = { keep_on_cancel = spec.keep_on_cancel, leftover = spec.leftover }
   if spec.stdin then
     how.started = function(id)
       return M.feed_stdin(id, spec.stdin)
     end
   end
-  local code, lines, run_error = self:run_to_end(argv, job_opts, how, spec.timeout_ms or self.startup_ms)
+  local code, lines, run_error = self:run_to_end(argv, job_opts, how)
   if run_error then
     return nil, M.with_stderr("maki cannot run " .. shown .. ": " .. run_error, stderr_tail)
   end

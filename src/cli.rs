@@ -420,7 +420,7 @@ pub fn normalize_tool_name(name: &str) -> String {
                 .is_some_and(|(server, tool)| !server.is_empty() && !tool.is_empty())
         })
         .unwrap_or(name);
-    let local = crate::tool_names::claude_to_maki_tool_name(name);
+    let local = crate::wire::claude_to_maki_tool_name(name);
     if local != name {
         return local.to_owned();
     }

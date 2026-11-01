@@ -1,3 +1,4 @@
+use maki_agent::tools::ToolKind;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::path::Path;
@@ -101,7 +102,11 @@ fn dctx_json(ctx: &DescriptionContext) -> Value {
         obj["only"] = json!(
             names
                 .iter()
-                .filter(|name| ctx.filter.matches(name))
+                .filter(|name| ctx.filter.admits(
+                    name,
+                    ToolKind::Registry(ToolAudience::all()),
+                    ToolAudience::MAIN
+                ))
                 .collect::<Vec<_>>()
         );
     } else if !ctx.filter.excluded.is_empty() {

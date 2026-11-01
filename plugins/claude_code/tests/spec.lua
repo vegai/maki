@@ -1,6 +1,7 @@
 local native = require("maki.claude_code.internal")
 local t = require("maki.test_helpers")
 local launch = require("claude_launch")
+local confine = require("claude_confine")
 local Stream = require("claude_stream")
 local snapshot = require("claude_snapshot")
 local importer = require("claude_import")
@@ -43,7 +44,7 @@ local BUILTIN_PLUGINS = {
 }
 local MISSING = {}
 local READ = launch.WORKERS.read
-local DEFAULT_DENY_RULES = launch.deny_rules(assert(path_utils.denied_paths("")))
+local DEFAULT_DENY_RULES = confine.deny_rules(assert(path_utils.denied_paths("")))
 local HOOKS_OFF = { hooks = maki.json.decode("[]"), policy = { allDisabled = true, policyHookCount = 0 } }
 local CONFINE = {
   deny_read = { "/work", "/home/u/.claude", "/artifacts" },
@@ -129,6 +130,7 @@ local function worker_spec(worker, confine, deny)
     worker = worker or READ,
     confine = confine,
     deny = deny or DEFAULT_DENY_RULES,
+    policy = native.worker_policy({ deny = deny or DEFAULT_DENY_RULES, sandbox = confine }),
   }
 end
 
@@ -242,7 +244,7 @@ for _, c in ipairs({
   },
 }) do
   case("shell_secret_problem_" .. c.name, function()
-    local problem = launch.shell_secret_problem(launch.WORKERS[c.profile], c.env)
+    local problem = confine.shell_secret_problem(launch.WORKERS[c.profile], c.env)
     if c.want then
       has(problem, c.want)
       eq(problem:find(SECRET, 1, true), nil)
@@ -272,13 +274,13 @@ end
 -- The default Claude Code login stays out of the coding shell, even when
 -- `config_dir` names another login.
 case("home_credentials_include_the_default_claude_login", function()
-  local paths = assert(launch.home_credentials("/home/u"))
+  local paths = assert(confine.home_credentials("/home/u"))
   assert(contains(paths, "/home/u/.claude"), "~/.claude must be denied")
   assert(contains(paths, "/home/u/.ssh"), "~/.ssh must be denied")
 end)
 
 case("home_credentials_follow_xdg_data_home", function()
-  local paths = assert(launch.home_credentials("/home/u", nil, { XDG_DATA_HOME = "/data" }))
+  local paths = assert(confine.home_credentials("/home/u", nil, { XDG_DATA_HOME = "/data" }))
   assert(contains(paths, "/data/keyrings"))
   assert(contains(paths, "/data/fish/fish_history"))
 end)
@@ -298,7 +300,7 @@ for _, name in ipairs({
     local absolute = "/elsewhere/credentials"
     local relative = "relocated-credentials"
     for _, path in ipairs({ absolute, relative }) do
-      local paths = assert(launch.home_credentials("/home/u", nil, { [name] = path }))
+      local paths = assert(confine.home_credentials("/home/u", nil, { [name] = path }))
       local expected = path == absolute and absolute or maki.fs.joinpath(assert(maki.uv.cwd()), relative)
       assert(contains(paths, expected), expected)
     end
@@ -308,7 +310,7 @@ end
 case("home_credentials_cover_standard_stores_and_user_paths", function()
   local home = "/home/u"
   local paths =
-    assert(launch.home_credentials(home, assert(launch.denied_home_paths("custom/login.json,tool/credentials"))))
+    assert(confine.home_credentials(home, assert(confine.denied_home_paths("custom/login.json,tool/credentials"))))
   for _, path in ipairs({
     ".gitconfig",
     ".config/git",
@@ -336,17 +338,17 @@ case("home_credentials_cover_standard_stores_and_user_paths", function()
     assert(contains(paths, home .. "/" .. path), path)
   end
   for _, path in ipairs({ "/etc/passwd", "../outside", "nested/../../outside" }) do
-    local denied, problem = launch.denied_home_paths(path)
+    local denied, problem = confine.denied_home_paths(path)
     eq(denied, nil)
-    eq(problem, launch.DENY_HOME_OUTSIDE)
+    eq(problem, confine.DENY_HOME_OUTSIDE)
   end
 end)
 
 for _, home in ipairs({ "", false }) do
   case("home_credentials_without_a_home_" .. tostring(home), function()
-    local paths, err = launch.home_credentials(home or nil)
+    local paths, err = confine.home_credentials(home or nil)
     eq(paths, nil)
-    eq(err, launch.NO_HOME)
+    eq(err, confine.NO_HOME)
   end)
 end
 
@@ -374,6 +376,7 @@ case("argv_for_a_coding_worker_edits_and_runs_without_bypass", function()
     deny = DEFAULT_DENY_RULES,
     worker = launch.WORKERS.code,
     confine = CONFINE,
+    policy = native.worker_policy({ deny = DEFAULT_DENY_RULES, sandbox = CONFINE }),
   })
   assert(has_pair(argv, "--tools", "Read,Glob,Grep,Edit,Write,Bash"), "coding tools")
   assert(has_pair(argv, "--permission-mode", "acceptEdits"), "coding mode")
@@ -528,7 +531,13 @@ case("a_coding_handshake_checks_the_sandbox_and_a_read_one_does_not", function()
 end)
 
 local function read_argv()
-  return launch.argv({ executable = "claude", model = "haiku", deny = DEFAULT_DENY_RULES, worker = READ })
+  return launch.argv({
+    executable = "claude",
+    model = "haiku",
+    deny = DEFAULT_DENY_RULES,
+    worker = READ,
+    policy = native.worker_policy({ deny = DEFAULT_DENY_RULES }),
+  })
 end
 
 case("argv_for_a_reader_never_widens_its_reach", function()
@@ -600,119 +609,9 @@ case("missing_effective_settings_return_a_problem", function()
   has(handshake_problem({ settings = answer }), "does not report effective settings")
 end)
 
--- An empty settings error list means every setting is valid.
-case("an_empty_settings_error_list_passes", function()
-  local answer = settings_answer()
-  answer.errors = maki.json.decode("[]")
-  eq(handshake_problem({ settings = answer }), nil)
+case("native_policy_refusals_reach_the_plugin", function()
+  has(handshake_problem({ settings = settings_answer({ hooks = { PreToolUse = {} } }) }) or "", "sets hooks")
 end)
-
-case("managed_keys_that_only_restrict_pass", function()
-  local policy = {
-    companyAnnouncements = { "Be nice" },
-    forceLoginMethod = "claudeai",
-    permissions = { deny = { "Read(./vault/**)" }, disableBypassPermissionsMode = "disable" },
-  }
-  eq(handshake_problem({ settings = settings_answer(policy) }), nil)
-end)
-
-for _, c in ipairs({
-  { name = "hooks", policy = { hooks = { PreToolUse = {} } }, want = "sets hooks" },
-  {
-    name = "extra_roots",
-    policy = { permissions = { additionalDirectories = { "/" } } },
-    want = "permissions.additionalDirectories",
-  },
-  { name = "allow_rules", policy = { permissions = { allow = { "Read(//**)" } } }, want = "permissions.allow" },
-  { name = "console_login", policy = { forceLoginMethod = "console" }, want = "forceLoginMethod" },
-  { name = "unknown_key", policy = { sandbox = { enabled = false } }, want = "sets sandbox" },
-  { name = "no_settings_object", policy = "anything", want = "not a settings object" },
-}) do
-  case("managed_policy_with_" .. c.name .. "_is_refused", function()
-    has(handshake_problem({ settings = settings_answer(c.policy) }) or "", c.want)
-  end)
-end
-
-for _, c in ipairs({
-  {
-    name = "extra_readable_directories",
-    edit = function(e)
-      e.permissions.additionalDirectories = { "/srv" }
-    end,
-    want = "also read /srv",
-  },
-  {
-    name = "outside_reads_allowed",
-    edit = function(e)
-      e.permissions.blockReadsOutsideWorkingDirectories = nil
-    end,
-    want = "outside the project",
-  },
-  {
-    name = "a_dropped_deny_rule",
-    edit = function(e)
-      e.permissions.deny = {}
-    end,
-    want = "Read(./.env*)",
-  },
-  {
-    name = "a_skipped_source",
-    edit = function(_, sources)
-      sources[#sources + 1] = { source = "userSettings", settings = {} }
-    end,
-    want = "userSettings",
-  },
-}) do
-  case("merged_settings_with_" .. c.name .. "_are_refused", function()
-    has(handshake_problem({ settings = settings_answer(nil, c.edit) }) or "", c.want)
-  end)
-end
-
--- Claude Code leaves invalid settings out of its response, so a policy with
--- a bad entry could do more than the response shows. The message can quote
--- the value, so only the file and the key are shown.
-for _, c in ipairs({
-  {
-    name = "a_listed_error",
-    errors = {
-      { file = "/etc/claude-code/managed-settings.json", path = "permissions.defaultMode", message = "bad TOKEN_42" },
-    },
-    want = "rejected some settings as invalid",
-  },
-  { name = "an_unreadable_error_list", errors = "TOKEN_42", want = "rejected some settings as invalid" },
-}) do
-  case("settings_with_" .. c.name .. "_are_refused", function()
-    local answer = settings_answer()
-    answer.errors = c.errors
-    local problem = handshake_problem({ settings = answer }) or ""
-    has(problem, c.want)
-    assert(not problem:find("TOKEN_42", 1, true), "the error message shows the secret: " .. problem)
-  end)
-end
-
--- Values that pass a table check but carry entries maki would not read.
-for _, c in ipairs({
-  {
-    name = "sources_as_an_object",
-    reshape = function(answer)
-      answer.sources = { flags = answer.sources[1] }
-    end,
-    want = "did not report its settings",
-  },
-  {
-    name = "extra_roots_as_an_object",
-    reshape = function(answer)
-      answer.effective.permissions.additionalDirectories = { root = "/" }
-    end,
-    want = "can also read",
-  },
-}) do
-  case("settings_with_" .. c.name .. "_are_refused", function()
-    local answer = settings_answer()
-    c.reshape(answer)
-    has(handshake_problem({ settings = answer }) or "", c.want)
-  end)
-end
 
 local function write_file(path, content)
   maki.fs.mkdir(maki.fs.dirname(path), { parents = true })
@@ -847,7 +746,7 @@ end
 -- dropped and no second ./ added.
 case("settings_deny_the_defaults_and_the_configured_paths", function()
   local settings = worker_settings(
-    worker_spec(READ, nil, launch.deny_rules(assert(path_utils.denied_paths(" config/prod.yml , ./certs/** ,, "))))
+    worker_spec(READ, nil, confine.deny_rules(assert(path_utils.denied_paths(" config/prod.yml , ./certs/** ,, "))))
   )
   eq(
     table.concat(settings.permissions.deny, " "),
@@ -879,31 +778,6 @@ case("a_missing_handshake_answer_is_refused", function()
   has(problem or "", "did not answer its settings request")
 end)
 
-for _, c in ipairs({
-  { name = "an_unknown_answer", id = "unknown", want = "never sent" },
-  { name = "a_repeated_answer", id = "account", want = "answered it twice" },
-  { name = "a_refused_answer", id = "settings", subtype = "error", want = "rejected the settings request" },
-}) do
-  case("a_worker_handshake_refuses_" .. c.name, function()
-    local handshake = launch.worker_handshake(worker_spec())
-    handshake_answer(handshake, "account", account_answer())
-    local complete, problem = handshake_answer(handshake, c.id, {}, c.subtype)
-    eq(complete, nil)
-    has(problem or "", c.want)
-  end)
-end
-
-case("a_worker_checks_the_account_before_the_policy", function()
-  local handshake = launch.worker_handshake(worker_spec())
-  local pending, problem = handshake_answer(handshake, "account", account_answer({ apiProvider = "other" }))
-  eq(pending, false)
-  eq(problem, nil)
-  handshake_answer(handshake, "settings", {})
-  local complete, failure = handshake_answer(handshake, "hooks", HOOKS_OFF)
-  eq(complete, nil)
-  has(failure or "", "instead of Anthropic")
-end)
-
 for _, accepted in ipairs({ false, true }) do
   case("a_hook_starting_stops_the_run" .. (accepted and "_after_init" or "_before_init"), function()
     local stream = accepted and started() or fresh()
@@ -921,7 +795,7 @@ case("usage_after_a_rejected_init_is_kept_without_accepting_output", function()
     cache_creation_input_tokens = 300,
   }))
   assert(step.stop)
-  eq(stream.accepted, false)
+  eq(stream:accepted(), false)
   eq(stream:usage_line(), "at least: 7 in · 2.0k cache read · 300 cache write · out unknown")
 end)
 
@@ -948,65 +822,16 @@ for _, c in ipairs({
   end)
 end
 
-for _, c in ipairs({
-  { name = "api_key", init = { apiKeySource = "ANTHROPIC_API_KEY" }, want = "ANTHROPIC_API_KEY" },
-  { name = "missing_key_source", init = { apiKeySource = MISSING }, want = "API key source" },
-  { name = "other_version", init = { claude_code_version = "2.1.285" }, want = "2.1.285" },
-  { name = "bypass_mode", init = { permissionMode = "bypassPermissions" }, want = "bypassPermissions" },
-  { name = "extra_tool", init = { tools = { "Glob", "Grep", "Read", "Bash" } }, want = 'has the tool "Bash"' },
-  { name = "missing_tool", init = { tools = { "Grep", "Read" } }, want = "does not have the tool Glob" },
-  { name = "no_tools", init = { tools = {} }, want = "did not list its tools" },
-  { name = "mcp_server", init = { mcp_servers = { { name = "x", status = "connected" } } }, want = "MCP" },
-  {
-    name = "installed_plugin",
-    init = { plugins = { BUILTIN_PLUGINS[1], { name = "p", path = "/p", source = "p@market" } } },
-    want = "p@market",
-  },
-  { name = "no_plugin_list", init = { plugins = MISSING }, want = "did not list its plugins" },
-  -- A table check would pass an object, and `ipairs` would skip its entries.
-  { name = "tools_as_an_object", init = { tools = { tool = "Bash" } }, want = "did not list its tools" },
-  {
-    name = "mcp_servers_as_an_object",
-    init = { mcp_servers = { x = { name = "x" } } },
-    want = "MCP servers are not just",
-  },
-  {
-    name = "plugins_as_an_object",
-    init = { plugins = { p = { source = "p@market" } } },
-    want = "did not list its plugins",
-  },
-  { name = "other_cwd", init = { cwd = "/elsewhere" }, want = "/elsewhere" },
-  -- Without acceptEdits, every edit waits for an approval that never comes.
-  {
-    name = "a_code_worker_in_default_mode",
-    worker = launch.WORKERS.code,
-    init = { tools = launch.WORKERS.code.tools },
-    want = 'permission mode "default"',
-  },
-  {
-    name = "a_code_worker_without_bash",
-    worker = launch.WORKERS.code,
-    init = { permissionMode = "acceptEdits", tools = { "Edit", "Glob", "Grep", "Read", "Write" } },
-    want = "does not have the tool Bash",
-  },
-  {
-    name = "a_code_worker_without_edit",
-    worker = launch.WORKERS.code,
-    init = { permissionMode = "acceptEdits", tools = { "Bash", "Glob", "Grep", "Read", "Write" } },
-    want = "does not have the tool Edit",
-  },
-}) do
-  case("init_with_" .. c.name .. "_stops_the_run", function()
-    local stream = fresh(c.worker)
-    has(stream:feed(init_event(c.init)).stop or "", c.want)
-    eq(stream.accepted, false)
-  end)
-end
+case("native_init_refusals_reach_the_plugin", function()
+  local stream = fresh()
+  has(stream:feed(init_event({ apiKeySource = "ANTHROPIC_API_KEY" })).stop or "", "ANTHROPIC_API_KEY")
+  eq(stream:accepted(), false)
+end)
 
 case("a_bad_init_after_a_good_one_still_stops", function()
   local stream = started()
   has(stream:feed(init_event({ apiKeySource = "apiKeyHelper" })).stop, "apiKeyHelper")
-  eq(stream.accepted, false)
+  eq(stream:accepted(), false)
 end)
 
 case("tool_uses_become_progress_lines_relative_to_cwd", function()
@@ -1246,7 +1071,7 @@ end)
 
 case("read_workers_deny_project_agent_and_git_settings", function()
   for _, path in ipairs({ ".git/config", ".maki/**", ".claude/settings*.json" }) do
-    has(table.concat(launch.deny_rules(assert(path_utils.denied_paths(""))), "\n"), "Read(./" .. path .. ")")
+    has(table.concat(confine.deny_rules(assert(path_utils.denied_paths(""))), "\n"), "Read(./" .. path .. ")")
   end
 end)
 

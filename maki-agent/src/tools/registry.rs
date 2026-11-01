@@ -13,6 +13,7 @@ use bitflags::bitflags;
 use maki_config::Permission;
 use serde_json::{Value, json};
 
+use super::ToolKind;
 use crate::template::Vars;
 use crate::{BufferSnapshot, ToolOutput};
 
@@ -504,13 +505,10 @@ impl ToolRegistry {
         let snapshot = self.tools.load();
         let mut out = Vec::with_capacity(snapshot.len());
         for entry in snapshot.iter() {
-            let admitted = ctx.filter.admits_definition(
+            let admitted = ctx.filter.admits(
                 entry.name(),
-                entry.tool.audience(),
+                ToolKind::of(entry.name(), self, ctx.local_tools),
                 ctx.audience,
-                ctx.local_tools
-                    .and_then(|tools| tools.get(entry.name()))
-                    .map(|tool| tool.audience),
             );
             if !admitted {
                 continue;

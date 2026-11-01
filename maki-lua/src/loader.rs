@@ -1466,7 +1466,7 @@ mod tests {
         let unsupported = BundledPlugin {
             name: bundled.name,
             dir: bundled.dir.clone(),
-            private_api: Some(crate::api::claude_code_unsupported::create_private_module),
+            private_api: Some(crate::api::claude_code::create_unsupported_module),
         };
         let source = bundled
             .dir

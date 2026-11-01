@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use flume::{Receiver, Sender};
-use maki_lua_macro::{lua_fn, lua_table, lua_value};
+use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::process;
 use maki_storage::id::MakiId;
 use mlua::{
@@ -15,16 +15,13 @@ use mlua::{
 use crate::api::fs::expand_tilde;
 use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
 use crate::api::util::convert::TableExt;
-use crate::api::util::pair::{Pair, err_pair, try_pair};
+use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::plugin_permissions::{Permission, PluginPermissions, denied_error};
 use crate::runtime::{active_task_id, job_task_id, strip_traceback, with_jobs};
 
 mod jobs;
 pub use jobs::set_shell_preference;
-use jobs::{
-    CallbackUpdate, CallbackUpdates, JobCommand, JobSnapshot, MAX_STDIN_BYTES, Redirect,
-    STDIN_FULL_ERR, STDIN_OVERSIZED_ERR,
-};
+use jobs::{CallbackUpdate, CallbackUpdates, JobCommand, JobSnapshot, Redirect};
 pub(crate) use jobs::{JobEvent, JobOwner, JobSpec, JobStore};
 
 const MAX_TAIL_LINES: usize = 1024;
@@ -113,8 +110,8 @@ impl Drop for CheckedOutReceiver {
 ///     stdout line. Bytes that are not UTF-8 become U+FFFD, where Neovim
 ///     passes the raw bytes.
 ///   `on_stderr` (function?) the same for each stderr line, with `"stderr"`.
-///   `on_exit` (function?) called with `(job_id, code, "exit", timed_out)` when the
-///     process stops.
+///   `on_exit` (function?) called with `(job_id, code, "exit", timed_out, stderr_tail)` when the
+///     process stops. `stderr_tail` holds up to 10 lines, each capped at 4096 bytes.
 ///   `stdout` (string|false?) append stdout to this path, or `false` to
 ///     discard it.
 ///   `stderr` (string|false?) same for stderr; both may name one path.
@@ -486,9 +483,8 @@ fn jobstop(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<()> {
 /// Unread data stays in memory. A descendant can retain stdin after the job
 /// exits. Use `guard` to stop that descendant and release the data.
 ///
-/// `chansend_limits.max_bytes` bounds the queue, including a write in progress.
-/// `chansend_limits.full_error` means wait for the child to consume input and retry.
-/// `chansend_limits.oversized_error` means split the write into smaller chunks.
+/// Waits for queue capacity while the child consumes input. Large writes are
+/// split internally, and the queue includes bytes being written to the pipe.
 ///
 /// @param id integer Job id returned by `jobstart`.
 /// @param data string|table Text to write, or a list of lines.
@@ -498,13 +494,23 @@ fn jobstop(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<()> {
 /// maki.fn.chansend(id, "hello\n")
 /// maki.fn.chanclose(id, "stdin")
 #[lua_fn(guard = Run)]
-fn chansend(lua: &Lua, #[ctx] plugin: Arc<str>, id: u32, data: Value) -> LuaResult<Pair<usize>> {
-    let bytes = chansend_bytes(data)?;
-    let task_id = active_task_id(lua);
-    match with_jobs(lua, |store| store.send(id, task_id, &plugin, bytes)) {
-        Ok(len) => Ok((Some(len), None)),
-        Err(e) => Ok(err_pair(e)),
-    }
+async fn chansend(
+    lua: Lua,
+    #[ctx] plugin: Arc<str>,
+    id: u32,
+    data: Value,
+) -> LuaResult<Pair<usize>> {
+    let lines = match &data {
+        Value::String(_) => Vec::new(),
+        other => chansend_bytes(other.clone())?,
+    };
+    let task_id = active_task_id(&lua);
+    let writer = try_pair!(with_jobs(&lua, |store| store.stdin_writer(id, task_id, &plugin)));
+    let result = match data {
+        Value::String(text) => writer.send(&text.as_bytes()).await,
+        _ => writer.send(&lines).await,
+    };
+    Ok(pair(result))
 }
 
 /// List items can contain arbitrary bytes, as in Neovim. A newline inside an item becomes NUL.
@@ -696,16 +702,28 @@ pub(crate) async fn deliver_job_event(lua: &Lua, job_id: u32, event: &JobEvent) 
             .callback_key(job_id, event)
             .and_then(|key| lua.registry_value::<Function>(key).ok())
     });
-    if let JobEvent::Exit(code, _) = event {
-        with_jobs(lua, |store| store.complete(lua, job_id, *code));
-    }
+    let stderr_tail = if let JobEvent::Exit(code, _) = event {
+        with_jobs(lua, |store| {
+            let tail = store.exit_stderr(job_id);
+            store.complete(lua, job_id, *code);
+            tail
+        })
+    } else {
+        Vec::new()
+    };
     match callback {
-        Some(callback) => call_back(lua, callback, job_id, event).await,
+        Some(callback) => call_back(lua, callback, job_id, event, stderr_tail).await,
         None => Ok(()),
     }
 }
 
-async fn call_back(lua: &Lua, callback: Function, job_id: u32, event: &JobEvent) -> LuaResult<()> {
+async fn call_back(
+    lua: &Lua,
+    callback: Function,
+    job_id: u32,
+    event: &JobEvent,
+    stderr_tail: Vec<String>,
+) -> LuaResult<()> {
     let arg = match event {
         JobEvent::Stdout(line) | JobEvent::Stderr(line) => Value::String(lua.create_string(line)?),
         JobEvent::Exit(code, _) => Value::Integer((*code).into()),
@@ -713,6 +731,7 @@ async fn call_back(lua: &Lua, callback: Function, job_id: u32, event: &JobEvent)
     let mut args = (job_id, arg, event.name()).into_lua_multi(lua)?;
     if let JobEvent::Exit(_, timed_out) = event {
         args.push_back(Value::Boolean(*timed_out));
+        args.push_back(Value::Table(lua.create_sequence_from(stderr_tail)?));
     }
     lua.create_thread(callback)?.into_async::<()>(args)?.await
 }
@@ -808,17 +827,6 @@ fn winrestview(
     Ok((Some(true), None))
 }
 
-/// Stdin queue limits: `max_bytes` includes a write in progress, `full_error`
-/// means retry later, and `oversized_error` means split the write.
-#[lua_value]
-fn chansend_limits(lua: &Lua) -> LuaResult<Table> {
-    let limits = lua.create_table()?;
-    limits.set("max_bytes", MAX_STDIN_BYTES)?;
-    limits.set("full_error", STDIN_FULL_ERR)?;
-    limits.set("oversized_error", STDIN_OVERSIZED_ERR)?;
-    Ok(limits)
-}
-
 lua_table! {
     /// Process and environment helpers, modeled after Neovim's `vim.fn` job
     /// control. Use these to run shell commands, wait for output, and check
@@ -838,7 +846,7 @@ lua_table! {
         jobstart(perms, plugin, fs_write), jobstop(perms, plugin), jobforget(perms, plugin),
         jobwait(perms, plugin), jobinfo(perms, plugin), joblist(perms, plugin),
         jobattach(perms, plugin), jobfind(perms, plugin),
-        chansend(perms, plugin), chansend_limits, chanclose(perms, plugin),
+        chansend(perms, plugin), chanclose(perms, plugin),
         executable(perms), exepath(perms),
         winsaveview(tx), winrestview(tx),
     ]
@@ -955,15 +963,15 @@ mod tests {
 
     #[test_case(JobEvent::Stdout(CALLBACK_LINE.into()), 3 ; "stdout")]
     #[test_case(JobEvent::Stderr(CALLBACK_LINE.into()), 3 ; "stderr")]
-    #[test_case(JobEvent::Exit(0, false), 4 ; "normal_exit")]
-    #[test_case(JobEvent::Exit(1, true), 4 ; "timeout_exit")]
+    #[test_case(JobEvent::Exit(0, false), 5 ; "normal_exit")]
+    #[test_case(JobEvent::Exit(1, true), 5 ; "timeout_exit")]
     fn job_callbacks_keep_their_argument_counts(event: JobEvent, count: usize) {
         let lua = Lua::new();
         let callback = lua
             .load("return function(...) args = table.pack(...) end")
             .eval()
             .unwrap();
-        smol::block_on(call_back(&lua, callback, 1, &event)).unwrap();
+        smol::block_on(call_back(&lua, callback, 1, &event, Vec::new())).unwrap();
         let args: Table = lua.globals().get("args").unwrap();
         assert_eq!(args.get::<usize>("n").unwrap(), count);
         assert_eq!(args.get::<String>(3).unwrap(), event.name());

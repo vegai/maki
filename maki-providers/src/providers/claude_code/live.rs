@@ -20,7 +20,7 @@ use super::checks::launch_env;
 use super::error::Error;
 use super::run::{Exchange, Launch, Limits, Request, Thinking, models, request};
 use super::transcript::{BATCH_CALL_TOOL, BATCH_CALLS, BATCH_TOOL};
-use super::validation::login_dir;
+use super::worker::login_dir;
 use super::{SLUG, agent_error, utf8_vars};
 use crate::model::Model;
 use crate::process::find_program;

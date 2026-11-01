@@ -2,14 +2,14 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::env;
-use std::fs;
+use std::fs::{self, File};
 use std::future::Future;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 use std::sync::{Arc, LazyLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use maki_agent::ToolOutput;
 use maki_agent::tools::{ToolContext, ToolRegistry};
@@ -23,6 +23,19 @@ use smol::future::or;
 #[path = "../common/environment.rs"]
 #[allow(dead_code)]
 pub mod environment;
+
+pub const STALE_AGE: Duration = Duration::from_secs(48 * 3600);
+pub const CONTROL_REPLY: &str = r#"reply() { printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":%s}}\n' "$1" "$2"; }"#;
+pub const ACCOUNT_SUBSCRIPTION: &str = r#"{"current_permission_mode":"default","account":{"apiProvider":"firstParty","subscriptionType":"Claude Pro"},"models":[{"value":"sonnet","resolvedModel":"claude-sonnet-5"},{"value":"opus","resolvedModel":"claude-opus-5-5"},{"value":"haiku","resolvedModel":"claude-haiku-4-5-20251001"}]}"#;
+pub const HOOKS_OFF: &str =
+    r#"{"hooks":[],"events":[],"policy":{"allDisabled":true,"policyHookCount":0}}"#;
+
+pub fn backdate(path: &Path) {
+    File::open(path)
+        .unwrap()
+        .set_modified(SystemTime::now() - STALE_AGE)
+        .unwrap();
+}
 
 const SWEEP_LOCK: &str = ".sweep.lock";
 
@@ -162,6 +175,10 @@ pub fn write(path: &Path, content: &str) {
 pub fn executable(dir: &Path, name: &str, script: &str) -> PathBuf {
     let path = dir.join(name);
     let replacement = dir.join(format!(".{name}.new"));
+    let script = script
+        .replace("@CONTROL_REPLY@", CONTROL_REPLY)
+        .replace("@ACCOUNT_SUBSCRIPTION@", ACCOUNT_SUBSCRIPTION)
+        .replace("@HOOKS_OFF@", HOOKS_OFF);
     fs::write(&replacement, script).unwrap();
     fs::set_permissions(&replacement, fs::Permissions::from_mode(OWNER_ONLY)).unwrap();
     fs::rename(replacement, &path).unwrap();
@@ -260,6 +277,19 @@ pub async fn tool_reply(
         ToolOutput::Plain(s) | ToolOutput::Markdown(s) => s.text,
         other => panic!("incorrect output: {other:?}"),
     })
+}
+
+pub fn reply(
+    reg: &ToolRegistry,
+    ctx: &ToolContext,
+    tool: &str,
+    input: Value,
+) -> Result<String, String> {
+    output(tool_reply(reg, ctx, tool, input))
+}
+
+pub fn output<T>(work: impl Future<Output = T>) -> T {
+    smol::block_on(within(DEADLINE, work))
 }
 
 /// Returns a shell loop that makes a fake wait until `release` exists.

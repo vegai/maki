@@ -1,19 +1,16 @@
 use super::super::MAX_EVENT_BYTES;
 use super::super::error::Error;
 use super::super::mcp::Handoff;
-use super::super::validation::handshake_input;
 use super::super::within;
-use crate::process::GroupSignals;
+use super::super::worker::handshake_input;
 use crate::process::guard;
-use crate::process::{pid_of, wait_without_reaping};
+use crate::process::{ChildExit, ChildGuard};
 use flume::Receiver;
 use futures_lite::future;
 use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use futures_lite::stream;
 use futures_lite::{FutureExt, Stream, StreamExt};
-use rustix::io::Errno;
-use rustix::process::{Signal, kill_process};
-use smol::process::{Child, ChildStdin, ChildStdout, Command};
+use smol::process::{ChildStderr, ChildStdin, ChildStdout, Command};
 use smol::{Task, Timer};
 use std::collections::VecDeque;
 use std::io;
@@ -23,7 +20,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use thiserror::Error as ThisError;
 use tracing::debug;
-use tracing::warn;
 
 pub(super) const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 const STDERR_DRAIN: Duration = Duration::from_secs(1);
@@ -37,32 +33,14 @@ struct EventTooLarge;
 
 /// Kills the group on drop until reaping starts.
 pub(super) struct Group {
-    child: Child,
-    signals: GroupSignals,
-    signalled: bool,
+    child: ChildGuard,
     exit_status: Option<ExitStatus>,
     _lifetime: UnixStream,
 }
 
-enum LeaderExit {
-    Exited,
-    WaitFailed,
-    TimedOut,
-}
-
-impl From<Option<bool>> for LeaderExit {
-    fn from(exited: Option<bool>) -> Self {
-        match exited {
-            Some(true) => Self::Exited,
-            Some(false) => Self::WaitFailed,
-            None => Self::TimedOut,
-        }
-    }
-}
-
 impl Group {
     pub(super) fn id(&self) -> u32 {
-        self.signals.id()
+        self.child.id()
     }
 
     pub(super) fn pipes(
@@ -74,8 +52,9 @@ impl Group {
         ),
         Error,
     > {
-        let lines = stdout_lines(self.child.stdout.take())?;
-        Ok((self.child.stdin.take(), lines))
+        let child = self.child.child_mut().ok_or(Error::NoStdout)?;
+        let lines = stdout_lines(child.stdout.take())?;
+        Ok((child.stdin.take(), lines))
     }
 
     pub(super) async fn spawn(command: process::Command) -> Result<Self, Error> {
@@ -84,64 +63,35 @@ impl Group {
             .map_err(Error::io("start Claude Code"))
     }
 
-    /// Only while the unreaped leader's pid still names the group.
     pub(super) fn kill(&mut self) {
-        if self.signals.is_enabled() {
-            self.signalled = true;
-            self.signals.kill();
-        }
+        self.child.kill();
     }
-
     pub(super) fn terminate(&mut self) {
-        if !self.signals.is_enabled() {
-            return;
-        }
-        self.signalled = true;
-        if let Some(pid) = pid_of(self.child.id())
-            && let Err(error) = kill_process(pid, Signal::TERM)
-            && error != Errno::SRCH
-        {
-            warn!(pid = self.child.id(), %error, "could not request Claude Code shutdown");
-        }
+        self.child.terminate();
     }
 
     /// Kill remaining group members before the leader reap so the pid cannot identify another
     /// group.
     pub(super) async fn wait(&mut self, deadline: Instant) -> Result<ExitStatus, Error> {
-        let exited = self.exited_by(deadline).await;
-        let natural_exit = matches!(exited, LeaderExit::Exited) && !self.signalled;
-        if !matches!(exited, LeaderExit::WaitFailed) {
+        let exited = self.child.exited_by(deadline).await;
+        let natural_exit = matches!(exited, ChildExit::Exited) && !self.child.was_signalled();
+        if !matches!(exited, ChildExit::WaitFailed) {
             self.kill();
         }
-        // The status future may reap even if its caller stops waiting. Disable further
-        // signals before it starts, while the leader's pid still belongs to the group.
-        self.signals.disable();
-        let status = within(Instant::now() + SHUTDOWN_GRACE, self.child.status())
-            .await
-            .ok_or(Error::ReapLate)?;
-        self.exit_status = if natural_exit {
-            status.as_ref().ok().copied()
-        } else {
-            None
-        };
-        if matches!(exited, LeaderExit::TimedOut) {
+        let status = self.child.reap(Instant::now() + SHUTDOWN_GRACE).await;
+        self.exit_status = natural_exit
+            .then(|| status.as_ref().ok().copied())
+            .flatten();
+        if matches!(exited, ChildExit::TimedOut) {
             return Err(Error::ExitLate);
         }
-        status.map_err(Error::io("reap Claude Code"))
-    }
-
-    /// Does not reap the leader.
-    async fn exited_by(&self, deadline: Instant) -> LeaderExit {
-        let pid = self.child.id();
-        within(deadline, smol::unblock(move || wait_without_reaping(pid)))
-            .await
-            .into()
-    }
-}
-
-impl Drop for Group {
-    fn drop(&mut self) {
-        self.kill();
+        status.map_err(|source| {
+            if source.kind() == io::ErrorKind::TimedOut {
+                Error::ReapLate
+            } else {
+                Error::io("reap Claude Code")(source)
+            }
+        })
     }
 }
 
@@ -154,9 +104,7 @@ fn spawn_piped(command: process::Command) -> io::Result<Group> {
         .stderr(Stdio::piped())
         .spawn()?;
     Ok(Group {
-        signals: GroupSignals::new(child.id()),
-        child,
-        signalled: false,
+        child: ChildGuard::new(child),
         exit_status: None,
         _lifetime: lifetime,
     })
@@ -189,10 +137,15 @@ pub(super) async fn supervised<T>(
 ) -> Result<T, Error> {
     let mut group = Group::spawn(command).await?;
     debug!(pid = group.id(), "claude-code: process started");
-    let stderr = watch_stderr(&mut group.child);
+    let stderr = watch_stderr(
+        group
+            .child
+            .child_mut()
+            .and_then(|child| child.stderr.take()),
+    );
     let result = work(&mut group).await;
-    if group.signals.is_enabled() {
-        drop(group.child.stdin.take());
+    if group.child.can_signal() {
+        drop(group.child.child_mut().and_then(|child| child.stdin.take()));
         group.terminate();
         if matches!(
             group.wait(Instant::now() + SHUTDOWN_GRACE).await,
@@ -205,10 +158,7 @@ pub(super) async fn supervised<T>(
         Ok(value) => Ok(value),
         Err(error) => {
             let error = match group.exit_status {
-                Some(status) if !error.has_exit_status() => Error::WithExit {
-                    error: Box::new(error),
-                    status,
-                },
+                Some(status) if !error.has_exit_status() => error.with_exit(status),
                 _ => error,
             };
             Err(stderr.explain(error).await)
@@ -216,9 +166,9 @@ pub(super) async fn supervised<T>(
     }
 }
 
-fn watch_stderr(child: &mut Child) -> Stderr {
+fn watch_stderr(stderr: Option<ChildStderr>) -> Stderr {
     let tail: StderrTail = Arc::default();
-    let reader = child.stderr.take().map(|stderr| {
+    let reader = stderr.map(|stderr| {
         let lines = Arc::clone(&tail);
         // A line that is not UTF-8 must not stop the reader, or Claude Code
         // blocks once its stderr fills the pipe.
@@ -270,10 +220,7 @@ fn with_stderr(error: Error, tail: &StderrTail) -> Error {
         return error;
     }
     let shown: Vec<&str> = lines.iter().map(String::as_str).collect();
-    Error::WithStderr {
-        error: Box::new(error),
-        stderr: shown.join("\n"),
-    }
+    error.with_stderr(shown.join("\n"))
 }
 
 pub(super) fn unreadable(source: io::Error) -> Error {
@@ -494,24 +441,14 @@ mod tests {
 
 #[cfg(test)]
 mod process_tests {
-    use std::env;
-    use std::os::unix::process::ExitStatusExt;
-    use std::path::Path;
     use std::process::Command;
     use std::time::Instant;
 
     use futures_lite::io::{AsyncBufReadExt, BufReader};
-    use rustix::process::{Pid, Signal, kill_process};
+
     use test_case::test_case;
 
-    use crate::providers::claude_code::linux::WAIT;
-    use crate::providers::claude_code::linux::fake::Fake;
-
-    use super::super::launch::command;
-    use super::{Error, Group, SHUTDOWN_GRACE, supervised};
-
-    const SLEEP: &str = "/bin/sleep";
-    const LONG_SLEEP_SECS: &str = "60";
+    use super::{Error, SHUTDOWN_GRACE, supervised};
 
     const PROCESS_ERROR: &str = "protocol failure";
     const PROCESS_STDERR: &str = "diagnostic stderr";
@@ -534,7 +471,7 @@ mod process_tests {
         let error = smol::block_on(supervised::<()>(command, async |group| {
             if shutdown {
                 let mut line = String::new();
-                BufReader::new(group.child.stdout.as_mut().unwrap())
+                BufReader::new(group.child.child_mut().unwrap().stdout.as_mut().unwrap())
                     .read_line(&mut line)
                     .await
                     .unwrap();
@@ -551,15 +488,14 @@ mod process_tests {
         let text = error.to_string();
         assert!(text.contains(PROCESS_ERROR), "{text}");
         assert!(text.contains(PROCESS_STDERR), "{text}");
-        if shutdown {
-            assert!(
-                matches!(&error, Error::WithStderr { error, .. } if matches!(**error, Error::Failed(_)))
-            );
-        } else {
-            assert!(
-                matches!(&error, Error::WithStderr { error, .. } if matches!(**error, Error::WithExit { status, .. } if status.code() == Some(FAIL_CODE)))
-            );
-        }
+        let Error::Context(failure) = &error else {
+            panic!("{error:?}")
+        };
+        assert_eq!(failure.stderr, PROCESS_STDERR);
+        assert_eq!(
+            failure.exit.map(|status| status.code()),
+            (!shutdown).then_some(Some(FAIL_CODE))
+        );
         assert!(matches!(error.cause(), Error::Failed(message) if message == PROCESS_ERROR));
     }
 
@@ -573,8 +509,7 @@ mod process_tests {
         }))
         .unwrap_err();
         assert!(
-            matches!(&error, Error::WithStderr { error, .. }
-            if matches!(**error, Error::Interrupted(ref inner) if matches!(**inner, Error::ExitedEarly(_)))),
+            matches!(&error, Error::Context(failure) if failure.interrupted && matches!(*failure.cause, Error::ExitedEarly(_))),
             "{error:?}"
         );
         assert!(error.temporary().is_some());
@@ -587,7 +522,7 @@ mod process_tests {
         command.args(["-c", "printf 'ready\n'; read reply"]);
         let error = smol::block_on(supervised::<()>(command, async |group| {
             let mut line = String::new();
-            BufReader::new(group.child.stdout.as_mut().unwrap())
+            BufReader::new(group.child.child_mut().unwrap().stdout.as_mut().unwrap())
                 .read_line(&mut line)
                 .await
                 .unwrap();
@@ -604,27 +539,5 @@ mod process_tests {
             matches!(error, Error::Failed(ref message) if message == PROCESS_ERROR),
             "{error:?}"
         );
-    }
-
-    /// Marking the leader reaped must prevent signalling a pid that may identify another group.
-    #[test_case(false ; "sigkill")]
-    #[test_case(true ; "sigterm")]
-    fn a_reaped_group_is_never_signalled(graceful: bool) {
-        let here = env::current_dir().unwrap();
-        let args = [LONG_SLEEP_SECS.to_owned()];
-        let sleep = command(Path::new(SLEEP), &Fake::env(), &here, &args);
-        let mut group = smol::block_on(Group::spawn(sleep)).unwrap();
-        group.signals.disable();
-
-        if graceful {
-            group.terminate();
-        } else {
-            group.kill();
-        }
-
-        let pid = Pid::from_raw(group.child.id().try_into().unwrap()).unwrap();
-        kill_process(pid, Signal::USR1).unwrap();
-        let status = smol::block_on(group.wait(Instant::now() + WAIT)).unwrap();
-        assert_eq!(status.signal(), Some(Signal::USR1.as_raw()));
     }
 }

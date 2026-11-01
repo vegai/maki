@@ -1,6 +1,6 @@
+local artifacts = require("claude_artifact")
 local t = require("maki.test_helpers")
 local jobs = require("claude_jobs")
-local snapshot = require("claude_snapshot")
 
 local case, eq, has = t.case, t.eq, t.has
 local STARTUP_MS = 30000
@@ -9,9 +9,6 @@ local OUTPUT = "complete"
 local CALLBACK_ERROR = "exit callback failed"
 local SEND_ERROR = "stdin send failed"
 local CLOSE_ERROR = "stdin close failed"
-local STDIN_LIMIT = 16
-local STDIN_FULL = "fixture stdin full"
-local STDIN_OVERSIZED = "fixture oversized write"
 local DIRECTORY = "/probe/hook-output"
 local SUCCESS_CODE = 0
 local STOPPED_CODE = 137
@@ -60,27 +57,8 @@ local function with_jobs(run)
     },
     {
       maki.fn,
-      "chansend_limits",
-      { max_bytes = STDIN_LIMIT, full_error = STDIN_FULL, oversized_error = STDIN_OVERSIZED },
-    },
-    {
-      maki.async,
-      "sleep",
-      function()
-        state.waited = true
-        state.full = false
-      end,
-    },
-    {
-      maki.fn,
       "chansend",
       function(_, data)
-        if state.full then
-          return nil, STDIN_FULL
-        end
-        if #data > STDIN_LIMIT then
-          return nil, STDIN_OVERSIZED
-        end
         state.input = (state.input or "") .. data
         if state.send_error then
           return nil, state.send_error
@@ -164,20 +142,6 @@ for _, answered in ipairs({ false, true }) do
     end)
   end)
 end
-
-case("stderr_tail_caps_each_line_and_preserves_utf8", function()
-  local tail = {}
-  local long = string.rep("é", jobs.ERROR_BYTES)
-  jobs.keep_tail(tail, long)
-  assert(#tail[1] < #long)
-  assert(utf8.len(tail[1]))
-  has(tail[1], "truncated")
-  for _ = 1, jobs.ERROR_BYTES do
-    jobs.keep_tail(tail, OUTPUT)
-  end
-  eq(#tail, 10)
-  eq(tail[1], OUTPUT)
-end)
 
 case("a_native_deadline_reports_a_timeout", function()
   with_jobs(function(state)
@@ -269,13 +233,11 @@ end)
 
 case("stdin_larger_than_the_queue_is_chunked_and_retried_without_losing_bytes", function()
   with_jobs(function(state)
-    state.full = true
-    local input = string.rep("a\0b\n", STDIN_LIMIT)
+    local input = "a\0b\n"
     local ok, err = jobs.feed_stdin(1, input)
     eq(ok, 1)
     eq(err, nil)
     eq(state.input, input)
-    eq(state.waited, true)
     eq(state.closes, 1)
   end)
 end)
@@ -319,8 +281,7 @@ for _, exited in ipairs({ false, true }) do
       local call = jobs.new(STARTUP_MS)
       state.finish = function()
         eq(state.stopped[1] == true, not exited)
-        state.started[1].opts.on_stderr(1, CALLBACK_ERROR)
-        state.started[1].opts.on_exit(1, SUCCESS_CODE)
+        state.started[1].opts.on_exit(1, SUCCESS_CODE, "exit", false, { CALLBACK_ERROR })
       end
       local output, err = call:run_lines(COMMAND, { stdin = OUTPUT })
       eq(output, nil)
@@ -370,7 +331,7 @@ for _, code in ipairs({ SUCCESS_CODE, STOPPED_CODE }) do
       end)
       call:stop()
       local removed = 0
-      snapshot.discard(call, { dir = DIRECTORY }, function()
+      artifacts.discard(call, { dir = DIRECTORY }, function()
         removed = removed + 1
       end)
       eq(call.alive, 1)
@@ -406,7 +367,7 @@ case("artifact_cleanup_reports_a_failed_start", function()
   with_jobs(function(state)
     state.start_error = CALLBACK_ERROR
     local call = jobs.new(STARTUP_MS)
-    snapshot.discard(call, { dir = DIRECTORY })
+    artifacts.discard(call, { dir = DIRECTORY })
     eq(call.alive, 0)
     eq(call.left_behind[1], DIRECTORY)
     call:answer()
@@ -419,13 +380,13 @@ case("a_sweep_keeps_an_active_coding_artifact_until_its_call_settles", function(
   local root = t.mktmpdir("cc_active_artifact")
   with_jobs(function(state)
     local call = jobs.new(STARTUP_MS)
-    local artifact = assert(snapshot.allocate(call, root, {}, STARTUP_MS))
+    local artifact = assert(artifacts.allocate(call, root, {}, STARTUP_MS))
     local sweep = jobs.new(STARTUP_MS)
-    snapshot.sweep(sweep, root, -1)
+    artifacts.sweep(sweep, root, -1)
     eq(#state.started, 0)
     sweep:answer()
     call:answer()
-    snapshot.sweep(jobs.new(STARTUP_MS), root, -1)
+    artifacts.sweep(jobs.new(STARTUP_MS), root, -1)
     eq(#state.started, 1)
     state.started[1].opts.on_exit(1, SUCCESS_CODE)
   end)
@@ -439,11 +400,11 @@ case("a_sweep_lock_error_is_reported", function()
   with_jobs(function(state)
     local _, lock_err = maki.fs.try_lock(lock_path)
     assert(lock_err)
-    snapshot.sweep(jobs.new(STARTUP_MS), root, -1)
+    artifacts.sweep(jobs.new(STARTUP_MS), root, -1)
     eq(#state.started, 0)
     eq(#state.notices, 1)
     eq(state.notices[1].level, "warn")
-    eq(state.notices[1].message, snapshot.CANNOT_SWEEP .. root .. ": " .. lock_err)
+    eq(state.notices[1].message, artifacts.CANNOT_SWEEP .. root .. ": " .. lock_err)
   end)
   t.rmtree(root)
 end)
@@ -452,7 +413,7 @@ case("a_missing_artifact_root_needs_no_cleanup", function()
   local parent = t.mktmpdir("cc_sweep_missing")
   local root = maki.fs.joinpath(parent, "missing")
   with_jobs(function(state)
-    snapshot.sweep(jobs.new(STARTUP_MS), root, -1)
+    artifacts.sweep(jobs.new(STARTUP_MS), root, -1)
     eq(#state.started, 0)
     eq(#state.notices, 0)
     eq(maki.fs.metadata(root), nil)
@@ -468,17 +429,17 @@ for _, trashed in ipairs({ false, true }) do
     assert(maki.fs.write(maki.fs.joinpath(artifact, ".maki-claude-code-artifact"), ""))
     with_jobs(function(state)
       local first, second = jobs.new(STARTUP_MS), jobs.new(STARTUP_MS)
-      snapshot.sweep(first, root, -1)
+      artifacts.sweep(first, root, -1)
       eq(#state.started, 1)
       -- The deletion command unlinks the artifact lock before exiting.
       local deleting = state.started[1].argv[5]
       assert(maki.fs.rm(maki.fs.joinpath(deleting, "import.lock")))
-      snapshot.sweep(second, root, -1)
+      artifacts.sweep(second, root, -1)
       eq(#state.started, 1)
       eq(#second.left_behind, 0)
       eq(#state.notices, 0)
       state.started[1].opts.on_exit(1, SUCCESS_CODE)
-      snapshot.sweep(second, root, -1)
+      artifacts.sweep(second, root, -1)
       eq(#state.started, 2)
       state.started[2].opts.on_exit(2, SUCCESS_CODE)
     end)

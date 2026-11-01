@@ -7,8 +7,6 @@ use maki_agent::headless::Ready;
 use maki_agent::mcp::{self, McpHandle};
 use maki_agent::{AgentEvent, SessionEvents};
 use maki_config::ProjectConfig;
-use maki_providers::ThinkingConfig;
-use maki_storage::sessions::StoredThinking;
 
 pub fn start_mcp(cwd: &Path, project_config: ProjectConfig) -> Option<McpHandle> {
     let (handle, errors) = smol::block_on(mcp::start_connected(cwd, project_config));
@@ -18,11 +16,7 @@ pub fn start_mcp(cwd: &Path, project_config: ProjectConfig) -> Option<McpHandle>
     handle
 }
 
-pub fn startup(
-    receiver: &Receiver<Ready>,
-    events: &mut SessionEvents,
-    thinking: Option<StoredThinking>,
-) -> Result<(Ready, String)> {
+pub fn startup(receiver: &Receiver<Ready>, events: &mut SessionEvents) -> Result<Ready> {
     let ready = match smol::block_on(receiver.recv_async()) {
         Ok(ready) => ready,
         Err(_) => {
@@ -34,8 +28,5 @@ pub fn startup(
             return Err(eyre!("provider startup ended before it was ready"));
         }
     };
-    let thinking = ThinkingConfig::from(thinking)
-        .clamped(&ready.model)
-        .to_string();
-    Ok((ready, thinking))
+    Ok(ready)
 }

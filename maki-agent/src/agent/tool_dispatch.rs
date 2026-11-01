@@ -1,3 +1,4 @@
+use crate::tools::ToolKind;
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -409,6 +410,14 @@ enum Route<'a> {
 }
 
 impl Route<'_> {
+    fn kind(&self) -> ToolKind {
+        match self {
+            Self::Native(entry) => ToolKind::Registry(entry.tool.audience()),
+            Self::Local(tool) => ToolKind::Local(tool.audience),
+            Self::Mcp(..) | Self::ToolSearch(_) => ToolKind::External,
+        }
+    }
+
     /// Registry tools report the plugin behind them, because "native" alone
     /// tells whoever reads the metric nothing.
     fn source(&self) -> Cow<'static, str> {
@@ -471,19 +480,11 @@ fn mcp_route<'a>(mcp: &'a McpSession, name: &str) -> Option<Route<'a>> {
 }
 
 fn offered(ctx: &ToolContext, name: &str, route: &Route<'_>) -> bool {
-    match route {
-        Route::Native(entry) => offered_native(ctx, name, entry),
-        Route::Local(tool) => ctx
-            .tool_filter
-            .admits_local(name, tool.audience, ctx.audience),
-        Route::Mcp(_, qualified) => ctx.tool_filter.matches_external(qualified),
-        Route::ToolSearch(_) => ctx.tool_filter.matches_external(name),
-    }
-}
-
-fn offered_native(ctx: &ToolContext, name: &str, entry: &RegisteredTool) -> bool {
-    ctx.tool_filter
-        .admits(name, entry.tool.audience(), ctx.audience)
+    let name = match route {
+        Route::Mcp(_, qualified) => qualified,
+        _ => name,
+    };
+    ctx.tool_filter.admits(name, route.kind(), ctx.audience)
 }
 
 /// One callable name, as [`resolve`] would route it.
@@ -537,7 +538,9 @@ pub fn callable(ctx: &ToolContext) -> Vec<Callable> {
     }
     for entry in ctx.registry.iter().iter() {
         let audience = entry.tool.audience();
-        if !claimed.insert(entry.name().to_owned()) || !offered_native(ctx, entry.name(), entry) {
+        if !claimed.insert(entry.name().to_owned())
+            || !offered(ctx, entry.name(), &Route::Native(entry.clone()))
+        {
             continue;
         }
         out.push(entry_of(

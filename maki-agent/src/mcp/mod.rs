@@ -24,6 +24,7 @@ pub mod stdio;
 pub mod transport;
 
 #[cfg(unix)]
+use crate::tools::{ToolAudience, ToolKind};
 use maki_providers::process::kill_group;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -452,8 +453,11 @@ impl McpSession {
         let searchable = existing.contains(TOOL_SEARCH_TOOL_NAME);
         let idx = self.handle.index.load();
         // Without tool_search, deferred definitions would have no discovery path.
-        let defer =
-            filter.matches_external(TOOL_SEARCH_TOOL_NAME) && self.deferring(&idx, deferral);
+        let defer = filter.admits(
+            TOOL_SEARCH_TOOL_NAME,
+            ToolKind::External,
+            ToolAudience::MAIN,
+        ) && self.deferring(&idx, deferral);
         if arrival == Arrival::Late && deferral == ToolDeferral::Native && !defer {
             let mut reported = self
                 .unadvertised
@@ -464,7 +468,11 @@ impl McpSession {
                 .iter()
                 .filter(|tool| {
                     !existing.contains(tool.wire_name())
-                        && filter.matches_external(&tool.qualified_name)
+                        && filter.admits(
+                            &tool.qualified_name,
+                            ToolKind::External,
+                            ToolAudience::MAIN,
+                        )
                         && reported.insert(Arc::clone(&tool.qualified_name))
                 })
                 .map(|tool| tool.qualified_name.as_ref())
@@ -477,7 +485,8 @@ impl McpSession {
         let loaded = self.lock_loaded();
         let mut cataloged: Vec<&ToolDescriptor> = Vec::new();
         for d in idx.descriptors.iter().filter(|d| {
-            !existing.contains(d.wire_name()) && filter.matches_external(&d.qualified_name)
+            !existing.contains(d.wire_name())
+                && filter.admits(&d.qualified_name, ToolKind::External, ToolAudience::MAIN)
         }) {
             let eager =
                 d.always_load && !(arrival == Arrival::Late && deferral == ToolDeferral::Native);
@@ -560,7 +569,7 @@ impl McpSession {
             .descriptors
             .iter()
             .filter(|d| loadable(d, deferral))
-            .filter(|d| filter.matches_external(&d.qualified_name))
+            .filter(|d| filter.admits(&d.qualified_name, ToolKind::External, ToolAudience::MAIN))
             .filter_map(|d| {
                 let name = d.wire_name().to_lowercase();
                 let haystack = build_haystack(&d.definition);

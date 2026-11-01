@@ -1,6 +1,9 @@
 //! Finds a program the way `execvp` does, and signals a child's process
 //! group only while the child's pid still names that group.
 
+mod child;
+pub use child::{ChildExit, ChildGuard};
+
 #[cfg(target_os = "linux")]
 pub mod guard;
 

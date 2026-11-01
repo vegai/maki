@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime};
 
 use maki_agent::cancel::CancelToken;
 use maki_agent::permissions::{PermissionAnswer, PermissionManager, TaggedAnswer};
@@ -25,14 +24,14 @@ use test_case::test_case;
 
 use super::super::support::{
     ARTIFACT_LINE, BASH_SRC, DEADLINE, IMPORT_TOOL, LEFT_BEHIND, NOTHING_IMPORTED, ORIGINALS,
-    PWNED, SNAPSHOT_DIR, TOOL, WRITE_SRC, artifact_listing, commit_all, contents, environment,
-    executable, git, listing, load, mode_bits_hold, on_path, tool_reply, try_load,
+    PWNED, SNAPSHOT_DIR, TOOL, WRITE_SRC, artifact_listing, backdate, commit_all, contents,
+    environment, executable, git, listing, load, mode_bits_hold, on_path, reply, try_load,
     use_fixture_user, wait_until, write,
 };
 use super::{
     ANSWERS, CODE_CLAUDE_CONFIG, CODE_EDIT, CODE_HANG, CODE_HOSTILE, CODE_LONG, CODE_PROFILE,
     CODE_RETYPE, FakeClaude, HOOK_SENTINEL, HOOKS_FILE, HOOKS_OFF, HOSTILE_NAME, MODEL_ALIAS,
-    NO_ANSWER_IN_TIME, ONE_SLOT, STOPPED_EXIT, WORKING, add_a_managed_hook, ctx_in, within,
+    NO_ANSWER_IN_TIME, ONE_SLOT, STOPPED_EXIT, WORKING, add_a_managed_hook, ctx_in,
 };
 
 const LARGE_IMPORT_CHANGES: usize = 1024;
@@ -192,8 +191,6 @@ const SANITIZE_STARTED: &str = "sanitize-started";
 const LINKED_PROJECT: &str = "linked";
 const PREPARE_TOLD: &str = "could not prepare the dependencies";
 const VENV_NOTE: &str = ".venv is a Python virtual environment";
-const SECS_PER_HOUR: u64 = 3600;
-const STALE_AGE_HOURS: u64 = 48;
 const OLD_FOLDER: &str = "Ab12Cd34";
 /// A stale artifact beside the one a sweep test checks, whose removal shows
 /// that the sweep ran.
@@ -315,8 +312,16 @@ impl Coding {
         self.artifact(id).join(SNAPSHOT_DIR)
     }
 
-    fn host(&self, extra: &[(&str, Value)]) -> (Arc<ToolRegistry>, PluginHost) {
+    fn host(&self) -> (Arc<ToolRegistry>, PluginHost) {
+        self.host_with(&[], BASH_SRC)
+    }
+
+    fn host_with_options(&self, extra: &[(&str, Value)]) -> (Arc<ToolRegistry>, PluginHost) {
         self.host_with(extra, BASH_SRC)
+    }
+
+    fn read(&self, path: &str) -> String {
+        fs::read_to_string(self.project().join(path)).unwrap()
     }
 
     fn host_with(&self, extra: &[(&str, Value)], bash: &str) -> (Arc<ToolRegistry>, PluginHost) {
@@ -342,7 +347,7 @@ impl Coding {
         prompt: &str,
     ) -> (Self, Arc<ToolRegistry>, PluginHost, String) {
         let coding = Self::in_format(object_format);
-        let (reg, host) = coding.host(&[]);
+        let (reg, host) = coding.host();
         let id = artifact_id(&coding.code(&reg, prompt, &[]).unwrap());
         (coding, reg, host, id)
     }
@@ -447,7 +452,7 @@ fn run_tool(
     tool: &str,
     input: Value,
 ) -> Result<String, String> {
-    smol::block_on(within(DEADLINE, tool_reply(reg, ctx, tool, input)))
+    reply(reg, ctx, tool, input)
 }
 
 /// Returns every import temporary file in or under `dir`.
@@ -486,10 +491,7 @@ fn worker_git_metadata_is_quarantined_and_ordinary_files_import(scenario: &str, 
     coding
         .import(&reg, json!({ "id": id, "paths": [NESTED_FILE] }))
         .unwrap();
-    assert_eq!(
-        fs::read_to_string(coding.project().join(NESTED_FILE)).unwrap(),
-        NESTED_WORK
-    );
+    assert_eq!(coding.read(NESTED_FILE), NESTED_WORK);
 }
 
 #[test_case(false ; "new_repository")]
@@ -501,7 +503,7 @@ fn embedded_bare_repositories_cannot_be_imported(overwrite: bool) {
         git(&coding.project(), &["add", EXISTING_BARE_FILE]);
         git(&coding.project(), &["commit", "-qm", "fixture"]);
     }
-    let (reg, _host) = coding.host(&[]);
+    let (reg, _host) = coding.host();
     let reply = coding.code(&reg, "code_bare", &[]).unwrap();
     let id = artifact_id(&reply);
     assert!(
@@ -516,10 +518,7 @@ fn embedded_bare_repositories_cannot_be_imported(overwrite: bool) {
             .import(&reg, json!({"id": id, "paths": [EXISTING_BARE_FILE]}))
             .unwrap();
         assert!(result.contains(APPLY_MANUALLY), "{result}");
-        assert_eq!(
-            fs::read_to_string(coding.project().join(EXISTING_BARE_FILE)).unwrap(),
-            BASE_LIB
-        );
+        assert_eq!(coding.read(EXISTING_BARE_FILE), BASE_LIB);
     } else {
         assert!(
             coding
@@ -540,7 +539,7 @@ fn embedded_bare_repositories_cannot_be_imported(overwrite: bool) {
 #[test]
 fn root_bare_metadata_requires_manual_import() {
     let coding = Coding::new();
-    let (reg, _host) = coding.host(&[]);
+    let (reg, _host) = coding.host();
     let reply = coding.code(&reg, "code_bare_root", &[]).unwrap();
     assert!(reply.contains(REPOSITORY_CHANGE), "{reply}");
     let id = artifact_id(&reply);
@@ -552,10 +551,7 @@ fn root_bare_metadata_requires_manual_import() {
         .import(&reg, json!({"id": id, "paths": [IMPORTED_LIB]}))
         .unwrap();
     assert!(result.contains(APPLY_MANUALLY), "{result}");
-    assert_eq!(
-        fs::read_to_string(coding.project().join(IMPORTED_LIB)).unwrap(),
-        DIRTY_LIB
-    );
+    assert_eq!(coding.read(IMPORTED_LIB), DIRTY_LIB);
     assert!(!coding.fake.path(METADATA_MARKER).exists());
 }
 
@@ -571,7 +567,7 @@ fn sparse_checkout_omissions_stay_out_of_the_snapshot() {
         &["update-index", "--skip-worktree", SPARSE_MISSING],
     );
     fs::remove_file(project.join(SPARSE_MISSING)).unwrap();
-    let (reg, _host) = coding.host(&[]);
+    let (reg, _host) = coding.host();
     let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
     let id = artifact_id(&reply);
     assert!(!coding.snapshot(&id).join(SPARSE_MISSING).exists());
@@ -600,7 +596,7 @@ fn protected_directory_contents_never_enter_the_snapshot(path: &str) {
     write(&project.join(path), DENIED_CONTENT);
     git(&project, &["add", "-f", path]);
     git(&project, &["commit", "-qm", "protected"]);
-    let (reg, _host) = coding.host(&[]);
+    let (reg, _host) = coding.host();
     let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
     let id = artifact_id(&reply);
     assert!(!coding.snapshot(&id).join(path).exists());
@@ -612,7 +608,7 @@ fn a_coding_run_changes_a_snapshot_and_never_the_checkout() {
     let coding = Coding::new();
     let project = coding.project();
     let before = contents(&project);
-    let (reg, _host) = coding.host(&[]);
+    let (reg, _host) = coding.host();
     let reply = coding.code(&reg, CODE_EDIT, include).unwrap();
 
     for change in REPORTED_CHANGES {
@@ -724,7 +720,7 @@ fn coding_sandboxes_hide_resolved_maki_directories(variable: &str) {
     fs::create_dir_all(target.join("maki")).unwrap();
     symlink(&target, &alias).unwrap();
     environment::set(variable, &alias);
-    let (registry, _host) = coding.host(&[]);
+    let (registry, _host) = coding.host();
     coding.code(&registry, CODE_EDIT, &[]).unwrap();
     let denied = denied_reads(&sandbox_filesystem(&coding.fake));
     assert!(denied.contains(&alias.join("maki")), "{denied:?}");
@@ -739,7 +735,7 @@ fn a_tracked_folder_replaced_by_a_link_has_an_actionable_error() {
     let moved = outside.path().join("src");
     fs::rename(&source, &moved).unwrap();
     symlink(&moved, &source).unwrap();
-    let (registry, _host) = coding.host(&[]);
+    let (registry, _host) = coding.host();
     let error = coding.code(&registry, CODE_EDIT, &[]).unwrap_err();
     assert!(error.contains(TRACKED_FOLDER_LINK), "{error}");
     assert!(error.contains(source.to_str().unwrap()), "{error}");
@@ -770,7 +766,7 @@ fn a_tracked_file_can_be_replaced_by_a_directory(
     if populated {
         write(&session.join(RETYPED_CHILD), BASE_LIB);
     }
-    let (registry, _host) = coding.host(&[]);
+    let (registry, _host) = coding.host();
     let include = if include { &[RETYPED_FILE][..] } else { &[] };
     let mut ctx = ctx_in(&session, None, None);
     ctx.registry = Arc::clone(&registry);
@@ -791,7 +787,7 @@ fn uncommitted_deletions_stay_out_of_the_snapshot(subdirectory: bool) {
     } else {
         project.clone()
     };
-    let (registry, _host) = coding.host(&[]);
+    let (registry, _host) = coding.host();
     let mut ctx = ctx_in(&session, None, None);
     ctx.registry = Arc::clone(&registry);
     let reply = run_tool(
@@ -812,7 +808,7 @@ fn uncommitted_deletions_stay_out_of_the_snapshot(subdirectory: bool) {
 #[test]
 fn a_coding_call_preserves_its_artifact_in_full_output_mode() {
     let coding = Coding::new();
-    let (registry, _host) = coding.host(&[]);
+    let (registry, _host) = coding.host();
     let mut ctx = coding.ctx(&registry);
     ctx.output_mode = ToolOutputMode::Full;
     let reply = run_tool(
@@ -833,7 +829,8 @@ fn a_dependency_under_a_tracked_symlink_is_not_reported_as_copied() {
     write(&outside.path().join(DEPENDENCY), DEPENDENCY_CONTENT);
     symlink(outside.path(), coding.project().join("vendor")).unwrap();
     commit_all(&coding.project());
-    let (registry, _host) = coding.host(&[("dependencies", json!(SYMLINKED_DEPENDENCY))]);
+    let (registry, _host) =
+        coding.host_with_options(&[("dependencies", json!(SYMLINKED_DEPENDENCY))]);
     let reply = coding.code(&registry, CODE_EDIT, &[]).unwrap();
     assert!(reply.contains(SYMLINKED_DEPENDENCY_NOTE), "{reply}");
     assert!(reply.contains(SYMLINKED_DEPENDENCY), "{reply}");
@@ -849,7 +846,7 @@ fn the_sandbox_denies_every_path_to_the_checkout(from_worktree: bool) {
     let coding = Coding::new();
     let project = coding.project();
     let outside = tempdir().unwrap();
-    let (reg, _host) = coding.host(&[]);
+    let (reg, _host) = coding.host();
 
     let (session, result) = coding.code_away_from_root(&reg, outside.path(), from_worktree);
     result.unwrap();
@@ -926,15 +923,12 @@ fn an_import_lands_what_the_artifact_recorded(object_format: &str) {
 fn an_import_ignores_inherited_git_paths(variable: &str) {
     let coding = Coding::new();
     environment::set(variable, INHERITED_GIT_PATH);
-    let (reg, _host) = coding.host(&[]);
+    let (reg, _host) = coding.host();
     let id = artifact_id(&coding.code(&reg, CODE_EDIT, &[]).unwrap());
 
     let reply = coding.import(&reg, json!({ "id": id })).unwrap();
     assert!(reply.contains(ORIGINALS_KEPT), "got: {reply}");
-    assert_eq!(
-        fs::read_to_string(coding.project().join(IMPORTED_LIB)).unwrap(),
-        WORKER_LIB
-    );
+    assert_eq!(coding.read(IMPORTED_LIB), WORKER_LIB);
     let again = coding.import(&reg, json!({ "id": id })).unwrap();
     assert!(again.contains(ALREADY_IMPORTED), "got: {again}");
 }
@@ -1024,10 +1018,7 @@ fn an_import_lands_what_was_recorded_whatever_the_snapshot_holds() {
     fs::write(snapshot.join(ADDED_FILE), TAMPERED).unwrap();
 
     coding.import(&reg, json!({ "id": id })).unwrap();
-    assert_eq!(
-        fs::read_to_string(coding.project().join(ADDED_FILE)).unwrap(),
-        WORKER_NEW
-    );
+    assert_eq!(coding.read(ADDED_FILE), WORKER_NEW);
 }
 
 /// A non-UTF-8 name cannot pass through the Lua process API. Stop the call so the snapshot
@@ -1039,7 +1030,7 @@ fn a_file_name_maki_cannot_pass_on_is_refused() {
     fs::write(project.join(OsStr::from_bytes(NOT_UTF8_NAME)), "x\n").unwrap();
     git(&project, &["add", "-A"]);
     git(&project, &["commit", "-q", "-m", "latin1"]);
-    let (reg, _host) = coding.host(&[]);
+    let (reg, _host) = coding.host();
 
     let err = coding.code(&reg, CODE_EDIT, &[]).unwrap_err();
     assert!(err.contains(NOT_UTF8_STOP), "got: {err}");
@@ -1062,7 +1053,7 @@ fn a_submodule_left_out_of_the_snapshot_is_named() {
         &project,
         &["update-index", "--add", "--cacheinfo", &gitlink],
     );
-    let (reg, _host) = coding.host(&[]);
+    let (reg, _host) = coding.host();
 
     let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
     assert!(reply.contains(SUBMODULE_NOTE), "got: {reply}");
@@ -1248,7 +1239,8 @@ fn pending_approval_blocks_another_import_and_expiry() {
 fn different_sessions_and_artifact_roots_share_the_checkout_lock() {
     let (coding, reg, _host, id) = Coding::coded(CODE_EDIT);
     let other_artifacts = tempdir().unwrap();
-    let (other_reg, _other_host) = coding.host(&[("artifact_dir", json!(other_artifacts.path()))]);
+    let (other_reg, _other_host) =
+        coding.host_with_options(&[("artifact_dir", json!(other_artifacts.path()))]);
     let other_id = artifact_id(&coding.code(&other_reg, CODE_EDIT, &[]).unwrap());
     let queued_reg = Arc::clone(&other_reg);
     let queued_ctx = coding.ctx(&other_reg);
@@ -1314,10 +1306,7 @@ fn an_import_that_cannot_be_recorded_says_so() {
         .unwrap();
 
     assert!(reply.contains(UNRECORDED), "got: {reply}");
-    assert_eq!(
-        fs::read_to_string(coding.project().join(IMPORTED_LIB)).unwrap(),
-        WORKER_LIB
-    );
+    assert_eq!(coding.read(IMPORTED_LIB), WORKER_LIB);
 }
 
 /// Import denials must preserve the checkout and include the user's guidance.
@@ -1365,7 +1354,7 @@ fn a_cancelled_import_leaves_the_checkout_as_it_was() {
     let (trigger, token) = CancelToken::new();
     ctx.cancel = token;
     let written = project.clone();
-    let snapshot = coding.artifact(&id).join(SNAPSHOT_DIR);
+    let snapshot = coding.snapshot(&id);
     let mut expected_temporary: Vec<_> = CHANGED_PATHS
         .into_iter()
         .filter(|path| *path != DELETED_FILE)
@@ -1418,7 +1407,7 @@ fn a_cancel_while_the_snapshot_is_made_discards_it(locked: bool) {
         ""
     };
     let prepare = format!("{setup} touch '{}'; {PREPARE_NEVER_ENDS}", marker.display());
-    let (reg, _host) = coding.host(&[("prepare", json!(prepare))]);
+    let (reg, _host) = coding.host_with_options(&[("prepare", json!(prepare))]);
     let mut ctx = coding.ctx(&reg);
     let (trigger, token) = CancelToken::new();
     ctx.cancel = token;
@@ -1455,7 +1444,7 @@ fn a_failed_dependency_scan_stops_the_worker() {
         &format!("#!/bin/sh\nprintf '%s\\n' '{SCAN_FAILURE}' >&2\nexit 1\n"),
     );
     let _path = environment::EnvVar::prepend_path(tools.path());
-    let (reg, _host) = coding.host(&[("dependencies", json!("deps"))]);
+    let (reg, _host) = coding.host_with_options(&[("dependencies", json!("deps"))]);
     let error = coding.code(&reg, CODE_EDIT, &[]).unwrap_err();
     assert!(
         error.contains("maki cannot examine the dependencies") && error.contains(SCAN_FAILURE),
@@ -1469,7 +1458,7 @@ fn a_cancel_during_sanitization_discards_the_idle_artifact() {
     let coding = Coding::new();
     let started = tempdir().unwrap();
     let marker = started.path().join(SANITIZE_STARTED);
-    let (reg, host) = coding.host(&[]);
+    let (reg, host) = coding.host();
     let mut opts = coding.fake.opts(ONE_SLOT);
     opts.insert("artifact_dir".into(), json!(coding.artifacts.path()));
     let source = format!(
@@ -1512,7 +1501,7 @@ fn a_cancel_during_sanitization_discards_the_idle_artifact() {
 fn a_refused_coding_call_keeps_what_a_policy_hook_wrote() {
     let coding = Coding::new();
     add_a_managed_hook(&coding.fake);
-    let (reg, _host) = coding.host(&[]);
+    let (reg, _host) = coding.host();
     let err = coding.code(&reg, CODE_EDIT, &[]).unwrap_err();
     let ran_in: Vec<PathBuf> = coding
         .fake
@@ -1543,7 +1532,7 @@ fn a_refused_coding_call_keeps_what_a_policy_hook_wrote() {
 #[test]
 fn what_prepare_writes_is_not_offered_for_import() {
     let coding = Coding::new();
-    let (reg, _host) = coding.host(&[("prepare", json!(PREPARE_WRITES_LOCK))]);
+    let (reg, _host) = coding.host_with_options(&[("prepare", json!(PREPARE_WRITES_LOCK))]);
     let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
 
     for change in REPORTED_CHANGES {
@@ -1561,7 +1550,7 @@ fn what_prepare_writes_is_not_offered_for_import() {
 #[test]
 fn the_change_report_fits_within_the_output_limits() {
     let coding = Coding::new();
-    let (reg, _host) = coding.host(&[("max_output_lines", json!(REPLY_LINES))]);
+    let (reg, _host) = coding.host_with_options(&[("max_output_lines", json!(REPLY_LINES))]);
     let reply = coding.code(&reg, CODE_LONG, &[]).unwrap();
 
     let lines = reply.lines().count();
@@ -1580,7 +1569,7 @@ fn the_change_report_fits_within_the_output_limits() {
 #[test_case("code_nested_cancel" ; "nested_repository_metadata")]
 fn a_cancel_during_the_run_keeps_the_workers_snapshot(prompt: &str) {
     let coding = Coding::new();
-    let (reg, _host) = coding.host(&[]);
+    let (reg, _host) = coding.host();
     let mut ctx = coding.ctx(&reg);
     let (trigger, token) = CancelToken::new();
     ctx.cancel = token;
@@ -1628,10 +1617,7 @@ fn an_import_that_landed_and_still_failed_says_so() {
         .unwrap();
 
     assert!(reply.contains(FAILED_AFTER_WRITES), "got: {reply}");
-    assert_eq!(
-        fs::read_to_string(coding.project().join(IMPORTED_LIB)).unwrap(),
-        WORKER_LIB
-    );
+    assert_eq!(coding.read(IMPORTED_LIB), WORKER_LIB);
 }
 
 /// The import copies and checks every blob from the artifact before any
@@ -1666,10 +1652,7 @@ fn a_sweep_while_approval_waits_keeps_the_artifact() {
         })
         .unwrap();
 
-    assert_eq!(
-        fs::read_to_string(coding.project().join(IMPORTED_LIB)).unwrap(),
-        WORKER_LIB
-    );
+    assert_eq!(coding.read(IMPORTED_LIB), WORKER_LIB);
 }
 
 /// A chmod leaves a file's bytes alone, so the import also compares
@@ -1728,7 +1711,7 @@ fn an_import_refuses_a_link_swapped_in_during_approval(swapped: &str) {
 fn an_unsafe_link_prepare_makes_is_dropped() {
     let coding = Coding::new();
     let prepare = format!("ln -s {OUTSIDE_TARGET} {PREPARED_LINK}");
-    let (reg, _host) = coding.host(&[("prepare", json!(prepare))]);
+    let (reg, _host) = coding.host_with_options(&[("prepare", json!(prepare))]);
     let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
     let prompt = coding.fake.log("prompt");
     assert!(
@@ -1760,7 +1743,7 @@ fn an_unsafe_link_prepare_makes_is_dropped() {
 fn collection_preserves_worker_links_for_manual_application(path: &str, status: &str) {
     const SCENARIO: &str = "code_edit_link";
     let coding = Coding::new();
-    let (reg, _host) = coding.host(&[]);
+    let (reg, _host) = coding.host();
     let reply = coding.code(&reg, SCENARIO, &[]).unwrap();
     let snapshot = coding.snapshot(&artifact_id(&reply));
     assert_eq!(
@@ -1776,7 +1759,7 @@ fn preparation_can_remove_links_with_non_utf8_names() {
     const SHOWN: &str = "latin\\377.link";
     let coding = Coding::new();
     let prepare = format!("ln -s {OUTSIDE_TARGET} \"$(printf 'latin\\377.link')\"");
-    let (registry, _host) = coding.host(&[("prepare", json!(prepare))]);
+    let (registry, _host) = coding.host_with_options(&[("prepare", json!(prepare))]);
     let reply = coding.code(&registry, CODE_EDIT, &[]).unwrap();
     assert!(
         reply.contains(LINKS_LEFT_OUT) && reply.contains(SHOWN),
@@ -1812,7 +1795,7 @@ fn escaping_links_are_removed_without_shell_resolution() {
     let prepare = format!(
         "i=0; while [ \"$i\" -lt {LINK_COUNT} ]; do ln -s lib.rs src/link_$i; i=$((i + 1)); done; ln -s {OUTSIDE_TARGET} {PREPARED_LINK}"
     );
-    let (reg, _host) = coding.host(&[("prepare", json!(prepare))]);
+    let (reg, _host) = coding.host_with_options(&[("prepare", json!(prepare))]);
     let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
     let snapshot = coding.snapshot(&artifact_id(&reply));
     for index in 0..LINK_COUNT {
@@ -1841,16 +1824,10 @@ fn ambiguous_import_paths_are_refused_and_unique_display_names_still_work() {
     coding
         .import(&reg, json!({ "id": id, "paths": [DISPLAYED_BACKSLASH] }))
         .unwrap();
-    assert_eq!(
-        fs::read_to_string(coding.project().join(BACKSLASH_PATH)).unwrap(),
-        "backslash\n"
-    );
+    assert_eq!(coding.read(BACKSLASH_PATH), "backslash\n");
     assert!(!coding.project().join(NEWLINE_PATH).exists());
     coding.import(&reg, json!({ "id": id })).unwrap();
-    assert_eq!(
-        fs::read_to_string(coding.project().join(NEWLINE_PATH)).unwrap(),
-        "newline\n"
-    );
+    assert_eq!(coding.read(NEWLINE_PATH), "newline\n");
 }
 
 #[test_case("nested/.env.local/prod" ; "nested_env_directory")]
@@ -1863,7 +1840,7 @@ fn denied_files_and_directories_stay_out_of_the_snapshot(path: &str) {
     fs::remove_dir_all(project.join("secrets")).unwrap();
     write(&project.join(path), DENIED_CONTENT);
     git(&project, &["add", "-A"]);
-    let (reg, _host) = coding.host(&[]);
+    let (reg, _host) = coding.host();
     let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
     let snapshot = coding
         .artifacts
@@ -1889,7 +1866,7 @@ fn prepared_hard_links_become_private_copies_before_the_worker_starts(internal: 
         outside.clone()
     };
     let prepare = format!("ln '{}' {PREPARED_LINK}", target.display());
-    let (reg, _host) = coding.host(&[("prepare", json!(prepare))]);
+    let (reg, _host) = coding.host_with_options(&[("prepare", json!(prepare))]);
     let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
     let snapshot = coding
         .artifacts
@@ -1927,7 +1904,7 @@ fn ignored_output_is_preserved_and_reported(prepared: bool) {
     if prepared {
         options.push(("prepare", json!(PREPARE_IGNORED)));
     }
-    let (reg, _host) = coding.host(&options);
+    let (reg, _host) = coding.host_with_options(&options);
     let prompt = if prepared {
         CODE_EDIT
     } else {
@@ -1965,7 +1942,7 @@ fn prepare_runs_with_the_users_environment() {
     let prepare = format!(
         "printf %s \"${USER_ONLY_VARIABLE}\" > {PREPARED_ENV}; printf %s \"$TMPDIR\" > {PREPARED_TMP}"
     );
-    let (reg, _host) = coding.host(&[("prepare", json!(prepare))]);
+    let (reg, _host) = coding.host_with_options(&[("prepare", json!(prepare))]);
     let id = artifact_id(&coding.code(&reg, CODE_EDIT, &[]).unwrap());
     let artifact = coding.artifact(&id);
     let snapshot = artifact.join(SNAPSHOT_DIR);
@@ -1984,7 +1961,7 @@ fn a_prepared_snapshot_can_use_the_reftable_backend() {
     const MIGRATE: &str = "git refs migrate --ref-format=reftable";
     const REFTABLE: &str = "reftable";
     let coding = Coding::new();
-    let (reg, _host) = coding.host(&[("prepare", json!(MIGRATE))]);
+    let (reg, _host) = coding.host_with_options(&[("prepare", json!(MIGRATE))]);
     let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
     let artifact = coding.artifact(&artifact_id(&reply));
     assert!(
@@ -2005,7 +1982,7 @@ fn prepare_git_commands_use_the_snapshot(variable: &str, git_directory: bool) {
         coding.project()
     };
     environment::set(variable, inherited);
-    let (reg, _host) = coding.host(&[("prepare", json!(PREPARE_RECORDS_GIT))]);
+    let (reg, _host) = coding.host_with_options(&[("prepare", json!(PREPARE_RECORDS_GIT))]);
     let id = artifact_id(&coding.code(&reg, CODE_EDIT, &[]).unwrap());
     let artifact = coding.artifact(&id);
     let snapshot = artifact.join(SNAPSHOT_DIR);
@@ -2022,7 +1999,7 @@ fn prepare_git_commands_use_the_snapshot(variable: &str, git_directory: bool) {
 #[test]
 fn a_prepare_timeout_is_reported_without_requiring_command_output() {
     let coding = Coding::new();
-    let (reg, _host) = coding.host(&[
+    let (reg, _host) = coding.host_with_options(&[
         ("prepare", json!(PREPARE_NEVER_ENDS)),
         ("prepare_timeout_secs", json!(PREPARE_TIMEOUT_SECS)),
     ]);
@@ -2047,7 +2024,7 @@ fn a_prepare_timeout_is_reported_without_requiring_command_output() {
 fn a_failed_prepare_reaches_the_worker_and_the_reply(command: &str, limit_secs: u64, detail: &str) {
     let coding = Coding::new();
     let command = format!("{PREPARE_WRITES_LOCK}; {command}");
-    let (reg, _host) = coding.host(&[
+    let (reg, _host) = coding.host_with_options(&[
         ("prepare", json!(command)),
         ("prepare_timeout_secs", json!(limit_secs)),
     ]);
@@ -2080,7 +2057,7 @@ fn an_unrecorded_prepare_baseline_stops_the_worker(fails: bool) {
     } else {
         BREAK_BASELINE.to_owned()
     };
-    let (reg, _host) = coding.host(&[("prepare", json!(command))]);
+    let (reg, _host) = coding.host_with_options(&[("prepare", json!(command))]);
     let error = coding.code(&reg, CODE_EDIT, &[]).unwrap_err();
 
     assert!(error.contains(CANNOT_RECORD_PREPARED), "{error}");
@@ -2098,7 +2075,7 @@ fn dependency_exclusions_do_not_depend_on_copying(prepared: bool) {
     if prepared {
         options.push(("prepare", json!(CREATE_DEPENDENCY)));
     }
-    let (reg, _host) = coding.host(&options);
+    let (reg, _host) = coding.host_with_options(&options);
     let included = if prepared {
         &[][..]
     } else {
@@ -2125,7 +2102,8 @@ fn dependencies_come_along_but_never_as_changes(subdir: bool) {
     };
     write(&session.join(DEPENDENCY), DEPENDENCY_CONTENT);
     write(&session.join(".venv/pyvenv.cfg"), "home = /usr/bin\n");
-    let (reg, _host) = coding.host(&[("dependencies", json!(DEPENDENCIES_WITH_A_VENV))]);
+    let (reg, _host) =
+        coding.host_with_options(&[("dependencies", json!(DEPENDENCIES_WITH_A_VENV))]);
     let mut ctx = ctx_in(&session, None, None);
     ctx.registry = Arc::clone(&reg);
     let reply = run_tool(
@@ -2167,7 +2145,7 @@ fn collecting_changes_never_follows_the_workers_links() {
     let project = coding.project();
     coding.fake.write("project", &project.display().to_string());
     let before = contents(&project);
-    let (reg, _host) = coding.host(&[]);
+    let (reg, _host) = coding.host();
     let reply = coding.code(&reg, CODE_REDIRECT, &[]).unwrap();
 
     assert_eq!(contents(&project), before, "the checkout must not change");
@@ -2184,7 +2162,7 @@ fn dependency_copies_keep_the_snapshot_exclusions() {
     write(&project.join(DEPENDENCY), DEPENDENCY_CONTENT);
     write(&project.join(DEPENDENCY_SECRET), "SECRET=1\n");
     write(&project.join(DEPENDENCY_DENIED), "key\n");
-    let (reg, _host) = coding.host(&[
+    let (reg, _host) = coding.host_with_options(&[
         ("dependencies", json!(dependencies)),
         ("deny_read", json!(deny_read)),
     ]);
@@ -2208,7 +2186,7 @@ fn dependency_copies_keep_the_snapshot_exclusions() {
 fn a_dependency_dir_is_copied_and_never_a_change(dir: &str, file: &str) {
     let coding = Coding::new();
     write(&coding.project().join(file), DEPENDENCY_CONTENT);
-    let (reg, _host) = coding.host(&[("dependencies", json!(dir))]);
+    let (reg, _host) = coding.host_with_options(&[("dependencies", json!(dir))]);
     let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
 
     let listing = coding.fake.log("snapshot_listing");
@@ -2243,7 +2221,7 @@ fn the_sweep_takes_only_stale_artifacts(files: &[&str], fresh_manifest: bool, sw
     if fresh_manifest {
         fs::write(old.join(MANIFEST), "{}").unwrap();
     }
-    let (reg, _host) = coding.host(&[]);
+    let (reg, _host) = coding.host();
     coding.code(&reg, CODE_EDIT, &[]).unwrap();
 
     assert!(
@@ -2299,7 +2277,7 @@ fn the_sweep_removes_protected_directories_without_changing_link_targets(mode: u
     ] {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     }
-    let (reg, _host) = coding.host(&[]);
+    let (reg, _host) = coding.host();
     coding.code(&reg, CODE_EDIT, &[]).unwrap();
     let removed = wait_until(DEADLINE, || {
         artifact_listing(coding.artifacts.path()).len() == 1
@@ -2331,7 +2309,7 @@ fn an_artifact_dir_inside_the_checkout_changes_nothing_there(exists: bool) {
         fs::create_dir(&inside).unwrap();
         old_folder(&inside, OLD_FOLDER, &[ARTIFACT_MARKER])
     });
-    let (reg, _host) = coding.host(&[("artifact_dir", json!(inside))]);
+    let (reg, _host) = coding.host_with_options(&[("artifact_dir", json!(inside))]);
     let err = coding.code(&reg, CODE_EDIT, &[]).unwrap_err();
 
     assert!(err.contains(ARTIFACTS_INSIDE), "got: {err}");
@@ -2352,7 +2330,7 @@ fn an_artifact_dir_beside_the_session_in_the_checkout_is_refused(from_worktree: 
     let coding = Coding::new();
     let inside = coding.project().join(INSIDE_ARTIFACTS);
     let outside = tempdir().unwrap();
-    let (reg, _host) = coding.host(&[("artifact_dir", json!(inside))]);
+    let (reg, _host) = coding.host_with_options(&[("artifact_dir", json!(inside))]);
 
     let (_, result) = coding.code_away_from_root(&reg, outside.path(), from_worktree);
 
@@ -2379,7 +2357,7 @@ fn an_artifact_dir_maki_cannot_follow_is_refused(dangling: bool, problem: &str) 
         fs::set_permissions(&blocker, fs::Permissions::from_mode(NO_ACCESS_MODE)).unwrap();
     }
     let artifacts = blocker.join(INSIDE_ARTIFACTS);
-    let (reg, _host) = coding.host(&[("artifact_dir", json!(artifacts))]);
+    let (reg, _host) = coding.host_with_options(&[("artifact_dir", json!(artifacts))]);
     let err = coding.code(&reg, CODE_EDIT, &[]).unwrap_err();
 
     assert!(err.contains(problem), "got: {err}");
@@ -2424,19 +2402,13 @@ fn old_folder(root: &Path, name: &str, files: &[&str]) -> PathBuf {
     dir
 }
 
-/// Backdates `path` past the sweep's time limit.
-fn backdate(path: &Path) {
-    let written = SystemTime::now() - Duration::from_secs(STALE_AGE_HOURS * SECS_PER_HOUR);
-    File::open(path).unwrap().set_modified(written).unwrap();
-}
-
 /// Inputs must lie inside the project and only make sense for a snapshot.
 /// A bad input is refused before any process starts.
 #[test_case(CODE_PROFILE, "../outside", "goes out of the project" ; "a_path_out_of_the_project")]
 #[test_case("read", "fixtures", "only the code profile can use `include`" ; "an_input_to_a_read_task")]
 fn a_wrong_input_is_refused_before_anything_runs(profile: &str, include: &str, want: &str) {
     let coding = Coding::new();
-    let (reg, _host) = coding.host(&[]);
+    let (reg, _host) = coding.host();
     let input = json!({ "prompt": CODE_EDIT, "profile": profile, "include": [include] });
     let err = run_tool(&reg, &coding.ctx(&reg), TOOL, input).unwrap_err();
     assert!(err.contains(want), "got: {err}");
@@ -2448,7 +2420,7 @@ fn a_wrong_input_is_refused_before_anything_runs(profile: &str, include: &str, w
 #[test]
 fn the_probe_starts_as_the_worker_does() {
     let coding = Coding::new();
-    let (reg, _host) = coding.host(&[]);
+    let (reg, _host) = coding.host();
     coding.code(&reg, CODE_EDIT, &[]).unwrap();
 
     let tmpdirs = coding.fake.log("tmpdirs");
@@ -2469,10 +2441,7 @@ fn a_session_in_a_linked_project_imports() {
     ctx.registry = Arc::clone(&reg);
 
     run_tool(&reg, &ctx, IMPORT_TOOL, json!({ "id": id })).unwrap();
-    assert_eq!(
-        fs::read_to_string(coding.project().join(IMPORTED_LIB)).unwrap(),
-        WORKER_LIB
-    );
+    assert_eq!(coding.read(IMPORTED_LIB), WORKER_LIB);
 }
 
 #[test_case(false ; "ordinary_ignore_rules")]
@@ -2483,7 +2452,7 @@ fn agent_config_the_worker_writes_stays_out_of_the_changes(negated: bool) {
         write(&coding.project().join(".gitignore"), NEGATED_EXCLUSIONS);
         git(&coding.project(), &["add", "--", ".gitignore"]);
     }
-    let (reg, _host) = coding.host(&[]);
+    let (reg, _host) = coding.host();
     let id = artifact_id(&coding.code(&reg, CODE_CLAUDE_CONFIG, &[]).unwrap());
     coding.import(&reg, json!({ "id": id })).unwrap();
 
@@ -2508,7 +2477,7 @@ fn tracked_dependency_edits_and_deletions_remain_importable(negated: bool) {
     let ignore = if negated { "src/\n!src/\n" } else { "src/\n" };
     write(&project.join(".gitignore"), ignore);
     git(&project, &["add", ".gitignore"]);
-    let (reg, _host) = coding.host(&[("dependencies", json!(TRACKED_DEPENDENCY))]);
+    let (reg, _host) = coding.host_with_options(&[("dependencies", json!(TRACKED_DEPENDENCY))]);
     let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
     assert!(reply.contains(TRACKED_DEPENDENCY_NOTE), "{reply}");
     assert!(reply.contains(REPORTED_CHANGES[0]), "{reply}");
@@ -2538,7 +2507,7 @@ fn the_baseline_preserves_raw_bytes_modes_and_literal_names() {
     symlink(BASELINE_RAW_TARGET, project.join(BASELINE_RAW_LINK)).unwrap();
     write(&project.join(".gitattributes"), TEXT_ATTRIBUTES);
     commit_all(&project);
-    let (reg, _host) = coding.host(&[]);
+    let (reg, _host) = coding.host();
     let id = artifact_id(&coding.code(&reg, CODE_EDIT, &[]).unwrap());
     let snapshot = coding.snapshot(&id);
     let manifest: Value =
@@ -2581,7 +2550,7 @@ fn negated_ignore_rules_cannot_collect_dependencies(prepared: bool) {
     } else {
         write(&project.join(DEPENDENCY), DEPENDENCY_CONTENT);
     }
-    let (reg, _host) = coding.host(&options);
+    let (reg, _host) = coding.host_with_options(&options);
     let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
     let id = artifact_id(&reply);
     coding.import(&reg, json!({ "id": id })).unwrap();
@@ -2607,7 +2576,7 @@ fn included_nested_repositories_are_skipped_with_a_note(include: &str) {
     fs::create_dir(&repository).unwrap();
     git(&repository, &["init", "-q"]);
     write(&repository.join("local.txt"), DENIED_CONTENT);
-    let (reg, _host) = coding.host(&[]);
+    let (reg, _host) = coding.host();
     let reply = coding.code(&reg, CODE_EDIT, &[include]).unwrap();
     let snapshot = coding.snapshot(&artifact_id(&reply));
     assert!(reply.contains(REPOSITORIES_LEFT_OUT), "{reply}");
@@ -2625,7 +2594,7 @@ fn included_nested_repositories_are_skipped_with_a_note(include: &str) {
 #[test]
 fn changes_the_import_cannot_apply_are_left_to_the_user() {
     let coding = Coding::new();
-    let (reg, _host) = coding.host(&[]);
+    let (reg, _host) = coding.host();
     let reply = coding.code(&reg, CODE_RETYPE, &[]).unwrap();
     for line in RETYPED_REPORT.into_iter().chain([NOT_UTF8_NOTE]) {
         assert!(reply.contains(line), "{line} missing from: {reply}");

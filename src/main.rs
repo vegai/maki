@@ -1,7 +1,6 @@
 mod cli;
 mod cmd;
 mod headless_startup;
-mod notice;
 mod print;
 mod project_trust;
 mod provider_scripts;
@@ -9,7 +8,6 @@ mod resume;
 mod sdk_mode;
 mod setup;
 mod shutdown;
-mod tool_names;
 mod update;
 mod wire;
 

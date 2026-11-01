@@ -1,13 +1,18 @@
-//! Shared launch validation for the provider and the Lua worker.
+//! Launch policy shared by the provider and plugin, and the plugin worker protocol.
 
+use super::run::{Launch, Limits};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder};
+use std::future::Future;
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf, absolute};
+use std::process::ExitStatus;
 use std::sync::Arc;
+use std::time::Duration;
 
 use maki_storage::permissions::{PERMISSION_BITS, PRIVATE_DIR_MODE};
 use rustix::process::geteuid;
@@ -25,15 +30,15 @@ use super::stream::{
     INPUT_TOKENS, OUTPUT_TOKENS, StreamMode, count,
 };
 
-pub use super::super::MAX_EVENT_BYTES;
+pub use super::MAX_EVENT_BYTES;
 pub use super::checks::{GIT_ENTRY, git_directory};
+pub use super::run::invalidate_version;
 use super::run::private_dir_async;
-pub use super::run::{VersionCheck, invalidate_version, version_check};
 use super::settings::{self, base_settings};
 use super::stream::usage_of as plan_usage;
 pub use super::stream::{EventKind, TOOL_USE_BLOCK, user_message};
 
-pub use super::super::{DEFAULT_EXECUTABLE, DEFAULT_MAX_CONCURRENT, MIN_MAX_CONCURRENT};
+pub use super::{DEFAULT_EXECUTABLE, DEFAULT_MAX_CONCURRENT, MIN_MAX_CONCURRENT};
 pub(super) const CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 pub(super) const HOME_ENV: &str = "HOME";
 const RUNTIME_DIR_ENV: &str = "XDG_RUNTIME_DIR";
@@ -91,8 +96,14 @@ pub fn shell_secret_problem(env: &HashMap<String, String>) -> Option<String> {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "PolicyInput")]
 pub struct WorkerPolicy {
+    settings: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyInput {
     deny: Vec<String>,
     sandbox: Option<WorkerPaths>,
 }
@@ -106,13 +117,23 @@ struct WorkerPaths {
 }
 
 impl WorkerPolicy {
-    pub fn settings(&self) -> Value {
+    pub fn args(&self, model: &str, tools: &str, mode: &str, contract: &str) -> Vec<String> {
+        settings::worker_args(model, tools, mode, self.settings(), contract)
+    }
+
+    pub fn settings(&self) -> &Value {
+        &self.settings
+    }
+}
+
+impl From<PolicyInput> for WorkerPolicy {
+    fn from(input: PolicyInput) -> Self {
         let mut settings = base_settings();
         settings[PERMISSIONS_KEY] = json!({
             (BLOCK_OUTSIDE): true,
-            (DENY): self.deny,
+            (DENY): input.deny,
         });
-        if let Some(paths) = &self.sandbox {
+        if let Some(paths) = &input.sandbox {
             settings[SANDBOX] = json!({
                 (ENABLED): true,
                 (FAIL_IF_UNAVAILABLE): true,
@@ -126,8 +147,16 @@ impl WorkerPolicy {
                 },
             });
         }
-        settings
+        Self { settings }
     }
+}
+
+pub fn executable(name: &str, cwd: &Path) -> Result<PathBuf, Error> {
+    crate::process::find_program(name, cwd).ok_or_else(|| Error::ExecutableMissing(name.to_owned()))
+}
+
+pub fn unchecked_start() -> String {
+    Error::UncheckedStart.to_string()
 }
 
 pub fn handshake_input() -> String {
@@ -135,16 +164,6 @@ pub fn handshake_input() -> String {
         .iter()
         .map(|step| stream::control_request(step.id, &json!({ "subtype": step.subtype })))
         .collect()
-}
-
-pub fn worker_args(
-    model: &str,
-    tools: &str,
-    mode: &str,
-    policy: &WorkerPolicy,
-    contract: &str,
-) -> Vec<String> {
-    settings::worker_args(model, tools, mode, &policy.settings(), contract)
 }
 
 pub struct WorkerHandshake {
@@ -175,9 +194,18 @@ impl WorkerHandshake {
             |account| checks::account_problem(account, &self.modes),
             |settings, hooks| {
                 checks::policy_problem(settings, hooks, false)
-                    .or_else(|| worker_problem(&settings[EFFECTIVE], &self.policy.settings()))
+                    .or_else(|| worker_problem(&settings[EFFECTIVE], self.policy.settings()))
             },
         )
+    }
+
+    pub fn probe_exit(&self, code: Option<i32>, timeout_secs: u64) -> Result<(), Error> {
+        match code {
+            None => Err(Error::ProbeLate(timeout_secs)),
+            Some(0) => self.finish(),
+            Some(code) if code < 0 => Err(Error::StoppedInChecks),
+            Some(code) => Err(Error::ExitedInChecks(ExitStatus::from_raw(code << 8))),
+        }
     }
 
     pub fn subscription_type(&self) -> Option<&str> {
@@ -221,11 +249,8 @@ pub fn prepare_launch(
     let temp_dir = var(TMPDIR_ENV)
         .filter(|path| !path.is_empty())
         .map_or_else(default_temp_dir, PathBuf::from);
-    let temp_dir = absolute(&temp_dir).map_err(|source| Error::Path {
-        what: "resolve the temporary directory",
-        path: temp_dir,
-        source,
-    })?;
+    let temp_dir =
+        absolute(&temp_dir).map_err(Error::path("resolve the temporary directory", &temp_dir))?;
     let cache = var(CACHE_HOME_ENV)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -351,14 +376,37 @@ pub async fn private_dir(
     Ok(name)
 }
 
-pub fn init_problem(
-    event: &Value,
-    version: &str,
-    cwd: &Path,
+pub struct WorkerStream {
+    version: String,
+    cwd: PathBuf,
     tools: HashSet<String>,
-    modes: &[String],
-) -> Option<Problem> {
-    checks::init_problem(event, version, cwd, &tools, modes, None)
+    modes: Vec<String>,
+    model: Option<String>,
+    model_checked: bool,
+    accepted: bool,
+}
+
+impl WorkerStream {
+    pub fn new(version: String, cwd: PathBuf, tools: Vec<String>, modes: Vec<String>) -> Self {
+        Self {
+            version,
+            cwd,
+            tools: tools.into_iter().collect(),
+            modes,
+            model: None,
+            model_checked: false,
+            accepted: false,
+        }
+    }
+
+    pub fn set_model(&mut self, model: String) {
+        self.model = Some(model);
+        self.model_checked = false;
+    }
+
+    pub fn accepted(&self) -> bool {
+        self.accepted
+    }
 }
 
 pub struct WorkerEvent {
@@ -366,70 +414,83 @@ pub struct WorkerEvent {
     pub event: Value,
     pub usage: Option<Value>,
     pub rate_limit: Option<ProviderUsage>,
-    pub model_checked: bool,
     pub problem: Option<Error>,
     pub failure: Option<String>,
 }
 
 /// Workers may compact and retry within their own run. Provider turns must preserve maki's
 /// transcript and retry accounting, so their classifier rejects both events.
-pub fn classify(
-    line: &str,
-    accepted: bool,
-    expected_model: Option<&str>,
-    mut model_checked: bool,
-) -> Result<WorkerEvent, Error> {
-    if line.len() > MAX_EVENT_BYTES {
-        return Err(Error::EventTooLarge {
-            limit: MAX_EVENT_BYTES,
-        });
-    }
-    let event = stream::parse_event(line)?;
-    let kind = stream::event_kind(&event, StreamMode::Worker);
-    let mut check = |event_kind| -> Result<(), Error> {
-        stream::check_start(&event, event_kind, StreamMode::Worker, accepted)?;
-        if let Some(expected) = expected_model {
-            let message = if event_kind == EventKind::Stream {
-                &event["event"]["message"]
-            } else {
-                &event["message"]
-            };
-            if event[API_ERROR_MARK] != true
-                && let Some(ran) = message["model"].as_str()
-            {
-                stream::check_model(ran, expected)?;
-                model_checked = true;
-            }
-            if event_kind == EventKind::Result && !stream::failed_result(&event) && !model_checked {
-                return Err(Error::NoModel);
-            }
+impl WorkerStream {
+    pub fn feed(&mut self, line: &str) -> Result<WorkerEvent, Error> {
+        if line.len() > MAX_EVENT_BYTES {
+            return Err(Error::EventTooLarge {
+                limit: MAX_EVENT_BYTES,
+            });
         }
-        Ok(())
-    };
-    let (kind, problem) = match kind {
-        Ok(kind) => (Some(kind), check(kind).err()),
-        Err(error) => (None, Some(error)),
-    };
-    let usage = if kind == Some(EventKind::Assistant) {
-        &event["message"]["usage"]
-    } else {
-        &event["usage"]
-    };
-    let usage = usage.is_object().then(|| usage_counts(usage));
-    let rate_limit = (kind == Some(EventKind::RateLimit) && event["rate_limit_info"].is_object())
+        let event = stream::parse_event(line)?;
+        let kind = stream::event_kind(&event, StreamMode::Worker);
+        let mut check = |event_kind| -> Result<(), Error> {
+            stream::check_start(&event, event_kind, StreamMode::Worker, self.accepted)?;
+            if let Some(expected) = self.model.as_deref() {
+                let message = if event_kind == EventKind::Stream {
+                    &event["event"]["message"]
+                } else {
+                    &event["message"]
+                };
+                if event[API_ERROR_MARK] != true
+                    && let Some(ran) = message["model"].as_str()
+                {
+                    stream::check_model(ran, expected)?;
+                    self.model_checked = true;
+                }
+                if event_kind == EventKind::Result
+                    && !stream::failed_result(&event)
+                    && !self.model_checked
+                {
+                    return Err(Error::NoModel);
+                }
+            }
+            Ok(())
+        };
+        let (kind, mut problem) = match kind {
+            Ok(kind) => (Some(kind), check(kind).err()),
+            Err(error) => (None, Some(error)),
+        };
+        if kind == Some(EventKind::Init) {
+            if problem.is_none() {
+                problem = checks::init_problem(
+                    &event,
+                    &self.version,
+                    &self.cwd,
+                    &self.tools,
+                    &self.modes,
+                    None,
+                )
+                .map(Error::from);
+            }
+            self.accepted = problem.is_none();
+        }
+        let usage = if kind == Some(EventKind::Assistant) {
+            &event["message"]["usage"]
+        } else {
+            &event["usage"]
+        };
+        let usage = usage.is_object().then(|| usage_counts(usage));
+        let rate_limit = (kind == Some(EventKind::RateLimit)
+            && event["rate_limit_info"].is_object())
         .then(|| plan_usage(&event["rate_limit_info"]));
-    let failure = (kind == Some(EventKind::Result))
-        .then(|| stream::result_failure(&event))
-        .flatten();
-    Ok(WorkerEvent {
-        kind,
-        event,
-        usage,
-        rate_limit,
-        model_checked,
-        problem,
-        failure,
-    })
+        let failure = (kind == Some(EventKind::Result))
+            .then(|| stream::result_failure(&event))
+            .flatten();
+        Ok(WorkerEvent {
+            kind,
+            event,
+            usage,
+            rate_limit,
+            problem,
+            failure,
+        })
+    }
 }
 
 fn usage_counts(usage: &Value) -> Value {
@@ -442,11 +503,7 @@ fn usage_counts(usage: &Value) -> Value {
 }
 
 pub fn checkout_root(cwd: &Path) -> Result<PathBuf, Error> {
-    let resolved = cwd.canonicalize().map_err(|source| Error::Path {
-        what: "resolve",
-        path: cwd.to_owned(),
-        source,
-    })?;
+    let resolved = cwd.canonicalize().map_err(Error::path("resolve", cwd))?;
     checks::checkout_root(&resolved)
 }
 
@@ -600,9 +657,36 @@ fn worker_problem(effective: &Value, expected: &Value) -> Option<Problem> {
         .and_then(|sandbox| sandbox_problem(&effective[SANDBOX], sandbox))
 }
 
+pub async fn checked_profile(
+    executable: &Path,
+    env: &[(String, String)],
+    cwd: &Path,
+    denied: &[PathBuf],
+    startup_secs: u64,
+    cancel: impl Future<Output = ()> + Send,
+) -> Result<String, Error> {
+    let limits = Limits {
+        startup: Duration::from_secs(startup_secs),
+        ..Limits::new(Duration::from_secs(startup_secs))
+    };
+    let temp_dir = env_value(env, TMPDIR_ENV).map_or_else(default_temp_dir, PathBuf::from);
+    super::run::checked_profile(
+        &Launch {
+            executable,
+            env,
+            project: cwd,
+            denied,
+            temp_dir: &temp_dir,
+            limits: &limits,
+        },
+        cancel,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Problem;
+    use super::{PolicyInput, Problem};
     use super::{
         SANDBOX, TMPDIR_ENV, WorkerPaths, WorkerPolicy, prepare_launch, sandbox_problem,
         worker_problem,
@@ -645,15 +729,16 @@ mod tests {
     }
 
     fn expected() -> Value {
-        WorkerPolicy {
+        WorkerPolicy::from(PolicyInput {
             deny: vec![READ_RULE.into()],
             sandbox: Some(WorkerPaths {
                 deny_read: vec![DENIED.into()],
                 allow_read: Vec::new(),
                 allow_write: Vec::new(),
             }),
-        }
+        })
         .settings()
+        .clone()
     }
 
     #[test_case("/excludedCommands", json!(null), Problem::SandboxOutside ; "null_command_exclusions")]

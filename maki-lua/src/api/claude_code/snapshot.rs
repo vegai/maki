@@ -16,8 +16,8 @@ use rustix::fs::{
 use rustix::io::Errno;
 use rustix::path::Arg;
 
-use super::DIRECTORY_FLAGS;
-use maki_providers::claude_code::validation::GIT_ENTRY;
+use super::native::DIRECTORY_FLAGS;
+use maki_providers::claude_code::worker::GIT_ENTRY;
 
 const MAX_DEPTH: usize = 64;
 const BASE_RESOLUTION_STEPS: usize = 64 * 1024;

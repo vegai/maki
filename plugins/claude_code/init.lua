@@ -9,6 +9,8 @@ local truncate = require("maki.truncate")
 local jobs = require("claude_jobs")
 local launch = require("claude_launch")
 local snapshot = require("claude_snapshot")
+local artifacts = require("claude_artifact")
+local confine = require("claude_confine")
 local importer = require("claude_import")
 local Run = require("claude_run")
 local workspace = require("claude_workspace")
@@ -18,7 +20,6 @@ local path_utils = require("claude_paths")
 local MODELS = launch.MODELS
 local MS_PER_SEC = jobs.MS_PER_SEC
 local STARTUP_MS = launch.STARTUP_MS
-local NO_STATE_DIR = "maki cannot find its state directory as a UTF-8 path for the coding sandbox"
 -- Each step of a coding snapshot, such as the copy, must finish in this time.
 local SNAPSHOT_TIMEOUT_MS = 120 * MS_PER_SEC
 local MAX_SHOWN_CHANGES = 50
@@ -137,7 +138,7 @@ local dependencies, dependencies_err = path_utils.dependency_dirs(opts.dependenc
 if not dependencies then
   error("the `dependencies` option: " .. dependencies_err)
 end
-local denied_home_paths, home_deny_err = launch.denied_home_paths(opts.deny_read_home)
+local denied_home_paths, home_deny_err = confine.denied_home_paths(opts.deny_read_home)
 if home_deny_err then
   error("the `deny_read_home` option: " .. home_deny_err)
 end
@@ -192,38 +193,6 @@ end
 -- created after startup. Restore write access only to the snapshot and temporary directory.
 -- Keep the git directory read-only.
 --
--- A read-only mount of the entire artifact would also block snapshot writes. The sandbox
--- skips nonexistent denied paths.
-local function coding_confine(spec, artifact)
-  local state_dir = maki.env.state_dir()
-  if not state_dir then
-    return nil, NO_STATE_DIR
-  end
-  local deny = table.clone(spec.denied)
-  local function hide(path)
-    if path then
-      deny[#deny + 1] = path
-      local resolved = maki.fs.realpath(path)
-      if resolved and resolved ~= path then
-        deny[#deny + 1] = resolved
-      end
-    end
-  end
-  hide(spec.config_dir)
-  hide(maki.fs.dirname(artifact.dir))
-  hide(state_dir)
-  hide(maki.env.config_dir())
-  hide(maki.env.logs_dir())
-  for _, name in ipairs({ "XDG_RUNTIME_DIR", "SSH_AUTH_SOCK" }) do
-    local path = maki.uv.os_getenv(name)
-    if path and path:sub(1, 1) == "/" then
-      hide(path)
-    end
-  end
-  table.move(spec.home_credentials, 1, #spec.home_credentials, #deny + 1, deny)
-  return { deny_read = deny, allow_read = { artifact.git }, allow_write = { artifact.tmp } }
-end
-
 local function fill_snapshot(call, view, plan, artifact, cwd, env)
   view:append({ { SNAPSHOTTING, "dim" } })
   local err = snapshot.fill(call, artifact, {
@@ -278,14 +247,14 @@ local function change_report(call, artifact, project)
 end
 
 local function open_artifact(call, spec, root)
-  local root, root_err = snapshot.resolve_root(root, spec)
+  local root, root_err = artifacts.resolve_root(root, spec)
   if not root then
     return nil, "maki cannot make a coding artifact: " .. root_err
   end
   local sweep = jobs.new(SNAPSHOT_TIMEOUT_MS)
-  snapshot.sweep(sweep, root, opts.artifact_ttl_hours)
+  artifacts.sweep(sweep, root, opts.artifact_ttl_hours)
   sweep:answer()
-  local artifact, allocate_err = snapshot.allocate(call, root, spec.env, SNAPSHOT_TIMEOUT_MS)
+  local artifact, allocate_err = artifacts.allocate(call, root, spec.env, SNAPSHOT_TIMEOUT_MS)
   if not artifact then
     return nil, "maki cannot make a coding artifact: " .. allocate_err
   end
@@ -318,13 +287,14 @@ local function run(input, ctx, call, timeout_secs)
     end
     call.artifact = artifact
     local confine_err
-    spec.confine, confine_err = coding_confine(spec, artifact)
+    spec.confine, confine_err = confine.coding(spec, artifact)
     if not spec.confine then
       return refuse(confine_err)
     end
     env = table.clone(spec.env)
     env.TMPDIR = artifact.tmp
   end
+  spec.policy = native.worker_policy({ deny = spec.deny, sandbox = spec.confine })
   local argv = launch.argv(spec)
   local probe_problem = launch.probe(call, spec, argv, env)
   if probe_problem then
@@ -367,10 +337,10 @@ end
 -- process exits.
 local function discard_unkept(call, removed)
   local artifact = call.artifact
-  if artifact then
+  if artifact and not call.artifact_kept then
     call.artifact = nil
     call:when_idle(function()
-      snapshot.discard(call, artifact, removed)
+      artifacts.discard(call, artifact, removed)
     end)
   elseif removed then
     removed()

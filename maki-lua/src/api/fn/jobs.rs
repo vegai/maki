@@ -8,12 +8,14 @@ use std::mem;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use event_listener::Event;
+use maki_agent::tools::truncate_output;
 use maki_config::ShellPreference;
 use maki_providers::process::GroupSignals;
 use maki_providers::{process, shell_command, strip_provider_keys};
@@ -27,6 +29,8 @@ use crate::api::fs::expand_tilde;
 use super::{JOB_NOT_FOUND_ERR, MAX_TAIL_LINES};
 
 const DEFAULT_TAIL: usize = 20;
+const EXIT_STDERR_LINES: usize = 10;
+const EXIT_STDERR_BYTES: usize = 4096;
 const MAX_COMPLETED_SESSION_JOBS: usize = 256;
 #[cfg(not(target_os = "linux"))]
 const GUARD_UNSUPPORTED: &str = "jobstart: guard requires Linux";
@@ -34,16 +38,11 @@ const READER_BUF_SIZE: usize = 8 * 1024;
 const JOB_EXITED_ERR: &str = "job: exited or closed its stdin";
 const STDIN_WRITE_ERR: &str = "job: writing stdin failed";
 const NO_STDIN_ERR: &str = "job: stdin is not an open pipe";
-pub(super) const STDIN_FULL_ERR: &str =
-    "job: stdin queue is full; wait for the job to consume input";
-pub(super) const STDIN_OVERSIZED_ERR: &str =
-    "job: stdin write exceeds the queue capacity; send smaller chunks";
-pub(super) const MAX_STDIN_BYTES: usize = 16 * 1024 * 1024;
+const MAX_STDIN_BYTES: usize = 16 * 1024 * 1024;
+const STDIN_CHUNK_BYTES: usize = 64 * 1024;
 const STDOUT_STREAM: &str = "stdout";
 const STDERR_STREAM: &str = "stderr";
 const EXIT_EVENT: &str = "exit";
-const STDIN_EXITED: u8 = 1;
-const STDIN_FAILED: u8 = 2;
 
 const CWD_NOT_DIRECTORY: &str = "cwd is not a directory";
 
@@ -313,7 +312,7 @@ struct JobMeta {
     on_exit: Option<RegistryKey>,
     /// Feeds the writer thread that owns the child's stdin. Dropping it closes
     /// stdin, which is what `chanclose` and removing the job do.
-    stdin: Option<flume::Sender<Vec<u8>>>,
+    stdin: Option<StdinQueue>,
     event_rx: Option<flume::Receiver<JobEvent>>,
     stdout_tail: VecDeque<String>,
     stderr_tail: VecDeque<String>,
@@ -470,9 +469,7 @@ impl JobStore {
             group: Mutex::new(GroupSignals::new(pid)),
             ..Default::default()
         });
-        let stdin = stdin_pipe
-            .map(|stdin| spawn_stdin_writer(stdin, Arc::clone(&reap_state)))
-            .transpose()?;
+        let stdin = stdin_pipe.map(spawn_stdin_writer).transpose()?;
         let stdout_handle = spawn_reader(
             stdout_pipe,
             "job-stdout",
@@ -651,6 +648,19 @@ impl JobStore {
 
     /// Session-owned jobs stay inspectable after exit. Task/plugin jobs are
     /// removed the way they always were.
+    pub fn exit_stderr(&self, job_id: u32) -> Vec<String> {
+        self.jobs
+            .get(&job_id)
+            .map(|job| {
+                job.stderr_tail
+                    .iter()
+                    .skip(job.stderr_tail.len().saturating_sub(EXIT_STDERR_LINES))
+                    .map(|line| truncate_output(line.clone(), 1, EXIT_STDERR_BYTES))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn complete(&mut self, lua: &Lua, job_id: u32, code: i32) {
         let Some(job) = self.jobs.get_mut(&job_id) else {
             return;
@@ -812,13 +822,12 @@ impl JobStore {
         }
     }
 
-    pub fn send(
+    pub(super) fn stdin_writer(
         &self,
         job_id: u32,
         task_id: Option<u64>,
         plugin: &str,
-        data: Vec<u8>,
-    ) -> Result<usize, &'static str> {
+    ) -> Result<StdinWriter, &'static str> {
         let job = self
             .jobs
             .get(&job_id)
@@ -827,38 +836,22 @@ impl JobStore {
         if job.exit_code.is_some() {
             return Err(JOB_EXITED_ERR);
         }
-        let stdin = job.stdin.as_ref().ok_or(NO_STDIN_ERR)?;
-        match job.reap_state.stdin_error.load(Ordering::Acquire) {
-            STDIN_EXITED => return Err(JOB_EXITED_ERR),
-            STDIN_FAILED => return Err(STDIN_WRITE_ERR),
-            _ => {}
-        }
-        let len = data.len();
-        if len == 0 {
-            return Ok(0);
-        }
-        if len > MAX_STDIN_BYTES {
-            return Err(STDIN_OVERSIZED_ERR);
-        }
-        job.reap_state
-            .stdin_bytes
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
-                queued
-                    .checked_add(len)
-                    .filter(|bytes| *bytes <= MAX_STDIN_BYTES)
-            })
-            .map_err(|_| STDIN_FULL_ERR)?;
-        if stdin.send(data).is_err() {
-            job.reap_state.stdin_bytes.fetch_sub(len, Ordering::AcqRel);
-            return Err(
-                if job.reap_state.stdin_error.load(Ordering::Acquire) == STDIN_EXITED {
-                    JOB_EXITED_ERR
-                } else {
-                    STDIN_WRITE_ERR
-                },
-            );
-        }
-        Ok(len)
+        let queue = job.stdin.as_ref().ok_or(NO_STDIN_ERR)?;
+        Ok(StdinWriter {
+            sender: queue.sender.clone(),
+            state: Arc::clone(&queue.state),
+        })
+    }
+
+    #[cfg(test)]
+    pub fn send(
+        &self,
+        job_id: u32,
+        task_id: Option<u64>,
+        plugin: &str,
+        data: Vec<u8>,
+    ) -> Result<usize, &'static str> {
+        smol::block_on(self.stdin_writer(job_id, task_id, plugin)?.send(&data))
     }
 
     pub fn close_stdin(
@@ -1048,35 +1041,88 @@ fn read_output_line(
 /// Writing to a pipe the child does not read blocks, so writes happen on
 /// their own thread instead of the Lua thread. The thread ends, closing
 /// stdin, when every sender drops or the child stops reading.
-fn spawn_stdin_writer(
-    mut stdin: ChildStdin,
-    state: Arc<ReapState>,
-) -> Result<flume::Sender<Vec<u8>>, String> {
-    let (tx, rx) = flume::unbounded::<Vec<u8>>();
+struct StdinQueue {
+    sender: flume::Sender<Vec<u8>>,
+    state: Arc<StdinState>,
+}
+
+#[derive(Default)]
+struct StdinState {
+    bytes: AtomicUsize,
+    ready: Event,
+    closed: AtomicBool,
+}
+
+impl StdinState {
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.ready.notify(usize::MAX);
+    }
+}
+
+impl Drop for StdinQueue {
+    fn drop(&mut self) {
+        self.state.close();
+    }
+}
+
+pub(super) struct StdinWriter {
+    sender: flume::Sender<Vec<u8>>,
+    state: Arc<StdinState>,
+}
+
+impl StdinWriter {
+    pub async fn send(&self, data: &[u8]) -> Result<usize, &'static str> {
+        for chunk in data.chunks(STDIN_CHUNK_BYTES) {
+            loop {
+                let ready = self.state.ready.listen();
+                if self.state.closed.load(Ordering::Acquire) || self.sender.is_disconnected() {
+                    return Err(STDIN_WRITE_ERR);
+                }
+                let len = chunk.len();
+                if self
+                    .state
+                    .bytes
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                        queued
+                            .checked_add(len)
+                            .filter(|bytes| *bytes <= MAX_STDIN_BYTES)
+                    })
+                    .is_ok()
+                {
+                    if self.sender.send(chunk.to_vec()).is_err() {
+                        self.state.bytes.fetch_sub(len, Ordering::AcqRel);
+                        self.state.close();
+                        return Err(STDIN_WRITE_ERR);
+                    }
+                    break;
+                }
+                ready.await;
+            }
+        }
+        Ok(data.len())
+    }
+}
+
+fn spawn_stdin_writer(mut stdin: ChildStdin) -> Result<StdinQueue, String> {
+    let (sender, receiver) = flume::unbounded::<Vec<u8>>();
+    let state = Arc::new(StdinState::default());
+    let writing = Arc::clone(&state);
     thread::Builder::new()
         .name("job-stdin".into())
         .spawn(move || {
-            for chunk in rx {
+            for chunk in receiver {
                 let result = stdin.write_all(&chunk);
-                state.stdin_bytes.fetch_sub(chunk.len(), Ordering::AcqRel);
-                if let Err(error) = result {
-                    state.stdin_error.store(
-                        if matches!(
-                            error.kind(),
-                            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
-                        ) {
-                            STDIN_EXITED
-                        } else {
-                            STDIN_FAILED
-                        },
-                        Ordering::Release,
-                    );
+                writing.bytes.fetch_sub(chunk.len(), Ordering::AcqRel);
+                writing.ready.notify(usize::MAX);
+                if result.is_err() {
                     break;
                 }
             }
+            writing.close();
         })
-        .map_err(|e| e.to_string())?;
-    Ok(tx)
+        .map_err(|error| error.to_string())?;
+    Ok(StdinQueue { sender, state })
 }
 
 /// The reap lock protects pid ownership through each signal. Status reads stay independent
@@ -1085,8 +1131,6 @@ fn spawn_stdin_writer(
 struct ReapState {
     group: Mutex<GroupSignals>,
     timed_out: AtomicBool,
-    stdin_error: AtomicU8,
-    stdin_bytes: AtomicUsize,
 }
 
 impl ReapState {
@@ -1144,8 +1188,11 @@ struct Unwatched(Option<Child>);
 impl Drop for Unwatched {
     fn drop(&mut self) {
         if let Some(mut child) = self.0.take() {
-            process::kill_group(child.id());
-            let _ = child.wait();
+            smol::spawn(smol::unblock(move || {
+                process::kill_group(child.id());
+                let _ = child.wait();
+            }))
+            .detach();
         }
     }
 }
@@ -1163,16 +1210,11 @@ fn kill_unreaped(state: &ReapState, timed_out: bool) {
 }
 
 fn kill_job(job: &JobMeta) {
-    #[cfg(windows)]
-    let pid = job.pid;
     let state = Arc::clone(&job.reap_state);
-    let kill = move || kill_unreaped(&state, false);
     #[cfg(windows)]
-    if let Err(error) = thread::Builder::new().name("job-kill".into()).spawn(kill) {
-        tracing::warn!(pid, %error, "could not start the job termination thread");
-    }
+    smol::spawn(smol::unblock(move || kill_unreaped(&state, false))).detach();
     #[cfg(not(windows))]
-    kill();
+    kill_unreaped(&state, false);
 }
 
 /// Returns {bytes} as one line of a job's output, without its line ending.
@@ -1188,7 +1230,6 @@ fn text_line(mut bytes: Vec<u8>) -> String {
 #[cfg(test)]
 mod tests {
     use crate::runtime::with_jobs;
-    #[cfg(target_os = "linux")]
     use futures_lite::future::poll_once;
     #[cfg(target_os = "linux")]
     use rustix::process::getpid;
@@ -1199,6 +1240,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
+    use std::pin::pin;
     use test_case::test_case;
 
     use super::*;
@@ -1906,57 +1948,54 @@ mod tests {
         );
     }
 
-    #[test_case(0, STDIN_WRITE_ERR ; "disconnected_writer")]
-    #[test_case(STDIN_EXITED, JOB_EXITED_ERR ; "exited_writer")]
-    #[test_case(STDIN_FAILED, STDIN_WRITE_ERR ; "failed_writer")]
-    fn stdin_queue_errors_do_not_leak_reservations(state: u8, expected: &str) {
-        let mut store = make_store();
-        let mut job = stub_job(task_owner(1), None, None);
-        let (tx, rx) = flume::unbounded();
-        drop(rx);
-        job.stdin = Some(tx);
-        job.reap_state.stdin_error.store(state, Ordering::Release);
-        store.jobs.insert(1, job);
-        assert_eq!(store.send(1, Some(1), TEST_PLUGIN, vec![0]), Err(expected));
-        assert_eq!(
-            store.jobs[&1]
-                .reap_state
-                .stdin_bytes
-                .load(Ordering::Acquire),
-            0
-        );
-    }
-
     #[test]
-    fn stdin_queue_bounds_bytes_and_ignores_empty_writes() {
+    fn a_disconnected_stdin_writer_keeps_no_reservation() {
         let mut store = make_store();
         let mut job = stub_job(task_owner(1), None, None);
-        let (tx, rx) = flume::unbounded();
-        job.stdin = Some(tx);
+        let (sender, receiver) = flume::unbounded();
+        drop(receiver);
+        let state = Arc::new(StdinState::default());
+        job.stdin = Some(StdinQueue {
+            sender,
+            state: Arc::clone(&state),
+        });
         store.jobs.insert(1, job);
-        assert_eq!(store.send(1, Some(1), TEST_PLUGIN, Vec::new()), Ok(0));
-        assert!(rx.is_empty());
-        assert_eq!(
-            store.send(1, Some(1), TEST_PLUGIN, vec![0; MAX_STDIN_BYTES + 1]),
-            Err(STDIN_OVERSIZED_ERR)
-        );
-        assert!(rx.is_empty());
-        assert_eq!(
-            store.send(1, Some(1), TEST_PLUGIN, vec![0; MAX_STDIN_BYTES]),
-            Ok(MAX_STDIN_BYTES)
-        );
         assert_eq!(
             store.send(1, Some(1), TEST_PLUGIN, vec![0]),
-            Err(STDIN_FULL_ERR)
+            Err(STDIN_WRITE_ERR)
         );
-        assert_eq!(rx.len(), 1);
-        assert_eq!(
-            store.jobs[&1]
-                .reap_state
-                .stdin_bytes
-                .load(Ordering::Acquire),
-            MAX_STDIN_BYTES
-        );
+        assert_eq!(state.bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test_case(false ; "space_becomes_available")]
+    #[test_case(true ; "stdin_is_closed")]
+    fn stdin_waits_at_capacity_and_wakes_when_the_queue_changes(close: bool) {
+        let mut store = make_store();
+        let mut job = stub_job(task_owner(1), None, None);
+        let (sender, receiver) = flume::unbounded();
+        let state = Arc::new(StdinState::default());
+        job.stdin = Some(StdinQueue {
+            sender,
+            state: Arc::clone(&state),
+        });
+        store.jobs.insert(1, job);
+        assert_eq!(store.send(1, Some(1), TEST_PLUGIN, Vec::new()), Ok(0));
+        assert!(receiver.is_empty());
+        let writer = store.stdin_writer(1, Some(1), TEST_PLUGIN).unwrap();
+        let data = vec![0; MAX_STDIN_BYTES + 1];
+        let mut sending = pin!(writer.send(&data));
+        assert!(smol::block_on(poll_once(&mut sending)).is_none());
+        assert_eq!(state.bytes.load(Ordering::Acquire), MAX_STDIN_BYTES);
+        if close {
+            store.close_stdin(1, Some(1), TEST_PLUGIN).unwrap();
+            assert_eq!(smol::block_on(sending), Err(STDIN_WRITE_ERR));
+        } else {
+            let consumed = receiver.recv().unwrap();
+            state.bytes.fetch_sub(consumed.len(), Ordering::AcqRel);
+            state.ready.notify(usize::MAX);
+            assert_eq!(smol::block_on(sending), Ok(data.len()));
+            assert!(state.bytes.load(Ordering::Acquire) <= MAX_STDIN_BYTES);
+        }
     }
 
     #[cfg(unix)]
@@ -1973,6 +2012,7 @@ mod tests {
         let data = format!("{line}\n").into_bytes();
         let len = data.len();
         assert_eq!(store.send(id, Some(1), TEST_PLUGIN, data), Ok(len));
+        let stdin = Arc::clone(&store.jobs[&id].stdin.as_ref().unwrap().state);
         store.close_stdin(id, Some(1), TEST_PLUGIN).unwrap();
 
         let events = collect_until_exit(id, || store.next_event(&task_owner(1)));
@@ -1984,13 +2024,7 @@ mod tests {
             })
             .collect();
         assert_eq!(out, [line]);
-        assert_eq!(
-            store.jobs[&id]
-                .reap_state
-                .stdin_bytes
-                .load(Ordering::Acquire),
-            0
-        );
+        assert_eq!(stdin.bytes.load(Ordering::Acquire), 0);
         assert!(
             events
                 .iter()
@@ -2178,7 +2212,9 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
+        let raw_pid = child.id();
         drop(Unwatched(Some(child)));
+        assert!(wait_for_group_exit(raw_pid));
         assert_eq!(
             rustix::process::test_kill_process(pid),
             Err(rustix::io::Errno::SRCH)

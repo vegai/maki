@@ -1,20 +1,18 @@
 //! Each request owns its process group and holds tool calls until the reply is complete.
-#[path = "run/launch.rs"]
 mod launch;
-#[path = "run/private_files.rs"]
 mod private_files;
-#[path = "run/supervision.rs"]
 mod supervision;
 
+pub(crate) use self::launch::checked_profile;
+pub use self::launch::invalidate_version;
 pub(crate) use self::launch::{Launch, models};
-pub use self::launch::{VersionCheck, invalidate_version, version_check};
-use self::launch::{base_args, checked_profile, command, probe};
+use self::launch::{base_args, command, probe};
 pub(super) use self::private_files::private_dir_async;
 use self::private_files::{PrivateDir, private_dir, private_file};
 use self::supervision::{
     Group, Next, ReadDeadline, SHUTDOWN_GRACE, send, send_handshake, supervised, unreadable,
 };
-use super::super::STARTUP_TIMEOUT_SECS;
+use super::STARTUP_TIMEOUT_SECS;
 use super::checks::InitExpect;
 use super::error::Error;
 use super::mcp::{self, Handoff};
@@ -27,7 +25,7 @@ use crate::providers::oauth_loopback::random_token;
 use crate::{Message, ProviderEvent, ProviderUsage, StreamResponse};
 use flume::{Receiver, Sender};
 use futures::future::try_join;
-use futures_lite::Stream;
+use futures_lite::{Stream, future};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::ffi::OsString;
@@ -141,7 +139,7 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
         .await
         .map_err(Error::io("start the handoff server"))?;
     let checks = async {
-        let profile = checked_profile(launch).await?;
+        let profile = checked_profile(launch, future::pending()).await?;
         let offered = probe(launch, req.plan_usage).await?;
         Ok::<_, Error>((profile, offered))
     };
@@ -373,10 +371,10 @@ async fn exchange_reply(
                 Ok(Step::Done)
             }
             Next::Late => Err(match waiting {
-                Wait::Startup => Error::StartupLate(limits.startup.as_secs()),
-                Wait::Idle => Error::Stalled(limits.idle.as_secs()),
-                Wait::Handoff => Error::HandoffLate(limits.handoff.as_secs()),
-                Wait::Result => Error::ResultLate(limits.exit.as_secs()),
+                Wait::Startup => Error::Late(Wait::Startup, limits.startup.as_secs()),
+                Wait::Idle => Error::Late(Wait::Idle, limits.idle.as_secs()),
+                Wait::Handoff => Error::Late(Wait::Handoff, limits.handoff.as_secs()),
+                Wait::Result => Error::Late(Wait::Result, limits.exit.as_secs()),
             }),
         };
         // Keep-alives come from a timer, so they do not restart the clock.
@@ -632,7 +630,7 @@ mod tests {
 
     fn into_cause(error: Error) -> Error {
         match error {
-            Error::WithStderr { error, .. } | Error::WithExit { error, .. } => into_cause(*error),
+            Error::Context(failure) => *failure.cause,
             error => error,
         }
     }
@@ -881,10 +879,7 @@ mod tests {
             fake.group_gone(),
             "a stopped run must not continue after its request"
         );
-        match into_cause(result.unwrap_err()) {
-            Error::Interrupted(error) => *error,
-            error => error,
-        }
+        into_cause(result.unwrap_err())
     }
 
     #[test]
@@ -892,9 +887,7 @@ mod tests {
         let fake = Fake::new("malformed_arguments");
         let (result, _) = smol::block_on(fake.request());
         let error = result.unwrap_err();
-        assert!(
-            matches!(error.cause(), Error::Interrupted(inner) if matches!(inner.as_ref(), Error::MalformedArguments(_)))
-        );
+        assert!(matches!(error.cause(), Error::MalformedArguments(_)));
         assert!(super::super::agent_error(error).is_retryable());
         assert!(fake.group_gone());
         assert!(fake.leader_reaped());
@@ -927,21 +920,13 @@ mod tests {
     fn a_truncated_line_before_stop_is_diagnosed_and_retryable() {
         let fake = Fake::new("truncated_line");
         let (result, _) = smol::block_on(fake.request());
-        let error = into_cause(result.unwrap_err());
+        let error = result.unwrap_err();
         assert!(error.temporary().is_some());
-        let Error::Interrupted(error) = error else {
+        let error = into_cause(error);
+        let Error::NotAnEvent { bytes, source, .. } = error else {
             panic!("{error:?}")
         };
-        let Error::NotAnEvent {
-            category,
-            bytes,
-            source,
-            ..
-        } = *error
-        else {
-            panic!("{error:?}")
-        };
-        assert_eq!(category, Category::Eof);
+        assert_eq!(source.classify(), Category::Eof);
         assert_eq!(bytes, source.column());
         assert!(fake.leader_reaped());
         assert!(fake.group_gone());
@@ -1058,10 +1043,10 @@ mod tests {
     /// idle limit. After a reply, only the held call or the result is missing, and
     /// it comes immediately. Only the generation runs with a short idle
     /// limit, so a slow start cannot end the other two early.
-    #[test_case("stalled_generation", SHORT_IDLE => matches Error::Stalled(_) ; "a_generation")]
-    #[test_case("progress_generation", SHORT_IDLE => matches Error::Stalled(_) ; "a_generation_with_tool_progress")]
-    #[test_case("stalled_handoff", IDLE => matches Error::HandoffLate(_) ; "a_handoff")]
-    #[test_case("stalled_result_without_usage", IDLE => matches Error::ResultLate(_) ; "a_finished_reply_without_its_final_count")]
+    #[test_case("stalled_generation", SHORT_IDLE => matches Error::Late(Wait::Idle, _) ; "a_generation")]
+    #[test_case("progress_generation", SHORT_IDLE => matches Error::Late(Wait::Idle, _) ; "a_generation_with_tool_progress")]
+    #[test_case("stalled_handoff", IDLE => matches Error::Late(Wait::Handoff, _) ; "a_handoff")]
+    #[test_case("stalled_result_without_usage", IDLE => matches Error::Late(Wait::Result, _) ; "a_finished_reply_without_its_final_count")]
     fn keep_alives_cannot_hold_a_reply_open(scenario: &str, idle: Duration) -> Error {
         let fake = Fake::new(scenario);
         let result = through_keep_alives(&fake, limits(STARTUP, idle, SHORT_HANDOFF, SHORT_EXIT));
@@ -1071,10 +1056,7 @@ mod tests {
             "a run that hangs must not continue after its request"
         );
         let error = result.unwrap_err();
-        match into_cause(error) {
-            Error::Interrupted(error) => *error,
-            error => error,
-        }
+        into_cause(error)
     }
 
     /// maki continues a reply that hit its limit itself. Claude Code would
@@ -1097,11 +1079,7 @@ mod tests {
     fn a_context_overflow_omits_makis_own_kill_status() {
         let fake = Fake::new("context_overflow");
         let error = smol::block_on(fake.request()).0.unwrap_err();
-        assert!(
-            matches!(&error, Error::ContextOverflow)
-                || matches!(&error, Error::WithStderr { error, .. } if matches!(**error, Error::ContextOverflow)),
-            "{error:?}"
-        );
+        assert!(matches!(error.cause(), Error::ContextOverflow), "{error:?}");
         assert!(fake.group_gone());
     }
 
@@ -1177,7 +1155,7 @@ mod tests {
         fs::write(fake.dir.path().join("version_error"), VERSION_ERROR).unwrap();
         let err = smol::block_on(fake.request()).0.unwrap_err();
         assert!(
-            matches!(&err, Error::WithStderr { error, stderr } if matches!(**error, Error::VersionFailed(_)) && stderr == VERSION_ERROR.trim_end()),
+            matches!(&err, Error::Context(failure) if matches!(*failure.cause, Error::VersionFailed(_)) && failure.stderr == VERSION_ERROR.trim_end()),
             "{err:?}"
         );
     }
@@ -1214,7 +1192,7 @@ mod tests {
             limits(STARTUP, IDLE, HANDOFF, SHORT_EXIT),
         ));
         assert!(
-            matches!(result.as_ref().map_err(Error::cause), Err(Error::Interrupted(error)) if matches!(**error, Error::WentQuiet)),
+            matches!(result.as_ref().map_err(Error::cause), Err(Error::WentQuiet)),
             "{result:?}"
         );
     }
