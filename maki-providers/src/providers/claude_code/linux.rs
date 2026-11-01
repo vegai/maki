@@ -4,22 +4,24 @@
 //! maki executes the calls with its own tools and permissions. The plugin setting enables
 //! both the plugin and the provider.
 
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fmt::Display;
 use std::fs;
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
+use super::slots::{Permit, Slots};
+pub(super) use crate::process::within;
+use crate::providers::plugin::{NativeFactory, create_native, native_factory, register_native};
 use flume::Sender;
-use futures_lite::FutureExt;
+use maki_storage::auth::now_millis;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use smol::Timer;
-use smol::lock::{Mutex as AsyncMutex, Semaphore, SemaphoreGuard};
+use smol::lock::Mutex as AsyncMutex;
 use tracing::{debug, info, warn};
 
 use super::Error;
@@ -79,15 +81,6 @@ const SUBSIDY: &str = "Claude subscription";
 const BAD_REQUEST: u16 = 400;
 const CONTEXT_OVERFLOW_STATUS: u16 = 413;
 
-pub(super) async fn within<T>(deadline: Instant, work: impl Future<Output = T>) -> Option<T> {
-    async { Some(work.await) }
-        .or(async {
-            Timer::at(deadline).await;
-            None
-        })
-        .await
-}
-
 type PlanUsage = Arc<Mutex<Option<ProviderUsage>>>;
 static PLAN_USAGE: Mutex<BTreeMap<(PathBuf, PathBuf), PlanUsage>> = Mutex::new(BTreeMap::new());
 type ListingState = Option<(Instant, Result<Vec<Listed>, String>)>;
@@ -123,35 +116,80 @@ impl PluginOptions {
     }
 }
 
-pub fn configure_plugin(enabled: bool, options: Option<&Map<String, Value>>) {
-    let factory = enabled.then(|| {
-        let known_models = Arc::new(Mutex::new(
-            models_cache_path()
-                .as_deref()
-                .map(read_models)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(_, saved)| saved)
-                .collect(),
-        ));
-        let options = PluginOptions::from_table(options);
-        let slots = Arc::new(Semaphore::new(
-            options.max_concurrent.unwrap_or(DEFAULT_MAX_CONCURRENT),
-        ));
-        Arc::new(move |timeouts| {
-            let mut provider = ClaudeCode::new(&options, timeouts)?;
-            provider.slots = Arc::clone(&slots);
-            provider.known_models = Arc::clone(&known_models);
-            Ok(Box::new(provider) as Box<dyn Provider>)
-        }) as Arc<dyn Fn(Timeouts) -> Result<Box<dyn Provider>, AgentError> + Send + Sync>
-    });
-    super::super::plugin::register_native(SLUG, factory);
+fn reusable_listing(
+    state: &ListingState,
+    started: Instant,
+    listing: ModelListing,
+) -> Option<Result<Vec<Listed>, Error>> {
+    let (at, result) = state.as_ref()?;
+    let age = at.elapsed();
+    (*at >= started
+        || (listing == ModelListing::Cached && result.is_err() && age < FAILED_LISTING_TTL))
+        .then(|| {
+            result.clone().map_err(|message| Error::ListedRecently {
+                message,
+                wait: FAILED_LISTING_TTL.saturating_sub(age),
+            })
+        })
 }
 
-async fn request_slot<'a>(
-    slots: &'a Semaphore,
-    events: &Sender<ProviderEvent>,
-) -> SemaphoreGuard<'a> {
+struct Factory {
+    options: PluginOptions,
+    slots: Arc<Slots>,
+    models_cache: Option<PathBuf>,
+    known_models: Arc<Mutex<Vec<TimedModels>>>,
+}
+
+impl Factory {
+    fn new(options: PluginOptions, models_cache: Option<PathBuf>, previous: Option<&Self>) -> Self {
+        let limit = options.max_concurrent.unwrap_or(DEFAULT_MAX_CONCURRENT);
+        let slots = previous
+            .map(|factory| Arc::clone(&factory.slots))
+            .unwrap_or_else(|| Arc::new(Slots::new(limit)));
+        slots.set_limit(limit);
+        let known_models = previous
+            .filter(|factory| factory.models_cache == models_cache)
+            .map(|factory| Arc::clone(&factory.known_models))
+            .unwrap_or_else(|| {
+                Arc::new(Mutex::new(
+                    models_cache.as_deref().map(read_models).unwrap_or_default(),
+                ))
+            });
+        Self {
+            options,
+            slots,
+            models_cache,
+            known_models,
+        }
+    }
+}
+
+impl NativeFactory for Factory {
+    fn create(&self, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+        let vars = [worker::HOME_ENV, worker::CONFIG_DIR_ENV]
+            .into_iter()
+            .filter_map(|name| env::var(name).ok().map(|value| (name.to_owned(), value)))
+            .collect::<Vec<_>>();
+        Ok(Box::new(ClaudeCode::new(self, timeouts, &vars)?))
+    }
+}
+
+pub fn configure_plugin(enabled: bool, options: Option<&Map<String, Value>>) {
+    let factory = enabled.then(|| {
+        let previous = native_factory(SLUG);
+        let previous = previous
+            .as_deref()
+            .and_then(|factory| (factory as &dyn Any).downcast_ref::<Factory>());
+        Arc::new(Factory::new(
+            PluginOptions::from_table(options),
+            models_cache_path(),
+            previous,
+        )) as Arc<dyn NativeFactory>
+    });
+    register_native(SLUG, factory);
+}
+
+async fn request_slot<'a>(slots: &'a Slots, events: &Sender<ProviderEvent>) -> Permit<'a> {
     if let Some(slot) = slots.try_acquire() {
         return slot;
     }
@@ -212,8 +250,7 @@ pub(super) fn agent_error(error: Error) -> AgentError {
 }
 
 pub(super) fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
-    super::super::plugin::create_native(SLUG, timeouts)
-        .unwrap_or_else(|| Err(config_error(PLUGIN_OFF)))
+    create_native(SLUG, timeouts).unwrap_or_else(|| Err(config_error(PLUGIN_OFF)))
 }
 
 fn models_cache_path() -> Option<PathBuf> {
@@ -243,16 +280,6 @@ struct SavedModels {
 
 type TimedModels = (u64, SavedModels);
 
-fn timestamp() -> u64 {
-    u64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
-    )
-    .unwrap_or(u64::MAX)
-}
-
 fn read_models(path: &Path) -> Vec<TimedModels> {
     fs::read(path)
         .ok()
@@ -266,22 +293,28 @@ fn saved_models(
     executable: &Path,
     config_dir: &Path,
 ) -> Option<SavedModels> {
+    let now = now_millis();
     read_models(path).into_iter().find_map(|(at, saved)| {
-        (Duration::from_millis(timestamp().saturating_sub(at)) <= max_age
+        (Duration::from_millis(now.saturating_sub(at)) <= max_age
             && saved.executable == executable
             && saved.config_dir == config_dir)
             .then_some(saved)
     })
 }
 
-fn save_models(path: &Path, saved: &SavedModels) -> bool {
-    let mut entries = read_models(path);
+fn remember_models(entries: &mut Vec<TimedModels>, saved: &SavedModels) {
+    let now = now_millis();
     entries.retain(|(at, entry)| {
-        Duration::from_millis(timestamp().saturating_sub(*at)) <= MODELS_CACHE_TTL
+        Duration::from_millis(now.saturating_sub(*at)) <= MODELS_CACHE_TTL
             && (entry.executable != saved.executable || entry.config_dir != saved.config_dir)
     });
-    entries.insert(0, (timestamp(), saved.clone()));
+    entries.insert(0, (now, saved.clone()));
     entries.truncate(MAX_MODEL_CACHES);
+}
+
+fn save_models(path: &Path, saved: &SavedModels) -> bool {
+    let mut entries = read_models(path);
+    remember_models(&mut entries, saved);
     let result = serde_json::to_vec(&entries)
         .map_err(|error| error.to_string())
         .and_then(|bytes| atomic_write(path, &bytes).map_err(|error| error.to_string()));
@@ -296,7 +329,7 @@ fn save_models(path: &Path, saved: &SavedModels) -> bool {
 fn backdate_models(path: &Path, age: Duration) {
     let mut entries = read_models(path);
     for (at, _) in &mut entries {
-        *at = timestamp().saturating_sub(age.as_millis() as u64);
+        *at = now_millis().saturating_sub(age.as_millis() as u64);
     }
     fs::write(path, serde_json::to_vec(&entries).unwrap()).unwrap();
 }
@@ -354,35 +387,32 @@ pub(super) fn utf8_vars(vars: impl Iterator<Item = (OsString, OsString)>) -> Vec
 struct ClaudeCode {
     executable: PathBuf,
     limits: Limits,
-    slots: Arc<Semaphore>,
-    known_models: Arc<Mutex<Vec<SavedModels>>>,
-    login: PathBuf,
+    slots: Arc<Slots>,
+    known_models: Arc<Mutex<Vec<TimedModels>>>,
+    login: Option<PathBuf>,
     models_cache: Option<PathBuf>,
     /// Takes precedence over `$CLAUDE_CONFIG_DIR`.
     config_dir: Option<PathBuf>,
 }
 
 impl ClaudeCode {
-    fn new(options: &PluginOptions, timeouts: Timeouts) -> Result<Self, AgentError> {
+    fn new(
+        factory: &Factory,
+        timeouts: Timeouts,
+        vars: &[(String, String)],
+    ) -> Result<Self, AgentError> {
+        let options = &factory.options;
         let name = options.executable.as_deref().unwrap_or(DEFAULT_EXECUTABLE);
         let cwd = env::current_dir().map_err(config_error)?;
         let executable = worker::executable(name, &cwd).map_err(config_error)?;
-        let vars = [worker::HOME_ENV, worker::CONFIG_DIR_ENV]
-            .into_iter()
-            .filter_map(|name| env::var(name).ok().map(|value| (name.to_owned(), value)))
-            .collect::<Vec<_>>();
-        let login =
-            worker::login_dir(&vars, options.config_dir.as_deref()).map_err(config_error)?;
-        let models_cache = models_cache_path();
+        let login = worker::login_dir(vars, options.config_dir.as_deref()).ok();
         Ok(Self {
             executable,
             limits: Limits::new(timeouts.stream),
-            slots: Arc::new(Semaphore::new(
-                options.max_concurrent.unwrap_or(DEFAULT_MAX_CONCURRENT),
-            )),
-            known_models: Arc::default(),
+            slots: Arc::clone(&factory.slots),
+            known_models: Arc::clone(&factory.known_models),
             login,
-            models_cache,
+            models_cache: factory.models_cache.clone(),
             config_dir: options.config_dir.clone(),
         })
     }
@@ -450,43 +480,46 @@ impl ClaudeCode {
         {
             return Ok(models);
         }
-        let refresh_slot = if listing == ModelListing::Refresh {
-            Some(self.slots.try_acquire().ok_or(Error::ListingBusy)?)
-        } else {
-            None
-        };
         let started = Instant::now();
-        let state = Arc::clone(
+        let listing_lock = Arc::clone(
             LISTINGS
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .entry(key.clone())
                 .or_default(),
         );
-        let mut state = state.lock().await;
+        let deadline = started + self.limits.startup;
+        let mut state = within(deadline, listing_lock.lock())
+            .await
+            .ok_or(Error::ListingBusy)?;
         if listing == ModelListing::Cached
             && let Some(models) = saved().await
         {
             return Ok(models);
         }
-        if let Some((at, result)) = &*state {
-            let age = at.elapsed();
-            if *at >= started
-                || (listing == ModelListing::Cached && result.is_err() && age < FAILED_LISTING_TTL)
-            {
-                return result.clone().map_err(|message| Error::ListedRecently {
-                    message,
-                    wait: FAILED_LISTING_TTL.saturating_sub(age),
-                });
-            }
+        if let Some(result) = reusable_listing(&state, started, listing) {
+            return result;
         }
-        let _slot = match refresh_slot {
+        let _slot = match self.slots.try_acquire() {
             Some(slot) => slot,
-            None => self.slots.acquire().await,
+            None if listing == ModelListing::Refresh => return Err(Error::ListingBusy),
+            None => {
+                drop(state);
+                let slot = within(deadline, self.slots.acquire())
+                    .await
+                    .ok_or(Error::ListingBusy)?;
+                state = within(deadline, listing_lock.lock())
+                    .await
+                    .ok_or(Error::ListingBusy)?;
+                if let Some(result) = reusable_listing(&state, started, listing) {
+                    return result;
+                }
+                slot
+            }
         };
         let listed = self.ask_models(cwd, vars).await;
         *state = match &listed {
-            Err(error) if error.is_version_error() || matches!(error, Error::ListingBusy) => None,
+            Err(error) if error.is_version_error() => None,
             _ => Some((
                 Instant::now(),
                 listed.as_ref().cloned().map_err(ToString::to_string),
@@ -500,11 +533,7 @@ impl ClaudeCode {
             .known_models
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        known.retain(|entry| {
-            entry.executable != saved.executable || entry.config_dir != saved.config_dir
-        });
-        known.insert(0, saved.clone());
-        known.truncate(MAX_MODEL_CACHES);
+        remember_models(&mut known, saved);
     }
 
     fn window_of(&self, id: &str) -> Option<u32> {
@@ -514,7 +543,11 @@ impl ClaudeCode {
             .unwrap_or_else(PoisonError::into_inner);
         known
             .iter()
-            .find(|saved| saved.executable == self.executable && saved.config_dir == self.login)?
+            .find(|(_, saved)| {
+                saved.executable == self.executable
+                    && Some(&saved.config_dir) == self.login.as_ref()
+            })?
+            .1
             .models
             .iter()
             .find(|listed| is_same_model(&listed.id, id))?
@@ -582,9 +615,7 @@ impl ClaudeCode {
     }
 
     fn invalidate_version_on_error(&self, error: &Error) {
-        if error.invalidates_version() {
-            run::invalidate_version(&self.executable);
-        }
+        worker::invalidate_on_error(&self.executable, error);
     }
 }
 
@@ -639,11 +670,12 @@ impl Provider for ClaudeCode {
     /// ask.
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
         Box::pin(async {
-            Ok(self
-                .plan_usage(&self.login)
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone())
+            Ok(self.login.as_ref().and_then(|login| {
+                self.plan_usage(login)
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone()
+            }))
         })
     }
 
@@ -663,17 +695,19 @@ impl Provider for ClaudeCode {
 
 #[cfg(test)]
 mod tests {
+    use std::any::Any;
     use std::env;
     use std::ffi::OsString;
     use std::fs;
     use std::os::unix::ffi::OsStringExt;
     use std::path::Path;
     use std::pin::pin;
+    use std::sync::Arc;
     use std::time::Duration;
 
+    use super::Slots;
     use futures_lite::future::poll_once;
     use serde_json::{Value, json};
-    use smol::lock::Semaphore;
     use tempfile::tempdir;
     use test_case::test_case;
 
@@ -699,7 +733,7 @@ mod tests {
     #[test]
     fn waiting_for_a_request_slot_is_reported_and_cleared_on_acquisition() {
         smol::block_on(async {
-            let slots = Semaphore::new(1);
+            let slots = Slots::new(1);
             let held = slots.acquire().await;
             let (events, received) = flume::unbounded();
             let mut queued = pin!(request_slot(&slots, &events));
@@ -721,7 +755,7 @@ mod tests {
     #[test]
     fn cancelling_a_queued_request_clears_its_waiting_status() {
         smol::block_on(async {
-            let slots = Semaphore::new(1);
+            let slots = Slots::new(1);
             let _held = slots.acquire().await;
             let (events, received) = flume::unbounded();
             {
@@ -875,22 +909,27 @@ mod tests {
     /// runs. The login and the saved model list live in `dir`, and the saved
     /// list is `listed`.
     fn provider_in(dir: &Path, listed: Vec<Listed>) -> ClaudeCode {
+        let executable = env::current_exe().unwrap();
         let options = PluginOptions {
-            executable: Some(env::current_exe().unwrap().to_string_lossy().into_owned()),
+            executable: Some(executable.display().to_string()),
             config_dir: Some(dir.to_owned()),
             ..PluginOptions::default()
         };
-        let mut provider = ClaudeCode::new(&options, Timeouts::default()).unwrap();
         let cache = dir.join(MODELS_CACHE_FILE);
-        let saved = SavedModels {
-            executable: provider.executable.clone(),
-            config_dir: dir.to_owned(),
-            models: listed,
-        };
-        save_models(&cache, &saved);
-        provider.remember(&saved);
-        provider.models_cache = Some(cache);
-        provider
+        save_models(
+            &cache,
+            &SavedModels {
+                executable,
+                config_dir: dir.to_owned(),
+                models: listed,
+            },
+        );
+        ClaudeCode::new(
+            &super::Factory::new(options, Some(cache), None),
+            Timeouts::default(),
+            &[],
+        )
+        .unwrap()
     }
 
     fn listed(id: &str, window: Option<u32>) -> Listed {
@@ -943,8 +982,18 @@ mod tests {
         };
         assert!(save_models(&base, &saved));
         backdate_models(&base, MODELS_CACHE_TTL + Duration::from_secs(1));
-        let unrelated = root.path().join("claude-code-models.unrelated.json");
-        fs::write(&unrelated, "untouched").unwrap();
+        assert!(save_models(
+            &base,
+            &SavedModels {
+                config_dir: "new-login".into(),
+                ..saved.clone()
+            }
+        ));
+        assert!(
+            read_models(&base)
+                .iter()
+                .all(|(_, entry)| entry.config_dir != saved.config_dir)
+        );
         for index in 0..=MAX_MODEL_CACHES {
             assert!(save_models(
                 &base,
@@ -961,8 +1010,7 @@ mod tests {
                 .all(|(_, saved)| saved.config_dir != Path::new("old-login"))
         );
         assert_eq!(entries.len(), MAX_MODEL_CACHES);
-        assert_eq!(fs::read_to_string(unrelated).unwrap(), "untouched");
-        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 2);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
     }
 
     /// maki counts a turn on the subscription login as `$0`, and the list
@@ -1107,40 +1155,69 @@ mod tests {
         );
     }
 
+    #[test_case(None ; "missing_home")]
+    #[test_case(Some("relative-login") ; "relative_login")]
+    fn invalid_login_configuration_is_reported_by_listing_not_construction(login: Option<&str>) {
+        let options = PluginOptions {
+            executable: Some(env::current_exe().unwrap().display().to_string()),
+            config_dir: login.map(Into::into),
+            ..PluginOptions::default()
+        };
+        let factory = super::Factory::new(options, None, None);
+        let provider = ClaudeCode::new(&factory, Timeouts::default(), &[]).unwrap();
+        assert!(provider.login.is_none());
+        assert!(
+            smol::block_on(provider.list(
+                Path::new("/"),
+                crate::provider::ModelListing::Refresh,
+                Vec::new()
+            ))
+            .is_err()
+        );
+    }
+
     #[test]
-    fn slots_follow_each_registration_without_changing_active_requests() {
-        let first = ClaudeCode::new(
-            &PluginOptions {
-                executable: Some(env::current_exe().unwrap().display().to_string()),
-                max_concurrent: Some(1),
-                ..PluginOptions::default()
-            },
-            Timeouts::default(),
-        )
-        .unwrap();
-        let _running = first.slots.try_acquire_arc().unwrap();
-        let second = ClaudeCode::new(
-            &PluginOptions {
-                executable: Some(env::current_exe().unwrap().display().to_string()),
-                max_concurrent: Some(2),
-                ..PluginOptions::default()
-            },
-            Timeouts::default(),
-        )
-        .unwrap();
-        let taken = [
-            second.slots.try_acquire_arc(),
-            second.slots.try_acquire_arc(),
-        ];
-        assert!(taken.iter().all(Option::is_some));
-        assert!(first.slots.try_acquire().is_none());
+    fn registrations_share_slots_across_reload_and_apply_new_limits() {
+        let executable = env::current_exe().unwrap();
+        let options = |limit| json!({(super::EXECUTABLE_OPTION):executable, (super::MAX_CONCURRENT_OPTION):limit});
+        let load = |limit| {
+            crate::providers::plugin::begin_load();
+            super::configure_plugin(true, options(limit).as_object());
+            crate::providers::plugin::commit_load();
+            let factory = super::native_factory(SLUG).unwrap();
+            Arc::clone(
+                &(factory.as_ref() as &dyn Any)
+                    .downcast_ref::<super::Factory>()
+                    .unwrap()
+                    .slots,
+            )
+        };
+        let slots = load(1);
+        let running = slots.try_acquire().unwrap();
+        let first = super::create(Timeouts::default()).unwrap();
+        let second = super::create(Timeouts::default()).unwrap();
+        for provider in [first, second] {
+            let error =
+                smol::block_on(provider.list_models(crate::provider::ModelListing::Refresh))
+                    .unwrap_err();
+            assert!(error.to_string().contains(&Error::ListingBusy.to_string()));
+        }
+        let reloaded = load(2);
+        assert!(Arc::ptr_eq(&slots, &reloaded));
+        let additional = reloaded.try_acquire().unwrap();
+        assert!(slots.try_acquire().is_none());
+        load(1);
+        drop(running);
+        assert!(reloaded.try_acquire().is_none());
+        drop(additional);
+        assert!(reloaded.try_acquire().is_some());
     }
 }
 
 /// The provider as maki builds it, on the fake `claude`.
 #[cfg(test)]
 mod on_the_fake {
-    use smol::lock::Semaphore;
+    use crate::providers::Timeouts;
     use std::env;
     use std::fs;
     use std::iter;
@@ -1149,7 +1226,6 @@ mod on_the_fake {
     use std::path::{Path, PathBuf};
     use std::pin::pin;
     use std::sync::Arc;
-    use std::sync::Mutex;
     use std::time::Duration;
 
     use futures_lite::future::poll_once;
@@ -1161,10 +1237,9 @@ mod on_the_fake {
 
     use super::error::{Error, Problem};
     use super::fake::{Fake, HAIKU, IDLE, MARKER, OPUS, SYSTEM, VERSION_ERROR, tools};
-    use super::run::{Limits, Listed, Thinking};
+    use super::run::{Listed, Thinking};
     use super::{
-        ClaudeCode, Exchange, LISTINGS, SPEC, SavedModels, WAIT, backdate_models, read_models,
-        save_models,
+        ClaudeCode, Exchange, LISTINGS, SPEC, SavedModels, WAIT, backdate_models, save_models,
     };
     use crate::provider::{ModelListing, Provider};
     use crate::{Message, Model, ProviderUsage, StreamResponse};
@@ -1302,24 +1377,23 @@ mod on_the_fake {
             (HOME.to_owned(), home.display().to_string()),
             (TMPDIR.to_owned(), temp.display().to_string()),
         ];
-        let known_models = models_cache
-            .as_deref()
-            .map(read_models)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(_, saved)| saved)
-            .collect();
+        let options = super::PluginOptions {
+            executable: Some(fake.executable().display().to_string()),
+            ..super::PluginOptions::default()
+        };
+        let factory = super::Factory::new(options, models_cache, None);
+        let provider = ClaudeCode::new(
+            &factory,
+            Timeouts {
+                stream: IDLE,
+                ..Timeouts::default()
+            },
+            &vars,
+        )
+        .unwrap();
         Fixture {
             vars: vars.to_vec(),
-            provider: ClaudeCode {
-                executable: fake.executable(),
-                limits: Limits::new(IDLE),
-                slots: Arc::new(Semaphore::new(super::DEFAULT_MAX_CONCURRENT)),
-                known_models: Arc::new(Mutex::new(known_models)),
-                login: home.join(CLAUDE_DIR),
-                models_cache,
-                config_dir: None,
-            },
+            provider,
         }
     }
 
@@ -1332,7 +1406,10 @@ mod on_the_fake {
             plan: Some("Claude Pro".into()),
             ..Default::default()
         };
-        *first.plan_usage(&first.login.clone()).lock().unwrap() = Some(usage.clone());
+        *first
+            .plan_usage(first.login.as_deref().unwrap())
+            .lock()
+            .unwrap() = Some(usage.clone());
         let second = provider_for(&fake, home.path(), &env::temp_dir(), None);
         assert_eq!(
             smol::block_on(second.fetch_usage()).unwrap(),
@@ -1352,7 +1429,10 @@ mod on_the_fake {
         let other_home = tempdir().unwrap();
         let other_fake = Fake::new("text");
         let first = provider_for(&fake, home.path(), &env::temp_dir(), None);
-        *first.plan_usage(&first.login.clone()).lock().unwrap() = Some(ProviderUsage::default());
+        *first
+            .plan_usage(first.login.as_deref().unwrap())
+            .lock()
+            .unwrap() = Some(ProviderUsage::default());
         let other = if executable {
             provider_for(&other_fake, home.path(), &env::temp_dir(), None)
         } else {
@@ -1470,7 +1550,7 @@ mod on_the_fake {
         let provider = provider_for(&fake, home.path(), &env::temp_dir(), Some(cache.clone()));
         let cwd = fake.project();
         let slots = Arc::clone(&provider.slots);
-        let held: Vec<_> = iter::from_fn(|| slots.try_acquire_arc()).collect();
+        let held: Vec<_> = iter::from_fn(|| slots.try_acquire()).collect();
         smol::block_on(async {
             let error = provider
                 .list(&cwd, ModelListing::Refresh)
@@ -1497,13 +1577,28 @@ mod on_the_fake {
     }
 
     #[test]
+    fn cached_listing_slot_wait_is_bounded() {
+        let fake = Fake::new("text");
+        let home = tempdir().unwrap();
+        let mut provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
+        provider.limits.startup = Duration::ZERO;
+        provider.slots.set_limit(1);
+        let slots = Arc::clone(&provider.slots);
+        let _held = slots.try_acquire().unwrap();
+        let error =
+            smol::block_on(provider.list(&fake.project(), ModelListing::Cached)).unwrap_err();
+        assert!(matches!(error, Error::ListingBusy));
+        assert!(fake.log("calls").is_empty());
+    }
+
+    #[test]
     fn a_cached_listing_waits_for_a_busy_slot() {
         let fake = Fake::new("text");
         let home = tempdir().unwrap();
         let provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
         smol::block_on(async {
             let slots = Arc::clone(&provider.slots);
-            let held: Vec<_> = iter::from_fn(|| slots.try_acquire_arc()).collect();
+            let held: Vec<_> = iter::from_fn(|| slots.try_acquire()).collect();
             let cwd = fake.project();
             let mut listed = pin!(provider.list(&cwd, ModelListing::Cached));
             assert!(poll_once(&mut listed).await.is_none());
@@ -1584,7 +1679,7 @@ mod on_the_fake {
         let home = tempdir().unwrap();
         let first = provider_for(&blocked, home.path(), &env::temp_dir(), None);
         let second = provider_for(&other, home.path(), &env::temp_dir(), None);
-        let key = (first.executable.clone(), first.login.clone());
+        let key = (first.executable.clone(), first.login.clone().unwrap());
         let state = Arc::clone(LISTINGS.lock().unwrap().entry(key).or_default());
         smol::block_on(async {
             let _held = state.lock().await;

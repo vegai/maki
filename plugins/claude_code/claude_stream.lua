@@ -71,15 +71,11 @@ function Stream:tool_line(name, input)
   return tostring(name) .. " " .. target
 end
 
---- Returns what to do with one stdout line, or nil:
----   `{ control = line }`  a handshake response
----   `{ stop = reason }`  kill the child, the run is unusable
----   `{ init = event }`   the checks found no problem in the child
----   `{ lines = {...} }`  status lines for the view
 function Stream:accepted()
   return self.native:accepted()
 end
 
+--- Returns a control completion, stop reason, init event or progress lines; nil means no update.
 function Stream:feed(line, handshake)
   local classified, problem = self.native:feed(line, handshake)
   if not classified then

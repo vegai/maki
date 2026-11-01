@@ -135,7 +135,7 @@ pub(crate) const DEFAULT_MODE: &str = "default";
 pub(crate) const CONNECTED: &str = "connected";
 const UNNAMED_SOURCE: &str = "unnamed";
 pub const GIT_ENTRY: &str = ".git";
-const GITDIR_PREFIX: &str = "gitdir:";
+pub const GITDIR_PREFIX: &str = "gitdir:";
 const COMMONDIR_FILE: &str = "commondir";
 
 // The fields of Claude Code's answers and init event that the checks read.
@@ -170,11 +170,11 @@ pub(crate) struct HandshakeStep {
     pub subtype: &'static str,
 }
 
-pub(super) fn inside_checkout(path: &Path, project: &Path, denied: &[PathBuf]) -> bool {
+pub fn inside_checkout(path: &Path, project: &Path, denied: &[PathBuf]) -> bool {
     path.starts_with(project) || denied.iter().any(|dir| path.starts_with(dir))
 }
 
-fn minimum_version() -> String {
+pub(super) fn minimum_version() -> String {
     MINIMUM_VERSION.map(|part| part.to_string()).join(".")
 }
 
@@ -330,11 +330,7 @@ pub(super) fn checkout_root(cwd: &Path) -> Result<PathBuf, Error> {
             Ok(_) => return Ok(dir.to_owned()),
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(source) => {
-                return Err(Error::Path {
-                    what: "examine",
-                    path: git,
-                    source,
-                });
+                return Err(Error::path("examine", &git)(source));
             }
         }
     }
@@ -1028,6 +1024,7 @@ mod tests {
     #[test_case(settings_with(None, Some(USER_SETTINGS)), hooks_off() => matches Some(Problem::LoadedSettings(source)) if source == USER_SETTINGS ; "user_settings_loaded")]
     #[test_case(json!({ "sources": [], "errors": [{ "file": "x" }] }), hooks_off() => matches Some(Problem::InvalidSettings) ; "invalid_settings")]
     #[test_case(json!({ "effective": { "autoCompactEnabled": false }, "sources": [], "errors": [] }), hooks_off() => matches None ; "an_empty_error_list")]
+    #[test_case(json!({ "effective": {}, "sources": [], "errors": {} }), hooks_off() => matches Some(Problem::InvalidSettings) ; "errors_as_an_object")]
     #[test_case(settings_with(Some(json!("anything")), None), hooks_off() => matches Some(Problem::UnreadablePolicy) ; "a_policy_that_is_no_object")]
     #[test_case(json!({}), hooks_off() => matches Some(Problem::NoSettings) ; "no_settings")]
     fn only_our_settings_and_harmless_policy_pass(
@@ -1082,6 +1079,46 @@ mod tests {
             expect.tools,
             &[DEFAULT_MODE.to_owned()],
             Some(SERVER),
+        )
+    }
+
+    #[test_case(json!([{ "name": SERVER, "status": CONNECTED }]) ; "foreign_server")]
+    #[test_case(json!({ "foreign": { "status": CONNECTED } }) ; "server_object")]
+    fn a_worker_without_handoff_refuses_foreign_mcp_servers(servers: Value) {
+        let event = init(|event| event["mcp_servers"] = servers);
+        let tools = [TOOL.to_owned(), OTHER_TOOL.to_owned()].into();
+        let problem = init_problem(
+            &event,
+            VERSION,
+            Path::new(CWD),
+            &tools,
+            &[DEFAULT_MODE.to_owned()],
+            None,
+        );
+        assert!(matches!(problem, Some(Problem::HandoffServer(_))));
+    }
+
+    #[test_case(DEFAULT_MODE, json!(["Read", "Edit", "Write", "Bash"]) => matches Some(Problem::RunMode(_)) ; "coding_requires_accept_edits")]
+    #[test_case(EDITS_MODE, json!(["Read", "Edit", "Write"]) => matches Some(Problem::MissingTool(_)) ; "coding_requires_bash")]
+    #[test_case(EDITS_MODE, json!(["Read", "Write", "Bash"]) => matches Some(Problem::MissingTool(_)) ; "coding_requires_edit")]
+    #[test_case(EDITS_MODE, json!(["Read", "Edit", "Write", "Bash"]) => matches None ; "coding_profile")]
+    fn coding_init_requires_its_permission_mode_and_tools(
+        mode: &str,
+        tools: Value,
+    ) -> Option<Problem> {
+        let event = init(|event| {
+            event["permissionMode"] = mode.into();
+            event["tools"] = tools;
+            event["mcp_servers"] = json!([]);
+        });
+        let expected = ["Read", "Edit", "Write", "Bash"].map(str::to_owned).into();
+        init_problem(
+            &event,
+            VERSION,
+            Path::new(CWD),
+            &expected,
+            &[EDITS_MODE.to_owned()],
+            None,
         )
     }
 

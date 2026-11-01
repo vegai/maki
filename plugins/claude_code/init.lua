@@ -1,7 +1,4 @@
--- Send the task only after the probe and worker pass the handshake.
---
--- Managed hooks can run at startup. Run the probe in an empty directory so a rejected hook
--- cannot write to the project.
+-- Delegate read-only investigations and sandboxed snapshot edits, then import approved changes.
 
 local native = require("maki.claude_code.internal")
 local output_limits = require("maki.output_limits")
@@ -186,13 +183,6 @@ local function snapshot_plan(input)
   return { include = include, dependencies = dependencies, root = root }
 end
 
--- Deny every checkout alias, git directory, login path and credential path. This includes
--- maki state, config and other artifacts.
---
--- Each sandbox command mounts empty filesystems over denied directories, including artifacts
--- created after startup. Restore write access only to the snapshot and temporary directory.
--- Keep the git directory read-only.
---
 local function fill_snapshot(call, view, plan, artifact, cwd, env)
   view:append({ { SNAPSHOTTING, "dim" } })
   local err = snapshot.fill(call, artifact, {

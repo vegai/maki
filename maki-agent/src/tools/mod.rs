@@ -107,7 +107,6 @@ impl ToolOutputMode {
 
 pub struct DescriptionContext<'a> {
     pub filter: &'a ToolFilter,
-    pub local_tools: Option<&'a LocalTools>,
     pub audience: ToolAudience,
     pub workflow: bool,
     /// Whether the session being described can reach MCP tools.
@@ -136,11 +135,11 @@ impl ToolKind {
         }
     }
 
-    pub fn of(name: &str, registry: &ToolRegistry, local: Option<&LocalTools>) -> Self {
+    pub fn of(name: &str, registered: Option<ToolAudience>, local: Option<&LocalTools>) -> Self {
         if let Some(tool) = local.and_then(|tools| tools.get(name)) {
             Self::Local(tool.audience)
-        } else if let Some(entry) = registry.get(name) {
-            Self::Registry(entry.tool.audience())
+        } else if let Some(audience) = registered {
+            Self::Registry(audience)
         } else {
             Self::unresolved(name)
         }
@@ -217,6 +216,13 @@ impl ToolFilter {
 /// produced it. A run context carries the pair, never a loose array, so the
 /// names dispatch offers in-process (`tool_dispatch::callable`, and through it
 /// the `code_execution` sandbox) cannot drift from what the model was shown.
+#[derive(Default)]
+pub struct RequestSpec<'a> {
+    pub excluded: &'a [&'a str],
+    pub workflow: bool,
+    pub mcp: bool,
+}
+
 #[derive(Clone)]
 pub struct RequestTools {
     definitions: Value,
@@ -236,27 +242,28 @@ impl RequestTools {
     /// The one place a run's tool array is built. Host exclusions (a client
     /// that cannot service `question`) go through here and nowhere else, so
     /// the array and the filter always agree on them.
-    #[allow(clippy::too_many_arguments)]
     pub fn build(
         registry: &ToolRegistry,
         local_tools: &LocalTools,
         vars: &crate::template::Vars,
         model: &Model,
         config: &AgentConfig,
-        excluded: &[&str],
-        workflow: bool,
-        mcp: bool,
+        spec: RequestSpec<'_>,
     ) -> Self {
-        let filter = ToolFilter::from_config(config, model, excluded);
+        let filter = ToolFilter::from_config(config, model, spec.excluded);
         let ctx = DescriptionContext {
-            local_tools: Some(local_tools),
             filter: &filter,
             audience: ToolAudience::MAIN,
-            workflow,
-            mcp,
+            workflow: spec.workflow,
+            mcp: spec.mcp,
         };
         Self {
-            definitions: registry.definitions(vars, &ctx, model.supports_tool_examples()),
+            definitions: registry.definitions(
+                vars,
+                &ctx,
+                Some(local_tools),
+                model.supports_tool_examples(),
+            ),
             filter: Arc::new(filter),
         }
     }
@@ -289,7 +296,11 @@ impl RequestTools {
                 def[TOOL_NAME_FIELD].as_str().is_none_or(|name| {
                     filter.admits(
                         name,
-                        ToolKind::of(name, registry, Some(local_tools)),
+                        ToolKind::of(
+                            name,
+                            registry.get(name).map(|entry| entry.tool.audience()),
+                            Some(local_tools),
+                        ),
                         audience,
                     )
                 })
@@ -1085,9 +1096,11 @@ mod tests {
             &Vars::new(),
             &model,
             &config,
-            &[],
-            false,
-            false,
+            RequestSpec {
+                excluded: &[],
+                workflow: false,
+                mcp: false,
+            },
         );
         let assembled = RequestTools::assembled(
             ToolRegistry::global(),

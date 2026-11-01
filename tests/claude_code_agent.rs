@@ -201,6 +201,7 @@ fn dry_run_uses_provider_capabilities_and_filters_without_starting_claude() {
     );
     let init: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(init["subtype"], INIT);
+    assert!(init["uuid"].is_string());
     assert_eq!(init["thinking"], "low");
     let mut tools: Vec<_> = init["tools"]
         .as_array()
@@ -263,6 +264,7 @@ fn request_policy_does_not_prevent_provider_creation_or_dry_run() {
     );
     let init: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(init["subtype"], INIT);
+    assert!(init["uuid"].is_string());
     assert!(!claude.with_extension(RAN_EXTENSION).exists());
     let output = finish(&mut fixture.maki(MODEL, PROMPT, STREAM_FORMAT));
     assert!(!output.status.success());

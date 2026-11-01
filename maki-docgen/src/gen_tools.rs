@@ -260,12 +260,12 @@ pub fn generate() -> String {
     let defs = registry.definitions(
         &vars,
         &DescriptionContext {
-            local_tools: None,
             filter: &ToolFilter::default(),
             audience: ToolAudience::MAIN,
             workflow: false,
             mcp: false,
         },
+        None,
         false,
     );
     let def_map: HashMap<String, &Value> = defs

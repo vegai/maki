@@ -9,7 +9,7 @@ use maki_agent::prompt::ResolvedPrompts;
 use maki_agent::session::Resumed;
 use maki_agent::template;
 use maki_agent::template::Vars;
-use maki_agent::tools::{LocalTools, RequestTools, ToolAudience, ToolRegistry};
+use maki_agent::tools::{LocalTools, RequestSpec, RequestTools, ToolAudience, ToolRegistry};
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, AgentSeed, CancelMap,
     CancelToken, DoneReason, Envelope, EventSender, History, Instructions, McpCommand, PromptRole,
@@ -37,9 +37,11 @@ fn base_tools(
         vars,
         model,
         config,
-        &[],
-        workflow,
-        has_mcp,
+        RequestSpec {
+            excluded: &[],
+            workflow,
+            mcp: has_mcp,
+        },
     )
 }
 

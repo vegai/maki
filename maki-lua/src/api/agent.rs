@@ -549,7 +549,6 @@ async fn tools(
 
     let vars = maki_agent::template::env_vars();
     let ctx_desc = DescriptionContext {
-        local_tools: None,
         filter: &filter,
         audience,
         workflow,
@@ -557,7 +556,8 @@ async fn tools(
     };
     // Base definitions only: the session injects MCP definitions per
     // request, so baking them into a tools array would freeze the catalog.
-    let defs = ToolRegistry::global().definitions(&vars, &ctx_desc, model.supports_tool_examples());
+    let defs =
+        ToolRegistry::global().definitions(&vars, &ctx_desc, None, model.supports_tool_examples());
 
     Ok((Some(json_to_lua(&lua, &defs)?), None))
 }

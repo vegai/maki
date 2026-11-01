@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::LazyLock;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -79,6 +80,8 @@ const CONFIRM_DENY_PROJECT_SESSION_HINTS: &[(&str, &str)] = &[
 const DENY_GUIDANCE_HINTS: &[(&str, &str)] = &[("Enter", "Deny"), ("Esc", "Cancel")];
 const QUEUED_NOTICE: &str = "more request(s) waiting";
 const TITLE: &str = " Permission Required ";
+
+static SCROLL_TITLE: LazyLock<String> = LazyLock::new(scroll_title);
 
 fn scroll_title() -> String {
     format!(
@@ -479,20 +482,19 @@ impl PermissionPrompt {
         let viewport = area.height.saturating_sub(BORDER);
         self.scroll.update_dimensions(total, viewport);
         let title = if total > viewport {
-            scroll_title()
+            SCROLL_TITLE.as_str()
         } else {
-            TITLE.to_owned()
+            TITLE
         };
         let t = theme::current();
-        let clipped = total > viewport.saturating_add(self.scroll.offset());
         render_form(
             &t,
-            &title,
+            title,
             frame,
             area,
             paragraph,
             (self.scroll.offset(), 0),
-            clipped,
+            total,
         );
     }
 

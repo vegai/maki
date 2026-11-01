@@ -29,8 +29,8 @@ use crate::api::fs::expand_tilde;
 use super::{JOB_NOT_FOUND_ERR, MAX_TAIL_LINES};
 
 const DEFAULT_TAIL: usize = 20;
-const EXIT_STDERR_LINES: usize = 10;
-const EXIT_STDERR_BYTES: usize = 4096;
+pub(crate) const EXIT_STDERR_LINES: usize = 10;
+pub(crate) const EXIT_STDERR_BYTES: usize = 4096;
 const MAX_COMPLETED_SESSION_JOBS: usize = 256;
 #[cfg(not(target_os = "linux"))]
 const GUARD_UNSUPPORTED: &str = "jobstart: guard requires Linux";
@@ -322,7 +322,7 @@ struct JobMeta {
     /// nothing ever reaches the tail there and an empty tail is no evidence
     /// the job stayed quiet.
     dropped_output: bool,
-    /// Coordinates reaping, signals, timeouts and stdin errors across the job's threads.
+    /// Coordinates reaping, signals and timeouts across the job's threads.
     reap_state: Arc<ReapState>,
     deadline: Option<smol::Task<()>>,
     exit_code: Option<i32>,
@@ -646,8 +646,6 @@ impl JobStore {
         }
     }
 
-    /// Session-owned jobs stay inspectable after exit. Task/plugin jobs are
-    /// removed the way they always were.
     pub fn exit_stderr(&self, job_id: u32) -> Vec<String> {
         self.jobs
             .get(&job_id)
@@ -661,6 +659,7 @@ impl JobStore {
             .unwrap_or_default()
     }
 
+    /// Session jobs stay inspectable after exit; task and plugin jobs release their records.
     pub fn complete(&mut self, lua: &Lua, job_id: u32, code: i32) {
         let Some(job) = self.jobs.get_mut(&job_id) else {
             return;
@@ -1051,6 +1050,7 @@ struct StdinState {
     bytes: AtomicUsize,
     ready: Event,
     closed: AtomicBool,
+    sending: AsyncMutex<()>,
 }
 
 impl StdinState {
@@ -1073,10 +1073,11 @@ pub(super) struct StdinWriter {
 
 impl StdinWriter {
     pub async fn send(&self, data: &[u8]) -> Result<usize, &'static str> {
+        let _sending = self.state.sending.lock().await;
         for chunk in data.chunks(STDIN_CHUNK_BYTES) {
             loop {
                 let ready = self.state.ready.listen();
-                if self.state.closed.load(Ordering::Acquire) || self.sender.is_disconnected() {
+                if self.state.closed.load(Ordering::Acquire) {
                     return Err(STDIN_WRITE_ERR);
                 }
                 let len = chunk.len();
@@ -1115,7 +1116,8 @@ fn spawn_stdin_writer(mut stdin: ChildStdin) -> Result<StdinQueue, String> {
                 let result = stdin.write_all(&chunk);
                 writing.bytes.fetch_sub(chunk.len(), Ordering::AcqRel);
                 writing.ready.notify(usize::MAX);
-                if result.is_err() {
+                if let Err(error) = result {
+                    tracing::debug!(kind = ?error.kind(), %error, "job stdin write failed");
                     break;
                 }
             }
@@ -1188,10 +1190,10 @@ struct Unwatched(Option<Child>);
 impl Drop for Unwatched {
     fn drop(&mut self) {
         if let Some(mut child) = self.0.take() {
-            smol::spawn(smol::unblock(move || {
+            smol::unblock(move || {
                 process::kill_group(child.id());
                 let _ = child.wait();
-            }))
+            })
             .detach();
         }
     }
@@ -1212,7 +1214,7 @@ fn kill_unreaped(state: &ReapState, timed_out: bool) {
 fn kill_job(job: &JobMeta) {
     let state = Arc::clone(&job.reap_state);
     #[cfg(windows)]
-    smol::spawn(smol::unblock(move || kill_unreaped(&state, false))).detach();
+    smol::unblock(move || kill_unreaped(&state, false)).detach();
     #[cfg(not(windows))]
     kill_unreaped(&state, false);
 }
@@ -1323,6 +1325,31 @@ mod tests {
     /// Keeps a `sleep` that closed all its output, and prints its pid.
     #[cfg(target_os = "linux")]
     const LEFT_ITS_OUTPUT: &str = "sleep 30 >/dev/null 2>&1 </dev/null & echo $!";
+
+    #[test]
+    fn exit_stderr_retains_only_bounded_utf8_lines() {
+        const LINE: &str = "ordinary error";
+        const CHARACTER: &str = "é";
+        const TRUNCATED: &str = "[truncated]";
+        let mut store = make_store();
+        store.jobs.insert(1, stub_job(task_owner(1), None, None));
+        for _ in 0..EXIT_STDERR_LINES {
+            store.record_event(1, &JobEvent::Stderr(LINE.into()));
+        }
+        let oversized = CHARACTER.repeat(EXIT_STDERR_BYTES);
+        store.record_event(1, &JobEvent::Stderr(oversized.clone()));
+        let tail = store.exit_stderr(1);
+        assert_eq!(tail.len(), EXIT_STDERR_LINES);
+        assert!(
+            tail[..EXIT_STDERR_LINES - 1]
+                .iter()
+                .all(|line| line == LINE)
+        );
+        let last = tail.last().unwrap();
+        assert!(last.ends_with(TRUNCATED));
+        assert!(last.len() <= EXIT_STDERR_BYTES + TRUNCATED.len() + 1);
+        assert!(oversized.starts_with(last.split_once('\n').unwrap().0));
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1946,6 +1973,36 @@ mod tests {
             ARGV,
             "the row a user reads must quote what the shell would have eaten"
         );
+    }
+
+    #[test]
+    fn concurrent_stdin_calls_keep_their_chunks_contiguous() {
+        const FIRST: u8 = b'a';
+        const SECOND: &[u8] = b"second";
+        let (sender, receiver) = flume::unbounded();
+        let state = Arc::new(StdinState::default());
+        let writer = StdinWriter {
+            sender,
+            state: Arc::clone(&state),
+        };
+        let data = vec![FIRST; MAX_STDIN_BYTES + STDIN_CHUNK_BYTES];
+        let mut first = pin!(writer.send(&data));
+        let mut second = pin!(writer.send(SECOND));
+        smol::block_on(async {
+            assert!(poll_once(&mut first).await.is_none());
+            let consumed = receiver.recv().unwrap();
+            state.bytes.fetch_sub(consumed.len(), Ordering::AcqRel);
+            state.ready.notify(usize::MAX);
+            assert!(poll_once(&mut second).await.is_none());
+            assert_eq!(first.await.unwrap(), data.len());
+            for chunk in receiver.drain() {
+                assert!(chunk.iter().all(|byte| *byte == FIRST));
+                state.bytes.fetch_sub(chunk.len(), Ordering::AcqRel);
+            }
+            state.ready.notify(usize::MAX);
+            assert_eq!(second.await.unwrap(), SECOND.len());
+            assert_eq!(receiver.recv().unwrap(), SECOND);
+        });
     }
 
     #[test]

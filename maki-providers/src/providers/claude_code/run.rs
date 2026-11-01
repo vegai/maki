@@ -147,7 +147,7 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
         try_join(checks, request_files(launch, req.exchange.system, &server)).await?;
     // An alias such as `sonnet` runs whatever model the account answer maps
     // it to.
-    let runs = offered.resolved_model(asked).unwrap_or(asked);
+    let runs = offered.resolved_model(asked)?;
     let checked = started.elapsed();
     debug!(
         version = %profile,
@@ -370,12 +370,15 @@ async fn exchange_reply(
                 result_late = true;
                 Ok(Step::Done)
             }
-            Next::Late => Err(match waiting {
-                Wait::Startup => Error::Late(Wait::Startup, limits.startup.as_secs()),
-                Wait::Idle => Error::Late(Wait::Idle, limits.idle.as_secs()),
-                Wait::Handoff => Error::Late(Wait::Handoff, limits.handoff.as_secs()),
-                Wait::Result => Error::Late(Wait::Result, limits.exit.as_secs()),
-            }),
+            Next::Late => {
+                let limit = match waiting {
+                    Wait::Startup => limits.startup,
+                    Wait::Idle => limits.idle,
+                    Wait::Handoff => limits.handoff,
+                    Wait::Result => limits.exit,
+                };
+                Err(Error::Late(waiting, limit.as_secs()))
+            }
         };
         // Keep-alives come from a timer, so they do not restart the clock.
         if !matches!(step, Ok(Step::Alive)) {

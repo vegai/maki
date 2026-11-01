@@ -3,6 +3,16 @@ use maki_storage::id::SessionRef;
 use serde::Serialize;
 use uuid::Uuid;
 
+pub const NOTIFICATION: &str = "notification";
+const PRIORITY: &str = "low";
+const PROVIDER_WAITING: &str = "provider_waiting";
+pub const INIT: &str = "init";
+pub const API_RETRY: &str = "api_retry";
+pub const SUCCESS: &str = "success";
+pub const ERROR_DURING_EXECUTION: &str = "error_during_execution";
+const SYSTEM: &str = "system";
+const ERROR_MAX_TURNS: &str = "error_max_turns";
+
 const TOOL_NAME_MAP: &[(&str, &str)] = &[
     ("bash", "Bash"),
     ("read", "Read"),
@@ -38,10 +48,6 @@ pub fn claude_to_maki_tool_name(name: &str) -> &str {
         .unwrap_or(name)
 }
 
-pub const NOTIFICATION: &str = "notification";
-const PRIORITY: &str = "low";
-const PROVIDER_WAITING: &str = "provider_waiting";
-
 #[derive(Serialize)]
 pub struct ProviderNotice<'a> {
     key: String,
@@ -62,11 +68,6 @@ impl<'a> ProviderNotice<'a> {
     }
 }
 
-pub const INIT: &str = "init";
-pub const API_RETRY: &str = "api_retry";
-pub const SUCCESS: &str = "success";
-pub const ERROR_DURING_EXECUTION: &str = "error_during_execution";
-
 #[derive(Serialize)]
 struct SystemEvent<'a, T> {
     #[serde(rename = "type")]
@@ -84,7 +85,7 @@ pub fn system_event<T: Serialize>(
     extra: T,
 ) -> impl Serialize {
     SystemEvent {
-        event_type: "system",
+        event_type: SYSTEM,
         subtype,
         extra,
         uuid: wire_uuid(),
@@ -99,7 +100,7 @@ pub fn wire_uuid() -> String {
 
 pub fn failure_subtype(reason: DoneReason) -> Option<&'static str> {
     match reason {
-        DoneReason::MaxTurns => Some("error_max_turns"),
+        DoneReason::MaxTurns => Some(ERROR_MAX_TURNS),
         DoneReason::Cancelled | DoneReason::Dropped => Some(ERROR_DURING_EXECUTION),
         DoneReason::EndTurn | DoneReason::MaxTokens | DoneReason::Compact => None,
     }

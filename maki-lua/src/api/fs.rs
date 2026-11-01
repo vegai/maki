@@ -100,8 +100,8 @@ async fn rename(_lua: Lua, path: String, new_path: String) -> LuaResult<Pair<boo
     let new_path = try_pair!(make_absolute(&new_path));
     let result = smol::unblock(move || -> IoResult<()> {
         fs::rename(&path, &new_path)?;
-        maki_agent::invalidate_for(&resolved(&path));
-        maki_agent::invalidate_for(&resolved(&new_path));
+        touched(&path, true);
+        touched(&new_path, true);
         Ok(())
     })
     .await;

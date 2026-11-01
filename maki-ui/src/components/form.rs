@@ -13,20 +13,21 @@ pub(crate) fn content_rows(paragraph: &Paragraph<'_>, width: u16) -> u16 {
     u16::try_from(paragraph.line_count(width.saturating_sub(BORDER))).unwrap_or(u16::MAX)
 }
 
-pub(crate) fn render_form(
+pub(crate) fn render_form<'a>(
     t: &Theme,
-    title: &str,
+    title: &'a str,
     frame: &mut Frame,
     area: Rect,
-    paragraph: Paragraph<'static>,
+    paragraph: Paragraph<'a>,
     scroll: (u16, u16),
-    clipped: bool,
+    total: u16,
 ) {
+    let clipped = total > area.height.saturating_sub(BORDER).saturating_add(scroll.0);
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(t.panel_border)
-        .title_top(Line::from(title.to_string()).left_aligned())
+        .title_top(Line::from(title).left_aligned())
         .title_style(t.panel_title);
 
     let paragraph = paragraph

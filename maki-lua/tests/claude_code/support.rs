@@ -24,7 +24,7 @@ use smol::future::or;
 #[allow(dead_code)]
 pub mod environment;
 
-pub const STALE_AGE: Duration = Duration::from_secs(48 * 3600);
+pub const STALE_AGE: Duration = Duration::from_hours(48);
 pub const CONTROL_REPLY: &str = r#"reply() { printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":%s}}\n' "$1" "$2"; }"#;
 pub const ACCOUNT_SUBSCRIPTION: &str = r#"{"current_permission_mode":"default","account":{"apiProvider":"firstParty","subscriptionType":"Claude Pro"},"models":[{"value":"sonnet","resolvedModel":"claude-sonnet-5"},{"value":"opus","resolvedModel":"claude-opus-5-5"},{"value":"haiku","resolvedModel":"claude-haiku-4-5-20251001"}]}"#;
 pub const HOOKS_OFF: &str =

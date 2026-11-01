@@ -87,12 +87,16 @@ impl PackReview {
         lines
     }
 
+    fn paragraph(&self) -> Paragraph<'static> {
+        Paragraph::new(self.lines()).wrap(Wrap { trim: false })
+    }
+
     pub fn view(&self, frame: &mut Frame, area: Rect) {
         if !self.is_open() {
             return;
         }
-        let paragraph = Paragraph::new(self.lines()).wrap(Wrap { trim: false });
-        let clipped = content_rows(&paragraph, area.width) > area.height.saturating_sub(BORDER);
+        let paragraph = self.paragraph();
+        let total = content_rows(&paragraph, area.width);
         render_form(
             &theme::current(),
             PACK_REVIEW_TITLE,
@@ -100,12 +104,12 @@ impl PackReview {
             area,
             paragraph,
             (0, 0),
-            clipped,
+            total,
         );
     }
 
     pub fn height(&self, width: u16) -> u16 {
-        let paragraph = Paragraph::new(self.lines()).wrap(Wrap { trim: false });
+        let paragraph = self.paragraph();
         content_rows(&paragraph, width).saturating_add(BORDER)
     }
 }

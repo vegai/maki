@@ -36,9 +36,9 @@ use serde_json::Value;
 use crate::headless_startup::{start_mcp, startup};
 use crate::shutdown::watch;
 use crate::wire::{
-    API_RETRY, ERROR_DURING_EXECUTION, INIT, SUCCESS, failure_subtype, system_event,
+    API_RETRY, ERROR_DURING_EXECUTION, INIT, NOTIFICATION, ProviderNotice, SUCCESS,
+    failure_subtype, system_event,
 };
-use crate::wire::{NOTIFICATION, ProviderNotice};
 
 const SESSION_LINE_PREFIX: &str = "session: ";
 

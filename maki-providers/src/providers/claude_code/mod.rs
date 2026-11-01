@@ -15,6 +15,8 @@ mod run;
 #[cfg(target_os = "linux")]
 mod settings;
 #[cfg(target_os = "linux")]
+mod slots;
+#[cfg(target_os = "linux")]
 mod stream;
 #[cfg(target_os = "linux")]
 mod transcript;

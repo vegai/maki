@@ -157,17 +157,6 @@ function M.path_problem(path)
 end
 
 function M.dependency_dirs(option)
-  --- Returns true if {path} is in the checkout of {spec}, which reaches past
-  --- the session's directory when that is a subdirectory or a worktree.
-  function M.in_checkout(path, spec)
-    for _, dir in ipairs(spec.denied) do
-      if M.within(path, dir) then
-        return true
-      end
-    end
-    return false
-  end
-
   return M.comma_list(option, M.relative_path)
 end
 
@@ -204,12 +193,7 @@ end
 --- Returns true if {path} is in the checkout of {spec}, which reaches past
 --- the session's directory when that is a subdirectory or a worktree.
 function M.in_checkout(path, spec)
-  for _, dir in ipairs(spec.denied) do
-    if M.within(path, dir) then
-      return true
-    end
-  end
-  return false
+  return native.in_checkout(path, spec.cwd, spec.denied)
 end
 
 return M

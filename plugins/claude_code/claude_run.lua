@@ -151,9 +151,9 @@ function Run:send(data)
 end
 
 function Run:on_answer()
-  local model = self.handshake:resolved_model(self.spec.model)
+  local model, problem = self.handshake:resolved_model(self.spec.model)
   if not model then
-    self:stop("Claude Code did not resolve the requested model " .. self.spec.model)
+    self:stop(problem)
     return
   end
   self.stream:set_model(model)
@@ -177,16 +177,13 @@ function Run:on_line(line)
     return
   end
   if problem then
-    if step.init then
-      native.invalidate_version(self.spec.executable)
-    end
     self:stop(problem)
   elseif step.control then
     if complete then
       self:on_answer()
     end
   elseif step.init and not self.prompted then
-    self:stop(require("maki.claude_code.internal").unchecked_start())
+    self:stop(native.unchecked_start)
   elseif step.init then
     self.clock:stop()
     local subscription = " (" .. self.handshake:subscription_type() .. ")"
@@ -224,10 +221,7 @@ function Run:on_exit(code)
     self:finish_with(self.stream:outcome())
     return
   end
-  local head = ERROR_PREFIX
-    .. "Claude Code exited with code "
-    .. code
-    .. (self.stream.result and " after its result" or " before its result")
+  local head = ERROR_PREFIX .. native.worker_exit(code, self.stream.result ~= nil)
   self:finish_with(jobs.with_stderr(head, self.stderr_tail), true)
 end
 
@@ -252,7 +246,8 @@ end
 -- After a cancel, the hook registered here delivers the call's result.
 function Run:start(argv, cwd, env, task)
   self.task = task
-  self.stream = Stream.new({ cwd = cwd, worker = self.spec.worker, cli = self.spec.cli })
+  self.stream =
+    Stream.new({ cwd = cwd, worker = self.spec.worker, cli = self.spec.cli, executable = self.spec.executable })
   local job_opts = launch.job_opts(cwd, env)
   job_opts.on_stdout = function(_, line)
     self:on_line(line)
@@ -273,7 +268,7 @@ function Run:start(argv, cwd, env, task)
   end)
   self.clock = maki.defer_fn(function()
     if not self.stream:accepted() then
-      self:stop("no init event in " .. launch.STARTUP_TIMEOUT_SECS .. " s")
+      self:stop(native.startup_late(launch.STARTUP_TIMEOUT_SECS))
     end
   end, launch.STARTUP_MS)
   -- A send error would finish the call before the wait starts, so the

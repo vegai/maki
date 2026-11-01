@@ -55,7 +55,7 @@ const THINKING_DELTA: &str = "thinking_delta";
 /// Claude Code's own placeholders. Its output filter drops a message whose
 /// only block is one of these, as it drops blank text.
 const DROPPED_TEXTS: [&str; 2] = ["(no content)", "[Request interrupted by user for tool use]"];
-const MESSAGE_START: &str = "message_start";
+pub(super) const MESSAGE_START: &str = "message_start";
 const BLOCK_START: &str = "content_block_start";
 const BLOCK_DELTA: &str = "content_block_delta";
 const BLOCK_STOP: &str = "content_block_stop";
@@ -92,6 +92,7 @@ const MCP_CLOSED: &str = "MCP server \"maki\" connection closed before the tool 
 const TRACE_LEN: usize = 32;
 const UNNAMED_HOOK: &str = "startup";
 const NO_MESSAGE: &str = "no message";
+const CLAUDE_MODEL_PREFIX: &str = "claude-";
 /// The Anthropic provider's names for the same windows.
 const WINDOW_LABELS: [(&str, &str); 2] =
     [("five_hour", LABEL_SESSION), ("seven_day", LABEL_WEEK_ALL)];
@@ -298,7 +299,7 @@ pub(crate) struct Turn<'a> {
     /// which can name an API error as the cause.
     lost: Option<Error>,
     /// Kinds of the latest events, logged when the request fails.
-    trace: VecDeque<String>,
+    trace: VecDeque<(String, u32)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -447,9 +448,19 @@ impl Handshake {
         self.offered().map(|(_, model)| model)
     }
 
-    pub fn resolved_model(&self, requested: &str) -> Option<&str> {
+    pub fn resolved_model<'a>(&'a self, requested: &'a str) -> Result<&'a str, Error> {
         self.offered()
             .find_map(|(name, model)| (name == requested).then_some(model))
+            .or_else(|| {
+                requested
+                    .starts_with(CLAUDE_MODEL_PREFIX)
+                    .then_some(requested)
+            })
+            .ok_or_else(|| Error::UnresolvedModel(requested.to_owned()))
+    }
+
+    pub fn complete(&self) -> bool {
+        self.answers.len() == HANDSHAKE.len()
     }
 
     pub(crate) fn feed(
@@ -662,24 +673,42 @@ impl<'a> Turn<'a> {
     pub fn trace(&self) -> String {
         self.trace
             .iter()
-            .map(String::as_str)
+            .map(|(kind, count)| {
+                if *count == 1 {
+                    kind.clone()
+                } else {
+                    format!("{kind}*{count}")
+                }
+            })
             .collect::<Vec<_>>()
             .join(" ")
     }
 
     fn record_event(&mut self, event: &Value) {
-        let kind = match (event["type"].as_str(), event["subtype"].as_str()) {
-            (Some(STREAM_EVENT), _) => event["event"]["type"].as_str().unwrap_or(STREAM_EVENT),
-            (Some(kind), _) => kind,
-            (None, _) => return,
+        let Some(outer) = event["type"].as_str() else {
+            return;
         };
+        let kind = if outer == STREAM_EVENT {
+            event["event"]["type"].as_str().unwrap_or(STREAM_EVENT)
+        } else {
+            outer
+        };
+        let subtype = (outer == kind).then(|| event["subtype"].as_str()).flatten();
+        if let Some((previous, count)) = self.trace.back_mut() {
+            let repeated = subtype.map_or_else(
+                || previous == kind,
+                |subtype| previous.split_once('/') == Some((kind, subtype)),
+            );
+            if repeated {
+                *count = count.saturating_add(1);
+                return;
+            }
+        }
         if self.trace.len() == TRACE_LEN {
             self.trace.pop_front();
         }
-        self.trace.push_back(match event["subtype"].as_str() {
-            Some(subtype) if kind == event["type"] => format!("{kind}/{subtype}"),
-            _ => kind.to_owned(),
-        });
+        let kind = subtype.map_or_else(|| kind.to_owned(), |subtype| format!("{kind}/{subtype}"));
+        self.trace.push_back((kind, 1));
     }
 
     /// A line that is not a Claude Code event stops the request. Anthropic
@@ -778,7 +807,7 @@ impl<'a> Turn<'a> {
                 let Some(id) = message["id"].as_str().filter(|id| !id.is_empty()) else {
                     return Err(Error::NoGenerationId);
                 };
-                let ran = message["model"].as_str().unwrap_or_default();
+                let ran = message["model"].as_str().ok_or(Error::NoModel)?;
                 check_model(ran, self.expect.model)?;
                 self.message_id = Some(id.to_owned());
                 self.take_usage(&message["usage"], false);
@@ -865,6 +894,9 @@ impl<'a> Turn<'a> {
     /// completed reply is frozen, because a later block could add a call that
     /// Claude Code never hands to maki.
     fn assistant(&mut self, message: &mut Value) -> Result<Step, Error> {
+        if let Some(ran) = message["model"].as_str() {
+            check_model(ran, self.expect.model)?;
+        }
         if self.is_complete() {
             return Err(Error::LateContent);
         }
@@ -1240,12 +1272,12 @@ mod tests {
     use super::super::transcript::Catalog;
     use super::{
         ACCOUNT_ANSWER, API_ERROR_MARK, API_ERROR_STATUS, BATCH_CALL_TOOL, BATCH_CALLS, BATCH_TOOL,
-        EXTRA_USAGE, EXTRA_USAGE_IN_USE, EventKind, HOOKS_ANSWER, Handshake, INPUT_REJECTED,
-        MAX_TOKENS_STOP, MAX_TURNS_ERROR, MCP_CLOSED, NO_SUCH_TOOL, PLAN_REJECTED,
-        RATE_LIMIT_EVENT, RATE_LIMITED, REFUSAL_STOP, RESULT_EVENT, SETTINGS_ANSWER,
-        SHOWN_TOOL_ERROR_CHARS, SUCCESS, Step, StreamMode, StreamedText, TOOL_RESULT,
-        TOOL_USE_STOP, Turn, WINDOW_FULL_STOP, answered, classify, result_failure, unexpose_batch,
-        usage_of, user_message,
+        BLOCK_DELTA, EXTRA_USAGE, EXTRA_USAGE_IN_USE, EventKind, HOOKS_ANSWER, Handshake,
+        INIT_EVENT, INPUT_REJECTED, MAX_TOKENS_STOP, MAX_TURNS_ERROR, MCP_CLOSED, NO_SUCH_TOOL,
+        PLAN_REJECTED, RATE_LIMIT_EVENT, RATE_LIMITED, REFUSAL_STOP, RESULT_EVENT, SETTINGS_ANSWER,
+        SHOWN_TOOL_ERROR_CHARS, STREAM_EVENT, SUCCESS, SYSTEM_EVENT, Step, StreamMode,
+        StreamedText, TOOL_RESULT, TOOL_USE_STOP, TRACE_LEN, Turn, WINDOW_FULL_STOP, answered,
+        classify, result_failure, unexpose_batch, usage_of, user_message,
     };
     use crate::{ContentBlock, StopReason, StreamResponse};
 
@@ -1847,12 +1879,35 @@ mod tests {
         json!({ "type": "rate_limit_event", "rate_limit_info": { "status": status, "unifiedWindows": {} } }).to_string()
     }
 
+    #[test]
+    fn event_trace_retains_transitions_across_repeated_deltas() {
+        with_turn(|mut turn| {
+            turn.trace.clear();
+            for _ in 0..=TRACE_LEN {
+                turn.record_event(&json!({"type":STREAM_EVENT, "event":{"type":BLOCK_DELTA}}));
+            }
+            turn.record_event(&json!({"type":SYSTEM_EVENT, "subtype":INIT_EVENT}));
+            assert_eq!(
+                turn.trace(),
+                format!(
+                    "{}*{} {}/{}",
+                    BLOCK_DELTA,
+                    TRACE_LEN + 1,
+                    SYSTEM_EVENT,
+                    INIT_EVENT
+                )
+            );
+        });
+    }
+
     #[test_case(json!({}) ; "missing_info")]
     #[test_case(json!({"rate_limit_info": null}) ; "null_info")]
     #[test_case(json!({"rate_limit_info": []}) ; "array_info")]
     fn a_rate_limit_event_without_info_keeps_the_previous_plan_usage(mut event: Value) {
         with_turn(|mut turn| {
-            turn.feed(&plan_report(PLAN_REJECTED)).unwrap();
+            let mut plan: Value = serde_json::from_str(&plan_report(PLAN_REJECTED)).unwrap();
+            plan["rate_limit_info"]["unifiedWindows"] = json!({"five_hour": {"utilization": 0.5}});
+            turn.feed(&plan.to_string()).unwrap();
             let previous = turn.plan_usage.lock().unwrap().clone();
             assert!(previous.is_some());
             event["type"] = RATE_LIMIT_EVENT.into();
@@ -2512,6 +2567,6 @@ mod tests {
             handshake.models().collect::<Vec<_>>(),
             expected.into_iter().collect::<Vec<_>>()
         );
-        assert_eq!(handshake.resolved_model("opus"), expected);
+        assert_eq!(handshake.resolved_model("opus").ok(), expected);
     }
 }

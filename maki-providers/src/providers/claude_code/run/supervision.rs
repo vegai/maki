@@ -78,20 +78,26 @@ impl Group {
         if !matches!(exited, ChildExit::WaitFailed) {
             self.kill();
         }
-        let status = self.child.reap(Instant::now() + SHUTDOWN_GRACE).await;
-        self.exit_status = natural_exit
-            .then(|| status.as_ref().ok().copied())
-            .flatten();
-        if matches!(exited, ChildExit::TimedOut) {
-            return Err(Error::ExitLate);
-        }
-        status.map_err(|source| {
-            if source.kind() == io::ErrorKind::TimedOut {
-                Error::ReapLate
-            } else {
-                Error::io("reap Claude Code")(source)
-            }
-        })
+        let status = wait_result(
+            exited,
+            self.child.reap(Instant::now() + SHUTDOWN_GRACE).await,
+        )?;
+        self.exit_status = natural_exit.then_some(status);
+        Ok(status)
+    }
+}
+
+fn wait_result(
+    exited: ChildExit,
+    reaped: Option<io::Result<ExitStatus>>,
+) -> Result<ExitStatus, Error> {
+    let status = reaped
+        .ok_or(Error::ReapLate)?
+        .map_err(Error::io("reap Claude Code"))?;
+    if matches!(exited, ChildExit::TimedOut) {
+        Err(Error::ExitLate)
+    } else {
+        Ok(status)
     }
 }
 
@@ -363,6 +369,10 @@ pub(super) async fn send(
 
 #[cfg(test)]
 mod tests {
+    use crate::process::ChildExit;
+    use std::io;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
     use std::time::{Duration, Instant};
 
     use futures_lite::future::poll_once;
@@ -371,10 +381,29 @@ mod tests {
 
     use super::{
         Error, MAX_EVENT_BYTES, Next, ReadDeadline, STDERR_LINE_BYTES, TRUNCATED_LINE, event_line,
-        stderr_line, unreadable,
+        stderr_line, unreadable, wait_result,
     };
 
     const NEXT_LINE: &str = "next";
+
+    #[test_case(ChildExit::TimedOut ; "exit_deadline_also_passed")]
+    #[test_case(ChildExit::Exited ; "leader_exited_on_time")]
+    fn reap_deadline_always_prevents_a_successful_cleanup(exited: ChildExit) {
+        let error = wait_result(exited, None).unwrap_err();
+        assert!(matches!(error, Error::ReapLate));
+    }
+
+    #[test]
+    fn a_reap_error_takes_precedence_over_the_exit_deadline() {
+        const REAP_ERROR: &str = "wait failed";
+        let error =
+            wait_result(ChildExit::TimedOut, Some(Err(io::Error::other(REAP_ERROR)))).unwrap_err();
+        assert!(error.to_string().contains(REAP_ERROR));
+        assert!(matches!(
+            wait_result(ChildExit::TimedOut, Some(Ok(ExitStatus::from_raw(0)))),
+            Err(Error::ExitLate)
+        ));
+    }
 
     #[test]
     fn a_read_deadline_can_be_reused_after_it_expires() {

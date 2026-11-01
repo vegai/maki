@@ -117,10 +117,14 @@ local function account_answer(overrides, mode)
 end
 
 local function handshake_answer(handshake, id, response, subtype)
-  return handshake:answer(maki.json.encode({
-    type = "control_response",
-    response = { request_id = id, subtype = subtype or "success", response = response },
-  }))
+  local step = fresh():feed(
+    maki.json.encode({
+      type = "control_response",
+      response = { request_id = id, subtype = subtype or "success", response = response },
+    }),
+    handshake
+  )
+  return step.complete, step.stop
 end
 
 local function worker_spec(worker, confine, deny)
@@ -764,7 +768,7 @@ case("a_complete_clean_handshake_passes", function()
     eq(problem, nil)
     eq(complete, i == 1)
   end
-  local complete, problem = handshake:finish()
+  local complete, problem = handshake:probe_exit(0, launch.STARTUP_TIMEOUT_SECS)
   eq(complete, true)
   eq(problem, nil)
 end)
@@ -773,9 +777,9 @@ case("a_missing_handshake_answer_is_refused", function()
   local handshake = launch.worker_handshake(worker_spec())
   handshake_answer(handshake, "account", account_answer())
   handshake_answer(handshake, "hooks", HOOKS_OFF)
-  local complete, problem = handshake:finish()
+  local complete, problem = handshake:probe_exit(0, launch.STARTUP_TIMEOUT_SECS)
   eq(complete, nil)
-  has(problem or "", "did not answer its settings request")
+  has(problem or "", "did not answer every check")
 end)
 
 for _, accepted in ipairs({ false, true }) do
@@ -1148,8 +1152,12 @@ case("import_approval_lists_escaped_paths_before_the_script", function()
 end)
 
 case("dependency_dirs_are_project_relative", function()
+  local in_checkout = path_utils.in_checkout
   local dirs = assert(path_utils.dependency_dirs(" node_modules/ , ./web//./node_modules,"))
   eq(table.concat(dirs, "|"), "node_modules|web/node_modules")
+  eq(path_utils.in_checkout, in_checkout)
+  eq(in_checkout("/work/sub/file", { cwd = "/work/sub", denied = { "/work" } }), true)
+  eq(in_checkout("/work-other/file", { cwd = "/work/sub", denied = { "/work" } }), false)
   local dirs_none, err = path_utils.dependency_dirs("../shared")
   eq(dirs_none, nil)
   eq(err, "../shared" .. path_utils.OUTSIDE_PROJECT)

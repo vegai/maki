@@ -1821,6 +1821,10 @@ pub(crate) fn active_task_cancel(lua: &Lua) -> Option<(u64, CancelToken)> {
     Some((cell.id, cell.cancel.clone()))
 }
 
+pub(crate) fn task_cancel(lua: &Lua) -> CancelToken {
+    active_task_cancel(lua).map_or_else(CancelToken::none, |(_, cancel)| cancel)
+}
+
 /// Slash-command hops that led to the running task; 0 outside a command
 /// handler, so a keybind or tool calling `maki.api.run_command` starts fresh.
 pub(crate) fn command_depth(lua: &Lua) -> u8 {

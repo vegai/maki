@@ -1,12 +1,11 @@
+local native = require("maki.claude_code.internal")
 -- Plugin jobs report exit after cancellation, so a slot must wait for every process.
 local M = {}
 
 M.ERROR_PREFIX = "claude_code: "
 M.LEFT_BEHIND = "maki did not remove: "
 M.CANCELLED = "cancelled"
-local STDERR_TAIL_LINES = 10
-local STDERR_LINE_BYTES = 4096
-M.ERROR_BYTES = STDERR_TAIL_LINES * STDERR_LINE_BYTES
+M.ERROR_BYTES = native.error_bytes
 M.MS_PER_SEC = 1000
 
 local Call = {}
@@ -62,9 +61,15 @@ end
 
 function Call:wait(operation, ...)
   self.alive = self.alive + 1
-  local result = table.pack(pcall(operation, ...))
-  self.alive = self.alive - 1
-  self:settle()
+  local args = table.pack(...)
+  local result = maki.async.await(1, function(done)
+    maki.async.spawn(function()
+      local completed = table.pack(pcall(operation, table.unpack(args, 1, args.n)))
+      self.alive = self.alive - 1
+      self:settle()
+      done(completed)
+    end)
+  end)
   if not result[1] then
     error(result[2], 0)
   end
@@ -108,7 +113,7 @@ function Call:start(argv, job_opts, on_exit)
   return id
 end
 
---- {how} has `on_exit(id, code, timed_out)`, `timeout_ms`, and
+--- {how} has `on_exit(id, code, timed_out, stderr_tail)`, `timeout_ms`, and
 --- `keep_on_cancel` for a job that a kill could interrupt. The startup limit
 --- applies to such a job unless it has its own.
 function Call:spawn(argv, job_opts, how)

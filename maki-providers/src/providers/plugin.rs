@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use std::any::Any;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -443,12 +445,14 @@ struct PluginEntry {
 }
 
 #[cfg(target_os = "linux")]
-type NativeFactory = dyn Fn(Timeouts) -> Result<Box<dyn Provider>, AgentError> + Send + Sync;
+pub(crate) trait NativeFactory: Any + Send + Sync {
+    fn create(&self, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError>;
+}
 
 #[derive(Default)]
 struct Registry {
     #[cfg(target_os = "linux")]
-    native: BTreeMap<Box<str>, Arc<NativeFactory>>,
+    native: BTreeMap<Box<str>, Arc<dyn NativeFactory>>,
     entries: BTreeMap<Box<str>, Arc<PluginEntry>>,
     selected: BTreeMap<Box<str>, String>,
 }
@@ -493,7 +497,7 @@ pub fn begin_load() {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn register_native(slug: &str, factory: Option<Arc<NativeFactory>>) {
+pub(crate) fn register_native(slug: &str, factory: Option<Arc<dyn NativeFactory>>) {
     let mut staging = STAGING.lock().unwrap();
     if let Some(staged) = staging.as_mut() {
         if let Some(factory) = factory {
@@ -505,12 +509,16 @@ pub(crate) fn register_native(slug: &str, factory: Option<Arc<NativeFactory>>) {
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) fn native_factory(slug: &str) -> Option<Arc<dyn NativeFactory>> {
+    entries().native.get(slug).cloned()
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn create_native(
     slug: &str,
     timeouts: Timeouts,
 ) -> Option<Result<Box<dyn Provider>, AgentError>> {
-    let factory = entries().native.get(slug).cloned()?;
-    Some(factory(timeouts))
+    Some(native_factory(slug)?.create(timeouts))
 }
 
 /// Publishes what this load registered. A load that registered nothing

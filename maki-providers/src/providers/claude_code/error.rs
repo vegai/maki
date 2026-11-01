@@ -142,6 +142,8 @@ pub enum Error {
     EventTooLarge { limit: usize },
     #[error("Claude Code printed a line that is not an event: {0}")]
     InvalidEvent(String),
+    #[error("Claude Code did not resolve the requested model {0}")]
+    UnresolvedModel(String),
     #[error("Claude Code did not report the model that ran")]
     NoModel,
     #[error("Claude Code exhausted the context window")]

@@ -729,13 +729,12 @@ pub fn prompt(
 
     if tools {
         let ctx = DescriptionContext {
-            local_tools: None,
             filter: &ToolFilter::default(),
             audience: ToolAudience::MAIN,
             workflow: false,
             mcp: false,
         };
-        let defs = reg.definitions(&vars, &ctx, true);
+        let defs = reg.definitions(&vars, &ctx, None, true);
         if names {
             for name in defs
                 .as_array()

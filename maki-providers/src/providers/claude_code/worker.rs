@@ -31,7 +31,7 @@ use super::stream::{
 };
 
 pub use super::MAX_EVENT_BYTES;
-pub use super::checks::{GIT_ENTRY, git_directory};
+pub use super::checks::{GIT_ENTRY, GITDIR_PREFIX, git_directory, inside_checkout};
 pub use super::run::invalidate_version;
 use super::run::private_dir_async;
 use super::settings::{self, base_settings};
@@ -39,6 +39,9 @@ use super::stream::usage_of as plan_usage;
 pub use super::stream::{EventKind, TOOL_USE_BLOCK, user_message};
 
 pub use super::{DEFAULT_EXECUTABLE, DEFAULT_MAX_CONCURRENT, MIN_MAX_CONCURRENT};
+const EXIT_CODE_SHIFT: u32 = 8;
+const UNKNOWN_EXIT_SIGNAL: i32 = 1;
+
 pub(super) const CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 pub(super) const HOME_ENV: &str = "HOME";
 const RUNTIME_DIR_ENV: &str = "XDG_RUNTIME_DIR";
@@ -118,7 +121,17 @@ struct WorkerPaths {
 
 impl WorkerPolicy {
     pub fn args(&self, model: &str, tools: &str, mode: &str, contract: &str) -> Vec<String> {
-        settings::worker_args(model, tools, mode, self.settings(), contract)
+        let mut args = settings::base_args(model, tools, mode, &self.settings().to_string());
+        args.extend(
+            [
+                settings::MCP_CONFIG_FLAG,
+                settings::EMPTY_MCP_CONFIG,
+                settings::APPEND_SYSTEM_PROMPT_FLAG,
+                contract,
+            ]
+            .map(str::to_owned),
+        );
+        args
     }
 
     pub fn settings(&self) -> &Value {
@@ -155,8 +168,47 @@ pub fn executable(name: &str, cwd: &Path) -> Result<PathBuf, Error> {
     crate::process::find_program(name, cwd).ok_or_else(|| Error::ExecutableMissing(name.to_owned()))
 }
 
-pub fn unchecked_start() -> String {
-    Error::UncheckedStart.to_string()
+pub fn probe_exit(status: ExitStatus, complete: bool) -> Result<(), Error> {
+    if status.code().is_none() {
+        return Err(Error::StoppedInChecks);
+    }
+    if !status.success() {
+        return Err(Error::ExitedInChecks(status));
+    }
+    if !complete {
+        return Err(Error::ChecksUnanswered);
+    }
+    Ok(())
+}
+
+fn exit_status(code: i32) -> ExitStatus {
+    ExitStatus::from_raw(if code < 0 {
+        UNKNOWN_EXIT_SIGNAL
+    } else {
+        code << EXIT_CODE_SHIFT
+    })
+}
+
+pub fn startup_late(seconds: u64) -> String {
+    Error::Late(stream::Wait::Startup, seconds).to_string()
+}
+
+pub fn worker_exit(code: i32, after_result: bool) -> String {
+    if code < 0 {
+        return Error::WentQuiet.to_string();
+    }
+    let status = exit_status(code);
+    if after_result {
+        format!("Claude Code exited ({status}) after its result")
+    } else {
+        Error::ExitedEarly(status).to_string()
+    }
+}
+
+pub fn invalidate_on_error(executable: &Path, error: &Error) {
+    if error.invalidates_version() {
+        invalidate_version(executable);
+    }
 }
 
 pub fn handshake_input() -> String {
@@ -202,9 +254,10 @@ impl WorkerHandshake {
     pub fn probe_exit(&self, code: Option<i32>, timeout_secs: u64) -> Result<(), Error> {
         match code {
             None => Err(Error::ProbeLate(timeout_secs)),
-            Some(0) => self.finish(),
-            Some(code) if code < 0 => Err(Error::StoppedInChecks),
-            Some(code) => Err(Error::ExitedInChecks(ExitStatus::from_raw(code << 8))),
+            Some(code) => {
+                probe_exit(exit_status(code), self.answers.complete())?;
+                self.finish()
+            }
         }
     }
 
@@ -212,7 +265,7 @@ impl WorkerHandshake {
         self.answers.account()[checks::ACCOUNT][checks::SUBSCRIPTION_TYPE].as_str()
     }
 
-    pub fn resolved_model(&self, requested: &str) -> Option<&str> {
+    pub fn resolved_model<'a>(&'a self, requested: &'a str) -> Result<&'a str, Error> {
         self.answers.resolved_model(requested)
     }
 }
@@ -437,6 +490,12 @@ impl WorkerStream {
                 } else {
                     &event["message"]
                 };
+                if event_kind == EventKind::Stream
+                    && event["event"]["type"] == stream::MESSAGE_START
+                    && message["model"].as_str().is_none()
+                {
+                    return Err(Error::NoModel);
+                }
                 if event[API_ERROR_MARK] != true
                     && let Some(ran) = message["model"].as_str()
                 {
@@ -667,7 +726,7 @@ pub async fn checked_profile(
 ) -> Result<String, Error> {
     let limits = Limits {
         startup: Duration::from_secs(startup_secs),
-        ..Limits::new(Duration::from_secs(startup_secs))
+        ..Limits::new(Duration::ZERO)
     };
     let temp_dir = env_value(env, TMPDIR_ENV).map_or_else(default_temp_dir, PathBuf::from);
     super::run::checked_profile(
@@ -686,7 +745,7 @@ pub async fn checked_profile(
 
 #[cfg(test)]
 mod tests {
-    use super::{PolicyInput, Problem};
+    use super::{Error, PolicyInput, Problem, WorkerHandshake, WorkerStream, checks, stream};
     use super::{
         SANDBOX, TMPDIR_ENV, WorkerPaths, WorkerPolicy, prepare_launch, sandbox_problem,
         worker_problem,
@@ -694,6 +753,8 @@ mod tests {
     use serde_json::{Value, json};
     use std::env;
     use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Arc;
     use tempfile::tempdir;
     use test_case::test_case;
 
@@ -701,6 +762,108 @@ mod tests {
     const DENIED: &str = "/checkout";
     const OUTSIDE: &str = "/outside";
     const RELATIVE_TEMP: &str = "relative-temp";
+
+    const MODEL: &str = "claude-test-model";
+    const OTHER_MODEL: &str = "claude-other-model";
+    const READ_TOOL: &str = "Read";
+
+    fn read_stream() -> WorkerStream {
+        let version = checks::minimum_version();
+        let mut stream = WorkerStream::new(
+            version.clone(),
+            PathBuf::from(DENIED),
+            vec![READ_TOOL.into()],
+            vec![checks::DEFAULT_MODE.into()],
+        );
+        let init = json!({"type":"system", "subtype":"init", "apiKeySource":"none", "claude_code_version":version, "permissionMode":checks::DEFAULT_MODE, "tools":[READ_TOOL], "mcp_servers":[], "plugins":[], "cwd":DENIED});
+        assert!(stream.feed(&init.to_string()).unwrap().problem.is_none());
+        stream.set_model(MODEL.into());
+        stream
+    }
+
+    #[test_case(None => matches Some(Error::NoModel) ; "message_start_without_model")]
+    #[test_case(Some(OTHER_MODEL) => matches Some(Error::OtherModel { .. }) ; "different_model")]
+    #[test_case(Some(MODEL) => matches None ; "requested_model")]
+    fn worker_message_start_checks_the_requested_model(model: Option<&str>) -> Option<Error> {
+        let mut worker = read_stream();
+        let event = json!({"type":"stream_event", "event":{"type":"message_start", "message":{"id":"m1", "model":model}}});
+        worker.feed(&event.to_string()).unwrap().problem
+    }
+
+    #[test_case(false ; "never_reported")]
+    #[test_case(true ; "reset_after_a_previous_model")]
+    fn worker_success_requires_a_reported_model(reset: bool) {
+        let mut worker = read_stream();
+        if reset {
+            let event = json!({"type":"stream_event", "event":{"type":"message_start", "message":{"id":"m1", "model":MODEL}}});
+            assert!(worker.feed(&event.to_string()).unwrap().problem.is_none());
+            worker.set_model(MODEL.into());
+        }
+        let result = worker
+            .feed(&json!({"type":"result", "subtype":"success", "result":"done"}).to_string())
+            .unwrap();
+        assert!(matches!(result.problem, Some(Error::NoModel)));
+    }
+
+    fn handshake() -> WorkerHandshake {
+        let policy = super::WorkerPolicy::from(PolicyInput {
+            deny: Vec::new(),
+            sandbox: None,
+        });
+        WorkerHandshake::new(vec![checks::DEFAULT_MODE.into()], Arc::new(policy))
+    }
+
+    #[test_case(None => matches Err(Error::ProbeLate(_)) ; "deadline")]
+    #[test_case(Some(-1) => matches Err(Error::StoppedInChecks) ; "unknown_status")]
+    #[test_case(Some(0) => matches Err(Error::ChecksUnanswered) ; "missing_answers")]
+    #[test_case(Some(73) => matches Err(Error::ExitedInChecks(_)) ; "nonzero_exit")]
+    fn probe_exit_preserves_timeout_status_and_completion(code: Option<i32>) -> Result<(), Error> {
+        handshake().probe_exit(code, 1)
+    }
+
+    #[test]
+    fn worker_checks_the_account_before_the_policy() {
+        let mut handshake = handshake();
+        let responses = [
+            json!({"current_permission_mode":"default", "account":{"apiProvider":"other", "subscriptionType":"Claude Pro"}}),
+            Value::Null,
+            Value::Null,
+        ];
+        let mut result = Ok(false);
+        for (step, response) in checks::HANDSHAKE.iter().zip(responses) {
+            result = handshake.answer(
+                &json!({"request_id":step.id, "subtype":stream::SUCCESS, "response":response}),
+            );
+        }
+        assert!(matches!(
+            result,
+            Err(Error::Check(Problem::OtherProvider(_)))
+        ));
+    }
+
+    #[test]
+    fn a_completed_worker_probe_exits_successfully() {
+        let policy = super::WorkerPolicy::from(PolicyInput {
+            deny: Vec::new(),
+            sandbox: None,
+        });
+        let settings = policy.settings().clone();
+        let mut handshake =
+            WorkerHandshake::new(vec![checks::DEFAULT_MODE.into()], Arc::new(policy));
+        let responses = [
+            json!({"current_permission_mode":"default", "account":{"apiProvider":"firstParty", "subscriptionType":"Claude Pro"}}),
+            json!({"effective":settings, "sources":[{"source":"flagSettings", "settings":settings}]}),
+            json!({"hooks":[], "policy":{"allDisabled":true,"policyHookCount":0}}),
+        ];
+        for (step, response) in checks::HANDSHAKE.iter().zip(responses) {
+            handshake
+                .answer(
+                    &json!({"request_id":step.id, "subtype":stream::SUCCESS, "response":response}),
+                )
+                .unwrap();
+        }
+        assert!(handshake.probe_exit(Some(0), 1).is_ok());
+    }
 
     #[test]
     fn a_relative_tmpdir_is_absolute_in_the_child_environment() {
@@ -772,6 +935,7 @@ mod tests {
     #[test_case("", json!(null), Problem::NoEffectiveSettings ; "missing_effective_settings")]
     #[test_case("/permissions/blockReadsOutsideWorkingDirectories", json!(false), Problem::OutsideProjectReads ; "reads_outside_project")]
     #[test_case("/permissions/additionalDirectories", json!([null]), Problem::AdditionalDirectories(String::new()) ; "null_additional_directories")]
+    #[test_case("/permissions/additionalDirectories", json!({"root":"/"}), Problem::AdditionalDirectories("directories given as a table".into()) ; "object_additional_directories")]
     #[test_case("/permissions/deny", json!([]), Problem::MissingDenyRule(READ_RULE.into()) ; "missing_deny_rule")]
     fn effective_worker_permissions_report_the_rule(path: &str, value: Value, want: Problem) {
         let expected = expected();

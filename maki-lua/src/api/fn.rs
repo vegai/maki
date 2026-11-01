@@ -22,6 +22,7 @@ use crate::runtime::{active_task_id, job_task_id, strip_traceback, with_jobs};
 mod jobs;
 pub use jobs::set_shell_preference;
 use jobs::{CallbackUpdate, CallbackUpdates, JobCommand, JobSnapshot, Redirect};
+pub(crate) use jobs::{EXIT_STDERR_BYTES, EXIT_STDERR_LINES};
 pub(crate) use jobs::{JobEvent, JobOwner, JobSpec, JobStore};
 
 const MAX_TAIL_LINES: usize = 1024;
@@ -500,17 +501,15 @@ async fn chansend(
     id: u32,
     data: Value,
 ) -> LuaResult<Pair<usize>> {
-    let lines = match &data {
-        Value::String(_) => Vec::new(),
-        other => chansend_bytes(other.clone())?,
+    let send = async |bytes: &[u8]| -> LuaResult<Pair<usize>> {
+        let task_id = active_task_id(&lua);
+        let writer = try_pair!(with_jobs(&lua, |store| store.stdin_writer(id, task_id, &plugin)));
+        Ok(pair(writer.send(bytes).await))
     };
-    let task_id = active_task_id(&lua);
-    let writer = try_pair!(with_jobs(&lua, |store| store.stdin_writer(id, task_id, &plugin)));
-    let result = match data {
-        Value::String(text) => writer.send(&text.as_bytes()).await,
-        _ => writer.send(&lines).await,
-    };
-    Ok(pair(result))
+    match data {
+        Value::String(text) => send(&text.as_bytes()).await,
+        other => send(&chansend_bytes(other)?).await,
+    }
 }
 
 /// List items can contain arbitrary bytes, as in Neovim. A newline inside an item becomes NUL.
@@ -704,7 +703,11 @@ pub(crate) async fn deliver_job_event(lua: &Lua, job_id: u32, event: &JobEvent) 
     });
     let stderr_tail = if let JobEvent::Exit(code, _) = event {
         with_jobs(lua, |store| {
-            let tail = store.exit_stderr(job_id);
+            let tail = if callback.is_some() {
+                store.exit_stderr(job_id)
+            } else {
+                Vec::new()
+            };
             store.complete(lua, job_id, *code);
             tail
         })

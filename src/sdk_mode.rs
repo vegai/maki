@@ -8,7 +8,6 @@
 //! `MakiId` canonical form.
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::io::{self, BufRead, Write};
 use std::mem;
 use std::path::Path;
@@ -40,9 +39,10 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::cli::Cli;
-use crate::wire::maki_to_claude_tool_name;
-use crate::wire::{API_RETRY, ERROR_DURING_EXECUTION, INIT, SUCCESS, system_event, wire_uuid};
-use crate::wire::{NOTIFICATION, ProviderNotice};
+use crate::wire::{
+    API_RETRY, ERROR_DURING_EXECUTION, INIT, NOTIFICATION, ProviderNotice, SUCCESS,
+    maki_to_claude_tool_name, system_event, wire_uuid,
+};
 
 const NOTICE_SUBTYPE: &str = "notice";
 
@@ -761,6 +761,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     Ok(())
 }
 
+/// Reap session jobs before joining the writer, because descendants may retain stdout.
 fn finish(
     handle: InteractiveHandle,
     lua: &EventHandle,

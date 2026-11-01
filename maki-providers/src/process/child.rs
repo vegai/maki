@@ -2,17 +2,19 @@ use std::io;
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
-use super::GroupSignals;
+use super::{GroupSignals, within};
 #[cfg(unix)]
 use super::{pid_of, wait_without_reaping};
-use futures_lite::future;
+#[cfg(unix)]
+use rustix::io::Errno;
 #[cfg(unix)]
 use rustix::process::{Signal, WaitOptions, kill_process, waitpid};
-use smol::{Timer, process::Child};
+use smol::process::Child;
+#[cfg(unix)]
+use tracing::warn;
 
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const ALREADY_REAPED: &str = "child already reaped";
-const REAP_TIMED_OUT: &str = "child did not exit before its reap deadline";
 
 pub enum ChildExit {
     Exited,
@@ -51,15 +53,7 @@ impl ChildGuard {
         #[cfg(unix)]
         {
             let pid = self.id();
-            match future::or(
-                async move { Some(smol::unblock(move || wait_without_reaping(pid)).await) },
-                async move {
-                    Timer::at(deadline).await;
-                    None
-                },
-            )
-            .await
-            {
+            match within(deadline, smol::unblock(move || wait_without_reaping(pid))).await {
                 Some(true) => ChildExit::Exited,
                 Some(false) => ChildExit::WaitFailed,
                 None => ChildExit::TimedOut,
@@ -91,17 +85,15 @@ impl ChildGuard {
         result
     }
 
-    pub async fn reap(&mut self, deadline: Instant) -> io::Result<ExitStatus> {
+    pub async fn reap(&mut self, deadline: Instant) -> Option<io::Result<ExitStatus>> {
         self.signals.disable();
-        let mut child = self
-            .child
-            .take()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, ALREADY_REAPED))?;
-        future::or(async { child.status().await }, async {
-            Timer::at(deadline).await;
-            Err(io::Error::new(io::ErrorKind::TimedOut, REAP_TIMED_OUT))
-        })
-        .await
+        let Some(mut child) = self.child.take() else {
+            return Some(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                ALREADY_REAPED,
+            )));
+        };
+        within(deadline, child.status()).await
     }
 
     pub fn kill(&mut self) {
@@ -120,8 +112,11 @@ impl ChildGuard {
     pub fn terminate(&mut self) {
         if self.can_signal() {
             self.signalled = true;
-            if let Some(pid) = pid_of(self.id()) {
-                let _ = kill_process(pid, Signal::TERM);
+            if let Some(pid) = pid_of(self.id())
+                && let Err(error) = kill_process(pid, Signal::TERM)
+                && error != Errno::SRCH
+            {
+                warn!(pid = self.id(), signal = ?Signal::TERM, %error, "failed to terminate child");
             }
         }
     }
@@ -271,6 +266,19 @@ mod tests {
         kill_process(pid, Signal::USR1).unwrap();
         let status = smol::block_on(guard.status()).unwrap();
         assert_eq!(status.signal(), Some(Signal::USR1.as_raw()));
+    }
+
+    #[test]
+    fn reap_deadline_on_a_live_child_is_distinct_from_an_io_error() {
+        smol::block_on(async {
+            let child = spawn_sleep();
+            let pid = pid_of(child.id()).unwrap();
+            let mut guard = ChildGuard::new(child);
+            assert!(guard.reap(Instant::now()).await.is_none());
+            assert!(!guard.can_signal());
+            kill_process(pid, Signal::KILL).unwrap();
+            wait_for_death(pid.as_raw_pid() as u32);
+        });
     }
 
     #[test]

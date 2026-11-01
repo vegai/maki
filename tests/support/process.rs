@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
 
-const PROCESS_TIMEOUT: Duration = Duration::from_secs(300);
+const PROCESS_TIMEOUT: Duration = Duration::from_secs(120);
 const RESULT: &str = "result";
 
 pub fn ndjson(bytes: &[u8]) -> Vec<Value> {

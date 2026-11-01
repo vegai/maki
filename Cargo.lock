@@ -3453,6 +3453,7 @@ name = "maki-providers"
 version = "0.6.5"
 dependencies = [
  "base64 0.23.1",
+ "event-listener",
  "fastrand",
  "flume",
  "futures",

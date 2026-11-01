@@ -369,6 +369,7 @@ mod tests {
                 message: "down".into(),
             },
         );
+        assert_eq!(batch.failed_provider, Some(spec.slug));
         let [warning] = batch.warnings.as_slice() else {
             panic!("{:?}", batch.warnings);
         };

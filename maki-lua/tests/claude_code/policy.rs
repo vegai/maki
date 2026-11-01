@@ -18,7 +18,7 @@ use maki_agent::tools::test_support::stub_ctx_in;
 use maki_agent::tools::{ToolContext, ToolRegistry};
 use maki_agent::{AgentEvent, Envelope, EventSender, ToolOutput, ToolOutputLines};
 use maki_lua::{MAX_INFLIGHT_TOOLS, PluginHost, RestoreItem, RestoreReason};
-use maki_providers::claude_code::STARTUP_TIMEOUT_SECS;
+use maki_providers::claude_code::{Error as WorkerError, STARTUP_TIMEOUT_SECS};
 use serde_json::{Map, Value, json};
 use tempfile::{TempDir, tempdir};
 use test_case::test_case;
@@ -26,7 +26,7 @@ use test_case::test_case;
 use super::support::{
     ACCOUNT_SUBSCRIPTION, DEADLINE, FIXTURE_GLOBAL_RULE, HOOKS_OFF, LEFT_BEHIND, MINIMUM_VERSION,
     PROJECT_RULE, TOOL, WorkingDir, executable, group_gone, load, output, running, tool_reply,
-    try_load, use_fixture_user, wait_until, within,
+    try_load, use_fixture_user, wait_for_release, wait_until,
 };
 
 mod coding;
@@ -127,12 +127,12 @@ const NOT_AN_OBJECT: &str = "settings.json: is not a JSON object";
 const SYNTAX_ERROR_AT: &str = "settings.json: EOF while parsing a value at line 2 column 17";
 const BROKEN_SETTINGS: &str = "{\n  \"apiKeyHelper\":";
 const API_KEY_STOP: &str = "API key source \"ANTHROPIC_API_KEY\"";
-const NO_INIT_STOP: &str = "no init event in ";
+const NO_INIT_STOP: &str = "Claude Code did not finish its startup checks within ";
 const NO_ANSWER_IN_TIME: &str = "did not complete in time";
 /// The fake's exit code, when it came, and its stderr, whatever text
 /// surrounds them.
-const CRASH_REPORT: &[&str] = &["code 3", "before its result", "boom"];
-const LATE_CRASH_REPORT: &[&str] = &["code 3", "after its result", "boom"];
+const CRASH_REPORT: &[&str] = &["exit status: 3", "before its reply was complete", "boom"];
+const LATE_CRASH_REPORT: &[&str] = &["exit status: 3", "after its result", "boom"];
 const CANCEL_MARKER: &str = "[cancelled by user";
 const USAGE_PROGRESS: &str = "Read src/usage.rs";
 const TOOL_USE_ID: &str = "toolu_ask";
@@ -148,7 +148,6 @@ const HOOK_SENTINEL: &str = ".claude_code_hook_sentinel";
 const HOOK_STOP: &str = "started a SessionStart hook";
 const PROBE_CRASH: &str = "exited (exit status: 3) during its checks:\nprobe gave up";
 const UNASKED_STOP: &str = "started its run before maki accepted its checks";
-const PROBE_RUN_STOP: &str = "started its run before maki accepted its checks";
 const ROUTE_CLAIM: &str = "maki found no route conflict";
 
 const CODE_PROFILE: &str = "code";
@@ -730,7 +729,7 @@ fn answer_without_the_checks(fake: &FakeClaude) {
 #[test_case(add_managed_extra_roots, MANAGED_ROOTS_STOP, PROBED ; "managed_extra_roots")]
 #[test_case(crash_the_probe, PROBE_CRASH, PROBED ; "probe_crashing_after_clean_answers")]
 #[test_case(answer_without_the_checks, UNASKED_STOP, STARTED ; "a_run_answering_before_its_checks")]
-#[test_case(run_in_the_probe, PROBE_RUN_STOP, PROBED ; "a_probe_that_starts_a_run")]
+#[test_case(run_in_the_probe, UNASKED_STOP, PROBED ; "a_probe_that_starts_a_run")]
 #[test_case(refuse_the_settings_request, SETTINGS_REFUSED, PROBED ; "a_refused_check_request")]
 #[test_case(answer_the_hooks_twice, STRAY_ANSWER, PROBED ; "a_repeated_check_response")]
 fn refused_before_the_prompt_is_sent(setup: fn(&FakeClaude), want: &str, calls: &str) {
@@ -1097,9 +1096,9 @@ fn a_cancelled_call_lets_go_only_once_its_processes_end(
     let error = first.unwrap_err();
     assert!(
         error.contains(CANCEL_MARKER)
-            || error.contains(STOPPED_EXIT)
-            || error.contains("cancelled")
-            || error.contains("was stopped during its checks"),
+            || error == format!("claude_code: {}", WorkerError::WentQuiet)
+            || error == format!("claude_code: {}", WorkerError::Cancelled)
+            || error == format!("claude_code: {}", WorkerError::StoppedInChecks),
         "{error}"
     );
     assert_eq!(second.unwrap(), ANSWER);
@@ -1112,6 +1111,52 @@ fn a_cancelled_call_lets_go_only_once_its_processes_end(
         wait_until(DEADLINE, || fake.probe_dirs_left(&project).is_empty()),
         "probe directories stayed"
     );
+}
+
+#[test]
+fn a_handler_deadline_during_version_check_releases_its_slot_after_reaping() {
+    const RELEASE: &str = "version_release";
+    const TIMED_OUT: &str = "runtime error: timeout";
+    let fake = FakeClaude::new();
+    stall_the_version_check(&fake);
+    let path = fake.path("claude");
+    let script = fs::read_to_string(&path).unwrap();
+    let held = script.replace(
+        "sleep \"${secs:-30}\"",
+        &wait_for_release("\"$dir/version_release\""),
+    );
+    assert_ne!(held, script);
+    executable(fake.dir.path(), "claude", &held);
+    let (reg, _host) = fake.host_with_deadlines(STARTUP_TIMEOUT_SECS);
+    let (tx, rx) = flume::unbounded::<Envelope>();
+    let events = EventSender::new(tx, 0);
+    let first = fake.ctx(Some(&events), Some(FIRST_ID));
+    let next = fake.ctx(Some(&events), Some(SECOND_ID));
+    let (first, next) = thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            output(tool_reply(
+                &reg,
+                &first,
+                TOOL,
+                json!({"prompt": ANSWERS, "timeout": TEST_TIMEOUT_SECS}),
+            ))
+        });
+        assert!(wait_until(DEADLINE, || fake
+            .path("version_stalled")
+            .exists()));
+        let next = scope.spawn(|| output(call(&reg, &next, ANSWERS)));
+        wait_for_view_line(&rx, WAITING).unwrap();
+        let first = first.join().unwrap();
+        fs::remove_file(fake.path(STALL_VERSION)).unwrap();
+        fake.write(RELEASE, "");
+        (first, next.join().unwrap())
+    });
+    assert_eq!(first.unwrap_err(), TIMED_OUT);
+    assert_eq!(next.unwrap(), ANSWER);
+    assert!(fake.log("overlaps").is_empty());
+    assert!(wait_until(DEADLINE, || fake
+        .probe_dirs_left(&fake.project.path())
+        .is_empty()));
 }
 
 /// With one slot, a path that fails to release its permit leaves the next
@@ -1204,11 +1249,7 @@ fn a_newer_version_runs() {
     let fake = FakeClaude::new();
     fake.answer_version(NEWER_VERSION);
     let (reg, _host) = fake.host(ONE_SLOT);
-    let output = smol::block_on(within(
-        DEADLINE,
-        execute(&reg, &fake.ctx(None, None), ANSWERS),
-    ))
-    .unwrap();
+    let output = output(execute(&reg, &fake.ctx(None, None), ANSWERS)).unwrap();
 
     let header = saved_header(&output);
     assert!(
@@ -1223,11 +1264,7 @@ fn a_newer_version_runs() {
 fn a_restored_answer_rebuilds_its_header() {
     let fake = FakeClaude::new();
     let (reg, host) = fake.host(ONE_SLOT);
-    let output = smol::block_on(within(
-        DEADLINE,
-        execute(&reg, &fake.ctx(None, None), ANSWERS),
-    ))
-    .unwrap();
+    let output = output(execute(&reg, &fake.ctx(None, None), ANSWERS)).unwrap();
     let state = output.state().cloned();
     let header = saved_header(&output);
     assert!(

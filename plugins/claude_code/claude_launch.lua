@@ -37,14 +37,12 @@ M.WORKERS = {
     tools = { "Read", "Glob", "Grep" },
     permission_mode = "manual",
     reported_modes = { "default", "manual" },
-    sandboxed = false,
     contract = READ_CONTRACT,
   },
   code = {
     tools = { "Read", "Glob", "Grep", "Edit", "Write", "Bash" },
     permission_mode = "acceptEdits",
     reported_modes = { "acceptEdits" },
-    sandboxed = true,
     contract = CODE_CONTRACT,
   },
 }
@@ -93,13 +91,7 @@ function M.checked_step(stream, line, handshake)
   if not step then
     return nil
   end
-  if step.stop then
-    return step, step.stop
-  end
-  if step.control then
-    return step, nil, step.complete
-  end
-  return step
+  return step, step.stop, step.complete
 end
 
 local function probe_dir(env, spec)
@@ -126,7 +118,7 @@ function M.probe(call, spec, argv, env)
   if not dir then
     return dir_err
   end
-  local stream = Stream.new({ cwd = dir, worker = spec.worker, cli = spec.cli })
+  local stream = Stream.new({ cwd = dir, worker = spec.worker, cli = spec.cli, executable = spec.executable })
   local handshake = M.worker_handshake(spec)
   local problem, stderr_tail = nil, {}
   local code, _, run_error = call:run_to_end(argv, M.job_opts(dir, env), {
@@ -142,7 +134,7 @@ function M.probe(call, spec, argv, env)
         return
       end
       local step, failure = M.checked_step(stream, line, handshake)
-      problem = failure or step and not step.control and native.unchecked_start() or nil
+      problem = failure or step and not step.control and native.unchecked_start or nil
       if problem then
         maki.fn.jobstop(id)
       end
@@ -204,7 +196,7 @@ function M.preflight(input, ctx, call, opts)
   local config_dir = prepared.config_dir
 
   local version, version_err =
-    call:wait(native.checked_profile, executable, env, cwd, prepared.denied, M.STARTUP_TIMEOUT_SECS)
+    call:wait(native.checked_profile, ctx, executable, env, cwd, prepared.denied, M.STARTUP_TIMEOUT_SECS)
   if not version then
     return nil, version_err
   end

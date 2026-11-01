@@ -2,15 +2,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::join_all;
-use maki_agent::cancel::CancelToken;
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use mlua::{Function, Lua, MultiValue, Result as LuaResult, Table, Value};
 use smol::lock::{Semaphore, SemaphoreGuardArc};
 
 use crate::docs::{FnDoc, ParamDoc};
 use crate::runtime::{
-    SpawnedTask, TaskHandle, enqueue_async_task, enqueue_spawned_task, lock_cell,
-    register_cancel_hook,
+    SpawnedTask, enqueue_async_task, enqueue_spawned_task, register_cancel_hook, task_cancel,
 };
 
 const AWAIT_MIN_ARGS: usize = 2;
@@ -39,10 +37,7 @@ struct LuaPermit {
 async fn acquire(lua: Lua, this: mlua::UserDataRef<LuaSemaphore>) -> LuaResult<LuaPermit> {
     let sem = Arc::clone(&this.sem);
     drop(this);
-    let cancel = lua
-        .app_data_ref::<TaskHandle>()
-        .map(|h| lock_cell(&h).cancel.clone())
-        .unwrap_or_else(CancelToken::none);
+    let cancel = task_cancel(&lua);
     let guard = cancel
         .race(sem.acquire_arc())
         .await
@@ -281,10 +276,7 @@ async fn sleep(lua: Lua, ms: i64) -> LuaResult<()> {
         smol::future::yield_now().await;
         return Ok(());
     }
-    let cancel = lua
-        .app_data_ref::<TaskHandle>()
-        .map(|h| lock_cell(&h).cancel.clone())
-        .unwrap_or_else(CancelToken::none);
+    let cancel = task_cancel(&lua);
     cancel
         .race(smol::Timer::after(Duration::from_millis(ms as u64)))
         .await
@@ -509,12 +501,12 @@ mod tests {
     use std::sync::Mutex;
 
     use futures_lite::future::{or, poll_once};
-    use maki_agent::cancel::CancelTrigger;
+    use maki_agent::cancel::{CancelToken, CancelTrigger};
     use mlua::Lua;
     use test_case::test_case;
 
     use super::*;
-    use crate::runtime::{CANCELLED_MSG, TaskCell, TaskScope, block_on_or_fail};
+    use crate::runtime::{CANCELLED_MSG, TaskCell, TaskHandle, TaskScope, block_on_or_fail};
 
     const ERR_TOO_FEW_ARGS: &str = "maki.async.await requires at least 2 arguments: argc, fun, ...";
     const ERR_ARGC_GE_1: &str = "argc must be >= 1";

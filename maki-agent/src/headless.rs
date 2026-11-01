@@ -20,7 +20,7 @@ use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedPrompts;
 use crate::session::{Resumed, SessionTrack};
 use crate::template;
-use crate::tools::{FileAccess, LocalTools, RequestTools, ToolAudience, ToolRegistry};
+use crate::tools::{FileAccess, LocalTools, RequestSpec, RequestTools, ToolAudience, ToolRegistry};
 use crate::types::EventSender;
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, EventStreamGuard,
@@ -145,9 +145,11 @@ impl ContextSpec {
             &self.vars,
             model,
             &self.config,
-            &self.excluded_tools,
-            workflow,
-            self.mcp,
+            RequestSpec {
+                excluded: &self.excluded_tools,
+                workflow,
+                mcp: self.mcp,
+            },
         )
     }
 

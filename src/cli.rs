@@ -10,7 +10,7 @@ use crate::print::OutputFormat;
 const SDK_THINKING_ENABLED: &str = "enabled";
 const SDK_THINKING_DISABLED: &str = "disabled";
 const CLAUDE_MCP_PREFIX: &str = "mcp__";
-pub(crate) const TOOL_ARGUMENT_PATTERNS_UNSUPPORTED: &str =
+const TOOL_ARGUMENT_PATTERNS_UNSUPPORTED: &str =
     "tool argument patterns are not supported; use tool names";
 
 fn parse_tool_name(name: &str) -> Result<String, &'static str> {
@@ -450,12 +450,13 @@ mod tests {
     const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
     const EFFORT_VALUES: &str = "[possible values: minimal, low, medium, high, xhigh, max]";
 
-    #[test_case("--allowed-tools")]
-    #[test_case("--allowedTools")]
-    #[test_case("--disallowed-tools")]
-    #[test_case("--disallowedTools")]
-    fn tool_argument_patterns_fail_before_startup(flag: &str) {
-        let error = Cli::try_parse_from(["maki", "-p", flag, "Bash(git log:*)"])
+    #[test_case("--allowed-tools", "Bash(git log:*)")]
+    #[test_case("--allowedTools", "Bash(git log:*)")]
+    #[test_case("--disallowed-tools", "Bash(git log:*)")]
+    #[test_case("--disallowedTools", "Bash(git log:*)")]
+    #[test_case("--disallowed-tools", "srv.GetDocs(secret:*)"; "mcp_pattern")]
+    fn tool_argument_patterns_fail_before_startup(flag: &str, pattern: &str) {
+        let error = Cli::try_parse_from(["maki", "-p", flag, pattern])
             .err()
             .unwrap();
         assert_eq!(error.kind(), ErrorKind::ValueValidation);

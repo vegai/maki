@@ -2,7 +2,6 @@
 //!
 //! nextest gives each test its own process. This also isolates the state directory, which
 //! maki selects once per process.
-#![cfg(target_os = "linux")]
 
 use std::env;
 use std::ffi::OsStr;
@@ -184,9 +183,10 @@ fn coding_refuses_a_state_directory_it_cannot_deny() {
         outside.path(),
         Map::from_iter([("artifact_dir".into(), json!(artifacts))]),
     );
-    let err = ask_with(
+    let err = reply(
         &reg,
         &session_ctx(),
+        TOOL,
         json!({ "prompt": "anything", "profile": "code" }),
     )
     .unwrap_err();
@@ -211,11 +211,7 @@ fn session_ctx() -> ToolContext {
 }
 
 fn ask(reg: &ToolRegistry, ctx: &ToolContext) -> Result<String, String> {
-    ask_with(reg, ctx, json!({ "prompt": "anything" }))
-}
-
-fn ask_with(reg: &ToolRegistry, ctx: &ToolContext, input: Value) -> Result<String, String> {
-    reply(reg, ctx, TOOL, input)
+    reply(reg, ctx, TOOL, json!({ "prompt": "anything" }))
 }
 
 /// An overlapping TMPDIR uses a scratch base outside the checkout. The
@@ -303,7 +299,7 @@ fn a_call_does_not_wait_for_the_sweep() {
     opts.insert("artifact_dir".into(), json!(artifacts.path()));
     let (reg, _host) = fake_host_with(&claude, tools.path(), opts);
     let input = json!({ "prompt": "anything", "profile": "code" });
-    let _ = ask_with(&reg, &stub_ctx_in(&project, None, None), input);
+    let _ = reply(&reg, &stub_ctx_in(&project, None, None), TOOL, input);
     assert!(
         wait_until(DEADLINE, || removing.exists()),
         "the sweep did not start"
@@ -465,7 +461,7 @@ fn a_login_token_in_the_environment_keeps_the_coding_worker_from_starting() {
 
     let (reg, _host) = fake_host(&claude, tools.path());
     let input = json!({ "prompt": "anything", "profile": "code" });
-    let err = ask_with(&reg, &stub_ctx_in(&project, None, None), input).unwrap_err();
+    let err = reply(&reg, &stub_ctx_in(&project, None, None), TOOL, input).unwrap_err();
 
     assert!(err.contains(OAUTH_TOKEN), "got: {err}");
     assert!(
@@ -562,7 +558,7 @@ fn the_default_artifact_root_hides_all_of_makis_state_but_the_workers_artifact(l
         Map::from_iter([("deny_read_home".into(), json!("custom/token"))]),
     );
     let input = json!({ "prompt": "anything", "profile": "code" });
-    let _ = ask_with(&reg, &stub_ctx_in(&project, None, None), input);
+    let _ = reply(&reg, &stub_ctx_in(&project, None, None), TOOL, input);
 
     assert!(
         tools.path().join("prompt").exists(),
@@ -661,7 +657,7 @@ fn code_with_cp(cp: &str, dependencies: &str) -> DisturbedCopy {
     opts.insert("dependencies".into(), json!(dependencies));
     let (reg, _host) = fake_host_with(&claude, tools.path(), opts);
     let input = json!({ "prompt": "anything", "profile": "code" });
-    let err = ask_with(&reg, &stub_ctx_in(&project, None, None), input).unwrap_err();
+    let err = reply(&reg, &stub_ctx_in(&project, None, None), TOOL, input).unwrap_err();
     DisturbedCopy {
         err,
         prompt: fs::read_to_string(tools.path().join("prompt")).unwrap_or_default(),

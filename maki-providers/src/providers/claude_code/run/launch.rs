@@ -151,12 +151,7 @@ pub(super) async fn probe(
             }
         }
         let status = group.wait(deadline).await?;
-        if !status.success() {
-            return Err(Error::ExitedInChecks(status));
-        }
-        if !passed {
-            return Err(Error::ChecksUnanswered);
-        }
+        super::super::worker::probe_exit(status, passed)?;
         Ok(handshake)
     })
     .await

@@ -1,4 +1,3 @@
-use crate::tools::ToolKind;
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -20,7 +19,7 @@ use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT
 use crate::tools::registry::{BoxFuture, InstalledHook, RegisteredTool, Tool, ToolInvocation};
 use crate::tools::{
     CallOrigin, FileKey, LocalTool, LocalToolFn, PermissionScopes, ToolAudience, ToolContext,
-    ToolLive, truncate_bytes,
+    ToolKind, ToolLive, truncate_bytes,
 };
 use crate::{
     AgentError, AgentEvent, AgentSeed, CallRecord, TextOutput, ToolDoneEvent, ToolOutput,
@@ -539,7 +538,9 @@ pub fn callable(ctx: &ToolContext) -> Vec<Callable> {
     for entry in ctx.registry.iter().iter() {
         let audience = entry.tool.audience();
         if !claimed.insert(entry.name().to_owned())
-            || !offered(ctx, entry.name(), &Route::Native(entry.clone()))
+            || !ctx
+                .tool_filter
+                .admits(entry.name(), ToolKind::Registry(audience), ctx.audience)
         {
             continue;
         }
@@ -1299,8 +1300,8 @@ mod tests {
     };
     use crate::tools::{
         BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult,
-        ParseError, PermissionScopes, RequestTools, TOOL_NAME_FIELD, Tool, ToolAudience,
-        ToolExecResult, ToolFilter, ToolHook, ToolReach, local_tool,
+        ParseError, PermissionScopes, RequestSpec, RequestTools, TOOL_NAME_FIELD, Tool,
+        ToolAudience, ToolExecResult, ToolFilter, ToolHook, ToolReach, local_tool,
     };
     use crate::{AgentMode, Envelope, EventSender, InstructionBlock};
 
@@ -2683,9 +2684,11 @@ mod tests {
             &Vars::new(),
             &ctx.model,
             &ctx.config,
-            excluded,
-            false,
-            false,
+            RequestSpec {
+                excluded,
+                workflow: false,
+                mcp: false,
+            },
         );
         ctx.tool_filter = Arc::clone(tools.filter());
 
@@ -2783,9 +2786,11 @@ mod tests {
                 &Vars::new(),
                 &ctx.model,
                 &ctx.config,
-                if excluded { &[CLIENT_NAME] } else { &[] },
-                false,
-                false,
+                RequestSpec {
+                    excluded: if excluded { &[CLIENT_NAME] } else { &[] },
+                    workflow: false,
+                    mcp: false,
+                },
             )
         };
         ctx.tool_filter = Arc::clone(tools.filter());
@@ -2877,9 +2882,11 @@ mod tests {
             &Vars::new(),
             &ctx.model,
             &ctx.config,
-            &[],
-            false,
-            true,
+            RequestSpec {
+                excluded: &[],
+                workflow: false,
+                mcp: true,
+            },
         );
         ctx.tool_filter = Arc::clone(tools.filter());
         let definitions = request_tools(&tools, ctx.mcp.as_ref(), ToolDeferral::Client).to_string();
@@ -2912,9 +2919,11 @@ mod tests {
             &Vars::new(),
             &ctx.model,
             &ctx.config,
-            &[],
-            false,
-            true,
+            RequestSpec {
+                excluded: &[],
+                workflow: false,
+                mcp: true,
+            },
         );
         ctx.tool_filter = Arc::clone(tools.filter());
         assert_eq!(
@@ -2966,6 +2975,32 @@ mod tests {
         ctx.tool_filter = Arc::clone(tools.filter());
 
         assert_eq!(callable_names(&ctx), [OTHER_WIRE]);
+    }
+
+    #[test_case(PROBE_WIRE ; "wire_name")]
+    #[test_case(PROBE_QUALIFIED ; "qualified_name")]
+    fn assembled_tools_apply_mcp_denials_to_both_spellings(blocked: &str) {
+        let mut ctx = mcp_ctx(&stub_mcp(&[PROBE_QUALIFIED, OTHER_QUALIFIED]));
+        ctx.config.disabled_tools = vec![blocked.to_owned()];
+        let tools = RequestTools::assembled(
+            &ctx.registry,
+            json!([{ TOOL_NAME_FIELD: PROBE_WIRE }, { TOOL_NAME_FIELD: OTHER_WIRE }]),
+            &ctx.local_tools,
+            &ctx.config,
+            &ctx.model,
+            ctx.audience,
+        );
+        assert_eq!(tool_names(tools.definitions()), [OTHER_WIRE]);
+        ctx.tool_filter = Arc::clone(tools.filter());
+        assert!(!callable_names(&ctx).contains(&PROBE_WIRE.to_owned()));
+        for name in [PROBE_WIRE, PROBE_QUALIFIED] {
+            let done = smol::block_on(dispatch(&ctx, name, &json!({})));
+            assert!(done.is_error);
+            assert_eq!(
+                done.output.as_text(),
+                format!("{UNAVAILABLE_TOOL_PREFIX}: {name}")
+            );
+        }
     }
 
     /// Losing on audience is not the same as freeing the name: MCP publishing

@@ -231,7 +231,7 @@ case("redirected_output_keeps_the_guard_and_explicit_timeout", function()
   end)
 end)
 
-case("stdin_larger_than_the_queue_is_chunked_and_retried_without_losing_bytes", function()
+case("stdin_preserves_binary_bytes_and_closes_after_the_complete_write", function()
   with_jobs(function(state)
     local input = "a\0b\n"
     local ok, err = jobs.feed_stdin(1, input)

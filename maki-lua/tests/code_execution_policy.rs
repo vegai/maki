@@ -172,7 +172,6 @@ fn describe(
         .expect("code_execution registered")
         .tool
         .description(&DescriptionContext {
-            local_tools: None,
             filter,
             audience,
             workflow,

@@ -1,4 +1,3 @@
-use maki_agent::tools::ToolKind;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::path::Path;
@@ -16,8 +15,8 @@ use maki_agent::tools::registry::{RegisteredTool, ToolRegistry};
 use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
 use maki_agent::tools::{
     BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
-    PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolInvocation, ToolReach,
-    is_tool_enabled, timeout_annotation,
+    PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolInvocation, ToolKind,
+    ToolReach, is_tool_enabled, timeout_annotation,
 };
 use maki_agent::{
     AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, SharedBuf, TextOutput, ToolOutput,
@@ -2054,7 +2053,6 @@ mod tests {
         let mut tool = make_lua_tool(None);
         tool.has_describe_fn = true;
         let ctx = DescriptionContext {
-            local_tools: None,
             filter: &ToolFilter::default(),
             audience: ToolAudience::MAIN,
             workflow: false,

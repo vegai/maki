@@ -17,16 +17,13 @@ pub fn start_mcp(cwd: &Path, project_config: ProjectConfig) -> Option<McpHandle>
 }
 
 pub fn startup(receiver: &Receiver<Ready>, events: &mut SessionEvents) -> Result<Ready> {
-    let ready = match smol::block_on(receiver.recv_async()) {
-        Ok(ready) => ready,
-        Err(_) => {
-            while let Some(envelope) = smol::block_on(events.next()) {
-                if let AgentEvent::Error { message, .. } = envelope.event {
-                    return Err(eyre!(message));
-                }
-            }
-            return Err(eyre!("provider startup ended before it was ready"));
+    if let Ok(ready) = smol::block_on(receiver.recv_async()) {
+        return Ok(ready);
+    }
+    while let Some(envelope) = smol::block_on(events.next()) {
+        if let AgentEvent::Error { message, .. } = envelope.event {
+            return Err(eyre!(message));
         }
-    };
-    Ok(ready)
+    }
+    Err(eyre!("provider startup ended before it was ready"))
 }

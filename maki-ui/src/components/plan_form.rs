@@ -334,7 +334,7 @@ impl PlanForm {
         lines.push(Line::default());
         lines.push(fit(hint_line(HINT_PAIRS).spans, width));
 
-        let clipped = lines.len() > usize::from(area.height.saturating_sub(BORDER));
+        let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
         render_form(
             &t,
             FORM_LABEL,
@@ -342,7 +342,7 @@ impl PlanForm {
             area,
             Paragraph::new(lines),
             (0, 0),
-            clipped,
+            total,
         );
     }
 }

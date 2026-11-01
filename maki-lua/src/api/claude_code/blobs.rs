@@ -1,11 +1,10 @@
-use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
 use std::str::from_utf8;
 
-use rustix::fs::{Mode, OFlags, open, openat};
+use rustix::fs::{CWD, Mode, open};
 
-use super::native::DIRECTORY_FLAGS;
+use super::{DIRECTORY_FLAGS, create_private, open_regular};
 
 const OBJECT_ID_LENGTHS: &[usize] = &[40, 64];
 const MAX_HEADER_BYTES: u64 = 128;
@@ -13,14 +12,7 @@ const INVALID_BATCH: &str = "invalid git blob batch";
 
 pub fn unpack(batch: &Path, stage: &Path, hashes: &[String]) -> io::Result<()> {
     let stage = open(stage, DIRECTORY_FLAGS, Mode::empty())?;
-    let input = File::from(open(
-        batch,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?);
-    if !input.metadata()?.is_file() {
-        return Err(io::Error::other(INVALID_BATCH));
-    }
+    let input = open_regular(&CWD, batch)?;
     let mut input = BufReader::new(input);
     for hash in hashes {
         if !OBJECT_ID_LENGTHS.contains(&hash.len())
@@ -43,12 +35,7 @@ pub fn unpack(batch: &Path, stage: &Path, hashes: &[String]) -> io::Result<()> {
                     "{INVALID_BATCH}: unexpected header {header_text:?} for {hash}"
                 ))
             })?;
-        let mut output = File::from(openat(
-            &stage,
-            hash.as_str(),
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::RUSR | Mode::WUSR,
-        )?);
+        let mut output = create_private(&stage, hash.as_str())?;
         if io::copy(&mut input.by_ref().take(size), &mut output)? != size {
             return Err(io::Error::other(INVALID_BATCH));
         }

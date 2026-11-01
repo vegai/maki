@@ -121,13 +121,12 @@ fn tool_description(reg: &ToolRegistry, agent: &maki_config::AgentConfig, name: 
     let model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
     let filter = ToolFilter::from_config(agent, &model, &[]);
     let ctx = DescriptionContext {
-        local_tools: None,
         filter: &filter,
         audience: ToolAudience::MAIN,
         workflow: false,
         mcp: false,
     };
-    let defs = reg.definitions(&Vars::new(), &ctx, false);
+    let defs = reg.definitions(&Vars::new(), &ctx, None, false);
     let def = defs
         .as_array()
         .expect("definitions returns an array")

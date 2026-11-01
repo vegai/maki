@@ -40,11 +40,17 @@ local function checkout_state(call, artifact, changes, keep_on_cancel)
   local timeout_ms = import_scripts.import_timeout(changes) * jobs.MS_PER_SEC
   local git_env = git_utils.snapshot_git_env({}, artifact.git, project)
   local state, files, executable = {}, {}, {}
-  for _, change in ipairs(changes) do
-    local meta, meta_err = native.checkout_file(maki.fs.joinpath(project, change.path))
-    if meta_err then
-      return nil, meta_err
-    elseif meta == nil then
+  local paths = {}
+  for i, change in ipairs(changes) do
+    paths[i] = maki.fs.joinpath(project, change.path)
+  end
+  local metadata, meta_err = native.checkout_files(paths)
+  if not metadata then
+    return nil, meta_err
+  end
+  for i, change in ipairs(changes) do
+    local meta = metadata[i]
+    if not meta then
       state[change.path] = false
     elseif meta.regular then
       files[#files + 1] = change.path

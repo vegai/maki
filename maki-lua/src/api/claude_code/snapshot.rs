@@ -11,13 +11,14 @@ use maki_storage::permissions::PERMISSION_BITS;
 use maki_storage::id::MakiId;
 use rustix::fd::{AsFd, BorrowedFd};
 use rustix::fs::{
-    AtFlags, Dir, FileType, Mode, OFlags, Stat, open, openat, renameat, statat, unlinkat,
+    AtFlags, Dir, FileType, Mode, ResolveFlags, Stat, open, openat, openat2, renameat, statat,
+    unlinkat,
 };
 use rustix::io::Errno;
 use rustix::path::Arg;
 
-use super::native::DIRECTORY_FLAGS;
-use maki_providers::claude_code::worker::GIT_ENTRY;
+use super::{DIRECTORY_FLAGS, create_private, open_regular};
+use maki_providers::claude_code::worker::{GIT_ENTRY, GITDIR_PREFIX};
 
 const MAX_DEPTH: usize = 64;
 const BASE_RESOLUTION_STEPS: usize = 64 * 1024;
@@ -107,23 +108,13 @@ fn resolve_links(root: &Path, path: &Path, remaining: &mut usize) -> io::Result<
 }
 
 fn private_copy(parent: &impl AsFd, name: impl Arg + Copy) -> io::Result<()> {
-    let mut source = File::from(openat(
-        parent,
-        name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?);
+    let mut source = open_regular(parent, name)?;
     let metadata = source.metadata()?;
     if !metadata.is_file() || metadata.nlink() <= 1 {
         return Ok(());
     }
     let temporary = format!("{PRIVATE_COPY_PREFIX}{}", MakiId::generate());
-    let mut copy = File::from(openat(
-        parent,
-        temporary.as_str(),
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR,
-    )?);
+    let mut copy = create_private(parent, temporary.as_str())?;
     let result = (|| {
         io::copy(&mut source, &mut copy)?;
         copy.set_permissions(Permissions::from_mode(metadata.mode() & PERMISSION_BITS))?;
@@ -209,15 +200,10 @@ fn quarantine_entry(
 }
 
 fn restore_pointer(root: &File, quarantine: &Path, git: &Path) -> io::Result<()> {
-    let expected = format!("gitdir: {}\n", git.display());
-    let pointer = openat(
-        root,
-        GIT_ENTRY,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    );
+    let expected = format!("{} {}\n", GITDIR_PREFIX, git.display());
+    let pointer = open_regular(root, GIT_ENTRY);
     if let Ok(pointer) = pointer {
-        let mut pointer = File::from(pointer);
+        let mut pointer = pointer;
         let metadata = pointer.metadata()?;
         if metadata.is_file() && metadata.len() == expected.len() as u64 {
             let mut content = Vec::new();
@@ -233,12 +219,7 @@ fn restore_pointer(root: &File, quarantine: &Path, git: &Path) -> io::Result<()>
     if statat(root, GIT_ENTRY, AtFlags::SYMLINK_NOFOLLOW).is_ok() {
         quarantine_entry(root, GIT_ENTRY, quarantine, 1)?;
     }
-    let mut pointer = File::from(openat(
-        root,
-        GIT_ENTRY,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR,
-    )?);
+    let mut pointer = create_private(root, GIT_ENTRY)?;
     pointer.write_all(expected.as_bytes())
 }
 
@@ -398,15 +379,21 @@ pub fn sanitize_snapshot(
         })
         .collect();
     for path in &relocated.dropped_links {
-        let mut parent = root.try_clone()?;
-        let mut parts = path.components().peekable();
-        while let Some(part) = parts.next() {
-            if parts.peek().is_none() {
-                unlinkat(&parent, part.as_os_str(), AtFlags::empty())?;
-            } else {
-                parent = directory(&parent, part.as_os_str())?;
-            }
-        }
+        let parent = match path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            Some(parent) => File::from(openat2(
+                &root,
+                parent,
+                DIRECTORY_FLAGS,
+                Mode::empty(),
+                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+            )?),
+            None => root.try_clone()?,
+        };
+        let name = path.file_name().ok_or(Errno::INVAL)?;
+        unlinkat(&parent, name, AtFlags::empty())?;
     }
     Ok(relocated)
 }
@@ -414,9 +401,9 @@ pub fn sanitize_snapshot(
 #[cfg(test)]
 mod tests {
     use super::{
-        BASE_RESOLUTION_STEPS, COMMONDIR, CONFIG, DEPTH_EXCEEDED, GIT_ENTRY, HEAD, MAX_DEPTH,
-        MAX_FAILURES, QUARANTINE_ENTRY, Visit, quarantine_entry, resolve_links, sanitize_snapshot,
-        walk,
+        BASE_RESOLUTION_STEPS, COMMONDIR, CONFIG, DEPTH_EXCEEDED, GIT_ENTRY, GITDIR_PREFIX, HEAD,
+        MAX_DEPTH, MAX_FAILURES, QUARANTINE_ENTRY, Visit, quarantine_entry, resolve_links,
+        sanitize_snapshot, walk,
     };
     use rustix::io::Errno;
     use rustix::process::geteuid;
@@ -680,7 +667,7 @@ mod tests {
         let git = dir.path().join("repository");
         let outside = dir.path().join(GIT_ENTRY);
         fs::create_dir(&snapshot).unwrap();
-        let expected = format!("gitdir: {}\n", git.display());
+        let expected = format!("{} {}\n", GITDIR_PREFIX, git.display());
         fs::write(&outside, &expected).unwrap();
         fs::hard_link(&outside, snapshot.join(GIT_ENTRY)).unwrap();
         sanitize_snapshot(&snapshot, &dir.path().join("quarantine"), &git, true).unwrap();
@@ -735,7 +722,7 @@ mod tests {
         let quarantine = dir.path().join("quarantine");
         let git = dir.path().join("repository");
         fs::create_dir_all(snapshot.join("nested")).unwrap();
-        let pointer = format!("gitdir: {}\n", git.display());
+        let pointer = format!("{} {}\n", GITDIR_PREFIX, git.display());
         fs::write(snapshot.join(GIT_ENTRY), &pointer).unwrap();
         fs::write(snapshot.join("nested").join(name), "untrusted metadata").unwrap();
         assert_eq!(
@@ -765,7 +752,7 @@ mod tests {
         fs::create_dir_all(&snapshot).unwrap();
         fs::create_dir_all(&outside).unwrap();
         let target = outside.join(GIT_ENTRY);
-        let pointer = format!("gitdir: {}\n", git.display());
+        let pointer = format!("{} {}\n", GITDIR_PREFIX, git.display());
         fs::write(&target, &pointer).unwrap();
         symlink(&target, snapshot.join(GIT_ENTRY)).unwrap();
         symlink(&outside, snapshot.join("linked")).unwrap();
@@ -978,7 +965,7 @@ mod tests {
         sanitize_snapshot(&snapshot, &quarantine, &git, true).unwrap();
         assert_eq!(
             fs::read_to_string(snapshot.join(GIT_ENTRY)).unwrap(),
-            format!("gitdir: {}\n", git.display())
+            format!("{} {}\n", GITDIR_PREFIX, git.display())
         );
         let preserved = fs::read_dir(&quarantine)
             .unwrap()

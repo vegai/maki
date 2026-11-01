@@ -74,6 +74,7 @@ impl Listing {
         if batch.models.is_empty()
             && let Some(provider) = batch.failed_provider
         {
+            // Keep configured but unavailable providers usable offline, including across cache writes.
             self.live.extend(
                 self.replayed
                     .extract_if(.., |spec| provider_of(spec) == provider),

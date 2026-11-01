@@ -11,9 +11,14 @@ use std::env;
 use std::ffi::OsStr;
 #[cfg(windows)]
 use std::ffi::OsString;
+use std::future::Future;
 use std::path::{Path, PathBuf, absolute};
 #[cfg(windows)]
 use std::process::{Command, Stdio};
+use std::time::Instant;
+
+use futures_lite::future;
+use smol::Timer;
 
 #[cfg(unix)]
 use rustix::fs::{Access, access};
@@ -26,6 +31,14 @@ const PATH: &str = "PATH";
 #[cfg(windows)]
 const PATHEXT: &str = "PATHEXT";
 const PATHEXT_SEPARATOR: char = ';';
+
+pub(crate) async fn within<T>(deadline: Instant, work: impl Future<Output = T>) -> Option<T> {
+    future::or(async { Some(work.await) }, async {
+        Timer::at(deadline).await;
+        None
+    })
+    .await
+}
 
 /// Returns the absolute path `name` runs as from `cwd`, using maki's `$PATH`
 /// (and `$PATHEXT` on Windows).
