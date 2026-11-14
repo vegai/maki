@@ -3827,6 +3827,7 @@ dependencies = [
  "tree-sitter-vlang",
  "tree-sitter-yaml",
  "tree-sitter-zig",
+ "unicode-general-category",
  "unicode-width",
  "url",
 ]

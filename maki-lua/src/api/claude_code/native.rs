@@ -9,7 +9,6 @@ use std::ops::RangeInclusive;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::str::from_utf8;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,6 +24,7 @@ use mlua::{
 use rustix::io::Errno;
 use serde_json::Value;
 use tokio::task::spawn_blocking;
+use unicode_general_category::{GeneralCategory, get_general_category};
 
 use crate::api::fs::path_text;
 use crate::api::util::convert::{TableExt, json_to_lua};
@@ -43,6 +43,15 @@ const VARIATION_SELECTORS: &[RangeInclusive<u32>] = &[
     0xfe00..=0xfe0f,
     0xe0100..=0xe01ef,
 ];
+/// Characters that draw nothing although their category usually draws: the
+/// combining grapheme joiner, Khmer inherent vowels and the Hangul fillers.
+const BLANK_CHARACTERS: &[RangeInclusive<u32>] = &[
+    0x034f..=0x034f,
+    0x115f..=0x1160,
+    0x17b4..=0x17b5,
+    0x3164..=0x3164,
+    0xffa0..=0xffa0,
+];
 
 pub(super) fn create_table(lua: &Lua, perms: &PluginPermissions) -> LuaResult<Table> {
     let table = create_claude_code_table(lua, perms)?;
@@ -52,13 +61,23 @@ pub(super) fn create_table(lua: &Lua, perms: &PluginPermissions) -> LuaResult<Ta
 
 fn is_printable(character: char) -> bool {
     if character.is_ascii() {
-        !character.is_control()
-    } else {
-        let mut buffer = [0; MAX_UTF8_BYTES + 1];
-        buffer[0] = b'a';
-        let length = character.encode_utf8(&mut buffer[1..]).len() + 1;
-        from_utf8(&buffer[..length]).is_ok_and(|text| text.escape_debug().count() == 2)
+        return !character.is_control();
     }
+    let code = u32::from(character);
+    !matches!(
+        get_general_category(character),
+        GeneralCategory::Control
+            | GeneralCategory::Format
+            | GeneralCategory::Surrogate
+            | GeneralCategory::PrivateUse
+            | GeneralCategory::Unassigned
+            | GeneralCategory::LineSeparator
+            | GeneralCategory::ParagraphSeparator
+            | GeneralCategory::SpaceSeparator
+    ) && !BLANK_CHARACTERS
+        .iter()
+        .chain(VARIATION_SELECTORS)
+        .any(|range| range.contains(&code))
 }
 
 fn escape_bytes(escaped: &mut String, bytes: &[u8], shell: bool) -> fmt::Result {
@@ -779,6 +798,9 @@ mod tests {
     #[test_case('\u{202e}', false ; "bidi_override")]
     #[test_case('\u{2028}', false ; "line_separator")]
     #[test_case('\u{80}', false ; "control")]
+    #[test_case('\u{a0}', false ; "no_break_space")]
+    #[test_case('\u{34f}', false ; "combining_grapheme_joiner")]
+    #[test_case('\u{3164}', false ; "hangul_filler")]
     fn printability_identifies_standalone_visible_characters(character: char, expected: bool) {
         assert_eq!(is_printable(character), expected);
     }
