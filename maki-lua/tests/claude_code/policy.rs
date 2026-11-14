@@ -194,7 +194,7 @@ echo $$ >> "$dir/pids"
 if [ "$1" = --version ]; then
   echo version >> "$dir/calls"
   pwd -P >> "$dir/version_started_in"
-  if [ -e "$dir/@STALL_VERSION@" ]; then touch "$dir/version_stalled"; secs=$(cat "$dir/@STALL_VERSION@"); sleep "$secs"; fi
+  if [ -e "$dir/@STALL_VERSION@" ]; then secs=$(cat "$dir/@STALL_VERSION@"); touch "$dir/version_stalled"; sleep "$secs"; fi
   cat "$dir/version"; exit 0
 fi
 echo start >> "$dir/calls"
