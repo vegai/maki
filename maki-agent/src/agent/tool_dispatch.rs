@@ -1381,20 +1381,13 @@ async fn execute_mcp_tool(mcp: &McpSession, tool: Arc<str>, call: Call<'_>) -> T
 /// Deduplicates doom-loop repeats, then runs remaining calls in parallel.
 /// `true` when one of them moved to the background.
 pub(super) async fn process_tool_calls(
-    response: maki_providers::StreamResponse,
+    tool_uses: Vec<(String, String, Value)>,
     recent_calls: &mut RecentCalls,
     history: &mut super::history::History,
     event_tx: &crate::EventSender,
     ctx: &ToolContext,
+    deny: Option<&str>,
 ) -> Result<bool, AgentError> {
-    let tool_uses: Vec<(String, String, Value)> = response
-        .message
-        .tool_uses()
-        .map(|(id, name, input)| (id.to_owned(), name.to_owned(), input.clone()))
-        .collect();
-
-    history.push(response.message);
-
     let mut immediate_errors: Vec<ToolDoneEvent> = Vec::new();
     let mut runnable: Vec<(String, String, Value)> = Vec::new();
 
@@ -1405,7 +1398,9 @@ pub(super) async fn process_tool_calls(
             input_preview = %crate::tools::schema::preview(&input.to_string()),
             "parsing tool call"
         );
-        if recent_calls.is_doom_loop(&name, &input) {
+        if let Some(reason) = deny {
+            immediate_errors.push(ToolDoneEvent::error(id.clone(), reason));
+        } else if recent_calls.is_doom_loop(&name, &input) {
             warn!(tool = %name, "doom loop detected, skipping execution");
             immediate_errors.push(ToolDoneEvent::error(id.clone(), DOOM_LOOP_MESSAGE));
         } else {
@@ -3931,11 +3926,16 @@ mod tests {
         )]));
 
         process_tool_calls(
-            probe_turn(ids),
+            probe_turn(ids)
+                .message
+                .tool_uses()
+                .map(|(id, name, input)| (id.to_owned(), name.to_owned(), input.clone()))
+                .collect(),
             &mut RecentCalls::new(),
             &mut History::new(Vec::new()),
             &event_tx,
             &ctx,
+            None,
         )
         .await
         .unwrap();
@@ -3989,11 +3989,16 @@ mod tests {
         let mut history = History::new(Vec::new());
 
         process_tool_calls(
-            probe_turn(&[SLOW_ID, PANICKING_ID, FAST_ID]),
+            probe_turn(&[SLOW_ID, PANICKING_ID, FAST_ID])
+                .message
+                .tool_uses()
+                .map(|(id, name, input)| (id.to_owned(), name.to_owned(), input.clone()))
+                .collect(),
             &mut RecentCalls::new(),
             &mut history,
             &event_tx,
             &ctx,
+            None,
         )
         .await
         .unwrap();

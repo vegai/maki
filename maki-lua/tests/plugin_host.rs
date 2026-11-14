@@ -9005,15 +9005,21 @@ fn tool_result_text(request: &[Message]) -> &str {
 /// Plan mode used to reach background sessions as is. The plan prompt landed in
 /// a monitor's history, and the plan file was the one file it could write
 /// without asking. We aim at the plan file because that was the hole.
-#[test]
-fn background_session_never_plans_and_cannot_write_while_the_chat_does() {
+#[test_case(false ; "ordinary_parent")]
+#[test_case(true ; "capped_parent_does_not_cap_child")]
+fn background_session_never_plans_and_cannot_write_while_the_chat_does(capped: bool) {
     let dir = tempfile::TempDir::new().unwrap();
     let plan = dir.path().join(PLAN_FILE);
     let reg = Arc::clone(ToolRegistry::global_arc());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let session = MakiId::generate();
     let mailbox = SessionMailbox::register(session);
-    let seed = mailbox.publish_seed(stub_seed(session));
+    let mut seed = stub_seed(session);
+    if capped {
+        seed.config.max_turns = Some(1);
+        seed.config.final_answer = true;
+    }
+    let seed = mailbox.publish_seed(seed);
     let requests = CallOnce::install(
         &seed,
         SCRIBBLE_TOOL,

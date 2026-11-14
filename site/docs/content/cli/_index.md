@@ -21,6 +21,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | Flag | TUI | `--print` | SDK (`stream-json`) |
 |------|-----|-----------|---------------------|
 | `-m` / `--model` | yes | yes | yes |
+| `--thinking` / `--effort`, `--max-thinking-tokens` | yes | yes | yes |
 | `--yolo` | yes | yes | yes (or `--permission-mode bypassPermissions`) |
 | `--no-plugins` / `--no-commands` / `--no-jit` | yes | yes | yes |
 | `--allowed-tools` / `--disallowed-tools` | yes | yes | yes |
@@ -31,11 +32,12 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--verbose`, `--output-format` | no | yes | stream only |
 | `--system-prompt`, `--append-system-prompt` | yes | yes | yes |
 | `--session-id`, `--fork-session` | yes | yes | yes |
-| `--max-turns` | error | yes | yes |
+| `--max-turns`, `--final-answer` | error | yes | yes |
+| `--dry-run` | error | yes | error |
 | `--permission-mode` | error | error | yes |
 | `--include-partial-messages` | no | no | yes |
 
-`no` means the flag is ignored. `error` means Maki exits before the run starts. Subcommands reject `--image`, `--max-turns`, `--permission-mode` and the system prompt flags, except that [`maki acp`](#maki-acp) and [`maki prompt`](#maki-prompt) take the system prompt flags.
+`no` means the flag is ignored. `error` means Maki exits before the run starts. Subcommands reject `--image`, `--max-turns`, `--final-answer`, `--dry-run`, `--permission-mode`, the thinking flags and the system prompt flags. [`maki acp`](#maki-acp) takes the thinking and system prompt flags, and [`maki prompt`](#maki-prompt) takes the system prompt flags.
 
 ### Shared flags (detail)
 
@@ -44,6 +46,9 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `-p`, `--print` | Non-interactive run. See [Headless Mode](/docs/headless/) |
 | `--image <PATH>` | Attach an image in `--print` mode (repeatable). Paths must be png, jpeg, gif, or webp |
 | `-m`, `--model <SPEC>` | Model as `provider/model-id`. Fallback: last used (skipped with a warning when its provider is gone or has no key) → `provider.default_model` in config → auto-detect from available providers |
+| `--thinking <SETTING>` | Thinking for this launch: `off`, `adaptive`, `minimal` through `max`, or a positive token budget. Accepts SDK spellings `disabled` and `enabled`. Overrides `always_thinking` and the saved `/thinking` level |
+| `--effort <LEVEL>` | Thinking effort for this launch: `minimal` through `max`. See [precedence](/docs/headless/#thinking) when combined with other thinking flags |
+| `--max-thinking-tokens <N>` | Thinking-token budget for this launch. `0` disables thinking. Takes precedence over effort unless thinking is explicitly disabled |
 | `--verbose` | Full turn-by-turn messages in `--print` output |
 | `-c`, `--continue` | Resume the most recent session in this directory |
 | `-r`, `--resume <ID>` | Resume a specific session (aliases: `-s`, `--session`) |
@@ -60,17 +65,31 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--disallowed-tools <LIST>` | Comma-separated deny list |
 | `--session-id <ID>` | Write this run under a chosen id. Errors if a session already exists under it, unless `-r` / `-c` is continuing that same session |
 | `--fork-session` | Copy the resumed session's history under a new id, leaving the original untouched. See [Sessions](/docs/headless/#sessions) |
-| `--max-turns <N>` | Cap agent turns (`--print` and SDK) |
+| `--max-turns <N>` | Cap model turns in `--print` and SDK mode. See [bounded runs](/docs/headless/#bounded-runs-and-recovery) |
+| `--final-answer` | Ask for a final report on the last allowed turn and prevent further tool execution. Requires `--max-turns` |
+| `--dry-run` | With `-p`, print effective startup metadata without inference. Conflicts with `--input-format` |
 | `--system-prompt <TEXT>` | Replace the main agent's whole system prompt, so project instructions are dropped too. Subagents keep their own |
 | `--append-system-prompt <TEXT>` | Add text to the end of the main agent's system prompt. Subagents do not get it, so put text they need in `AGENTS.local.md` |
 | `--permission-mode <MODE>` | SDK: `default`, `acceptEdits`, `plan`, or `bypassPermissions` |
 | `--include-partial-messages` | Stream partial deltas in SDK mode |
 
+Thinking flags applied when resuming a TUI session are saved in that session. A later resume without a flag keeps the level. The global `/thinking` default is unchanged.
+
 Pass the system prompt flags again when you resume a session. Other text, or none, rebuilds the prompt and [starts the cache over](/docs/context/#one-prompt-per-session).
 
 ### Tool name lists
 
-`--allowed-tools` / `--disallowed-tools` accept Claude Code PascalCase (`Read,Edit,Bash`) or snake_case (`read,edit,bash`). Maki lowercases PascalCase to snake_case and checks the result against the built-in tool names, so `CodeExecution` works but `MultiEdit` errors: it normalizes to `multi_edit`, and the tool is called `multiedit`. Write `multiedit` or `edit_lines` as-is. Unknown names in `--allowed-tools` error out with the list of valid names. `--disallowed-tools` skips them. The edit plugin's sub-tools (`multiedit`, `edit_lines`, `insert_lines`) are valid names here even when disabled. Listing a disabled tool has no effect until you enable it in config.
+`--allowed-tools` / `--disallowed-tools` accept built-in, plugin and MCP tool names. Claude Code names map to maki names (`WebFetch` becomes `webfetch`, and `MultiEdit` becomes `multiedit`). Other PascalCase names become snake_case (`CodeExecution` becomes `code_execution`). Names with underscores, dots or hyphens keep their spelling and case. Use the exact name for plugin sub-tools such as `edit_lines`.
+
+Both flags reject argument patterns such as `Bash(git log:*)`. Use tool names here and configure argument rules in [permissions](/docs/permissions/).
+
+MCP names accept `server.tool`, `server__tool` and Claude Code's `mcp__server__tool` spelling. Use the dotted form for a server named `mcp` when its tool name contains `__`.
+
+Maki retains qualified MCP names even if their tools have not loaded yet. An allow list that matches no loaded tool and contains no qualified MCP name stops startup with an error. This lets a filter apply to an MCP tool that connects later. After plugins load, Maki warns about other unmatched names. Check the spelling if the tool should already be loaded. A name that never loads has no effect. Filters control both the advertised tools and dispatch, including calls through `batch`, `code_execution` and `maki.agent.call_tool`.
+
+Allow lists apply to built-in, plugin and MCP tools. Session-local tools, such as a task's `structured_output` and ACP client tools, remain available under an allow list. Deny lists and audience limits still apply to these local tools.
+
+For example, `--allowed-tools read,grep` excludes every MCP tool. Add each required MCP name, such as `github.search_code` or `github__search_code`. Include `tool_search` to keep MCP deferral active. Excluding `tool_search` loads the permitted MCP tools directly at the start of a frame. With native deferral, tools from servers that connect later become available in the next frame. Maki logs a warning about these tools when they arrive.
 
 ### Permission modes (SDK)
 
@@ -201,11 +220,12 @@ Uses the same install locations as the install scripts.
 maki acp
 maki acp -m anthropic/claude-sonnet-4-6
 maki acp --yolo
+maki acp --thinking xhigh
 maki --no-jit acp
 maki --append-system-prompt "..." acp
 ```
 
-Starts an [ACP](/docs/acp/) server on stdio for editors like Zed. Subcommand flags are only `-m` / `--model` and `--yolo`. Global flags like `--no-jit` must come before the subcommand.
+Starts an [ACP](/docs/acp/) server on stdio for editors like Zed. Subcommand flags are `-m` / `--model` and `--yolo`. Thinking flags work before or after `acp`. Other global flags like `--no-jit` must come before the subcommand.
 
 ### `maki index`
 

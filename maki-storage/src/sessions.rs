@@ -2030,7 +2030,7 @@ where
 
     /// Adopting a producer's snapshot inherits its run token, so the log's
     /// cursors survive exactly when the snapshot was an append.
-    fn set_history(&mut self, snapshot: &HistorySnapshot<M>) {
+    pub fn set_history(&mut self, snapshot: &HistorySnapshot<M>) {
         // Only compaction replaces a producer's history with a shorter one.
         if snapshot.messages.len() < self.messages.len() {
             self.sealed_by = SealedBy::Compaction;
