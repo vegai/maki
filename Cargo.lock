@@ -3607,6 +3607,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-width",
  "uuid",
+ "wait-timeout",
 ]
 
 [[package]]
@@ -3826,6 +3827,7 @@ dependencies = [
  "tree-sitter-vlang",
  "tree-sitter-yaml",
  "tree-sitter-zig",
+ "unicode-general-category",
  "unicode-width",
  "url",
 ]
