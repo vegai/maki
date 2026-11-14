@@ -106,14 +106,19 @@ impl TaskParent {
 pub(crate) enum TaskStatus {
     Working,
     Idle,
+    Queued,
     Done,
     Error,
     Cancelled,
 }
 
 impl TaskStatus {
+    pub(super) fn is_running(self) -> bool {
+        matches!(self, Self::Working | Self::Queued)
+    }
+
     fn is_live(self) -> bool {
-        matches!(self, Self::Working | Self::Idle)
+        self.is_running() || self == Self::Idle
     }
 }
 
@@ -399,7 +404,7 @@ impl App {
                 TaskStatus::Done => Some(BackgroundOutcome::Done),
                 TaskStatus::Error => Some(BackgroundOutcome::Error),
                 TaskStatus::Cancelled => Some(BackgroundOutcome::Cancelled),
-                TaskStatus::Working | TaskStatus::Idle => None,
+                TaskStatus::Working | TaskStatus::Idle | TaskStatus::Queued => None,
             };
         } else if let Some(mut row) = self.chats[origin].tool_message(&done.id) {
             row.movable = false;
@@ -629,9 +634,7 @@ impl App {
     /// tool tasks a turn owns. Counted the way `/tasks` lists them.
     pub(crate) fn running_background_tasks(&self) -> impl Iterator<Item = &Chat> {
         self.chats.iter().filter(|chat| {
-            chat.plugin.is_some()
-                && chat.task_status() == TaskStatus::Working
-                && !self.is_wrapper(chat)
+            chat.plugin.is_some() && chat.task_status().is_running() && !self.is_wrapper(chat)
         })
     }
 
@@ -662,7 +665,7 @@ impl App {
         let Some(id) = chat.task_id() else {
             return false;
         };
-        let working = |task: &Chat| task.task_status() == TaskStatus::Working;
+        let working = |task: &Chat| task.task_status().is_running();
         let mut children = self
             .chats
             .iter()
@@ -1291,6 +1294,22 @@ mod tests {
         (app, body, part_task_id(MOVED_ID, PART_KEY))
     }
 
+    #[test]
+    fn queued_background_work_counts_as_running() {
+        let (mut app, _) = app_with_moved_call();
+        let idx = app.chat_of_task(MOVED_ID).unwrap();
+        app.chats[idx].handle_event(
+            AgentEvent::ProviderWaiting {
+                message: Some(MOVED_ID.into()),
+            },
+            None,
+        );
+        app.active_chat = idx;
+        assert_eq!(app.chats[idx].task_status(), TaskStatus::Queued);
+        assert!(app.active_chat_working());
+        assert_eq!(app.running_background_tasks().count(), 1);
+    }
+
     fn part_status(app: &App, part: &str) -> Option<TaskStatus> {
         let idx = app.chat_of_task(part).ok()?;
         Some(app.chats[idx].task_status())
@@ -1752,6 +1771,7 @@ mod tests {
     /// diff never sees it finished. Its end is announced all the same, or a
     /// count kept from these events stays up.
     #[test_case(TaskStatus::Working ; "working")]
+    #[test_case(TaskStatus::Queued ; "queued")]
     #[test_case(TaskStatus::Idle    ; "idle")]
     fn diff_announces_a_live_task_whose_tab_went(status: TaskStatus) {
         let mut watch = TaskWatch::default();
@@ -1871,6 +1891,7 @@ mod tests {
     /// A plugin task shows up idle the moment it opens, long before its first
     /// prompt, and has to announce itself just like a working one.
     #[test_case(TaskStatus::Working ; "working")]
+    #[test_case(TaskStatus::Queued ; "queued")]
     #[test_case(TaskStatus::Idle ; "idle")]
     fn diff_announces_a_live_task_on_first_sight(status: TaskStatus) {
         let mut watch = TaskWatch::default();

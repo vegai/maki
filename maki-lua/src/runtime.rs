@@ -307,6 +307,8 @@ fn load_user_source<'a>(lua: &'a Lua, name: &str, source: &'a str) -> Chunk<'a> 
     lua.load(source).set_name(name)
 }
 
+pub(crate) type PrivateApi = fn(&Lua, &PluginPermissions) -> mlua::Result<(&'static str, Table)>;
+
 /// Everything a load needs besides the code itself.
 ///
 /// One value rather than a row of positional arguments: it travels unchanged
@@ -334,6 +336,7 @@ pub struct LoadContext {
     /// [`PluginHost::load_builtins`] leaves this at the answer that grants
     /// nothing.
     pub authority: DeclAuthority,
+    pub(crate) private_api: Option<PrivateApi>,
 }
 
 impl LoadContext {
@@ -348,6 +351,7 @@ impl LoadContext {
             revision_guard: None,
             package: false,
             authority: DeclAuthority::ThirdParty,
+            private_api: None,
         }
     }
 
@@ -363,6 +367,7 @@ impl LoadContext {
             revision_guard: None,
             package: false,
             authority: DeclAuthority::Config,
+            private_api: None,
         }
     }
 }
@@ -571,6 +576,9 @@ pub enum Request {
     },
     CollectPluginOptions {
         reply: SyncSender<PluginOptionSpecs>,
+    },
+    CollectLoadedPlugins {
+        reply: SyncSender<Vec<String>>,
     },
     /// Packages `init.lua` declared. Read after the init files have run, since
     /// that is when the declared set is complete.
@@ -2719,6 +2727,10 @@ pub(crate) fn active_task_cancel(lua: &Lua) -> Option<(u64, CancelToken)> {
     Some((cell.id, cell.cancel.clone()))
 }
 
+pub(crate) fn task_cancel(lua: &Lua) -> CancelToken {
+    active_task_cancel(lua).map_or_else(CancelToken::none, |(_, cancel)| cancel)
+}
+
 pub(crate) fn is_user_action(lua: &Lua) -> bool {
     lua.app_data_ref::<TaskHandle>()
         .is_some_and(|handle| lock_cell(&handle).user_action)
@@ -3427,26 +3439,32 @@ async fn run_work_fn(
 /// the callback still gets its `on_stdout` and `on_exit`.
 ///
 /// The gate guard comes after the sleep: pending timers should pile up
-/// cheaply, but the bodies compete for the `MAX_INFLIGHT_TOOLS` budget so
-/// `for i=1,10000 do maki.defer_fn(f, 0) end` can't run 10k coroutines at
-/// once. Errors are logged and dropped, nobody is awaiting a result.
+/// cheaply, but the bodies compete for `timer_gate`'s `MAX_INFLIGHT_TOOLS`
+/// budget so `for i=1,10000 do maki.defer_fn(f, 0) end` can't run 10k
+/// coroutines at once. That budget is not the tool slots', so tool calls
+/// filling every slot cannot hold up a cancellation timer. Errors are logged
+/// and dropped, nobody is awaiting a result.
 fn spawn_deferred_callback(
     lua: &Lua,
     gate: &Rc<InflightGate>,
+    timer_gate: &Arc<Semaphore>,
     cb: DeferredCallback,
 ) -> LocalJoinHandle<()> {
     let lua = lua.clone();
     let gate = Rc::clone(gate);
+    let timer_gate = Arc::clone(timer_gate);
     spawn_local(async move {
         // Biased, so a stop that lands as the gate opens still wins. Once the
-        // guard is held the drain barrier waits for it, and a `clear_plugin`
+        // hold is taken the drain barrier waits for it, and a `clear_plugin`
         // cannot reach the callback any more.
         let fired = tokio::select! {
             biased;
             () = cb.cancel.cancelled() => None,
             guard = async {
                 sleep(cb.delay).await;
-                gate.acquire().await
+                let hold = DrainHold::new(&gate);
+                let slot = timer_gate.acquire_owned().await.expect(GATE_SLOTS_OPEN);
+                GateGuard::new(&gate, Some(slot), Some(hold))
             } => Some(guard),
         };
         let Some(_guard) = fired else {
@@ -3813,7 +3831,7 @@ impl LuaRuntime {
         let watchdog = Watchdog::spawn(&lua, Arc::clone(&shutdown));
 
         let globals = lua.globals();
-        for name in &["require", "io", "package"] {
+        for name in &["require", "io", "package", "getfenv", "setfenv"] {
             globals
                 .set(*name, LuaValue::Nil)
                 .map_err(|e| PluginError::Lua {
@@ -4133,12 +4151,13 @@ impl LuaRuntime {
         &self,
         maki: mlua::Table,
         require_root: Option<RequireRoot>,
+        private: Option<(&'static str, Table)>,
     ) -> Result<mlua::Table, mlua::Error> {
         let env = self.lua.create_table()?;
         env.set("maki", maki)?;
 
         if require_root.is_some() || !self.bundled.dirs.is_empty() {
-            let require_fn = self.create_require_fn(&env, require_root)?;
+            let require_fn = self.create_require_fn(&env, require_root, private)?;
             env.set("require", require_fn)?;
         }
 
@@ -4155,6 +4174,7 @@ impl LuaRuntime {
         &self,
         env: &mlua::Table,
         require_root: Option<RequireRoot>,
+        private: Option<(&'static str, Table)>,
     ) -> Result<Function, mlua::Error> {
         let loader = Arc::new(ModuleLoader {
             bundled: self.bundled.clone(),
@@ -4165,6 +4185,9 @@ impl LuaRuntime {
             loads: Arc::default(),
         });
 
+        if let Some((module, private)) = private {
+            loader.loaded.set(module, private)?;
+        }
         self.lua.create_async_function(move |lua, modname: String| {
             let loader = Arc::clone(&loader);
             async move { loader.require(&lua, &modname).await }
@@ -4205,6 +4228,7 @@ impl LuaRuntime {
             revision_guard,
             package,
             authority,
+            private_api,
         } = context;
         let map_err = |e: mlua::Error| PluginError::Lua {
             plugin: name.to_string(),
@@ -4255,7 +4279,17 @@ impl LuaRuntime {
             .map_err(map_err)?;
             maki.set("pack", pack).map_err(map_err)?;
         }
-        let env = self.build_env(maki, require_root).map_err(map_err)?;
+        let private = if authority == DeclAuthority::Bundled && !package {
+            private_api
+                .map(|create| create(&self.lua, &permissions))
+                .transpose()
+                .map_err(map_err)?
+        } else {
+            None
+        };
+        let env = self
+            .build_env(maki, require_root, private)
+            .map_err(map_err)?;
         if let Some(mut envs) = self.lua.app_data_mut::<PluginEnvs>() {
             envs.0.insert(Arc::clone(&name), env.to_pointer() as usize);
         }
@@ -5871,6 +5905,7 @@ pub fn spawn(
                 });
             }
             let gate = Rc::new(InflightGate::new(rt.lua.clone()));
+            let timer_gate = Arc::new(Semaphore::new(MAX_INFLIGHT_TOOLS));
             let restores = Rc::new(RestoreTracker::default());
             let (hook_tx, mut hook_rx) = unbounded_channel::<HostHook>();
             {
@@ -5906,7 +5941,7 @@ pub fn spawn(
                         spawn_async_task(&rt.lua, &gate, task);
                     }
                     while let Ok(cb) = defer_rx.try_recv() {
-                        spawn_deferred_callback(&rt.lua, &gate, cb);
+                        spawn_deferred_callback(&rt.lua, &gate, &timer_gate, cb);
                     }
                     // Nothing to serve, so spend the lull on native codegen.
                     // One chunk per pass with a yield in between, so no request
@@ -5934,7 +5969,7 @@ pub fn spawn(
                             Some(None)
                         }
                         Some(cb) = defer_rx.recv() => {
-                            spawn_deferred_callback(&rt.lua, &gate, cb);
+                            spawn_deferred_callback(&rt.lua, &gate, &timer_gate, cb);
                             Some(None)
                         }
                         msg = rx.recv() => msg.map(Some),
@@ -6195,6 +6230,11 @@ pub fn spawn(
                         }
                         Request::CollectPluginOptions { reply } => {
                             let _ = reply.send(collect_plugin_options(&rt.lua));
+                        }
+                        Request::CollectLoadedPlugins { reply } => {
+                            let mut names: Vec<String> = rt.plugins.borrow().keys().map(ToString::to_string).collect();
+                            names.sort_unstable();
+                            let _ = reply.send(names);
                         }
                         Request::CollectPackages { reply } => {
                             let declared = with_packs(&rt.lua, |packs| packs.specs.clone());
@@ -6687,6 +6727,7 @@ mod tests {
                 let timer = spawn_deferred_callback(
                     &lua,
                     &Rc::new(gate()),
+                    &Arc::new(Semaphore::new(MAX_INFLIGHT_TOOLS)),
                     DeferredCallback {
                         func: lua.create_registry_value(true).unwrap(),
                         delay: Duration::from_secs(3600),

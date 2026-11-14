@@ -247,6 +247,26 @@ pub(crate) fn enter_runtime() -> EnterGuard<'static> {
     maki_lua::test_support::runtime().enter()
 }
 
+pub(crate) struct WorkingDir(PathBuf);
+
+impl WorkingDir {
+    pub(crate) fn current() -> Self {
+        Self(env::current_dir().unwrap())
+    }
+
+    pub(crate) fn enter(path: &Path) -> Self {
+        let original = Self::current();
+        env::set_current_dir(path).unwrap();
+        original
+    }
+}
+
+impl Drop for WorkingDir {
+    fn drop(&mut self) {
+        env::set_current_dir(&self.0).unwrap();
+    }
+}
+
 pub(crate) fn test_app() -> App {
     spawned_app(
         tmp_tab(AppSession::new(TEST_MODEL_SPEC, TEST_CWD)),
@@ -5199,22 +5219,23 @@ fn ctrl_r_refreshes_usage_while_modal_open() {
 #[test]
 fn cd_command_behavior() {
     let mut app = test_app();
+    let target = TempDir::new().unwrap();
+    let _cwd = WorkingDir::current();
+    let resolved = maki_storage::paths::canonicalize_clean(target.path());
+    assert_ne!(app.permissions.cwd(), resolved);
     app.execute_command(
         ParsedCommand {
             name: "/cd".into(),
-            args: "/tmp".into(),
+            args: resolved.to_string_lossy().into_owned(),
             bang: false,
         },
         0,
     );
     let flash = app.status_bar.flash_text().unwrap();
-    assert!(flash.starts_with("cd /tmp"), "flash={flash:?}");
-    // Use `canonicalize_clean` (resolves symlinks like the OS does) rather
-    // than `absolute` which preserves symlinks. On macOS `/tmp` is a symlink
-    // to `/private/tmp`; production `cmd_cd` reads back `current_dir()` which
-    // returns the resolved form, so the test expectation must match.
-    let resolved = maki_storage::paths::canonicalize_clean(Path::new("/tmp"));
+    assert_eq!(flash, format!("cd {}", resolved.display()));
     assert_eq!(app.state.session.cwd, resolved.to_string_lossy());
+    assert_eq!(app.permissions.cwd(), resolved);
+    assert_eq!(app.permissions.fork().cwd(), resolved);
 
     app.execute_command(
         ParsedCommand {
@@ -11950,11 +11971,14 @@ fn run_builtin_file_picker_opens_modal() {
 }
 
 #[test]
-fn run_builtin_model_picker_opens_and_refreshes() {
+fn run_builtin_model_picker_opens_cached_models() {
     let mut app = test_app();
     let actions = app.run_builtin(BuiltinAction::ModelPicker);
     assert!(app.model_picker.is_open());
-    assert!(matches!(&actions[..], [Action::RefreshModels]));
+    assert!(matches!(
+        &actions[..],
+        [Action::RefreshModels(ModelListing::Cached)]
+    ));
 }
 
 /// A provider row that cannot serve models hands Enter to its login.
@@ -13329,6 +13353,21 @@ fn a_session_opened_under_a_moved_call_works_once_it_runs() {
     );
 
     assert_eq!(app.chats[tab].task_status(), TaskStatus::Working);
+}
+
+#[test]
+fn model_picker_refresh_requires_an_explicit_key() {
+    let mut app = test_app();
+    app.run_builtin(BuiltinAction::ModelPicker);
+    let actions = app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Char('r'),
+        KeyModifiers::CONTROL,
+    )));
+    assert!(matches!(
+        &actions[..],
+        [Action::RefreshModels(ModelListing::Refresh)]
+    ));
+    assert!(app.model_picker.is_open());
 }
 
 const OWNER_MISMATCH: &str = "the wrong state holds the keyboard";

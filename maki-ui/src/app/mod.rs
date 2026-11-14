@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::OpenSession;
-use crate::app::tasks::{BackgroundMoves, TaskOutcome, TaskStatus, count_phrase};
+use crate::app::tasks::{BackgroundMoves, TaskOutcome, count_phrase};
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
@@ -78,6 +78,7 @@ use maki_lua::{
     WinView, is_reserved,
 };
 use maki_providers::models_cache::ModelList;
+use maki_providers::provider::ModelListing;
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
@@ -774,7 +775,7 @@ impl App {
         if self.is_main_chat() {
             self.status == Status::Streaming
         } else {
-            self.chats[self.active_chat].task_status() == TaskStatus::Working
+            self.chats[self.active_chat].task_status().is_running()
         }
     }
 
@@ -1583,6 +1584,7 @@ impl App {
             }),
             KeyboardOwner::ModelPicker => Some(match self.model_picker.handle_key(key) {
                 ModelPickerAction::Consumed => vec![],
+                ModelPickerAction::Refresh => vec![Action::RefreshModels(ModelListing::Refresh)],
                 ModelPickerAction::Select(spec) => {
                     vec![Action::ChangeModel(spec)]
                 }
@@ -1612,10 +1614,16 @@ impl App {
                 LoginPickerAction::Consumed => vec![],
                 LoginPickerAction::Close => vec![],
                 LoginPickerAction::Authenticated { model_spec } => {
-                    vec![Action::ChangeModel(model_spec), Action::RefreshModels]
+                    vec![
+                        Action::ChangeModel(model_spec),
+                        Action::RefreshModels(ModelListing::Cached),
+                    ]
                 }
                 LoginPickerAction::Configured { slug } => {
-                    vec![Action::RefreshProvider { slug }, Action::RefreshModels]
+                    vec![
+                        Action::RefreshProvider { slug },
+                        Action::RefreshModels(ModelListing::Cached),
+                    ]
                 }
             }),
             KeyboardOwner::McpPicker => Some(match self.mcp_picker.handle_key(key) {
@@ -1789,7 +1797,7 @@ impl App {
             }
             BuiltinAction::ModelPicker => {
                 self.model_picker.open(&self.state.model.spec());
-                return (true, vec![Action::RefreshModels]);
+                return (true, vec![Action::RefreshModels(ModelListing::Cached)]);
             }
             BuiltinAction::InputRaw => {
                 self.input_box.buffer.toggle_raw();

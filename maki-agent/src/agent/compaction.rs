@@ -3,6 +3,7 @@ use std::env;
 use std::time::{Duration, Instant};
 
 use maki_config::AgentConfig;
+use maki_providers::provider::RequestScope;
 use maki_providers::retry::RetryPolicy;
 use maki_providers::{
     ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, Message, Model, RequestOptions, Role,
@@ -227,7 +228,10 @@ pub(super) async fn compact_history(
                 tools: &empty_tools,
                 opts: RequestOptions::default(),
                 output_budget: SUMMARY_OUTPUT_BUDGET,
-                session_id: hooks.session_id,
+                scope: RequestScope {
+                    session_id: hooks.session_id,
+                    cwd: &hooks.cwd,
+                },
                 retry,
             },
             // A stripped, collapsed rewrite of the transcript, far smaller than
@@ -686,9 +690,10 @@ pub(super) fn auto_compact_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use std::iter;
+    use std::path::Path;
     use std::sync::Mutex;
 
-    use maki_providers::provider::{BoxFuture, Provider};
+    use maki_providers::provider::{BoxFuture, ModelListing, Provider, RequestScope};
     use maki_providers::{
         ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
         StreamResponse, TokenUsage,
@@ -703,7 +708,7 @@ mod tests {
     use crate::AgentConfig;
     use crate::agent::hook::testing::script;
     use crate::cancel::CancelToken;
-    use crate::tools::{RequestTools, ToolRegistry};
+    use crate::tools::{LocalTools, RequestTools, ToolAudience, ToolRegistry};
     use maki_config::CompactionBuffer;
 
     #[test]
@@ -766,6 +771,7 @@ mod tests {
     const POST: &str = "Re-read plan.md and agent.md";
     const OVERFLOW_MESSAGE: &str = "prompt is too long";
     const OVERFLOW_STATUS: u16 = 413;
+    const ANY_CWD: &str = "/";
     /// Differs from the session window, so a report that mixes them up shows.
     const SUMMARY_CONTEXT_WINDOW: u32 = 128_000;
     /// Shorter than [`NEW_RESULT`], so the budget-burn case below is the only
@@ -780,7 +786,14 @@ mod tests {
     fn bare_context(model: &Model) -> RunContext {
         RunContext::fixed(
             NO_SYSTEM.into(),
-            RequestTools::assembled(Value::Array(Vec::new()), &AgentConfig::default(), model),
+            RequestTools::assembled(
+                ToolRegistry::global(),
+                Value::Array(Vec::new()),
+                &LocalTools::default(),
+                &AgentConfig::default(),
+                model,
+                ToolAudience::MAIN,
+            ),
         )
     }
 
@@ -809,8 +822,9 @@ mod tests {
             _: &'a Value,
             _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
-            session_id: Option<&'a SessionRef>,
+            scope: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            let session_id = scope.session_id;
             Box::pin(async move {
                 self.requests.lock().unwrap().push(messages.to_vec());
                 self.sessions
@@ -823,7 +837,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
             Box::pin(async { unimplemented!() })
         }
     }
@@ -870,6 +887,7 @@ mod tests {
             model,
             cancel,
             context_size: 0,
+            cwd: Path::new(ANY_CWD).to_owned(),
         }
     }
 

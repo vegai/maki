@@ -3,8 +3,7 @@
 pub mod agent;
 pub mod call_scope;
 pub mod cancel;
-pub mod child_guard;
-pub use child_guard::ChildGuard;
+pub use maki_providers::process::ChildGuard;
 pub mod file_index;
 pub use file_index::{
     FILE_MATCH_CONFIG, FileIndex, FileMatch, FileQuery, FileReader, Ranked, WalkEnd,
@@ -161,9 +160,9 @@ pub struct AgentInput {
 }
 
 impl AgentInput {
-    /// What a host with no toggle UI sends. `-p`, the SDK and ACP know nothing
-    /// about the toggles beyond what config says, so they all build their input
-    /// here and a knob added to [`SessionDefaults`] reaches every one of them.
+    /// What a host with no toggle UI sends. `-p`, the SDK and ACP build their
+    /// input from resolved launch defaults here, so a knob added to
+    /// [`SessionDefaults`] reaches every one of them.
     pub fn from_defaults(
         message: String,
         mode: AgentMode,

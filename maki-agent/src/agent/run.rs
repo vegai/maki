@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::{debug, error, info, warn};
 
-use maki_providers::provider::Provider;
+use maki_providers::provider::{Provider, RequestScope};
 use maki_providers::{
     ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, ImageSource, InputTransformation, Message,
     Model, ModelTier, RequestOptions, Role, StopReason, StreamResponse, model_registry,
@@ -61,6 +61,8 @@ const PARENT_INTERRUPT_NOTE: &str = "Your parent agent or a plugin sent this whi
 /// the user would pay for every turn of it. So `agent.stop` gets this many in
 /// a row, and the count starts over whenever the user speaks.
 const MAX_STOP_CONTINUATIONS: u32 = 3;
+const FINAL_TOOLS_DENIED: &str = "The turn limit was reached. No further tools can run.";
+const FINAL_ANSWER_NOTE: &str = "This is your last allowed turn. Return your final answer now, including partial findings and any remaining work. No more tools can run.";
 const FIELD_TEXT: &str = "text";
 const STOP_FINISHED: &str = "finished";
 const STOP_MAX_TOKENS: &str = "max_tokens";
@@ -524,6 +526,14 @@ impl<'h> Agent<'h> {
             .is_some_and(|max| self.num_turns >= max)
     }
 
+    fn final_answer_turn(&self) -> bool {
+        self.config.final_answer
+            && self
+                .config
+                .max_turns
+                .is_some_and(|max| self.num_turns.saturating_add(1) == max)
+    }
+
     async fn run_loop(&mut self) -> Result<DoneReason, AgentError> {
         loop {
             // Ahead of `try_auto_compact`: a switch landing after the check
@@ -535,7 +545,9 @@ impl<'h> Agent<'h> {
             }
             self.follow_served_window().await?;
             self.try_auto_compact().await?;
-            match self.turn().await? {
+            let outcome = self.turn().await;
+            self.history.checkpoint(self.gauge.size()).await;
+            match outcome? {
                 TurnOutcome::Continue => {}
                 TurnOutcome::Done(reason) => return Ok(reason),
             }
@@ -668,6 +680,21 @@ impl<'h> Agent<'h> {
         if !continues_answer {
             self.tell_changes();
         }
+        if self.final_answer_turn()
+            && !self
+                .history
+                .as_slice()
+                .iter()
+                .rev()
+                .take_while(|message| message.role != Role::Assistant)
+                .any(|message| {
+                    message.display_text.as_deref() == Some("")
+                        && message.first_text_content() == Some(FINAL_ANSWER_NOTE)
+                })
+        {
+            self.history
+                .push(Message::synthetic(FINAL_ANSWER_NOTE.to_owned()));
+        }
         Ok(())
     }
 
@@ -676,6 +703,7 @@ impl<'h> Agent<'h> {
             return Err(AgentError::Cancelled);
         }
         self.prepare_request()?;
+        self.history.checkpoint(self.gauge.size()).await;
         let Some((system, tools)) = self.history.request_prefix() else {
             return Err(no_frame());
         };
@@ -688,7 +716,10 @@ impl<'h> Agent<'h> {
                 tools,
                 opts: self.opts,
                 output_budget: self.config.max_turn_output,
-                session_id: self.session_id.as_ref(),
+                scope: RequestScope {
+                    session_id: self.session_id.as_ref(),
+                    cwd: &self.permissions.cwd(),
+                },
                 retry: self.timeouts.retry,
             },
             Some(self.gauge),
@@ -751,10 +782,15 @@ impl<'h> Agent<'h> {
         self.emit_turn_complete(&response)?;
 
         if has_tools {
+            let deny =
+                (self.config.final_answer && self.turns_exhausted()).then_some(FINAL_TOOLS_DENIED);
             let history_len_before = self.history.len();
-            self.moved_last_round = self.process_tool_calls(response).await?;
+            self.moved_last_round = self.process_tool_calls(response, deny).await?;
             self.gauge
                 .append(&self.history.as_slice()[history_len_before..]);
+            if deny.is_some() {
+                return Ok(TurnOutcome::Done(DoneReason::MaxTurns));
+            }
         } else {
             if response.message.first_text_content().is_some() {
                 self.history.push(response.message);
@@ -827,6 +863,7 @@ impl<'h> Agent<'h> {
             model: &self.model,
             cancel: &self.cancel,
             context_size: self.gauge.size(),
+            cwd: self.permissions.cwd(),
         }
     }
 
@@ -1062,19 +1099,31 @@ impl<'h> Agent<'h> {
 
     /// Fails closed: the filter is the frame's, and without one no tool may
     /// run under some other set. `true` when a call moved to the background.
-    async fn process_tool_calls(&mut self, response: StreamResponse) -> Result<bool, AgentError> {
+    async fn process_tool_calls(
+        &mut self,
+        response: StreamResponse,
+        deny: Option<&str>,
+    ) -> Result<bool, AgentError> {
         let filter = self
             .history
             .live_frame()
             .map(|live| Arc::clone(live.tools.filter()))
             .ok_or_else(no_frame)?;
         let ctx = self.tool_context(filter);
+        let tool_uses = response
+            .message
+            .tool_uses()
+            .map(|(id, name, input)| (id.to_owned(), name.to_owned(), input.clone()))
+            .collect();
+        self.history.push(response.message);
+        self.history.checkpoint(self.gauge.size()).await;
         tool_dispatch::process_tool_calls(
-            response,
+            tool_uses,
             &mut self.recent_calls,
             self.history,
             &self.event_tx,
             &ctx,
+            deny,
         )
         .await
     }
@@ -1168,6 +1217,7 @@ impl<'h> Agent<'h> {
             model: &self.model,
             cancel: &self.cancel,
             context_size: context_size_before,
+            cwd: self.permissions.cwd(),
         };
         let Compacted {
             summary,
@@ -1355,14 +1405,14 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
-    use std::collections::{BTreeMap, VecDeque};
+    use std::collections::{BTreeMap, HashMap, VecDeque};
     use std::iter;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
     use maki_providers::model::FastSupport;
-    use maki_providers::provider::{BoxFuture, Provider};
+    use maki_providers::provider::{BoxFuture, ModelListing, Provider, RequestScope};
     use maki_providers::test_support::isolated_home;
     use maki_providers::{
         ContentBlock, FastPricing, Message, Model, ModelPricing, ProviderEvent, RequestOptions,
@@ -1391,7 +1441,7 @@ mod tests {
     use crate::tools::RequestTools;
     use crate::tools::{
         DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, MovedCall, ParseError, Tool,
-        ToolExecResult, ToolInvocation, ToolRegistry, ToolSource,
+        ToolExecResult, ToolInvocation, ToolRegistry, ToolSource, local_tool,
     };
     use crate::{EarlierInput, Envelope, ToolOutput};
 
@@ -1412,6 +1462,7 @@ mod tests {
     const DEFAULT_IDENTITY_PREFIX: &str = "You are Maki, an interactive CLI coding agent.";
     const ONE_GAUGE_MSG: &str =
         "TurnComplete, Done, and the compaction trigger must read one context gauge";
+    const FINAL_CONTEXT_INPUT: u32 = 1_000;
     const NOTICE_BODY: &str = "Background task find auth finished:\n\nok";
     const NOTICE_LINE: &str = "Background agent finished: find auth";
 
@@ -1498,7 +1549,7 @@ mod tests {
             tools: &'a Value,
             _: &'a UnboundedSender<ProviderEvent>,
             opts: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _scope: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 self.requests.lock().unwrap().push(CapturedRequest {
@@ -1517,7 +1568,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
             Box::pin(async { unimplemented!() })
         }
 
@@ -1544,7 +1598,7 @@ mod tests {
             _: &'a Value,
             ptx: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _scope: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 if let Some(text) = self.delta {
@@ -1561,7 +1615,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
             Box::pin(async { unimplemented!() })
         }
     }
@@ -2452,6 +2509,131 @@ mod tests {
         assert_eq!(slot.unwrap().load().model.context_window, served);
     }
 
+    #[test_case(false ; "model_answers")]
+    #[test_case(true ; "model_still_calls_a_tool")]
+    #[tokio::test]
+    async fn final_answer_turn_preserves_the_prefix_and_executes_no_tools(calls_tool: bool) {
+        let mut final_response = if calls_tool {
+            tool_call_response("glob", "last")
+        } else {
+            text_response(StopReason::EndTurn)
+        };
+        final_response.usage.input = u64::from(FINAL_CONTEXT_INPUT);
+        let mut history = History::new(Vec::new());
+        let provider = MockProvider::new(vec![tool_call_response("glob", "first"), final_response]);
+        let requests = Arc::clone(&provider.requests);
+        let (mut agent, mut events) = make_agent(provider, &mut history);
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&executed);
+        agent.local_tools = Arc::new(HashMap::from([(
+            "glob".into(),
+            local_tool(ToolAudience::MAIN, move |_, ctx| {
+                recorded.lock().unwrap().push(ctx.tool_use_id.unwrap());
+                Box::pin(async { Ok(String::new()) })
+            }),
+        )]));
+        agent.config.max_turns = Some(2);
+        agent.config.final_answer = true;
+        let reason = agent.run(default_input()).await.unwrap();
+        if calls_tool {
+            let mut expected = ContextGauge::restored(FINAL_CONTEXT_INPUT);
+            expected.append(&agent.history.as_slice()[agent.history.len() - 2..]);
+            assert_eq!(agent.gauge.size(), expected.size());
+        }
+        assert_eq!(
+            reason,
+            if calls_tool {
+                DoneReason::MaxTurns
+            } else {
+                DoneReason::EndTurn
+            }
+        );
+        drop(agent);
+        assert_eq!(*executed.lock().unwrap(), ["first"]);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_append_only(&requests[0], &requests[1]);
+        let events = drain_events(&mut events);
+        if calls_tool {
+            let last = history.as_slice().last().unwrap();
+            assert!(matches!(
+                last.content.as_slice(),
+                [ContentBlock::ToolResult { tool_use_id, content, is_error: true, .. }]
+                    if tool_use_id == "last" && content == FINAL_TOOLS_DENIED
+            ));
+            assert!(has_event(&events, |event| matches!(
+                event,
+                AgentEvent::ToolDone(done)
+                    if done.id == "last" && done.is_error && done.output.as_text() == FINAL_TOOLS_DENIED
+            )));
+            assert!(has_event(&events, |event| matches!(
+                event,
+                AgentEvent::ToolResultsSubmitted { message } if message.content == last.content
+            )));
+        }
+        assert!(
+            !events.iter().any(
+                |event| matches!(&event.event, AgentEvent::ToolStart(call) if call.id == "last")
+            )
+        );
+        assert!(
+            history
+                .as_slice()
+                .iter()
+                .any(|message| message.first_text_content() == Some(FINAL_ANSWER_NOTE))
+        );
+    }
+
+    #[tokio::test]
+    async fn user_text_matching_the_final_answer_note_still_gets_the_note() {
+        let mut history = History::new(Vec::new());
+        let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+        let (mut agent, _events) = make_agent(provider, &mut history);
+        agent.config.max_turns = Some(1);
+        agent.config.final_answer = true;
+        let input = AgentInput {
+            message: FINAL_ANSWER_NOTE.into(),
+            ..default_input()
+        };
+        assert_eq!(agent.run(input).await.unwrap(), DoneReason::EndTurn);
+        drop(agent);
+        let notes: Vec<_> = history
+            .as_slice()
+            .iter()
+            .filter(|message| message.first_text_content() == Some(FINAL_ANSWER_NOTE))
+            .map(|message| message.display_text.as_deref())
+            .collect();
+        assert_eq!(notes, [None, Some("")]);
+    }
+
+    #[test_case(false ; "preparation_retried")]
+    #[test_case(true ; "facts_change_during_retry")]
+    fn final_answer_note_survives_context_updates_without_duplication(change_again: bool) {
+        let mut history = History::new(Vec::new());
+        let world = World::default();
+        let (mut agent, _) = make_agent(MockProvider::new(Vec::new()), &mut history);
+        agent.context = world.builder();
+        agent.config.max_turns = Some(1);
+        agent.config.final_answer = true;
+        agent.prepare_request().unwrap();
+        agent.prompt_facts.as_mut().unwrap().date = NEXT_DATE.into();
+        agent.prepare_request().unwrap();
+        if change_again {
+            agent.prompt_facts.as_mut().unwrap().cwd = HERE_CWD.into();
+            agent.prepare_request().unwrap();
+        }
+        assert_eq!(
+            agent
+                .history
+                .as_slice()
+                .iter()
+                .filter(|message| message.first_text_content() == Some(FINAL_ANSWER_NOTE))
+                .count(),
+            1
+        );
+        assert!(!updates(agent.history).is_empty());
+    }
+
     fn small_context_model(context_window: u32, max_output_tokens: u32) -> Model {
         let mut model = default_model();
         model.context_window = context_window;
@@ -2682,9 +2864,12 @@ mod tests {
             RunContext {
                 system: "system".into(),
                 tools: RequestTools::assembled(
+                    ToolRegistry::global(),
                     serde_json::json!([{ "name": tool }]),
+                    &LocalTools::default(),
                     &AgentConfig::default(),
                     model,
+                    ToolAudience::MAIN,
                 ),
                 facts: Some(PromptFacts {
                     model: model.spec(),
@@ -2747,9 +2932,12 @@ mod tests {
                 RunContext {
                     system: format!("system {facts:?}"),
                     tools: RequestTools::assembled(
+                        ToolRegistry::global(),
                         serde_json::json!([{ "name": *world.tool.lock().unwrap() }]),
+                        &LocalTools::default(),
                         &AgentConfig::default(),
                         model,
+                        ToolAudience::MAIN,
                     ),
                     facts: (!world.host_written.load(Ordering::Relaxed)).then_some(facts),
                     authored: world.authored.lock().unwrap().to_string(),
@@ -3461,7 +3649,7 @@ mod tests {
         let mut history = History::new(Vec::new());
         let (mut agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
         let err = agent
-            .process_tool_calls(tool_call_response("glob", "t1"))
+            .process_tool_calls(tool_call_response("glob", "t1"), None)
             .await
             .unwrap_err();
         assert!(matches!(err, AgentError::Config { message } if message == NO_FRAME));
@@ -3775,7 +3963,7 @@ mod tests {
             _: &'a Value,
             _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _scope: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
                 match self
@@ -3788,7 +3976,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
             Box::pin(async { unimplemented!() })
         }
     }
@@ -3828,19 +4019,36 @@ mod tests {
     /// Fails while a request still carries thinking, or always.
     struct UnboundThinkingProvider {
         always: bool,
+        requests: Arc<Mutex<Vec<CapturedRequest>>>,
     }
 
     impl Provider for UnboundThinkingProvider {
         fn stream_message<'a>(
             &'a self,
-            _: &'a Model,
+            model: &'a Model,
             messages: &'a [Message],
-            _: &'a str,
-            _: &'a Value,
+            system: &'a str,
+            tools: &'a Value,
             _: &'a UnboundedSender<ProviderEvent>,
-            _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            opts: RequestOptions,
+            _scope: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            self.requests.lock().unwrap().push(CapturedRequest {
+                model: model.id.clone(),
+                system: system.to_owned(),
+                tools: tools.clone(),
+                // Recovery intentionally removes invalid thinking. Everything else must
+                // remain append-only across the retry.
+                messages: messages
+                    .iter()
+                    .cloned()
+                    .map(|mut message| {
+                        message.content.retain(|block| !block.is_thinking());
+                        serde_json::to_value(message).unwrap()
+                    })
+                    .collect(),
+                opts,
+            });
             let thinking = messages
                 .iter()
                 .flat_map(|m| &m.content)
@@ -3854,15 +4062,19 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
             Box::pin(async { unimplemented!() })
         }
     }
 
-    #[test_case(false, true, UNBOUND_RECOVER_MSG ; "drops_thinking_and_retries")]
-    #[test_case(true, false, UNBOUND_GIVE_UP_MSG ; "nothing_left_to_drop_surfaces_the_error")]
+    #[test_case(false, true, UNBOUND_RECOVER_MSG, false ; "drops_thinking_and_retries")]
+    #[test_case(true, false, UNBOUND_GIVE_UP_MSG, false ; "nothing_left_to_drop_surfaces_the_error")]
+    #[test_case(false, true, UNBOUND_RECOVER_MSG, true ; "final_answer_note_is_not_duplicated_on_retry")]
     #[tokio::test]
-    async fn unbound_thinking_recovery(always: bool, expected: bool, message: &str) {
+    async fn unbound_thinking_recovery(always: bool, expected: bool, message: &str, bounded: bool) {
         let mut history = History::new(vec![Message::user("go".into())]);
         fit_frame(&mut history, fixed_context(), None, &default_model());
         history.push(Message {
@@ -3879,13 +4091,44 @@ mod tests {
             ],
             ..Default::default()
         });
-        let (mut agent, mut event_rx) =
-            make_agent(UnboundThinkingProvider { always }, &mut history);
+        let requests = Arc::default();
+        let (mut agent, mut event_rx) = make_agent(
+            UnboundThinkingProvider {
+                always,
+                requests: Arc::clone(&requests),
+            },
+            &mut history,
+        );
 
-        let recovered = agent.run(default_input()).await.is_ok();
+        if bounded {
+            agent.config.max_turns = Some(1);
+            agent.config.final_answer = true;
+        }
+        let input = AgentInput {
+            mode: if bounded {
+                AgentMode::Plan(PLAN_FILE.into())
+            } else {
+                AgentMode::Build
+            },
+            ..default_input()
+        };
+        let recovered = agent.run(input).await.is_ok();
         drop(agent);
 
         assert_eq!(recovered, expected, "{message}");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_append_only(&requests[0], &requests[1]);
+        if bounded {
+            assert_eq!(
+                history
+                    .as_slice()
+                    .iter()
+                    .filter(|message| message.first_text_content() == Some(FINAL_ANSWER_NOTE))
+                    .count(),
+                1
+            );
+        }
         assert!(
             history
                 .as_slice()

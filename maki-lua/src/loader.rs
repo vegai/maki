@@ -13,8 +13,10 @@ use include_dir::{Dir, File, include_dir};
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::ToolRegistry;
 use maki_agent::{Cutter, SessionEndReason};
-use maki_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
+use maki_config::{GatedFile, PluginFileConfig, PluginsConfig, ProjectConfig, RawConfig};
+use maki_providers::claude_code::PLUGIN;
 use maki_providers::plugin::{DeclAuthority, keep_granted};
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use tokio::runtime::{Builder, EnterGuard, Handle, Runtime, RuntimeFlavor};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
@@ -38,7 +40,7 @@ use crate::plugin_permissions::{
 };
 use crate::runtime::{
     self, ClickFallback, ConfigScope, EndSession, LoadChunk, LoadContext, LuaThread, MoveOutcome,
-    MoveRequest, Request, RestoreItem,
+    MoveRequest, PrivateApi, Request, RestoreItem,
 };
 use maki_agent::prompt::ResolvedPrompts;
 use maki_storage::id::MakiId;
@@ -101,6 +103,10 @@ impl InitFiles {
 struct BundledPlugin {
     name: &'static str,
     dir: Dir<'static>,
+}
+
+fn private_api(name: &str) -> Option<PrivateApi> {
+    (name == PLUGIN).then_some(crate::api::claude_code::create_private_module)
 }
 
 /// `lib` is not a default builtin; it exists so plugins can
@@ -183,6 +189,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     BundledPlugin {
         name: "completion",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/completion"),
+    },
+    BundledPlugin {
+        name: PLUGIN,
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/claude_code"),
     },
     BundledPlugin {
         name: "view_image",
@@ -403,12 +413,25 @@ impl PluginHost {
         self.inner.prio_tx = unbounded_channel().0;
     }
 
-    /// Boots the runtime and loads every default bundled plugin into
-    /// `registry`. For callers like tests and docgen that want the full
-    /// builtin set without building a config.
+    /// Boots the runtime and loads every bundled plugin into `registry`, the
+    /// ones that ship switched off included. For callers like tests and
+    /// docgen that want the full builtin set without building a config, and
+    /// which have to document an opt-in plugin's options too.
     pub fn with_all_builtins(registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
+        let opt_in: HashMap<String, PluginFileConfig> = maki_config::OPTIONAL_BUILTINS
+            .iter()
+            .map(|name| {
+                (
+                    (*name).to_owned(),
+                    PluginFileConfig {
+                        enabled: Some(true),
+                        ..PluginFileConfig::default()
+                    },
+                )
+            })
+            .collect();
         let mut host = Self::new(registry)?;
-        host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))?;
+        host.load_builtins(&PluginsConfig::from_plugins(opt_in))?;
         Ok(host)
     }
 
@@ -551,24 +574,14 @@ impl PluginHost {
                     plugin: builtin.clone(),
                     source: mlua::Error::runtime("bundled plugin missing init.lua"),
                 })?;
-            let permissions = bundled_permissions(bundled)?;
-            let name: Arc<str> = Arc::from(builtin.as_str());
-            let opts = config
-                .opts
-                .get(builtin.as_str())
-                .cloned()
-                .map(Arc::new)
-                .unwrap_or_default();
-            self.send_load(
-                Arc::clone(&name),
-                vec![LoadChunk::bundled(name.as_ref(), init)],
-                LoadContext {
-                    opts,
-                    // The one load that ships inside the binary, and so the
-                    // one that may declare a provider under a built-in slug.
-                    authority: DeclAuthority::Bundled,
-                    ..LoadContext::plain(None, permissions)
-                },
+            self.load_bundled(
+                bundled,
+                init,
+                config
+                    .opts
+                    .get(builtin.as_str())
+                    .cloned()
+                    .unwrap_or_default(),
             )?;
         }
         Ok(())
@@ -589,9 +602,13 @@ impl PluginHost {
     }
 
     /// Option specs declared by loaded plugins via `maki.api.register_options`,
-    /// keyed by plugin name. Used by docgen.
+    /// keyed by plugin name.
     pub fn plugin_options(&self) -> Result<PluginOptionSpecs, PluginError> {
         self.ask(|reply| Request::CollectPluginOptions { reply })
+    }
+
+    pub fn loaded_plugins(&self) -> Result<Vec<String>, PluginError> {
+        self.ask(|reply| Request::CollectLoadedPlugins { reply })
     }
 
     /// Runs a source as the global `init.lua`.
@@ -646,6 +663,41 @@ impl PluginHost {
             .send(request(reply_tx))
             .map_err(|_| PluginError::HostDead)?;
         reply_rx.recv().map_err(|_| PluginError::HostDead)
+    }
+
+    /// Runs trusted test source with a bundled plugin's permissions and private API.
+    pub fn load_bundled_source(
+        &self,
+        name: &str,
+        source: &str,
+        opts: JsonMap<String, JsonValue>,
+    ) -> Result<(), PluginError> {
+        let bundled = BUNDLED_PLUGINS
+            .iter()
+            .find(|plugin| plugin.name == name)
+            .ok_or_else(|| PluginError::UnknownPlugin {
+                plugin: name.to_owned(),
+            })?;
+        self.load_bundled(bundled, source, opts)
+    }
+
+    fn load_bundled(
+        &self,
+        bundled: &BundledPlugin,
+        source: &str,
+        opts: JsonMap<String, JsonValue>,
+    ) -> Result<(), PluginError> {
+        let name = bundled.name;
+        self.send_load(
+            Arc::from(name),
+            vec![LoadChunk::bundled(name, source)],
+            LoadContext {
+                opts: Arc::new(opts),
+                authority: DeclAuthority::Bundled,
+                private_api: private_api(bundled.name),
+                ..LoadContext::plain(None, bundled_permissions(bundled)?)
+            },
+        )
     }
 
     /// Runs a source with every permission granted, for tests and embedders.
@@ -748,6 +800,7 @@ impl PluginHost {
                 revision_guard: package.revision_guard.clone(),
                 package: true,
                 authority: DeclAuthority::ThirdParty,
+                private_api: None,
             },
             reply,
         })?
@@ -825,6 +878,7 @@ impl PluginHost {
                 revision_guard,
                 package: true,
                 authority: DeclAuthority::ThirdParty,
+                private_api: None,
             },
         )
     }
@@ -1366,6 +1420,7 @@ impl EventHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::claude_code::MODULE as CLAUDE_CODE_MODULE;
     use crate::api::keymap::{
         CursorShape, CursorStyle, InputMode, InputSnapshot, TAKEN_ERR, UNKNOWN_CURSOR_SHAPE_ERR,
     };
@@ -1380,12 +1435,142 @@ mod tests {
     use crate::test_support::runtime;
     use crate::test_support::wait_next;
     use crossterm::event::KeyCode;
+    use maki_agent::AgentMode;
     use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, assemble};
     use maki_agent::tools::ToolRegistry;
+    use maki_agent::tools::test_support::stub_ctx;
+    use maki_providers::claude_code::UNSUPPORTED_SYSTEM;
+    use serde_json::json;
+    #[cfg(target_os = "linux")]
+    use std::process::Command;
+
     use test_case::test_case;
 
     const GLOBAL_TRUST_PATH: &str = "~/src/me/*";
     const PROJECT_TRUST_PATH: &str = "**";
+
+    #[test_case(DeclAuthority::Bundled, false, true ; "bundled")]
+    #[test_case(DeclAuthority::Bundled, true, false ; "bundled_package")]
+    #[test_case(DeclAuthority::ThirdParty, false, false ; "third_party")]
+    #[test_case(DeclAuthority::Config, false, false ; "config")]
+    fn private_claude_helpers_require_bundled_authority(
+        authority: DeclAuthority,
+        package: bool,
+        granted: bool,
+    ) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let source = format!(
+            r#"
+            assert(maki.claude_code == nil)
+            assert(pcall(require, "{CLAUDE_CODE_MODULE}") == {granted})
+        "#
+        );
+        host.send_load(
+            Arc::from(PLUGIN),
+            vec![LoadChunk::bundled(PLUGIN, source)],
+            LoadContext {
+                authority,
+                package,
+                private_api: private_api(PLUGIN),
+                ..LoadContext::plain(None, PluginPermissions::trusted())
+            },
+        )
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test_case(include_str!("../../plugins/claude_code/tests/spec.lua") ; "plugin_spec")]
+    #[test_case(include_str!("../../plugins/claude_code/tests/jobs.lua") ; "job_spec")]
+    fn claude_code_bundled_spec(source: &str) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_bundled_source(PLUGIN, source, JsonMap::new())
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn git_environment_cleanup_matches_the_installed_git() {
+        let output = Command::new("git")
+            .args(["rev-parse", "--local-env-vars"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let names: Vec<_> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let source = format!(
+            r#"
+            local git = require("claude_git")
+            local expected = maki.json.decode([==[{}]==])
+            local names = {{}}
+            for name in git.without_local_git_env(""):gmatch("%S+") do names[name] = true end
+            names.unset = nil
+            for _, name in ipairs(expected) do assert(names[name], name) names[name] = nil end
+            assert(next(names) == nil)
+        "#,
+            serde_json::to_string(&names).unwrap()
+        );
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_bundled_source(PLUGIN, &source, JsonMap::new())
+            .unwrap();
+    }
+
+    #[test]
+    fn unsupported_claude_loads_without_disrupting_later_builtins() {
+        let registry = Arc::new(ToolRegistry::new());
+        let mut host = PluginHost::new(Arc::clone(&registry)).unwrap();
+        let bundled = BUNDLED_PLUGINS
+            .iter()
+            .find(|plugin| plugin.name == PLUGIN)
+            .unwrap();
+        let source = bundled
+            .dir
+            .get_file("init.lua")
+            .unwrap()
+            .contents_utf8()
+            .unwrap();
+        host.send_load(
+            Arc::from(PLUGIN),
+            vec![LoadChunk::bundled(PLUGIN, source)],
+            LoadContext {
+                opts: Arc::new(JsonMap::new()),
+                authority: DeclAuthority::Bundled,
+                private_api: Some(crate::api::claude_code::create_unsupported_module),
+                ..LoadContext::plain(None, bundled_permissions(bundled).unwrap())
+            },
+        )
+        .unwrap();
+        host.load_builtins(&PluginsConfig {
+            names: vec!["view_image".into(), "openrouter".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        let loaded = host.loaded_plugins().unwrap();
+        assert!(loaded.iter().any(|name| name == "view_image"));
+        assert!(loaded.iter().any(|name| name == "openrouter"));
+        let ctx = stub_ctx(&AgentMode::Build);
+        for (name, input) in [
+            (PLUGIN, json!({"prompt": "inspect"})),
+            ("claude_code_import", json!({"id": "Ab12Cd34"})),
+        ] {
+            let invocation = registry.get(name).unwrap().try_parse(&input).unwrap();
+            let result = crate::test_support::runtime().block_on(invocation.execute(&ctx));
+            assert!(result.output.unwrap_err().contains(UNSUPPORTED_SYSTEM));
+        }
+    }
+
+    #[test]
+    fn loaded_plugins_include_plugins_without_options() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("empty", "return {}").unwrap();
+        assert_eq!(host.loaded_plugins().unwrap(), ["empty"]);
+        assert!(host.load_source("broken", "error('broken')").is_err());
+        assert_eq!(host.loaded_plugins().unwrap(), ["empty"]);
+        host.unload("empty").unwrap();
+        assert!(host.loaded_plugins().unwrap().is_empty());
+    }
 
     /// Closing the queue and reading it are one message. A Lua task can record
     /// an activation between a separate read and close, and a close that threw
@@ -3376,10 +3561,9 @@ mod bundled_manifests {
         let mut drift = Vec::new();
         // `lib` is the one bundled directory that never loads on its own, so it
         // ships no manifest and its modules answer to whoever requires them.
-        for plugin in BUNDLED_PLUGINS
-            .iter()
-            .filter(|p| DEFAULT_BUILTINS.contains(&p.name))
-        {
+        for plugin in BUNDLED_PLUGINS.iter().filter(|p| {
+            DEFAULT_BUILTINS.contains(&p.name) || maki_config::OPTIONAL_BUILTINS.contains(&p.name)
+        }) {
             let declared = bundled_permissions(plugin).expect("every builtin ships a plugin.toml");
             // Each permission paired with the usage demanding it, so a failure
             // points at something to go look at.

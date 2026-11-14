@@ -9,7 +9,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::TryStreamExt;
-use maki_storage::id::SessionRef;
 use reqwest::header::HeaderValue;
 use reqwest::{Client, Method, Request, RequestBuilder};
 use serde::Deserialize;
@@ -22,7 +21,7 @@ use maki_config::providers::Protocol;
 
 use crate::headers::header_value;
 use crate::model::{Model, ModelFamily};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use crate::providers::aperture::NO_PATH_PREFIX;
 use crate::spec::{
     ApertureRoute, AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
@@ -47,8 +46,8 @@ const BLOCK_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 const BETA_HEADER: &str = "anthropic-beta";
 const BETA_SEPARATOR: &str = ",";
 const MONEY_EXPONENT: u32 = 2;
-const LABEL_SESSION: &str = "Current session";
-const LABEL_WEEK_ALL: &str = "Current week (all models)";
+pub(crate) const LABEL_SESSION: &str = "Current session";
+pub(crate) const LABEL_WEEK_ALL: &str = "Current week (all models)";
 
 pub(crate) const SLUG: &str = "anthropic";
 pub(crate) const DISPLAY_NAME: &str = "Anthropic";
@@ -93,10 +92,11 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     fallback_max_output: Some(128_000),
     fallback_context_window: 200_000,
     models_toml: include_str!("../../../models/anthropic.toml"),
+    models_of: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
-        with_auth: create_with_auth,
+        with_auth: Some(create_with_auth),
     }),
     aperture: Some(ApertureRoute {
         path_prefix: NO_PATH_PREFIX,
@@ -549,7 +549,7 @@ impl Provider for Anthropic {
         tools: &'a Value,
         event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let system_blocks = if let Some(prefix) = &self.system_prefix {
@@ -598,7 +598,7 @@ impl Provider for Anthropic {
             if reports_block_binding(&body, anthropic_api) {
                 betas.push(BLOCK_BINDING_BETA);
             }
-            if let Some(session) = session_id {
+            if let Some(session) = scope.session_id {
                 self.session_id.apply(session, &mut body, &mut auth)?;
             }
 
@@ -607,7 +607,10 @@ impl Provider for Anthropic {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(self.do_list_models())
     }
 
@@ -1692,7 +1695,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
             crate::providers::Timeouts::default(),
         );
 
-        let models = provider.list_models().await.unwrap();
+        let models = provider.list_models(ModelListing::Cached).await.unwrap();
 
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, expected);

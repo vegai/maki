@@ -139,6 +139,14 @@ pub const PROVIDER_BUILTINS: &[&str] = &[
 /// so their names stay free for MCP servers and are not valid tool names.
 pub const NON_TOOL_BUILTINS: &[&str] = &["completion", "sessions", "thinking"];
 
+/// Bundled plugins that ship switched off. They load only when a config says
+/// `plugins.<name> = { enabled = true }`, and the config layer accepts their
+/// tables either way so that line is not itself an error.
+///
+/// A plugin belongs here while what it does is worth shipping but what it
+/// costs at scale is not yet known.
+pub const OPTIONAL_BUILTINS: &[&str] = &["claude_code"];
+
 /// Tools the edit plugin provides alongside `edit`, toggled through its options.
 pub const EDIT_SUB_TOOLS: &[&str] = &["edit_lines", "insert_lines", "multiedit"];
 
@@ -381,7 +389,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         default: ConfigValue::Str("none"),
         min: None,
         env: None,
-        description: "Pin the thinking level of every new session: true/\"adaptive\", false/\"off\", \"minimal\" to \"max\", or a token budget. Unset, new sessions start at the last `/thinking` level",
+        description: "Set the thinking level of every new session: true/\"adaptive\", false/\"off\", \"minimal\" to \"max\", or a token budget. A launch thinking flag overrides this. Unset, TUI and ACP sessions start at the last `/thinking` level and headless and SDK sessions use low",
     },
 ];
 
@@ -614,11 +622,16 @@ impl RawConfig {
         let mut unknown: Vec<&String> = self
             .plugins
             .keys()
-            .filter(|name| !DEFAULT_BUILTINS.contains(&name.as_str()) && !packages.contains(name))
+            .filter(|name| {
+                !DEFAULT_BUILTINS.contains(&name.as_str())
+                    && !OPTIONAL_BUILTINS.contains(&name.as_str())
+                    && !packages.contains(name)
+            })
             .collect();
         unknown.sort();
         if let Some(&plugin) = unknown.first() {
             let mut valid: Vec<&str> = DEFAULT_BUILTINS.to_vec();
+            valid.extend(OPTIONAL_BUILTINS);
             valid.extend(packages.iter().map(String::as_str));
             valid.sort_unstable();
             return Err(ConfigError::UnknownPlugin {
@@ -1452,6 +1465,9 @@ pub struct AgentConfig {
     #[config(skip, default = "None")]
     pub max_turns: Option<u32>,
 
+    #[config(skip, default = false)]
+    pub final_answer: bool,
+
     #[config(skip, default = "Vec::new()")]
     pub allowed_tools: Vec<String>,
 
@@ -1483,6 +1499,7 @@ impl AgentConfig {
             rtk: file.rtk.unwrap_or(true),
             shell: file.shell.unwrap_or_default(),
             max_turns: None,
+            final_answer: false,
             allowed_tools: Vec::new(),
             disabled_tools: Vec::new(),
             instructions: InstructionsConfig::default(),
@@ -4442,6 +4459,32 @@ mod tests {
                 pair[1]
             );
         }
+    }
+
+    /// A name in both lists would be on by default and documented as opt-in,
+    /// and the two answers are given by different code paths.
+    #[test]
+    fn optional_builtins_are_not_also_defaults() {
+        for name in OPTIONAL_BUILTINS {
+            assert!(
+                !DEFAULT_BUILTINS.contains(name),
+                "{name} is both a default and an opt-in builtin"
+            );
+        }
+    }
+
+    /// The point of shipping one off by default: naming it in a config is
+    /// accepted, and it stays off until that config says `enabled = true`.
+    #[test]
+    fn an_optional_builtin_loads_only_when_a_config_asks_for_it() {
+        let name = OPTIONAL_BUILTINS[0];
+        let off: RawConfig = toml::from_str(&format!("[plugins.{name}]\n")).unwrap();
+        let off = off.into_config(&[]).expect("naming it is not an error");
+        assert!(!off.plugins.names.iter().any(|n| n == name));
+
+        let on: RawConfig = toml::from_str(&format!("[plugins.{name}]\nenabled = true\n")).unwrap();
+        let on = on.into_config(&[]).unwrap();
+        assert!(on.plugins.names.iter().any(|n| n == name));
     }
 
     #[test_case("enabled = false" ; "enabled_false")]

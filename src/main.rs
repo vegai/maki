@@ -1,5 +1,6 @@
 mod cli;
 mod cmd;
+mod headless_startup;
 mod interrupt;
 mod print;
 mod project_trust;
@@ -9,6 +10,7 @@ mod sdk_mode;
 mod setup;
 mod subagent_tasks;
 mod update;
+mod wire;
 
 use std::time::Duration;
 

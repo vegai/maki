@@ -28,7 +28,8 @@ plugin.toml     permission grants for every Lua file in the dir
 Nothing under `lua/` loads on its own. A module name is its path under `lua/`
 without the extension: `lua/browser.lua` is `require("browser")`,
 `lua/acme/tools.lua` is `require("acme.tools")`. `require` cannot reach files
-outside that directory.
+outside that directory. Plugin environments omit `getfenv` and `setfenv` so a
+plugin cannot inspect or replace another environment.
 
 A module can call `maki.fs` and the other async APIs at its top level. In a
 `require` cycle, the `require` that closes the cycle returns `true` rather than

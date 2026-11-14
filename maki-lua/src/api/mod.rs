@@ -3,6 +3,7 @@ pub(crate) mod agent;
 pub(crate) mod r#async;
 pub(crate) mod autocmd;
 pub(crate) mod base64;
+pub(crate) mod claude_code;
 pub(crate) mod env;
 pub(crate) mod r#fn;
 pub(crate) mod fs;
@@ -155,7 +156,6 @@ pub(crate) fn create_maki_global(
     )?;
     split::split__register(&maki, lua)?;
     top::add_top_methods(&maki, lua, Arc::clone(&plugin))?;
-    maki.set("NIL", Value::NULL)?;
     maki.set(
         "async",
         r#async::create_async_table(lua, Arc::clone(&plugin))?,

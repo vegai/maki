@@ -14,6 +14,7 @@
 //! read them. That stays true after a resume, a rewind or a rebuilt frame,
 //! and there is no side state to drift out of sync.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -191,11 +192,30 @@ pub(crate) fn fingerprint(context: &RunContext, mcp: Option<&McpSession>, model:
     if mcp.is_some() {
         hasher.update([0]);
         hasher.update(format!("{:?}", ToolDeferral::for_model(model)));
+        if let Some(filter) = context.tools.filter().cache_key() {
+            hasher.update([0]);
+            hasher.update(filter);
+        }
     }
     hasher.finalize()[..FINGERPRINT_BYTES]
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+pub(crate) fn request_tools<'t>(
+    tools: &'t RequestTools,
+    mcp: Option<&McpSession>,
+    deferral: ToolDeferral,
+) -> Cow<'t, Value> {
+    match mcp {
+        Some(mcp) => {
+            let mut definitions = tools.definitions().clone();
+            mcp.extend_tools(&mut definitions, deferral, tools.filter());
+            Cow::Owned(definitions)
+        }
+        None => Cow::Borrowed(tools.definitions()),
+    }
 }
 
 /// The in-memory half of a frame. The first run of a process rebuilds it from
@@ -213,10 +233,7 @@ pub(crate) struct LiveFrame {
 
 impl LiveFrame {
     pub(crate) fn build(tools: RequestTools, mcp: Option<&McpSession>, model: &Model) -> Self {
-        let mut wire = tools.definitions().clone();
-        if let Some(mcp) = mcp {
-            mcp.extend_tools(&mut wire, ToolDeferral::for_model(model));
-        }
+        let wire = request_tools(&tools, mcp, ToolDeferral::for_model(model)).into_owned();
         Self {
             tools,
             wire: Arc::new(wire),
@@ -253,7 +270,7 @@ impl LiveFrame {
         deferral: ToolDeferral,
     ) -> &[Value] {
         let before = self.wire.as_array().map_or(0, Vec::len);
-        mcp.append_late_tools(Arc::make_mut(&mut self.wire), deferral);
+        mcp.append_late_tools(Arc::make_mut(&mut self.wire), deferral, self.tools.filter());
         self.wire.as_array().map_or(&[], |wire| &wire[before..])
     }
 }
@@ -406,6 +423,8 @@ pub(crate) fn context_update(
 
 #[cfg(test)]
 mod tests {
+    use crate::tools::ToolAudience;
+    use crate::tools::ToolRegistry;
     use std::path::PathBuf;
 
     use maki_providers::test_support::isolated_home;
@@ -414,6 +433,7 @@ mod tests {
     use super::*;
     use crate::AgentConfig;
     use crate::mcp::test_support::stub_session;
+    use crate::tools::LocalTools;
     use arc_swap::ArcSwap;
     use serde_json::json;
     use test_case::test_case;
@@ -424,6 +444,9 @@ mod tests {
     const NATIVE_MODEL: &str = "anthropic/claude-opus-5";
     const OTHER_NATIVE_MODEL: &str = "anthropic/claude-sonnet-5";
     const CLIENT_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+    const BASE_TOOL: &str = "read";
+    const MCP_TOOL: &str = "srv.probe";
+    const MCP_WIRE: &str = "srv__probe";
     const INSTRUCTIONS: &str = "\n\nProject instructions:\nbe nice";
     const APPEND: &str = "You review the auth module only.";
     const APPENDED: &str = "\nYou review the auth module only.";
@@ -477,9 +500,12 @@ mod tests {
         RunContext::fixed(
             authored.into(),
             RequestTools::assembled(
+                ToolRegistry::global(),
                 json!([{ "name": tools }]),
+                &LocalTools::default(),
                 &AgentConfig::default(),
                 &model(NATIVE_MODEL),
+                ToolAudience::MAIN,
             ),
         )
     }
@@ -541,6 +567,101 @@ mod tests {
             fingerprint(&context("a", ""), Some(&mcp), &native),
             fingerprint(&context("a", ""), Some(&mcp), &model(CLIENT_MODEL)),
             "a model without tool search shapes the MCP entries another way"
+        );
+    }
+
+    #[test_case(false, "679dc2f4a48a473b9e5f948abcf928e3" ; "without_mcp")]
+    #[test_case(true, "9000657a8417bcfd7d032d863059feb7" ; "mcp_with_native_exclusion")]
+    fn the_default_filter_keeps_the_stored_frame_fingerprint(with_mcp: bool, expected: &str) {
+        let _home = isolated_home();
+        let model = model(NATIVE_MODEL);
+        let mcp = stub_session(&[]);
+        let initial = context("a", "");
+        let context = RunContext::fixed(
+            String::new(),
+            RequestTools::assembled(
+                ToolRegistry::global(),
+                initial.tools.definitions().clone(),
+                &LocalTools::default(),
+                &AgentConfig {
+                    disabled_tools: vec!["question".into()],
+                    ..Default::default()
+                },
+                &model,
+                ToolAudience::MAIN,
+            ),
+        );
+        assert_eq!(
+            fingerprint(&context, with_mcp.then_some(&mcp), &model),
+            expected
+        );
+    }
+
+    #[test_case(false, false ; "native_exclusions_are_already_in_definitions")]
+    #[test_case(true, false ; "external_exclusions_change_the_frame")]
+    #[test_case(true, true ; "external_allow_list_changes_the_frame")]
+    fn changed_policy_rebuilds_a_restored_frame_with_the_same_base_tools(
+        with_mcp: bool,
+        allow_list: bool,
+    ) {
+        let _home = isolated_home();
+        let model = model(NATIVE_MODEL);
+        let mcp = stub_session(&[(MCP_TOOL, "Probe")]);
+        let mcp = with_mcp.then_some(&mcp);
+        let mut history = History::new(Vec::new());
+        let initial = context(BASE_TOOL, "");
+        let base_tools = initial.tools.definitions().clone();
+        assert_eq!(
+            fit_frame(&mut history, initial, mcp, &model),
+            FrameFit::Built
+        );
+        assert_eq!(
+            history
+                .live_frame()
+                .unwrap()
+                .wire
+                .to_string()
+                .contains(MCP_WIRE),
+            with_mcp
+        );
+
+        let mut restored = History::new(Vec::new()).with_frame(history.frame().cloned());
+        let (allowed_tools, disabled_tools) = if allow_list {
+            (vec![BASE_TOOL.into()], Vec::new())
+        } else {
+            (Vec::new(), vec![MCP_TOOL.into()])
+        };
+        let restricted = RunContext::fixed(
+            String::new(),
+            RequestTools::assembled(
+                ToolRegistry::global(),
+                base_tools.clone(),
+                &LocalTools::default(),
+                &AgentConfig {
+                    allowed_tools,
+                    disabled_tools,
+                    ..Default::default()
+                },
+                &model,
+                ToolAudience::MAIN,
+            ),
+        );
+        assert_eq!(restricted.tools.definitions(), &base_tools);
+        assert_eq!(
+            fit_frame(&mut restored, restricted, mcp, &model),
+            if with_mcp {
+                FrameFit::Rebuilt
+            } else {
+                FrameFit::Kept
+            }
+        );
+        assert!(
+            !restored
+                .live_frame()
+                .unwrap()
+                .wire
+                .to_string()
+                .contains(MCP_WIRE)
         );
     }
 

@@ -9,9 +9,8 @@
 use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter, Write};
 
-use jsonrepair::{Options as RepairOpts, loads as repair_loads};
 use serde_json::{Value, json};
-use tracing::{debug, warn};
+use tracing::warn;
 
 pub(crate) const PARAM_PREVIEW_MAX: usize = 120;
 
@@ -691,19 +690,9 @@ fn coerce_str_to(s: &str, expected: ParamKind) -> Option<Value> {
         return None;
     }
 
-    if let Ok(parsed) = serde_json::from_str::<Value>(s)
-        && ParamKind::of(&parsed) == expected
-    {
-        return Some(parsed);
-    }
-
-    let repaired = repair_loads(s, &RepairOpts::default()).ok()?;
-    if ParamKind::of(&repaired) == expected {
-        debug!(input = %preview(s), "repaired malformed JSON");
-        Some(repaired)
-    } else {
-        None
-    }
+    serde_json::from_str::<Value>(s)
+        .ok()
+        .filter(|parsed| ParamKind::of(parsed) == expected)
 }
 
 fn log_coercion(
@@ -1206,11 +1195,28 @@ mod tests {
         assert!(validate(schema, json!({"anything": 1})).is_ok());
     }
 
+    #[test_case(r#"[{"old_string":"sed -n '1,130p' file" "new_string":"fixed"}]"# ; "missing_separator")]
+    #[test_case(r#"[{"old_string":"grep "needle" file","new_string":"fixed"}]"# ; "unescaped_command_quotes")]
+    fn malformed_stringified_parameters_are_rejected(encoded: &str) {
+        let input = json!({"path": "/x", "edits": encoded});
+        let error = validate(&MULTIEDIT_LIKE, input).unwrap_err();
+        assert_eq!(error.path.to_string(), "edits");
+        assert!(matches!(
+            error.kind,
+            ToolInputErrorKind::TypeMismatch {
+                expected: ParamKind::Array,
+                got: ParamKind::String,
+                ..
+            }
+        ));
+    }
+
     #[test]
-    fn coerce_stringified_array_with_unescaped_inner_quotes_via_repair() {
-        let broken = r#"[{"old_string": "const x = { \"color\": 1 };", "new_string": "fixed"}]"#;
-        let input = json!({"path": "/x", "edits": broken});
+    fn valid_stringified_array_preserves_inner_quotes() {
+        let encoded = r#"[{"old_string": "const x = { \"color\": 1 };", "new_string": "fixed"}]"#;
+        let input = json!({"path": "/x", "edits": encoded});
         let out = validate(&MULTIEDIT_LIKE, input).unwrap();
+        assert_eq!(out["edits"][0]["old_string"], "const x = { \"color\": 1 };");
         assert_eq!(out["edits"][0]["new_string"], "fixed");
     }
 

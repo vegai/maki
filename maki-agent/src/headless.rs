@@ -9,14 +9,15 @@ use arc_swap::ArcSwap;
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
-use maki_providers::{Message, RequestOptions, Timeouts};
+use maki_providers::{Message, RequestOptions, ThinkingConfig, Timeouts};
+#[cfg(test)]
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio::time::{sleep_until, timeout};
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{error, warn};
@@ -28,7 +29,7 @@ use crate::prompt::ResolvedPrompts;
 use crate::session::{Resumed, SessionTrack};
 use crate::template;
 use crate::tools::{
-    BackgroundFor, FileAccess, LocalTools, RequestTools, ToolAudience, ToolRegistry,
+    BackgroundFor, FileAccess, LocalTools, RequestSpec, RequestTools, ToolAudience, ToolRegistry,
 };
 use crate::types::EventSender;
 use crate::{
@@ -341,6 +342,13 @@ pub struct SessionEnd {
 
 pub type SessionTask = AbortOnDropHandle<SessionEnd>;
 
+/// Provider-adjusted startup metadata, matching the first request's capabilities.
+pub struct Ready {
+    pub model: Model,
+    pub tool_names: Vec<String>,
+    pub thinking: String,
+}
+
 /// Read once at startup. A headless host has no `/cd` and its slots come from
 /// the caller, so nothing here changes mid-session.
 struct ContextSpec {
@@ -348,6 +356,7 @@ struct ContextSpec {
     instructions: String,
     slots: Arc<ResolvedPrompts>,
     config: AgentConfig,
+    local_tools: LocalTools,
     excluded_tools: Vec<&'static str>,
     mcp: bool,
     background: bool,
@@ -364,12 +373,14 @@ impl ContextSpec {
         config: AgentConfig,
         excluded_tools: Vec<&'static str>,
         mcp: Option<&McpHandle>,
+        local_tools: LocalTools,
     ) -> Self {
         Self {
             vars,
             instructions: instructions.text.clone(),
             slots,
             config,
+            local_tools,
             excluded_tools,
             mcp: mcp.is_some(),
             background: true,
@@ -377,17 +388,35 @@ impl ContextSpec {
         }
     }
 
-    fn render(&self, model: &Model, workflow: bool) -> RunContext {
-        let tools = RequestTools::build_with_background(
+    fn ready(&self, model: &Model, defaults: SessionDefaults, mcp: Option<&McpSession>) -> Ready {
+        let tools = self.tools(model, defaults.workflow);
+        Ready {
+            model: model.clone(),
+            tool_names: advertised_tool_names(&tools, mcp),
+            thinking: ThinkingConfig::from(defaults.thinking)
+                .clamped(model)
+                .to_string(),
+        }
+    }
+
+    fn tools(&self, model: &Model, workflow: bool) -> RequestTools {
+        RequestTools::build(
             ToolRegistry::global(),
+            &self.local_tools,
             &self.vars,
             model,
             &self.config,
-            &self.excluded_tools,
-            workflow,
-            self.mcp,
-            self.background,
-        );
+            RequestSpec {
+                background: self.background,
+                excluded: &self.excluded_tools,
+                workflow,
+                mcp: self.mcp,
+            },
+        )
+    }
+
+    fn render(&self, model: &Model, workflow: bool) -> RunContext {
+        let tools = self.tools(model, workflow);
         self.host_prompt
             .context(&self.vars, &self.instructions, &self.slots, model, tools)
     }
@@ -401,12 +430,8 @@ impl ContextSpec {
 /// would put in the model's context from MCP (always-load definitions and
 /// `tool_search`). Probed as [`ToolDeferral::Client`] because the native
 /// array lists every deferred definition too.
-fn advertised_tool_names(tools: &Value, mcp: Option<&McpSession>) -> Vec<String> {
-    let mut probe = tools.clone();
-    if let Some(mcp) = mcp {
-        mcp.extend_tools(&mut probe, ToolDeferral::Client);
-    }
-    extract_tool_names(&probe)
+fn advertised_tool_names(tools: &RequestTools, mcp: Option<&McpSession>) -> Vec<String> {
+    extract_tool_names(&agent::request_tools(tools, mcp, ToolDeferral::Client))
 }
 
 pub struct InteractiveParams {
@@ -422,15 +447,12 @@ pub struct InteractiveParams {
     /// The right to write [`Self::resumed`]'s session, taken before its
     /// transcript was read.
     pub claim: SessionClaim,
-    /// Where the transcript is written. The same dir the caller resolved the
-    /// session from, so a run cannot read one session and write another.
-    pub storage: StateDir,
     pub yolo: bool,
     /// Nobody answers permission prompts, so they are denied at once instead
     /// of waiting forever.
     pub unattended: bool,
     pub host_prompt: HostPrompt,
-    /// The `always_*` knobs. `workflow` picks the tool catalog here; the rest
+    /// Resolved launch defaults. `workflow` picks the tool catalog here; the rest
     /// are what a host without toggles puts on every [`AgentInput`] it sends.
     pub defaults: SessionDefaults,
     pub model_policy: Arc<ModelPolicy>,
@@ -449,13 +471,13 @@ pub struct InteractiveParams {
 }
 
 pub struct InteractiveHandle {
-    pub tool_names: Vec<String>,
     pub input_tx: UnboundedSender<AgentInput>,
     pub answer_tx: UnboundedSender<String>,
     pub cancel_tx: watch::Sender<()>,
     pub model_tx: UnboundedSender<Model>,
     /// Send through [`Self::switch_mode`], which also tells background work.
     pub mode_tx: UnboundedSender<AgentMode>,
+    pub ready: oneshot::Receiver<Ready>,
     pub session_id: SessionRef,
     pub permissions: Arc<PermissionManager>,
     pub task: SessionTask,
@@ -489,16 +511,13 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             params.config.clone(),
             params.excluded_tools,
             params.mcp_handle.as_ref(),
+            params.local_tools.clone(),
         )
     };
-    let initial = spec.render(&params.model, params.defaults.workflow);
-    let context = spec.builder();
-
     let mcp = params
         .mcp_handle
         .clone()
         .map(|h| McpSession::new(h, &params.resumed.history));
-    let tool_names = advertised_tool_names(initial.tools.definitions(), mcp.as_ref());
 
     let (guard, events) = event_stream();
     let base_tx = guard.sender(0);
@@ -527,13 +546,15 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     let task_permissions = Arc::clone(&permissions);
     let spend = Arc::<RunLedger>::default();
     let track_spend = Arc::clone(&spend);
+    let (ready_tx, ready_rx) = oneshot::channel();
     let task = tokio::spawn(run_session(guard, params.mcp_handle.clone(), async move {
         let mut model = params.model;
         let mut provider = connect(&mut model, params.timeouts, &base_tx).await?;
+        let _ = ready_tx.send(spec.ready(&model, params.defaults, mcp.as_ref()));
+        let context = spec.builder();
         let mut track = SessionTrack::open(
             params.resumed,
             params.claim,
-            params.storage,
             mailbox.clone(),
             track_spend,
             &working_dir,
@@ -675,7 +696,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 
     (
         InteractiveHandle {
-            tool_names,
+            ready: ready_rx,
             input_tx,
             answer_tx,
             cancel_tx,
@@ -759,7 +780,7 @@ mod tests {
     use maki_providers::plugin::{
         self, DeclAuthority, Hook, ProviderDecl, ProviderHooks, Registration,
     };
-    use maki_providers::provider::BoxFuture;
+    use maki_providers::provider::{BoxFuture, ModelListing, RequestScope};
     use maki_providers::{AgentError, ModelInfo, ProviderEvent, StreamResponse};
     use maki_storage::id::MakiId;
     use tempfile::TempDir;
@@ -809,6 +830,7 @@ mod tests {
     const DROPPED_RELAY_FREES_CHANNEL: &str =
         "a dropped relay must not take the next turn's cancel";
     const RELAY_WAIT: Duration = Duration::from_secs(5);
+    const MODEL_SPEC: &str = "anthropic/claude-sonnet-4-5";
     const LISTED_PROVIDER: &str = "copilot";
     const LISTED_MODEL: &str = "listed-model";
     const UNLISTED_MODEL: &str = "unlisted-model";
@@ -842,12 +864,15 @@ mod tests {
             _tools: &'a Value,
             _event_tx: &'a UnboundedSender<ProviderEvent>,
             _opts: RequestOptions,
-            _session_id: Option<&'a SessionRef>,
+            _scope: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             unreachable!("{ONLY_LISTS_MODELS}")
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             (self.0)()
         }
     }
@@ -970,7 +995,6 @@ mod tests {
             initial_wd: tmp.path().to_path_buf(),
             resumed: Resumed::empty(SessionRef::from(id)),
             claim: SessionClaim::acquire(id, &dir).expect("nothing else holds it"),
-            storage: dir,
             yolo: false,
             unattended: true,
             host_prompt: HostPrompt::default(),
@@ -1080,6 +1104,7 @@ mod tests {
                 AgentConfig::default(),
                 Vec::new(),
                 None,
+                LocalTools::default(),
             )
         };
         let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
@@ -1112,6 +1137,7 @@ mod tests {
                 AgentConfig::default(),
                 Vec::new(),
                 None,
+                LocalTools::default(),
             )
         };
         let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
@@ -1130,9 +1156,17 @@ mod tests {
     #[test]
     fn advertised_names_show_tool_search_not_deferred_tools() {
         let base = serde_json::json!([{"name": "read"}]);
+        let tools = RequestTools::assembled(
+            ToolRegistry::global(),
+            base.clone(),
+            &LocalTools::default(),
+            &AgentConfig::default(),
+            &Model::from_spec(MODEL_SPEC).unwrap(),
+            ToolAudience::MAIN,
+        );
         let mcp =
             crate::mcp::test_support::stub_session(&[("srv.fetch_issue", "Fetch a GitHub issue")]);
-        let names = advertised_tool_names(&base, Some(&mcp));
+        let names = advertised_tool_names(&tools, Some(&mcp));
         assert_eq!(
             names,
             vec!["read", crate::mcp::TOOL_SEARCH_TOOL_NAME],
@@ -1143,7 +1177,7 @@ mod tests {
             serde_json::json!([{"name": "read"}]),
             "probing must not bake MCP entries into the base tools"
         );
-        assert_eq!(advertised_tool_names(&base, None), vec!["read"]);
+        assert_eq!(advertised_tool_names(&tools, None), vec!["read"]);
     }
 
     /// The ordering the SDK and `-p` exits rest on: the stream ends and the
@@ -1161,7 +1195,6 @@ mod tests {
         let track = SessionTrack::open(
             Resumed::empty(SessionRef::from(id)),
             claim,
-            dir,
             mailbox,
             Arc::default(),
             CWD,

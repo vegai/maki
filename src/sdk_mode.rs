@@ -14,22 +14,21 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use color_eyre::Result;
-use color_eyre::eyre::{Context, eyre};
-use maki_agent::headless::{self, BackgroundMode, InteractiveHandle, InteractiveParams};
-use maki_agent::mcp;
+use color_eyre::eyre::{Context, bail, eyre};
+use maki_agent::headless::{self, BackgroundMode, InteractiveHandle, InteractiveParams, Ready};
 use maki_agent::permissions::{PermissionAnswer, PluginRuleStore, TaggedAnswer};
 use maki_agent::prompt::ResolvedPrompts;
 use maki_agent::session::Resumed;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, InputSource,
-    PermissionsConfig, RunTotals, SessionEndReason, SessionEvents, SteerKind,
+    PermissionsConfig, RunTotals, SessionEvents, SteerKind,
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
+use maki_lua::EventHandle;
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
 use maki_providers::model::Model;
 use maki_providers::{ImageSource, StopReason, Timeouts, TokenUsage};
-use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
 use maki_storage::stdin;
@@ -41,38 +40,16 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::cli::Cli;
+use crate::headless_startup::{shutdown, start_mcp, startup};
 use crate::interrupt::Interrupt;
 use crate::subagent_tasks::{SubagentTasks, TaskMessage};
+use crate::wire::{
+    API_RETRY, ERROR_DURING_EXECUTION, INIT, NOTIFICATION, ProviderNotice, SUCCESS,
+    maki_to_claude_tool_name, system_event, wire_uuid,
+};
 
-/// An accepted observation's line, such as a background result. It goes out
-/// live only, since the SDK has no history replay.
 pub(crate) const NOTICE_SUBTYPE: &str = "notice";
 const BACKGROUND_USAGE_SUBTYPE: &str = "background_usage";
-const TOOL_NAME_MAP: &[(&str, &str)] = &[
-    ("bash", "Bash"),
-    ("read", "Read"),
-    ("edit", "Edit"),
-    ("write", "Write"),
-    ("grep", "Grep"),
-    ("glob", "Glob"),
-    ("todo_write", "TodoWrite"),
-    ("webfetch", "WebFetch"),
-    ("websearch", "WebSearch"),
-    ("task", "Task"),
-    ("multiedit", "MultiEdit"),
-    ("code_execution", "CodeExecution"),
-    ("index", "Index"),
-    ("memory", "Memory"),
-    ("question", "Question"),
-    ("skill", "Skill"),
-];
-
-/// Emits a hyphenated-hex UUIDv7 string for Claude Code SDK wire ids
-/// (message.id, assistant message.id).
-#[allow(clippy::disallowed_methods)]
-fn wire_uuid() -> String {
-    uuid::Uuid::now_v7().to_string()
-}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum PermissionMode {
@@ -132,20 +109,12 @@ struct WireMessage {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WireInner {
-    System(SystemPayload),
     Assistant(AssistantPayload),
     User(UserPayload),
     Result(ResultPayload),
     StreamEvent(StreamEventPayload),
     ControlResponse(ControlResponsePayload),
     ControlRequest(ControlRequestPayload),
-}
-
-#[derive(Serialize)]
-struct SystemPayload {
-    subtype: &'static str,
-    #[serde(flatten)]
-    extra: Value,
 }
 
 #[derive(Serialize)]
@@ -190,6 +159,22 @@ struct ResultPayload {
     usage: TokenUsage,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     permission_denials: Vec<Value>,
+}
+
+impl ResultPayload {
+    fn error(result: String) -> Self {
+        Self {
+            subtype: ERROR_DURING_EXECUTION,
+            is_error: true,
+            duration_ms: 0,
+            duration_api_ms: 0,
+            num_turns: 0,
+            result,
+            total_cost_usd: 0.0,
+            usage: TokenUsage::default(),
+            permission_denials: Vec::new(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -403,14 +388,6 @@ impl StreamSynth {
     }
 }
 
-fn maki_to_claude_tool_name(name: &str) -> &str {
-    TOOL_NAME_MAP
-        .iter()
-        .find(|(m, _)| *m == name)
-        .map(|(_, c)| *c)
-        .unwrap_or(name)
-}
-
 #[derive(Clone)]
 struct SdkWriter {
     session_id: SessionRef,
@@ -424,13 +401,17 @@ impl SdkWriter {
             session_id: self.session_id.clone(),
             uuid: wire_uuid(),
         };
+        self.write(&msg)
+    }
+
+    fn write(&self, message: &impl Serialize) -> Result<()> {
         self.out_tx
-            .send(serde_json::to_string(&msg)?)
+            .send(serde_json::to_string(message)?)
             .map_err(|_| eyre!("stdout writer closed"))
     }
 
-    fn emit_system(&self, subtype: &'static str, extra: Value) -> Result<()> {
-        self.emit(WireInner::System(SystemPayload { subtype, extra }))
+    fn emit_system(&self, subtype: &'static str, extra: impl Serialize) -> Result<()> {
+        self.write(&system_event(&self.session_id, subtype, extra))
     }
 
     fn emit_control_response(
@@ -441,7 +422,7 @@ impl SdkWriter {
     ) -> Result<()> {
         self.emit(WireInner::ControlResponse(ControlResponsePayload {
             response: ControlResponseInner {
-                subtype: if error.is_some() { "error" } else { "success" },
+                subtype: if error.is_some() { "error" } else { SUCCESS },
                 request_id: request_id.into(),
                 response,
                 error,
@@ -458,7 +439,6 @@ pub struct SdkParams {
     /// The right to write [`Self::resumed`]'s session, taken when it was
     /// resolved and held for the whole run.
     pub claim: SessionClaim,
-    pub storage: StateDir,
     pub model: Model,
     pub config: AgentConfig,
     pub permissions_config: PermissionsConfig,
@@ -549,14 +529,11 @@ struct Shared {
     permissions: Permissions,
 }
 
-/// Hands back the interrupt it ran under, for the caller to exit with once
-/// the plugin host is down.
-pub async fn run(params: SdkParams) -> Result<Interrupt> {
+pub async fn run(params: SdkParams, interrupt: &Interrupt) -> Result<()> {
     let SdkParams {
         cli,
         resumed,
         claim,
-        storage,
         model,
         config,
         permissions_config,
@@ -570,19 +547,14 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
     } = params;
     cli.warn_ignored_flags();
     let permission_mode = PermissionMode::resolve(cli.permission_mode.as_deref(), cli.yolo);
-    let interrupt = Interrupt::install();
     let stop = interrupt.stop();
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let working_dir = cwd.to_string_lossy().into_owned();
 
-    let (mcp_handle, mcp_config_errors) = mcp::start_connected(&cwd, project_config.clone()).await;
-    if !mcp_config_errors.is_empty() {
-        eprintln!("MCP config error: {mcp_config_errors}");
-    }
+    let mcp_handle = start_mcp(&cwd, project_config.clone()).await;
 
-    let startup_model = model.clone();
-    let (handle, events) = headless::spawn_interactive(InteractiveParams {
+    let (mut handle, mut events) = headless::spawn_interactive(InteractiveParams {
         model,
         config,
         permissions_config,
@@ -593,7 +565,6 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
         initial_wd: cwd.clone(),
         resumed,
         claim,
-        storage,
         yolo: permission_mode == PermissionMode::BypassPermissions,
         unattended: false,
         host_prompt: cli.host_prompt(),
@@ -621,17 +592,31 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
         session_id: handle.session_id.clone(),
         out_tx,
     };
-    let tools: Vec<&str> = handle
-        .tool_names
+    let Ready {
+        model: startup_model,
+        tool_names,
+        thinking,
+    } = match startup(&mut handle.ready, &mut events).await {
+        Ok(started) => started,
+        Err(error) => {
+            let emitted = writer.emit(WireInner::Result(ResultPayload::error(error.to_string())));
+            finish(handle, &lua_handle, writer, writer_task).await;
+            emitted?;
+            return Err(error);
+        }
+    };
+
+    let tools: Vec<&str> = tool_names
         .iter()
         .map(|t| maki_to_claude_tool_name(t))
         .collect();
     writer.emit_system(
-        "init",
+        INIT,
         serde_json::json!({
             "cwd": working_dir,
             "tools": tools,
             "model": startup_model.id,
+            "thinking": thinking,
             "permissionMode": permission_mode.as_str(),
             "apiKeySource": "none",
             "mcp_servers": [],
@@ -672,6 +657,7 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
         tasks: SubagentTasks::new(maki_to_claude_tool_name),
         result_text: String::new(),
         reported: RunTotals::default(),
+        failed: false,
         run_id: None,
         request_counter: 0,
         lua_handle: lua_handle.clone(),
@@ -782,14 +768,11 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
     drop(input_tx);
     // Unbounded: the pump ends at the stream marker, which the session
     // emits once it has answered every prompt stdin queued.
-    let reported = pump.await.context("event pump")?;
-    let track = headless::await_shutdown(task).await;
+    let (reported, failed) = pump.await.context("event pump")?;
     // Reaps session-owned plugin jobs before the writer task ends: an
     // orphan inheriting stdout would keep an orchestrator's read blocked
     // after maki exits.
-    lua_handle
-        .end_sessions([session_id.id()], SessionEndReason::Completed)
-        .await;
+    let track = shutdown(task, &lua_handle, &session_id).await;
     // Background work and plugin jobs are stopped by now, so nothing spends
     // any more. Dropping the track saves the full bill, also what no result
     // was left to report.
@@ -799,7 +782,10 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
     }
     drop(writer);
     let _ = writer_task.await;
-    Ok(interrupt)
+    if failed {
+        bail!("SDK session ended with an error");
+    }
+    Ok(())
 }
 
 /// What background work spent that no result carried, because it paid after
@@ -815,6 +801,20 @@ fn emit_unreported(writer: &SdkWriter, unreported: RunTotals) -> Result<()> {
             "usage": unreported.usage,
         }),
     )
+}
+
+/// Reap session jobs before joining the writer, because descendants may retain stdout.
+async fn finish(
+    handle: InteractiveHandle,
+    lua: &EventHandle,
+    writer: SdkWriter,
+    writer_task: JoinHandle<()>,
+) {
+    drop(handle.input_tx);
+    let track = shutdown(handle.task, lua, &handle.session_id).await;
+    drop(track);
+    drop(writer);
+    let _ = writer_task.await;
 }
 
 fn parse_or_warn<T: serde::de::DeserializeOwned>(payload: Value, what: &str) -> Option<T> {
@@ -978,6 +978,7 @@ struct EventPump {
     result_text: String,
     /// What every result so far reported.
     reported: RunTotals,
+    failed: bool,
     /// The run the last event belonged to. A new one starts a turn.
     run_id: Option<u64>,
     request_counter: u64,
@@ -988,7 +989,7 @@ struct EventPump {
 
 impl EventPump {
     /// Ends with what its results reported.
-    fn spawn(mut self, mut events: SessionEvents) -> JoinHandle<RunTotals> {
+    fn spawn(mut self, mut events: SessionEvents) -> JoinHandle<(RunTotals, bool)> {
         tokio::spawn(async move {
             while let Some(envelope) = events.next().await {
                 // Folded in first, so a plugin handling `TurnEnd` finds the
@@ -1004,7 +1005,7 @@ impl EventPump {
             if let Err(e) = self.emit_tasks(unended) {
                 warn!(error = %e, "sdk event pump could not end its subagent tasks");
             }
-            self.reported
+            (self.reported, self.failed)
         })
     }
 
@@ -1027,7 +1028,7 @@ impl EventPump {
 
     fn emit_turn_result(
         &mut self,
-        is_error: bool,
+        failure: Option<&'static str>,
         result: String,
         num_turns: u32,
         totals: RunTotals,
@@ -1043,12 +1044,8 @@ impl EventPump {
         // Zero on an unpriced model, which is what its turns reported too.
         let total_cost_usd = totals.cost.unwrap_or_default();
         self.writer.emit(WireInner::Result(ResultPayload {
-            subtype: if is_error {
-                "error_during_execution"
-            } else {
-                "success"
-            },
-            is_error,
+            subtype: failure.unwrap_or(SUCCESS),
+            is_error: failure.is_some(),
             duration_ms,
             duration_api_ms: duration_ms,
             num_turns,
@@ -1152,13 +1149,19 @@ impl EventPump {
                     .emit_system(NOTICE_SUBTYPE, serde_json::json!({ "text": text }))?;
             }
             AgentEvent::ObservationLine { .. } => {}
+            AgentEvent::ProviderWaiting { message } => {
+                self.writer.emit_system(
+                    NOTIFICATION,
+                    ProviderNotice::new(message.as_deref(), parent_tool_use_id.as_deref()),
+                )?;
+            }
             AgentEvent::Retry {
                 attempt,
                 message,
                 delay_ms,
             } => {
                 self.writer.emit_system(
-                    "api_retry",
+                    API_RETRY,
                     serde_json::json!({
                         "attempt": attempt,
                         "retry_delay_ms": delay_ms,
@@ -1257,28 +1260,27 @@ impl EventPump {
                 reason,
                 ..
             } => {
-                // An interrupted run leaves a partial answer and a dropped one
-                // never ran, so neither is a success.
-                let is_error = match reason {
-                    DoneReason::Cancelled | DoneReason::Dropped => true,
-                    DoneReason::EndTurn
-                    | DoneReason::MaxTokens
-                    | DoneReason::MaxTurns
-                    | DoneReason::Compact => false,
-                };
+                if parent_tool_use_id.is_some() {
+                    return Ok(());
+                }
+                let failure = crate::wire::failure_subtype(*reason);
+                // A client interrupt ends the request successfully, even though its reply is incomplete.
+                self.failed |= failure.is_some() && *reason != DoneReason::Cancelled;
                 let result = mem::take(&mut self.result_text);
                 let totals = RunTotals {
                     usage: *usage,
                     cost: *cost,
                     list_cost: *list_cost,
                 };
-                self.emit_turn_result(is_error, result, *num_turns, totals)?;
+                self.emit_turn_result(failure, result, *num_turns, totals)?;
             }
             AgentEvent::Error {
                 message, totals, ..
-            } => {
-                self.emit_turn_result(true, message.clone(), 0, *totals)?;
+            } if parent_tool_use_id.is_none() => {
+                self.failed = true;
+                self.emit_turn_result(Some(ERROR_DURING_EXECUTION), message.clone(), 0, *totals)?;
             }
+            AgentEvent::Error { .. } => {}
         }
         Ok(())
     }
@@ -1317,40 +1319,6 @@ mod tests {
     use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
     use super::*;
-
-    fn claude_to_maki_tool_name(name: &str) -> &str {
-        TOOL_NAME_MAP
-            .iter()
-            .find(|(_, c)| *c == name)
-            .map(|(m, _)| *m)
-            .unwrap_or(name)
-    }
-
-    #[test_case("bash", "Bash")]
-    #[test_case("read", "Read")]
-    #[test_case("edit", "Edit")]
-    #[test_case("write", "Write")]
-    #[test_case("grep", "Grep")]
-    #[test_case("glob", "Glob")]
-    #[test_case("todo_write", "TodoWrite")]
-    #[test_case("webfetch", "WebFetch")]
-    #[test_case("websearch", "WebSearch")]
-    #[test_case("task", "Task")]
-    #[test_case("multiedit", "MultiEdit")]
-    #[test_case("code_execution", "CodeExecution")]
-    #[test_case("index", "Index")]
-    #[test_case("memory", "Memory")]
-    #[test_case("question", "Question")]
-    fn maki_to_claude_roundtrip(maki: &str, claude: &str) {
-        assert_eq!(maki_to_claude_tool_name(maki), claude);
-        assert_eq!(claude_to_maki_tool_name(claude), maki);
-    }
-
-    #[test]
-    fn unknown_tool_name_passthrough() {
-        assert_eq!(maki_to_claude_tool_name("unknown_tool"), "unknown_tool");
-        assert_eq!(claude_to_maki_tool_name("UnknownTool"), "UnknownTool");
-    }
 
     const MODEL: &str = "test-model";
 
@@ -1539,7 +1507,7 @@ mod tests {
     fn wire_result_serializes_correctly() {
         let msg = WireMessage {
             inner: WireInner::Result(ResultPayload {
-                subtype: "success",
+                subtype: SUCCESS,
                 is_error: false,
                 duration_ms: 1000,
                 duration_api_ms: 1000,
@@ -1554,26 +1522,21 @@ mod tests {
         };
         let json: Value = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["type"], "result");
-        assert_eq!(json["subtype"], "success");
+        assert_eq!(json["subtype"], SUCCESS);
         assert_eq!(json["num_turns"], 1);
         assert!(json.get("session_id").is_some());
     }
 
     #[test]
     fn wire_init_serializes_correctly() {
-        let msg = WireMessage {
-            inner: WireInner::System(SystemPayload {
-                subtype: "init",
-                extra: serde_json::json!({
-                    "cwd": "/tmp",
-                    "tools": ["Read"],
-                    "model": "test",
-                    "permissionMode": "default",
-                }),
+        let session_id = SessionRef::generate();
+        let msg = system_event(
+            &session_id,
+            INIT,
+            serde_json::json!({
+                "cwd": "/tmp", "tools": ["Read"], "model": "test", "permissionMode": "default",
             }),
-            session_id: SessionRef::generate(),
-            uuid: "u".into(),
-        };
+        );
         let json: Value = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["type"], "system");
         assert_eq!(json["subtype"], "init");
@@ -1585,7 +1548,7 @@ mod tests {
         let msg = WireMessage {
             inner: WireInner::ControlResponse(ControlResponsePayload {
                 response: ControlResponseInner {
-                    subtype: "success",
+                    subtype: SUCCESS,
                     request_id: "req_1".into(),
                     response: Some(serde_json::json!({"commands": []})),
                     error: None,
@@ -1766,6 +1729,7 @@ mod tests {
             tasks: SubagentTasks::new(maki_to_claude_tool_name),
             result_text: String::new(),
             reported: RunTotals::default(),
+            failed: false,
             run_id: None,
             request_counter: 0,
             lua_handle: maki_lua::EventHandle::disconnected_for_test(),
@@ -1872,7 +1836,7 @@ mod tests {
         let (mut pump, _out_rx) = test_pump(PermissionMode::Default, answer_tx);
         pump.handle(permission_request()).unwrap();
 
-        pump.emit_turn_result(false, String::new(), 1, RunTotals::default())
+        pump.emit_turn_result(None, String::new(), 1, RunTotals::default())
             .unwrap();
         pump.shared
             .lock()
@@ -1955,6 +1919,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn provider_waiting_emits_keyed_notifications_and_clear() {
+        const WAITING: &str = "waiting for a provider request slot";
+        let (mut pump, mut out_rx) = test_pump(PermissionMode::Default, unbounded_channel().0);
+        for message in [Some(WAITING.to_owned()), None] {
+            pump.handle(top_level(AgentEvent::ProviderWaiting { message }))
+                .unwrap();
+        }
+        let notices: Vec<Value> = iter::from_fn(|| out_rx.try_recv().ok())
+            .map(|line| serde_json::from_str(&line).unwrap())
+            .collect();
+        assert_eq!(notices.len(), 2);
+        for notice in &notices {
+            assert_eq!(notice["type"], "system");
+            assert_eq!(notice["subtype"], NOTIFICATION);
+            assert_eq!(notice["priority"], "low");
+            assert!(notice["uuid"].as_str().is_some());
+            assert_eq!(notice["session_id"], pump.session_id);
+        }
+        assert_eq!(notices[0]["text"], WAITING);
+        assert_eq!(notices[1]["text"], "");
+        assert_eq!(notices[0]["key"], notices[1]["key"]);
+        assert_eq!(pump.result_text, "");
+    }
+
     fn from_subagent(id: &str, event: AgentEvent) -> Envelope {
         Envelope {
             event,
@@ -2023,6 +2012,7 @@ mod tests {
         let wire: Value = serde_json::from_str(&out_rx.try_recv().unwrap()).unwrap();
         assert_eq!(wire["is_error"], true);
         assert_eq!(wire["result"], DROP_REASON);
+        assert!(pump.failed);
     }
 
     /// The SDK has no history replay, so the line goes out live as a system

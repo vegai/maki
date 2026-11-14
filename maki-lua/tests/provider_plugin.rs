@@ -23,7 +23,7 @@ use maki_agent::tools::ToolRegistry;
 use maki_lua::test_support::runtime;
 use maki_lua::{DiscoveredPackage, Origin, PluginHost, PluginPermissions, Requested};
 use maki_providers::model::{Model, ModelTier};
-use maki_providers::provider::Provider;
+use maki_providers::provider::{ModelListing, Provider, RequestScope};
 use maki_providers::retry::RetryKind;
 use maki_providers::test_support::{
     Canned, JSON_HEADERS, Recorded, Requests, isolated_home, serve,
@@ -38,6 +38,10 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use test_case::test_case;
 use tokio::sync::mpsc::unbounded_channel;
+
+#[path = "common/environment.rs"]
+#[allow(dead_code)]
+mod environment;
 
 const SLUG: &str = "acmelua";
 const DISPLAY_NAME: &str = "Acme (Lua)";
@@ -245,7 +249,7 @@ impl Fixture {
     }
 
     fn at(home: TempDir, base_url: &str, server: Requests) -> Self {
-        unsafe { std::env::set_var(BASE_URL_ENV, base_url) };
+        environment::set(BASE_URL_ENV, base_url);
 
         let host = plugin_host();
         host.load_plugin_file(&fixture_path()).expect(LOAD_FAILED);
@@ -306,7 +310,10 @@ fn stream(
             thinking,
             fast: false,
         },
-        None,
+        RequestScope {
+            session_id: None,
+            cwd: Path::new("."),
+        },
     ));
     drop(tx);
     (iter::from_fn(|| rx.try_recv().ok()).collect(), result)
@@ -412,7 +419,7 @@ fn list_models_and_fetch_usage_answer_from_their_hooks() {
     let fixture = Fixture::start(MODELS_SCRIPT);
 
     let models = runtime()
-        .block_on(fixture.provider.list_models())
+        .block_on(fixture.provider.list_models(ModelListing::Refresh))
         .expect(HOOK_FAILED);
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].id, MODEL);
@@ -469,7 +476,7 @@ fn a_refused_side_request_is_the_native_error() {
     let fixture = Fixture::start(OVERLOADED_SCRIPT);
 
     let error = runtime()
-        .block_on(fixture.provider.list_models())
+        .block_on(fixture.provider.list_models(ModelListing::Refresh))
         .unwrap_err();
 
     assert!(
@@ -490,7 +497,7 @@ fn a_side_request_that_cannot_connect_is_a_transport_error() {
     let fixture = Fixture::at(isolated_home(), &base_url, Requests::default());
 
     let error = runtime()
-        .block_on(fixture.provider.list_models())
+        .block_on(fixture.provider.list_models(ModelListing::Refresh))
         .unwrap_err();
 
     assert_eq!(error.retry_kind(), Some(RetryKind::Connect), "{error:?}");

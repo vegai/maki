@@ -42,7 +42,7 @@ async fn load_stack(
                 .unwrap_or_default()
                 .into_config(&names(host)?)
                 .context("invalid config")?;
-            cli.apply_tool_flags(&mut config.agent)?;
+            cli.apply_tool_flags(&mut config.agent);
             config.validate()?;
             Ok(config)
         },
@@ -88,7 +88,11 @@ pub async fn run(
     let (model, warning) =
         setup::resolve_model(model_arg.as_deref(), &config.provider, &storage).await?;
     super::report_warnings(Vec::from_iter(warning));
-    setup::remember_thinking(&mut config.session_defaults, &storage);
+    setup::resolve_thinking(
+        &mut config.session_defaults,
+        &storage,
+        cli.thinking_override(),
+    );
 
     setup::init_logging(&config.storage, trust.project_config.config_root());
     setup::init_telemetry(&config.telemetry);

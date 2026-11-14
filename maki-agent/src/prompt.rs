@@ -367,10 +367,10 @@ mod tests {
     const TOOLLESS_HINT: &str = "Be brief.";
     const PERSONA: &str = "You are a reviewer.";
 
-    #[test_case(ToolFilter::All, true ; "all_tools_sent")]
-    #[test_case(ToolFilter::AllExcept(vec![TOOL_A.into()]), true ; "one_tool_still_sent")]
-    #[test_case(ToolFilter::AllExcept(vec![TOOL_A.into(), TOOL_B.into()]), false ; "every_tool_excluded")]
-    #[test_case(ToolFilter::Only(vec!["other".into()]), false ; "not_allowed")]
+    #[test_case(ToolFilter::default(), true ; "all_tools_sent")]
+    #[test_case(ToolFilter { excluded: vec![TOOL_A.into()], ..Default::default() }, true ; "one_tool_still_sent")]
+    #[test_case(ToolFilter { excluded: vec![TOOL_A.into(), TOOL_B.into()], ..Default::default() }, false ; "every_tool_excluded")]
+    #[test_case(ToolFilter { allowed: Some(vec!["other".into()]), ..Default::default() }, false ; "not_allowed")]
     fn hints_follow_their_plugins_tools(filter: ToolFilter, hinted: bool) {
         let registry = ToolRegistry::new();
         for name in [TOOL_A, TOOL_B] {

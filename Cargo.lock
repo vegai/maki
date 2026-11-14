@@ -3328,18 +3328,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jsonrepair"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbd084aab201d699b6da54bc10fbedf1ab92c984eeb306d40546fa675184ec06"
-dependencies = [
- "memchr",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
-]
-
-[[package]]
 name = "jsonschema"
 version = "0.60.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3619,6 +3607,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-width",
  "uuid",
+ "wait-timeout",
 ]
 
 [[package]]
@@ -3655,7 +3644,6 @@ dependencies = [
  "grep-searcher",
  "ignore",
  "jiff",
- "jsonrepair",
  "maki-config",
  "maki-otel",
  "maki-providers",
@@ -3839,6 +3827,7 @@ dependencies = [
  "tree-sitter-vlang",
  "tree-sitter-yaml",
  "tree-sitter-zig",
+ "unicode-general-category",
  "unicode-width",
  "url",
 ]
@@ -3914,10 +3903,12 @@ dependencies = [
  "inventory",
  "jiff",
  "keyring",
+ "libc",
  "maki-config",
  "maki-storage",
  "open",
  "reqwest",
+ "rustix 1.1.6",
  "serde",
  "serde-saphyr",
  "serde_json",
@@ -3928,10 +3919,12 @@ dependencies = [
  "test-case",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",
  "url",
+ "wait-timeout",
 ]
 
 [[package]]
@@ -8180,6 +8173,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d9b2acfb050df409c972a37d3b8e08cdea3bddb0c09db9d53137e504cfabed0"
 dependencies = [
  "utf8parse",
+]
+
+[[package]]
+name = "wait-timeout"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09ac3b126d3914f9849036f826e054cbabdc8519970b8998ddaf3b5bd3c65f11"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

@@ -100,6 +100,7 @@ fn spec_row(decl: &ProviderDecl, target: Target, models: &'static [ModelEntry]) 
         fallback_max_output: decl.max_output_tokens.unwrap_or(max_output),
         fallback_context_window: decl.context_window.unwrap_or(context_window),
         models_toml: NO_CURATED_MODELS,
+        models_of: None,
         pricing_schedule: decl.pricing_schedule.clone().map(leak),
         build: Build::Declared(models),
         aperture: decl.aperture.as_ref().map(|route| ApertureRoute {

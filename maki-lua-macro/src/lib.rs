@@ -188,12 +188,22 @@ fn parse_lua_fn_args(attr: TokenStream) -> syn::Result<LuaFnArgs> {
 /// `name = "<lua name>"`.
 #[proc_macro_attribute]
 pub fn lua_fn(attr: TokenStream, item: TokenStream) -> TokenStream {
+    expand_attribute(attr, item, false)
+}
+
+/// Register a synchronous value and its documentation in `lua_table!`.
+#[proc_macro_attribute]
+pub fn lua_value(attr: TokenStream, item: TokenStream) -> TokenStream {
+    expand_attribute(attr, item, true)
+}
+
+fn expand_attribute(attr: TokenStream, item: TokenStream, value: bool) -> TokenStream {
     let args = match parse_lua_fn_args(attr) {
         Ok(a) => a,
         Err(e) => return e.to_compile_error().into(),
     };
     let mut func = parse_macro_input!(item as ItemFn);
-    match expand_lua_fn(args, &mut func) {
+    match expand_lua_fn(args, &mut func, value) {
         Ok(ts) => ts.into(),
         Err(e) => {
             let err = e.to_compile_error();
@@ -263,7 +273,7 @@ fn classify_params(func: &mut ItemFn) -> syn::Result<FnParams> {
     Ok(out)
 }
 
-fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2> {
+fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn, value: bool) -> syn::Result<TokenStream2> {
     let fn_ident = func.sig.ident.clone();
     let span = fn_ident.span();
     let is_async = func.sig.asyncness.is_some();
@@ -326,9 +336,26 @@ fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2
             returns: #returns,
             example: #example,
             guard: #guard_doc,
-            value: false,
+            value: #value,
         };
     };
+
+    if value {
+        if is_async || method.is_some() || !ctx.is_empty() || !real.is_empty() || !guard.is_empty()
+        {
+            return Err(syn::Error::new(
+                span,
+                "lua_value takes only the Lua handle and cannot yield or have a guard",
+            ));
+        }
+        return Ok(quote! {
+            #func
+            #doc_const
+            pub(crate) fn #reg_ident(t: &mlua::Table, lua: &mlua::Lua) -> mlua::Result<()> {
+                t.set(#lua_name, #fn_ident(lua)?)
+            }
+        });
+    }
 
     let ctx_idents: Vec<&Ident> = ctx.iter().map(|(i, _)| i).collect();
     let ctx_tys: Vec<&Type> = ctx.iter().map(|(_, t)| t).collect();
@@ -375,8 +402,10 @@ fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2
         (false, false) => quote!(lua.create_function(#closure)?),
         (false, true) => quote!(lua.create_async_function(#closure)?),
     };
-    let perms_param =
-        guarded.then(|| quote!(, perms: &crate::plugin_permissions::PluginPermissions));
+    let perms_param = guarded.then(
+        || quote!(, perms: impl std::borrow::Borrow<crate::plugin_permissions::PluginPermissions>),
+    );
+    let borrow_perms = guarded.then(|| quote!(let perms: &crate::plugin_permissions::PluginPermissions = std::borrow::Borrow::borrow(&perms);));
 
     Ok(quote! {
         #func
@@ -387,6 +416,7 @@ fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2
             #perms_param
             #(, #ctx_idents: #ctx_tys)*
         ) -> mlua::Result<()> {
+            #borrow_perms
             t.set(#lua_name, #create)
         }
     })

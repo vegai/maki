@@ -3,6 +3,8 @@
 
 #![allow(dead_code, reason = "each test binary uses a different part")]
 
+pub mod environment;
+
 use std::fs;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -19,7 +21,7 @@ use maki_agent::{
 };
 use maki_lua::test_support::{runtime, wait_next, wait_reply};
 use maki_lua::{EventHandle, MoveOutcome, PluginHost, SessionEndReason, UiAction};
-use maki_providers::provider::{BoxFuture, Provider};
+use maki_providers::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use maki_providers::{
     AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
     StopReason, StreamResponse, TokenUsage,
@@ -222,7 +224,7 @@ impl Provider for ParkedProvider {
         _: &'a Value,
         _: &'a UnboundedSender<ProviderEvent>,
         _: RequestOptions,
-        _: Option<&'a SessionRef>,
+        _: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let _ = self.user_turns.send(closing_user_texts(messages));
@@ -251,7 +253,7 @@ impl Provider for ParkedProvider {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(&self, _: ModelListing) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }

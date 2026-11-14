@@ -1,6 +1,7 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use maki_providers::provider::Provider;
+use maki_providers::provider::{Provider, RequestScope};
 use maki_providers::{Message, Model, ProviderEvent, RequestOptions};
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionTools;
@@ -92,6 +93,7 @@ impl App {
             system,
             tools,
             messages,
+            cwd: self.permissions.cwd(),
         };
         tokio::spawn(request.run(tx));
     }
@@ -105,6 +107,7 @@ struct BtwRequest {
     messages: Vec<Message>,
     opts: RequestOptions,
     session_id: SessionRef,
+    cwd: PathBuf,
 }
 
 impl BtwRequest {
@@ -124,7 +127,10 @@ impl BtwRequest {
                     &self.tools,
                     &event_tx,
                     self.opts,
-                    Some(&self.session_id),
+                    RequestScope {
+                        session_id: Some(&self.session_id),
+                        cwd: &self.cwd,
+                    },
                 )
                 .await;
             drop(event_tx);
@@ -142,7 +148,9 @@ impl BtwRequest {
                         let _ = btw_tx.send(BtwEvent::Error(reached_for_tool(&name))).await;
                         return false;
                     }
-                    ProviderEvent::PromptProgress { .. } => continue,
+                    ProviderEvent::PromptProgress { .. } | ProviderEvent::Waiting { .. } => {
+                        continue;
+                    }
                 };
                 if btw_tx.send(event).await.is_err() {
                     return false;
@@ -181,7 +189,7 @@ mod tests {
     use maki_agent::prompt::{PromptId, Slot};
     use maki_agent::tools::ToolRegistry;
     use maki_lua::PluginHost;
-    use maki_providers::provider::BoxFuture;
+    use maki_providers::provider::{BoxFuture, ModelListing};
     use maki_providers::{
         AgentError, ContentBlock, Effort, ModelInfo, Role, StopReason, StreamResponse,
         ThinkingConfig, TokenUsage,
@@ -189,6 +197,7 @@ mod tests {
     use maki_storage::frame::{PromptFacts, StoredFrame};
     use serde_json::json;
     use std::iter;
+    use std::path::Path;
     use test_case::test_case;
     use tokio::sync::mpsc::UnboundedSender;
 
@@ -198,12 +207,14 @@ mod tests {
     const OTHER_MODEL: &str = "anthropic/other-model";
     const THOUGHT: &str = "sqlite needs no server";
     const SIGNATURE: &str = "bound-to-the-old-prefix";
+    const SESSION_DIR: &str = "/session/dir";
 
     struct Recorded {
         messages: Vec<Message>,
         system: String,
         tools: Value,
         opts: RequestOptions,
+        cwd: PathBuf,
     }
 
     struct FakeProvider {
@@ -220,7 +231,7 @@ mod tests {
             tools: &'a Value,
             events: &'a UnboundedSender<ProviderEvent>,
             opts: RequestOptions,
-            _: Option<&'a SessionRef>,
+            scope: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 let _ = self.sent.send(Recorded {
@@ -228,6 +239,7 @@ mod tests {
                     system: system.to_owned(),
                     tools: tools.clone(),
                     opts,
+                    cwd: scope.cwd.to_owned(),
                 });
                 for event in self.script.iter().cloned() {
                     events.send(event).unwrap();
@@ -241,7 +253,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
     }
@@ -318,6 +333,13 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn side_question_runs_in_the_session_directory() {
+        let mut app = test_app();
+        app.permissions.set_cwd(PathBuf::from(SESSION_DIR));
+        assert_eq!(ask(&mut app).await.cwd, Path::new(SESSION_DIR));
+    }
+
     /// Some models cannot turn thinking off, so without the session's wire the
     /// old signatures must go or Anthropic rejects the request.
     #[test_case(Some(test_model().spec()), wire(), ThinkingConfig::Effort(Effort::High), Some(SIGNATURE) ; "live_wire_shares_the_cache_prefix")]
@@ -365,6 +387,7 @@ mod tests {
             messages: vec![btw_question(Q)],
             opts: RequestOptions::default(),
             session_id: SessionRef::generate(),
+            cwd: PathBuf::from(SESSION_DIR),
         }
         .run(tx)
         .await;

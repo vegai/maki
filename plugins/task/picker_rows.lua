@@ -14,7 +14,11 @@ local M = {}
 
 -- An idle plugin task is waiting for its next prompt, not finished.
 local function alive(status)
-  return status == "working" or status == "idle"
+  return status == "working" or status == "idle" or status == "queued"
+end
+
+local function running(task)
+  return task.status == "working" or task.status == "queued"
 end
 
 local function index_by_id(tasks)
@@ -66,7 +70,7 @@ end
 function M.working(tasks)
   local n = 0
   for _, task in ipairs(tasks) do
-    if task.status == "working" and not task.wrapper then
+    if running(task) and not task.wrapper then
       n = n + 1
     end
   end

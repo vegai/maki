@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::join_all;
-use maki_agent::cancel::CancelToken;
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use mlua::{Function, Lua, MultiValue, Result as LuaResult, Table, Value};
 use tokio::sync::mpsc::channel;
@@ -11,8 +10,7 @@ use tokio::task::yield_now;
 
 use crate::docs::{FnDoc, ParamDoc};
 use crate::runtime::{
-    SpawnedTask, TaskHandle, enqueue_async_task, enqueue_spawned_task, lock_cell,
-    register_cancel_hook,
+    SpawnedTask, enqueue_async_task, enqueue_spawned_task, register_cancel_hook, task_cancel,
 };
 
 const AWAIT_MIN_ARGS: usize = 2;
@@ -41,10 +39,7 @@ struct LuaPermit {
 async fn acquire(lua: Lua, this: mlua::UserDataRef<LuaSemaphore>) -> LuaResult<LuaPermit> {
     let sem = Arc::clone(&this.sem);
     drop(this);
-    let cancel = lua
-        .app_data_ref::<TaskHandle>()
-        .map(|h| lock_cell(&h).cancel.clone())
-        .unwrap_or_else(CancelToken::none);
+    let cancel = task_cancel(&lua);
     let guard = cancel
         .race(sem.acquire_owned())
         .await
@@ -310,10 +305,7 @@ async fn sleep(lua: Lua, ms: i64) -> LuaResult<()> {
         yield_now().await;
         return Ok(());
     }
-    let cancel = lua
-        .app_data_ref::<TaskHandle>()
-        .map(|h| lock_cell(&h).cancel.clone())
-        .unwrap_or_else(CancelToken::none);
+    let cancel = task_cancel(&lua);
     cancel
         .race(tokio::time::sleep(Duration::from_millis(ms as u64)))
         .await
@@ -471,7 +463,8 @@ pub(crate) fn create_async_table(lua: &Lua, plugin: Arc<str>) -> LuaResult<Table
             let insert_pos = (argc - 1).min(args_vec.len());
             args_vec.insert(insert_pos, Value::Function(callback));
 
-            fun.call::<()>(MultiValue::from_iter(args_vec))?;
+            fun.call_async::<()>(MultiValue::from_iter(args_vec))
+                .await?;
 
             let result = rx
                 .recv()
@@ -537,14 +530,14 @@ mod tests {
     use std::sync::Mutex;
 
     use futures::FutureExt;
-    use maki_agent::cancel::CancelTrigger;
+    use maki_agent::cancel::{CancelToken, CancelTrigger};
     use mlua::Lua;
     use test_case::test_case;
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
     use tokio::task::{LocalSet, spawn_local};
 
     use super::*;
-    use crate::runtime::{CANCELLED_MSG, TaskCell, TaskScope, wake_or_fail};
+    use crate::runtime::{CANCELLED_MSG, TaskCell, TaskHandle, TaskScope, wake_or_fail};
 
     const ERR_TOO_FEW_ARGS: &str = "maki.async.await requires at least 2 arguments: argc, fun, ...";
     const ERR_ARGC_GE_1: &str = "argc must be >= 1";
@@ -613,21 +606,27 @@ mod tests {
         assert_eq!(result, expected_pos as i64);
     }
 
-    #[tokio::test]
-    async fn await_returns_multivalue_from_callback() {
-        let (lua, _tbl) = setup();
-        let code = r#"
-            local function producer(cb)
-                cb("hello", 42, true)
-            end
-            return async_tbl.await(1, producer)
-        "#;
-        let results = lua.load(code).eval_async::<MultiValue>().await.unwrap();
-        let vals: Vec<Value> = results.into_vec();
-        assert_eq!(vals.len(), 3);
-        assert_eq!(vals[0].as_string().unwrap().to_string_lossy(), "hello");
-        assert_eq!(vals[1].as_integer().unwrap(), 42);
-        assert!(vals[2].as_boolean().unwrap());
+    #[test_case(false ; "synchronous_registration")]
+    #[test_case(true ; "yielding_registration")]
+    fn await_returns_multivalue_from_callback(yielding: bool) {
+        crate::test_support::runtime().block_on(async {
+            let (lua, _tbl) = setup();
+            lua.globals().set("yielding", yielding).unwrap();
+            let code = r#"
+                local function producer(cb)
+                    if yielding then async_tbl.sleep(0) end
+                    cb("hello", 42, true)
+                    cb("ignored")
+                end
+                return async_tbl.await(1, producer)
+            "#;
+            let results = lua.load(code).eval_async::<MultiValue>().await.unwrap();
+            let vals: Vec<Value> = results.into_vec();
+            assert_eq!(vals.len(), 3);
+            assert_eq!(vals[0].as_string().unwrap().to_string_lossy(), "hello");
+            assert_eq!(vals[1].as_integer().unwrap(), 42);
+            assert!(vals[2].as_boolean().unwrap());
+        });
     }
 
     /// A second call used to block the Lua thread for good.

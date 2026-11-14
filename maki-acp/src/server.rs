@@ -29,7 +29,7 @@ use maki_agent::{
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults, TrustConfig};
 use maki_providers::model::Model;
-use maki_providers::provider::{available_model_specs, fetch_all_models};
+use maki_providers::provider::{ModelListing, available_model_specs, fetch_all_models};
 use maki_providers::settle_session;
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
@@ -97,6 +97,7 @@ struct Server {
     model_specs: Vec<String>,
     model_policy: Arc<ModelPolicy>,
     client_elicits_form: bool,
+    client_receives_notices: bool,
     defaults: SessionDefaults,
     session: Option<SessionState>,
     on_session_end: Option<SessionEndHook>,
@@ -133,6 +134,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         model_specs: available_model_specs(&params.model_policy),
         model_policy: Arc::clone(&params.model_policy),
         client_elicits_form: false,
+        client_receives_notices: false,
         defaults: params.defaults,
         session: None,
         on_session_end: params.on_session_end.clone(),
@@ -190,6 +192,7 @@ fn discover_models(policy: Arc<ModelPolicy>, tx: WeakUnboundedSender<Incoming>) 
                 }
             },
             None,
+            ModelListing::Cached,
         )
         .await;
     });
@@ -261,8 +264,14 @@ async fn handle_request(
 ) {
     let result = match method {
         "initialize" => {
-            srv.client_elicits_form = parse_params::<InitializeRequest>(raw)
-                .is_ok_and(|req| elicitation::supports_form(&req.client_capabilities));
+            let capabilities = parse_params::<InitializeRequest>(raw)
+                .map(|req| req.client_capabilities)
+                .unwrap_or_default();
+            srv.client_elicits_form = elicitation::supports_form(&capabilities);
+            srv.client_receives_notices = capabilities
+                .session
+                .as_ref()
+                .is_some_and(|session| session.notices.is_some());
             Ok(AgentResponse::InitializeResponse(
                 methods::initialize_response(),
             ))
@@ -480,7 +489,6 @@ fn start_session(
         initial_wd: cwd.clone(),
         resumed,
         claim: claim.clone(),
-        storage: params.storage.clone(),
         yolo: params.yolo,
         unattended: false,
         host_prompt: params.host_prompt.clone(),
@@ -509,6 +517,7 @@ fn start_session(
         maki_storage::paths::home(),
         project_trusted,
         initial_cost,
+        srv.client_receives_notices,
     );
     srv.session = Some(SessionState {
         handle,
@@ -947,6 +956,7 @@ fn start_event_pump(
     home: Option<PathBuf>,
     project_trusted: bool,
     initial_cost: Option<f64>,
+    notices: bool,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let sid = SessionId::from(session_id.to_string());
@@ -1033,6 +1043,16 @@ fn start_event_pump(
                         request,
                     );
                     continue;
+                }
+                AgentEvent::ProviderWaiting { message } => {
+                    let Some(message) = message else {
+                        continue;
+                    };
+                    let text = match subagent {
+                        Some(info) => format!("{}: {message}", info.name),
+                        None => message,
+                    };
+                    translate::provider_waiting(text, notices)
                 }
                 _ if subagent.is_some() => continue,
                 AgentEvent::TextDelta { text } => translate::text_delta(&text),
@@ -1155,7 +1175,7 @@ mod tests {
     use maki_storage::trusted_folders::{CanonicalFolder, TrustStatus, TrustedFolders};
     use std::future;
     use std::iter;
-    use tokio::sync::watch;
+    use tokio::sync::{oneshot, watch};
 
     use tempfile::TempDir;
     use test_case::test_case;
@@ -1390,7 +1410,7 @@ mod tests {
         let (out_tx, out_rx) = unbounded_channel();
         let claim = SessionClaim::fresh(&StateDir::from_path(FIXTURE_CLAIMS.path().to_path_buf()));
         let handle = InteractiveHandle {
-            tool_names: Vec::new(),
+            ready: oneshot::channel().1,
             input_tx: unbounded_channel().0,
             answer_tx,
             cancel_tx: watch::channel(()).0,
@@ -1412,6 +1432,7 @@ mod tests {
             model_specs: Vec::new(),
             model_policy: Arc::new(ModelPolicy::default()),
             client_elicits_form: false,
+            client_receives_notices: false,
             defaults: SessionDefaults::default(),
             on_session_end: None,
             session: Some(SessionState {
@@ -1548,6 +1569,7 @@ mod tests {
             None,
             PUMP_TRUSTED,
             initial_cost,
+            srv.client_receives_notices,
         );
         let sender = guard.sender(0);
         feed(&sender);
@@ -1959,6 +1981,54 @@ mod tests {
         assert_eq!(answer["id"], PROMPT_ID);
         assert_eq!(answer["error"]["code"], i32::from(expected.code));
         assert_eq!(answer["error"]["data"], TURN_ERROR);
+    }
+
+    #[test_case(true, false, "notice" ; "negotiated_notice")]
+    #[test_case(false, false, "agent_thought_chunk" ; "compatible_thought_fallback")]
+    #[test_case(true, true, "notice" ; "subagent_notice")]
+    #[test_case(false, true, "agent_thought_chunk" ; "subagent_fallback")]
+    #[tokio::test]
+    async fn provider_waiting_reaches_acp_without_leaving_the_prompt_pending(
+        notices: bool,
+        child: bool,
+        kind: &str,
+    ) {
+        const WAITING: &str = "waiting for a provider request slot";
+        let (mut srv, .., mut out_rx) = test_server();
+        srv.client_receives_notices = notices;
+        pending(&srv).lock().unwrap().prompt = Some(RequestId::Number(PROMPT_ID));
+        run_pump(&srv, None, |sender| {
+            sender
+                .send_envelope(Envelope {
+                    event: AgentEvent::ProviderWaiting {
+                        message: Some(WAITING.to_owned()),
+                    },
+                    subagent: child.then(|| subagent(None)),
+                    run_id: 0,
+                })
+                .unwrap();
+            sender
+                .send(AgentEvent::ProviderWaiting { message: None })
+                .unwrap();
+            sender.send(done_event()).unwrap();
+        })
+        .await;
+        let event = out_rx.try_recv().unwrap();
+        let update = &event["params"]["update"];
+        assert_eq!(update["sessionUpdate"], kind);
+        let expected = if child {
+            format!("{SUBAGENT_NAME}: {WAITING}")
+        } else {
+            WAITING.to_owned()
+        };
+        if notices {
+            assert_eq!(update["title"], expected);
+        } else {
+            assert_eq!(update["content"]["text"], format!("{expected}\n\n"));
+        }
+        assert_eq!(out_rx.try_recv().unwrap()["id"], PROMPT_ID);
+        assert!(out_rx.is_empty());
+        assert!(pending(&srv).lock().unwrap().prompt.is_none());
     }
 
     /// A cached input holds the whole file a `write` is about to lay down, and
