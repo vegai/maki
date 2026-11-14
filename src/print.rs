@@ -4,8 +4,8 @@
 //! unchanged. Keep `PrintResult` fields a strict subset of theirs. `StreamJson`
 //! is JSONL with the same shape, `Text` prints the raw response only.
 //!
-//! We adopt new fields when Claude Code adds them but never invent our own.
-//! Check their docs before changing anything here.
+//! Keep Claude Code fields compatible with its wire format. Maki adds `thinking` to init
+//! metadata so scripted callers can inspect the effective, model-clamped setting.
 
 use std::io::{self, Read};
 use std::mem;
@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
 use color_eyre::Result;
-use color_eyre::eyre::{Context, eyre};
-use maki_agent::headless::{self, BackgroundMode, InteractiveHandle, InteractiveParams};
+use color_eyre::eyre::{Context, bail, eyre};
+use maki_agent::headless::{self, BackgroundMode, InteractiveHandle, InteractiveParams, Ready};
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::session::Resumed;
 use maki_agent::tools::QUESTION_TOOL_NAME;
@@ -25,19 +25,23 @@ use maki_agent::{
     InputSource, PermissionsConfig, SteerKind,
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
+use maki_lua::EventHandle;
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
-use maki_lua::{EventHandle, SessionEndReason};
 use maki_providers::TokenUsage;
 use maki_providers::model::Model;
-use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::headless_startup::{shutdown, start_mcp, startup};
 use crate::interrupt::Interrupt;
 use crate::sdk_mode::NOTICE_SUBTYPE;
 use crate::subagent_tasks::{SubagentTasks, TaskMessage};
+use crate::wire::{
+    API_RETRY, ERROR_DURING_EXECUTION, INIT, NOTIFICATION, ProviderNotice, SUCCESS,
+    failure_subtype, system_event,
+};
 
 const SESSION_LINE_PREFIX: &str = "session: ";
 
@@ -77,15 +81,29 @@ struct PrintResult {
     usage: TokenUsage,
 }
 
+impl PrintResult {
+    fn error(session_id: SessionRef, duration_ms: u128, result: String) -> Self {
+        Self {
+            result_type: "result",
+            subtype: ERROR_DURING_EXECUTION,
+            is_error: true,
+            duration_ms,
+            num_turns: 0,
+            result,
+            stop_reason: None,
+            session_id,
+            total_cost_usd: 0.0,
+            usage: TokenUsage::default(),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct InitEvent<'a> {
-    #[serde(rename = "type")]
-    event_type: &'static str,
-    subtype: &'static str,
     cwd: &'a str,
-    session_id: &'a SessionRef,
     tools: &'a [String],
     model: &'a str,
+    thinking: String,
 }
 
 #[derive(Serialize)]
@@ -127,11 +145,7 @@ struct UserMessage<'a> {
 /// between them that says what woke it.
 #[derive(Serialize)]
 struct NoticeEvent<'a> {
-    #[serde(rename = "type")]
-    event_type: &'static str,
-    subtype: &'static str,
     text: &'a str,
-    session_id: &'a SessionRef,
 }
 
 #[derive(Serialize)]
@@ -157,13 +171,9 @@ impl<'a> TaskEvent<'a> {
 
 #[derive(Serialize)]
 struct RetryEvent<'a> {
-    #[serde(rename = "type")]
-    event_type: &'static str,
-    subtype: &'static str,
     attempt: u32,
     retry_delay_ms: u64,
     error: &'a str,
-    session_id: &'a SessionRef,
 }
 
 /// What the result reports besides the spend. A turn woken by a background
@@ -195,17 +205,17 @@ impl Totals {
             }
             AgentEvent::Done {
                 num_turns, reason, ..
-            } => {
+            } if parent_tool_use_id.is_none() => {
                 self.num_turns += *num_turns;
                 self.stop_reason = Some(*reason);
                 // Only a stop cancels a run here, and its answer is cut short.
-                self.is_error |= *reason == DoneReason::Cancelled;
+                self.is_error |= failure_subtype(*reason).is_some();
                 let run_text = mem::take(&mut self.run_text);
                 if !run_text.is_empty() {
                     self.result_text = run_text;
                 }
             }
-            AgentEvent::Error { message, .. } => {
+            AgentEvent::Error { message, .. } if parent_tool_use_id.is_none() => {
                 self.is_error = true;
                 self.result_text = message.clone();
                 return false;
@@ -238,8 +248,9 @@ impl VerboseOutput {
 }
 
 pub struct PrintParams {
+    pub dry_run: bool,
     pub model: Model,
-    pub prompt: Option<String>,
+    pub prompt: String,
     pub image_paths: Vec<PathBuf>,
     pub format: OutputFormat,
     pub verbose: bool,
@@ -258,16 +269,26 @@ pub struct PrintParams {
     /// The right to write [`Self::resumed`]'s session, taken when it was
     /// resolved and held for the whole run.
     pub claim: SessionClaim,
-    pub storage: StateDir,
     /// How long to wait for background work once the prompt's run ends.
     /// `None` runs every call blocking instead.
     pub background_wait: Option<Duration>,
 }
 
-/// Hands back the interrupt it ran under, for the caller to exit with once
-/// the plugin host is down.
-pub async fn run(params: PrintParams) -> Result<Interrupt> {
+pub fn read_prompt(prompt: Option<String>, dry_run: bool) -> Result<String> {
+    match prompt {
+        Some(p) => Ok(p),
+        None if dry_run => Ok(String::new()),
+        None => {
+            let mut buf = String::new();
+            io::stdin().read_to_string(&mut buf).context("read stdin")?;
+            Ok(buf)
+        }
+    }
+}
+
+pub async fn run(params: PrintParams, interrupt: &Interrupt) -> Result<()> {
     let PrintParams {
+        dry_run,
         model,
         prompt,
         image_paths,
@@ -284,22 +305,10 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         host_prompt,
         resumed,
         claim,
-        storage,
         background_wait,
     } = params;
 
-    let prompt = match prompt {
-        Some(p) => p,
-        None => {
-            let mut buf = String::new();
-            io::stdin().read_to_string(&mut buf).context("read stdin")?;
-            buf
-        }
-    };
-
     let images = load_images(&image_paths)?;
-    // After the prompt is read, so a signal still ends a stdin read at once.
-    let interrupt = Interrupt::install();
 
     let prompt_slots = lua_handle
         .collect_prompt_slots(Some(resumed.id.as_str()))
@@ -307,11 +316,7 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
 
     let initial_wd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let cwd = initial_wd.to_string_lossy().into_owned();
-    let (mcp_handle, mcp_config_errors) =
-        maki_agent::mcp::start_connected(&initial_wd, project_config.clone()).await;
-    if !mcp_config_errors.is_empty() {
-        eprintln!("MCP config error: {mcp_config_errors}");
-    }
+    let mcp_handle = start_mcp(&initial_wd, project_config.clone()).await;
 
     let (handle, mut events) = headless::spawn_interactive(InteractiveParams {
         model: model.clone(),
@@ -324,7 +329,6 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         initial_wd,
         resumed,
         claim,
-        storage,
         yolo: false,
         unattended: true,
         host_prompt,
@@ -338,19 +342,60 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
     });
 
     let InteractiveHandle {
-        ready,
+        mut ready,
         input_tx,
         session_id,
         task,
         spend,
         ..
     } = handle;
-    let tool_names = ready
-        .await
-        .map(|ready| ready.tool_names)
-        .unwrap_or_default();
-    // One prompt, then the input ends. A session that never connected has
-    // already said why on the event stream.
+    let start = Instant::now();
+    let mut verbose_out = match format {
+        OutputFormat::StreamJson => Some(VerboseOutput::StreamJson),
+        _ if verbose => Some(VerboseOutput::Json(Vec::new())),
+        _ => None,
+    };
+
+    let Ready {
+        model,
+        tool_names,
+        thinking,
+    } = match startup(&mut ready, &mut events).await {
+        Ok(started) => started,
+        Err(error) => {
+            drop(shutdown(task, &lua_handle, &session_id).await);
+            if !matches!(format, OutputFormat::Text) {
+                write_result(
+                    format,
+                    verbose_out,
+                    PrintResult::error(session_id, start.elapsed().as_millis(), error.to_string()),
+                )?;
+            }
+            return Err(error);
+        }
+    };
+
+    let init = system_event(
+        &session_id,
+        INIT,
+        InitEvent {
+            cwd: &cwd,
+            tools: &tool_names,
+            model: &model.id,
+            thinking,
+        },
+    );
+    if dry_run {
+        drop(input_tx);
+        drop(shutdown(task, &lua_handle, &session_id).await);
+        println!("{}", serde_json::to_string(&init)?);
+        return Ok(());
+    }
+    match &mut verbose_out {
+        Some(out) => out.emit(&init)?,
+        None => eprintln!("{SESSION_LINE_PREFIX}{session_id}"),
+    }
+    drop(init);
     let _ = input_tx.send(AgentInput::from_defaults(
         prompt,
         AgentMode::Build,
@@ -359,27 +404,6 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         InputSource::Headless,
     ));
     drop(input_tx);
-    let start = Instant::now();
-
-    let mut verbose_out = match format {
-        OutputFormat::StreamJson => Some(VerboseOutput::StreamJson),
-        _ if verbose => Some(VerboseOutput::Json(Vec::new())),
-        _ => None,
-    };
-
-    match &mut verbose_out {
-        Some(out) => out.emit(&InitEvent {
-            event_type: "system",
-            subtype: "init",
-            cwd: &cwd,
-            session_id: &session_id,
-            tools: &tool_names,
-            model: &model.id,
-        })?,
-        // Text mode never says which session it wrote, and a later `-r`
-        // needs it. On stderr so a pipe reading the answer is unaffected.
-        None => eprintln!("{SESSION_LINE_PREFIX}{session_id}"),
-    }
 
     let mut totals = Totals::default();
     // The stream shows Maki's own tool names, so a task message does too.
@@ -418,7 +442,6 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         }
         match event {
             AgentEvent::TextDelta { .. }
-            | AgentEvent::ProviderWaiting { .. }
             | AgentEvent::ThinkingDelta { .. }
             | AgentEvent::ToolPending { .. }
             | AgentEvent::ToolStart(_)
@@ -450,12 +473,25 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
                     .as_mut()
                     .filter(|_| parent_tool_use_id.is_none())
                 {
-                    out.emit(&NoticeEvent {
-                        event_type: "system",
-                        subtype: NOTICE_SUBTYPE,
-                        text,
-                        session_id: &session_id,
-                    })?;
+                    out.emit(&system_event(
+                        &session_id,
+                        NOTICE_SUBTYPE,
+                        NoticeEvent { text },
+                    ))?;
+                }
+            }
+            AgentEvent::ProviderWaiting { message } => {
+                if let Some(out) = &mut verbose_out {
+                    out.emit(&system_event(
+                        &session_id,
+                        NOTIFICATION,
+                        ProviderNotice::new(message.as_deref(), parent_tool_use_id),
+                    ))?;
+                } else if let Some(message) = message {
+                    match &subagent {
+                        Some(info) => eprintln!("{}: {message}", info.name),
+                        None => eprintln!("{message}"),
+                    }
                 }
             }
             AgentEvent::Retry {
@@ -464,14 +500,15 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
                 delay_ms,
             } => {
                 if let Some(out) = &mut verbose_out {
-                    out.emit(&RetryEvent {
-                        event_type: "system",
-                        subtype: "api_retry",
-                        attempt: *attempt,
-                        retry_delay_ms: *delay_ms,
-                        error: message,
-                        session_id: &session_id,
-                    })?;
+                    out.emit(&system_event(
+                        &session_id,
+                        API_RETRY,
+                        RetryEvent {
+                            attempt: *attempt,
+                            retry_delay_ms: *delay_ms,
+                            error: message,
+                        },
+                    ))?;
                 }
             }
             AgentEvent::TurnComplete(tc) => {
@@ -509,10 +546,7 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
             out.emit_tasks(task_messages.after, &session_id)?;
         }
     }
-    let track = headless::await_shutdown(task).await;
-    lua_handle
-        .end_sessions([session_id.id()], SessionEndReason::Completed)
-        .await;
+    let track = shutdown(task, &lua_handle, &session_id).await;
     if let Some(out) = &mut verbose_out {
         out.emit_tasks(tasks.finish(), &session_id)?;
     }
@@ -535,34 +569,52 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
     // Zero on an unpriced model, which is what its turns reported too.
     let total_cost_usd = spent.cost.unwrap_or_default();
 
-    match format {
-        OutputFormat::Text => {
-            print!("{result_text}");
-        }
-        OutputFormat::Json | OutputFormat::StreamJson => {
-            let result = PrintResult {
-                result_type: "result",
-                subtype: if is_error { "error" } else { "success" },
-                is_error,
-                duration_ms,
-                num_turns,
-                result: result_text,
-                stop_reason,
-                session_id,
-                total_cost_usd,
-                usage: spent.usage,
-            };
-            match verbose_out {
-                Some(VerboseOutput::Json(mut events)) => {
-                    events.push(serde_json::to_value(&result)?);
-                    println!("{}", serde_json::to_string(&events)?);
-                }
-                _ => println!("{}", serde_json::to_string(&result)?),
-            }
-        }
+    let subtype = stop_reason
+        .and_then(failure_subtype)
+        .unwrap_or(if is_error {
+            ERROR_DURING_EXECUTION
+        } else {
+            SUCCESS
+        });
+    write_result(
+        format,
+        verbose_out,
+        PrintResult {
+            result_type: "result",
+            subtype,
+            is_error,
+            duration_ms,
+            num_turns,
+            result: result_text,
+            stop_reason,
+            session_id,
+            total_cost_usd,
+            usage: spent.usage,
+        },
+    )?;
+    if is_error {
+        bail!("headless run ended with {subtype}");
     }
 
-    Ok(interrupt)
+    Ok(())
+}
+
+fn write_result(
+    format: OutputFormat,
+    verbose_out: Option<VerboseOutput>,
+    result: PrintResult,
+) -> Result<()> {
+    match format {
+        OutputFormat::Text => print!("{}", result.result),
+        OutputFormat::Json | OutputFormat::StreamJson => match verbose_out {
+            Some(VerboseOutput::Json(mut events)) => {
+                events.push(serde_json::to_value(&result)?);
+                println!("{}", serde_json::to_string(&events)?);
+            }
+            _ => println!("{}", serde_json::to_string(&result)?),
+        },
+    }
+    Ok(())
 }
 
 /// Nothing reached the model, so the reason is the only answer there is. A
@@ -581,7 +633,7 @@ fn dropped_prompt<'a>(event: &'a AgentEvent, parent_tool_use_id: Option<&str>) -
 mod tests {
     use super::*;
     use maki_agent::RunTotals;
-    use maki_providers::TokenUsage;
+    use maki_providers::{ThinkingConfig, TokenUsage};
     use test_case::test_case;
 
     const DROP_REASON: &str = "blocked by a plugin";
@@ -681,10 +733,20 @@ mod tests {
         "usage",
         "duration_ms",
     ];
-    const INIT_EVENT_FIELDS: &[&str] = &["type", "subtype", "cwd", "session_id", "tools", "model"];
+    const INIT_EVENT_FIELDS: &[&str] = &[
+        "uuid",
+        "type",
+        "subtype",
+        "cwd",
+        "session_id",
+        "tools",
+        "model",
+        "thinking",
+    ];
     const NOTICE_EVENT_FIELDS: &[&str] = &["type", "subtype", "text", "session_id"];
     const NOTICE_TEXT: &str = "Background bash finished: cargo test";
     const RETRY_EVENT_FIELDS: &[&str] = &[
+        "uuid",
         "type",
         "subtype",
         "attempt",
@@ -697,7 +759,7 @@ mod tests {
     fn wire_format_required_fields() {
         let result = PrintResult {
             result_type: "result",
-            subtype: "success",
+            subtype: SUCCESS,
             is_error: false,
             duration_ms: 1234,
             num_turns: 2,
@@ -713,38 +775,37 @@ mod tests {
         }
 
         let sid = SessionRef::generate();
-        let init = InitEvent {
-            event_type: "system",
-            subtype: "init",
-            cwd: "/tmp",
-            session_id: &sid,
-            tools: &["bash".into(), "read".into()],
-            model: "test-model",
-        };
+        let tools = ["bash".into(), "read".into()];
+        let init = system_event(
+            &sid,
+            INIT,
+            InitEvent {
+                cwd: "/tmp",
+                tools: &tools,
+                model: "test-model",
+                thinking: ThinkingConfig::Off.to_string(),
+            },
+        );
         let json: Value = serde_json::to_value(&init).unwrap();
         for field in INIT_EVENT_FIELDS {
             assert!(json.get(field).is_some(), "InitEvent missing: {field}");
         }
 
-        let retry = RetryEvent {
-            event_type: "system",
-            subtype: "api_retry",
-            attempt: 2,
-            retry_delay_ms: 3000,
-            error: "rate_limit",
-            session_id: &sid,
-        };
+        let retry = system_event(
+            &sid,
+            API_RETRY,
+            RetryEvent {
+                attempt: 2,
+                retry_delay_ms: 3000,
+                error: "rate_limit",
+            },
+        );
         let json: Value = serde_json::to_value(&retry).unwrap();
         for field in RETRY_EVENT_FIELDS {
             assert!(json.get(field).is_some(), "RetryEvent missing: {field}");
         }
 
-        let notice = NoticeEvent {
-            event_type: "system",
-            subtype: NOTICE_SUBTYPE,
-            text: NOTICE_TEXT,
-            session_id: &sid,
-        };
+        let notice = system_event(&sid, NOTICE_SUBTYPE, NoticeEvent { text: NOTICE_TEXT });
         let json: Value = serde_json::to_value(&notice).unwrap();
         for field in NOTICE_EVENT_FIELDS {
             assert!(json.get(field).is_some(), "NoticeEvent missing: {field}");

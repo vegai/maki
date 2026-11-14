@@ -1,6 +1,6 @@
 //! The one vocabulary every driver uses to talk about a persisted session.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use arc_swap::ArcSwap;
 use maki_providers::{ContextGauge, Message, TokenUsage};
@@ -160,20 +160,13 @@ impl Resumed {
 pub struct SessionTrack {
     history: History,
     gauge: ContextGauge,
-    store: SessionStore,
-    /// Every turn's ledger is its child, so a round lands here once, when it
-    /// is paid, even from work that moved off a turn that ended long ago.
-    spend: Arc<RunLedger>,
-    /// What the session had spent before this process opened it.
-    opened_usage: TokenUsage,
-    /// The part of `spend` some turn's ledger reported.
+    store: Arc<Mutex<SessionStore>>,
     reported: RunTotals,
 }
 
 impl SessionTrack {
     /// Built once the provider resolves, so a run that never started leaves no
-    /// file behind. The state dir comes from the caller rather than being
-    /// resolved here, so the run writes where its history was read from.
+    /// file behind. The claim retains the directory the caller read the session from.
     ///
     /// Takes the claim by value, so nobody else can write the session for as
     /// long as this track can.
@@ -190,22 +183,21 @@ impl SessionTrack {
     pub fn open(
         resumed: Resumed,
         claim: SessionClaim,
-        storage: StateDir,
         mailbox: SessionMailbox,
         spend: Arc<RunLedger>,
         cwd: &str,
     ) -> Self {
         let mirror: SharedMessages = Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
-        let store = SessionStore::open(storage, claim, mailbox, resumed.session, cwd);
+        let store = SessionStore::open(claim, mailbox, spend, resumed.session, cwd);
         publish_live_session(resumed.id.id(), &mirror, &store.header);
+        let store = Arc::new(Mutex::new(store));
         Self {
-            opened_usage: store.session.token_usage,
-            store,
+            store: Arc::clone(&store),
             history: History::restored(resumed.history)
                 .with_frame(resumed.frame)
-                .with_mirror(mirror),
+                .with_mirror(mirror)
+                .with_checkpoint(SessionCheckpoint(store)),
             gauge: ContextGauge::restored(resumed.context_size),
-            spend,
             reported: RunTotals::default(),
         }
     }
@@ -227,9 +219,10 @@ impl SessionTrack {
     /// reported yet. Moved work sends no events a frontend sees, so this
     /// turn's `Done` is where that spend shows up.
     pub fn turn(&mut self, model_spec: String, input: &AgentInput) -> SessionTurn<'_> {
-        let unreported = self.spend.totals().since(&self.reported);
-        let ledger = RunLedger::carrying(&self.spend, unreported);
-        let session = &mut self.store.session;
+        let mut store = self.store.lock().unwrap_or_else(PoisonError::into_inner);
+        let unreported = store.spend.totals().since(&self.reported);
+        let ledger = RunLedger::carrying(&store.spend, unreported);
+        let session = &mut store.session;
         session.set_model(model_spec);
         session.meta.mode = Some(match input.mode {
             AgentMode::Build => StoredMode::Build,
@@ -238,7 +231,8 @@ impl SessionTrack {
         session.meta.thinking = Some(input.thinking.into());
         session.meta.fast = input.fast;
         session.meta.workflow = input.workflow;
-        self.store.publish_header(true);
+        store.publish_header(true);
+        drop(store);
         SessionTurn {
             track: self,
             ledger,
@@ -251,24 +245,13 @@ impl SessionTrack {
     /// `--continue`, stamp a model no turn ran on, and commit the
     /// restore-time repair over the only copy of the transcript.
     fn settle(&mut self) {
-        let mut usage = self.opened_usage;
-        usage += self.spend.totals().usage;
-        let billed = usage != self.store.session.token_usage;
-        self.store.session.token_usage = usage;
-        if !billed && !self.history.has_unsaved() {
-            return;
-        }
-        let history = &mut self.history;
-        let store = &mut self.store;
-        match store.record_turn(history.as_slice(), history.frame(), self.gauge.size()) {
-            Ok(()) => history.mark_saved(),
-            // Only headless runs save through here (the TUI has its own
-            // writer), so printing cannot tear a drawn frame.
-            Err(e) => {
-                warn!(error = %e, session_id = %store.session.id, "failed to persist session");
-                eprintln!("{SAVE_FAILED}{}: {e}", store.session.id);
-            }
-        }
+        let mut store = self.store.lock().unwrap_or_else(PoisonError::into_inner);
+        let saved = store.save(
+            &self.history.snapshot(),
+            self.gauge.size(),
+            self.history.has_unsaved(),
+        );
+        self.history.mark_save_result(saved);
     }
 }
 
@@ -309,29 +292,65 @@ impl Drop for SessionTurn<'_> {
     fn drop(&mut self) {
         self.track.reported += self.ledger.totals();
         self.track.settle();
-        self.track.store.publish_header(false);
+        self.track
+            .store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .publish_header(false);
+    }
+}
+
+pub(crate) struct SessionCheckpoint(Arc<Mutex<SessionStore>>);
+
+impl SessionCheckpoint {
+    pub(crate) async fn persist(
+        &self,
+        snapshot: HistorySnapshot,
+        context_size: u32,
+        unsaved: bool,
+    ) -> bool {
+        if let Ok(store) = self.0.try_lock()
+            && !store.needs_save(&snapshot, unsaved)
+        {
+            return true;
+        }
+        let store = Arc::clone(&self.0);
+        tokio::task::spawn_blocking(move || {
+            let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
+            let saved = store.save(&snapshot, context_size, unsaved);
+            if saved {
+                store.publish_header(true);
+            }
+            saved
+        })
+        .await
+        .unwrap_or_else(|error| {
+            warn!(%error, "session checkpoint task failed");
+            false
+        })
     }
 }
 
 struct SessionStore {
-    dir: StateDir,
     claim: SessionClaim,
     mailbox: SessionMailbox,
     session: StoredSession,
-    /// `session`'s header as readers see it, republished whenever it moves.
     header: SharedHeader,
+    opened_usage: TokenUsage,
+    save_failed: bool,
+    spend: Arc<RunLedger>,
 }
 
 impl SessionStore {
     /// Opening touches no file: the driver either read the session already or
     /// there is nothing under the id to read. A session nothing was written for
-    /// yet is held in memory until [`Self::record_turn`] has something to
+    /// yet is held in memory until [`Self::save`] has something to
     /// store, so every file on disk has a transcript in it. The blank model
     /// spec is [`SessionTrack::turn`]'s to fill, and it runs before any write.
     fn open(
-        dir: StateDir,
         claim: SessionClaim,
         mailbox: SessionMailbox,
+        spend: Arc<RunLedger>,
         stored: Option<StoredSession>,
         cwd: &str,
     ) -> Self {
@@ -341,12 +360,20 @@ impl SessionStore {
             session
         });
         Self {
-            dir,
             claim,
             mailbox,
+            spend,
             header: Arc::new(ArcSwap::from_pointee(SessionHeader::of(&session))),
+            opened_usage: session.token_usage,
+            save_failed: false,
             session,
         }
+    }
+
+    fn current_usage(&self) -> TokenUsage {
+        let mut usage = self.opened_usage;
+        usage += self.spend.totals().usage;
+        usage
     }
 
     fn publish_header(&self, working: bool) {
@@ -356,15 +383,19 @@ impl SessionStore {
         }));
     }
 
-    /// `context_size` travels with the messages, since a resumed session seeds
-    /// its gauge from it. Stored without one, the next process is back to
-    /// estimating a transcript this one had measured.
-    ///
     /// An empty transcript is not a session, the same rule [`save_new`]
     /// holds a new one to. An empty log is one the picker offers and `--continue`
     /// resolves to, so a run killed before its first turn would leave a dead
     /// entry behind for good. The same guard stops a history that sanitized
     /// down to nothing from replacing the copy it was restored from.
+    fn needs_save(&self, snapshot: &HistorySnapshot, unsaved: bool) -> bool {
+        !snapshot.messages.is_empty()
+            && (unsaved || self.session.token_usage != self.current_usage())
+    }
+
+    /// `context_size` travels with the messages, since a resumed session seeds
+    /// its gauge from it. Stored without one, the next process is back to
+    /// estimating a transcript this one had measured.
     ///
     /// The receipts still unsettled go with the transcript that holds them,
     /// so a process that dies with work out leaves a resume something to
@@ -374,34 +405,46 @@ impl SessionStore {
     /// dropped turns held would ride every later rewrite and archive, so
     /// exactly those ids lose their state: runs living beside the chat are
     /// not in the log yet and must survive the appends around them.
-    fn record_turn(
-        &mut self,
-        messages: &[Message],
-        frame: Option<&Arc<StoredFrame>>,
-        context_size: u32,
-    ) -> Result<(), SessionError> {
+    fn save(&mut self, snapshot: &HistorySnapshot, context_size: u32, unsaved: bool) -> bool {
         fn tool_call_ids(m: &Message) -> Vec<String> {
             m.tool_uses().map(|(id, _, _)| id.to_owned()).collect()
         }
-        if messages.is_empty() {
-            return Ok(());
+        if !self.needs_save(snapshot, unsaved) {
+            return true;
         }
-        let dropped = self.session.dropped_tool_ids(messages, tool_call_ids);
-        self.session.replace_messages(messages.to_vec());
+        let dropped = self
+            .session
+            .dropped_tool_ids(&snapshot.messages, tool_call_ids);
+        self.session.set_history(snapshot);
         self.session.drop_tool_state_of(&dropped, tool_call_ids);
-        self.session.set_frame(frame.cloned());
+        self.session.token_usage = self.current_usage();
         self.session.meta.context_size = context_size;
         self.session.meta.pending_background = self.mailbox.unsettled();
         self.session.update_title_if_default();
-        self.session.save(&self.claim, &self.dir)
+        match self.claim.persist(&self.session) {
+            Ok(()) => {
+                self.save_failed = false;
+                true
+            }
+            Err(error) => {
+                warn!(%error, session_id = %self.session.id, "failed to persist session");
+                if !self.save_failed {
+                    eprintln!("{SAVE_FAILED}{}: {error}", self.session.id);
+                    self.save_failed = true;
+                }
+                false
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
 
     use maki_providers::{ContentBlock, Role};
+    use maki_storage::StateDir;
     use maki_storage::frame::PromptFacts;
     use maki_storage::id::MakiId;
     use maki_storage::sessions::{SESSIONS_DIR, generate_title};
@@ -485,7 +528,6 @@ mod tests {
         open_track(
             Resumed::stored(SessionRef::from(session_id()), load(tmp)),
             claim(tmp),
-            tmp,
         )
     }
 
@@ -505,13 +547,13 @@ mod tests {
         SessionClaim::acquire(session_id(), &state_dir(tmp)).expect("nothing else holds it")
     }
 
-    fn open_track(resumed: Resumed, claim: SessionClaim, tmp: &TempDir) -> SessionTrack {
+    fn open_track(resumed: Resumed, claim: SessionClaim) -> SessionTrack {
         let mailbox = SessionMailbox::register(resumed.id.id());
-        SessionTrack::open(resumed, claim, state_dir(tmp), mailbox, Arc::default(), CWD)
+        SessionTrack::open(resumed, claim, mailbox, Arc::default(), CWD)
     }
 
     fn track_on(tmp: &TempDir) -> SessionTrack {
-        open_track(resumed(), claim(tmp), tmp)
+        open_track(resumed(), claim(tmp))
     }
 
     fn input(mode: AgentMode) -> AgentInput {
@@ -545,6 +587,97 @@ mod tests {
         push_turn(track, spec, |params| {
             params.history.push(Message::user(text.into()))
         });
+    }
+
+    #[test_case(false ; "on_drop")]
+    #[test_case(true ; "mid_run_checkpoint")]
+    #[tokio::test]
+    async fn usage_without_history_changes_is_saved_once(checkpoint: bool) {
+        let tmp = TempDir::new().unwrap();
+        let mut track = track_on(&tmp);
+        push_prompt(&mut track, MODEL_SPEC, PROMPT);
+        let mut turn = track.turn(MODEL_SPEC.into(), &input(AgentMode::Build));
+        turn.ledger().add(
+            TokenUsage {
+                input: TURN_INPUT_TOKENS,
+                ..Default::default()
+            },
+            None,
+            None,
+        );
+        let params = run_params(&mut turn);
+        assert!(!params.history.has_unsaved());
+        if checkpoint {
+            (params.history.checkpoint(CONTEXT_SIZE)).await;
+            assert_eq!(load(&tmp).token_usage.input, TURN_INPUT_TOKENS);
+            let saved = fs::read(log_path(&tmp)).unwrap();
+            (params.history.checkpoint(CONTEXT_SIZE)).await;
+            assert_eq!(fs::read(log_path(&tmp)).unwrap(), saved, "{UNTOUCHED}");
+        }
+        drop(turn);
+        assert_eq!(load(&tmp).token_usage.input, TURN_INPUT_TOKENS);
+        assert_eq!(load(&tmp).messages().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_usage_only_checkpoint_is_retried() {
+        let tmp = TempDir::new().unwrap();
+        push_prompt(&mut track_on(&tmp), MODEL_SPEC, PROMPT);
+        let mut track = open_track(
+            Resumed::stored(SessionRef::from(session_id()), load(&tmp)),
+            claim(&tmp),
+        );
+        let blocker = log_path(&tmp).with_extension("jsonl.tmp");
+        fs::create_dir(&blocker).unwrap();
+        let mut turn = track.turn(MODEL_SPEC.into(), &input(AgentMode::Build));
+        turn.ledger().add(
+            TokenUsage {
+                input: TURN_INPUT_TOKENS,
+                ..Default::default()
+            },
+            None,
+            None,
+        );
+        let params = run_params(&mut turn);
+        assert!(!params.history.has_unsaved());
+        (params.history.checkpoint(CONTEXT_SIZE)).await;
+        assert!(params.history.has_unsaved(), "{RETRIED}");
+        fs::remove_dir(blocker).unwrap();
+        (params.history.checkpoint(CONTEXT_SIZE)).await;
+        assert!(!params.history.has_unsaved());
+        assert_eq!(load(&tmp).token_usage.input, TURN_INPUT_TOKENS);
+        drop(turn);
+        assert_eq!(load(&tmp).token_usage.input, TURN_INPUT_TOKENS);
+    }
+
+    #[tokio::test]
+    async fn checkpoints_are_readable_before_the_turn_ends_and_append_once() {
+        let tmp = TempDir::new().unwrap();
+        let mut track = track_on(&tmp);
+        let mut turn = track.turn(MODEL_SPEC.to_owned(), &input(AgentMode::Build));
+        let params = turn.run_params(
+            EventSender::new(unbounded_channel().0, 0),
+            Arc::new(|_, _| RunContext::fixed(String::new(), RequestTools::default())),
+        );
+        params.history.push(Message::user(PROMPT.into()));
+        (params.history.checkpoint(CONTEXT_SIZE)).await;
+        assert_eq!(load(&tmp).messages().len(), 1);
+        let path = tmp
+            .path()
+            .join(SESSIONS_DIR)
+            .join(format!("{}.jsonl", session_id()));
+        let prefix = fs::read(&path).unwrap();
+        assert!(!params.history.has_unsaved());
+        (params.history.checkpoint(CONTEXT_SIZE)).await;
+        assert_eq!(fs::read(&path).unwrap(), prefix);
+        params
+            .history
+            .push(Message::observation(OBSERVATION.into()));
+        (params.history.checkpoint(CONTEXT_SIZE)).await;
+        assert!(fs::read(&path).unwrap().starts_with(&prefix));
+        drop(turn);
+        let stored = load(&tmp);
+        assert_eq!(stored.messages().len(), 2);
     }
 
     /// A run killed before its first turn has to leave nothing behind, neither
@@ -648,7 +781,7 @@ mod tests {
     /// of the turns it dropped has to go with them: otherwise it rides every
     /// later rewrite and lands in each archive again.
     #[test]
-    fn record_turn_drops_tool_state_the_summary_dropped() {
+    fn save_drops_tool_state_the_summary_dropped() {
         fn call(id: &str) -> Message {
             Message {
                 role: Role::Assistant,
@@ -660,30 +793,17 @@ mod tests {
             Arc::new(ToolOutput::Plain("output".into()))
         }
         let tmp = TempDir::new().unwrap();
-        let mut track = track_on(&tmp);
-        track
-            .store
-            .session
-            .insert_tool_output("gone".into(), output());
-        track
-            .store
-            .session
-            .insert_tool_output("kept".into(), output());
+        let track = track_on(&tmp);
+        let mut store = track.store.lock().unwrap();
+        store.session.insert_tool_output("gone".into(), output());
+        store.session.insert_tool_output("kept".into(), output());
 
-        track
-            .store
-            .record_turn(&[call("gone"), call("kept")], None, CONTEXT_SIZE)
-            .unwrap();
+        let full = HistorySnapshot::new(vec![call("gone"), call("kept")]);
+        assert!(store.save(&full, CONTEXT_SIZE, true));
         assert!(load(&tmp).tool_outputs().contains_key("gone"));
 
-        track
-            .store
-            .record_turn(
-                &[Message::user("summary".into()), call("kept")],
-                None,
-                CONTEXT_SIZE,
-            )
-            .unwrap();
+        let compacted = HistorySnapshot::new(vec![Message::user("summary".into()), call("kept")]);
+        assert!(store.save(&compacted, CONTEXT_SIZE, true));
         let compacted = load(&tmp);
         assert!(!compacted.tool_outputs().contains_key("gone"));
         assert!(compacted.tool_outputs().contains_key("kept"));
@@ -693,18 +813,16 @@ mod tests {
     /// prompt ends, so a plain appended turn must not prune the state it
     /// holds under ids the log has never seen.
     #[test]
-    fn record_turn_keeps_state_of_runs_beside_the_chat() {
+    fn save_keeps_state_of_runs_beside_the_chat() {
         let tmp = TempDir::new().unwrap();
-        let mut track = track_on(&tmp);
-        track
-            .store
+        let track = track_on(&tmp);
+        let mut store = track.store.lock().unwrap();
+        store
             .session
             .insert_tool_output("live".into(), Arc::new(ToolOutput::Plain("x".into())));
 
-        track
-            .store
-            .record_turn(&[Message::user("next turn".into())], None, CONTEXT_SIZE)
-            .unwrap();
+        let next = HistorySnapshot::new(vec![Message::user("next turn".into())]);
+        assert!(store.save(&next, CONTEXT_SIZE, true));
 
         assert!(load(&tmp).tool_outputs().contains_key("live"));
     }
@@ -760,7 +878,6 @@ mod tests {
         let mut track = open_track(
             Resumed::stored(SessionRef::from(session_id()), stored),
             claim(&tmp),
-            &tmp,
         );
         push_prompt(&mut track, OTHER_SPEC, PROMPT);
 
@@ -791,7 +908,7 @@ mod tests {
             frame: Some(Arc::clone(&frame)),
             ..resumed()
         };
-        let mut track = open_track(resumed, claim(&tmp), &tmp);
+        let mut track = open_track(resumed, claim(&tmp));
         push_prompt(&mut track, MODEL_SPEC, OBSERVATION);
         drop(track);
 
@@ -800,7 +917,6 @@ mod tests {
         let reopened = open_track(
             Resumed::stored(SessionRef::from(session_id()), stored),
             claim(&tmp),
-            &tmp,
         );
         assert_eq!(reopened.history.frame(), Some(&frame), "{FRAME_KEPT}");
     }
@@ -818,7 +934,7 @@ mod tests {
             ..Resumed::empty(SessionRef::from(id))
         };
         let claim = SessionClaim::acquire(id, &state_dir(&tmp)).expect("nothing else holds it");
-        let mut track = open_track(resumed, claim, &tmp);
+        let mut track = open_track(resumed, claim);
 
         let restored = live_history(id).expect("an open track is live");
         assert_eq!(restored.len(), 1);
@@ -841,7 +957,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let id = MakiId::generate();
         let claim = SessionClaim::acquire(id, &state_dir(&tmp)).expect("nothing else holds it");
-        let mut track = open_track(Resumed::empty(SessionRef::from(id)), claim, &tmp);
+        let mut track = open_track(Resumed::empty(SessionRef::from(id)), claim);
 
         let opened = live_header(id).expect("an open track publishes its header");
         assert_eq!(opened.cwd, CWD);
@@ -873,7 +989,7 @@ mod tests {
         let id = MakiId::generate();
         let mailbox = SessionMailbox::register(id);
         let claim = SessionClaim::acquire(id, &state_dir(&tmp)).expect("nothing else holds it");
-        let mut track = open_track(Resumed::empty(SessionRef::from(id)), claim, &tmp);
+        let mut track = open_track(Resumed::empty(SessionRef::from(id)), claim);
         let stored = || StoredSession::load(id, &state_dir(&tmp)).unwrap();
 
         mailbox.track(BACKGROUND_TASK_ID);
@@ -908,22 +1024,32 @@ mod tests {
     /// A headless driver keeps no other record of its settings or its spend,
     /// so the turn has to put them on the session, where `read`, `export` and
     /// the next resume look.
-    #[test]
-    fn each_turn_records_its_settings_and_adds_its_usage() {
+    #[test_case(false ; "persist_on_drop")]
+    #[test_case(true ; "persist_after_checkpoint")]
+    #[tokio::test]
+    async fn each_turn_records_its_settings_and_adds_its_usage(checkpoint: bool) {
         let tmp = TempDir::new().unwrap();
         let id = MakiId::generate();
         let claim = SessionClaim::acquire(id, &state_dir(&tmp)).expect("nothing else holds it");
-        let mut track = open_track(Resumed::empty(SessionRef::from(id)), claim, &tmp);
+        let mut track = open_track(Resumed::empty(SessionRef::from(id)), claim);
         let usage = TokenUsage {
             input: TURN_INPUT_TOKENS,
             ..Default::default()
         };
-        for _ in 0..TURNS {
+        for turn_index in 1..=TURNS {
             let mut turn = track.turn(MODEL_SPEC.into(), &input(AgentMode::Plan(PLAN_PATH.into())));
             turn.ledger().add(usage, None, None);
-            run_params(&mut turn)
-                .history
-                .push(Message::user(PROMPT.into()));
+            let params = run_params(&mut turn);
+            params.history.push(Message::user(PROMPT.into()));
+            if checkpoint {
+                (params.history.checkpoint(CONTEXT_SIZE)).await;
+                let stored = StoredSession::load(id, &state_dir(&tmp)).unwrap();
+                assert_eq!(
+                    stored.token_usage.input,
+                    TURN_INPUT_TOKENS * turn_index,
+                    "{USAGE_SUMMED}"
+                );
+            }
         }
 
         let header = live_header(id).unwrap();
@@ -1021,14 +1147,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let spend = Arc::<RunLedger>::default();
         let mailbox = SessionMailbox::register(session_id());
-        let mut track = SessionTrack::open(
-            resumed(),
-            claim(&tmp),
-            state_dir(&tmp),
-            mailbox,
-            Arc::clone(&spend),
-            CWD,
-        );
+        let mut track =
+            SessionTrack::open(resumed(), claim(&tmp), mailbox, Arc::clone(&spend), CWD);
         let moved = turn_leaving_moved_work(&mut track);
         for _ in 0..turns_after_move {
             moved.add(tokens(LATE_INPUT_TOKENS), Some(LATE_COST), None);
@@ -1066,7 +1186,6 @@ mod tests {
         let mut track = SessionTrack::open(
             Resumed::empty(SessionRef::from(id)),
             claim,
-            state_dir(&tmp),
             mailbox.clone(),
             Arc::default(),
             CWD,
