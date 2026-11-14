@@ -2,20 +2,26 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use clap::builder::{PossibleValuesParser, TypedValueParser};
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum, value_parser};
 use color_eyre::Result;
-use color_eyre::eyre::bail;
 use thiserror::Error;
 
 use maki_agent::HostPrompt;
-use maki_agent::tools::{all_builtin_tool_names, is_builtin_tool};
+use maki_agent::mcp::WIRE_SEPARATOR;
 use maki_config::AgentConfig;
+use maki_storage::sessions::{Effort, StoredThinking, ThinkingParseError};
 
 use crate::print::OutputFormat;
 
 const DEFAULT_BACKGROUND_TIMEOUT_SECS: u64 = 600;
 /// A week. The deadline is an `Instant`, which panics on overflow.
 const MAX_BACKGROUND_TIMEOUT_SECS: u64 = 7 * 24 * 60 * 60;
+const SDK_THINKING_ENABLED: &str = "enabled";
+const SDK_THINKING_DISABLED: &str = "disabled";
+const CLAUDE_MCP_PREFIX: &str = "mcp__";
+const TOOL_ARGUMENT_PATTERNS_UNSUPPORTED: &str =
+    "tool argument patterns are not supported; use tool names";
 const HOST_PROMPT_PATHS: &[RunPath] = &[
     RunPath::Tui,
     RunPath::Print,
@@ -23,6 +29,23 @@ const HOST_PROMPT_PATHS: &[RunPath] = &[
     RunPath::Acp,
     RunPath::SystemPromptPreview,
 ];
+const THINKING_PATHS: &[RunPath] = &[RunPath::Tui, RunPath::Print, RunPath::Sdk, RunPath::Acp];
+const TURN_CAP_PATHS: &[RunPath] = &[RunPath::Print, RunPath::Sdk];
+
+fn parse_tool_name(name: &str) -> Result<String, &'static str> {
+    if name.contains(['(', ')']) {
+        return Err(TOOL_ARGUMENT_PATTERNS_UNSUPPORTED);
+    }
+    Ok(normalize_tool_name(name))
+}
+
+fn parse_thinking(input: &str) -> Result<StoredThinking, ThinkingParseError> {
+    match input.trim() {
+        SDK_THINKING_ENABLED => Ok(StoredThinking::Adaptive),
+        SDK_THINKING_DISABLED => Ok(StoredThinking::Off),
+        value => StoredThinking::parse_setting(value),
+    }
+}
 
 /// Where a run goes, for flags only some paths read.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -91,6 +114,10 @@ pub struct Cli {
     #[arg(short, long)]
     pub print: bool,
 
+    /// Print effective startup metadata without inference (requires --print)
+    #[arg(long, requires = "print", conflicts_with = "input_format")]
+    pub dry_run: bool,
+
     /// Attach an image to the prompt in --print mode as vision content (repeatable)
     #[arg(long = "image", value_name = "PATH")]
     pub images: Vec<PathBuf>,
@@ -98,6 +125,18 @@ pub struct Cli {
     /// Model spec (provider/model-id). Defaults to last used model, then configured default_model, then auto-detected
     #[arg(short, long)]
     pub model: Option<String>,
+
+    /// Thinking setting for this launch: off, adaptive, minimal through max, or a positive token budget
+    #[arg(long, global = true, value_parser = parse_thinking)]
+    pub thinking: Option<StoredThinking>,
+
+    /// Thinking effort for this launch: minimal through max
+    #[arg(long, global = true, value_parser = PossibleValuesParser::new(Effort::ALL.map(Effort::as_str)).try_map(|value| value.parse::<Effort>()))]
+    pub effort: Option<Effort>,
+
+    /// Thinking-token budget for this launch (0 disables thinking)
+    #[arg(long, global = true)]
+    pub max_thinking_tokens: Option<u32>,
 
     /// Include full turn-by-turn messages in --print output
     #[arg(long)]
@@ -154,12 +193,12 @@ pub struct Cli {
     #[arg(long)]
     pub exit_on_done: bool,
 
-    /// Pre-approve tools (comma-separated). Accepts PascalCase (Claude Code) or snake_case.
-    #[arg(long, value_delimiter = ',', visible_alias = "allowedTools")]
+    /// Allowed tools (comma-separated). Accepts PascalCase (Claude Code) or snake_case.
+    #[arg(long, value_delimiter = ',', visible_alias = "allowedTools", value_parser = parse_tool_name)]
     pub allowed_tools: Vec<String>,
 
     /// Disallowed tools (comma-separated).
-    #[arg(long, value_delimiter = ',', visible_alias = "disallowedTools")]
+    #[arg(long, value_delimiter = ',', visible_alias = "disallowedTools", value_parser = parse_tool_name)]
     pub disallowed_tools: Vec<String>,
 
     /// Write this run under a chosen session ID, unless one already exists there
@@ -173,6 +212,10 @@ pub struct Cli {
     /// Maximum number of agent turns
     #[arg(long)]
     pub max_turns: Option<u32>,
+
+    /// Ask for a final text answer on the last allowed turn and prevent further tool execution
+    #[arg(long, requires = "max_turns")]
+    pub final_answer: bool,
 
     /// Replace the main agent's system prompt
     #[arg(long)]
@@ -228,15 +271,9 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub betas: Option<String>,
     #[arg(long, hide = true)]
-    pub max_thinking_tokens: Option<String>,
-    #[arg(long, hide = true)]
-    pub effort: Option<String>,
-    #[arg(long, hide = true)]
     pub json_schema: Option<String>,
     #[arg(long, hide = true)]
     pub max_budget_usd: Option<String>,
-    #[arg(long, hide = true)]
-    pub thinking: Option<String>,
     #[arg(long, hide = true)]
     pub thinking_display: Option<String>,
 
@@ -246,6 +283,16 @@ pub struct Cli {
 }
 
 impl Cli {
+    pub fn thinking_override(&self) -> Option<StoredThinking> {
+        if self.thinking == Some(StoredThinking::Off) || self.max_thinking_tokens == Some(0) {
+            return Some(StoredThinking::Off);
+        }
+        self.max_thinking_tokens
+            .map(|tokens| StoredThinking::Budget { tokens })
+            .or_else(|| self.effort.map(|level| StoredThinking::Effort { level }))
+            .or(self.thinking)
+    }
+
     pub fn warn_ignored_flags(&self) {
         let ignored = [
             ("fallback-model", self.fallback_model.is_some()),
@@ -257,11 +304,8 @@ impl Cli {
             ("mcp-config", self.mcp_config.is_some()),
             ("tools", self.tools.is_some()),
             ("betas", self.betas.is_some()),
-            ("max-thinking-tokens", self.max_thinking_tokens.is_some()),
-            ("effort", self.effort.is_some()),
             ("json-schema", self.json_schema.is_some()),
             ("max-budget-usd", self.max_budget_usd.is_some()),
-            ("thinking", self.thinking.is_some()),
             ("thinking-display", self.thinking_display.is_some()),
         ];
         for (flag, set) in &ignored {
@@ -271,22 +315,16 @@ impl Cli {
         }
     }
 
-    /// `--allowed-tools` replaces the allowlist and rejects an unknown name;
-    /// `--disallowed-tools` adds to the denylist and skips one.
-    pub fn apply_tool_flags(&self, agent: &mut AgentConfig) -> Result<()> {
+    /// `--allowed-tools` replaces the allowlist and `--disallowed-tools` adds
+    /// to the denylist. Names are normalized while parsing, and unknown names
+    /// stay, since a plugin or MCP tool may register later.
+    pub fn apply_tool_flags(&self, agent: &mut AgentConfig) {
         if !self.allowed_tools.is_empty() {
-            agent.allowed_tools = self
-                .allowed_tools
-                .iter()
-                .map(|t| normalize_tool_name(t))
-                .collect::<Result<Vec<_>>>()?;
+            agent.allowed_tools = self.allowed_tools.clone();
         }
-        agent.disabled_tools.extend(
-            self.disallowed_tools
-                .iter()
-                .filter_map(|t| normalize_tool_name(t).ok()),
-        );
-        Ok(())
+        agent
+            .disabled_tools
+            .extend(self.disallowed_tools.iter().cloned());
     }
 
     pub fn is_sdk_mode(&self) -> bool {
@@ -320,9 +358,24 @@ impl Cli {
     /// `--verbose` stay out, because Claude Code wrappers pass them on every
     /// path. `every_visible_flag_is_placed` makes each new flag pick a side,
     /// and the matrix in `site/docs/content/cli/_index.md` is a copy by hand.
-    fn scoped_flags(&self) -> [ScopedFlag; 5] {
+    fn scoped_flags(&self) -> [ScopedFlag; 10] {
         let host_prompt = self.host_prompt();
         [
+            ScopedFlag {
+                name: "thinking",
+                set: self.thinking.is_some(),
+                paths: THINKING_PATHS,
+            },
+            ScopedFlag {
+                name: "effort",
+                set: self.effort.is_some(),
+                paths: THINKING_PATHS,
+            },
+            ScopedFlag {
+                name: "max-thinking-tokens",
+                set: self.max_thinking_tokens.is_some(),
+                paths: THINKING_PATHS,
+            },
             ScopedFlag {
                 name: "system-prompt",
                 set: host_prompt.replaces(),
@@ -336,7 +389,17 @@ impl Cli {
             ScopedFlag {
                 name: "max-turns",
                 set: self.max_turns.is_some(),
-                paths: &[RunPath::Print, RunPath::Sdk],
+                paths: TURN_CAP_PATHS,
+            },
+            ScopedFlag {
+                name: "final-answer",
+                set: self.final_answer,
+                paths: TURN_CAP_PATHS,
+            },
+            ScopedFlag {
+                name: "dry-run",
+                set: self.dry_run,
+                paths: &[RunPath::Print],
             },
             ScopedFlag {
                 name: "permission-mode",
@@ -554,7 +617,21 @@ pub enum AuthAction {
     Status,
 }
 
-fn normalize_tool_name(name: &str) -> Result<String> {
+fn normalize_tool_name(name: &str) -> String {
+    let name = name
+        .strip_prefix(CLAUDE_MCP_PREFIX)
+        .filter(|name| {
+            name.split_once(WIRE_SEPARATOR)
+                .is_some_and(|(server, tool)| !server.is_empty() && !tool.is_empty())
+        })
+        .unwrap_or(name);
+    let local = crate::wire::claude_to_maki_tool_name(name);
+    if local != name {
+        return local.to_owned();
+    }
+    if name.contains(['_', '.', '-']) {
+        return name.to_owned();
+    }
     let mut result = String::with_capacity(name.len() + 4);
     for (i, c) in name.chars().enumerate() {
         if c.is_ascii_uppercase() {
@@ -566,18 +643,12 @@ fn normalize_tool_name(name: &str) -> Result<String> {
             result.push(c);
         }
     }
-    if !is_builtin_tool(&result) {
-        bail!(
-            "unknown tool '{}'. Valid tools: {}",
-            name,
-            all_builtin_tool_names().join(", ")
-        );
-    }
-    Ok(result)
+    result
 }
 
 #[cfg(test)]
 mod tests {
+    use clap::error::ErrorKind;
     use clap::{ArgAction, CommandFactory};
     use test_case::test_case;
 
@@ -609,25 +680,96 @@ mod tests {
         "include-partial-messages",
         "background-timeout",
     ];
+    const EFFORT_VALUES: &str = "[possible values: minimal, low, medium, high, xhigh, max]";
+
+    #[test_case("--allowed-tools", "Bash(git log:*)")]
+    #[test_case("--allowedTools", "Bash(git log:*)")]
+    #[test_case("--disallowed-tools", "Bash(git log:*)")]
+    #[test_case("--disallowedTools", "Bash(git log:*)")]
+    #[test_case("--disallowed-tools", "srv.GetDocs(secret:*)"; "mcp_pattern")]
+    fn tool_argument_patterns_fail_before_startup(flag: &str, pattern: &str) {
+        let error = Cli::try_parse_from(["maki", "-p", flag, pattern])
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::ValueValidation);
+        assert!(
+            error
+                .to_string()
+                .contains(TOOL_ARGUMENT_PATTERNS_UNSUPPORTED)
+        );
+    }
+
+    #[test_case(&["--thinking", "xhigh"], "xhigh" ; "thinking_level")]
+    #[test_case(&["--thinking", "off"], "off" ; "explicit_off")]
+    #[test_case(&["--thinking", "adaptive"], "adaptive" ; "adaptive")]
+    #[test_case(&["--thinking", "8192"], "8192" ; "thinking_budget")]
+    #[test_case(&["--effort", "low"], "low" ; "effort")]
+    #[test_case(&["--max-thinking-tokens", "2048"], "2048" ; "compatibility_budget")]
+    #[test_case(&["-p", "--max-thinking-tokens", "0"], "off" ; "zero_print_budget")]
+    #[test_case(&["-p", "--input-format", "stream-json", "--max-thinking-tokens", "0"], "off" ; "zero_sdk_budget")]
+    #[test_case(&["acp", "--max-thinking-tokens", "0"], "off" ; "zero_acp_budget")]
+    #[test_case(&["--thinking", "high", "--effort", "low", "--max-thinking-tokens", "0"], "off" ; "zero_budget_overrides_effort")]
+    #[test_case(&["acp", "--thinking", "high"], "high" ; "acp_local_flag")]
+    #[test_case(&["--effort", "high", "acp"], "high" ; "acp_global_flag")]
+    #[test_case(&["acp", "--max-thinking-tokens", "4096"], "4096" ; "acp_budget")]
+    #[test_case(&["--thinking", "enabled"], "adaptive" ; "sdk_enabled")]
+    #[test_case(&["--thinking", "disabled"], "off" ; "sdk_disabled")]
+    #[test_case(&["--thinking=adaptive", "--effort", "high"], "high" ; "sdk_adaptive_and_effort")]
+    #[test_case(&["--thinking", "enabled", "--effort", "low"], "low" ; "sdk_enabled_and_effort")]
+    #[test_case(&["--max-thinking-tokens", "4096", "--effort", "high"], "4096" ; "sdk_budget_and_effort")]
+    #[test_case(&["--thinking", "disabled", "--max-thinking-tokens", "4096", "--effort", "high"], "off" ; "disabled_overrides_budget_and_effort")]
+    #[test_case(&["--thinking", "high", "--effort", "low"], "low" ; "effort_overrides_thinking")]
+    #[test_case(&["--thinking", "high", "--max-thinking-tokens", "2048"], "2048" ; "budget_overrides_thinking")]
+    #[test_case(&["acp", "--effort", "high", "--max-thinking-tokens", "2048"], "2048" ; "acp_budget_overrides_effort")]
+    fn thinking_flags_use_the_shared_setting(args: &[&str], expected: &str) {
+        let cli = Cli::try_parse_from(std::iter::once("maki").chain(args.iter().copied())).unwrap();
+        assert_eq!(
+            cli.thinking_override(),
+            Some(StoredThinking::parse_setting(expected).unwrap())
+        );
+    }
+
+    #[test_case(&["--thinking", "turbo"], ErrorKind::ValueValidation ; "unknown_level")]
+    #[test_case(&["--thinking", "0"], ErrorKind::ValueValidation ; "zero_thinking_budget")]
+    #[test_case(&["-p", "--effort", "turbo"], ErrorKind::InvalidValue ; "invalid_print_effort")]
+    #[test_case(&["acp", "--thinking", "turbo"], ErrorKind::ValueValidation ; "invalid_acp_thinking")]
+    #[test_case(&["--max-thinking-tokens", "high"], ErrorKind::ValueValidation ; "non_numeric_compatibility_budget")]
+    fn invalid_thinking_flags_fail_during_parsing(args: &[&str], expected: ErrorKind) {
+        let error = Cli::try_parse_from(std::iter::once("maki").chain(args.iter().copied()))
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), expected);
+    }
+
+    #[test_case("off" ; "off")]
+    #[test_case("adaptive" ; "adaptive")]
+    #[test_case("4096" ; "token_budget")]
+    fn invalid_effort_lists_only_effort_levels(value: &str) {
+        let error = Cli::try_parse_from(["maki", "--effort", value])
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::InvalidValue);
+        assert!(error.to_string().contains(EFFORT_VALUES));
+    }
 
     #[test_case("Read", "read")]
     #[test_case("Bash", "bash")]
     #[test_case("CodeExecution", "code_execution")]
     #[test_case("code_execution", "code_execution"; "snake_passthrough")]
+    #[test_case("ClaudeCode", "claude_code"; "plugin_pascal_case")]
+    #[test_case("claude_code_import", "claude_code_import"; "plugin_passthrough")]
+    #[test_case("srv__GetDocs", "srv__GetDocs"; "mcp_wire_case_is_preserved")]
+    #[test_case("mcp__srv__GetDocs", "srv__GetDocs"; "claude_mcp_wire_spelling")]
+    #[test_case("mcp__srv__tool__part", "srv__tool__part"; "claude_mcp_tool_underscores")]
+    #[test_case("mcp.GetDocs", "mcp.GetDocs"; "literal_mcp_server")]
+    #[test_case("mcp__tool", "mcp__tool"; "wire_mcp_server")]
+    #[test_case("srv.GetDocs", "srv.GetDocs"; "mcp_qualified_case_is_preserved")]
+    #[test_case("NonExistentTool", "non_existent_tool"; "a_tool_can_register_later")]
+    #[test_case("MultiEdit", "multiedit"; "sdk_alias")]
+    #[test_case("WebFetch", "webfetch")]
+    #[test_case("WebSearch", "websearch")]
     fn normalize_tool_name_valid_inputs(input: &str, expected: &str) {
-        assert_eq!(normalize_tool_name(input).unwrap(), expected);
-    }
-
-    #[test]
-    fn normalize_tool_name_rejects_unknown() {
-        let result = normalize_tool_name("NonExistentTool");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unknown tool"));
-    }
-
-    #[test]
-    fn normalize_tool_name_multi_edit_rejects_snake_variant() {
-        assert!(normalize_tool_name("MultiEdit").is_err());
+        assert_eq!(normalize_tool_name(input), expected);
     }
 
     /// `--session-id` with `-c` stays legal: continue the latest, but write
@@ -688,6 +830,11 @@ mod tests {
     #[test_case(&["--max-turns", "3"], Some("max-turns") ; "tui_max_turns")]
     #[test_case(&["-p", "--permission-mode", "plan"], Some("permission-mode") ; "print_permission_mode")]
     #[test_case(&["--image", "a.png"], Some("image") ; "tui_image")]
+    #[test_case(&["--effort", "high", "acp"], None ; "acp_effort")]
+    #[test_case(&["models", "--thinking", "low"], Some("thinking") ; "models_thinking")]
+    #[test_case(&["prompt", "--max-thinking-tokens", "0"], Some("max-thinking-tokens") ; "prompt_budget")]
+    #[test_case(&["-p", "--max-turns", "3", "--final-answer"], None ; "print_final_answer")]
+    #[test_case(&["-p", "--dry-run", "models"], Some("dry-run") ; "models_dry_run")]
     fn run_path_flag_check(args: &[&str], rejected: Option<&'static str>) {
         let checked = parse(args).check_run_path_flags();
 

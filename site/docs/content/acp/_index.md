@@ -55,10 +55,17 @@ asks, so trust a project with `maki trust add` in it, match it with a
 maki acp
 maki acp -m anthropic/claude-sonnet-4-6
 maki acp --yolo
+maki acp --thinking xhigh
 maki --no-jit acp
 ```
 
-`maki acp` only takes `-m` / `--model` and `--yolo` as subcommand flags. Global flags like `--no-jit` must come before the subcommand (`maki --no-jit acp`, not `maki acp --no-jit`). `--allowed-tools` and `--disallowed-tools` apply to every ACP session: `maki --allowed-tools read,grep acp`.
+`maki acp` takes `-m` / `--model` and `--yolo` as subcommand flags. Thinking
+flags work before or after `acp`: `--thinking`, `--effort`, and
+`--max-thinking-tokens`. They override config for this server process. With no flag or
+`always_thinking`, ACP uses the saved TUI thinking level. See [Thinking](/docs/headless/#thinking) for values and
+precedence. Other global flags like `--no-jit` must come before the subcommand
+(`maki --no-jit acp`). `--allowed-tools` and `--disallowed-tools` apply to every
+ACP session: `maki --allowed-tools read,grep acp`.
 
 Plan mode in ACP uses the same state-directory plan files as the TUI (`…/plans/<slug>.md`), not the SDK's `./plan.md`.
 

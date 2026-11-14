@@ -33,19 +33,30 @@ type SignalStream = CtrlC;
 
 pub struct Interrupt {
     stop: CancelToken,
+    _unwatched: Option<CancelTrigger>,
     /// The number of the signal caught first.
     caught: Arc<OnceLock<i32>>,
 }
 
 impl Interrupt {
     pub fn install() -> Self {
+        Self::with_signals(watched())
+    }
+
+    fn with_signals(signals: Vec<(i32, SignalStream)>) -> Self {
         let (trigger, stop) = CancelToken::new();
         let caught = Arc::new(OnceLock::new());
-        let signals = watched();
-        if !signals.is_empty() {
+        let unwatched = if signals.is_empty() {
+            Some(trigger)
+        } else {
             tokio::spawn(watch(signals, trigger, Arc::clone(&caught)));
+            None
+        };
+        Self {
+            stop,
+            caught,
+            _unwatched: unwatched,
         }
-        Self { stop, caught }
     }
 
     /// Fires on the first signal.
@@ -154,5 +165,97 @@ mod tests {
 
             assert_eq!(inherited_ignore(SignalKind::user_defined1()), ignored);
         }
+    }
+}
+
+#[cfg(test)]
+mod portability_tests {
+    use test_case::test_case;
+
+    use super::{Interrupt, watched};
+
+    #[test_case(false ; "all_signals_ignored")]
+    #[test_case(true ; "signals_watched")]
+    #[tokio::test]
+    async fn installing_the_watcher_keeps_the_run_active(watch: bool) {
+        let interrupt = Interrupt::with_signals(if watch { watched() } else { Vec::new() });
+        assert!(!interrupt.stop().is_cancelled());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod signal_tests {
+    use std::env;
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Child, Command, Stdio};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    use rustix::process::{Pid, Signal, kill_process};
+    use test_case::test_case;
+    use wait_timeout::ChildExt;
+
+    use super::{Interrupt, SIGNAL_EXIT_BASE};
+
+    const READY: &str = "MAKI_SIGNAL_READY";
+    const CANCELLED: &str = "MAKI_SIGNAL_CANCELLED";
+    const CHILD_TEST: &str = "interrupt::signal_tests::signal_child";
+    const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+    struct Running(Child);
+    impl Drop for Running {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "subprocess fixture run by second_signal_forces_exit"]
+    async fn signal_child() {
+        let interrupt = Interrupt::install();
+        let token = interrupt.stop();
+        println!("\n{READY}");
+        std::io::stdout().flush().unwrap();
+        token.cancelled().await;
+        println!("{CANCELLED}");
+        std::io::stdout().flush().unwrap();
+        // Simulate a session write blocking the executor during shutdown.
+        loop {
+            thread::park();
+        }
+    }
+
+    #[test_case(Signal::TERM ; "sigterm")]
+    #[test_case(Signal::INT ; "sigint")]
+    fn second_signal_forces_exit(signal: Signal) {
+        let child = Command::new(env::current_exe().unwrap())
+            .args(["--ignored", "--exact", CHILD_TEST, "--nocapture"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut child = Running(child);
+        let output = child.0.stdout.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(output).lines() {
+                if tx.send(line.unwrap()).is_err() {
+                    break;
+                }
+            }
+        });
+        while rx.recv_timeout(TEST_TIMEOUT).unwrap() != READY {}
+        let pid = Pid::from_raw(child.0.id().try_into().unwrap()).unwrap();
+        kill_process(pid, signal).unwrap();
+        while rx.recv_timeout(TEST_TIMEOUT).unwrap() != CANCELLED {}
+        assert!(child.0.try_wait().unwrap().is_none());
+        kill_process(pid, signal).unwrap();
+        let status = child
+            .0
+            .wait_timeout(TEST_TIMEOUT)
+            .unwrap()
+            .expect("second signal did not terminate maki");
+        assert_eq!(status.code(), Some(SIGNAL_EXIT_BASE + signal.as_raw()));
     }
 }

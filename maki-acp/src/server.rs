@@ -489,7 +489,6 @@ fn start_session(
         initial_wd: cwd.clone(),
         resumed,
         claim: claim.clone(),
-        storage: params.storage.clone(),
         yolo: params.yolo,
         unattended: false,
         host_prompt: params.host_prompt.clone(),

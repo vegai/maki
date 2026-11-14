@@ -10,6 +10,7 @@ use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
 use maki_providers::{Message, RequestOptions, ThinkingConfig, Timeouts};
+#[cfg(test)]
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
@@ -446,15 +447,12 @@ pub struct InteractiveParams {
     /// The right to write [`Self::resumed`]'s session, taken before its
     /// transcript was read.
     pub claim: SessionClaim,
-    /// Where the transcript is written. The same dir the caller resolved the
-    /// session from, so a run cannot read one session and write another.
-    pub storage: StateDir,
     pub yolo: bool,
     /// Nobody answers permission prompts, so they are denied at once instead
     /// of waiting forever.
     pub unattended: bool,
     pub host_prompt: HostPrompt,
-    /// The `always_*` knobs. `workflow` picks the tool catalog here; the rest
+    /// Resolved launch defaults. `workflow` picks the tool catalog here; the rest
     /// are what a host without toggles puts on every [`AgentInput`] it sends.
     pub defaults: SessionDefaults,
     pub model_policy: Arc<ModelPolicy>,
@@ -557,7 +555,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
         let mut track = SessionTrack::open(
             params.resumed,
             params.claim,
-            params.storage,
             mailbox.clone(),
             track_spend,
             &working_dir,
@@ -998,7 +995,6 @@ mod tests {
             initial_wd: tmp.path().to_path_buf(),
             resumed: Resumed::empty(SessionRef::from(id)),
             claim: SessionClaim::acquire(id, &dir).expect("nothing else holds it"),
-            storage: dir,
             yolo: false,
             unattended: true,
             host_prompt: HostPrompt::default(),
@@ -1199,7 +1195,6 @@ mod tests {
         let track = SessionTrack::open(
             Resumed::empty(SessionRef::from(id)),
             claim,
-            dir,
             mailbox,
             Arc::default(),
             CWD,
