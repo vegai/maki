@@ -3607,6 +3607,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-width",
  "uuid",
+ "wait-timeout",
 ]
 
 [[package]]
