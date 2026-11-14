@@ -8,6 +8,10 @@ build *ARGS:
 check *ARGS:
     cargo check --workspace --all-targets {{ARGS}}
 
+# Requires the target's Rust standard library and C toolchain.
+check-non-linux target="x86_64-pc-windows-gnu":
+    cargo check -p maki-lua --lib --target {{target}}
+
 run *ARGS:
     cargo run {{ARGS}}
 

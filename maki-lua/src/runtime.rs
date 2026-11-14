@@ -3427,26 +3427,32 @@ async fn run_work_fn(
 /// the callback still gets its `on_stdout` and `on_exit`.
 ///
 /// The gate guard comes after the sleep: pending timers should pile up
-/// cheaply, but the bodies compete for the `MAX_INFLIGHT_TOOLS` budget so
-/// `for i=1,10000 do maki.defer_fn(f, 0) end` can't run 10k coroutines at
-/// once. Errors are logged and dropped, nobody is awaiting a result.
+/// cheaply, but the bodies compete for `timer_gate`'s `MAX_INFLIGHT_TOOLS`
+/// budget so `for i=1,10000 do maki.defer_fn(f, 0) end` can't run 10k
+/// coroutines at once. That budget is not the tool slots', so tool calls
+/// filling every slot cannot hold up a cancellation timer. Errors are logged
+/// and dropped, nobody is awaiting a result.
 fn spawn_deferred_callback(
     lua: &Lua,
     gate: &Rc<InflightGate>,
+    timer_gate: &Arc<Semaphore>,
     cb: DeferredCallback,
 ) -> LocalJoinHandle<()> {
     let lua = lua.clone();
     let gate = Rc::clone(gate);
+    let timer_gate = Arc::clone(timer_gate);
     spawn_local(async move {
         // Biased, so a stop that lands as the gate opens still wins. Once the
-        // guard is held the drain barrier waits for it, and a `clear_plugin`
+        // hold is taken the drain barrier waits for it, and a `clear_plugin`
         // cannot reach the callback any more.
         let fired = tokio::select! {
             biased;
             () = cb.cancel.cancelled() => None,
             guard = async {
                 sleep(cb.delay).await;
-                gate.acquire().await
+                let hold = DrainHold::new(&gate);
+                let slot = timer_gate.acquire_owned().await.expect(GATE_SLOTS_OPEN);
+                GateGuard::new(&gate, Some(slot), Some(hold))
             } => Some(guard),
         };
         let Some(_guard) = fired else {
@@ -3813,7 +3819,7 @@ impl LuaRuntime {
         let watchdog = Watchdog::spawn(&lua, Arc::clone(&shutdown));
 
         let globals = lua.globals();
-        for name in &["require", "io", "package"] {
+        for name in &["require", "io", "package", "getfenv", "setfenv"] {
             globals
                 .set(*name, LuaValue::Nil)
                 .map_err(|e| PluginError::Lua {
@@ -5871,6 +5877,7 @@ pub fn spawn(
                 });
             }
             let gate = Rc::new(InflightGate::new(rt.lua.clone()));
+            let timer_gate = Arc::new(Semaphore::new(MAX_INFLIGHT_TOOLS));
             let restores = Rc::new(RestoreTracker::default());
             let (hook_tx, mut hook_rx) = unbounded_channel::<HostHook>();
             {
@@ -5906,7 +5913,7 @@ pub fn spawn(
                         spawn_async_task(&rt.lua, &gate, task);
                     }
                     while let Ok(cb) = defer_rx.try_recv() {
-                        spawn_deferred_callback(&rt.lua, &gate, cb);
+                        spawn_deferred_callback(&rt.lua, &gate, &timer_gate, cb);
                     }
                     // Nothing to serve, so spend the lull on native codegen.
                     // One chunk per pass with a yield in between, so no request
@@ -5934,7 +5941,7 @@ pub fn spawn(
                             Some(None)
                         }
                         Some(cb) = defer_rx.recv() => {
-                            spawn_deferred_callback(&rt.lua, &gate, cb);
+                            spawn_deferred_callback(&rt.lua, &gate, &timer_gate, cb);
                             Some(None)
                         }
                         msg = rx.recv() => msg.map(Some),
@@ -6687,6 +6694,7 @@ mod tests {
                 let timer = spawn_deferred_callback(
                     &lua,
                     &Rc::new(gate()),
+                    &Arc::new(Semaphore::new(MAX_INFLIGHT_TOOLS)),
                     DeferredCallback {
                         func: lua.create_registry_value(true).unwrap(),
                         delay: Duration::from_secs(3600),

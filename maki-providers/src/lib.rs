@@ -8,6 +8,7 @@ pub mod model;
 pub mod model_registry;
 pub mod models_cache;
 pub mod pricing;
+pub mod process;
 pub mod provider;
 pub(crate) mod providers;
 pub mod retry;

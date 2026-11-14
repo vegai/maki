@@ -333,7 +333,10 @@ fn spawn_stdio(
         return Err(start_failed(name, "stdio pipes missing"));
     };
     let process = StdioProcess {
-        child: ChildGuard::new(child),
+        child: ChildGuard::new(child).map_err(|error| McpError::StartFailed {
+            server: name.to_owned(),
+            reason: error.to_string(),
+        })?,
         _stderr: AbortOnDropHandle::new(tokio::spawn(log_stderr(Arc::from(name), stderr))),
     };
     Ok((stdout, stdin, process))

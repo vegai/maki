@@ -1,23 +1,25 @@
+use std::collections::HashMap;
 use std::env;
-use std::path::Path;
 use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use maki_lua_macro::{lua_fn, lua_table};
+use maki_providers::process;
 use maki_storage::id::MakiId;
-use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
+use mlua::{Function, Lua, LuaString, RegistryKey, Result as LuaResult, Table, Value};
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 
 use crate::api::fs::expand_tilde;
 use crate::api::keymap::{InputMode, KeymapWriter};
 use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
 use crate::api::util::convert::TableExt;
-use crate::api::util::pair::{Pair, err_pair, try_pair};
+use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::jobs::{
-    CallbackUpdate, CallbackUpdates, JobCommand, JobEvent, JobOwner, JobSnapshot, JobSpec,
-    MAX_TAIL_LINES, Redirect, deliver_job_event,
+    CallbackUpdate, CallbackUpdates, JOB_NOT_FOUND_ERR, JobCommand, JobEvent, JobOwner,
+    JobSnapshot, JobSpec, MAX_TAIL_LINES, Redirect, deliver_job_event,
 };
 use crate::plugin_permissions::{Ceiling, Permission, PluginPermissions, require};
 use crate::runtime::{active_task_id, job_task_id, strip_traceback, with_jobs};
@@ -28,12 +30,17 @@ const NO_TASK_SCOPE_ERR: &str =
     "jobstart: no active task; use scope = \"plugin\" or { session = ... }";
 const TABLE_SCOPE_ERR: &str = "jobstart: table scope must be { session = <id> }";
 const SCOPE_TYPE_ERR: &str = "jobstart: scope must be \"task\", \"plugin\", or { session = <id> }";
-const JOB_NOT_FOUND_ERR: &str = "job: not found";
 const JOB_UNWAITABLE_ERR: &str = "jobwait: unknown job id or already waited";
 const JOB_WAIT_TIMEOUT_ERR: &str = "jobwait: timed out";
 const BLANK_NAME_ERR: &str = "jobstart: name must be non-blank";
 const EMPTY_ARGV_ERR: &str = "jobstart: argv table must not be empty";
 const CMD_TYPE_ERR: &str = "jobstart: cmd must be a shell string or an argv table";
+const STDIN_MODE_ERR: &str = "jobstart: stdin must be \"pipe\" or \"null\"";
+const STDIN_PIPE: &str = "pipe";
+const STDIN_NULL: &str = "null";
+const CHANCLOSE_STREAM_ERR: &str = "chanclose: you can close only \"stdin\"";
+const CHANSEND_DATA_ERR: &str = "chansend: data must be a string or a list";
+const STDIN_STREAM: &str = "stdin";
 
 /// Run a command in the background. A string runs through `bash -c` on Unix
 /// and through [`agent.shell`](/docs/configuration/#agent) on Windows. A table
@@ -42,32 +49,39 @@ const CMD_TYPE_ERR: &str = "jobstart: cmd must be a shell string or an argv tabl
 /// You get back a job id that you can pass to `jobstop` or `jobwait` to
 /// control the process.
 ///
-/// Output nobody has read yet waits in a queue of up to 16 MiB per job.
-/// Past that the child blocks on write until `on_stdout` / `on_stderr` or
-/// `jobwait` drain it, so a job started where nothing delivers its events,
-/// like a tool handler before it returns, pauses there.
+/// Unread output is bounded to 16 MiB per job. The child blocks on write until
+/// callbacks or `jobwait` drain it.
 ///
-/// `stdout` and `stderr` route a stream to a file instead of into maki. A
-/// path is opened for append and handed to the child, so nothing is buffered
-/// here: no callback, no tail, no events for that stream, and it counts as
-/// truncated everywhere a tail is reported. That makes the two mutually
-/// exclusive with `on_stdout` / `on_stderr` for the same stream, and a path
-/// additionally needs the `fs_write` permission. To both persist and react,
-/// run one job writing the file and a second one tailing it.
+/// `stdout` and `stderr` can append directly to files. Redirected streams
+/// have no callbacks, tails or events and count as truncated in job reports.
+/// A redirect conflicts with the corresponding output callback and needs
+/// `fs_write`. Use separate writer and reader jobs to store and process output.
+///
+/// Yields while starting the process. Call from a coroutine. Cancel hooks and
+/// describe callbacks cannot yield.
 ///
 /// @param cmd string|table Shell command, or an argv table like
 ///   `{ "tail", "-F", path }`.
 /// @param opts table? Optional settings:
 ///   `cwd` (string?) working directory (tilde is expanded).
-///   `env` (table?) extra environment variables, `{ VAR = "value" }`.
-///   `on_stdout` (function?) called with `(job_id, line, "stdout", bytes)`
-///     for each stdout line, the stream name third as in Neovim (which
-///     passes a list of lines where maki passes one). `bytes` is the line's
-///     length before `max_line_bytes` cut it, so it equals `#line` unless
-///     the line was cut. Bytes that are not UTF-8 arrive as U+FFFD.
-///   `on_stderr` (function?) called with `(job_id, line, "stderr", bytes)`
-///     for each stderr line.
-///   `on_exit` (function?) called with `(job_id, code)` when the process finishes.
+///   `env` (table?) environment variables, `{ VAR = "value" }`, added to
+///     maki's environment.
+///   `clear_env` (boolean?) use only `env` for the child
+///     environment (default false). Without an explicit `PATH`, the program
+///     (or shell for a string command) is resolved through maki's `PATH`.
+///   `stdin` (string?) `"pipe"` to write to the job with `chansend`. Defaults
+///     to `"null"`, no input. Neovim defaults to `"pipe"`, but a job that
+///     reads an open pipe with no data hangs.
+///   `guard` (boolean?) on Linux, stop remaining group members as soon as the leader exits,
+///     including descendants that retain output pipes, or when maki dies, even from SIGKILL.
+///   `timeout_ms` (integer?) stop the process group after this many milliseconds.
+///     The deadline runs independently of Lua callbacks.
+///   `on_stdout` (function?) called with `(job_id, line, "stdout", bytes)` for each
+///     stdout line. Bytes that are not UTF-8 become U+FFFD, where Neovim
+///     passes the raw bytes. `bytes` is the original byte count before truncation.
+///   `on_stderr` (function?) the same for each stderr line, with `"stderr"`.
+///   `on_exit` (function?) called with `(job_id, code, "exit", timed_out, stderr_tail)` when the
+///     process stops. `stderr_tail` holds up to 10 lines, each capped at 4096 bytes.
 ///   `stdout` (string|false?) append stdout to this path, or `false` to
 ///     discard it.
 ///   `stderr` (string|false?) same for stderr; both may name one path.
@@ -75,16 +89,17 @@ const CMD_TYPE_ERR: &str = "jobstart: cmd must be a shell string or an argv tabl
 ///     with the current call. `"plugin"` keeps it alive until the plugin
 ///     unloads or reloads. `{ session = "<id>" }` keeps it alive until that
 ///     session ends, and survives plugin reload.
+///   `max_line_bytes` (integer?) longest delivered output line in bytes. Longer lines
+///     are cut at a UTF-8 boundary and end in `...` (default, `0`, and max: 64 MiB).
+///   `stop_on_line_limit` (boolean?) stop the job on an oversized line instead of
+///     truncating it (default false). Use for protocols that require complete lines.
 ///   `tail` (integer?) trailing lines per stream kept for `jobinfo` and
 ///     `jobwait` (default 20, 0 disables, max 1024).
-///   `max_line_bytes` (integer?) longest line delivered, in bytes. A longer
-///     line is cut at a UTF-8 boundary and ends in `...`, and its rest is
-///     skipped without being read into memory. Default, `0`, and max: 64 MiB.
 ///   `name` (string?) handle for `jobfind`, unique among the live jobs this
-///     plugin can see. Starting a second job under a live name is an error.
+///     plugin can see. A second job with the same live name fails.
 /// @return (integer?, string?) Job id, or nil plus an error message when the
 ///   process could not start (binary not found, bad `cwd`, redirect file not
-///   writable).
+///   writable or a live name is already held).
 /// @example
 /// local id, err = maki.fn.jobstart({ "rg", "--json", pattern, dir }, {
 ///   on_stdout = function(_, line) print(line) end,
@@ -94,8 +109,8 @@ const CMD_TYPE_ERR: &str = "jobstart: cmd must be a shell string or an argv tabl
 ///   maki.log.warn("rg failed to start: " .. err)
 /// end
 #[lua_fn(guard = Run)]
-fn jobstart(
-    lua: &Lua,
+async fn jobstart(
+    lua: Lua,
     #[ctx] plugin: Arc<str>,
     #[ctx] grants: PluginPermissions,
     cmd: Value,
@@ -103,51 +118,66 @@ fn jobstart(
 ) -> LuaResult<Pair<u32>> {
     let scope = opts
         .as_ref()
-        .map(|opts| opts.get::<Value>("scope"))
+        .map(|opts| opts.opt::<Value>("scope"))
         .transpose()?
+        .flatten()
         .unwrap_or(Value::Nil);
-    let mut spec = JobSpec::new(parse_scope(lua, &plugin, scope)?, parse_command(cmd)?);
-    let mut tail = None;
+    let mut spec = JobSpec::new(parse_scope(&lua, &plugin, scope)?, parse_command(cmd)?);
+    spec.ceiling = Ceiling::current_for(&lua, &plugin);
 
     if let Some(ref opts) = opts {
-        spec.cwd = opts.opt("cwd").ok().flatten();
-        spec.env = opts
-            .get::<Table>("env")
-            .ok()
-            .map(|t| t.pairs::<String, String>().filter_map(Result::ok).collect());
-        spec.name = job_name(opts)?;
-        spec.on_stdout = callback_key(lua, opts, "on_stdout")?;
-        spec.on_stderr = callback_key(lua, opts, "on_stderr")?;
-        spec.on_exit = callback_key(lua, opts, "on_exit")?;
-        spec.ceiling = Ceiling::current_for(lua, &plugin);
-        spec.stdout = parse_redirect(lua, opts, "stdout", spec.on_stdout.is_some(), &grants)?;
-        spec.stderr = parse_redirect(lua, opts, "stderr", spec.on_stderr.is_some(), &grants)?;
-        if let Some(max) = opts.opt_nonzero("max_line_bytes")? {
-            spec.max_line_bytes = max;
+        spec.cwd = opts.opt("cwd")?;
+        spec.env = opts.opt::<HashMap<String, String>>("env")?;
+        spec.clear_env = opts.opt::<bool>("clear_env")?.unwrap_or(false);
+        spec.guard = opts.opt::<bool>("guard")?.unwrap_or(false);
+        spec.timeout = opts.opt::<u64>("timeout_ms")?.map(Duration::from_millis);
+        if let Some(limit) = opts.opt_nonzero("max_line_bytes")? {
+            spec.max_line_bytes = limit;
         }
-        tail = opts.opt("tail").ok().flatten();
-        if let Some(n) = tail
-            && n > MAX_TAIL_LINES
-        {
+        spec.stop_on_line_limit = opts.opt::<bool>("stop_on_line_limit")?.unwrap_or(false);
+        spec.pipe_stdin = match opts.opt::<String>("stdin")?.as_deref() {
+            None | Some(STDIN_NULL) => false,
+            Some(STDIN_PIPE) => true,
+            Some(_) => return Err(mlua::Error::runtime(STDIN_MODE_ERR)),
+        };
+        spec.name = job_name(opts)?;
+        spec.on_stdout = callback_key(&lua, opts, "on_stdout")?;
+        spec.on_stderr = callback_key(&lua, opts, "on_stderr")?;
+        spec.on_exit = callback_key(&lua, opts, "on_exit")?;
+        spec.stdout = parse_redirect(&lua, opts, "stdout", spec.on_stdout.is_some(), &grants)?;
+        spec.stderr = parse_redirect(&lua, opts, "stderr", spec.on_stderr.is_some(), &grants)?;
+        spec.tail = opts.opt("tail")?.unwrap_or(spec.tail);
+        if spec.tail > MAX_TAIL_LINES {
             return Err(mlua::Error::runtime(format!(
                 "jobstart: tail must be in 0..={MAX_TAIL_LINES}"
             )));
         }
     }
 
-    let task_id = active_task_id(lua);
-    with_jobs(lua, |store| {
+    let task_id = active_task_id(&lua);
+    let gate = with_jobs(&lua, |store| Arc::clone(&store.start_gate));
+    let _starting = if spec.name.is_some() {
+        Some(gate.lock().await)
+    } else {
+        None
+    };
+    let available = with_jobs(&lua, |store| {
         if let Some(ref name) = spec.name
             && let Some(held) = store.find_named(name, task_id, &plugin)
         {
-            return Err(mlua::Error::runtime(format!(
+            return Err(format!(
                 "jobstart: name {name:?} is already held by live job {held}"
-            )));
+            ));
         }
-        let id = try_pair!(store.start(spec));
-        store.set_tail(id, tail);
-        Ok((Some(id), None))
-    })
+        Ok(())
+    });
+    try_pair!(available);
+    let spawned = try_pair!(
+        spawn_blocking(move || spec.spawn())
+            .await
+            .map_err(mlua::Error::external)?
+    );
+    with_jobs(&lua, |store| Ok(pair(store.register(spawned))))
 }
 
 fn parse_command(cmd: Value) -> LuaResult<JobCommand> {
@@ -193,8 +223,7 @@ fn parse_redirect(
 }
 
 fn callback_key(lua: &Lua, opts: &Table, key: &str) -> LuaResult<Option<RegistryKey>> {
-    opts.get::<Function>(key)
-        .ok()
+    opts.opt::<Function>(key)?
         .map(|f| lua.create_registry_value(f))
         .transpose()
 }
@@ -208,9 +237,9 @@ fn job_name(opts: &Table) -> LuaResult<Option<String>> {
 }
 
 /// Find the live job of this plugin that `jobstart` registered under {name}.
-/// An exited job never answers, so `jobfind(...) or jobstart(...)` restarts a
-/// job that died instead of adopting its id. The name stays on the `joblist`
-/// row, which is where you go to see why it died.
+/// An exited job never answers. The name stays on its `joblist` row so you can inspect
+/// why it died. Another coroutine may claim the name while `jobstart` yields.
+/// Check for a start error, or look up the winner again.
 ///
 /// @param name string Name passed to `jobstart`.
 /// @return (integer|nil, string|nil) Job id, or nil and an error when no live
@@ -218,7 +247,10 @@ fn job_name(opts: &Table) -> LuaResult<Option<String>> {
 /// @example
 /// local id = maki.fn.jobfind("log-tail")
 /// if not id then
-///   id = maki.fn.jobstart("tail -F /tmp/log", { name = "log-tail", scope = "plugin" })
+///   local err
+///   id, err = maki.fn.jobstart("tail -F /tmp/log", { name = "log-tail", scope = "plugin" })
+///   if not id then id = maki.fn.jobfind("log-tail") end
+///   if not id then return nil, err end
 /// end
 #[lua_fn(guard = Run)]
 fn jobfind(lua: &Lua, #[ctx] plugin: Arc<str>, name: String) -> LuaResult<Pair<u32>> {
@@ -268,7 +300,7 @@ fn parse_scope(lua: &Lua, plugin: &Arc<str>, scope: Value) -> LuaResult<JobOwner
 ///
 /// @param job_id integer Job id returned by `jobstart`.
 /// @return (table|nil, string|nil) `{ id, command, name, pid, session, status,
-///   exit_code, elapsed_secs, stdout_lines, stderr_lines }`, or nil and
+///   exit_code, timed_out, elapsed_secs, stdout_lines, stderr_lines }`, or nil and
 ///   an error. `status` is `"running"` or `"exited"`.
 /// @example
 /// local info = maki.fn.jobinfo(id)
@@ -345,7 +377,7 @@ fn callback_update(lua: &Lua, opts: &Table, key: &str) -> LuaResult<CallbackUpda
 ///
 /// @param session string? Session id filter.
 /// @return (table) array of `{ id, command, name, pid, session, status,
-///   exit_code, elapsed_secs }`.
+///   exit_code, timed_out, elapsed_secs }`.
 /// @example
 /// local jobs = maki.fn.joblist(maki.session.current())
 #[lua_fn(guard = Run)]
@@ -383,6 +415,7 @@ fn snapshot_table(lua: &Lua, snap: &JobSnapshot, tails: bool) -> LuaResult<Table
         },
     )?;
     row.set("exit_code", snap.exit_code)?;
+    row.set("timed_out", snap.timed_out)?;
     if tails {
         let stdout = lua.create_table()?;
         for (i, line) in snap.stdout_lines.iter().enumerate() {
@@ -412,6 +445,87 @@ fn jobstop(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<()> {
     Ok(())
 }
 
+/// Write {data} to job {id}'s stdin. Start the job with `stdin = "pipe"`.
+/// Unlike `vim.fn.chansend`, an error returns nil and a message instead of 0.
+/// List items use newline separators. A newline inside an item becomes NUL.
+/// The final item has no newline suffix.
+///
+/// Unread data stays in memory. A descendant can retain stdin after the job
+/// exits. Use `guard` to stop that descendant and release the data.
+///
+/// Waits for queue capacity while the child consumes input. Large writes are
+/// split internally, and the queue includes bytes being written to the pipe.
+///
+/// @param id integer Job id returned by `jobstart`.
+/// @param data string|table Text to write, or a list of lines.
+/// @return (integer?, string?) Bytes accepted from this call, or nil and an error.
+/// @example
+/// local id = maki.fn.jobstart({ "cat" }, { stdin = "pipe" })
+/// maki.fn.chansend(id, "hello\n")
+/// maki.fn.chanclose(id, "stdin")
+#[lua_fn(guard = Run)]
+async fn chansend(
+    lua: Lua,
+    #[ctx] plugin: Arc<str>,
+    id: u32,
+    data: Value,
+) -> LuaResult<Pair<usize>> {
+    let send = async |bytes: &[u8]| -> LuaResult<Pair<usize>> {
+        let task_id = active_task_id(&lua);
+        let writer = try_pair!(with_jobs(&lua, |store| store.stdin_writer(id, task_id, &plugin)));
+        Ok(pair(writer.send(bytes).await))
+    };
+    match data {
+        Value::String(text) => send(&text.as_bytes()).await,
+        Value::Table(lines) => send(&chansend_bytes(lines)?).await,
+        _ => Err(mlua::Error::runtime(CHANSEND_DATA_ERR)),
+    }
+}
+
+/// List items can contain arbitrary bytes, as in Neovim. A newline inside an item becomes NUL.
+fn chansend_bytes(lines: Table) -> LuaResult<Vec<u8>> {
+    let mut bytes = Vec::new();
+    for (index, line) in lines.sequence_values::<LuaString>().enumerate() {
+        if index > 0 {
+            bytes.push(b'\n');
+        }
+        bytes.extend(
+            line?
+                .as_bytes()
+                .iter()
+                .map(|&byte| if byte == b'\n' { b'\0' } else { byte }),
+        );
+    }
+    Ok(bytes)
+}
+
+/// Close job {id}'s stdin, so the job reads end of file. Like
+/// `vim.fn.chanclose`, but only for the `"stdin"` stream: without a stream,
+/// Neovim closes every stream, while this closes stdin. The {stream}
+/// argument is kept, so a call written for Neovim works unchanged.
+///
+/// @param id integer Job id returned by `jobstart`.
+/// @param stream string? `"stdin"`, which is also the default.
+/// @return (integer?, string?) `1`, as Neovim returns, or nil and an error.
+/// @example
+/// maki.fn.chanclose(id, "stdin")
+#[lua_fn(guard = Run)]
+fn chanclose(
+    lua: &Lua,
+    #[ctx] plugin: Arc<str>,
+    id: u32,
+    stream: Option<String>,
+) -> LuaResult<Pair<i32>> {
+    if stream.is_some_and(|s| s != STDIN_STREAM) {
+        return Err(mlua::Error::runtime(CHANCLOSE_STREAM_ERR));
+    }
+    let task_id = active_task_id(lua);
+    match with_jobs(lua, |store| store.close_stdin(id, task_id, &plugin)) {
+        Ok(()) => Ok((Some(1), None)),
+        Err(e) => Ok(err_pair(e)),
+    }
+}
+
 /// Drop an exited session-owned job from the store. Running jobs are left
 /// alone; use `jobstop` to kill those. Unknown ids are a no-op.
 ///
@@ -427,12 +541,13 @@ fn jobforget(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<()> {
 }
 
 /// Wait for a job to finish and collect its output. Returns a result
-/// table with `stdout`, `stderr`, `exit_code`, and `truncated`. The output
-/// starts from the job's captured tail, which holds what was delivered before
-/// the wait, and a live job adds every line from then on. `truncated` says
-/// whether that tail had already lost a line by then (`tail` too small or 0,
-/// or the stream redirected away). It doesn't count lines cut by
-/// `max_line_bytes`: those still arrive, ending in `...`.
+/// table with `stdout`, `stderr`, `exit_code`, `timed_out`, and `truncated`.
+/// The output starts from the job's captured tail, which holds what was
+/// delivered before the wait, and a live job adds every line from then on.
+/// `truncated` says whether that tail had already lost a line by then (`tail`
+/// too small or 0, or the stream redirected away). It doesn't count lines cut
+/// by `max_line_bytes`: those still arrive, ending in `...`.
+/// `timed_out` is true when the job's own `timeout_ms` deadline stopped it.
 ///
 /// While waiting, the job's `on_stdout`, `on_stderr`, and `on_exit`
 /// callbacks fire as events arrive (like Neovim), so you can stream
@@ -443,7 +558,7 @@ fn jobforget(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<()> {
 ///
 /// @param job_id integer Job id returned by `jobstart`.
 /// @param timeout_ms integer? Maximum wait in milliseconds (default 30000).
-/// @return (table?, string?) `{ stdout, stderr, exit_code, truncated }`, or
+/// @return (table?, string?) `{ stdout, stderr, exit_code, timed_out, truncated }`, or
 ///   nil plus an error on timeout or an unknown job.
 /// @example
 /// local id = maki.fn.jobstart("echo hello")
@@ -468,6 +583,7 @@ async fn jobwait(
             &snap.stdout_lines,
             &snap.stderr_lines,
             code,
+            snap.timed_out,
             snap.dropped_output,
         );
     }
@@ -484,7 +600,7 @@ async fn jobwait(
     let mut stdout_lines = snap.stdout_lines;
     let mut stderr_lines = snap.stderr_lines;
 
-    let exit_code = loop {
+    let (exit_code, timed_out) = loop {
         let event = tokio::select! {
             biased;
             event = lease.recv() => event,
@@ -503,7 +619,7 @@ async fn jobwait(
         match event {
             JobEvent::Stdout(line) => stdout_lines.push(line.text),
             JobEvent::Stderr(line) => stderr_lines.push(line.text),
-            JobEvent::Exit(code) => break code,
+            JobEvent::Exit(code, timed_out) => break (code, timed_out),
         }
     };
 
@@ -512,6 +628,7 @@ async fn jobwait(
         &stdout_lines,
         &stderr_lines,
         exit_code,
+        timed_out,
         snap.dropped_output,
     )
 }
@@ -523,18 +640,20 @@ fn wait_result(
     stdout: &[String],
     stderr: &[String],
     exit_code: i32,
+    timed_out: bool,
     truncated: bool,
 ) -> LuaResult<Pair<Table>> {
     let result = lua.create_table()?;
     result.set("stdout", stdout.join("\n"))?;
     result.set("stderr", stderr.join("\n"))?;
     result.set("exit_code", exit_code)?;
+    result.set("timed_out", timed_out)?;
     result.set("truncated", truncated)?;
     Ok((Some(result), None))
 }
 
-/// Check whether {name} can be found on `$PATH` or is an absolute path
-/// to a file. Returns 1 when found, 0 otherwise (matches Neovim's
+/// Check whether {name} names a runnable file, resolving relative paths
+/// and `$PATH` from maki's directory. Returns 1 when found, 0 otherwise (matches Neovim's
 /// `vim.fn.executable`).
 ///
 /// @param name string Program name (e.g. `"git"`) or absolute path.
@@ -547,11 +666,12 @@ fn wait_result(
 // environment holds, so `fs_read` covers it.
 #[lua_fn(guard = FsRead)]
 fn executable(_lua: &Lua, name: String) -> LuaResult<i32> {
-    let found = env::var_os("PATH")
-        .map(|paths| env::split_paths(&paths).any(|dir| dir.join(&name).is_file()))
-        .unwrap_or(false)
-        || Path::new(&name).is_file();
-    Ok(if found { 1 } else { 0 })
+    Ok(i32::from(
+        env::current_dir()
+            .ok()
+            .and_then(|cwd| process::find_program(&name, &cwd))
+            .is_some(),
+    ))
 }
 
 /// Read the viewport of the focused chat transcript, like Neovim's
@@ -642,6 +762,7 @@ lua_table! {
         jobstart(perms, plugin, grants), jobstop(perms, plugin), jobforget(perms, plugin),
         jobwait(perms, plugin), jobinfo(perms, plugin), joblist(perms, plugin),
         jobattach(perms, plugin), jobfind(perms, plugin),
+        chansend(perms, plugin), chanclose(perms, plugin),
         executable(perms),
         winsaveview(tx), winrestview(tx), mode,
     ]
@@ -649,16 +770,95 @@ lua_table! {
 
 #[cfg(test)]
 mod tests {
+    use futures::FutureExt;
+    use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
+
     use super::*;
     use crate::api::util::command::{NO_UI_ERR, WinView};
-    use futures::FutureExt;
-    use tokio::sync::mpsc::UnboundedSender;
-    use tokio::sync::mpsc::unbounded_channel;
+    #[cfg(unix)]
+    use crate::test_support::runtime;
 
     const TEST_PLUGIN: &str = "test-plugin";
     /// Can't exit while a test runs, so only the code under test ends it.
     const SLEEPING_JOB: &str = "sleep 600";
     const LONG_WAIT_MS: u64 = 600_000;
+    const FIRST_LINE: &[u8] = b"first";
+    const NOT_UTF8_LINE: &[u8] = b"latin\xe9";
+    const LINE_WITH_NEWLINE: &[u8] = b"two\nparts";
+    const LINE_WITH_NUL: &[u8] = b"two\0parts";
+
+    #[cfg(unix)]
+    #[test]
+    fn only_named_starts_take_the_gate() {
+        const PLUGIN: &str = "gate-test";
+        const COMMAND: &str = "cat";
+        const START_TIMEOUT: Duration = Duration::from_secs(5);
+        runtime().block_on(async {
+            let lua = Lua::new();
+            let table = create_fn_table(
+                &lua,
+                PLUGIN.into(),
+                &PluginPermissions::trusted(),
+                PluginPermissions::trusted(),
+                None,
+            )
+            .unwrap();
+            let gate = with_jobs(&lua, |store| Arc::clone(&store.start_gate));
+            let held = gate.lock().await;
+            let named_options = lua
+                .create_table_from([("scope", "plugin"), ("stdin", "pipe")])
+                .unwrap();
+            named_options.set("name", PLUGIN).unwrap();
+            let start: Function = table.get("jobstart").unwrap();
+            let mut starting =
+                pin!(start.call_async::<(Option<u32>, Option<String>)>((COMMAND, named_options)));
+            assert!((starting.as_mut()).now_or_never().is_none());
+            let unnamed_options = lua
+                .create_table_from([("scope", "plugin"), ("stdin", "pipe")])
+                .unwrap();
+            let unnamed =
+                start.call_async::<(Option<u32>, Option<String>)>((COMMAND, unnamed_options));
+            let (id, error) = tokio::select! {
+                biased;
+                result = unnamed => result,
+                result = starting.as_mut() => panic!("named start passed the held gate: {result:?}"),
+                () = sleep(START_TIMEOUT) => panic!("jobstart waited on an unrelated start"),
+            }.unwrap();
+            assert!(id.is_some(), "{error:?}");
+            assert!((starting.as_mut()).now_or_never().is_none());
+            assert!(with_jobs(&lua, |store| store.find_named(PLUGIN, None, PLUGIN)).is_none());
+            drop(held);
+            let (id, error) = starting.await.unwrap();
+            assert!(id.is_some(), "{error:?}");
+            assert_eq!(
+                with_jobs(&lua, |store| store.find_named(PLUGIN, None, PLUGIN)),
+                id
+            );
+        });
+    }
+
+    /// List items can contain arbitrary bytes, as in Neovim. A newline inside an item becomes NUL.
+    #[test]
+    fn chansend_sends_a_list_as_bytes() {
+        let lua = Lua::new();
+        let lines = lua
+            .create_sequence_from([
+                lua.create_string(FIRST_LINE).unwrap(),
+                lua.create_string(NOT_UTF8_LINE).unwrap(),
+                lua.create_string(LINE_WITH_NEWLINE).unwrap(),
+            ])
+            .unwrap();
+        let expected = [
+            FIRST_LINE,
+            b"\n".as_slice(),
+            NOT_UTF8_LINE,
+            b"\n".as_slice(),
+            LINE_WITH_NUL,
+        ]
+        .concat();
+        assert_eq!(chansend_bytes(lines).unwrap(), expected);
+    }
 
     fn lua_with_view(tx: Option<UnboundedSender<UiAction>>) -> Lua {
         let lua = Lua::new();
@@ -669,8 +869,8 @@ mod tests {
         lua
     }
 
-    #[test_case::test_case("return f.winsaveview()" ; "winsaveview")]
-    #[test_case::test_case("return f.winrestview({ topline = 3 })" ; "winrestview")]
+    #[test_case("return f.winsaveview()" ; "winsaveview")]
+    #[test_case("return f.winrestview({ topline = 3 })" ; "winrestview")]
     #[tokio::test]
     async fn view_without_ui_returns_error_pair(code: &str) {
         let lua = lua_with_view(None);
@@ -711,9 +911,9 @@ mod tests {
         assert!(!view.get::<bool>("auto_scroll").unwrap());
     }
 
-    #[test_case::test_case("{ topline = 12 }", 11 ; "explicit_topline")]
-    #[test_case::test_case("{}", 0 ; "missing_topline_defaults_to_first_line")]
-    #[test_case::test_case("{ topline = -5 }", 0 ; "below_range_clamps_to_first_line")]
+    #[test_case("{ topline = 12 }", 11 ; "explicit_topline")]
+    #[test_case("{}", 0 ; "missing_topline_defaults_to_first_line")]
+    #[test_case("{ topline = -5 }", 0 ; "below_range_clamps_to_first_line")]
     #[tokio::test]
     async fn winrestview_forwards_zero_based_scroll_top(arg: &str, expected: u32) {
         let (tx, mut rx) = unbounded_channel::<UiAction>();
@@ -739,8 +939,8 @@ mod tests {
         PluginCoroutine,
     }
 
-    #[test_case::test_case(Abandoned::HostCall ; "host_call")]
-    #[test_case::test_case(Abandoned::PluginCoroutine ; "plugin_coroutine")]
+    #[test_case(Abandoned::HostCall ; "host_call")]
+    #[test_case(Abandoned::PluginCoroutine ; "plugin_coroutine")]
     #[tokio::test]
     async fn abandoned_jobwait_releases_the_job(abandoned: Abandoned) {
         let lua = Lua::new();
@@ -748,7 +948,7 @@ mod tests {
         jobwait__register(
             &t,
             &lua,
-            &PluginPermissions::trusted(),
+            PluginPermissions::trusted(),
             Arc::from(TEST_PLUGIN),
         )
         .unwrap();

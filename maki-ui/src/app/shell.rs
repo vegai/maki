@@ -244,7 +244,8 @@ async fn run_command(
     if let Some(stderr) = child.stderr.take() {
         spawn_line_reader(BufReader::new(stderr), line_tx.clone());
     }
-    let mut guard = maki_agent::ChildGuard::new(child);
+    let mut guard =
+        maki_agent::ChildGuard::new(child).map_err(|e| format!("cannot supervise process: {e}"))?;
     drop(line_tx);
 
     let mut output = String::new();

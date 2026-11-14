@@ -20,6 +20,8 @@ pub mod error;
 pub mod oauth;
 pub mod transport;
 
+#[cfg(unix)]
+use maki_providers::process::kill_group;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::future::pending;
@@ -1370,9 +1372,9 @@ fn spawn_persist_enabled(path: PathBuf, name: String, enabled: bool) {
 
 #[cfg(unix)]
 pub fn kill_process_groups(pids: &[u32]) {
-    use crate::child_guard::sigkill_process_group;
-
-    pids.iter().copied().for_each(sigkill_process_group);
+    for &pid in pids {
+        kill_group(pid);
+    }
 }
 
 #[cfg(not(unix))]

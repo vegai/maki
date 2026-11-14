@@ -3914,10 +3914,12 @@ dependencies = [
  "inventory",
  "jiff",
  "keyring",
+ "libc",
  "maki-config",
  "maki-storage",
  "open",
  "reqwest",
+ "rustix 1.1.6",
  "serde",
  "serde-saphyr",
  "serde_json",
@@ -3932,6 +3934,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "wait-timeout",
 ]
 
 [[package]]
@@ -8180,6 +8183,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d9b2acfb050df409c972a37d3b8e08cdea3bddb0c09db9d53137e504cfabed0"
 dependencies = [
  "utf8parse",
+]
+
+[[package]]
+name = "wait-timeout"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09ac3b126d3914f9849036f826e054cbabdc8519970b8998ddaf3b5bd3c65f11"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
