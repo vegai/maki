@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use super::claude_code::Factory as ClaudeCodeFactory;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
@@ -11,7 +13,6 @@ use maki_config::host_allowed;
 use maki_config::providers::{Protocol, ProvidersConfig, base_url_override, plan_base_url};
 use maki_storage::StateDir;
 use maki_storage::auth::{lock_credentials, plugin_auth_stamp};
-use maki_storage::id::SessionRef;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex as AsyncMutex;
@@ -23,7 +24,7 @@ use url::{Host, Url};
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelInfo};
 use crate::pricing::PricingSchedule;
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use crate::spec::{BASES, ProviderRegistry, ProviderSpec};
 use crate::types::ThinkingFallback;
 use crate::{
@@ -485,8 +486,23 @@ struct PluginEntry {
     auth: Arc<AuthState>,
 }
 
-/// Ordered by slug, so every listing comes out the same each run.
-type Registry = BTreeMap<Box<str>, Arc<PluginEntry>>;
+#[derive(Default)]
+struct Registry {
+    #[cfg(target_os = "linux")]
+    native: Option<Arc<ClaudeCodeFactory>>,
+    /// Ordered by slug, so every listing comes out the same each run.
+    entries: BTreeMap<Box<str>, Arc<PluginEntry>>,
+}
+
+impl Registry {
+    const fn new() -> Self {
+        Self {
+            #[cfg(target_os = "linux")]
+            native: None,
+            entries: BTreeMap::new(),
+        }
+    }
+}
 
 type AuthCell = (Option<Arc<str>>, Arc<AuthState>);
 
@@ -544,6 +560,19 @@ pub fn keep_legacy_selections() -> Vec<String> {
     warnings
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn register_native(factory: Arc<ClaudeCodeFactory>) {
+    let mut staging = STAGING.lock().unwrap();
+    if let Some(staged) = staging.as_mut() {
+        staged.native = Some(factory);
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn native_factory() -> Option<Arc<ClaudeCodeFactory>> {
+    entries().native.clone()
+}
+
 /// Publishes what this load registered. A load that registered nothing
 /// publishes nothing, which is how a `/reload` drops a plugin that was removed.
 ///
@@ -554,7 +583,7 @@ pub fn commit_load() {
     let Some(staged) = STAGING.lock().unwrap().take() else {
         return;
     };
-    for entry in staged.values() {
+    for entry in staged.entries.values() {
         let slug = &entry.decl.slug;
         let api_key_env = entry.decl.api_key_env.clone().filter(|var| !var.is_empty());
         if let Err(error) = entry.auth.redeclare(
@@ -566,7 +595,11 @@ pub fn commit_load() {
             warn!(slug, %error, "provider credentials were not re-declared");
         }
     }
-    let logins = staged.values().filter_map(|e| e.built.login).collect();
+    let logins = staged
+        .entries
+        .values()
+        .filter_map(|e| e.built.login)
+        .collect();
     maki_config::providers::set_registered_providers(logins);
     PROVIDERS.store(Arc::new(staged));
 }
@@ -580,12 +613,13 @@ pub fn discard(plugin: &str) {
         return;
     };
     let dropped: Vec<Box<str>> = staged
+        .entries
         .iter()
         .filter(|(_, entry)| entry.owner.as_deref() == Some(plugin))
         .map(|(slug, _)| slug.clone())
         .collect();
     for slug in &dropped {
-        staged.remove(slug);
+        staged.entries.remove(slug);
     }
     if !dropped.is_empty() {
         debug!(plugin, slugs = ?dropped, "discarded the declarations of a failed plugin load");
@@ -693,7 +727,7 @@ fn register_owned(
     let Some(staged) = staging.as_mut() else {
         return Err(RegisterError::Closed(slug));
     };
-    let Entry::Vacant(vacant) = staged.entry(slug.as_str().into()) else {
+    let Entry::Vacant(vacant) = staged.entries.entry(slug.as_str().into()) else {
         return Err(RegisterError::DuplicateSlug(slug));
     };
     debug!(
@@ -786,7 +820,7 @@ fn entries() -> Arc<Registry> {
 }
 
 fn entry(slug: &str) -> Option<Arc<PluginEntry>> {
-    entries().get(slug).cloned()
+    entries().entries.get(slug).cloned()
 }
 
 fn unknown(slug: &str) -> AgentError {
@@ -1239,14 +1273,14 @@ impl PluginProvider {
         })
     }
 
-    async fn models(&self) -> Result<Vec<ModelInfo>, AgentError> {
+    async fn models(&self, listing: ModelListing) -> Result<Vec<ModelInfo>, AgentError> {
         self.entry.ensure_auth().await?;
         // Rows describe models, they do not bound the catalogue, so without a
         // hook the listing is whatever the codec or base serves. Listing the
         // rows too, and falling back to them alone, is `fetch_all_models`'s job.
         match &self.entry.hooks.list_models {
             Some(hook) => hook.call(()).await,
-            None => self.inner.list_models().await,
+            None => self.inner.list_models(listing).await,
         }
     }
 
@@ -1269,7 +1303,7 @@ impl Provider for PluginProvider {
         tools: &'a Value,
         event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let result = async {
@@ -1287,7 +1321,7 @@ impl Provider for PluginProvider {
                     let attempt = async {
                         let result = self
                             .inner
-                            .stream_message(model, messages, system, tools, &tx, opts, session_id)
+                            .stream_message(model, messages, system, tools, &tx, opts, scope.clone())
                             .await;
                         drop(tx);
                         result
@@ -1340,9 +1374,12 @@ impl Provider for PluginProvider {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
-            let result = self.models().await;
+            let result = self.models(listing).await;
             self.mapped(result).await
         })
     }
@@ -1411,10 +1448,13 @@ pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, Agent
 
     let inner = match entry.target {
         Target::Base(spec) => {
-            let native = spec.native().ok_or_else(|| AgentError::Config {
-                message: format!("base provider '{}' has no constructor", spec.slug),
-            })?;
-            (native.with_auth)(shared, timeouts, prefix)
+            let with_auth = spec
+                .native()
+                .and_then(|native| native.with_auth)
+                .ok_or_else(|| AgentError::Config {
+                    message: format!("base provider '{}' has no constructor", spec.slug),
+                })?;
+            with_auth(shared, timeouts, prefix)
         }
         Target::Codec(protocol) => codec::build(codec_options(&entry, protocol), shared, timeouts),
     };
@@ -1601,12 +1641,17 @@ pub fn build_with_auth(
 }
 
 pub fn specs() -> Vec<&'static ProviderSpec> {
-    entries().values().map(|entry| entry.built.spec).collect()
+    entries()
+        .entries
+        .values()
+        .map(|entry| entry.built.spec)
+        .collect()
 }
 
 /// The providers whose `maki auth login` runs a `login` hook.
 pub fn auth_providers() -> Vec<(String, String)> {
     entries()
+        .entries
         .values()
         .filter(|entry| entry.hooks.login.is_some())
         .map(|entry| (entry.decl.slug.clone(), entry.decl.display_name.clone()))
@@ -1614,7 +1659,7 @@ pub fn auth_providers() -> Vec<(String, String)> {
 }
 
 pub fn is_registered(slug: &str) -> bool {
-    entries().contains_key(slug)
+    entries().entries.contains_key(slug)
 }
 
 /// Records the slugs granted to an enabled package, so they stay owned even
@@ -1639,7 +1684,7 @@ pub fn release_granted(package: &str) {
 /// package whose load failed. The catalog client must not serve a slug a
 /// package owns, because it would receive the key saved for that name.
 pub fn owns_slug(slug: &str) -> bool {
-    if entries().contains_key(slug) {
+    if entries().entries.contains_key(slug) {
         return true;
     }
     GRANTED
@@ -1677,6 +1722,7 @@ pub async fn logout(slug: &str) -> Result<bool, AgentError> {
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+    use std::path::Path;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use tokio::sync::Notify;
@@ -1686,6 +1732,7 @@ mod tests {
     use maki_config::PROVIDER_BUILTINS;
     use maki_config::providers::base_url_env_var;
     use maki_storage::auth::{PluginAuthData, save_plugin_auth};
+    use maki_storage::id::SessionRef;
     use test_case::test_case;
 
     use super::spec::{UNKNOWN_MODEL_CONTEXT_WINDOW, UNKNOWN_MODEL_MAX_OUTPUT};
@@ -1905,7 +1952,7 @@ mod tests {
             _tools: &'a Value,
             _event_tx: &'a UnboundedSender<ProviderEvent>,
             _opts: RequestOptions,
-            _session_id: Option<&'a SessionRef>,
+            _scope: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
                 Err(AgentError::Config {
@@ -1914,7 +1961,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             Box::pin(async {
                 Err(AgentError::Config {
                     message: INNER_UNUSED.to_string(),
@@ -2103,7 +2153,7 @@ mod tests {
             .unwrap();
             commit_load();
             let provider = create(SLUG, Timeouts::default()).unwrap();
-            provider.list_models().await.unwrap();
+            (provider.list_models(ModelListing::Cached)).await.unwrap();
         }
         assert_eq!(first.calls(), 1);
         assert_eq!(next.calls(), 1);
@@ -2494,7 +2544,10 @@ mod tests {
                 &serde_json::json!([]),
                 &tx,
                 RequestOptions::default(),
-                None,
+                RequestScope {
+                    session_id: None,
+                    cwd: Path::new("."),
+                },
             )
             .await;
 
@@ -2542,7 +2595,10 @@ mod tests {
                 &serde_json::json!([]),
                 &tx,
                 RequestOptions::default(),
-                None,
+                RequestScope {
+                    session_id: None,
+                    cwd: Path::new("."),
+                },
             )
             .await;
 
@@ -2594,7 +2650,10 @@ mod tests {
                 &serde_json::json!([]),
                 &tx,
                 RequestOptions::default(),
-                Some(&session),
+                RequestScope {
+                    session_id: Some(&session),
+                    cwd: Path::new("."),
+                },
             )
             .await;
 

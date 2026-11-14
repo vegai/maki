@@ -952,7 +952,7 @@ name the session now running or focused. What each event adds:
 - `"SessionCwdChanged"`: `data.cwd`, the session's new working
   directory, when `/cd` changes it.
 - `"TaskStatusChanged"`: `data.id`, `data.name`, and `data.status`
-  (`"working"`, `"idle"`, `"done"`, `"error"`, or `"cancelled"`), when a subagent starts
+  (`"queued"`, `"working"`, `"idle"`, `"done"`, `"error"`, or `"cancelled"`), when a subagent starts
   or changes status. A task a plugin opened with `maki.agent.session`
   carries `data.plugin`, and `"idle"` is such a task between prompts. A
   task that comes back from disk already finished stays quiet, so
@@ -1527,6 +1527,44 @@ print(model.spec, model.tier)
 
 ---
 
+### `maki.agent.cwd()` {#maki-agent-cwd}
+
+```lua
+maki.agent.cwd({ctx})
+```
+
+The calling session's canonical working directory. Under ACP it can differ from
+the process directory. Outside a handler, returns nil and an error.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Agent context.
+
+**Returns:** (`string?`, `string?`) Session directory, or nil and an error.
+
+---
+
+### `maki.agent.instructions()` {#maki-agent-instructions}
+
+```lua
+maki.agent.instructions({ctx})
+```
+
+Load the project and global instructions for the calling session's directory.
+Outside a handler, returns nil and an error.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Agent context.
+
+**Returns:** (`string?`, `string?`) Instruction text, or nil and an error.
+
+---
+
 ### `maki.agent.system_prompt()` {#maki-agent-system_prompt}
 
 ```lua
@@ -1548,7 +1586,7 @@ prompt for a subagent session.
 
   - `instructions` (`string|boolean?`) text inserted at the template's
     `{{instructions}}` marker.
-    `true` loads project instruction files.
+    `true` loads project instruction files and requires `fs_read`.
     `false` or nil omits them.
   - `tools` (`table[]?`) the definitions the session will get, as returned
     by `maki.agent.tools`. A plugin's hints are dropped when none of its
@@ -1813,6 +1851,7 @@ session, so opening one fails with "session not live". The
     `(string)` or `(nil, err)`. Optional `audiences` (string[]) gates who may
     call it, the same way `maki.api.register_tool` does. The default is the
     model alone, so a script cannot reach it through `code_execution`.
+    Config allow lists do not restrict local tools. Explicit denials still apply.
   - `name` (`string?`) display name for logs and UI.
   - `audience` (`string?`) tool audience for capability gating. Default: `"general_sub"`.
   - `mcp` (`boolean?`) give the session MCP tools. Their definitions are
@@ -6092,8 +6131,9 @@ tool spawned has its tool call's id, one a plugin opened with
 
 **Returns:** (`table|nil`, `string|nil`) Array of `{id, session, name, focused, status?, plugin?,
   tool?, parent?, part?, wrapper?, started_at?, ended_at?, cost?}`, or nil and an error.
-  `status` is `"working"`, `"idle"` (a plugin task between prompts), `"done"`,
-  `"error"` or `"cancelled"`. `session` is the chat session that `stop()` asks for.
+  `status` is `"queued"`, `"working"`, `"idle"` (a plugin task between prompts),
+  `"done"`, `"error"` or `"cancelled"`. `session` is the chat session that `stop()`
+  asks for.
   `tool` is the tool whose call the task runs, like `"task"` or `"bash"`, and is
   absent on a session a plugin opened on its own. `parent` is the id of the call
   the task runs under, like a `batch`, which is listed only once it moved. `part`

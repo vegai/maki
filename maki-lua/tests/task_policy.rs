@@ -33,6 +33,8 @@ const MAX_SCHEMA_ERRORS: usize = 3;
 const SCHEMA_COMPILE_ERROR: &str = "invalid output_schema";
 const SCHEMA_ROOT_ERROR: &str = "output_schema must have type object";
 const STRUCTURED_MISSING_ERROR: &str = "subagent finished without calling structured_output";
+const STRUCTURED_DUPLICATE_ERROR: &str =
+    "structured output was already recorded; the first valid result is retained";
 const STRUCTURED_INVALID_ERROR: &str = "subagent result does not match output_schema";
 const SUMMARY_MISSING_ERROR: &str = "subagent finished without providing a summary";
 const UNKNOWN_SUBAGENT_ERR: &str = "unknown subagent type: bogus";
@@ -171,6 +173,13 @@ behaviors.invalid_then_valid = function(sess, msg)
   local h = sess.opts.local_tools.structured_output.handler
   recorder.first_ack, recorder.first_err = h({ answer = 42 })
   recorder.second_ack, recorder.second_err = h({ answer = "42" })
+  return { text = "raw text ignored" }
+end
+
+behaviors.duplicate = function(sess, msg)
+  local h = sess.opts.local_tools.structured_output.handler
+  recorder.first_ack, recorder.first_err = h({ answer = "42" })
+  recorder.second_ack, recorder.second_err = h({ answer = "lost result" })
   return { text = "raw text ignored" }
 end
 
@@ -564,6 +573,24 @@ fn structured_happy_path_returns_validated_json(schema: Value) {
         prompt.contains(STRUCTURED_OUTPUT_TOOL),
         "prompt must point at the structured_output tool: {prompt}"
     );
+}
+
+#[test]
+fn a_second_structured_result_cannot_replace_the_first() {
+    let (reg, _host) = load_task_host();
+    let output = exec_tool(
+        &reg,
+        TASK_TOOL,
+        task_input("duplicate", Some(answer_schema())),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&output).unwrap(),
+        json!({"answer":"42"})
+    );
+    let snapshot = probe(&reg);
+    assert!(snapshot["second_ack"].is_null());
+    assert_eq!(snapshot["second_err"], STRUCTURED_DUPLICATE_ERROR);
 }
 
 #[test]

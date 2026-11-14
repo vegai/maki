@@ -285,6 +285,7 @@ impl App {
                         &canonical,
                         max_entries,
                     ));
+                    self.permissions.set_cwd(canonical.clone());
                     self.state
                         .session_mut()
                         .set_cwd(canonical.to_string_lossy().into_owned());

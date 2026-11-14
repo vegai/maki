@@ -582,7 +582,7 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
     }
 
     let startup_model = model.clone();
-    let (handle, events) = headless::spawn_interactive(InteractiveParams {
+    let (mut handle, events) = headless::spawn_interactive(InteractiveParams {
         model,
         config,
         permissions_config,
@@ -621,8 +621,11 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
         session_id: handle.session_id.clone(),
         out_tx,
     };
-    let tools: Vec<&str> = handle
-        .tool_names
+    let tool_names = (&mut handle.ready)
+        .await
+        .map(|ready| ready.tool_names)
+        .unwrap_or_default();
+    let tools: Vec<&str> = tool_names
         .iter()
         .map(|t| maki_to_claude_tool_name(t))
         .collect();
@@ -1090,6 +1093,7 @@ impl EventPump {
             .map(|s| s.parent_tool_use_id.clone());
 
         match &envelope.event {
+            AgentEvent::ProviderWaiting { .. } => {}
             AgentEvent::TextDelta { text } => {
                 if self.include_partial_messages {
                     let model = self.model_id();

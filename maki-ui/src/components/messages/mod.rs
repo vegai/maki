@@ -125,6 +125,7 @@ pub struct MessagesPanel {
     /// only bumps when colors actually land.
     rebake_requested: HashMap<String, u64>,
     prompt_progress: Option<PromptProgress>,
+    provider_wait: Option<String>,
     /// The chat this panel shows, stamped on every restore it requests so a
     /// plugin files the call where the live one went.
     session_id: Option<SessionRef>,
@@ -179,6 +180,7 @@ impl MessagesPanel {
             clock_format: ui_config.clock_format,
             rebake_requested: HashMap::new(),
             prompt_progress: None,
+            provider_wait: None,
             session_id: None,
             task_id: None,
             live_start: 0,
@@ -527,6 +529,7 @@ impl MessagesPanel {
     }
 
     pub fn stream_reset(&mut self) {
+        self.provider_wait = None;
         self.streaming_thinking.clear();
         self.streaming_text.clear();
         self.live_thinking_expanded = false;
@@ -687,9 +690,19 @@ impl MessagesPanel {
 
     pub fn clear_prompt_progress(&mut self) {
         self.prompt_progress = None;
+        self.provider_wait = None;
+    }
+
+    pub fn set_provider_wait(&mut self, message: Option<String>) {
+        self.provider_wait = message;
+    }
+
+    pub fn is_waiting_on_provider(&self) -> bool {
+        self.provider_wait.is_some()
     }
 
     pub fn flush(&mut self) {
+        self.provider_wait = None;
         self.flush_thinking();
         self.prompt_progress = None;
         if !self.streaming_text.is_empty() {
@@ -950,6 +963,7 @@ impl MessagesPanel {
 
     fn show_idle_splash(&self) -> bool {
         self.messages.is_empty()
+            && self.provider_wait.is_none()
             && self.streaming_thinking.is_empty()
             && self.streaming_text.is_empty()
     }
@@ -1082,7 +1096,17 @@ impl MessagesPanel {
         }
         self.release_images_outside(last_drawn);
 
-        if let Some(pp) = self.prompt_progress
+        if let Some(message) = &self.provider_wait {
+            let line = Line::styled(message.as_str(), theme::current().tool_dim);
+            let line_width = u16::try_from(line.width()).unwrap_or(width).min(width);
+            let status_area = Rect::new(
+                area.x + width.saturating_sub(line_width),
+                area.y + area.height.saturating_sub(1),
+                line_width,
+                1,
+            );
+            frame.render_widget(line, status_area);
+        } else if let Some(pp) = self.prompt_progress
             && pp.total > 0
         {
             let ratio = pp.processed as f64 / pp.total as f64;

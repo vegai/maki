@@ -11,6 +11,7 @@ mod transcript;
 
 pub use compaction::compact;
 pub use display_order::{DisplayItem, display_order, observation_detail, observation_line};
+pub(crate) use frame::request_tools;
 pub use frame::{HostPrompt, RunContext, RunContextBuilder, plan_mode_update};
 pub use history::{
     Cutter, History, HistorySnapshot, SharedHeader, SharedMessages, UNAVAILABLE_RESULT,

@@ -3,6 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use arc_swap::ArcSwap;
 use maki_config::{
     DefaultEffect, Effect, FILE_WRITE_TOOLS, PermissionRule, PermissionTarget, PermissionsConfig,
     ProjectConfig, ToolKey, append_permission_rule,
@@ -370,6 +371,7 @@ pub struct PermissionManager {
     session_rules: Mutex<Vec<PermissionRule>>,
     config_rules: Vec<PermissionRule>,
     builtin_rules: Vec<PermissionRule>,
+    cwd: Arc<ArcSwap<PathBuf>>,
     yolo: AtomicBool,
     /// Whether the user set yolo for this session themselves, which is what
     /// makes it worth persisting.
@@ -379,7 +381,6 @@ pub struct PermissionManager {
     seed_yolo: bool,
     default: DefaultEffect,
     tool_defaults: HashMap<ToolKey, DefaultEffect>,
-    cwd: PathBuf,
     project_config: ProjectConfig,
     plugin_rules: Arc<PluginRuleStore>,
     /// Canonical root of the per-session plugin data dirs. It usually does
@@ -396,7 +397,6 @@ impl PermissionManager {
         plugin_rules: Arc<PluginRuleStore>,
     ) -> Self {
         let config_rules = config.rules;
-        let builtin_rules = builtin_rules(&cwd);
 
         // Warn if wildcard deny is present — it blocks ALL tools including builtins.
         let has_wildcard_deny = config_rules
@@ -422,7 +422,8 @@ impl PermissionManager {
         }
 
         Self {
-            builtin_rules,
+            builtin_rules: builtin_rules(&cwd),
+            cwd: Arc::new(ArcSwap::from_pointee(cwd)),
             session_rules: Mutex::new(Vec::new()),
             config_rules,
             yolo: AtomicBool::new(config.yolo),
@@ -430,7 +431,6 @@ impl PermissionManager {
             seed_yolo: config.yolo,
             default: config.default,
             tool_defaults: config.tool_defaults,
-            cwd,
             project_config,
             plugin_rules,
             plugin_data: maki_storage::paths::sessions_data_dir()
@@ -440,19 +440,19 @@ impl PermissionManager {
     }
 
     /// Fresh manager for a new session runtime: shares config and builtin
-    /// rules plus the current yolo state, but owns empty session rules so
-    /// restoring one session never clobbers another's grants.
+    /// rules, working directory and current yolo state, but owns empty session
+    /// rules so restoring one session never clobbers another's grants.
     pub fn fork(&self) -> Self {
         Self {
             session_rules: Mutex::new(Vec::new()),
             config_rules: self.config_rules.clone(),
             builtin_rules: self.builtin_rules.clone(),
+            cwd: Arc::clone(&self.cwd),
             yolo: AtomicBool::new(self.is_yolo()),
             yolo_explicit: AtomicBool::new(self.yolo_explicit.load(Ordering::Relaxed)),
             seed_yolo: self.seed_yolo,
             default: self.default,
             tool_defaults: self.tool_defaults.clone(),
-            cwd: self.cwd.clone(),
             project_config: self.project_config.clone(),
             plugin_rules: Arc::clone(&self.plugin_rules),
             plugin_data: self.plugin_data.clone(),
@@ -482,6 +482,16 @@ impl PermissionManager {
             scope: Some(format!("{}/**", dir.display())),
             effect: Effect::Allow,
         })
+    }
+
+    /// The session's working directory, which an ACP client picks per
+    /// session.
+    pub fn cwd(&self) -> PathBuf {
+        (**self.cwd.load()).clone()
+    }
+
+    pub fn set_cwd(&self, cwd: PathBuf) {
+        self.cwd.store(Arc::new(cwd));
     }
 
     fn session_rules(&self) -> std::sync::MutexGuard<'_, Vec<PermissionRule>> {
@@ -676,7 +686,7 @@ impl PermissionManager {
     /// permission prompt (which uses the same canonicalization via
     /// [`scope_matches`]). Only unresolvable boundaries are hard-blocked.
     pub fn boundary_block_reason(&self, path: &Path) -> Option<String> {
-        match physical_boundary_check(&self.cwd, path) {
+        match physical_boundary_check(&self.cwd.load(), path) {
             Some(_) => None,
             None => Some(format!(
                 "{BOUNDARY_UNVERIFIABLE_PREFIX} {} \
@@ -1257,6 +1267,44 @@ mod tests {
 
     fn default_mgr() -> PermissionManager {
         mgr_with(PermissionsConfig::default(), PathBuf::from("/tmp"))
+    }
+
+    #[test_case(false ; "another_project")]
+    #[test_case(true ; "filesystem_root")]
+    fn changing_cwd_keeps_the_original_write_grants(root: bool) {
+        let original = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let manager = mgr_with(PermissionsConfig::default(), original.path().to_owned());
+        let target = if root {
+            original.path().ancestors().last().unwrap()
+        } else {
+            outside.path()
+        };
+        let fork = manager.fork();
+        let independent = mgr_with(PermissionsConfig::default(), original.path().to_owned());
+        let allowed = original.path().join("file");
+        let prompted = outside.path().join("file");
+        let check_grants = || {
+            for manager in [&manager, &fork] {
+                for tool in FILE_WRITE_TOOLS {
+                    let tool = ToolKey::native(tool);
+                    assert_eq!(
+                        outcome(manager.check(&tool, allowed.to_str().unwrap(), None)),
+                        ALLOWED
+                    );
+                    assert_eq!(
+                        outcome(manager.check(&tool, prompted.to_str().unwrap(), None)),
+                        PROMPTS
+                    );
+                }
+            }
+        };
+        check_grants();
+        manager.set_cwd(target.to_owned());
+        check_grants();
+        assert_eq!(manager.cwd(), target);
+        assert_eq!(fork.cwd(), target);
+        assert_eq!(independent.cwd(), original.path());
     }
 
     #[tokio::test]

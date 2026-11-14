@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::TryStreamExt;
-use maki_storage::id::{MakiId, SessionRef};
+use maki_storage::id::MakiId;
 use reqwest::{Client, Request, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -12,7 +12,7 @@ use tracing::warn;
 use maki_config::providers::Protocol;
 
 use crate::model::{Model, ModelFamily};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use crate::providers::Timeouts;
 use crate::providers::aperture::GEMINI_PATH_PREFIX;
 use crate::providers::openai_compat::assistant_response;
@@ -63,10 +63,11 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     fallback_max_output: Some(65_536),
     fallback_context_window: 1_000_000,
     models_toml: include_str!("../../models/google.toml"),
+    models_of: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
-        with_auth: create_with_auth,
+        with_auth: Some(create_with_auth),
     }),
     aperture: Some(ApertureRoute {
         path_prefix: GEMINI_PATH_PREFIX,
@@ -267,12 +268,15 @@ impl Provider for Google {
         tools: &'a Value,
         event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(self.do_stream(model, messages, system, tools, event_tx, opts.thinking))
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         let url = self.models_url();
         let request = self.finish(self.client.get(&url));
         let client = self.client.clone();
@@ -722,7 +726,7 @@ mod tests {
     async fn list_models_on_a_malformed_base_url_is_a_config_error() {
         let google = Google::with_auth(test_auth(), test_timeouts())
             .with_fallback_base_url(Some(MALFORMED_BASE_URL.into()));
-        let error = google.list_models().await.unwrap_err();
+        let error = google.list_models(ModelListing::Cached).await.unwrap_err();
         assert_eq!(error.projection(), ErrorProjection::Config);
     }
 

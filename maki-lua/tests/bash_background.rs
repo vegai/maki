@@ -463,12 +463,12 @@ fn a_log_that_stopped_taking_writes_does_not_claim_to_hold_the_earlier_lines() {
 fn offered_tools(audience: ToolAudience, background: bool) -> Value {
     let (reg, _host) = builtins_host(&json!({}));
     let ctx = DescriptionContext {
-        filter: &ToolFilter::All,
+        filter: &ToolFilter::default(),
         audience,
         workflow: false,
         mcp: false,
     };
-    reg.definitions_with_background(&Vars::new(), &ctx, false, background)
+    reg.definitions_with_background(&Vars::new(), &ctx, None, false, background)
 }
 
 fn tool_def<'a>(defs: &'a Value, name: &str) -> Option<&'a Value> {

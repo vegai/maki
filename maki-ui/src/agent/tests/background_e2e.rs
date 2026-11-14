@@ -21,12 +21,11 @@ use maki_config::project::{self, TrustMode};
 use maki_config::{PermissionsConfig, PluginsConfig};
 use maki_lua::test_support::{wait_next, wait_reply};
 use maki_lua::{MoveOutcome, PluginHost, UiAction};
-use maki_providers::provider::{BoxFuture, Provider};
+use maki_providers::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use maki_providers::{
     AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
     StopReason, StreamResponse, ThinkingConfig, TokenUsage,
 };
-use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 use tokio::runtime::EnterGuard;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -276,7 +275,7 @@ impl Provider for ScriptedProvider {
         tools: &'a Value,
         _event_tx: &'a UnboundedSender<ProviderEvent>,
         _opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         let _ = self.requests.send(SeenRequest {
             system: system.to_owned(),
@@ -302,7 +301,7 @@ impl Provider for ScriptedProvider {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(&self, _: ModelListing) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }

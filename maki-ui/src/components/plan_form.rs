@@ -1,6 +1,7 @@
 use crate::components::form::{render_form, selected_prefix};
 use crate::components::hint_line;
 use crate::components::keybindings::key;
+use crate::components::modal::BORDER;
 use crate::theme;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -9,6 +10,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const FORM_LABEL: &str = " Plan complete ";
@@ -310,7 +312,7 @@ impl PlanForm {
 
         // The form measures one line per row, so a wide row is cut instead of
         // wrapping into a second line the box never reserved.
-        let width = area.width.saturating_sub(2) as usize;
+        let width = usize::from(area.width.saturating_sub(BORDER));
         let first = self.first_visible(area.height);
         for (i, row) in self.menu.rows.iter().enumerate().skip(first).take(visible) {
             let (prefix, style) = selected_prefix(&t, i == self.selected);
@@ -332,7 +334,16 @@ impl PlanForm {
         lines.push(Line::default());
         lines.push(fit(hint_line(HINT_PAIRS).spans, width));
 
-        render_form(&t, FORM_LABEL, frame, area, lines, (0, 0));
+        let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+        render_form(
+            &t,
+            FORM_LABEL,
+            frame,
+            area,
+            Paragraph::new(lines),
+            (0, 0),
+            total,
+        );
     }
 }
 

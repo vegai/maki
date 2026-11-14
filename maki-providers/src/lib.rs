@@ -32,6 +32,7 @@ pub use providers::catalog::{
     catalog_provider, catalog_provider_if_available, catalog_providers,
     catalog_providers_if_available, refresh_catalog, warm_catalog,
 };
+pub use providers::claude_code;
 pub use providers::client_builder;
 pub use providers::copilot::auth as copilot_auth;
 pub use providers::custom;

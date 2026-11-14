@@ -39,19 +39,21 @@ use maki_lua::test_support::runtime;
 use maki_providers::model::ModelInfo;
 use maki_providers::model_registry;
 use maki_providers::plugin;
-use maki_providers::provider::Provider;
+use maki_providers::provider::{ModelListing, Provider, RequestScope};
 use maki_providers::test_support::{Canned, Recorded, Requests, is_routed, isolated_home, serve};
 use maki_providers::{
     AgentError, Message, Model, ProviderEvent, RequestOptions, StreamResponse, ThinkingSupport,
     Timeouts,
 };
+use maki_storage::StateDir;
+use maki_storage::auth::{ProviderCredentials, save_provider_credentials};
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::StoredThinking;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tempfile::TempDir;
 
-use super::load_bundled_with_opts;
+use super::{environment, load_bundled_with_opts};
 
 const GOLDEN_DIR: &str = "tests/goldens";
 const GOLDEN_EXTENSION: &str = "json";
@@ -85,6 +87,7 @@ const TOOL_NAME: &str = "read";
 const TOOL_DESCRIPTION: &str = "Read a file";
 
 const API_KEY: &str = "sk-replay";
+const API_KEY_SUFFIX: &str = "_API_KEY";
 
 const NO_GOLDENS: &str = "no golden files to replay";
 const UNREADABLE_DIR: &str = "the golden directory is unreadable";
@@ -97,7 +100,6 @@ const WRITE_FAILED: &str = "the golden could not be recorded";
 const BAD_GOLDEN: &str = "the golden is not a well-formed case";
 const NOT_AN_OBJECT: &str = "an observation is always a json object";
 const NO_REQUESTS: &str = "every observation records the requests it sent";
-const NOT_DECLARED: &str = "the bundled plugin did not declare its slug";
 const CREATE_FAILED: &str = "the provider could not be built";
 const UNKNOWN_MODEL: &str = "the model spec did not resolve";
 const NO_MIDNIGHT: &str = "the day after a sampled one is representable";
@@ -246,7 +248,13 @@ fn goldens() -> Vec<PathBuf> {
 /// loudly instead of matching nothing and exiting clean.
 fn replay_in_child(golden: &Path) -> Result<(), String> {
     let (_, module) = module_path!().split_once("::").expect(NOT_A_MODULE);
-    let output = Command::new(env::current_exe().expect(NO_TEST_BINARY))
+    let mut command = Command::new(env::current_exe().expect(NO_TEST_BINARY));
+    for (name, _) in env::vars_os() {
+        if name.as_encoded_bytes().ends_with(API_KEY_SUFFIX.as_bytes()) {
+            command.env_remove(name);
+        }
+    }
+    let output = command
         .args([
             &format!("{module}::{CHILD_TEST}"),
             "--exact",
@@ -325,9 +333,7 @@ struct Replay {
 }
 
 impl Replay {
-    /// The key goes under the env var the plugin itself declared, and `create`
-    /// reads it right away. So a broken `api_key_env` fails here instead of
-    /// hiding behind a name the test hard-coded.
+    /// The key is saved before loading the plugin that reads it.
     ///
     /// The recorded server goes in `<SLUG>_BASE_URL` because it is the only
     /// origin a test can set. The declared `base_url` is the real provider, and
@@ -339,10 +345,17 @@ impl Replay {
     ) -> Self {
         let home = isolated_home();
         let (base_url, requests) = serve(script);
-        unsafe { env::set_var(base_url_env_var(slug), base_url) };
+        environment::set(&base_url_env_var(slug), base_url);
+        save_provider_credentials(
+            &StateDir::resolve().unwrap(),
+            slug,
+            &ProviderCredentials {
+                api_key: API_KEY.into(),
+                host: None,
+            },
+        )
+        .unwrap();
         let host = load_bundled_with_opts(slug, opts);
-        let key_env = plugin::spec(slug).expect(NOT_DECLARED).api_key_env;
-        unsafe { env::set_var(key_env, API_KEY) };
         let provider = plugin::create(slug, Timeouts::default()).expect(CREATE_FAILED);
         Self {
             provider,
@@ -378,7 +391,7 @@ impl Replay {
     }
 
     fn models(&self) -> Value {
-        let listed = runtime().block_on(self.provider.list_models());
+        let listed = runtime().block_on(self.provider.list_models(ModelListing::Refresh));
         json!({
             REQUESTS_KEY: self.recorded(),
             OUTCOME_KEY: listing(&listed),
@@ -390,7 +403,7 @@ impl Replay {
     /// through the request path alone.
     fn discovered(&self, slug: &str, turn: &Turn) -> Value {
         let model = turn.model();
-        let listed = runtime().block_on(self.provider.list_models());
+        let listed = runtime().block_on(self.provider.list_models(ModelListing::Refresh));
         if let Ok(models) = &listed {
             model_registry::set_known_models(slug, models.clone());
         }
@@ -424,7 +437,10 @@ impl Replay {
                 thinking: turn.thinking.into(),
                 fast: false,
             },
-            turn.session.as_ref(),
+            RequestScope {
+                session_id: turn.session.as_ref(),
+                cwd: Path::new("."),
+            },
         ));
         drop(tx);
         (iter::from_fn(|| rx.try_recv().ok()).collect(), result)

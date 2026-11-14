@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::io;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +30,21 @@ const DISCOVERY_WAIT: Duration = Duration::from_secs(10);
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Where a request runs: its session, if any, and that session's working
+/// directory. A provider shared by all sessions cannot know this, and one that
+/// starts a process per request needs the directory.
+#[derive(Clone, Debug)]
+pub struct RequestScope<'a> {
+    pub session_id: Option<&'a SessionRef>,
+    pub cwd: &'a Path,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ModelListing {
+    Cached,
+    Refresh,
+}
+
 pub trait Provider: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn stream_message<'a>(
@@ -39,14 +55,18 @@ pub trait Provider: Send + Sync {
         tools: &'a Value,
         event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>>;
 
-    /// The models this provider serves right now. A failed listing must return
-    /// an error, never a static or cached fallback: discovery reads a clean
-    /// answer as proof that a model missing from it is retired, and hides that
-    /// model from the picker's recents.
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>>;
+    /// The models this provider serves right now. `listing` says whether a
+    /// recent cached answer will do or the provider must ask again. A failed
+    /// listing must return an error, never a static or cached fallback:
+    /// discovery reads a clean answer as proof that a model missing from it is
+    /// retired, and hides that model from the picker's recents.
+    fn list_models(
+        &self,
+        listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>>;
 
     /// The context window the server runs `model` with right now. Only a
     /// server that sizes the window when it loads a model can differ from
@@ -135,6 +155,32 @@ pub fn from_model_fallback(model: &mut Model, timeouts: Timeouts) -> Box<dyn Pro
 
 struct UnconfiguredProvider;
 
+const STATIC_FALLBACK: &str = "using static fallback";
+const NO_FALLBACK: &str = "no static fallback";
+
+fn curated_specs(spec: &ProviderSpec) -> impl Iterator<Item = String> + '_ {
+    spec.listed_rows()
+        .iter()
+        .flat_map(|entry| entry.prefixes.iter())
+        .map(move |prefix| format!("{}/{prefix}", spec.slug))
+}
+
+/// Report a listing failure and retain any curated fallback model specs.
+fn failed_listing(spec: &ProviderSpec, error: &AgentError) -> ModelBatch {
+    let models: Vec<String> = curated_specs(spec).collect();
+    let fallback = if models.is_empty() {
+        NO_FALLBACK
+    } else {
+        STATIC_FALLBACK
+    };
+    warn!(provider = spec.slug, %error, "maki cannot get the model list, {fallback}");
+    ModelBatch {
+        provider: spec.slug.to_string(),
+        models,
+        status: ProviderStatus::Failed(format!("{}: {error} ({fallback})", spec.display_name)),
+    }
+}
+
 const NOT_CONFIGURED: &str = "no provider configured: run /login or `maki auth login`";
 
 impl Provider for UnconfiguredProvider {
@@ -146,7 +192,7 @@ impl Provider for UnconfiguredProvider {
         _tools: &'a Value,
         _event_tx: &'a UnboundedSender<ProviderEvent>,
         _opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async {
             Err(AgentError::Config {
@@ -155,7 +201,10 @@ impl Provider for UnconfiguredProvider {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async {
             Err(AgentError::Config {
                 message: NOT_CONFIGURED.to_string(),
@@ -205,12 +254,7 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
         .into_iter()
         .filter(|m| !m.catalog_is_authoritative)
         .filter(|m| provider_available_offline(m.slug))
-        .flat_map(|m| {
-            m.models()
-                .iter()
-                .flat_map(|entry| entry.prefixes.iter())
-                .map(move |p| format!("{}/{}", m.slug, p))
-        })
+        .flat_map(curated_specs)
         .collect();
     for spec in custom::declared_model_specs() {
         if !specs.contains(&spec) {
@@ -245,6 +289,7 @@ pub async fn fetch_all_models(
     policy: &ModelPolicy,
     mut on_ready: impl FnMut(ModelBatch),
     on_done: Option<Box<dyn FnOnce() + Send>>,
+    listing: ModelListing,
 ) {
     let (tx, mut rx) = unbounded_channel();
     let timeouts = Timeouts::default();
@@ -260,7 +305,7 @@ pub async fn fetch_all_models(
         };
         let tx = tx.clone();
         tokio::spawn(async move {
-            let listed = provider.list_models().await;
+            let listed = provider.list_models(listing).await;
             let batch = listing_batch(spec, &listed);
             if let Ok(models) = listed {
                 set_known_models(slug, models);
@@ -307,18 +352,12 @@ pub async fn fetch_all_models(
 
 fn listing_batch(spec: &ProviderSpec, listed: &Result<Vec<ModelInfo>, AgentError>) -> ModelBatch {
     let slug = spec.slug;
-    let curated = || {
-        spec.models()
-            .iter()
-            .flat_map(|entry| &entry.prefixes)
-            .map(move |prefix| format!("{slug}/{prefix}"))
-    };
     let (models, status) = match listed {
         Ok(models) => {
             let mut specs: Vec<String> =
                 models.iter().map(|m| format!("{slug}/{}", m.id)).collect();
             if !spec.catalog_is_authoritative {
-                for row in curated() {
+                for row in curated_specs(spec) {
                     if !specs.contains(&row) {
                         specs.push(row);
                     }
@@ -337,11 +376,7 @@ fn listing_batch(spec: &ProviderSpec, listed: &Result<Vec<ModelInfo>, AgentError
                 ProviderStatus::Failed(format!("{}: {e}", spec.display_name)),
             )
         }
-        Err(e) => {
-            warn!(provider = slug, error = %e, "failed to list models, using static fallback");
-            let warning = format!("{}: {e} (using static fallback)", spec.display_name);
-            (curated().collect(), ProviderStatus::Failed(warning))
-        }
+        Err(e) => return failed_listing(spec, e),
     };
     ModelBatch {
         provider: slug.to_string(),
@@ -390,7 +425,7 @@ async fn remember_models(
     provider: &dyn Provider,
     wait: Duration,
 ) -> Result<(), AgentError> {
-    let models = timeout(wait, provider.list_models())
+    let models = timeout(wait, provider.list_models(ModelListing::Cached))
         .await
         .map_err(io::Error::from)??;
     set_known_models(slug, models);
@@ -404,6 +439,28 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::providers::{anthropic, claude_code};
+
+    /// Only a provider with its own rows falls back to them after an error.
+    #[test_case(&anthropic::SPEC => (false, STATIC_FALLBACK) ; "a_provider_with_its_own_rows")]
+    #[test_case(&claude_code::SPEC => (true, NO_FALLBACK) ; "one_that_runs_anothers_models")]
+    fn a_failed_listing_says_whether_it_fell_back(spec: &ProviderSpec) -> (bool, &'static str) {
+        let batch = failed_listing(
+            spec,
+            &AgentError::Config {
+                message: "down".into(),
+            },
+        );
+        assert_eq!(batch.provider, spec.slug);
+        let ProviderStatus::Failed(warning) = &batch.status else {
+            panic!("{:?}", batch.status);
+        };
+        let said = [STATIC_FALLBACK, NO_FALLBACK]
+            .into_iter()
+            .find(|fallback| warning.contains(fallback))
+            .unwrap();
+        (batch.models.is_empty(), said)
+    }
 
     const SPEC_WITHOUT_THINKING: &str = "copilot";
     const LANDED_SLUG: &str = "ollama";
@@ -432,12 +489,12 @@ mod tests {
             _tools: &'a Value,
             _event_tx: &'a UnboundedSender<ProviderEvent>,
             _opts: RequestOptions,
-            _session_id: Option<&'a SessionRef>,
+            _scope: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             unreachable!("{ONLY_LISTS_MODELS}")
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Listed> {
+        fn list_models(&self, _listing: ModelListing) -> BoxFuture<'_, Listed> {
             (self.0)()
         }
 

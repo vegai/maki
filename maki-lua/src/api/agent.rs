@@ -2,11 +2,12 @@
 //! validation, concurrency) lives in the task plugin, not here.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use maki_agent::agent::{LoadedInstructions, tool_dispatch};
+use maki_agent::agent::{LoadedInstructions, load_instruction_text, tool_dispatch};
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
 use maki_agent::permissions::{PermissionAnswer, TaggedAnswer};
 use maki_agent::tools::interpreter_bridge;
@@ -24,6 +25,7 @@ use maki_agent::{
     RunTotals, SessionControl, SessionEvents, SessionMailbox, SessionStub, SubagentInfo, TaskHome,
     ToolDoneEvent, TurnHost, UNAVAILABLE_RESULT, event_stream, run_turns,
 };
+use maki_config::InstructionsConfig;
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
 use maki_providers::model_registry;
@@ -45,6 +47,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::spawn_blocking;
 use tracing::info;
 
+use crate::api::fs::canonical_path;
 use crate::api::model::stale_tier_err;
 use crate::api::session::{not_live, required_session};
 use crate::api::tool::{audiences_to_lua, format_name, parse_audience};
@@ -120,19 +123,6 @@ fn model_to_lua_table(lua: &Lua, model: &Model) -> LuaResult<Table> {
 fn dispatch_ctx<'a>(ctx: &'a LuaCtx, method: &str) -> Result<&'a AgentContext, String> {
     ctx.agent()
         .ok_or_else(|| ctx.cap_err(&format!("maki.agent.{method}")))
-}
-
-/// What the config and the model take away from `base`, the same for a
-/// subagent's tools as for the hints in its prompt.
-fn config_filter(base: ToolFilter, agent: &AgentContext, model: &Model) -> ToolFilter {
-    let disabled: Vec<&str> = agent
-        .config
-        .disabled_tools
-        .iter()
-        .map(String::as_str)
-        .collect();
-    base.excluding(&disabled)
-        .excluding(maki_agent::tools::capability_exclusions(model))
 }
 
 fn required_opts(opts: Option<Table>) -> LuaResult<Table> {
@@ -563,7 +553,7 @@ fn unattended_answer(event: &AgentEvent) -> Option<String> {
 #[lua_fn]
 async fn resolve_model(
     lua: Lua,
-    ctx: mlua::UserDataRef<LuaCtx>,
+    ctx: UserDataRef<LuaCtx>,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Table>> {
     let agent = try_pair!(dispatch_ctx(&ctx, "resolve_model"));
@@ -586,6 +576,45 @@ async fn resolve_model(
     Ok((Some(tbl), None))
 }
 
+fn session_cwd(ctx: &LuaCtx, method: &str) -> Result<PathBuf, String> {
+    Ok(dispatch_ctx(ctx, method)?.permissions.cwd())
+}
+
+/// The calling session's canonical working directory. Under ACP it can differ from
+/// the process directory. Outside a handler, returns nil and an error.
+/// @param ctx LuaCtx Agent context.
+/// @return (string?, string?) Session directory, or nil and an error.
+#[lua_fn(guard = FsRead)]
+async fn cwd(_lua: Lua, ctx: UserDataRef<LuaCtx>) -> LuaResult<Pair<String>> {
+    let path = try_pair!(session_cwd(&ctx, "cwd"));
+    drop(ctx);
+    Ok(pair(canonical_path(path).await))
+}
+
+/// Load the project and global instructions for the calling session's directory.
+/// Outside a handler, returns nil and an error.
+/// @param ctx LuaCtx Agent context.
+/// @return (string?, string?) Instruction text, or nil and an error.
+#[lua_fn(guard = FsRead)]
+async fn instructions(_lua: Lua, ctx: UserDataRef<LuaCtx>) -> LuaResult<Pair<String>> {
+    let config = try_pair!(dispatch_ctx(&ctx, "instructions"))
+        .config
+        .instructions
+        .clone();
+    let path = try_pair!(session_cwd(&ctx, "instructions"));
+    drop(ctx);
+    Ok(pair(instruction_text(path, config).await))
+}
+
+async fn instruction_text(path: PathBuf, config: InstructionsConfig) -> Result<String, String> {
+    let path = canonical_path(path)
+        .await
+        .map_err(|error| error.to_string())?;
+    spawn_blocking(move || load_instruction_text(&path, &config))
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// Build a system prompt from the parent's resolved prompt catalogue.
 /// Plugin template and section replacements apply. Environment variables like
 /// `{cwd}` are substituted automatically. Use this when you need a ready-made
@@ -597,7 +626,7 @@ async fn resolve_model(
 /// Optional fields:
 ///   `instructions` (string|boolean?) - text inserted at the template's
 ///     `{{instructions}}` marker.
-///     `true` loads project instruction files.
+///     `true` loads project instruction files and requires `fs_read`.
 ///     `false` or nil omits them.
 ///   `tools` (table[]?) - the definitions the session will get, as returned
 ///     by `maki.agent.tools`. A plugin's hints are dropped when none of its
@@ -613,21 +642,32 @@ async fn resolve_model(
 #[lua_fn]
 async fn system_prompt(
     lua: Lua,
-    ctx: mlua::UserDataRef<LuaCtx>,
+    #[ctx] perms: PluginPermissions,
+    ctx: UserDataRef<LuaCtx>,
     opts: Table,
 ) -> LuaResult<Pair<String>> {
     let agent = try_pair!(dispatch_ctx(&ctx, "system_prompt"));
     let slots = Arc::clone(&agent.prompt_slots);
     let instructions_config = agent.config.instructions.clone();
+    let registry = Arc::clone(&agent.registry);
     let filter = match opts.opt::<LuaValue>("tools")? {
         Some(tools) => match lua_to_json(&lua, &tools)? {
-            defs @ JsonValue::Array(_) => {
-                Arc::clone(RequestTools::assembled(defs, &agent.config, &agent.model).filter())
-            }
+            defs @ JsonValue::Array(_) => Arc::clone(
+                RequestTools::assembled(
+                    &agent.registry,
+                    defs,
+                    &agent.local_tools,
+                    &agent.config,
+                    &agent.model,
+                    agent.audience,
+                )
+                .filter(),
+            ),
             _ => return Err(mlua::Error::runtime(TOOLS_ARRAY_ERR)),
         },
-        None => Arc::new(config_filter(ToolFilter::All, agent, &agent.model)),
+        None => Arc::new(ToolFilter::from_config(&agent.config, &agent.model, &[])),
     };
+    let cwd = try_pair!(session_cwd(&ctx, "system_prompt"));
     // Nothing may hold the ctx borrow across the wait: a cancel hook firing
     // meanwhile needs `ctx:finish`, which takes it mutably.
     drop(ctx);
@@ -639,27 +679,18 @@ async fn system_prompt(
         other => return Ok(err_pair(format!("unknown prompt_id: {other}"))),
     };
 
-    let vars = maki_agent::template::env_vars();
+    let vars = maki_agent::template::env_vars_for(&cwd.to_string_lossy());
     let instructions_val: LuaValue = opts.get("instructions")?;
     let instructions = match instructions_val {
         LuaValue::Boolean(true) => {
-            let cwd = vars.apply("{cwd}").into_owned();
-            spawn_blocking(move || {
-                maki_agent::agent::load_instruction_text(&cwd, &instructions_config)
-            })
-            .await
-            .map_err(mlua::Error::external)?
+            crate::plugin_permissions::require(&lua, &perms, Permission::FsRead)?;
+            try_pair!(instruction_text(cwd, instructions_config).await)
         }
         LuaValue::Boolean(false) | LuaValue::Nil => String::new(),
         LuaValue::String(s) => s.to_str()?.to_owned(),
         _ => return Err(mlua::Error::runtime("instructions must be bool or string")),
     };
 
-    let registry = try_pair!(
-        lua.app_data_ref::<Arc<ToolRegistry>>()
-            .map(|registry| Arc::clone(&registry))
-            .ok_or(NO_REGISTRY_ERR)
-    );
     let slots = slots.for_tools(&registry, &filter);
     Ok((Some(slots.render(prompt_id, &vars, &instructions)), None))
 }
@@ -742,12 +773,12 @@ async fn tools(
     };
     let model = parsed.as_ref().unwrap_or(&agent.model);
 
-    let base = match (only, except) {
-        (Some(o), _) => ToolFilter::Only(o),
-        (_, Some(e)) => ToolFilter::AllExcept(e),
-        _ => ToolFilter::All,
+    let base = ToolFilter::from_config(&agent.config, model, &[]);
+    let filter = match (only, except) {
+        (Some(names), _) => base.publishing(names),
+        (_, Some(names)) => base.excluding(&names.iter().map(String::as_str).collect::<Vec<_>>()),
+        _ => base,
     };
-    let filter = config_filter(base, &agent, model);
 
     let vars = maki_agent::template::env_vars();
     let ctx_desc = DescriptionContext {
@@ -763,6 +794,7 @@ async fn tools(
     let defs = ToolRegistry::global().definitions_with_background(
         &vars,
         &ctx_desc,
+        None,
         model.supports_tool_examples(),
         false,
     );
@@ -862,7 +894,7 @@ async fn callable_tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<P
 #[lua_fn]
 async fn call_tool(
     lua: Lua,
-    ctx: mlua::UserDataRef<LuaCtx>,
+    ctx: UserDataRef<LuaCtx>,
     name: String,
     input: LuaValue,
     opts: Option<Table>,
@@ -1018,6 +1050,7 @@ async fn dispatch_child(
 ///     `(string)` or `(nil, err)`. Optional `audiences` (string[]) gates who may
 ///     call it, the same way `maki.api.register_tool` does. The default is the
 ///     model alone, so a script cannot reach it through `code_execution`.
+///     Config allow lists do not restrict local tools. Explicit denials still apply.
 ///   `name` (string?) - display name for logs and UI.
 ///   `audience` (string?) - tool audience for capability gating. Default: `"general_sub"`.
 ///   `mcp` (boolean?) - give the session MCP tools. Their definitions are
@@ -1312,7 +1345,15 @@ async fn session(
     // The array is the caller's, and the filter comes out of it, so whatever
     // the caller left out is also a name this session cannot dispatch or bind
     // inside its sandbox.
-    let tools = RequestTools::assembled(JsonValue::Array(tools_json), &agent_ctx.config, &model);
+    let local_tools = Arc::new(local_map);
+    let tools = RequestTools::assembled(
+        &agent_ctx.registry,
+        JsonValue::Array(tools_json),
+        &local_tools,
+        &agent_ctx.config,
+        &model,
+        audience,
+    );
     let system = system.unwrap_or_default();
     let context: RunContextBuilder =
         Arc::new(move |_, _| RunContext::fixed(system.clone(), tools.clone()));
@@ -1365,7 +1406,7 @@ async fn session(
         cancellation: Arc::clone(&cancellation),
         upstream,
         subagent_info,
-        local_tools: Arc::new(local_map),
+        local_tools,
         name,
         dones: RunDones::new(done_rx),
         background,
@@ -1507,7 +1548,7 @@ lua_table! {
     /// })
     /// ```
     "maki.agent" => pub(crate) fn create_agent_table(plugin: Arc<str>, perms: PluginPermissions), DOCS [
-        resolve_model, system_prompt, tools, callable_tools, call_tool,
+        resolve_model, cwd(perms), instructions(perms), system_prompt(perms), tools, callable_tools, call_tool,
         session(plugin, perms), list,
     ]
 }
@@ -2225,7 +2266,7 @@ mod tests {
     use futures::FutureExt;
     use futures::future::select;
     use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, SlotEntry};
-    use maki_agent::tools::test_support::{mock_tool, stub_ctx_with, stub_seed};
+    use maki_agent::tools::test_support::{mock_tool, stub_ctx_in, stub_ctx_with, stub_seed};
     use maki_agent::tools::{ToolAudience, ToolSource};
     use maki_agent::{
         BackgroundNotice, Cutter, DoneReason, MovedTrigger, SessionMailbox, TaskEnd,
@@ -2233,17 +2274,19 @@ mod tests {
     };
     use maki_config::ToolKey;
     use maki_providers::model::ThinkingSupport;
-    use maki_providers::provider::{BoxFuture, Provider};
+    use maki_providers::provider::{BoxFuture, ModelListing, Provider, RequestScope};
     use maki_providers::{
         AgentError, ContentBlock, Message, ModelInfo, ProviderEvent, Role, StopReason,
         StreamResponse, TokenUsage,
     };
-    use maki_storage::id::SessionRef;
     use maki_storage::sessions::Effort;
     use mlua::AnyUserData;
     use serde_json::json;
+    use std::fs;
     use std::iter;
+    use std::path::Path;
     use std::sync::mpsc::{Sender, channel};
+    use tempfile::tempdir;
     use test_case::test_case;
     use tokio::sync::mpsc::UnboundedSender;
     use tokio::time::timeout;
@@ -2289,6 +2332,91 @@ mod tests {
     // Malformed on purpose: an unknown slug would warm the catalog, which
     // fetches models.dev.
     const STALE_SPEC: &str = "removed-model";
+
+    const CWD_IN_START_ERR: &str = "maki.agent.cwd not available in start ctx";
+    const INSTRUCTIONS_IN_START_ERR: &str = "maki.agent.instructions not available in start ctx";
+    const PROMPT_IN_START_ERR: &str = "maki.agent.system_prompt not available in start ctx";
+
+    #[test_case("cwd", CWD_IN_START_ERR ; "cwd")]
+    #[test_case("instructions", INSTRUCTIONS_IN_START_ERR ; "instructions")]
+    #[test_case("system_prompt", PROMPT_IN_START_ERR ; "system_prompt")]
+    fn a_session_location_outside_a_call_is_a_capability_error(method: &str, expected: &str) {
+        let lua = Lua::new();
+        lua.globals()
+            .set(
+                "ctx",
+                LuaCtx::start(&stub_ctx_with(&AgentMode::Build, None, None)),
+            )
+            .unwrap();
+        lua.globals()
+            .set(
+                "agent",
+                create_agent_table(&lua, PLUGIN.into(), PluginPermissions::trusted()).unwrap(),
+            )
+            .unwrap();
+        let (value, err): (Option<String>, Option<String>) = crate::test_support::runtime().block_on(
+            lua.load(format!(
+                r#"return agent.{method}(ctx, {{ prompt_id = "research", instructions = false }})"#
+            ))
+            .eval_async(),
+        )
+        .unwrap();
+        assert_eq!(value, None);
+        assert_eq!(err.as_deref(), Some(expected));
+    }
+
+    #[test_case(false ; "initial_directory")]
+    #[test_case(true ; "after_cd")]
+    fn session_instructions_and_prompts_use_the_calling_checkout(changed: bool) {
+        const INSTRUCTIONS: &str = "Unique session checkout instructions.";
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("AGENTS.md"), INSTRUCTIONS).unwrap();
+        let lua = Lua::new();
+        let initial = tempdir().unwrap();
+        let ctx = stub_ctx_in(
+            if changed { initial.path() } else { dir.path() },
+            None,
+            None,
+        );
+        lua.globals().set("ctx", LuaCtx::handler(&ctx)).unwrap();
+        if changed {
+            ctx.permissions.set_cwd(dir.path().to_owned());
+        }
+        lua.globals()
+            .set(
+                "agent",
+                create_agent_table(&lua, PLUGIN.into(), PluginPermissions::trusted()).unwrap(),
+            )
+            .unwrap();
+        let (instructions, prompt, cwd): (String, String, String) = crate::test_support::runtime().block_on(lua.load(r#"
+            local text = assert(agent.instructions(ctx))
+            local prompt = assert(agent.system_prompt(ctx, { prompt_id = "research", instructions = true }))
+            return text, prompt, assert(agent.cwd(ctx))
+        "#).eval_async()).unwrap();
+        assert!(instructions.contains(INSTRUCTIONS));
+        assert!(prompt.contains(INSTRUCTIONS), "{prompt}");
+        assert_eq!(Path::new(&cwd), dir.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn a_prompt_without_file_reads_accepts_a_missing_session_directory() {
+        let root = tempdir().unwrap();
+        let missing = root.path().join("missing");
+        let lua = Lua::new();
+        let ctx = stub_ctx_in(&missing, None, None);
+        lua.globals().set("ctx", LuaCtx::handler(&ctx)).unwrap();
+        lua.globals()
+            .set(
+                "agent",
+                create_agent_table(&lua, PLUGIN.into(), PluginPermissions::denied()).unwrap(),
+            )
+            .unwrap();
+        let prompt: String = crate::test_support::runtime().block_on(lua.load(r#"return assert(agent.system_prompt(ctx, { prompt_id = "research", instructions = false }))"#).eval_async()).unwrap();
+        assert!(
+            prompt.contains(missing.to_string_lossy().as_ref()),
+            "{prompt}"
+        );
+    }
 
     #[test_case(ThinkingConfig::Effort(Effort::Low), json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Effort::Low) ; "toggle_keeps_ancestor_effort_ceiling")]
     #[test_case(ThinkingConfig::Adaptive, json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Effort::Max) ; "explicit_adaptive_stays_unbounded")]
@@ -2336,7 +2464,7 @@ mod tests {
             _tools: &'a JsonValue,
             events: &'a UnboundedSender<ProviderEvent>,
             _opts: RequestOptions,
-            _session_id: Option<&'a SessionRef>,
+            _scope: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 events
@@ -2349,7 +2477,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
     }
@@ -2520,7 +2651,7 @@ mod tests {
             _: &'a JsonValue,
             _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 self.0.send(system.to_owned()).unwrap();
@@ -2538,7 +2669,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
     }
@@ -2561,8 +2695,8 @@ mod tests {
         registry
             .register(mock_tool(HINTED_TOOL, ToolAudience::all()), source)
             .unwrap();
-        lua.set_app_data(Arc::new(registry));
         let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        ctx.registry = Arc::new(registry);
         ctx.config.disabled_tools = disabled.iter().map(|name| (*name).to_owned()).collect();
         let mut prompts = ResolvedPrompts::default();
         let entry = SlotEntry {
@@ -2580,9 +2714,14 @@ mod tests {
             opts.set("tools", json_to_lua(&lua, &json!(defs)).unwrap())
                 .unwrap();
         }
-        let (system, error) = system_prompt(lua.clone(), ctx.borrow().unwrap(), opts)
-            .await
-            .unwrap();
+        let (system, error) = system_prompt(
+            lua.clone(),
+            PluginPermissions::trusted(),
+            ctx.borrow().unwrap(),
+            opts,
+        )
+        .await
+        .unwrap();
 
         assert!(error.is_none(), "{error:?}");
         assert_eq!(system.unwrap().contains(TOOL_HINT), hinted);
@@ -2605,9 +2744,14 @@ mod tests {
         let opts = lua.create_table().unwrap();
         opts.set("prompt_id", name).unwrap();
         opts.set("instructions", CHILD_INSTRUCTIONS).unwrap();
-        let (system, error) = system_prompt(lua.clone(), ctx.borrow().unwrap(), opts)
-            .await
-            .unwrap();
+        let (system, error) = system_prompt(
+            lua.clone(),
+            PluginPermissions::trusted(),
+            ctx.borrow().unwrap(),
+            opts,
+        )
+        .await
+        .unwrap();
         assert!(error.is_none(), "{error:?}");
         let opts = lua.create_table().unwrap();
         opts.set("system", system.unwrap()).unwrap();
@@ -2657,7 +2801,7 @@ mod tests {
             _: &'a JsonValue,
             _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 let mut user_turn: Vec<String> = messages
@@ -2683,7 +2827,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
     }
@@ -2769,7 +2916,7 @@ mod tests {
             _: &'a JsonValue,
             _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 self.requests.send(messages.to_vec()).unwrap();
@@ -2793,7 +2940,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
     }
@@ -3310,7 +3460,6 @@ mod tests {
         )
         .await;
 
-        assert!(done_rx.is_empty());
         let events = iter::from_fn(|| ui_rx.try_recv().ok())
             .map(|action| match action {
                 UiAction::PluginTaskEvent { envelope, .. } => envelope.event,
@@ -3326,6 +3475,7 @@ mod tests {
             "{:?}",
             event_names(&events)
         );
+        assert!(done_rx.is_empty());
     }
 
     #[test_case(None ; "unassigned_default_has_no_provenance")]
@@ -3656,7 +3806,7 @@ mod tests {
             tools: &'a JsonValue,
             _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 self.requests
@@ -3680,7 +3830,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
     }

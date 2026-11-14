@@ -14,6 +14,7 @@ use maki_providers::provider::ProviderStatus;
 use maki_providers::spec::{Build, ProviderRegistry};
 
 use crate::components::Overlay;
+use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::{Cadence, Dirty, Watch};
 
@@ -29,6 +30,7 @@ const OFFLINE_LABEL: &str = "offline";
 const FALLBACK_LABEL: &str = "fallback";
 const CURRENT_MARK: &str = "● ";
 const FOOTER: &[(&str, &str)] = &[
+    (key::REFRESH.label, "refresh"),
     ("Enter", "select"),
     ("!", "strong"),
     ("@", "medium"),
@@ -91,6 +93,7 @@ fn provider_row(
 
 pub enum ModelPickerAction {
     Consumed,
+    Refresh,
     Select(String),
     AssignTier(String, ModelTier),
     UnassignTier(String, ModelTier),
@@ -390,6 +393,9 @@ impl ModelPicker {
     }
 
     fn handle_key_inner(&mut self, key: KeyEvent) -> ModelPickerAction {
+        if key::REFRESH.matches(key) {
+            return ModelPickerAction::Refresh;
+        }
         if key.code == FOLD_ALL_KEY {
             return self.toggle_all_folds();
         }

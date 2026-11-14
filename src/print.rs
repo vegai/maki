@@ -338,13 +338,17 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
     });
 
     let InteractiveHandle {
-        tool_names,
+        ready,
         input_tx,
         session_id,
         task,
         spend,
         ..
     } = handle;
+    let tool_names = ready
+        .await
+        .map(|ready| ready.tool_names)
+        .unwrap_or_default();
     // One prompt, then the input ends. A session that never connected has
     // already said why on the event stream.
     let _ = input_tx.send(AgentInput::from_defaults(
@@ -414,6 +418,7 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         }
         match event {
             AgentEvent::TextDelta { .. }
+            | AgentEvent::ProviderWaiting { .. }
             | AgentEvent::ThinkingDelta { .. }
             | AgentEvent::ToolPending { .. }
             | AgentEvent::ToolStart(_)

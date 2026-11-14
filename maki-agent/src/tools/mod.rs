@@ -36,21 +36,23 @@ use std::time::{Duration, SystemTime};
 use ignore::WalkBuilder;
 use jiff::fmt::friendly::{Designator, Spacing, SpanPrinter};
 use maki_config::ProjectConfig;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use crate::agent::{CallInstructions, LoadedInstructions, default_instruction_files};
 use crate::call_scope::CallScope;
 use crate::cancel::{CancelMap, CancelToken};
 use crate::live_session::SessionMailbox;
-use crate::mcp::McpSession;
+use crate::mcp::{
+    McpSession, TOOL_SEARCH_TOOL_NAME, is_qualified_name, is_wire_name, same_tool_name,
+};
 use crate::permissions::PermissionManager;
 use crate::prompt::ResolvedPrompts;
 use crate::{AgentConfig, AgentMode, EventSender, RunLedger, SharedBuf};
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_providers::Model;
 use maki_providers::RequestOptions;
-use maki_providers::provider::Provider;
+use maki_providers::provider::{ModelListing, Provider, RequestScope};
 use maki_storage::id::{MakiId, SessionRef};
 
 pub(crate) const TOOL_NAME_FIELD: &str = "name";
@@ -121,63 +123,116 @@ pub struct DescriptionContext<'a> {
 }
 
 #[derive(Debug, Clone, Default)]
-pub enum ToolFilter {
-    #[default]
-    All,
-    Only(Vec<String>),
-    AllExcept(Vec<String>),
+pub struct ToolFilter {
+    pub allowed: Option<Vec<String>>,
+    pub published: Option<Vec<String>>,
+    pub excluded: Vec<String>,
+}
+
+pub enum ToolKind {
+    Registry(ToolAudience),
+    Local(ToolAudience),
+    External,
+}
+
+impl ToolKind {
+    fn unresolved(name: &str) -> Self {
+        if is_wire_name(name) || is_qualified_name(name) || name == TOOL_SEARCH_TOOL_NAME {
+            Self::External
+        } else {
+            Self::Registry(ToolAudience::all())
+        }
+    }
+
+    pub fn of(name: &str, registered: Option<ToolAudience>, local: Option<&LocalTools>) -> Self {
+        if let Some(tool) = local.and_then(|tools| tools.get(name)) {
+            Self::Local(tool.audience)
+        } else if let Some(audience) = registered {
+            Self::Registry(audience)
+        } else {
+            Self::unresolved(name)
+        }
+    }
 }
 
 impl ToolFilter {
-    pub fn matches(&self, name: &str) -> bool {
-        match self {
-            Self::All => true,
-            Self::Only(allowed) => allowed.iter().any(|n| n == name),
-            Self::AllExcept(blocked) => !blocked.iter().any(|n| n == name),
+    pub(crate) fn cache_key(&self) -> Option<String> {
+        fn sorted(names: &[String]) -> String {
+            let mut names: Vec<&str> = names
+                .iter()
+                .map(String::as_str)
+                .filter(|name| matches!(ToolKind::unresolved(name), ToolKind::External))
+                .collect();
+            names.sort_unstable();
+            names.dedup();
+            names
+                .into_iter()
+                .map(|name| format!("{}:{name}", name.len()))
+                .collect()
+        }
+        let excluded = sorted(&self.excluded);
+        match &self.allowed {
+            Some(allowed) => Some(format!("only:{}|excluded:{excluded}", sorted(allowed))),
+            None if !excluded.is_empty() => Some(format!("excluded:{excluded}")),
+            None => None,
         }
     }
 
-    pub fn excluding(self, names: &[&str]) -> Self {
-        if names.is_empty() {
-            return self;
-        }
-        match self {
-            Self::All => Self::AllExcept(names.iter().map(|s| (*s).to_owned()).collect()),
-            Self::Only(allowed) => Self::Only(
-                allowed
-                    .into_iter()
-                    .filter(|n| !names.iter().any(|x| *x == n))
-                    .collect(),
-            ),
-            Self::AllExcept(mut blocked) => {
-                for &n in names {
-                    if !blocked.iter().any(|b| b == n) {
-                        blocked.push(n.to_owned());
-                    }
-                }
-                Self::AllExcept(blocked)
+    pub fn admits_name(&self, name: &str) -> bool {
+        self.admits(name, ToolKind::unresolved(name), ToolAudience::all())
+    }
+
+    pub fn admits(&self, name: &str, kind: ToolKind, caller: ToolAudience) -> bool {
+        let matches = |candidate: &str| match kind {
+            ToolKind::External => same_tool_name(name, candidate),
+            _ => name == candidate,
+        };
+        let includes = |names: &Option<Vec<String>>| {
+            names
+                .as_ref()
+                .is_none_or(|names| names.iter().any(|name| matches(name)))
+        };
+        let included = match kind {
+            ToolKind::Registry(audience) => {
+                audience.contains(caller) && includes(&self.allowed) && includes(&self.published)
+            }
+            ToolKind::Local(audience) => audience.contains(caller),
+            ToolKind::External => includes(&self.allowed),
+        };
+        included && !self.excluded.iter().any(|name| matches(name))
+    }
+
+    pub fn publishing(mut self, names: Vec<String>) -> Self {
+        self.published = Some(names);
+        self
+    }
+
+    pub fn excluding(mut self, names: &[&str]) -> Self {
+        for &name in names {
+            if !self.excluded.iter().any(|excluded| excluded == name) {
+                self.excluded.push(name.to_owned());
             }
         }
+        self
     }
 
     pub fn from_config(config: &AgentConfig, model: &Model, extra_exclude: &[&str]) -> Self {
-        let base = if config.allowed_tools.is_empty() {
-            Self::All
-        } else {
-            Self::Only(
-                config
-                    .allowed_tools
-                    .iter()
-                    .filter(|s| is_builtin_tool(s))
-                    .cloned()
-                    .collect(),
-            )
+        let base = Self {
+            allowed: (!config.allowed_tools.is_empty()).then(|| config.allowed_tools.clone()),
+            ..Self::default()
         };
         let mut exclude: Vec<&str> = extra_exclude.to_vec();
         exclude.extend(capability_exclusions(model));
         exclude.extend(config.disabled_tools.iter().map(|s| s.as_str()));
         base.excluding(&exclude)
     }
+}
+
+pub struct RequestSpec<'a> {
+    pub background: bool,
+    pub excluded: &'a [&'a str],
+    pub workflow: bool,
+    pub mcp: bool,
 }
 
 /// The tool array one run sends to the model, paired with the filter that
@@ -205,59 +260,42 @@ impl RequestTools {
     /// the array and the filter always agree on them.
     pub fn build(
         registry: &ToolRegistry,
+        local_tools: &LocalTools,
         vars: &crate::template::Vars,
         model: &Model,
         config: &AgentConfig,
-        excluded: &[&str],
-        workflow: bool,
-        mcp: bool,
+        spec: RequestSpec<'_>,
     ) -> Self {
-        Self::build_with_background(registry, vars, model, config, excluded, workflow, mcp, true)
-    }
-
-    /// [`Self::build`] for a session whose `background` is known: when it is
-    /// off, tools and parameters that only exist to move a call to the
-    /// background stay out of the array for the whole session.
-    #[allow(clippy::too_many_arguments)]
-    pub fn build_with_background(
-        registry: &ToolRegistry,
-        vars: &crate::template::Vars,
-        model: &Model,
-        config: &AgentConfig,
-        excluded: &[&str],
-        workflow: bool,
-        mcp: bool,
-        background: bool,
-    ) -> Self {
-        let filter = ToolFilter::from_config(config, model, excluded);
+        let filter = ToolFilter::from_config(config, model, spec.excluded);
         let ctx = DescriptionContext {
             filter: &filter,
             audience: ToolAudience::MAIN,
-            workflow,
-            mcp,
+            workflow: spec.workflow,
+            mcp: spec.mcp,
         };
         Self {
             definitions: registry.definitions_with_background(
                 vars,
                 &ctx,
+                Some(local_tools),
                 model.supports_tool_examples(),
-                background,
+                spec.background,
             ),
             filter: Arc::new(filter),
         }
     }
 
-    /// For an array the host built itself, like a Lua subagent publishing what
-    /// its caller picked. The filter is read back off that array, so the names
-    /// the model was shown and the names a script may reach are one set, and
-    /// the caller's `only`/`except` never has to be passed twice. MCP names are
-    /// never matched against this filter and stay reachable.
-    ///
-    /// An array nobody can read a name out of says nothing about intent, so it
-    /// falls back to the config's filter instead of an `Only` of nothing that
-    /// would leave the session unable to do anything. An array that is
-    /// genuinely empty is an answer, and is kept as one.
-    pub fn assembled(definitions: Value, config: &AgentConfig, model: &Model) -> Self {
+    /// The caller's array restricts registry tools. Config also filters MCP tools.
+    /// Session-local tools keep explicit denials but bypass registry allow lists.
+    /// Missing names fall back to the config filter. An empty array offers no registry tools.
+    pub fn assembled(
+        registry: &ToolRegistry,
+        mut definitions: Value,
+        local_tools: &LocalTools,
+        config: &AgentConfig,
+        model: &Model,
+        audience: ToolAudience,
+    ) -> Self {
         let published: Option<Vec<String>> = definitions.as_array().and_then(|defs| {
             let names: Vec<String> = defs
                 .iter()
@@ -265,10 +303,30 @@ impl RequestTools {
                 .collect();
             (defs.is_empty() || !names.is_empty()).then_some(names)
         });
-        let filter = published.map_or_else(
-            || ToolFilter::from_config(config, model, &[]),
-            ToolFilter::Only,
-        );
+        let base = ToolFilter::from_config(config, model, &[]);
+        let filter = match published {
+            Some(names) => base.publishing(names),
+            None => base,
+        };
+        if let Some(defs) = definitions.as_array_mut() {
+            let registered = registry.iter();
+            defs.retain(|def| {
+                def[TOOL_NAME_FIELD].as_str().is_none_or(|name| {
+                    filter.admits(
+                        name,
+                        ToolKind::of(
+                            name,
+                            registered
+                                .iter()
+                                .find(|entry| entry.name() == name)
+                                .map(|entry| entry.tool.audience()),
+                            Some(local_tools),
+                        ),
+                        audience,
+                    )
+                })
+            });
+        }
         Self {
             definitions,
             filter: Arc::new(filter),
@@ -340,7 +398,8 @@ pub type LocalTools = Arc<HashMap<String, LocalTool>>;
 /// A tool the session's host supplies: an ACP client tool, a subagent's
 /// `structured_output`. Dispatch puts it ahead of the registry, so it carries
 /// its own audience: a host tool must not reach a sandbox by wearing the name
-/// of a registry tool that may.
+/// of a registry tool that may. Host tools bypass the registry allow list, so the host
+/// must enforce its own policy before supplying them.
 #[derive(Clone)]
 pub struct LocalTool {
     pub handler: LocalToolFn,
@@ -625,13 +684,14 @@ impl Provider for NullProvider {
         _: &'a Value,
         _: &'a UnboundedSender<ProviderEvent>,
         _: RequestOptions,
-        _: Option<&'a SessionRef>,
+        _scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
         Box::pin(async { unimplemented!() })
     }
 
     fn list_models(
         &self,
+        _listing: ModelListing,
     ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, crate::AgentError>> {
         Box::pin(async { unimplemented!() })
     }
@@ -718,6 +778,7 @@ pub mod test_support {
     use std::borrow::Cow;
 
     use arc_swap::ArcSwap;
+    use maki_config::{DefaultEffect, PermissionsConfig};
     use maki_providers::Timeouts;
     use maki_storage::id::MakiId;
     use tokio::sync::mpsc::unbounded_channel;
@@ -735,7 +796,7 @@ pub mod test_support {
         mock_tool_with_schema(
             name,
             audience,
-            serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false}),
+            json!({"type": "object", "properties": {}, "additionalProperties": false}),
         )
     }
 
@@ -817,7 +878,7 @@ pub mod test_support {
             "guarded mock".into()
         }
         fn schema(&self) -> Value {
-            serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false})
+            json!({"type": "object", "properties": {}, "additionalProperties": false})
         }
         fn parse(
             &self,
@@ -889,6 +950,25 @@ pub mod test_support {
         )
     }
 
+    /// [`stub_ctx_with`] for a session whose working directory is {dir}.
+    pub fn stub_ctx_in(
+        dir: &Path,
+        event_tx: Option<&EventSender>,
+        tool_use_id: Option<&str>,
+    ) -> ToolContext {
+        let mut ctx = stub_ctx_with(&AgentMode::Build, event_tx, tool_use_id);
+        ctx.permissions = Arc::new(PermissionManager::new(
+            PermissionsConfig {
+                default: DefaultEffect::Allow,
+                ..Default::default()
+            },
+            dir.to_path_buf(),
+            ProjectConfig::discover(dir),
+            Arc::default(),
+        ));
+        ctx
+    }
+
     #[cfg(test)]
     pub(crate) fn stub_ctx_with_permissions(
         mode: &AgentMode,
@@ -926,6 +1006,8 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use super::registry::ToolSource;
+    use crate::template::Vars;
     use std::fs::{self, File};
 
     use tempfile::TempDir;
@@ -933,25 +1015,111 @@ mod tests {
 
     use super::*;
 
+    const FIRST_EXTERNAL: &str = "server.one";
+    const SECOND_EXTERNAL: &str = "server.two";
+    const FILTER_KEY: &str = "only:10:server.one10:server.two|excluded:10:server.two";
     const LINE_LIMIT: usize = 500;
     const TEST_MODEL_SPEC: &str = "anthropic/claude-opus-4-8";
+
+    #[test_case(false ; "ordered")]
+    #[test_case(true ; "reordered_with_duplicates_and_native_names")]
+    fn filter_cache_key_has_a_stable_encoding(reordered: bool) {
+        let names = if reordered {
+            vec![
+                SECOND_EXTERNAL,
+                FIRST_EXTERNAL,
+                FIRST_EXTERNAL,
+                READ_TOOL_NAME,
+            ]
+        } else {
+            vec![FIRST_EXTERNAL, SECOND_EXTERNAL]
+        };
+        let filter = ToolFilter {
+            allowed: Some(names.into_iter().map(str::to_owned).collect()),
+            excluded: vec![SECOND_EXTERNAL.into()],
+            ..Default::default()
+        };
+        assert_eq!(filter.cache_key().as_deref(), Some(FILTER_KEY));
+    }
 
     /// The array a host hands in is the whole answer, but only where names can
     /// be read out of it. Something unreadable must not quietly come out as
     /// "no tools at all".
-    #[test_case(serde_json::json!([{ TOOL_NAME_FIELD: READ_TOOL_NAME }]), true,  false ; "published_names_bind_the_filter")]
-    #[test_case(serde_json::json!([]),                                    false, false ; "empty_array_publishes_nothing")]
-    #[test_case(serde_json::json!([{ "description": "nameless" }]),       true,  true  ; "unreadable_array_falls_back_to_config")]
-    #[test_case(serde_json::json!({}),                                    true,  true  ; "non_array_falls_back_to_config")]
+    #[test_case(json!([{ TOOL_NAME_FIELD: READ_TOOL_NAME }]), true,  false ; "published_names_bind_the_filter")]
+    #[test_case(json!([]),                                    false, false ; "empty_array_publishes_nothing")]
+    #[test_case(json!([{ "description": "nameless" }]),       true,  true  ; "unreadable_array_falls_back_to_config")]
+    #[test_case(json!({}),                                    true,  true  ; "non_array_falls_back_to_config")]
     fn assembled_reads_its_filter_off_the_published_array(
         definitions: Value,
         read_matches: bool,
         write_matches: bool,
     ) {
         let model = Model::from_spec(TEST_MODEL_SPEC).unwrap();
-        let tools = RequestTools::assembled(definitions, &AgentConfig::default(), &model);
-        assert_eq!(tools.filter().matches(READ_TOOL_NAME), read_matches);
-        assert_eq!(tools.filter().matches(WRITE_TOOL_NAME), write_matches);
+        let tools = RequestTools::assembled(
+            ToolRegistry::global(),
+            definitions,
+            &LocalTools::default(),
+            &AgentConfig::default(),
+            &model,
+            ToolAudience::MAIN,
+        );
+        assert_eq!(
+            tools.filter().admits(
+                READ_TOOL_NAME,
+                ToolKind::Registry(ToolAudience::all()),
+                ToolAudience::MAIN
+            ),
+            read_matches
+        );
+        assert_eq!(
+            tools.filter().admits(
+                WRITE_TOOL_NAME,
+                ToolKind::Registry(ToolAudience::all()),
+                ToolAudience::MAIN
+            ),
+            write_matches
+        );
+    }
+
+    #[test_case(ToolAudience::MAIN, ToolAudience::RESEARCH_SUB, false ; "main_tool_hidden_from_research")]
+    #[test_case(ToolAudience::RESEARCH_SUB, ToolAudience::MAIN, false ; "research_tool_hidden_from_main")]
+    #[test_case(ToolAudience::RESEARCH_SUB, ToolAudience::RESEARCH_SUB, true ; "research_tool_offered")]
+    #[test_case(ToolAudience::INTERPRETER, ToolAudience::MAIN, false ; "script_tool_hidden_from_main")]
+    #[test_case(ToolAudience::INTERPRETER, ToolAudience::INTERPRETER, true ; "script_tool_offered")]
+    fn assembled_registry_tools_agree_with_dispatch(
+        tool_audience: ToolAudience,
+        caller: ToolAudience,
+        offered: bool,
+    ) {
+        let registry = Arc::new(ToolRegistry::new());
+        registry
+            .register(
+                test_support::mock_tool(READ_TOOL_NAME, tool_audience),
+                ToolSource {
+                    plugin: Arc::from(READ_TOOL_NAME),
+                },
+            )
+            .unwrap();
+        let model = Model::from_spec(TEST_MODEL_SPEC).unwrap();
+        let tools = RequestTools::assembled(
+            &registry,
+            json!([{ TOOL_NAME_FIELD: READ_TOOL_NAME }]),
+            &LocalTools::default(),
+            &AgentConfig::default(),
+            &model,
+            caller,
+        );
+        let mut ctx = test_support::stub_ctx(&AgentMode::Build);
+        ctx.registry = registry;
+        ctx.audience = caller;
+        ctx.tool_filter = Arc::clone(tools.filter());
+        assert_eq!(!tools.definitions().as_array().unwrap().is_empty(), offered);
+        assert_eq!(
+            crate::agent::tool_dispatch::callable(&ctx)
+                .iter()
+                .any(|tool| tool.name == READ_TOOL_NAME),
+            offered
+        );
     }
 
     #[test_case(true  ; "vision_model_keeps_view_image")]
@@ -960,10 +1128,171 @@ mod tests {
         let mut model = Model::from_spec(TEST_MODEL_SPEC).unwrap();
         model.supports_vision_override = Some(vision);
         let filter = ToolFilter::from_config(&AgentConfig::default(), &model, &[]);
-        assert_eq!(filter.matches(VIEW_IMAGE_TOOL_NAME), vision);
+        assert_eq!(
+            filter.admits(
+                VIEW_IMAGE_TOOL_NAME,
+                ToolKind::Registry(ToolAudience::all()),
+                ToolAudience::MAIN
+            ),
+            vision
+        );
         assert!(
-            filter.matches(READ_TOOL_NAME),
+            filter.admits(
+                READ_TOOL_NAME,
+                ToolKind::Registry(ToolAudience::all()),
+                ToolAudience::MAIN
+            ),
             "unrelated tools stay enabled"
+        );
+    }
+
+    #[test_case("claude_code" ; "plugin")]
+    #[test_case("claude_code_import" ; "plugin_import")]
+    #[test_case("srv__probe" ; "mcp")]
+    #[test_case("future_plugin" ; "late_registration")]
+    fn an_allow_list_keeps_non_builtin_names(name: &str) {
+        let model = Model::from_spec(TEST_MODEL_SPEC).unwrap();
+        let config = AgentConfig {
+            allowed_tools: vec![name.to_owned()],
+            ..Default::default()
+        };
+        let filter = ToolFilter::from_config(&config, &model, &[]);
+        assert!(filter.admits(
+            name,
+            ToolKind::Registry(ToolAudience::all()),
+            ToolAudience::MAIN
+        ));
+        assert!(!filter.admits(
+            READ_TOOL_NAME,
+            ToolKind::Registry(ToolAudience::all()),
+            ToolAudience::MAIN
+        ));
+    }
+
+    #[test_case(false ; "local_override_bypasses_the_registry_allowlist")]
+    #[test_case(true ; "local_override_preserves_explicit_denials")]
+    fn local_tools_follow_the_same_filter_in_built_and_assembled_requests(denied: bool) {
+        let model = Model::from_spec(TEST_MODEL_SPEC).unwrap();
+        let config = AgentConfig {
+            allowed_tools: vec![READ_TOOL_NAME.to_owned()],
+            disabled_tools: if denied {
+                vec![WRITE_TOOL_NAME.to_owned()]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        };
+        let local_tools = Arc::new(HashMap::from([(
+            WRITE_TOOL_NAME.to_owned(),
+            local_tool(ToolAudience::MAIN, |_, _| {
+                Box::pin(async { Ok(String::new()) })
+            }),
+        )]));
+        let built = RequestTools::build(
+            ToolRegistry::global(),
+            &local_tools,
+            &Vars::new(),
+            &model,
+            &config,
+            RequestSpec {
+                background: true,
+                excluded: &[],
+                workflow: false,
+                mcp: false,
+            },
+        );
+        let assembled = RequestTools::assembled(
+            ToolRegistry::global(),
+            json!([{ TOOL_NAME_FIELD: WRITE_TOOL_NAME }]),
+            &local_tools,
+            &config,
+            &model,
+            ToolAudience::MAIN,
+        );
+        assert_eq!(
+            built.filter().admits(
+                WRITE_TOOL_NAME,
+                ToolKind::Local(ToolAudience::all()),
+                ToolAudience::MAIN
+            ),
+            !denied
+        );
+        assert_eq!(
+            assembled.filter().admits(
+                WRITE_TOOL_NAME,
+                ToolKind::Local(ToolAudience::all()),
+                ToolAudience::MAIN
+            ),
+            !denied
+        );
+        assert_eq!(
+            !assembled.definitions().as_array().unwrap().is_empty(),
+            !denied
+        );
+    }
+
+    #[test_case(ToolAudience::RESEARCH_SUB, ToolAudience::RESEARCH_SUB, true ; "research_subagent")]
+    #[test_case(ToolAudience::GENERAL_SUB, ToolAudience::GENERAL_SUB, true ; "general_subagent")]
+    #[test_case(ToolAudience::INTERPRETER, ToolAudience::INTERPRETER, true ; "interpreter")]
+    #[test_case(ToolAudience::RESEARCH_SUB, ToolAudience::MAIN, false ; "research_tool_hidden_from_main")]
+    #[test_case(ToolAudience::GENERAL_SUB, ToolAudience::MAIN, false ; "general_tool_hidden_from_main")]
+    #[test_case(ToolAudience::INTERPRETER, ToolAudience::MAIN, false ; "interpreter_tool_hidden_from_main")]
+    fn assembled_local_tools_match_the_session_audience(
+        tool_audience: ToolAudience,
+        caller: ToolAudience,
+        offered: bool,
+    ) {
+        let model = Model::from_spec(TEST_MODEL_SPEC).unwrap();
+        let local_tools = Arc::new(HashMap::from([(
+            WRITE_TOOL_NAME.to_owned(),
+            local_tool(tool_audience, |_, _| Box::pin(async { Ok(String::new()) })),
+        )]));
+        let definitions = json!([{ TOOL_NAME_FIELD: WRITE_TOOL_NAME }]);
+        let tools = RequestTools::assembled(
+            ToolRegistry::global(),
+            definitions.clone(),
+            &local_tools,
+            &AgentConfig::default(),
+            &model,
+            caller,
+        );
+        assert_eq!(
+            tools.definitions(),
+            &if offered { definitions } else { json!([]) }
+        );
+        assert_eq!(
+            tools
+                .filter()
+                .admits(WRITE_TOOL_NAME, ToolKind::Local(tool_audience), caller),
+            offered
+        );
+    }
+
+    #[test]
+    fn a_published_array_cannot_override_config_denials() {
+        let model = Model::from_spec(TEST_MODEL_SPEC).unwrap();
+        let config = AgentConfig {
+            disabled_tools: vec![WRITE_TOOL_NAME.to_owned()],
+            ..Default::default()
+        };
+        let tools = RequestTools::assembled(
+            ToolRegistry::global(),
+            json!([{ TOOL_NAME_FIELD: WRITE_TOOL_NAME }]),
+            &LocalTools::default(),
+            &config,
+            &model,
+            ToolAudience::MAIN,
+        );
+        assert!(!tools.filter().admits(
+            WRITE_TOOL_NAME,
+            ToolKind::Registry(ToolAudience::all()),
+            ToolAudience::MAIN
+        ));
+        assert!(tools.definitions().as_array().unwrap().is_empty());
+        assert!(
+            tools
+                .filter()
+                .admits("srv__probe", ToolKind::External, ToolAudience::MAIN)
         );
     }
 

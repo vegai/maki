@@ -48,8 +48,9 @@ async fn roundtrip(
 ///
 /// @return (table|nil, string|nil) Array of `{id, session, name, focused, status?, plugin?,
 ///   tool?, parent?, part?, wrapper?, started_at?, ended_at?, cost?}`, or nil and an error.
-///   `status` is `"working"`, `"idle"` (a plugin task between prompts), `"done"`,
-///   `"error"` or `"cancelled"`. `session` is the chat session that `stop()` asks for.
+///   `status` is `"queued"`, `"working"`, `"idle"` (a plugin task between prompts),
+///   `"done"`, `"error"` or `"cancelled"`. `session` is the chat session that `stop()`
+///   asks for.
 ///   `tool` is the tool whose call the task runs, like `"task"` or `"bash"`, and is
 ///   absent on a session a plugin opened on its own. `parent` is the id of the call
 ///   the task runs under, like a `batch`, which is listed only once it moved. `part`

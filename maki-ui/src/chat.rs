@@ -161,6 +161,7 @@ impl Chat {
         match self.finish {
             Some((outcome, _)) => outcome.into(),
             None if self.idle && !self.backs_moved_call => TaskStatus::Idle,
+            None if self.messages_panel.is_waiting_on_provider() => TaskStatus::Queued,
             None => TaskStatus::Working,
         }
     }
@@ -357,6 +358,9 @@ impl Chat {
                     detail.map(|text| NoticeDetail { text, markdown }),
                     end.map(BackgroundOutcome::from),
                 ));
+            }
+            AgentEvent::ProviderWaiting { message } => {
+                self.messages_panel.set_provider_wait(message)
             }
             AgentEvent::SubagentHistory { .. } | AgentEvent::StreamClosed => {}
             AgentEvent::LiveToolBuf { id, body } => {
@@ -1246,6 +1250,20 @@ mod tests {
 
     fn text_delta(chat: &mut Chat, text: &str) {
         chat.handle_event(AgentEvent::TextDelta { text: text.into() }, None);
+    }
+
+    #[test]
+    fn a_queued_task_is_distinct_from_a_generating_task() {
+        let mut chat = chat();
+        chat.handle_event(
+            AgentEvent::ProviderWaiting {
+                message: Some(USER_TEXT.into()),
+            },
+            None,
+        );
+        assert_eq!(chat.task_status(), TaskStatus::Queued);
+        chat.handle_event(AgentEvent::ProviderWaiting { message: None }, None);
+        assert_eq!(chat.task_status(), TaskStatus::Working);
     }
 
     #[test]

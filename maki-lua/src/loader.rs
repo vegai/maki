@@ -594,6 +594,10 @@ impl PluginHost {
         self.ask(|reply| Request::CollectPluginOptions { reply })
     }
 
+    pub fn loaded_plugins(&self) -> Result<Vec<String>, PluginError> {
+        self.ask(|reply| Request::CollectLoadedPlugins { reply })
+    }
+
     /// Runs a source as the global `init.lua`.
     ///
     /// The one scope where `maki.pack.add` may declare packages, so it is its

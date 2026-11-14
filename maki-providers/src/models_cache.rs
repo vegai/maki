@@ -1,7 +1,8 @@
 //! On-disk cache of discovered model specs, so the model picker shows the last
 //! discovery instantly instead of waiting on every provider's /models
-//! endpoint. Live discovery always runs right after, and each provider's live
-//! answer replaces what the cache said about it.
+//! endpoint. Live discovery always runs right after. Each successful provider
+//! answer replaces its cached models. A failed probe without a static fallback
+//! keeps the cached models available.
 //!
 //! The cache only ever feeds the picker list. It never touches the model
 //! registry, so pricing, context windows, tier picks and
@@ -19,7 +20,7 @@ use tokio::task::spawn_blocking;
 use tracing::{debug, warn};
 
 use crate::provider::{
-    ModelBatch, ProviderStatus, fetch_all_models, provider_available, provider_of,
+    ModelBatch, ModelListing, ProviderStatus, fetch_all_models, provider_available, provider_of,
 };
 use crate::providers::custom;
 use crate::spec::ProviderRegistry;
@@ -68,13 +69,32 @@ struct Listing {
     /// this, an empty run reads as "offline" even when the real cause is an
     /// expired token or a revoked key.
     degraded: bool,
+    retained: bool,
+}
+
+/// An authoritative catalog fails with no models only when it refuses the
+/// account, so the models cached for it are unusable too.
+fn refused_by_catalog(provider: &str) -> bool {
+    ProviderRegistry::get(provider).is_some_and(|spec| spec.catalog_is_authoritative)
 }
 
 impl Listing {
     /// Replaces rather than merges, so a model the provider dropped since
     /// last run leaves the picker instead of failing when picked.
     fn add_live(&mut self, batch: &ModelBatch) {
-        self.degraded |= matches!(batch.status, ProviderStatus::Failed(_));
+        let failed = matches!(batch.status, ProviderStatus::Failed(_));
+        self.degraded |= failed;
+        if failed && batch.models.is_empty() && !refused_by_catalog(&batch.provider) {
+            let provider = batch.provider.as_str();
+            self.retained |= self
+                .replayed
+                .iter()
+                .any(|spec| provider_of(spec) == provider);
+            self.live.extend(
+                self.replayed
+                    .extract_if(.., |spec| provider_of(spec) == provider),
+            );
+        }
         self.replayed
             .retain(|old| provider_of(old) != batch.provider);
         for spec in &batch.models {
@@ -241,11 +261,18 @@ fn store_discovery(path: &Path, listing: &Listing, fingerprint: String, now_ms: 
     if listing.live.is_empty() && listing.degraded {
         return;
     }
+    let written_at = if listing.retained {
+        load_from(path)
+            .filter(|cache| cache.fingerprint == fingerprint)
+            .map_or(now_ms, |cache| cache.written_at)
+    } else {
+        now_ms
+    };
     store_at(
         path,
         &ModelsCache {
             fingerprint,
-            written_at: now_ms,
+            written_at,
             specs: listing.live.clone(),
         },
     );
@@ -254,47 +281,49 @@ fn store_discovery(path: &Path, listing: &Listing, fingerprint: String, now_ms: 
 /// Like [`fetch_all_models`], but the first `on_update` comes straight from
 /// the on-disk cache. Every call carries the whole list to show, not a delta,
 /// plus the warning of the batch that changed it. The last call has
-/// `loading` off and holds only this run's live answer.
+/// `loading` off and retains cached models only for failed probes without a fallback.
 pub async fn fetch_all_models_cached(
     policy: &ModelPolicy,
     mut on_update: impl FnMut(ModelList, Option<String>),
+    listing: ModelListing,
 ) {
     let path = cache_path();
     let fingerprint = spawn_blocking(fingerprint)
         .await
         .expect("fingerprint task panicked");
-    let mut listing = Listing {
+    let mut discovered = Listing {
         replayed: path
             .as_deref()
             .map(|p| replay(p, policy, &fingerprint, maki_storage::auth::now_millis()))
             .unwrap_or_default(),
         ..Listing::default()
     };
-    on_update(listing.snapshot(), None);
+    on_update(discovered.snapshot(), None);
 
     fetch_all_models(
         policy,
         |batch| {
-            listing.add_live(&batch);
+            discovered.add_live(&batch);
             let warning = match batch.status {
                 ProviderStatus::Failed(warning) => Some(warning),
                 ProviderStatus::Live | ProviderStatus::MissingKey => None,
             };
-            on_update(listing.snapshot(), warning);
+            on_update(discovered.snapshot(), warning);
         },
         None,
+        listing,
     )
     .await;
 
     if let Some(path) = &path {
         store_discovery(
             path,
-            &listing,
+            &discovered,
             fingerprint,
             maki_storage::auth::now_millis(),
         );
     }
-    on_update(listing.finish(), None);
+    on_update(discovered.finish(), None);
 }
 
 #[cfg(test)]
@@ -302,9 +331,15 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::providers::claude_code::SLUG;
 
     const FINGERPRINT: &str = "fingerprint-a";
     const NOW: u64 = 1_700_000_000_000;
+    const CACHED_CLAUDE: &str = "claude-code/cached";
+    const LIVE_CLAUDE: &str = "claude-code/live";
+    const OTHER: &str = "other";
+    const OTHER_LIVE: &str = "other/live";
+    const LISTING_FAILED: &str = "provider is busy or offline";
 
     fn specs(specs: &[&str]) -> Vec<String> {
         specs.iter().map(|s| s.to_string()).collect()
@@ -401,6 +436,32 @@ mod tests {
         assert_eq!(shown.providers["a"], ProviderStatus::MissingKey);
     }
 
+    #[test_case(true, &[], &[OTHER_LIVE, CACHED_CLAUDE] ; "failed_refresh_keeps_cached_models")]
+    #[test_case(false, &[], &[OTHER_LIVE] ; "successful_empty_refresh_removes_cached_models")]
+    #[test_case(true, &[LIVE_CLAUDE], &[OTHER_LIVE, LIVE_CLAUDE] ; "static_fallback_replaces_cached_models")]
+    #[test_case(false, &[LIVE_CLAUDE], &[OTHER_LIVE, LIVE_CLAUDE] ; "successful_refresh_replaces_cached_models")]
+    fn a_failed_provider_survives_mixed_discovery_in_the_picker_and_on_disk(
+        failed: bool,
+        models: &[&str],
+        expected: &[&str],
+    ) {
+        let (_dir, path) = cache_file(&[CACHED_CLAUDE, "removed/cached"]);
+        let mut listing = Listing {
+            replayed: load_from(&path).unwrap().specs,
+            ..Listing::default()
+        };
+        listing.add_live(&batch(OTHER, &[OTHER_LIVE], ProviderStatus::Live));
+        let status = if failed {
+            ProviderStatus::Failed(LISTING_FAILED.into())
+        } else {
+            ProviderStatus::Live
+        };
+        listing.add_live(&batch(SLUG, models, status));
+        store_discovery(&path, &listing, FINGERPRINT.into(), NOW);
+        assert_eq!(listing.finish().specs, expected);
+        assert_eq!(load_from(&path).unwrap().specs, expected);
+    }
+
     #[test_case(&[],            true,  &["good/model"] ; "degraded_empty_keeps_cache")]
     #[test_case(&[],            false, &[]             ; "authenticated_empty_is_recorded")]
     #[test_case(&["new/model"], false, &["new/model"]  ; "non_empty_rewrites_cache")]
@@ -415,6 +476,33 @@ mod tests {
         let cache = load_from(&path).unwrap();
         assert_eq!(cache.specs, expected);
         assert_eq!(cache.fingerprint, FINGERPRINT);
+    }
+
+    #[test]
+    fn repeated_failed_discovery_does_not_renew_cached_models() {
+        let (_dir, path) = cache_file(&[CACHED_CLAUDE]);
+        for now in [NOW + 1, NOW + MAX_AGE_MS] {
+            let mut listing = Listing {
+                replayed: load_from(&path).unwrap().specs,
+                ..Listing::default()
+            };
+            listing.add_live(&batch(OTHER, &[OTHER_LIVE], ProviderStatus::Live));
+            listing.add_live(&batch(
+                SLUG,
+                &[],
+                ProviderStatus::Failed(LISTING_FAILED.into()),
+            ));
+            store_discovery(&path, &listing, FINGERPRINT.into(), now);
+        }
+        assert!(
+            replay(
+                &path,
+                &ModelPolicy::default(),
+                FINGERPRINT,
+                NOW + MAX_AGE_MS + 1
+            )
+            .is_empty()
+        );
     }
 
     #[test]

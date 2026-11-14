@@ -51,7 +51,7 @@ Dev builds skip debug info for deps and vendored C (our crates keep it); to debu
 Rust workspace, key crates in root dir:
 
 - maki-ui: Uses ratatui for an interactive UI (elm like architecture)
-- maki-providers: Integration with LLM providers via APIs (e.g. Anthropic, Z.AI, xAI)
+- maki-providers: Integration with LLM providers via APIs and local processes (e.g. Anthropic, Z.AI, xAI)
 - maki-agent: An async agent loop that runs on tokio
 - maki-interpreter: code_execution tool implementation using pydantic/monty (a minimal python sandbox)
 - maki-storage: Persistent state across runs (e.g. sessions, auth)

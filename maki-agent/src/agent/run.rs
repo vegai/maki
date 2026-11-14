@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::{debug, error, info, warn};
 
-use maki_providers::provider::Provider;
+use maki_providers::provider::{Provider, RequestScope};
 use maki_providers::{
     ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, ImageSource, InputTransformation, Message,
     Model, ModelTier, RequestOptions, Role, StopReason, StreamResponse, model_registry,
@@ -688,7 +688,10 @@ impl<'h> Agent<'h> {
                 tools,
                 opts: self.opts,
                 output_budget: self.config.max_turn_output,
-                session_id: self.session_id.as_ref(),
+                scope: RequestScope {
+                    session_id: self.session_id.as_ref(),
+                    cwd: &self.permissions.cwd(),
+                },
                 retry: self.timeouts.retry,
             },
             Some(self.gauge),
@@ -827,6 +830,7 @@ impl<'h> Agent<'h> {
             model: &self.model,
             cancel: &self.cancel,
             context_size: self.gauge.size(),
+            cwd: self.permissions.cwd(),
         }
     }
 
@@ -1168,6 +1172,7 @@ impl<'h> Agent<'h> {
             model: &self.model,
             cancel: &self.cancel,
             context_size: context_size_before,
+            cwd: self.permissions.cwd(),
         };
         let Compacted {
             summary,
@@ -1362,7 +1367,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use maki_providers::model::FastSupport;
-    use maki_providers::provider::{BoxFuture, Provider};
+    use maki_providers::provider::{BoxFuture, ModelListing, Provider, RequestScope};
     use maki_providers::test_support::isolated_home;
     use maki_providers::{
         ContentBlock, FastPricing, Message, Model, ModelPricing, ProviderEvent, RequestOptions,
@@ -1498,7 +1503,7 @@ mod tests {
             tools: &'a Value,
             _: &'a UnboundedSender<ProviderEvent>,
             opts: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _scope: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 self.requests.lock().unwrap().push(CapturedRequest {
@@ -1517,7 +1522,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
             Box::pin(async { unimplemented!() })
         }
 
@@ -1544,7 +1552,7 @@ mod tests {
             _: &'a Value,
             ptx: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _scope: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 if let Some(text) = self.delta {
@@ -1561,7 +1569,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
             Box::pin(async { unimplemented!() })
         }
     }
@@ -2682,9 +2693,12 @@ mod tests {
             RunContext {
                 system: "system".into(),
                 tools: RequestTools::assembled(
+                    ToolRegistry::global(),
                     serde_json::json!([{ "name": tool }]),
+                    &LocalTools::default(),
                     &AgentConfig::default(),
                     model,
+                    ToolAudience::MAIN,
                 ),
                 facts: Some(PromptFacts {
                     model: model.spec(),
@@ -2747,9 +2761,12 @@ mod tests {
                 RunContext {
                     system: format!("system {facts:?}"),
                     tools: RequestTools::assembled(
+                        ToolRegistry::global(),
                         serde_json::json!([{ "name": *world.tool.lock().unwrap() }]),
+                        &LocalTools::default(),
                         &AgentConfig::default(),
                         model,
+                        ToolAudience::MAIN,
                     ),
                     facts: (!world.host_written.load(Ordering::Relaxed)).then_some(facts),
                     authored: world.authored.lock().unwrap().to_string(),
@@ -3775,7 +3792,7 @@ mod tests {
             _: &'a Value,
             _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _scope: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
                 match self
@@ -3788,7 +3805,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
             Box::pin(async { unimplemented!() })
         }
     }
@@ -3828,19 +3848,36 @@ mod tests {
     /// Fails while a request still carries thinking, or always.
     struct UnboundThinkingProvider {
         always: bool,
+        requests: Arc<Mutex<Vec<CapturedRequest>>>,
     }
 
     impl Provider for UnboundThinkingProvider {
         fn stream_message<'a>(
             &'a self,
-            _: &'a Model,
+            model: &'a Model,
             messages: &'a [Message],
-            _: &'a str,
-            _: &'a Value,
+            system: &'a str,
+            tools: &'a Value,
             _: &'a UnboundedSender<ProviderEvent>,
-            _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            opts: RequestOptions,
+            _scope: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            self.requests.lock().unwrap().push(CapturedRequest {
+                model: model.id.clone(),
+                system: system.to_owned(),
+                tools: tools.clone(),
+                // Recovery intentionally removes invalid thinking. Everything else must
+                // remain append-only across the retry.
+                messages: messages
+                    .iter()
+                    .cloned()
+                    .map(|mut message| {
+                        message.content.retain(|block| !block.is_thinking());
+                        serde_json::to_value(message).unwrap()
+                    })
+                    .collect(),
+                opts,
+            });
             let thinking = messages
                 .iter()
                 .flat_map(|m| &m.content)
@@ -3854,7 +3891,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
             Box::pin(async { unimplemented!() })
         }
     }
@@ -3879,8 +3919,14 @@ mod tests {
             ],
             ..Default::default()
         });
-        let (mut agent, mut event_rx) =
-            make_agent(UnboundThinkingProvider { always }, &mut history);
+        let requests = Arc::default();
+        let (mut agent, mut event_rx) = make_agent(
+            UnboundThinkingProvider {
+                always,
+                requests: Arc::clone(&requests),
+            },
+            &mut history,
+        );
 
         let recovered = agent.run(default_input()).await.is_ok();
         drop(agent);

@@ -9,6 +9,7 @@
 
 use serde_json::{Map, Value};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -18,10 +19,15 @@ use maki_config::{PROVIDER_BUILTINS, PluginsConfig};
 use maki_lua::PluginHost;
 use maki_lua::test_support::runtime;
 use maki_providers::plugin;
+use maki_providers::provider::RequestScope;
 use maki_providers::test_support::{Canned, isolated_home, serve};
 use maki_providers::{Message, Model, RequestOptions, ResolvedAuth, ThinkingSupport, Timeouts};
 use serde_json::json;
 use test_case::test_case;
+
+#[path = "../common/environment.rs"]
+#[allow(dead_code)]
+mod environment;
 
 mod golden;
 
@@ -143,7 +149,7 @@ fn routed(model_id: &str) -> Model {
 #[test_case(routed, MEDIUM, true ; "routed_medium")]
 fn only_ministral_is_denied_thinking(adjusted: fn(&str) -> Model, model_id: &str, thinks: bool) {
     let _state = isolated_home();
-    unsafe { std::env::set_var(MISTRAL_KEY_ENV, MISTRAL_KEY) };
+    environment::set(MISTRAL_KEY_ENV, MISTRAL_KEY);
     let _host = load_bundled(MISTRAL);
 
     let model = adjusted(model_id);
@@ -159,10 +165,10 @@ fn only_ministral_is_denied_thinking(adjusted: fn(&str) -> Model, model_id: &str
 fn only_opted_in_providers_read_usage_cost(slug: &str, spec: &str, expected: Option<f64>) {
     let _state = isolated_home();
     let (base_url, _requests) = serve(COST_SSE);
-    unsafe { std::env::set_var(base_url_env_var(slug), base_url) };
+    environment::set(&base_url_env_var(slug), base_url);
     let _host = load_bundled(slug);
     let key_env = plugin::spec(slug).expect(NOT_BUILT).api_key_env;
-    unsafe { std::env::set_var(key_env, MISTRAL_KEY) };
+    environment::set(key_env, MISTRAL_KEY);
 
     let provider = plugin::create(slug, Timeouts::default()).expect(NOT_BUILT);
     let model = Model::from_spec(spec).expect(UNKNOWN_MODEL);
@@ -175,7 +181,10 @@ fn only_opted_in_providers_read_usage_cost(slug: &str, spec: &str, expected: Opt
             &json!([]),
             &tx,
             RequestOptions::default(),
-            None,
+            RequestScope {
+                session_id: None,
+                cwd: Path::new("."),
+            },
         ))
         .expect(STREAM_FAILED);
 

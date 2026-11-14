@@ -572,6 +572,9 @@ pub enum Request {
     CollectPluginOptions {
         reply: SyncSender<PluginOptionSpecs>,
     },
+    CollectLoadedPlugins {
+        reply: SyncSender<Vec<String>>,
+    },
     /// Packages `init.lua` declared. Read after the init files have run, since
     /// that is when the declared set is complete.
     CollectPackages {
@@ -2717,6 +2720,10 @@ pub(crate) fn active_task_cancel(lua: &Lua) -> Option<(u64, CancelToken)> {
     let handle = lua.app_data_ref::<TaskHandle>()?;
     let cell = lock_cell(&handle);
     Some((cell.id, cell.cancel.clone()))
+}
+
+pub(crate) fn task_cancel(lua: &Lua) -> CancelToken {
+    active_task_cancel(lua).map_or_else(CancelToken::none, |(_, cancel)| cancel)
 }
 
 pub(crate) fn is_user_action(lua: &Lua) -> bool {
@@ -6202,6 +6209,11 @@ pub fn spawn(
                         }
                         Request::CollectPluginOptions { reply } => {
                             let _ = reply.send(collect_plugin_options(&rt.lua));
+                        }
+                        Request::CollectLoadedPlugins { reply } => {
+                            let mut names: Vec<String> = rt.plugins.borrow().keys().map(ToString::to_string).collect();
+                            names.sort_unstable();
+                            let _ = reply.send(names);
                         }
                         Request::CollectPackages { reply } => {
                             let declared = with_packs(&rt.lua, |packs| packs.specs.clone());

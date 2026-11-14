@@ -14,6 +14,7 @@ use maki_agent::tools::ToolRegistry;
 use maki_config::project::{self, TrustMode};
 use maki_config::{Config, load_env_files, load_permissions};
 use maki_lua::{DiscoveredPackage, InitFiles, Interaction, PluginHost};
+use maki_providers::claude_code;
 use maki_storage::StateDir;
 
 use crate::cli::{AuthAction, Cli, Command, McpAction, MigrateAction, SessionAction, TrustAction};
@@ -101,8 +102,10 @@ async fn load_plugins(
     // the hosts the user exempted from the private-address block.
     maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
     maki_lua::set_shell_preference(config.agent.shell.clone());
+    // Model resolution must wait until the plugin has checked the shared options.
+    let builtins = host.load_builtins(&config.plugins);
 
-    if let Err(e) = host.load_builtins(&config.plugins) {
+    if let Err(e) = builtins {
         let e = color_eyre::eyre::Report::from(e).wrap_err("load builtin plugins");
         match on_builtin_failure {
             BuiltinFailure::Fatal => return Err(e),
@@ -129,6 +132,11 @@ async fn load_plugins(
     // Publishes this load's providers in one step. Until here every reader
     // still sees the generation that was serving, so a `/reload` never opens a
     // window in which a registered provider answers "unknown".
+    let loaded = host.loaded_plugins()?;
+    claude_code::configure_plugin(
+        loaded.iter().any(|name| name == claude_code::PLUGIN),
+        config.plugins.opts.get(claude_code::PLUGIN),
+    );
     maki_providers::plugin::commit_load();
 
     Ok((config, sanitize_warnings(&warnings)))

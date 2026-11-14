@@ -8,14 +8,17 @@
 //! it wakes the moment any of them has something and never blocks a worker:
 //! it runs under `block_on` on the main thread.
 
-use std::future::{pending, ready};
+use std::env;
+use std::future::{Future, pending, ready};
 use std::mem;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
+use futures::FutureExt;
 
 use crossterm::event::{
     Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
@@ -43,6 +46,7 @@ use maki_lua::{
 };
 use maki_providers::Timeouts;
 use maki_providers::models_cache::{ModelList, fetch_all_models_cached};
+use maki_providers::provider::ModelListing;
 use maki_providers::provider::{Provider, from_model};
 use maki_providers::{Message, Model};
 use maki_storage::StateDir;
@@ -479,6 +483,7 @@ impl SpawnCtx {
         let session = &open.session;
         let resumed = !session.messages().is_empty();
         let permissions = Arc::new(self.permissions.fork());
+        permissions.set_cwd(env::current_dir().unwrap_or_else(|_| self.permissions.cwd()));
         let cell = Arc::new(ArcSwap::from(Arc::clone(&slot)));
         let handles = AgentHandles::spawn(
             &cell,
@@ -567,7 +572,7 @@ pub(crate) struct EventLoop<'t> {
     /// second `/packupdate` would otherwise race the first over the same clones
     /// and locks.
     pack: Option<JoinHandle<PackPreparation>>,
-    _model_fetch_task: AbortOnDropHandle<()>,
+    model_fetch: ModelFetch,
 }
 
 /// One item from any of the event loop's sources; `None` from `next_wake`
@@ -647,48 +652,92 @@ struct BackgroundModels {
     warn_rx: UnboundedReceiver<String>,
     warn_tx: UnboundedSender<String>,
     models_fetched: Arc<Notify>,
-    task: AbortOnDropHandle<()>,
+    fetch: ModelFetch,
+}
+
+#[derive(Default)]
+struct ModelFetch {
+    task: Option<AbortOnDropHandle<()>>,
+    pending: Option<ModelListing>,
+}
+
+impl ModelFetch {
+    fn request(
+        &mut self,
+        listing: ModelListing,
+        start: impl FnOnce(ModelListing) -> JoinHandle<()>,
+    ) {
+        if self.task.is_some() {
+            self.pending = Some(self.pending.unwrap_or(listing).max(listing));
+        } else {
+            self.task = Some(AbortOnDropHandle::new(start(listing)));
+        }
+    }
+
+    fn finished(&mut self) -> Option<ModelListing> {
+        self.task = None;
+        self.pending.take()
+    }
 }
 
 /// The one way discovery starts, so startup and `/models refresh` cannot drift
-/// apart. It only reports that it finished and leaves rebuilding to the UI
-/// thread, over a `Notify` so the loop wakes on it instead of noticing at the
-/// next tick. It keeps one permit, which collapses overlapping fetches into a
-/// single rebuild.
+/// apart. [`ModelFetch`] runs one at a time and coalesces the refreshes queued
+/// behind it. It only reports that it finished, panics included, and leaves
+/// rebuilding to the UI thread over a `Notify`, so the loop wakes on it instead
+/// of noticing at the next tick.
 fn fetch_models(
     available: Arc<ArcSwapOption<ModelList>>,
     policy: Arc<ModelPolicy>,
     warn_tx: UnboundedSender<String>,
     models_fetched: Arc<Notify>,
+    listing: ModelListing,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        fetch_all_models_cached(&policy, |list, warning| {
-            if let Some(warning) = warning {
-                let _ = warn_tx.send(warning);
-            }
-            available.store(Some(Arc::new(list)));
-        })
-        .await;
-        models_fetched.notify_one();
+        let fetch = fetch_all_models_cached(
+            &policy,
+            |list, warning| {
+                if let Some(warning) = warning {
+                    let _ = warn_tx.send(warning);
+                }
+                available.store(Some(Arc::new(list)));
+            },
+            listing,
+        );
+        complete_model_fetch(fetch, &warn_tx, &models_fetched).await;
     })
+}
+
+async fn complete_model_fetch(
+    fetch: impl Future<Output = ()>,
+    warn_tx: &UnboundedSender<String>,
+    models_fetched: &Notify,
+) {
+    if AssertUnwindSafe(fetch).catch_unwind().await.is_err() {
+        let _ = warn_tx.send("model discovery panicked; refresh to try again".to_owned());
+    }
+    models_fetched.notify_one();
 }
 
 fn spawn_model_fetch(policy: Arc<ModelPolicy>) -> BackgroundModels {
     let available: Arc<ArcSwapOption<ModelList>> = Arc::new(ArcSwapOption::empty());
     let (warn_tx, warn_rx) = unbounded_channel::<String>();
     let models_fetched = Arc::new(Notify::new());
-    let task = AbortOnDropHandle::new(fetch_models(
-        Arc::clone(&available),
-        policy,
-        warn_tx.clone(),
-        Arc::clone(&models_fetched),
-    ));
+    let mut fetch = ModelFetch::default();
+    fetch.request(ModelListing::Cached, |listing| {
+        fetch_models(
+            Arc::clone(&available),
+            policy,
+            warn_tx.clone(),
+            Arc::clone(&models_fetched),
+            listing,
+        )
+    });
     BackgroundModels {
         available,
         warn_rx,
         warn_tx,
         models_fetched,
-        task,
+        fetch,
     }
 }
 
@@ -848,7 +897,7 @@ impl<'t> EventLoop<'t> {
             ui_action_rx,
             ui_waker,
             pack: None,
-            _model_fetch_task: bg.task,
+            model_fetch: bg.fetch,
         })
     }
 
@@ -987,7 +1036,12 @@ impl<'t> EventLoop<'t> {
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
             Wake::Warn(warning) => self.focused_app().flash(warning),
             Wake::Pack(preparation) => self.finish_pack(*preparation),
-            Wake::ModelsDiscovered => self.rebuild_models(),
+            Wake::ModelsDiscovered => {
+                self.rebuild_models();
+                if let Some(listing) = self.model_fetch.finished() {
+                    self.refresh_models(listing);
+                }
+            }
         }
         Ok(())
     }
@@ -2140,7 +2194,7 @@ impl<'t> EventLoop<'t> {
                 terminal::suspend(self.terminal);
                 self.focus.on_resume();
             }
-            Action::RefreshModels => self.refresh_models(),
+            Action::RefreshModels(listing) => self.refresh_models(listing),
             Action::RefreshUsage => self.refresh_usage(),
             Action::ManualExit => self.sessions[idx].notifications.on_manual_exit(),
         }
@@ -2186,13 +2240,16 @@ impl<'t> EventLoop<'t> {
         self.dispatch(self.focused, actions);
     }
 
-    fn refresh_models(&self) {
-        fetch_models(
-            Arc::clone(&self.ctx.available_models),
-            Arc::clone(&self.ctx.model_policy),
-            self.warn_tx.clone(),
-            Arc::clone(&self.models_fetched),
-        );
+    fn refresh_models(&mut self, listing: ModelListing) {
+        self.model_fetch.request(listing, |listing| {
+            fetch_models(
+                Arc::clone(&self.ctx.available_models),
+                Arc::clone(&self.ctx.model_policy),
+                self.warn_tx.clone(),
+                Arc::clone(&self.models_fetched),
+                listing,
+            )
+        });
     }
 
     fn refresh_usage(&mut self) {
@@ -2326,15 +2383,151 @@ fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::tests::{MOVED_ID, app_with_moved_call, end_turn};
-    use crate::components::BackgroundOutcome;
+    use crate::app::tests::{MOVED_ID, WorkingDir, app_with_moved_call, end_turn};
+    use crate::components::{BackgroundOutcome, key};
+    use crossterm::event::KeyCode;
     use maki_agent::DoneReason;
+    use maki_config::PermissionsConfig;
+    use maki_config::project::{self, TrustMode};
     use maki_providers::TokenUsage;
+    use std::future::pending;
+    use tempfile::tempdir;
     use test_case::test_case;
     use tokio::sync::oneshot;
 
     const OBSERVATION: &str = "failed";
     const SHELL_RESULT: &str = "command finished";
+    const RUNTIME_MODEL: &str = "opencode/test";
+
+    #[test_case(false ; "resumed_session")]
+    #[test_case(true ; "loaded_into_a_blank_tab")]
+    fn tabs_use_the_process_directory_and_share_cd(load_in_place: bool) {
+        let _runtime = crate::app::tests::enter_runtime();
+        let root = tempdir().unwrap();
+        let current = tempdir().unwrap();
+        let target = tempdir().unwrap();
+        let _cwd = WorkingDir::enter(current.path());
+        let storage = StateDir::from_path(root.path().to_owned());
+        let prototype = Arc::new(PermissionManager::new(
+            PermissionsConfig::default(),
+            root.path().to_owned(),
+            project::resolve_noninteractive(root.path(), TrustMode::Session).project_config,
+            Arc::default(),
+        ));
+        let ctx = SpawnCtx {
+            storage: storage.clone(),
+            config: AgentConfig::default(),
+            ui_config: UiConfig::default(),
+            input_history_size: 100,
+            permissions: Arc::clone(&prototype),
+            timeouts: Timeouts::default(),
+            custom_commands: Arc::from([]),
+            lua_command_reader: LuaCommandReader::empty(),
+            keymap_reader: KeymapReader::empty(),
+            hint_reader: HintReader::empty(),
+            input_rules_reader: InputRulesReader::empty(),
+            lua_event_handle: EventHandle::disconnected_for_test(),
+            mcp_handle: None,
+            mcp_config_errors: McpConfigErrors::new(root.path().to_owned()),
+            available_models: Arc::new(ArcSwapOption::empty()),
+            storage_writer: Arc::new(StorageWriter::new(storage.clone(), unbounded_channel().0)),
+            model_policy: Arc::default(),
+            trust: TrustState::Inert,
+            host_prompt: Arc::default(),
+        };
+        let mut model = Model::from_spec(RUNTIME_MODEL).unwrap();
+        let provider = Arc::from(from_model(&mut model, ctx.timeouts).unwrap());
+        let slot = Arc::new(ModelSlot { model, provider });
+        let mut first = ctx.spawn_runtime(
+            OpenSession::fresh(&slot.model.spec(), &root.path().to_string_lossy(), &storage),
+            Arc::clone(&slot),
+        );
+        let mut second = ctx.spawn_runtime(
+            OpenSession::fresh(&slot.model.spec(), &root.path().to_string_lossy(), &storage),
+            Arc::clone(&slot),
+        );
+        if load_in_place {
+            second.app.apply_loaded_session(
+                OpenSession::fresh(&slot.model.spec(), &root.path().to_string_lossy(), &storage),
+                &slot.model,
+            );
+        }
+        let current = env::current_dir().unwrap();
+        assert_ne!(first.app.state.session.cwd, current.to_string_lossy());
+        assert_eq!(first.app.permissions.cwd(), current);
+        assert_eq!(second.app.permissions.cwd(), current);
+        let command = format!("/cd {}", target.path().display());
+        for character in command.chars() {
+            first.app.update(Msg::Key(key(KeyCode::Char(character))));
+        }
+        first.app.update(Msg::Key(key(KeyCode::Enter)));
+        let cwd = target.path().canonicalize().unwrap();
+        for permissions in [&first.app.permissions, &second.app.permissions, &prototype] {
+            assert_eq!(permissions.cwd(), cwd);
+        }
+        let opened = ctx.spawn_runtime(
+            OpenSession::fresh(&slot.model.spec(), &root.path().to_string_lossy(), &storage),
+            slot,
+        );
+        assert_eq!(opened.app.permissions.cwd(), cwd);
+    }
+
+    #[test]
+    fn a_panicked_model_fetch_completes_and_allows_the_queued_refresh() {
+        let models_fetched = Arc::new(Notify::new());
+        let (warn_tx, mut warn_rx) = unbounded_channel();
+        let mut fetch = ModelFetch {
+            task: None,
+            pending: None,
+        };
+        let notify = Arc::clone(&models_fetched);
+        fetch.request(ModelListing::Cached, |_| {
+            maki_lua::test_support::runtime().spawn(async move {
+                complete_model_fetch(async { panic!("discovery failed") }, &warn_tx, &notify).await;
+            })
+        });
+        fetch.request(ModelListing::Refresh, |_| unreachable!());
+        maki_lua::test_support::runtime().block_on(models_fetched.notified());
+        assert!(
+            warn_rx
+                .try_recv()
+                .unwrap()
+                .contains("model discovery panicked")
+        );
+        let next = fetch.finished().unwrap();
+        assert_eq!(next, ModelListing::Refresh);
+        fetch.request(next, |_| maki_lua::test_support::runtime().spawn(pending()));
+        assert!(fetch.task.is_some());
+    }
+
+    #[test]
+    fn model_refresh_waits_for_discovery_and_coalesces_with_priority() {
+        let mut fetch = ModelFetch {
+            task: None,
+            pending: None,
+        };
+        let mut started = Vec::new();
+        for listing in [
+            ModelListing::Cached,
+            ModelListing::Refresh,
+            ModelListing::Cached,
+            ModelListing::Refresh,
+        ] {
+            fetch.request(listing, |listing| {
+                started.push(listing);
+                maki_lua::test_support::runtime().spawn(pending())
+            });
+        }
+        assert_eq!(started, [ModelListing::Cached]);
+        let next = fetch.finished().unwrap();
+        assert_eq!(next, ModelListing::Refresh);
+        fetch.request(next, |listing| {
+            started.push(listing);
+            maki_lua::test_support::runtime().spawn(pending())
+        });
+        assert_eq!(started, [ModelListing::Cached, ModelListing::Refresh]);
+        assert_eq!(fetch.finished(), None);
+    }
 
     fn done_event() -> AgentEvent {
         AgentEvent::Done {

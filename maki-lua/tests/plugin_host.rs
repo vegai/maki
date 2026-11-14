@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
 use std::time::{Duration, Instant};
 
-use common::{end_session, poll_until};
+use common::{end_session, environment, poll_until};
 use maki_agent::live_session::BACKGROUND_PLAN_WRITE_DENIED;
 use maki_agent::template::Vars;
 use maki_agent::tools::test_support::stub_seed;
@@ -36,7 +36,7 @@ use maki_lua::{
     PluginError, PluginHost, PluginPermissions, SKIPPED_PLUGIN_WARNING, SessionEndReason,
     UNDECLARED_REACH, UNPAID_REACH_ERR, WARM_TOOL_CAP, set_allowed_private_hosts,
 };
-use maki_providers::provider::{BoxFuture, Provider};
+use maki_providers::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use maki_providers::{
     AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
     StopReason, StreamResponse, ThinkingConfig, TokenUsage,
@@ -4367,6 +4367,24 @@ fn register_options_rejects_bad_spec(src: &str, expected: &str) {
     assert!(err.to_string().contains(expected), "got: {err}");
 }
 
+/// A failed plugin load must remove its registered options so the provider cannot mistake it
+/// for a loaded plugin.
+#[test]
+fn a_plugin_that_fails_after_declaring_options_is_not_listed() {
+    const PLUGIN: &str = "fails_late";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        PLUGIN,
+        r#"
+        maki.api.register_options({ a = { default = 1, desc = "A." } })
+        error("an error after the options")
+        "#,
+    )
+    .expect_err("the load of the plugin must give an error");
+    assert!(!host.plugin_options().unwrap().contains_key(PLUGIN));
+}
+
 #[test]
 fn builtin_opts_flow_from_setup_plugins() {
     let reg = fresh_registry();
@@ -4421,7 +4439,7 @@ fn websearch_provider_option_selects_the_backend(provider: &str, expected: &str)
 /// model guessing, so the missing key is named before anything goes out.
 #[test]
 fn websearch_kagi_without_key_names_the_env_var() {
-    unsafe { std::env::remove_var(KAGI_KEY_ENV) };
+    environment::remove(KAGI_KEY_ENV);
     let (reg, _host) = builtins_host_with(&websearch_config("kagi"));
     let err = exec_tool(&reg, "websearch", json!({ "query": "rust" }))
         .expect_err("a keyless kagi search must fail");
@@ -6391,12 +6409,15 @@ fn user_plugin_with_fs_read_can_read_but_not_write() {
     assert!(result.contains("write=false"), "got: {result}");
 }
 
-/// Locating maki's own directories, or a program on `$PATH`, answers where a
-/// file lives and never what the environment holds. `fs_read` is what these
-/// cost, and it is also what they need, so `env` stays the key to the process
-/// environment alone.
+/// These calls locate maki's directories, a program on `$PATH` or the
+/// session's directory, or read the instruction files there. They reveal
+/// file locations or contents rather than the environment, so they need
+/// `fs_read`, and `env` stays reserved for the process environment.
 #[test_case::test_case("maki.env.state_dir()" ; "state_dir")]
 #[test_case::test_case(r#"maki.fn.executable("ls")"# ; "executable")]
+#[test_case::test_case("maki.agent.cwd(ctx)" ; "session_dir")]
+#[test_case::test_case("maki.agent.instructions(ctx)" ; "session_instructions")]
+#[test_case::test_case(r#"maki.agent.system_prompt(ctx, { prompt_id = "research", instructions = true })"# ; "system_prompt_instructions")]
 fn location_queries_cost_fs_read(call: &str) {
     const TOOL: &str = "location_test";
     let src = perm_tool_src(
@@ -6421,6 +6442,23 @@ fn location_queries_cost_fs_read(call: &str) {
     .unwrap();
     assert!(refused.contains(PERMISSION_DENIED_MSG), "got: {refused}");
     assert!(refused.contains("fs_read"), "got: {refused}");
+}
+
+#[test_case("nil" ; "omitted_instructions")]
+#[test_case("false" ; "no_instructions")]
+#[test_case(r#""supplied instructions""# ; "provided_text")]
+fn system_prompts_without_file_reads_do_not_need_fs_read(instructions: &str) {
+    const TOOL: &str = "prompt_test";
+    let src = perm_tool_src(
+        TOOL,
+        &format!(
+            r#"return assert(maki.agent.system_prompt(ctx, {{ prompt_id = "research", instructions = {instructions} }}))"#
+        ),
+    );
+    let mut perms = PluginPermissions::denied();
+    perms.set(maki_lua::Permission::Agent, true);
+    let prompt = exec_tool_with_perms(perms, &src, TOOL, serde_json::json!({})).unwrap();
+    assert!(!prompt.trim().is_empty());
 }
 
 const PATH_FIELD_SCHEMA: &str = r#"{
@@ -8380,7 +8418,7 @@ impl Provider for TurnThenPark {
         _: &'a Value,
         _: &'a UnboundedSender<ProviderEvent>,
         _: RequestOptions,
-        _: Option<&'a SessionRef>,
+        _: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         if self.billed.swap(true, Ordering::SeqCst) {
             let _ = self.parked.send(());
@@ -8407,7 +8445,10 @@ impl Provider for TurnThenPark {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }
@@ -8775,7 +8816,7 @@ impl Provider for OptsRecorder {
         _: &'a Value,
         _: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
-        _: Option<&'a SessionRef>,
+        _: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         let _ = self.0.send(opts);
         Box::pin(async {
@@ -8786,7 +8827,10 @@ impl Provider for OptsRecorder {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }
@@ -8909,7 +8953,7 @@ impl Provider for CallOnce {
         _: &'a Value,
         _: &'a UnboundedSender<ProviderEvent>,
         _: RequestOptions,
-        _: Option<&'a SessionRef>,
+        _: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         let _ = self.requests.send(messages.to_vec());
         let (block, stop) = if self.asked.swap(true, Ordering::SeqCst) {
@@ -8939,7 +8983,10 @@ impl Provider for CallOnce {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }
