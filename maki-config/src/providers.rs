@@ -19,7 +19,8 @@ const PROVIDERS_FILE: &str = "providers.toml";
 const BAD_CONFIG_EXIT_CODE: i32 = 2;
 /// The only built-in that reads `enable_free_models`.
 const OPENCODE_SLUG: &str = "opencode";
-const LOCAL_OVERLAY_SLUGS: [&str; 2] = ["ollama", "llama-cpp"];
+const LOCAL_ENDPOINT_SLUGS: [&str; 2] = ["ollama", "llama-cpp"];
+pub const BASE_URL_ENV_SUFFIX: &str = "_BASE_URL";
 
 /// Where the last parse came from and what the file looked like then. The
 /// config path follows the project directory, so one process can read more
@@ -293,8 +294,8 @@ pub struct ProviderDef {
     pub display_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol: Option<Protocol>,
-    /// The plugin owner selected to implement this provider name. Catalog
-    /// metadata does not select an implementation or grant it credentials.
+    /// Legacy v0.6.4 `plugin =` selection, parsed so the slug stays owned and
+    /// the user is told to migrate. Not used for selection.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -335,8 +336,10 @@ pub struct ProviderDef {
     /// CF-Access-Client-Secret = "${CF_ACCESS_CLIENT_SECRET}"
     /// ```
     ///
-    /// A same-name header (case-insensitive) replaces the built-in auth
-    /// header instead of appending, and keeps winning across key rotations.
+    /// A same-name header (case-insensitive) replaces whatever maki, the
+    /// plugin or the built-in auth would send under that name, and keeps
+    /// winning across key rotations. `anthropic-beta` values are added to the
+    /// betas maki sends rather than replacing them.
     /// An unset or empty variable fails the whole provider so callers see the
     /// missing name instead of a silent 401.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -414,7 +417,6 @@ impl ProvidersConfig {
         };
         let result = toml::from_str::<ProvidersConfig>(&content)
             .map_err(|e| format!("invalid {}: {e}", stamp.0.display()))
-            .and_then(|config| config.validate().map(|()| config))
             .inspect(|_| debug!(path = %stamp.0.display(), "loaded providers config"))
             .inspect_err(|e| tracing::warn!(error = %e, "cannot use providers.toml"));
         *parsed = Some((stamp, result.clone()));
@@ -422,8 +424,6 @@ impl ProvidersConfig {
     }
 
     pub fn save(&self) -> Result<(), std::io::Error> {
-        self.validate()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let path = providers_file_path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -442,17 +442,6 @@ impl ProvidersConfig {
         self.providers.get(slug)
     }
 
-    fn validate(&self) -> Result<(), String> {
-        for (slug, def) in &self.providers {
-            if def.plugin.is_some() && def.protocol.is_some() {
-                return Err(format!(
-                    "provider '{slug}' must select either a plugin or a protocol"
-                ));
-            }
-        }
-        Ok(())
-    }
-
     pub fn upsert(&mut self, slug: String, def: ProviderDef) {
         self.providers.insert(slug, def);
     }
@@ -462,14 +451,12 @@ impl ProvidersConfig {
     }
 }
 
-/// The `providers.toml` we already read, or where a fresh one goes. Both share
-/// this path so `save` cannot leave a second copy behind in the other dir.
+/// The `providers.toml` we already read, or where a fresh one goes; one file
+/// under the config dir is both.
 fn providers_file_path() -> PathBuf {
-    paths::find_config_path(PROVIDERS_FILE).unwrap_or_else(|| {
-        paths::config_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(PROVIDERS_FILE)
-    })
+    paths::config_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(PROVIDERS_FILE)
 }
 
 pub fn set_registered_providers(rows: Vec<&'static BuiltInProvider>) {
@@ -508,7 +495,10 @@ pub fn resolve_api_key_env(slug: &str, def: Option<&ProviderDef>) -> String {
 /// The `<SLUG>_BASE_URL` env var name (e.g. `anthropic` -> `ANTHROPIC_BASE_URL`,
 /// `llama-cpp` -> `LLAMA_CPP_BASE_URL`).
 pub fn base_url_env_var(slug: &str) -> String {
-    format!("{}_BASE_URL", slug.to_uppercase().replace('-', "_"))
+    format!(
+        "{}{BASE_URL_ENV_SUFFIX}",
+        slug.to_uppercase().replace('-', "_")
+    )
 }
 
 /// The `<SLUG>_BASE_URL` override, or `None` when unset or empty.
@@ -541,18 +531,13 @@ pub fn resolve_base_url(slug: &str, def: Option<&ProviderDef>) -> Option<String>
         .or_else(|| builtin_provider(slug).map(|b| b.default_base_url.to_string()))
 }
 
-/// Whether a built-in slug reads the thinking keys (`supports_thinking`,
-/// `requires_thinking`, `thinking_fields`) of its `providers.toml` models.
-/// Only the local endpoints do, and only those keys: everything else about
-/// them stays compiled in, so an `OLLAMA_HOST` setup can describe how its
-/// models think without a second slug and without touching auth wiring.
-///
-/// The list is the slugs whose request path merges those keys into the body,
-/// not every slug that serves models we cannot know (`google`, `copilot` and
-/// `mistral` also accept arbitrary models, but their paths would drop the
-/// keys on the floor). It grows when a path learns to read them.
-pub fn overlays_local_thinking(slug: &str) -> bool {
-    LOCAL_OVERLAY_SLUGS.contains(&slug)
+/// Whether a built-in slug runs on `LocalEndpoint`. Unlike the other built-ins
+/// it reads `protocol` and the model thinking keys (`supports_thinking`,
+/// `requires_thinking`, `thinking_fields`) from its `providers.toml` entry, so
+/// an `OLLAMA_HOST` setup can describe its models without a second slug. Auth
+/// and the rest of the model catalog stay compiled in.
+pub fn is_local_endpoint(slug: &str) -> bool {
+    LOCAL_ENDPOINT_SLUGS.contains(&slug)
 }
 
 /// The rest of a local `[[slug.models]]` entry, which still loses to the
@@ -589,11 +574,19 @@ fn ignored_local_model_fields(models: &[ModelDef]) -> Vec<&'static str> {
 /// Callers decide what counts as built-in (the inventory misses the `opencode`
 /// slugs) and when to report it.
 ///
-/// [`overlays_local_thinking`] slugs are the exception: their `models` table is
-/// half read, so only the keys nobody reads are named.
+/// [`is_local_endpoint`] slugs read part of their `models` table, so only the
+/// keys nobody reads are named. They also read `protocol`, but `LocalEndpoint`
+/// only branches on `openai-responses` and sends every other value over chat
+/// completions, so only `openai` and `openai-responses` are honored.
 pub fn ignored_builtin_fields(slug: &str, def: &ProviderDef) -> Vec<&'static str> {
+    let local = is_local_endpoint(slug);
+    let honored_protocol = local
+        && matches!(
+            def.protocol,
+            Some(Protocol::Openai | Protocol::OpenaiResponses)
+        );
     let mut ignored = Vec::new();
-    if def.protocol.is_some() {
+    if def.protocol.is_some() && !honored_protocol {
         ignored.push("protocol");
     }
     if def.api_key_env.is_some() {
@@ -603,7 +596,7 @@ pub fn ignored_builtin_fields(slug: &str, def: &ProviderDef) -> Vec<&'static str
         ignored.push("discover_models");
     }
     if !def.models.is_empty() {
-        if overlays_local_thinking(slug) {
+        if local {
             ignored.extend(ignored_local_model_fields(&def.models));
         } else {
             ignored.push("models");
@@ -765,50 +758,25 @@ mod tests {
     const EMPTY_PROVIDER_DEF_TOML: &str = "";
 
     #[test]
-    fn selected_plugin_roundtrip_preserves_gateway_settings() {
-        const PLUGIN: &str = "provider-package";
-        const SLUG: &str = "selected-provider";
-        const GATEWAY: &str = "https://gateway.example/v1";
-        let config: ProvidersConfig = toml::from_str(&format!(
-            "[{SLUG}]\nplugin = {PLUGIN:?}\nbase_url = {GATEWAY:?}\n"
-        ))
-        .unwrap();
-        let parsed: ProvidersConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
-        let def = parsed.get(SLUG).unwrap();
-        assert_eq!(def.plugin.as_deref(), Some(PLUGIN));
-        assert_eq!(def.base_url.as_deref(), Some(GATEWAY));
-        assert!(def.protocol.is_none());
-        let legacy: ProviderDef = toml::from_str(EMPTY_PROVIDER_DEF_TOML).unwrap();
-        assert!(legacy.plugin.is_none());
-        assert!(!toml::to_string(&legacy).unwrap().contains("plugin"));
-    }
-
-    #[test_case("\"\"" ; "empty")]
-    #[test_case("\" \"" ; "whitespace")]
-    #[test_case("\" provider-package\"" ; "leading_whitespace")]
-    #[test_case("42" ; "wrong_type")]
-    fn invalid_plugin_owner_is_rejected(value: &str) {
-        assert!(toml::from_str::<ProviderDef>(&format!("plugin = {value}")).is_err());
-    }
-
-    #[test]
-    fn selected_plugin_cannot_save_a_protocol_definition() {
-        const SLUG: &str = "selected-provider";
-        const ERROR: &str = "must select either a plugin or a protocol";
-        let config: ProvidersConfig = toml::from_str(&format!(
-            "[{SLUG}]\nplugin = \"provider-package\"\nprotocol = \"openai\"\n"
-        ))
-        .unwrap();
-        let error = config.save().unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains(SLUG));
-        assert!(error.to_string().contains(ERROR));
-    }
-
-    #[test]
     fn provider_def_enable_free_models_defaults_none() {
         let def: ProviderDef = toml::from_str(EMPTY_PROVIDER_DEF_TOML).unwrap();
         assert_eq!(def.enable_free_models, None);
+    }
+
+    #[test]
+    fn legacy_plugin_selection_parses() {
+        let config: ProvidersConfig =
+            toml::from_str("[my-slug]\nplugin = \"my-package\"\n").unwrap();
+        assert_eq!(
+            config.get("my-slug").unwrap().plugin.as_deref(),
+            Some("my-package")
+        );
+    }
+
+    #[test]
+    fn legacy_plugin_selection_rejects_empty_or_padded_name() {
+        assert!(toml::from_str::<ProvidersConfig>("[slug]\nplugin = \"\"\n").is_err());
+        assert!(toml::from_str::<ProvidersConfig>("[slug]\nplugin = \" padded\"\n").is_err());
     }
 
     const UNKNOWN_TIER_TOML: &str = r#"id = "x"
@@ -1039,6 +1007,21 @@ tier = "{input}"
     #[test_case("ollama", RICH_MODEL, vec!["models.tier", "models.context_window", "models.supports_vision", "models.pricing_*"] ; "local_slug_names_what_it_dropped")]
     fn ignored_builtin_fields_on_declared_models(slug: &str, entry: &str, expected: Vec<&str>) {
         let def: ProviderDef = toml::from_str(entry).unwrap();
+        assert_eq!(ignored_builtin_fields(slug, &def), expected);
+    }
+
+    #[test_case("ollama", Protocol::OpenaiResponses, Vec::new() ; "local_honors_responses")]
+    #[test_case("llama-cpp", Protocol::Openai, Vec::new() ; "local_honors_completions")]
+    #[test_case("ollama", Protocol::Anthropic, vec!["protocol"] ; "local_warns_on_other_wires")]
+    fn ignored_builtin_fields_on_local_protocol(
+        slug: &str,
+        protocol: Protocol,
+        expected: Vec<&str>,
+    ) {
+        let def = ProviderDef {
+            protocol: Some(protocol),
+            ..ProviderDef::default()
+        };
         assert_eq!(ignored_builtin_fields(slug, &def), expected);
     }
 

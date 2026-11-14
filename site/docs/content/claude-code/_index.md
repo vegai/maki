@@ -42,7 +42,7 @@ maki removes provider credentials, including `CLAUDE_CODE_OAUTH_TOKEN`, from com
    })
    ```
 
-A call needs the `run` [permission](/docs/permissions/), like `bash`. Its scope contains the profile and model, for example `claude read sonnet` or `claude code sonnet`. You can allow every read task and approve each coding task separately.
+A call needs the `run` [permission](/docs/permissions/), like `bash`. Its scope contains the profile and model, for example `claude read sonnet` or `claude code sonnet`. An always-allow answer covers that profile and model. Use the rule `claude read *` to allow read tasks across models while approving coding tasks separately.
 
 ## What happens in a call
 
@@ -112,7 +112,7 @@ Use `git --git-dir=<path>` when you intend to open a bare repository.
 
 The `claude-code` provider runs maki's agent loop on Claude Code models. The `claude_code` plugin enables the provider. Both use the plugin's `executable` and `config_dir`.
 
-Claude Code adds environment and account context to provider turns, including the working directory and your account email. Provider turns keep the session's start directory after `/cd`.
+Claude Code adds environment and account context to provider turns, including the working directory and your account email. In the TUI, all tabs, tools and provider turns share the process working directory. `/cd` updates that directory for every tab. File-write auto-allow rules remain anchored to the original project directory.
 
 Provider concurrency is configured separately from plugin tool calls. See the [plugin options](/docs/configuration/#plugins). Queued generations show a waiting message, and queued subagents are marked in `/tasks`.
 
@@ -124,30 +124,13 @@ Each model gets the context window Claude Code opens for it. maki reads the wind
 
 `/thinking` sets Claude Code's effort on models with adaptive thinking, such as Sonnet 5, and a thinking budget on Haiku 4.5. `off` disables thinking, and `adaptive` keeps Claude Code's default.
 
-The provider does not resume a native Claude Code session between turns.
-Native session state includes Claude Code's tool and transcript bookkeeping,
-while maki owns tool execution and the append-only conversation. Each turn
-also has its own private MCP connection and held calls. Reusing a native
-session needs a separate transport design that preserves these boundaries.
-The current provider omits signed thinking blocks because they belong to
-the original request prefix.
+The provider does not resume a native Claude Code session between turns. Native session state includes Claude Code's tool and transcript bookkeeping, while maki owns tool execution and the append-only conversation. Each turn also has its own private MCP connection and held calls. Reusing a native session needs a separate transport design that preserves these boundaries. The current provider omits signed thinking blocks because they belong to the original request prefix.
 
-Provider startup uses a private scratch directory outside the project and
-its denied paths. Starting Claude inside the checkout could run project
-settings or hooks before maki checks them. If `TMPDIR` resolves into a
-denied path or does not exist, maki uses an owned 0700 directory under
-`XDG_RUNTIME_DIR`, the cache directory, or `/var/tmp`. Existing `TMPDIR` paths outside the denied directories are used as supplied.
-If the request cannot write there, it returns a filesystem error. If none is suitable, set `TMPDIR` to an existing directory
-outside the project. A project below `/tmp` is allowed when `/tmp` itself
-is outside the detected checkout.
+Provider startup uses a private scratch directory outside the project and its denied paths. Starting Claude inside the checkout could run project settings or hooks before maki checks them. If `TMPDIR` resolves inside the checkout or a denied path, is missing, or is not a directory, maki uses an owned 0700 directory under `XDG_RUNTIME_DIR`, the cache directory, or `/var/tmp`. maki passes an existing `TMPDIR` outside the project as its resolved absolute path. If the request cannot write there, it returns a filesystem error. If none is suitable, set `TMPDIR` to an existing directory outside the project. A project below `/tmp` is allowed when `/tmp` itself is outside the detected checkout.
 
-Under bubblewrap, provide `/dev` and `/proc`, for example with
-`--dev /dev --proc /proc`. Some Claude Code and Bun versions abort without
-them. A failed version probe names `claude --version` and its exit status
-or signal. Provider failures also include available stderr and process
-status. The exit status is attached when Claude exits before maki requests shutdown.
+Under bubblewrap, provide `/dev` and `/proc`, for example with `--dev /dev --proc /proc`. Some Claude Code and Bun versions abort without them. A failed version probe names `claude --version` and its exit status or signal. Provider failures also include available stderr and process status. The exit status is attached when Claude exits before maki requests shutdown.
 
-Claude Code's own tools are off. When the model calls a tool, maki stops Claude Code and runs the call with its own tools and your permission rules. It sends the results with the next request. Claude Code's own retries are off too.
+Claude Code's own tools are off. When the model calls a tool, maki stops Claude Code and runs the call with its own tools and your permission rules. It sends the results with the next request. Claude Code's own retries are off too. If Claude Code still abandons or restarts a reply inside one request, maki stops it and retries the request. Claude Code also prompts the model again by itself when a reply shows no text, or when the output limit cuts it. maki stops it at that prompt and keeps the reply as it streamed. A reply that uses its whole output limit before it writes any text fails with an error, because a retry with the same limit would end the same way.
 
 On a normal shutdown, maki sends SIGTERM to the CLI leader and allows up to one second for Claude Code to remove its session file. Tool calls stay parked during this grace period. maki then kills remaining group members before reaping the leader. A reply at its output limit needs an immediate group kill to stop Claude Code's automatic continuation. This forced stop, cancellation, a crash, or a CLI that ignores SIGTERM can leave a session file in the Claude config directory. maki leaves Claude Code's private files alone. A Linux lifetime watcher stops the process group if maki exits or is killed, including by SIGKILL.
 

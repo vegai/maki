@@ -1,38 +1,35 @@
 use std::collections::HashMap;
 use std::env;
-use std::path::PathBuf;
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use flume::{Receiver, Sender};
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::process;
 use maki_storage::id::MakiId;
-use mlua::{
-    Function, IntoLuaMulti, Lua, LuaString, RegistryKey, Result as LuaResult, Table, Value,
-};
+use mlua::{Function, Lua, LuaString, RegistryKey, Result as LuaResult, Table, Value};
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::task::spawn_blocking;
+use tokio::time::sleep;
 
 use crate::api::fs::expand_tilde;
+use crate::api::keymap::{InputMode, KeymapWriter};
 use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
 use crate::api::util::convert::TableExt;
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
-use crate::plugin_permissions::{Permission, PluginPermissions, denied_error};
+use crate::jobs::{
+    CallbackUpdate, CallbackUpdates, JOB_NOT_FOUND_ERR, JobCommand, JobEvent, JobOwner,
+    JobSnapshot, JobSpec, MAX_TAIL_LINES, Redirect, deliver_job_event,
+};
+use crate::plugin_permissions::{Ceiling, Permission, PluginPermissions, require};
 use crate::runtime::{active_task_id, job_task_id, strip_traceback, with_jobs};
 
-mod jobs;
-pub use jobs::set_shell_preference;
-use jobs::{CallbackUpdate, CallbackUpdates, JobCommand, JobSnapshot, Redirect};
-pub(crate) use jobs::{EXIT_STDERR_BYTES, EXIT_STDERR_LINES};
-pub(crate) use jobs::{JobEvent, JobOwner, JobSpec, JobStore};
-
-const MAX_TAIL_LINES: usize = 1024;
 const DEFAULT_WAIT_MS: u64 = 30_000;
 
 const NO_TASK_SCOPE_ERR: &str =
     "jobstart: no active task; use scope = \"plugin\" or { session = ... }";
 const TABLE_SCOPE_ERR: &str = "jobstart: table scope must be { session = <id> }";
 const SCOPE_TYPE_ERR: &str = "jobstart: scope must be \"task\", \"plugin\", or { session = <id> }";
-const JOB_NOT_FOUND_ERR: &str = "job: not found";
 const JOB_UNWAITABLE_ERR: &str = "jobwait: unknown job id or already waited";
 const JOB_WAIT_TIMEOUT_ERR: &str = "jobwait: timed out";
 const BLANK_NAME_ERR: &str = "jobstart: name must be non-blank";
@@ -43,38 +40,7 @@ const STDIN_PIPE: &str = "pipe";
 const STDIN_NULL: &str = "null";
 const CHANCLOSE_STREAM_ERR: &str = "chanclose: you can close only \"stdin\"";
 const CHANSEND_DATA_ERR: &str = "chansend: data must be a string or a list";
-const ZERO_LINE_LIMIT_ERR: &str = "jobstart: max_line_bytes must be positive";
 const STDIN_STREAM: &str = "stdin";
-
-struct CheckedOutReceiver {
-    lua: Lua,
-    job_id: u32,
-    receiver: Option<Receiver<JobEvent>>,
-}
-
-impl CheckedOutReceiver {
-    fn new(lua: &Lua, job_id: u32, receiver: Receiver<JobEvent>) -> Self {
-        Self {
-            lua: lua.clone(),
-            job_id,
-            receiver: Some(receiver),
-        }
-    }
-
-    fn get(&self) -> &Receiver<JobEvent> {
-        self.receiver.as_ref().expect("receiver is checked out")
-    }
-}
-
-impl Drop for CheckedOutReceiver {
-    fn drop(&mut self) {
-        if let Some(receiver) = self.receiver.take() {
-            with_jobs(&self.lua, |store| {
-                store.restore_receiver(self.job_id, receiver);
-            });
-        }
-    }
-}
 
 /// Run a command in the background. A string runs through `bash -c` on Unix
 /// and through [`agent.shell`](/docs/configuration/#agent) on Windows. A table
@@ -82,6 +48,9 @@ impl Drop for CheckedOutReceiver {
 /// pipe, or `$(...)`.
 /// You get back a job id that you can pass to `jobstop` or `jobwait` to
 /// control the process.
+///
+/// Unread output is bounded to 16 MiB per job. The child blocks on write until
+/// callbacks or `jobwait` drain it.
 ///
 /// `stdout` and `stderr` can append directly to files. Redirected streams
 /// have no callbacks, tails or events and count as truncated in job reports.
@@ -107,9 +76,9 @@ impl Drop for CheckedOutReceiver {
 ///     including descendants that retain output pipes, or when maki dies, even from SIGKILL.
 ///   `timeout_ms` (integer?) stop the process group after this many milliseconds.
 ///     The deadline runs independently of Lua callbacks.
-///   `on_stdout` (function?) called with `(job_id, line, "stdout")` for each
+///   `on_stdout` (function?) called with `(job_id, line, "stdout", bytes)` for each
 ///     stdout line. Bytes that are not UTF-8 become U+FFFD, where Neovim
-///     passes the raw bytes.
+///     passes the raw bytes. `bytes` is the original byte count before truncation.
 ///   `on_stderr` (function?) the same for each stderr line, with `"stderr"`.
 ///   `on_exit` (function?) called with `(job_id, code, "exit", timed_out, stderr_tail)` when the
 ///     process stops. `stderr_tail` holds up to 10 lines, each capped at 4096 bytes.
@@ -120,10 +89,12 @@ impl Drop for CheckedOutReceiver {
 ///     with the current call. `"plugin"` keeps it alive until the plugin
 ///     unloads or reloads. `{ session = "<id>" }` keeps it alive until that
 ///     session ends, and survives plugin reload.
-///   `max_line_bytes` (integer?) maximum bytes per output line, excluding the newline.
-///     An oversized line stops the job and reports the limit on stderr.
-///   `tail` (integer?) trailing lines per stream kept for `jobinfo`
-///     (default 20, 0 disables, max 1024).
+///   `max_line_bytes` (integer?) longest delivered output line in bytes. Longer lines
+///     are cut at a UTF-8 boundary and end in `...` (default, `0`, and max: 64 MiB).
+///   `stop_on_line_limit` (boolean?) stop the job on an oversized line instead of
+///     truncating it (default false). Use for protocols that require complete lines.
+///   `tail` (integer?) trailing lines per stream kept for `jobinfo` and
+///     `jobwait` (default 20, 0 disables, max 1024).
 ///   `name` (string?) handle for `jobfind`, unique among the live jobs this
 ///     plugin can see. A second job with the same live name fails.
 /// @return (integer?, string?) Job id, or nil plus an error message when the
@@ -141,7 +112,7 @@ impl Drop for CheckedOutReceiver {
 async fn jobstart(
     lua: Lua,
     #[ctx] plugin: Arc<str>,
-    #[ctx] fs_write: bool,
+    #[ctx] grants: PluginPermissions,
     cmd: Value,
     opts: Option<Table>,
 ) -> LuaResult<Pair<u32>> {
@@ -152,7 +123,7 @@ async fn jobstart(
         .flatten()
         .unwrap_or(Value::Nil);
     let mut spec = JobSpec::new(parse_scope(&lua, &plugin, scope)?, parse_command(cmd)?);
-    let mut tail = None;
+    spec.ceiling = Ceiling::current_for(&lua, &plugin);
 
     if let Some(ref opts) = opts {
         spec.cwd = opts.opt("cwd")?;
@@ -160,10 +131,10 @@ async fn jobstart(
         spec.clear_env = opts.opt::<bool>("clear_env")?.unwrap_or(false);
         spec.guard = opts.opt::<bool>("guard")?.unwrap_or(false);
         spec.timeout = opts.opt::<u64>("timeout_ms")?.map(Duration::from_millis);
-        spec.max_line_bytes = opts.opt("max_line_bytes")?;
-        if spec.max_line_bytes == Some(0) {
-            return Err(mlua::Error::runtime(ZERO_LINE_LIMIT_ERR));
+        if let Some(limit) = opts.opt_nonzero("max_line_bytes")? {
+            spec.max_line_bytes = limit;
         }
+        spec.stop_on_line_limit = opts.opt::<bool>("stop_on_line_limit")?.unwrap_or(false);
         spec.pipe_stdin = match opts.opt::<String>("stdin")?.as_deref() {
             None | Some(STDIN_NULL) => false,
             Some(STDIN_PIPE) => true,
@@ -173,12 +144,10 @@ async fn jobstart(
         spec.on_stdout = callback_key(&lua, opts, "on_stdout")?;
         spec.on_stderr = callback_key(&lua, opts, "on_stderr")?;
         spec.on_exit = callback_key(&lua, opts, "on_exit")?;
-        spec.stdout = parse_redirect(opts, "stdout", spec.on_stdout.is_some(), fs_write)?;
-        spec.stderr = parse_redirect(opts, "stderr", spec.on_stderr.is_some(), fs_write)?;
-        tail = opts.opt("tail")?;
-        if let Some(n) = tail
-            && n > MAX_TAIL_LINES
-        {
+        spec.stdout = parse_redirect(&lua, opts, "stdout", spec.on_stdout.is_some(), &grants)?;
+        spec.stderr = parse_redirect(&lua, opts, "stderr", spec.on_stderr.is_some(), &grants)?;
+        spec.tail = opts.opt("tail")?.unwrap_or(spec.tail);
+        if spec.tail > MAX_TAIL_LINES {
             return Err(mlua::Error::runtime(format!(
                 "jobstart: tail must be in 0..={MAX_TAIL_LINES}"
             )));
@@ -203,12 +172,12 @@ async fn jobstart(
         Ok(())
     });
     try_pair!(available);
-    let spawned = try_pair!(smol::unblock(move || spec.spawn()).await);
-    with_jobs(&lua, |store| {
-        let id = try_pair!(store.register(spawned));
-        store.set_tail(id, tail);
-        Ok((Some(id), None))
-    })
+    let spawned = try_pair!(
+        spawn_blocking(move || spec.spawn())
+            .await
+            .map_err(mlua::Error::external)?
+    );
+    with_jobs(&lua, |store| Ok(pair(store.register(spawned))))
 }
 
 fn parse_command(cmd: Value) -> LuaResult<JobCommand> {
@@ -226,14 +195,16 @@ fn parse_command(cmd: Value) -> LuaResult<JobCommand> {
 }
 
 fn parse_redirect(
+    lua: &Lua,
     opts: &Table,
     key: &str,
     has_callback: bool,
-    fs_write: bool,
+    grants: &PluginPermissions,
 ) -> LuaResult<Redirect> {
-    let Some(value) = opts.opt::<Value>(key)? else {
+    let value = opts.get::<Value>(key)?;
+    if value.is_nil() {
         return Ok(Redirect::Capture);
-    };
+    }
     if has_callback {
         return Err(mlua::Error::runtime(format!(
             "jobstart: {key} and on_{key} are mutually exclusive; tail the file from a second job to get both"
@@ -242,9 +213,7 @@ fn parse_redirect(
     match value {
         Value::Boolean(false) => Ok(Redirect::Discard),
         Value::String(path) => {
-            if !fs_write {
-                return Err(denied_error(Permission::FsWrite));
-            }
+            require(lua, grants, Permission::FsWrite)?;
             Ok(Redirect::File(expand_tilde(&path.to_str()?)))
         }
         _ => Err(mlua::Error::runtime(format!(
@@ -508,30 +477,26 @@ async fn chansend(
     };
     match data {
         Value::String(text) => send(&text.as_bytes()).await,
-        other => send(&chansend_bytes(other)?).await,
+        Value::Table(lines) => send(&chansend_bytes(lines)?).await,
+        _ => Err(mlua::Error::runtime(CHANSEND_DATA_ERR)),
     }
 }
 
 /// List items can contain arbitrary bytes, as in Neovim. A newline inside an item becomes NUL.
-fn chansend_bytes(data: Value) -> LuaResult<Vec<u8>> {
-    match data {
-        Value::String(s) => Ok(s.as_bytes().to_vec()),
-        Value::Table(lines) => {
-            let mut bytes = Vec::new();
-            for (index, line) in lines.sequence_values::<LuaString>().enumerate() {
-                if index > 0 {
-                    bytes.push(b'\n');
-                }
-                bytes.extend(line?.as_bytes().iter().map(
-                    |&byte| {
-                        if byte == b'\n' { b'\0' } else { byte }
-                    },
-                ));
-            }
-            Ok(bytes)
+fn chansend_bytes(lines: Table) -> LuaResult<Vec<u8>> {
+    let mut bytes = Vec::new();
+    for (index, line) in lines.sequence_values::<LuaString>().enumerate() {
+        if index > 0 {
+            bytes.push(b'\n');
         }
-        _ => Err(mlua::Error::runtime(CHANSEND_DATA_ERR)),
+        bytes.extend(
+            line?
+                .as_bytes()
+                .iter()
+                .map(|&byte| if byte == b'\n' { b'\0' } else { byte }),
+        );
     }
+    Ok(bytes)
 }
 
 /// Close job {id}'s stdin, so the job reads end of file. Like
@@ -576,11 +541,12 @@ fn jobforget(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<()> {
 }
 
 /// Wait for a job to finish and collect its output. Returns a result
-/// table with `stdout`, `stderr`, `exit_code`, `timed_out`, and `truncated`. A job that
-/// already exited answers from its captured tail, so `truncated` says
-/// whether that tail ever lost a line (`tail` too small or 0, or the stream
-/// redirected away). Waiting on a live job collects every line and is never
-/// truncated.
+/// table with `stdout`, `stderr`, `exit_code`, `timed_out`, and `truncated`.
+/// The output starts from the job's captured tail, which holds what was
+/// delivered before the wait, and a live job adds every line from then on.
+/// `truncated` says whether that tail had already lost a line by then (`tail`
+/// too small or 0, or the stream redirected away). It doesn't count lines cut
+/// by `max_line_bytes`: those still arrive, ending in `...`.
 /// `timed_out` is true when the job's own `timeout_ms` deadline stopped it.
 ///
 /// While waiting, the job's `on_stdout`, `on_stderr`, and `on_exit`
@@ -608,9 +574,10 @@ async fn jobwait(
     timeout_ms: Option<u64>,
 ) -> LuaResult<Pair<Table>> {
     let task_id = active_task_id(&lua);
-    if let Some(snap) = with_jobs(&lua, |store| store.snapshot(job_id, task_id, &plugin))
-        && let Some(code) = snap.exit_code
-    {
+    let Some(snap) = with_jobs(&lua, |store| store.snapshot(job_id, task_id, &plugin)) else {
+        return Ok(err_pair(JOB_UNWAITABLE_ERR));
+    };
+    if let Some(code) = snap.exit_code {
         return wait_result(
             &lua,
             &snap.stdout_lines,
@@ -620,26 +587,25 @@ async fn jobwait(
             snap.dropped_output,
         );
     }
-    let Some(receiver) = with_jobs(&lua, |store| store.take_receiver(job_id, task_id, &plugin))
+    let Some(mut lease) = with_jobs(&lua, |store| store.lease_events(job_id, task_id, &plugin))
     else {
         return Ok(err_pair(JOB_UNWAITABLE_ERR));
     };
-    let receiver = CheckedOutReceiver::new(&lua, job_id, receiver);
 
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_WAIT_MS));
-    let deadline = smol::Timer::after(timeout);
-    futures_lite::pin!(deadline);
+    let mut deadline = pin!(sleep(timeout));
 
-    let mut stdout_lines = Vec::new();
-    let mut stderr_lines = Vec::new();
+    // A pump delivers until the wait takes its lease, and only the tail
+    // remembers those lines.
+    let mut stdout_lines = snap.stdout_lines;
+    let mut stderr_lines = snap.stderr_lines;
 
     let (exit_code, timed_out) = loop {
-        let event =
-            futures_lite::future::or(async { receiver.get().recv_async().await.ok() }, async {
-                (&mut deadline).await;
-                None
-            })
-            .await;
+        let event = tokio::select! {
+            biased;
+            event = lease.recv() => event,
+            () = &mut deadline => None,
+        };
 
         let Some(event) = event else {
             return Ok(err_pair(JOB_WAIT_TIMEOUT_ERR));
@@ -651,8 +617,8 @@ async fn jobwait(
             tracing::warn!(job_id, error = %strip_traceback(&e), "jobwait callback failed");
         }
         match event {
-            JobEvent::Stdout(line) => stdout_lines.push(line),
-            JobEvent::Stderr(line) => stderr_lines.push(line),
+            JobEvent::Stdout(line) => stdout_lines.push(line.text),
+            JobEvent::Stderr(line) => stderr_lines.push(line.text),
             JobEvent::Exit(code, timed_out) => break (code, timed_out),
         }
     };
@@ -663,7 +629,7 @@ async fn jobwait(
         &stderr_lines,
         exit_code,
         timed_out,
-        false,
+        snap.dropped_output,
     )
 }
 
@@ -686,59 +652,6 @@ fn wait_result(
     Ok((Some(result), None))
 }
 
-/// Fire the job's Lua callback for {event} (if any) and mark the job
-/// dead on exit. Shared by `jobwait` and the async dispatch loop so
-/// both deliver events identically.
-///
-/// The callback runs in a fresh coroutine so it may suspend (the
-/// `maki.fs.*` helpers park on `smol::unblock`); resumed inline from a
-/// poll loop it would die with "attempt to yield across metamethod /
-/// C-call boundary" on its first suspension.
-pub(crate) async fn deliver_job_event(lua: &Lua, job_id: u32, event: &JobEvent) -> LuaResult<()> {
-    let callback = with_jobs(lua, |store| {
-        store.record_event(job_id, event);
-        store
-            .callback_key(job_id, event)
-            .and_then(|key| lua.registry_value::<Function>(key).ok())
-    });
-    let stderr_tail = if let JobEvent::Exit(code, _) = event {
-        with_jobs(lua, |store| {
-            let tail = if callback.is_some() {
-                store.exit_stderr(job_id)
-            } else {
-                Vec::new()
-            };
-            store.complete(lua, job_id, *code);
-            tail
-        })
-    } else {
-        Vec::new()
-    };
-    match callback {
-        Some(callback) => call_back(lua, callback, job_id, event, stderr_tail).await,
-        None => Ok(()),
-    }
-}
-
-async fn call_back(
-    lua: &Lua,
-    callback: Function,
-    job_id: u32,
-    event: &JobEvent,
-    stderr_tail: Vec<String>,
-) -> LuaResult<()> {
-    let arg = match event {
-        JobEvent::Stdout(line) | JobEvent::Stderr(line) => Value::String(lua.create_string(line)?),
-        JobEvent::Exit(code, _) => Value::Integer((*code).into()),
-    };
-    let mut args = (job_id, arg, event.name()).into_lua_multi(lua)?;
-    if let JobEvent::Exit(_, timed_out) = event {
-        args.push_back(Value::Boolean(*timed_out));
-        args.push_back(Value::Table(lua.create_sequence_from(stderr_tail)?));
-    }
-    lua.create_thread(callback)?.into_async::<()>(args)?.await
-}
-
 /// Check whether {name} names a runnable file, resolving relative paths
 /// and `$PATH` from maki's directory. Returns 1 when found, 0 otherwise (matches Neovim's
 /// `vim.fn.executable`).
@@ -753,32 +666,12 @@ async fn call_back(
 // environment holds, so `fs_read` covers it.
 #[lua_fn(guard = FsRead)]
 fn executable(_lua: &Lua, name: String) -> LuaResult<i32> {
-    Ok(i32::from(find_program_here(&name).is_some()))
-}
-
-/// Resolve {name} to an absolute executable path, or return `""` if no
-/// executable exists, as in Neovim's `vim.fn.exepath`.
-/// Names with a path separator resolve from the working directory. Other
-/// names resolve through `$PATH`, with files this process cannot execute
-/// excluded. Resolve the program before a directory change so a relative
-/// name cannot select a different executable.
-///
-/// @param name string The name of a program (for example `"git"`), or a relative or absolute path.
-/// @return (string) Absolute path, or `""` if not found.
-/// @example
-/// local git = maki.fn.exepath("git")
-/// if git ~= "" then
-///   maki.fn.jobstart({ git, "status" }, { cwd = "/tmp" })
-/// end
-#[lua_fn(guard = FsRead)]
-fn exepath(_lua: &Lua, name: String) -> LuaResult<String> {
-    Ok(find_program_here(&name)
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_default())
-}
-
-fn find_program_here(name: &str) -> Option<PathBuf> {
-    process::find_program(name, &env::current_dir().ok()?)
+    Ok(i32::from(
+        env::current_dir()
+            .ok()
+            .and_then(|cwd| process::find_program(&name, &cwd))
+            .is_some(),
+    ))
 }
 
 /// Read the viewport of the focused chat transcript, like Neovim's
@@ -795,7 +688,10 @@ fn find_program_here(name: &str) -> Option<PathBuf> {
 /// local view = maki.fn.winsaveview()
 /// maki.fn.winrestview({ topline = view.topline + 1 })
 #[lua_fn]
-async fn winsaveview(lua: Lua, #[ctx] tx: Option<Sender<UiAction>>) -> LuaResult<Pair<Table>> {
+async fn winsaveview(
+    lua: Lua,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
+) -> LuaResult<Pair<Table>> {
     let view =
         try_pair!(ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::WinSaveView { reply_tx }).await);
     let t = lua.create_table()?;
@@ -821,13 +717,30 @@ async fn winsaveview(lua: Lua, #[ctx] tx: Option<Sender<UiAction>>) -> LuaResult
 #[lua_fn]
 fn winrestview(
     _lua: &Lua,
-    #[ctx] tx: Option<Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     view: Table,
 ) -> LuaResult<Pair<bool>> {
     let topline = view.opt::<i64>("topline")?.unwrap_or(1);
     let scroll_top = topline.saturating_sub(1).clamp(0, i64::from(u32::MAX)) as u32;
     try_pair!(ui_send(tx.as_ref(), UiAction::WinRestView { scroll_top }));
     Ok((Some(true), None))
+}
+
+/// The current mode, like `vim.fn.mode()`: `"i"` while the chat input has
+/// the keyboard and takes typed text, `"n"` otherwise. See
+/// [Modes](/docs/lua-api/#modes). Always `"n"` without a UI.
+///
+/// @return (string) `"n"` or `"i"`.
+/// @example
+/// maki.keymap.set({ "n", "i" }, "<M-m>", function()
+///   maki.ui.set_mode(maki.fn.mode() == "n" and "i" or "n")
+/// end)
+#[lua_fn]
+fn mode(lua: &Lua) -> LuaResult<&'static str> {
+    let mode = lua
+        .app_data_ref::<KeymapWriter>()
+        .map_or(InputMode::Normal, |writer| writer.mode.get());
+    Ok(mode.letter())
 }
 
 lua_table! {
@@ -843,71 +756,37 @@ lua_table! {
     "maki.fn" => pub(crate) fn create_fn_table(
         plugin: Arc<str>,
         perms: &PluginPermissions,
-        fs_write: bool,
-        tx: Option<Sender<UiAction>>,
+        grants: PluginPermissions,
+        tx: Option<UnboundedSender<UiAction>>,
     ), DOCS [
-        jobstart(perms, plugin, fs_write), jobstop(perms, plugin), jobforget(perms, plugin),
+        jobstart(perms, plugin, grants), jobstop(perms, plugin), jobforget(perms, plugin),
         jobwait(perms, plugin), jobinfo(perms, plugin), joblist(perms, plugin),
         jobattach(perms, plugin), jobfind(perms, plugin),
         chansend(perms, plugin), chanclose(perms, plugin),
-        executable(perms), exepath(perms),
-        winsaveview(tx), winrestview(tx),
+        executable(perms),
+        winsaveview(tx), winrestview(tx), mode,
     ]
 }
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use super::with_jobs;
-    use super::{ZERO_LINE_LIMIT_ERR, create_fn_table};
-    use crate::plugin_permissions::PluginPermissions;
-    use flume::Sender;
-    #[cfg(unix)]
-    use futures_lite::{FutureExt, future::poll_once};
-    use mlua::Function;
-    use mlua::{Lua, Table, Value};
-    #[cfg(unix)]
-    use std::pin::pin;
-    #[cfg(unix)]
-    use std::sync::Arc;
-    #[cfg(unix)]
-    use std::time::Duration;
+    use futures::FutureExt;
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
-    use super::{
-        JobEvent, call_back, chansend_bytes, winrestview__register, winsaveview__register,
-    };
-    use crate::api::util::command::{NO_UI_ERR, UiAction, WinView};
+    use super::*;
+    use crate::api::util::command::{NO_UI_ERR, WinView};
+    #[cfg(unix)]
+    use crate::test_support::runtime;
 
-    const UNREACHABLE_COMMAND: &str = "maki-unused-line-limit-command";
-    const CALLBACK_LINE: &str = "output";
+    const TEST_PLUGIN: &str = "test-plugin";
+    /// Can't exit while a test runs, so only the code under test ends it.
+    const SLEEPING_JOB: &str = "sleep 600";
+    const LONG_WAIT_MS: u64 = 600_000;
     const FIRST_LINE: &[u8] = b"first";
     const NOT_UTF8_LINE: &[u8] = b"latin\xe9";
     const LINE_WITH_NEWLINE: &[u8] = b"two\nparts";
     const LINE_WITH_NUL: &[u8] = b"two\0parts";
-
-    #[test]
-    fn a_zero_output_line_limit_is_rejected_before_starting_a_job() {
-        let lua = Lua::new();
-        let table = create_fn_table(
-            &lua,
-            "line-limit-test".into(),
-            &PluginPermissions::trusted(),
-            false,
-            None,
-        )
-        .unwrap();
-        let start: Function = table.get("jobstart").unwrap();
-        let options = lua.create_table().unwrap();
-        options.set("max_line_bytes", 0).unwrap();
-        options.set("scope", "plugin").unwrap();
-        let error = smol::block_on(start.call_async::<Value>((
-            lua.create_sequence_from([UNREACHABLE_COMMAND]).unwrap(),
-            options,
-        )))
-        .unwrap_err();
-        assert!(error.to_string().contains(ZERO_LINE_LIMIT_ERR), "{error}");
-    }
 
     #[cfg(unix)]
     #[test]
@@ -915,13 +794,13 @@ mod tests {
         const PLUGIN: &str = "gate-test";
         const COMMAND: &str = "cat";
         const START_TIMEOUT: Duration = Duration::from_secs(5);
-        smol::block_on(async {
+        runtime().block_on(async {
             let lua = Lua::new();
             let table = create_fn_table(
                 &lua,
                 PLUGIN.into(),
                 &PluginPermissions::trusted(),
-                false,
+                PluginPermissions::trusted(),
                 None,
             )
             .unwrap();
@@ -934,25 +813,20 @@ mod tests {
             let start: Function = table.get("jobstart").unwrap();
             let mut starting =
                 pin!(start.call_async::<(Option<u32>, Option<String>)>((COMMAND, named_options)));
-            assert!(poll_once(starting.as_mut()).await.is_none());
+            assert!((starting.as_mut()).now_or_never().is_none());
             let unnamed_options = lua
                 .create_table_from([("scope", "plugin"), ("stdin", "pipe")])
                 .unwrap();
             let unnamed =
                 start.call_async::<(Option<u32>, Option<String>)>((COMMAND, unnamed_options));
-            let (id, error) = unnamed
-                .or(async {
-                    let result = starting.as_mut().await;
-                    panic!("named start passed the held gate: {result:?}")
-                })
-                .or(async {
-                    smol::Timer::after(START_TIMEOUT).await;
-                    panic!("jobstart waited on an unrelated start")
-                })
-                .await
-                .unwrap();
+            let (id, error) = tokio::select! {
+                biased;
+                result = unnamed => result,
+                result = starting.as_mut() => panic!("named start passed the held gate: {result:?}"),
+                () = sleep(START_TIMEOUT) => panic!("jobstart waited on an unrelated start"),
+            }.unwrap();
             assert!(id.is_some(), "{error:?}");
-            assert!(poll_once(starting.as_mut()).await.is_none());
+            assert!((starting.as_mut()).now_or_never().is_none());
             assert!(with_jobs(&lua, |store| store.find_named(PLUGIN, None, PLUGIN)).is_none());
             drop(held);
             let (id, error) = starting.await.unwrap();
@@ -962,25 +836,6 @@ mod tests {
                 id
             );
         });
-    }
-
-    #[test_case(JobEvent::Stdout(CALLBACK_LINE.into()), 3 ; "stdout")]
-    #[test_case(JobEvent::Stderr(CALLBACK_LINE.into()), 3 ; "stderr")]
-    #[test_case(JobEvent::Exit(0, false), 5 ; "normal_exit")]
-    #[test_case(JobEvent::Exit(1, true), 5 ; "timeout_exit")]
-    fn job_callbacks_keep_their_argument_counts(event: JobEvent, count: usize) {
-        let lua = Lua::new();
-        let callback = lua
-            .load("return function(...) args = table.pack(...) end")
-            .eval()
-            .unwrap();
-        smol::block_on(call_back(&lua, callback, 1, &event, Vec::new())).unwrap();
-        let args: Table = lua.globals().get("args").unwrap();
-        assert_eq!(args.get::<usize>("n").unwrap(), count);
-        assert_eq!(args.get::<String>(3).unwrap(), event.name());
-        if let JobEvent::Exit(_, timed_out) = event {
-            assert_eq!(args.get::<bool>(4).unwrap(), timed_out);
-        }
     }
 
     /// List items can contain arbitrary bytes, as in Neovim. A newline inside an item becomes NUL.
@@ -1002,10 +857,10 @@ mod tests {
             LINE_WITH_NUL,
         ]
         .concat();
-        assert_eq!(chansend_bytes(Value::Table(lines)).unwrap(), expected);
+        assert_eq!(chansend_bytes(lines).unwrap(), expected);
     }
 
-    fn lua_with_view(tx: Option<Sender<UiAction>>) -> Lua {
+    fn lua_with_view(tx: Option<UnboundedSender<UiAction>>) -> Lua {
         let lua = Lua::new();
         let t = lua.create_table().unwrap();
         winsaveview__register(&t, &lua, tx.clone()).unwrap();
@@ -1016,37 +871,39 @@ mod tests {
 
     #[test_case("return f.winsaveview()" ; "winsaveview")]
     #[test_case("return f.winrestview({ topline = 3 })" ; "winrestview")]
-    fn view_without_ui_returns_error_pair(code: &str) {
+    #[tokio::test]
+    async fn view_without_ui_returns_error_pair(code: &str) {
         let lua = lua_with_view(None);
-        let (val, err): (Value, Option<String>) =
-            smol::block_on(lua.load(code).eval_async()).unwrap();
+        let (val, err): (Value, Option<String>) = lua.load(code).eval_async().await.unwrap();
         assert!(val.is_nil());
         assert_eq!(err.as_deref(), Some(NO_UI_ERR));
     }
 
-    #[test]
-    fn winsaveview_reports_the_viewport_one_based() {
+    #[tokio::test]
+    async fn winsaveview_reports_the_viewport_one_based() {
         const SCROLL_TOP: u32 = 6;
         const LINE_COUNT: u32 = 100;
         const HEIGHT: u16 = 24;
 
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         let lua = lua_with_view(Some(tx));
         std::thread::spawn(move || {
-            let Ok(UiAction::WinSaveView { reply_tx }) = rx.recv() else {
+            let Some(UiAction::WinSaveView { reply_tx }) = rx.blocking_recv() else {
                 panic!("expected winsaveview request");
             };
-            reply_tx
-                .send(WinView {
-                    scroll_top: SCROLL_TOP,
-                    line_count: LINE_COUNT,
-                    height: HEIGHT,
-                    auto_scroll: false,
-                })
-                .unwrap();
+            let sent = reply_tx.send(WinView {
+                scroll_top: SCROLL_TOP,
+                line_count: LINE_COUNT,
+                height: HEIGHT,
+                auto_scroll: false,
+            });
+            assert!(sent.is_ok());
         });
-        let (view, err): (Table, Option<String>) =
-            smol::block_on(lua.load("return f.winsaveview()").eval_async()).unwrap();
+        let (view, err): (Table, Option<String>) = lua
+            .load("return f.winsaveview()")
+            .eval_async()
+            .await
+            .unwrap();
         assert_eq!(err, None);
         assert_eq!(view.get::<u32>("topline").unwrap(), SCROLL_TOP + 1);
         assert_eq!(view.get::<u32>("line_count").unwrap(), LINE_COUNT);
@@ -1057,19 +914,68 @@ mod tests {
     #[test_case("{ topline = 12 }", 11 ; "explicit_topline")]
     #[test_case("{}", 0 ; "missing_topline_defaults_to_first_line")]
     #[test_case("{ topline = -5 }", 0 ; "below_range_clamps_to_first_line")]
-    fn winrestview_forwards_zero_based_scroll_top(arg: &str, expected: u32) {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+    #[tokio::test]
+    async fn winrestview_forwards_zero_based_scroll_top(arg: &str, expected: u32) {
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         let lua = lua_with_view(Some(tx));
-        let (ok, err): (bool, Option<String>) = smol::block_on(
-            lua.load(format!("return f.winrestview({arg})"))
-                .eval_async(),
-        )
-        .unwrap();
+        let (ok, err): (bool, Option<String>) = lua
+            .load(format!("return f.winrestview({arg})"))
+            .eval_async()
+            .await
+            .unwrap();
         assert!(ok);
         assert_eq!(err, None);
-        let Ok(UiAction::WinRestView { scroll_top }) = rx.recv() else {
+        let Some(UiAction::WinRestView { scroll_top }) = rx.recv().await else {
             panic!("expected winrestview request");
         };
         assert_eq!(scroll_top, expected);
+    }
+
+    enum Abandoned {
+        /// `call_async` ends the Lua call the moment its future drops.
+        HostCall,
+        /// The shape of #1345: a coroutine the plugin made, which only the
+        /// collector ever frees.
+        PluginCoroutine,
+    }
+
+    #[test_case(Abandoned::HostCall ; "host_call")]
+    #[test_case(Abandoned::PluginCoroutine ; "plugin_coroutine")]
+    #[tokio::test]
+    async fn abandoned_jobwait_releases_the_job(abandoned: Abandoned) {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        jobwait__register(
+            &t,
+            &lua,
+            PluginPermissions::trusted(),
+            Arc::from(TEST_PLUGIN),
+        )
+        .unwrap();
+        lua.globals().set("f", t).unwrap();
+        let owner = JobOwner::Plugin(Arc::from(TEST_PLUGIN));
+        let id = with_jobs(&lua, |store| store.start(JobSpec::new(owner, SLEEPING_JOB))).unwrap();
+        let wait_src = format!("function() f.jobwait({id}, {LONG_WAIT_MS}) end");
+
+        match abandoned {
+            Abandoned::HostCall => {
+                let wait: Function = lua.load(format!("return {wait_src}")).eval().unwrap();
+                assert!(
+                    wait.call_async::<()>(()).now_or_never().is_none(),
+                    "jobwait must park"
+                );
+            }
+            Abandoned::PluginCoroutine => {
+                let resume = format!("coroutine.resume(coroutine.create({wait_src}))");
+                lua.load(resume).exec_async().await.unwrap();
+                lua.gc_collect().unwrap();
+                lua.gc_collect().unwrap();
+            }
+        }
+
+        assert!(
+            with_jobs(&lua, |store| store.lease_events(id, None, TEST_PLUGIN)).is_some(),
+            "the abandoned wait must free the job"
+        );
     }
 }

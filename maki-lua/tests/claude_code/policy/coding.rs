@@ -11,20 +11,22 @@ use std::process::Command;
 use std::sync::Arc;
 use std::thread;
 
-use maki_agent::cancel::CancelToken;
 use maki_agent::permissions::{PermissionAnswer, PermissionManager, TaggedAnswer};
 use maki_agent::tools::{ToolContext, ToolOutputMode, ToolRegistry};
 use maki_agent::{AgentEvent, EventSender};
 use maki_config::{PermissionsConfig, ProjectConfig};
 use maki_lua::PluginHost;
+use maki_lua::test_support::wait_next;
 use serde_json::{Map, Value, json};
-use smol::lock::Mutex;
 use tempfile::{TempDir, tempdir};
 use test_case::test_case;
+use tokio::sync::Mutex;
+use tokio::sync::mpsc::unbounded_channel;
 
 use super::super::support::{
-    ARTIFACT_LINE, BASH_SRC, DEADLINE, IMPORT_TOOL, LEFT_BEHIND, NOTHING_IMPORTED, ORIGINALS,
-    PWNED, SNAPSHOT_DIR, TOOL, WRITE_SRC, artifact_listing, backdate, commit_all, contents,
+    ARTIFACT_LINE, ARTIFACT_MARKER, BASH_SRC, DEADLINE, DEPENDENCY_DIR, DEPENDENCY_FILE,
+    DEPENDENCY_UNSETTLED, IMPORT_TOOL, LEFT_BEHIND, MANIFEST, NOTHING_IMPORTED, ORIGINALS, PWNED,
+    SNAPSHOT_DIR, TOOL, WRITE_SRC, artifact_listing, backdate, cancel_after, commit_all, contents,
     environment, executable, git, listing, load, mode_bits_hold, on_path, reply, try_load,
     use_fixture_user, wait_until, write,
 };
@@ -35,6 +37,7 @@ use super::{
 };
 
 const LARGE_IMPORT_CHANGES: usize = 1024;
+const STAGE_PREFIX: &str = "stage.";
 const IMPORT_TOO_LARGE: &str = "Use `paths` to import smaller groups";
 const AMBIGUOUS_IMPORT_PATH: &str = "matches more than one change";
 const TRACKED_FOLDER_LINK: &str = "is a symlink. Restore a directory before retrying the snapshot";
@@ -77,7 +80,6 @@ const TAMPERED: &str = "tampered\n";
 /// Untracked in the test repository, so a coding call copies it only on
 /// request.
 const UNTRACKED_INPUT: &str = "fixtures";
-const NODE_MODULES: &str = "node_modules";
 const DEPENDENCIES_WITH_A_VENV: &str = "node_modules,.venv";
 /// Makes the fake point the snapshot's `.git/info/attributes` at a file in
 /// the live checkout, then edit a file.
@@ -100,11 +102,9 @@ const DELETION_IMPORTED: &str = "src/old.rs: imported before";
 const OUTSIDE_COPY: &str = "copy";
 const WORKER_NEW: &str = "fresh\n";
 const NEWER_LIB: &str = "newer\n";
-const DEPENDENCY: &str = "node_modules/pkg/index.js";
 const DEPENDENCY_CONTENT: &str = "module.exports = 1;\n";
 const EXPRESSION_NAMED_DIR: &str = "-print";
 const EXPRESSION_NAMED_DEPENDENCY: &str = "-print/index.js";
-const UNSETTLED_NOTE: &str = "dependencies changed during the copy";
 const UNICODE_DEPENDENCY_DIR: &str = "d\u{e9}ps";
 const UNICODE_DEPENDENCY: &str = "d\u{e9}ps/pkg/index.js";
 /// Target of a link in the test repository that points outside the project.
@@ -195,8 +195,6 @@ const OLD_FOLDER: &str = "Ab12Cd34";
 /// A stale artifact beside the one a sweep test checks, whose removal shows
 /// that the sweep ran.
 const SWEPT_FOLDER: &str = "Ef56Gh78";
-const MANIFEST: &str = "manifest.json";
-const ARTIFACT_MARKER: &str = ".maki-claude-code-artifact";
 const INSIDE_ARTIFACTS: &str = "artifacts";
 const ARTIFACTS_INSIDE: &str = "is in the project";
 const LINK_TO_NOWHERE: &str = "is a link to a missing target";
@@ -418,12 +416,12 @@ impl Coding {
             ProjectConfig::discover(&project),
             Arc::default(),
         ));
-        let (event_tx, events) = flume::unbounded();
-        let (answer_tx, answers) = flume::unbounded();
+        let (event_tx, mut events) = unbounded_channel();
+        let (answer_tx, answers) = unbounded_channel();
         ctx.event_tx = EventSender::new(event_tx, 0);
         ctx.user_response_rx = Some(Arc::new(Mutex::new(answers)));
         let approver = thread::spawn(move || {
-            while let Ok(envelope) = events.recv_timeout(DEADLINE) {
+            while let Some(envelope) = wait_next(&mut events, DEADLINE) {
                 if let AgentEvent::PermissionRequest { id, .. } = envelope.event {
                     meanwhile();
                     let answer = TaggedAnswer::new(id, answer);
@@ -561,10 +559,7 @@ fn sparse_checkout_omissions_stay_out_of_the_snapshot() {
     coding
         .import(&reg, json!({ "id": id, "paths": [IMPORTED_LIB] }))
         .unwrap();
-    assert_eq!(
-        fs::read_to_string(project.join(IMPORTED_LIB)).unwrap(),
-        WORKER_LIB
-    );
+    assert_eq!(coding.read(IMPORTED_LIB), WORKER_LIB);
 }
 
 #[test_case(".env/prod" ; "an_env_directory")]
@@ -813,7 +808,7 @@ fn a_coding_call_preserves_its_artifact_in_full_output_mode() {
 fn a_dependency_under_a_tracked_symlink_is_not_reported_as_copied() {
     let coding = Coding::new();
     let outside = tempdir().unwrap();
-    write(&outside.path().join(DEPENDENCY), DEPENDENCY_CONTENT);
+    write(&outside.path().join(DEPENDENCY_FILE), DEPENDENCY_CONTENT);
     symlink(outside.path(), coding.project().join("vendor")).unwrap();
     commit_all(&coding.project());
     let (registry, _host) = coding.host(&[("dependencies", json!(SYMLINKED_DEPENDENCY))]);
@@ -865,10 +860,7 @@ fn an_import_lands_what_the_artifact_recorded(object_format: &str) {
 
     let reply = coding.import(&reg, json!({ "id": id })).unwrap();
     assert!(reply.contains(ORIGINALS_KEPT), "got: {reply}");
-    assert_eq!(
-        fs::read_to_string(project.join(IMPORTED_LIB)).unwrap(),
-        WORKER_LIB
-    );
+    assert_eq!(coding.read(IMPORTED_LIB), WORKER_LIB);
     let originals = listing(&coding.artifact(&id).join(ORIGINALS))
         .pop()
         .unwrap();
@@ -880,10 +872,7 @@ fn an_import_lands_what_the_artifact_recorded(object_format: &str) {
         originals.join(DELETED_FILE).exists(),
         "the deleted file is missing"
     );
-    assert_eq!(
-        fs::read_to_string(project.join(ADDED_FILE)).unwrap(),
-        WORKER_NEW
-    );
+    assert_eq!(coding.read(ADDED_FILE), WORKER_NEW);
     assert!(
         !project.join(DELETED_FILE).exists(),
         "the import did not delete the file"
@@ -935,22 +924,13 @@ fn an_import_applies_nothing_over_newer_work() {
     );
     assert!(!project.join(ADDED_FILE).exists());
     assert!(project.join(DELETED_FILE).exists());
-    assert_eq!(
-        fs::read_to_string(project.join(IMPORTED_LIB)).unwrap(),
-        NEWER_LIB
-    );
+    assert_eq!(coding.read(IMPORTED_LIB), NEWER_LIB);
 
     coding
         .import(&reg, json!({ "id": id, "paths": [ADDED_FILE] }))
         .unwrap();
-    assert_eq!(
-        fs::read_to_string(project.join(ADDED_FILE)).unwrap(),
-        WORKER_NEW
-    );
-    assert_eq!(
-        fs::read_to_string(project.join(IMPORTED_LIB)).unwrap(),
-        NEWER_LIB
-    );
+    assert_eq!(coding.read(ADDED_FILE), WORKER_NEW);
+    assert_eq!(coding.read(IMPORTED_LIB), NEWER_LIB);
 }
 
 #[test_case(false ; "existing_target")]
@@ -973,7 +953,7 @@ fn an_import_refuses_symlink_targets_before_approval(dangling: bool) {
         ProjectConfig::discover(&project),
         Arc::default(),
     ));
-    let (events_tx, events) = flume::unbounded();
+    let (events_tx, mut events) = unbounded_channel();
     ctx.event_tx = EventSender::new(events_tx, 0);
     let error = reply(
         &reg,
@@ -984,8 +964,7 @@ fn an_import_refuses_symlink_targets_before_approval(dangling: bool) {
     .unwrap_err();
     assert!(error.contains(NOTHING_IMPORTED), "{error}");
     assert!(
-        !events
-            .try_iter()
+        !iter::from_fn(|| events.try_recv().ok())
             .any(|envelope| matches!(envelope.event, AgentEvent::PermissionRequest { .. }))
     );
     assert!(fs::symlink_metadata(&target).unwrap().is_symlink());
@@ -1162,10 +1141,7 @@ fn an_original_that_cannot_be_kept_changes_no_file() {
 
     fs::remove_file(&blocker).unwrap();
     coding.import(&reg, input).unwrap();
-    assert_eq!(
-        fs::read_to_string(project.join(IMPORTED_LIB)).unwrap(),
-        WORKER_LIB
-    );
+    assert_eq!(coding.read(IMPORTED_LIB), WORKER_LIB);
     assert!(!project.join(DELETED_FILE).exists());
 }
 
@@ -1336,8 +1312,6 @@ fn a_cancelled_import_leaves_the_checkout_as_it_was() {
     let project = coding.project();
     let before = contents(&project);
     let mut ctx = coding.ctx(&reg);
-    let (trigger, token) = CancelToken::new();
-    ctx.cancel = token;
     let written = project.clone();
     let snapshot = coding.snapshot(&id);
     let mut expected_temporary: Vec<_> = CHANGED_PATHS
@@ -1346,16 +1320,30 @@ fn a_cancelled_import_leaves_the_checkout_as_it_was() {
         .map(|path| fs::read(snapshot.join(path)).unwrap())
         .collect();
     expected_temporary.sort();
-    let canceller = thread::spawn(move || {
+    let artifact = coding.artifact(&id);
+    let canceller = cancel_after(&mut ctx, move || {
         let paused = wait_until(DEADLINE, || held.exists());
         let mut temporary: Vec<_> = temp_files(&written)
             .into_iter()
             .flat_map(|dir| contents(&dir).into_values())
             .collect();
         temporary.sort();
-        let wrote_all = paused && temporary == expected_temporary;
-        trigger.cancel();
-        wrote_all
+        let staged: Vec<_> = fs::read_dir(&artifact)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(STAGE_PREFIX)
+            })
+            .flat_map(|dir| contents(&dir).into_values())
+            .collect();
+        paused
+            && temporary == expected_temporary
+            && expected_temporary
+                .iter()
+                .all(|bytes| staged.contains(bytes))
     });
 
     let result = reply(
@@ -1366,7 +1354,7 @@ fn a_cancelled_import_leaves_the_checkout_as_it_was() {
     );
     assert!(
         canceller.join().unwrap(),
-        "the import did not write its new files"
+        "the paused import did not preserve its staged blobs and temporary files"
     );
     let cancelled = result.unwrap_err();
     assert!(cancelled.contains(CANCELLED), "{cancelled}");
@@ -1394,13 +1382,7 @@ fn a_cancel_while_the_snapshot_is_made_discards_it(locked: bool) {
     let prepare = format!("{setup} touch '{}'; {PREPARE_NEVER_ENDS}", marker.display());
     let (reg, _host) = coding.host(&[("prepare", json!(prepare))]);
     let mut ctx = coding.ctx(&reg);
-    let (trigger, token) = CancelToken::new();
-    ctx.cancel = token;
-    let canceller = thread::spawn(move || {
-        let preparing = wait_until(DEADLINE, || marker.exists());
-        trigger.cancel();
-        preparing
-    });
+    let canceller = cancel_after(&mut ctx, move || wait_until(DEADLINE, || marker.exists()));
 
     let input = json!({ "prompt": CODE_EDIT, "model": MODEL_ALIAS, "profile": CODE_PROFILE });
     let result = reply(&reg, &ctx, TOOL, input);
@@ -1428,7 +1410,7 @@ fn a_failed_dependency_scan_stops_the_worker() {
         "find",
         &format!("#!/bin/sh\nprintf '%s\\n' '{SCAN_FAILURE}' >&2\nexit 1\n"),
     );
-    let _path = environment::EnvVar::prepend_path(tools.path());
+    environment::prepend_path(tools.path());
     let (reg, _host) = coding.host(&[("dependencies", json!("deps"))]);
     let error = coding.code(&reg, CODE_EDIT, &[]).unwrap_err();
     assert!(
@@ -1459,13 +1441,7 @@ fn a_cancel_during_sanitization_discards_the_idle_artifact() {
     );
     host.load_bundled_source(TOOL, &source, opts).unwrap();
     let mut ctx = coding.ctx(&reg);
-    let (trigger, token) = CancelToken::new();
-    ctx.cancel = token;
-    let canceller = thread::spawn(move || {
-        let sanitizing = wait_until(DEADLINE, || marker.exists());
-        trigger.cancel();
-        sanitizing
-    });
+    let canceller = cancel_after(&mut ctx, move || wait_until(DEADLINE, || marker.exists()));
     let input = json!({ "prompt": CODE_EDIT, "model": MODEL_ALIAS, "profile": CODE_PROFILE });
     let result = reply(&reg, &ctx, TOOL, input);
     assert!(canceller.join().unwrap(), "sanitize did not start");
@@ -1556,14 +1532,8 @@ fn a_cancel_during_the_run_keeps_the_workers_snapshot(prompt: &str) {
     let coding = Coding::new();
     let (reg, _host) = coding.host(&[]);
     let mut ctx = coding.ctx(&reg);
-    let (trigger, token) = CancelToken::new();
-    ctx.cancel = token;
     let working = coding.fake.path(WORKING);
-    let canceller = thread::spawn(move || {
-        let started = wait_until(DEADLINE, || working.exists());
-        trigger.cancel();
-        started
-    });
+    let canceller = cancel_after(&mut ctx, move || wait_until(DEADLINE, || working.exists()));
 
     let input = json!({ "prompt": prompt, "model": MODEL_ALIAS, "profile": CODE_PROFILE });
     let err = reply(&reg, &ctx, TOOL, input).unwrap_err();
@@ -1776,7 +1746,7 @@ fn escaping_links_are_removed_without_shell_resolution() {
             realpath.display()
         ),
     );
-    let _path = environment::EnvVar::prepend_path(tools.path());
+    environment::prepend_path(tools.path());
     let prepare = format!(
         "i=0; while [ \"$i\" -lt {LINK_COUNT} ]; do ln -s lib.rs src/link_$i; i=$((i + 1)); done; ln -s {OUTSIDE_TARGET} {PREPARED_LINK}"
     );
@@ -1833,10 +1803,7 @@ fn denied_files_and_directories_stay_out_of_the_snapshot(path: &str) {
         .join(artifact_id(&reply))
         .join(SNAPSHOT_DIR);
     assert!(!snapshot.join(path).exists());
-    assert_eq!(
-        fs::read_to_string(project.join(path)).unwrap(),
-        DENIED_CONTENT
-    );
+    assert_eq!(coding.read(path), DENIED_CONTENT);
 }
 
 #[test_case(false ; "external_inode")]
@@ -1884,8 +1851,8 @@ fn ignored_output_is_preserved_and_reported(prepared: bool) {
     let project = coding.project();
     write(&project.join(".gitignore"), "dist/\nnode_modules/\n");
     git(&project, &["add", "--", ".gitignore"]);
-    write(&project.join(DEPENDENCY), DEPENDENCY_CONTENT);
-    let mut options = vec![("dependencies", json!(NODE_MODULES))];
+    write(&project.join(DEPENDENCY_FILE), DEPENDENCY_CONTENT);
+    let mut options = vec![("dependencies", json!(DEPENDENCY_DIR))];
     if prepared {
         options.push(("prepare", json!(PREPARE_IGNORED)));
     }
@@ -1905,7 +1872,7 @@ fn ignored_output_is_preserved_and_reported(prepared: bool) {
         assert!(reply.contains(IGNORED_DIR), "{reply}");
         assert!(!reply.contains(IGNORED_FILE), "{reply}");
     }
-    assert!(!reply.contains(DEPENDENCY), "{reply}");
+    assert!(!reply.contains(DEPENDENCY_FILE), "{reply}");
     let artifact = coding.artifacts.path().join(artifact_id(&reply));
     assert!(artifact.join(SNAPSHOT_DIR).join(IGNORED_FILE).is_file());
     let manifest: Value =
@@ -2054,9 +2021,9 @@ fn an_unrecorded_prepare_baseline_stops_the_worker(fails: bool) {
 fn dependency_exclusions_do_not_depend_on_copying(prepared: bool) {
     let coding = Coding::new();
     if !prepared {
-        write(&coding.project().join(DEPENDENCY), DEPENDENCY_CONTENT);
+        write(&coding.project().join(DEPENDENCY_FILE), DEPENDENCY_CONTENT);
     }
-    let mut options = vec![("dependencies", json!(NODE_MODULES))];
+    let mut options = vec![("dependencies", json!(DEPENDENCY_DIR))];
     if prepared {
         options.push(("prepare", json!(CREATE_DEPENDENCY)));
     }
@@ -2064,13 +2031,18 @@ fn dependency_exclusions_do_not_depend_on_copying(prepared: bool) {
     let included = if prepared {
         &[][..]
     } else {
-        &[NODE_MODULES][..]
+        &[DEPENDENCY_DIR][..]
     };
     let reply = coding.code(&reg, CODE_EDIT, included).unwrap();
 
-    assert!(coding.fake.log("snapshot_listing").contains(DEPENDENCY));
-    assert!(!reply.contains(&format!("M {DEPENDENCY}")), "{reply}");
-    assert!(!reply.contains(&format!("A {DEPENDENCY}")), "{reply}");
+    assert!(
+        coding
+            .fake
+            .log("snapshot_listing")
+            .contains(DEPENDENCY_FILE)
+    );
+    assert!(!reply.contains(&format!("M {DEPENDENCY_FILE}")), "{reply}");
+    assert!(!reply.contains(&format!("A {DEPENDENCY_FILE}")), "{reply}");
 }
 
 /// Dependency paths stay outside the import. Python virtual environment scripts contain
@@ -2085,7 +2057,7 @@ fn dependencies_come_along_but_never_as_changes(subdir: bool) {
     } else {
         project.clone()
     };
-    write(&session.join(DEPENDENCY), DEPENDENCY_CONTENT);
+    write(&session.join(DEPENDENCY_FILE), DEPENDENCY_CONTENT);
     write(&session.join(".venv/pyvenv.cfg"), "home = /usr/bin\n");
     let (reg, _host) = coding.host(&[("dependencies", json!(DEPENDENCIES_WITH_A_VENV))]);
     let mut ctx = ctx_in(&session, None, None);
@@ -2102,7 +2074,7 @@ fn dependencies_come_along_but_never_as_changes(subdir: bool) {
     assert!(
         listing
             .lines()
-            .any(|line| line == format!("./{DEPENDENCY}")),
+            .any(|line| line == format!("./{DEPENDENCY_FILE}")),
         "{listing}"
     );
     assert!(
@@ -2111,11 +2083,11 @@ fn dependencies_come_along_but_never_as_changes(subdir: bool) {
     );
     assert!(reply.contains(VENV_NOTE), "got: {reply}");
     assert!(
-        !reply.contains(&format!("{NODE_MODULES}/")),
+        !reply.contains(&format!("{DEPENDENCY_DIR}/")),
         "a dependency shows as a change: {reply}"
     );
     assert_eq!(
-        fs::read_to_string(session.join(DEPENDENCY)).unwrap(),
+        fs::read_to_string(session.join(DEPENDENCY_FILE)).unwrap(),
         DEPENDENCY_CONTENT
     );
 }
@@ -2140,10 +2112,10 @@ fn collecting_changes_never_follows_the_workers_links() {
 /// secret in it never reaches the worker's shell.
 #[test]
 fn dependency_copies_keep_the_snapshot_exclusions() {
-    let (dependencies, deny_read) = (NODE_MODULES, DEPENDENCY_DENIED);
+    let (dependencies, deny_read) = (DEPENDENCY_DIR, DEPENDENCY_DENIED);
     let coding = Coding::new();
     let project = coding.project();
-    write(&project.join(DEPENDENCY), DEPENDENCY_CONTENT);
+    write(&project.join(DEPENDENCY_FILE), DEPENDENCY_CONTENT);
     write(&project.join(DEPENDENCY_SECRET), "SECRET=1\n");
     write(&project.join(DEPENDENCY_DENIED), "key\n");
     let (reg, _host) = coding.host(&[
@@ -2154,7 +2126,7 @@ fn dependency_copies_keep_the_snapshot_exclusions() {
 
     let listing = coding.fake.log("snapshot_listing");
     let listed = |path: &str| listing.lines().any(|line| line == format!("./{path}"));
-    assert!(listed(DEPENDENCY), "{listing}");
+    assert!(listed(DEPENDENCY_FILE), "{listing}");
     for left_out in [DEPENDENCY_SECRET, DEPENDENCY_DENIED] {
         assert!(
             !listed(left_out),
@@ -2180,7 +2152,7 @@ fn a_dependency_dir_is_copied_and_never_a_change(dir: &str, file: &str) {
     );
     assert!(reply.contains(REPORTED_CHANGES[0]), "got: {reply}");
     assert!(!reply.contains(file), "got: {reply}");
-    assert!(!reply.contains(UNSETTLED_NOTE), "got: {reply}");
+    assert!(!reply.contains(DEPENDENCY_UNSETTLED), "got: {reply}");
 }
 
 /// The next coding call removes an artifact untouched for longer than its
@@ -2358,8 +2330,13 @@ fn an_artifact_dir_it_cannot_trust_is_refused(climbs: bool, problem: &str) {
     let dir = if climbs {
         base.path().join(NOWHERE).join("..").join(INSIDE_ARTIFACTS)
     } else {
-        PathBuf::from(INSIDE_ARTIFACTS)
+        base.path()
+            .strip_prefix(Path::new("/"))
+            .unwrap()
+            .join(INSIDE_ARTIFACTS)
     };
+    let relative_target = env::current_dir().unwrap().join(&dir);
+    assert!(!relative_target.exists());
     let mut opts = coding.fake.opts(ONE_SLOT);
     opts.insert("artifact_dir".into(), json!(dir));
     let err = try_load(opts)
@@ -2367,11 +2344,8 @@ fn an_artifact_dir_it_cannot_trust_is_refused(climbs: bool, problem: &str) {
         .expect("the plugin must refuse the option");
 
     assert!(err.contains(problem), "got: {err}");
-    assert_eq!(
-        fs::read_dir(base.path()).unwrap().count(),
-        0,
-        "maki made a folder"
-    );
+    assert!(!relative_target.exists(), "maki made a folder");
+    assert_eq!(fs::read_dir(base.path()).unwrap().count(), 0);
 }
 
 fn old_folder(root: &Path, name: &str, files: &[&str]) -> PathBuf {
@@ -2441,10 +2415,7 @@ fn agent_config_the_worker_writes_stays_out_of_the_changes(negated: bool) {
     coding.import(&reg, json!({ "id": id })).unwrap();
 
     let project = coding.project();
-    assert_eq!(
-        fs::read_to_string(project.join(IMPORTED_LIB)).unwrap(),
-        WORKER_LIB
-    );
+    assert_eq!(coding.read(IMPORTED_LIB), WORKER_LIB);
     assert!(!project.join(".claude/settings.local.json").exists());
     assert!(!project.join("src/.claude").exists());
     assert!(!project.join("tools/.claude").exists());
@@ -2470,10 +2441,7 @@ fn tracked_dependency_edits_and_deletions_remain_importable(negated: bool) {
     coding
         .import(&reg, json!({ "id": artifact_id(&reply) }))
         .unwrap();
-    assert_eq!(
-        fs::read_to_string(project.join(IMPORTED_LIB)).unwrap(),
-        WORKER_LIB
-    );
+    assert_eq!(coding.read(IMPORTED_LIB), WORKER_LIB);
     assert!(!project.join(DELETED_FILE).exists());
     assert!(!project.join(ADDED_FILE).exists());
 }
@@ -2528,27 +2496,21 @@ fn negated_ignore_rules_cannot_collect_dependencies(prepared: bool) {
     let project = coding.project();
     write(&project.join(".gitignore"), NEGATED_EXCLUSIONS);
     git(&project, &["add", "--", ".gitignore"]);
-    let mut options = vec![("dependencies", json!(NODE_MODULES))];
+    let mut options = vec![("dependencies", json!(DEPENDENCY_DIR))];
     if prepared {
         options.push(("prepare", json!(CREATE_DEPENDENCY)));
     } else {
-        write(&project.join(DEPENDENCY), DEPENDENCY_CONTENT);
+        write(&project.join(DEPENDENCY_FILE), DEPENDENCY_CONTENT);
     }
     let (reg, _host) = coding.host(&options);
     let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
     let id = artifact_id(&reply);
     coding.import(&reg, json!({ "id": id })).unwrap();
-    assert_eq!(
-        fs::read_to_string(project.join(IMPORTED_LIB)).unwrap(),
-        WORKER_LIB
-    );
+    assert_eq!(coding.read(IMPORTED_LIB), WORKER_LIB);
     if prepared {
-        assert!(!project.join(NODE_MODULES).exists());
+        assert!(!project.join(DEPENDENCY_DIR).exists());
     } else {
-        assert_eq!(
-            fs::read_to_string(project.join(DEPENDENCY)).unwrap(),
-            DEPENDENCY_CONTENT
-        );
+        assert_eq!(coding.read(DEPENDENCY_FILE), DEPENDENCY_CONTENT);
     }
 }
 
@@ -2592,14 +2554,8 @@ fn changes_the_import_cannot_apply_are_left_to_the_user() {
         .unwrap();
     assert!(imported.contains(RETYPED_SKIPPED), "got: {imported}");
     let project = coding.project();
-    assert_eq!(
-        fs::read_to_string(project.join(IMPORTED_LIB)).unwrap(),
-        DIRTY_LIB
-    );
-    assert_eq!(
-        fs::read_to_string(project.join(ADDED_FILE)).unwrap(),
-        WORKER_NEW
-    );
+    assert_eq!(coding.read(IMPORTED_LIB), DIRTY_LIB);
+    assert_eq!(coding.read(ADDED_FILE), WORKER_NEW);
     assert!(project.join(ESCAPE_NAME).exists());
 }
 
@@ -2611,16 +2567,16 @@ fn a_hostile_file_name_lands_through_the_whole_import() {
     coding.import(&reg, json!({ "id": id })).unwrap();
 
     let project = coding.project();
-    assert_eq!(
-        fs::read_to_string(project.join(HOSTILE_NAME)).unwrap(),
-        HOSTILE_CONTENT
-    );
-    assert!(
-        contents(&project)
-            .keys()
-            .all(|path| path.file_name().is_none_or(|name| name != PWNED)),
-        "a name ran a command"
-    );
+    assert_eq!(coding.read(HOSTILE_NAME), HOSTILE_CONTENT);
+    for root in [&project, &coding.artifact(&id)] {
+        assert!(
+            contents(root)
+                .keys()
+                .all(|path| path.file_name().is_none_or(|name| name != PWNED)),
+            "a name ran a command in {}",
+            root.display()
+        );
+    }
 }
 
 #[test]

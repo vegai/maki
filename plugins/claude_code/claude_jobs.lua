@@ -16,7 +16,7 @@ function M.with_stderr(head, stderr_tail)
 end
 
 --- {released} runs once the call has replied and all its processes exited.
-function M.new(startup_ms, released)
+function M.new(released)
   return setmetatable({
     alive = 0,
     -- Jobs a cancel stops. The rest must outlive the cancel, because they
@@ -26,7 +26,6 @@ function M.new(startup_ms, released)
     idle = {},
     answered = false,
     left_behind = {},
-    startup_ms = startup_ms,
     release_hooks = released and { released } or {},
   }, Call)
 end
@@ -98,8 +97,8 @@ function Call:start(argv, job_opts, on_exit)
   job_opts.scope = "plugin"
   job_opts.guard = true
   job_opts.on_exit = function(id, code, _, timed_out, stderr_tail)
-    self.alive = self.alive - 1
     local ok, err = pcall(on_exit, id, code, timed_out, stderr_tail or {})
+    self.alive = self.alive - 1
     self:settle()
     if not ok then
       error(err, 0)
@@ -114,14 +113,12 @@ function Call:start(argv, job_opts, on_exit)
 end
 
 --- {how} has `on_exit(id, code, timed_out, stderr_tail)`, `timeout_ms`, and
---- `keep_on_cancel` for a job that a kill could interrupt. The startup limit
---- applies to such a job unless it has its own.
+--- `keep_on_cancel` for a job that must finish cleanup after cancellation.
 function Call:spawn(argv, job_opts, how)
   if self.stopped and not how.keep_on_cancel then
     return nil, M.CANCELLED
   end
-  local limit = how.timeout_ms or how.keep_on_cancel and self.startup_ms or nil
-  job_opts.timeout_ms = limit
+  job_opts.timeout_ms = how.timeout_ms
   local id, err = self:start(argv, job_opts, how.on_exit)
   if not id then
     return nil, err
@@ -157,26 +154,15 @@ function Call:leave(dir)
   end
 end
 
-function Call:remove_dir(dir)
-  local ok = maki.fs.rm(dir)
-  if not ok and maki.fs.metadata(dir) then
-    self:leave(dir)
-  end
-end
-
 --- Returns the exit code, stdout lines, and any input error.
 --- The code is nil after a timeout. Waits for `on_exit`, because a cancel can stop a coroutine that calls `jobwait`.
---- {how} has `started(id)` returning `(ok, err)`, `on_line(id, line)`, `keep_on_cancel`,
---- and `leftover()`, which names a directory to remove first.
+--- {how} has `started(id)` returning `(ok, err)`, `keep_on_cancel`, `timeout_ms`, and `on_stderr_tail`.
 function Call:run_to_end(argv, job_opts, how)
   local lines = {}
   local input_error
   if job_opts.stdout == nil then
-    job_opts.on_stdout = function(id, line)
+    job_opts.on_stdout = function(_, line)
       lines[#lines + 1] = line
-      if how.on_line then
-        how.on_line(id, line)
-      end
     end
   end
   local code = maki.async.await(1, function(done)
@@ -185,10 +171,6 @@ function Call:run_to_end(argv, job_opts, how)
         how.on_stderr_tail(stderr_tail or {})
       end
       local result = not timed_out and exit_code or nil
-      local leftover = how.leftover and how.leftover()
-      if leftover then
-        self:remove_dir(leftover)
-      end
       done(result, timed_out)
     end
     local id, err = self:spawn(argv, job_opts, {
@@ -218,7 +200,6 @@ end
 --- The `inherit_env` option merges `env` into maki's environment without provider keys.
 --- Otherwise `env` supplies the entire child environment.
 --- The `display` option replaces the joined argv in error messages.
---- `leftover` returns a directory to remove after exit, including cancellation.
 function Call:run_lines(argv, spec)
   local shown = "`" .. (spec.display or table.concat(argv, " ")) .. "`"
   local stderr_tail = {}
@@ -231,8 +212,7 @@ function Call:run_lines(argv, spec)
   }
   local how = {
     keep_on_cancel = spec.keep_on_cancel,
-    leftover = spec.leftover,
-    timeout_ms = spec.timeout_ms or self.startup_ms,
+    timeout_ms = assert(spec.timeout_ms, "a command needs an explicit timeout_ms"),
     on_stderr_tail = function(tail)
       stderr_tail = tail
     end,

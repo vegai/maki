@@ -68,7 +68,7 @@ local opts = maki.api.register_options(output_limits.extend({
   max_response_bytes = {
     default = 5 * 1024 * 1024,
     min = 1024,
-    desc = "Stop reading a response after this many bytes.",
+    desc = "Stop reading a response after this many bytes, at most 64 MiB.",
   },
 }))
 
@@ -142,8 +142,14 @@ maki.api.register_tool({
     if ct:find("^image/") and not ct:find("svg") then
       return { llm_output = "error: image content cannot be displayed as text", is_error = true }
     end
+    -- Text never has NUL, PDFs and zips almost always do. The model can act on this error,
+    -- not on a page of U+FFFD.
+    if resp.body:find("\0", 1, true) then
+      return { llm_output = "error: binary content (" .. ct .. ") cannot be displayed as text", is_error = true }
+    end
 
-    local body = resp.body
+    -- Decode before truncating, so the cut counts final bytes and not legacy ones that triple.
+    local body = maki.text.to_utf8(resp.body)
     local is_html = ct:find("text/html") ~= nil
 
     if fmt == "markdown" and is_html then

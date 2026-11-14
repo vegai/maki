@@ -4,20 +4,17 @@ use std::fs::{self, File, FileTimes, Permissions};
 use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use maki_storage::permissions::PERMISSION_BITS;
 
 use maki_storage::id::MakiId;
 use rustix::fd::{AsFd, BorrowedFd};
-use rustix::fs::{
-    AtFlags, Dir, FileType, Mode, ResolveFlags, Stat, open, openat, openat2, renameat, statat,
-    unlinkat,
-};
+use rustix::fs::{AtFlags, CWD, Dir, FileType, Stat, renameat, statat, unlinkat};
 use rustix::io::Errno;
 use rustix::path::Arg;
 
-use super::{DIRECTORY_FLAGS, create_private, open_regular};
+use super::fd::{create_private, directory, open_regular};
 use maki_providers::claude_code::worker::{GIT_ENTRY, GITDIR_PREFIX};
 
 const MAX_DEPTH: usize = 64;
@@ -110,7 +107,7 @@ fn resolve_links(root: &Path, path: &Path, remaining: &mut usize) -> io::Result<
 fn private_copy(parent: &impl AsFd, name: impl Arg + Copy) -> io::Result<()> {
     let mut source = open_regular(parent, name)?;
     let metadata = source.metadata()?;
-    if !metadata.is_file() || metadata.nlink() <= 1 {
+    if metadata.nlink() <= 1 {
         return Ok(());
     }
     let temporary = format!("{PRIVATE_COPY_PREFIX}{}", MakiId::generate());
@@ -130,15 +127,6 @@ fn private_copy(parent: &impl AsFd, name: impl Arg + Copy) -> io::Result<()> {
         let _ = unlinkat(parent, temporary.as_str(), AtFlags::empty());
     }
     result
-}
-
-fn directory(parent: &impl AsFd, name: impl Arg) -> io::Result<File> {
-    Ok(File::from(openat(
-        parent,
-        name,
-        DIRECTORY_FLAGS,
-        Mode::empty(),
-    )?))
 }
 
 fn entry_is(dir: &impl AsFd, name: impl Arg, kind: FileType) -> bool {
@@ -164,7 +152,7 @@ fn move_entry(
     let destination = tempfile::Builder::new()
         .prefix(QUARANTINE_PREFIX)
         .tempdir_in(quarantine)?;
-    let dir = File::from(open(destination.path(), DIRECTORY_FLAGS, Mode::empty())?);
+    let dir = directory(&CWD, destination.path())?;
     renameat(parent, name, &dir, QUARANTINE_ENTRY)?;
     let destination = destination.keep();
     let metadata = statat(&dir, QUARANTINE_ENTRY, AtFlags::SYMLINK_NOFOLLOW)?;
@@ -185,7 +173,7 @@ fn quarantine_entry(
         .map(|root| (root, depth))
         .collect();
     while let Some((path, depth)) = pending.pop() {
-        let root = File::from(open(&path, DIRECTORY_FLAGS, Mode::empty())?);
+        let root = directory(&CWD, &path)?;
         walk(root, depth, |parent, name, path, _metadata| {
             if name.to_bytes() == CONFIG.as_bytes() && repository(parent) {
                 if let Some(child) = move_entry(parent, name, quarantine)? {
@@ -201,11 +189,9 @@ fn quarantine_entry(
 
 fn restore_pointer(root: &File, quarantine: &Path, git: &Path) -> io::Result<()> {
     let expected = format!("{} {}\n", GITDIR_PREFIX, git.display());
-    let pointer = open_regular(root, GIT_ENTRY);
-    if let Ok(pointer) = pointer {
-        let mut pointer = pointer;
+    if let Ok(mut pointer) = open_regular(root, GIT_ENTRY) {
         let metadata = pointer.metadata()?;
-        if metadata.is_file() && metadata.len() == expected.len() as u64 {
+        if metadata.len() == expected.len() as u64 {
             let mut content = Vec::new();
             (&mut pointer)
                 .take(expected.len() as u64 + 1)
@@ -311,7 +297,7 @@ pub fn sanitize_snapshot(
     prune_links: bool,
 ) -> io::Result<SnapshotMetadata> {
     fs::create_dir_all(quarantine)?;
-    let root = File::from(open(snapshot, DIRECTORY_FLAGS, Mode::empty())?);
+    let root = directory(&CWD, snapshot)?;
     let resolved_root = snapshot.canonicalize()?;
     let pinned = root.metadata()?;
     let named = fs::metadata(&resolved_root)?;
@@ -378,22 +364,21 @@ pub fn sanitize_snapshot(
                 .is_ok_and(|target| target.starts_with(&resolved_root))
         })
         .collect();
+    let mut cached_parent = (PathBuf::new(), root.try_clone()?);
     for path in &relocated.dropped_links {
-        let parent = match path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            Some(parent) => File::from(openat2(
-                &root,
-                parent,
-                DIRECTORY_FLAGS,
-                Mode::empty(),
-                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
-            )?),
-            None => root.try_clone()?,
-        };
+        let parent = path.parent().ok_or(Errno::INVAL)?;
+        if cached_parent.0 != parent {
+            let mut dir = root.try_clone()?;
+            for component in parent.components() {
+                let Component::Normal(name) = component else {
+                    return Err(Errno::INVAL.into());
+                };
+                dir = directory(&dir, name)?;
+            }
+            cached_parent = (parent.to_owned(), dir);
+        }
         let name = path.file_name().ok_or(Errno::INVAL)?;
-        unlinkat(&parent, name, AtFlags::empty())?;
+        unlinkat(&cached_parent.1, name, AtFlags::empty())?;
     }
     Ok(relocated)
 }
@@ -448,8 +433,6 @@ mod tests {
         symlink(".", snapshot.join("dot")).unwrap();
         symlink("../outside", snapshot.join("escape")).unwrap();
         symlink(snapshot.join("inside"), outside.join("back")).unwrap();
-        symlink("loop", snapshot.join("loop")).unwrap();
-        symlink("growing/again", snapshot.join("growing")).unwrap();
         for i in 0..LINK_CHAIN_LENGTH {
             let next = if i + 1 == LINK_CHAIN_LENGTH {
                 "inside/file".to_owned()

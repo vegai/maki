@@ -65,7 +65,7 @@ fn pattern_matches(patterns: Option<&[String]>, fired: Option<&str>) -> bool {
 /// One dispatch path for host-fired and plugin-fired events. Never throws.
 /// Each callback runs in its own coroutine under its own detached task
 /// scope, so it may suspend (the `maki.fs.*` helpers park on
-/// `smol::unblock`); an inline resume would die with "attempt to yield
+/// `spawn_blocking`); an inline resume would die with "attempt to yield
 /// across metamethod / C-call boundary". The per-callback scope also means
 /// task-owned jobs a handler starts die with that handler instead of
 /// outliving it to the end of the batch.
@@ -138,12 +138,7 @@ pub(crate) async fn dispatch(lua: Lua, event: String, pattern: Option<String>, d
                 return;
             }
         };
-        if let Err(e) = run_detached(&lua, async {
-            let thread = lua.create_thread(callback)?;
-            thread.into_async::<()>(ev)?.await
-        })
-        .await
-        {
+        if let Err(e) = run_detached(&lua, callback.call_async::<()>(ev)).await {
             tracing::warn!(
                 event,
                 plugin = &*plugin,
@@ -232,15 +227,16 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// `del_autocmd` later to remove the listener.
 ///
 /// Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
-/// `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
-/// `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
+/// `"TurnError"`, `"TurnComplete"`, `"ToolStart"`, `"ToolDone"`,
+/// `"AutoCompacting"`, `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 /// `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"SessionTitleChanged"`,
 /// `"SessionCwdChanged"`, `"TaskStatusChanged"`, `"TaskStopped"`, `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`,
-/// and `"FileIndexReady"`. Plugins can also fire their own events with
-/// `exec_autocmds`.
+/// `"ModeChanged"` and `"FileIndexReady"`. Plugins can also fire their own
+/// events with `exec_autocmds`.
 ///
 /// Every host event carries `data.session_id` except `"FileIndexReady"`,
-/// which is about a directory rather than a session. For `"SessionReset"` and
+/// which is about a directory rather than a session, and `"ModeChanged"`,
+/// since the mode is the same in every session. For `"SessionReset"` and
 /// `"SessionEnd"` that is the session being left behind, the other events
 /// name the session now running or focused. What each event adds:
 ///
@@ -258,6 +254,11 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 ///   turn took). `list_cost` is the un-subsidised list price and `cost` is
 ///   the real bill, so a budget plugin charges against whichever one it
 ///   wants.
+/// - `"TurnComplete"`: `data.context_size` and `data.context_window` after
+///   each model response, before its tool calls run. Use it to act mid-turn,
+///   before `"AutoCompacting"`. `data.context_size` is absent when unknown.
+///   A subagent's response carries its own sizes plus `data.id`, its task id.
+///   To watch only the main context, skip events that have an `id`.
 /// - `"AutoCompacting"`: `data.context_size` and `data.context_window` at
 ///   trigger time.
 /// - `"CompactionDone"`: `data.context_size_before`,
@@ -269,13 +270,14 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// - `"SessionFocusChanged"`: `data.previous_session_id`, absent on the
 ///   first focus at startup.
 /// - `"SessionStatusChanged"`: `data.status` (`"working"`, `"needs_input"`,
-///   or `"idle"`), `data.title`, and `data.focused` (boolean).
+///   or `"idle"`), `data.title`, and `data.focused` (boolean). A session
+///   stays `"working"` while a background task it waits on still runs.
 /// - `"SessionTitleChanged"`: `data.title` and `data.focused` (boolean),
 ///   when the title changes (rename or auto-generation).
 /// - `"SessionCwdChanged"`: `data.cwd`, the session's new working
 ///   directory, when `/cd` changes it.
 /// - `"TaskStatusChanged"`: `data.id`, `data.name`, and `data.status`
-///   (`"queued"`, `"working"`, `"idle"`, `"done"`, or `"error"`), when a subagent starts
+///   (`"queued"`, `"working"`, `"idle"`, `"done"`, `"error"`, or `"cancelled"`), when a subagent starts
 ///   or changes status. A task a plugin opened with `maki.agent.session`
 ///   carries `data.plugin`, and `"idle"` is such a task between prompts. A
 ///   task that comes back from disk already finished stays quiet, so
@@ -293,15 +295,23 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// - `"ModelChanged"`: `data.model` in the shape `maki.model.get` returns,
 ///   plus `data.previous_spec`. Picking the model already in use stays
 ///   quiet, and so does startup.
-/// - `"InputChanged"`: `data.text`, `data.cursor` and `data.version`, the
-///   chat input as `maki.ui.input` reports it. `data.source` is the plugin
-///   name when that plugin's `maki.ui.input_edit` was the only writer this
-///   frame, and nil otherwise (including when the user moved the caret), so
-///   ignoring your own name never drops a change. `data.cursor_only` is true
-///   when only the caret moved. Handlers that only care about the text
-///   should return early on it. Fires at most once per frame, and only when
-///   the text or caret changed. Focusing another session republishes that
-///   session's input.
+/// - `"InputChanged"`: `data.text`, `data.cursor`, `data.anchor`,
+///   `data.version` and `data.session_id`, as
+///   [`maki.ui.input`](#maki-ui-input) reports them. `data.cursor_only` is
+///   true when only the cursor or the selection moved. `data.source` names
+///   the plugin whose `maki.ui.input_edit` made the only change since the
+///   last `"InputChanged"`, and is nil otherwise, so a handler can skip its
+///   own edits. A package goes by its
+///   [package name](/docs/packages/#install-from-git), and `init.lua` code
+///   by `"global/init.lua"` or `"project/init.lua"`. Fires at most once per
+///   screen redraw, and again for the input of a tab that takes focus.
+///   [Marks](#input-marks) alone do not fire it, so a handler can call
+///   `maki.ui.input_decorate` without looping.
+/// - `"ModeChanged"`: `data.old_mode` and `data.new_mode`, each `"n"` or
+///   `"i"`. Fires whenever `maki.fn.mode()` changes: on `maki.ui.set_mode`,
+///   and when the chat input gains or loses the keyboard, as when a picker
+///   opens. Use it to draw a mode indicator. Like `"InputChanged"`, it fires
+///   only with a UI.
 /// - `"FileIndexReady"`: `data.root`, the absolute directory that was
 ///   walked, `data.files`, how many paths the walk left, and `data.crashed`
 ///   and `data.truncated`, the two ways that list is not the whole tree.
@@ -320,9 +330,9 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// `data.text`. Maki warns once per plugin and event, naming what was left
 /// out. Events a plugin fires under its own names arrive as fired.
 ///
-/// `"TurnEnd"` fires once per turn and only for the main session, so
-/// subagent turns never show up. A manual `/compact` ends its run without
-/// ending a turn, so it stays quiet too.
+/// A subagent's run fires only `"TurnComplete"`, never tool or other turn
+/// events. `"TurnEnd"` fires once per turn of the main session. A manual `/compact` fires no `"TurnEnd"`, only the
+/// `"TurnComplete"` of its summary request.
 ///
 /// Drivers are not all caught up. `"TurnStart"` and `"PlanReady"` come from
 /// `maki-ui` only. `maki-acp` runs the agent on its own loop and does not

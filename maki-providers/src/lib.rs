@@ -1,5 +1,7 @@
 mod child_env;
 pub(crate) mod error;
+pub mod headers;
+pub mod http;
 pub(crate) mod image;
 pub(crate) mod manifest;
 pub mod model;
@@ -11,9 +13,8 @@ pub mod provider;
 pub(crate) mod providers;
 pub mod retry;
 pub mod spec;
-/// One recorded server for two audiences: other crates get it behind the
-/// feature, this crate's own tests get it without.
-#[cfg(any(test, feature = "test-support"))]
+/// Tests only, here and in other crates. Always built because a cargo feature
+/// gating it would pass in the workspace build and fail a lone crate.
 pub mod test_support;
 pub mod tokens;
 pub(crate) mod types;
@@ -32,6 +33,7 @@ pub use providers::catalog::{
     catalog_providers_if_available, refresh_catalog, warm_catalog,
 };
 pub use providers::claude_code;
+pub use providers::client_builder;
 pub use providers::copilot::auth as copilot_auth;
 pub use providers::custom;
 pub use providers::openai::auth as openai_auth;
@@ -45,7 +47,7 @@ pub use types::{
     EffortDialect, FACTS_WITHOUT_CONTEXT_UPDATE, IMAGE_EVICTED_NOTE, IMAGE_OMITTED_NOTE,
     IMAGE_PLACEHOLDER, IMAGE_UNUSABLE_NOTE, ImageMediaType, ImageSource, InputTransformation,
     Message, MessageKind, ModelUsageRow, ProviderEvent, ProviderUsage, RequestOptions, Role,
-    StopReason, StreamResponse, THINKING_USAGE, ThinkingConfig, ThinkingFallback,
-    UNKNOWN_IMAGE_MEDIA_TYPE, UNTYPED_BLOCK, UsageLimit, adapt_images_for_model, dialect,
-    is_deferred_tool,
+    StopReason, StreamResponse, THINKING_USAGE, TaskAnswer, TaskEnd, TaskSettled, ThinkingConfig,
+    ThinkingFallback, UNKNOWN_IMAGE_MEDIA_TYPE, UNTYPED_BLOCK, UsageLimit, adapt_images_for_model,
+    dialect, is_deferred_tool, non_empty_tool_result,
 };

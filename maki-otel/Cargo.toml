@@ -2,19 +2,20 @@
 name = "maki-otel"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 maki-config = { workspace = true }
-isahc = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-proto = { workspace = true }
+http = { workspace = true }
+percent-encoding = { workspace = true }
+tokio = { workspace = true }
 serde_json = { workspace = true }
-smol = { workspace = true }
-flume = { workspace = true }
-futures-lite = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-flate2 = { workspace = true }
-jiff = { workspace = true }
-fastrand = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }

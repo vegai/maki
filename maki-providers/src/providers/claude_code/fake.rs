@@ -2,6 +2,7 @@
 
 use std::env;
 use std::fs;
+use std::iter;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Mutex;
@@ -12,6 +13,7 @@ use super::checks::launch_env;
 use rustix::process::{Pid, Signal, kill_process, test_kill_process_group};
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
+use tokio::sync::mpsc::unbounded_channel;
 
 use super::WAIT;
 use super::error::Error;
@@ -134,7 +136,7 @@ impl Fake {
         limits: Limits,
     ) -> (Result<StreamResponse, Error>, Vec<ProviderEvent>) {
         let tools = tools();
-        let (events, received) = flume::unbounded();
+        let (events, mut received) = unbounded_channel();
         let project = self.project();
         let result = request(Request {
             launch: Launch {
@@ -157,7 +159,7 @@ impl Fake {
             thinking,
         })
         .await;
-        (result, received.try_iter().collect())
+        (result, iter::from_fn(|| received.try_recv().ok()).collect())
     }
 
     /// Where the fake's requests make their private directories, apart

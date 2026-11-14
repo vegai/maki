@@ -2,16 +2,16 @@ use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
 use std::str::from_utf8;
 
-use rustix::fs::{CWD, Mode, open};
+use rustix::fs::CWD;
 
-use super::{DIRECTORY_FLAGS, create_private, open_regular};
+use super::fd::{create_private, directory, open_regular};
 
 const OBJECT_ID_LENGTHS: &[usize] = &[40, 64];
 const MAX_HEADER_BYTES: u64 = 128;
 const INVALID_BATCH: &str = "invalid git blob batch";
 
 pub fn unpack(batch: &Path, stage: &Path, hashes: &[String]) -> io::Result<()> {
-    let stage = open(stage, DIRECTORY_FLAGS, Mode::empty())?;
+    let stage = directory(&CWD, stage)?;
     let input = open_regular(&CWD, batch)?;
     let mut input = BufReader::new(input);
     for hash in hashes {

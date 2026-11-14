@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use maki_storage::paths::normalize_path;
 use rustix::fs::{Mode, OFlags, open};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::OAUTH_TOKEN_ENV;
 use super::error::{Error, Problem};
@@ -448,7 +448,7 @@ pub(crate) fn file_conflicts(paths: &[PathBuf]) -> Vec<String> {
 }
 
 /// Requires a claude.ai subscription without an API key and an allowed permission mode.
-pub(super) fn account_problem(init: &Value, modes: &[String]) -> Option<Problem> {
+pub(super) fn account_problem(init: &Value, modes: &[&str]) -> Option<Problem> {
     let Some(account) = init.get(ACCOUNT).filter(|a| a.is_object()) else {
         return Some(Problem::NoLogin);
     };
@@ -467,7 +467,7 @@ pub(super) fn account_problem(init: &Value, modes: &[String]) -> Option<Problem>
     {
         return Some(Problem::NoSubscription);
     }
-    if !modes.iter().any(|mode| init[START_MODE] == mode.as_str()) {
+    if !modes.iter().any(|mode| init[START_MODE] == *mode) {
         return Some(Problem::StartMode(init[START_MODE].clone()));
     }
     None
@@ -576,12 +576,12 @@ pub(super) fn plugins_problem(plugins: &Value) -> Option<Problem> {
 }
 
 /// The API key, mode, tool catalog and handoff connection must all satisfy the route checks.
-pub(super) fn init_problem(
+pub(super) fn init_problem<'a>(
     event: &Value,
     version: &str,
     cwd: &Path,
-    expected_tools: &HashSet<String>,
-    modes: &[String],
+    mut expected_tools: impl Iterator<Item = &'a str> + Clone,
+    modes: &[&str],
     handoff: Option<&str>,
 ) -> Option<Problem> {
     if event[API_KEY_SOURCE] != NO_KEY_SOURCE {
@@ -590,7 +590,7 @@ pub(super) fn init_problem(
     if event[VERSION] != version {
         return Some(Problem::OtherVersion(event[VERSION].clone()));
     }
-    if !modes.iter().any(|mode| event[RUN_MODE] == mode.as_str()) {
+    if !modes.iter().any(|mode| event[RUN_MODE] == *mode) {
         return Some(Problem::RunMode(event[RUN_MODE].clone()));
     }
     let Some(tools) = event[TOOLS].as_array() else {
@@ -598,15 +598,14 @@ pub(super) fn init_problem(
     };
     if let Some(tool) = tools.iter().find(|tool| {
         tool.as_str()
-            .is_none_or(|name| !expected_tools.contains(name))
+            .is_none_or(|name| !expected_tools.clone().any(|expected| expected == name))
     }) {
         return Some(Problem::ExtraTool(tool.clone()));
     }
-    if let Some(missing) = expected_tools
-        .iter()
-        .find(|name| !tools.iter().any(|tool| tool == name.as_str()))
+    if let Some(missing) =
+        expected_tools.find(|name| !tools.iter().any(|tool| tool.as_str() == Some(*name)))
     {
-        return Some(Problem::MissingTool(missing.clone()));
+        return Some(Problem::MissingTool(missing.to_owned()));
     }
     let Some(servers) = event[MCP_SERVERS].as_array() else {
         return Some(Problem::HandoffServer(event[MCP_SERVERS].clone()));
@@ -628,6 +627,13 @@ pub(super) fn init_problem(
     None
 }
 
+pub fn handshake_input() -> String {
+    HANDSHAKE
+        .iter()
+        .map(|step| super::stream::control_request(step.id, &json!({ "subtype": step.subtype })))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -645,11 +651,10 @@ mod tests {
     use super::super::error::{Error, Problem};
     use super::NOT_A_FILE;
     use super::{
-        ACCOUNT_ANSWER, COMMONDIR_FILE, CONNECTED, DEFAULT_MODE, ESSENTIAL_TRAFFIC_ONLY,
-        FLAG_SOURCE, GIT_ENTRY, HANDSHAKE, HOOKS_ANSWER, InitExpect, MAX_GIT_PATH_BYTES,
-        MAX_SETTINGS_BYTES, NO_ATTACHMENTS, NO_KEY_SOURCE, NOT_AN_OBJECT, POLICY_SOURCE,
-        SETTINGS_ANSWER, SETTINGS_TOO_LARGE, UNREADABLE_FILE, account_problem, config_dir,
-        file_conflicts, init_problem, launch_env, local_settings_dirs, minimum_version,
+        COMMONDIR_FILE, CONNECTED, DEFAULT_MODE, ESSENTIAL_TRAFFIC_ONLY, FLAG_SOURCE, GIT_ENTRY,
+        InitExpect, MAX_GIT_PATH_BYTES, MAX_SETTINGS_BYTES, NO_ATTACHMENTS, NO_KEY_SOURCE,
+        NOT_AN_OBJECT, POLICY_SOURCE, SETTINGS_TOO_LARGE, UNREADABLE_FILE, account_problem,
+        config_dir, file_conflicts, init_problem, launch_env, local_settings_dirs, minimum_version,
         plugins_problem, policy_problem, profile, settings_conflicts,
     };
 
@@ -844,7 +849,7 @@ mod tests {
     #[test_case(json!({"current_permission_mode":"default","account":{"apiProvider":"bedrock","subscriptionType":"Claude Pro"}}) => matches Some(Problem::OtherProvider(_)) ; "cloud_provider")]
     #[test_case(json!({"current_permission_mode":"bypassPermissions","account":{"apiProvider":"firstParty","subscriptionType":"Claude Pro"}}) => matches Some(Problem::StartMode(_)) ; "bypass_permission_mode")]
     fn accounts_use_a_subscription_route(value: Value) -> Option<Problem> {
-        account_problem(&value, &[DEFAULT_MODE.to_owned()])
+        account_problem(&value, &[DEFAULT_MODE])
     }
 
     #[test_case(json!([]) => matches None ; "empty_plugin_list")]
@@ -1076,8 +1081,8 @@ mod tests {
             &event,
             expect.version,
             expect.cwd,
-            expect.tools,
-            &[DEFAULT_MODE.to_owned()],
+            expect.tools.iter().map(String::as_str),
+            &[DEFAULT_MODE],
             Some(SERVER),
         )
     }
@@ -1086,13 +1091,13 @@ mod tests {
     #[test_case(json!({ "foreign": { "status": CONNECTED } }) ; "server_object")]
     fn a_worker_without_handoff_refuses_foreign_mcp_servers(servers: Value) {
         let event = init(|event| event["mcp_servers"] = servers);
-        let tools = [TOOL.to_owned(), OTHER_TOOL.to_owned()].into();
+        let tools = [TOOL, OTHER_TOOL];
         let problem = init_problem(
             &event,
             VERSION,
             Path::new(CWD),
-            &tools,
-            &[DEFAULT_MODE.to_owned()],
+            tools.into_iter(),
+            &[DEFAULT_MODE],
             None,
         );
         assert!(matches!(problem, Some(Problem::HandoffServer(_))));
@@ -1111,22 +1116,14 @@ mod tests {
             event["tools"] = tools;
             event["mcp_servers"] = json!([]);
         });
-        let expected = ["Read", "Edit", "Write", "Bash"].map(str::to_owned).into();
+        let expected = ["Read", "Edit", "Write", "Bash"];
         init_problem(
             &event,
             VERSION,
             Path::new(CWD),
-            &expected,
-            &[EDITS_MODE.to_owned()],
+            expected.into_iter(),
+            &[EDITS_MODE],
             None,
         )
-    }
-
-    /// The decoder keys the answers on these ids, in the order the requests go
-    /// out.
-    #[test]
-    fn handshake_requests_match_the_decoder_roles() {
-        let ids: Vec<&str> = HANDSHAKE.iter().map(|step| step.id).collect();
-        assert_eq!(ids, [ACCOUNT_ANSWER, SETTINGS_ANSWER, HOOKS_ANSWER]);
     }
 }

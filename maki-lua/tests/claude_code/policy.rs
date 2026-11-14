@@ -7,13 +7,12 @@
 use std::env;
 use std::fs;
 use std::future::Future;
+use std::iter;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use flume::Receiver;
-use maki_agent::cancel::CancelToken;
 use maki_agent::tools::test_support::stub_ctx_in;
 use maki_agent::tools::{ToolContext, ToolRegistry};
 use maki_agent::{AgentEvent, Envelope, EventSender, ToolOutput, ToolOutputLines};
@@ -22,17 +21,18 @@ use maki_providers::claude_code::{Error as WorkerError, STARTUP_TIMEOUT_SECS};
 use serde_json::{Map, Value, json};
 use tempfile::{TempDir, tempdir};
 use test_case::test_case;
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use super::support::{
     ACCOUNT_SUBSCRIPTION, DEADLINE, FIXTURE_GLOBAL_RULE, HOOKS_OFF, LEFT_BEHIND, MINIMUM_VERSION,
-    PROJECT_RULE, TOOL, WorkingDir, executable, group_gone, load, output, running, tool_reply,
-    try_load, use_fixture_user, wait_for_release, wait_until,
+    PROJECT_RULE, TOOL, WorkingDir, cancel_after, cancel_trigger, executable, group_gone, load,
+    output, running, tool_reply, try_load, use_fixture_user, wait_for_release, wait_until,
 };
 
 mod coding;
 
 const TRUNCATED: &str = "truncated";
-const ANSWER: &str = "The parser lives in src/parse.rs:10.";
+pub(super) const ANSWER: &str = "The parser lives in src/parse.rs:10.";
 const OLDER_VERSION: &str = "2.1.283";
 const NEWER_VERSION: &str = "2.1.290";
 
@@ -51,7 +51,7 @@ const READ_TOOLS: &str = "Read,Glob,Grep";
 const INSTRUCTION_FILE: &str = "AGENTS.md";
 
 /// The leading `-` also proves the prompt does not go through argv.
-const ANSWERS: &str = "--answers";
+pub(super) const ANSWERS: &str = "--answers";
 /// More lines than a collapsed view shows, so only the expanded view shows
 /// the last one.
 const LONG_ANSWER: &str = "one\n\ntwo\n\nthree\n\nfour\n\nfive\n\nsix\n\nthe very last line";
@@ -97,9 +97,11 @@ const STRAY_THEN_API_KEY: &str = "stray_then_api_key";
 const WRAPPER: &str = "#!/bin/sh\nexec \"@TARGET@\" \"$@\"\n";
 /// Files that make the fake hang at one stage until it is killed.
 const STALL: &str = "stall";
-/// Holds how many seconds to hang, or 30 when empty.
+/// Holds how many seconds to hang.
 const STALL_VERSION: &str = "stall_version";
 const HANG_AFTER_HOOK: &str = "hang_after_hook";
+const PROBE_ERROR: &str = "probe_error";
+const PROBE_ERROR_TEXT: &str = "socat not installed";
 /// Makes the run in the project skip the handshake and reply at once.
 const UNASKED: &str = "unasked";
 /// Makes the probe answer the handshake and then run as if it had a prompt.
@@ -137,6 +139,7 @@ const CANCEL_MARKER: &str = "[cancelled by user";
 const USAGE_PROGRESS: &str = "Read src/usage.rs";
 const TOOL_USE_ID: &str = "toolu_ask";
 const TEST_TIMEOUT_SECS: u64 = 10;
+const RUN_TIMEOUT_SECS: u64 = 20;
 const SPENT_BEFORE_CANCEL: &[&str] = &["7 in", "2.0k cache read", "300 cache write", "out unknown"];
 const WAITING: &str = "Wait for a free Claude Code slot";
 const FIRST_ID: &str = "toolu_first";
@@ -191,13 +194,14 @@ echo $$ >> "$dir/pids"
 if [ "$1" = --version ]; then
   echo version >> "$dir/calls"
   pwd -P >> "$dir/version_started_in"
-  if [ -e "$dir/@STALL_VERSION@" ]; then touch "$dir/version_stalled"; secs=$(cat "$dir/@STALL_VERSION@"); sleep "${secs:-30}"; fi
+  if [ -e "$dir/@STALL_VERSION@" ]; then touch "$dir/version_stalled"; secs=$(cat "$dir/@STALL_VERSION@"); sleep "$secs"; fi
   cat "$dir/version"; exit 0
 fi
 echo start >> "$dir/calls"
 echo $$ > "$dir/pid"
 pwd -P >> "$dir/started_in"
 if [ -e "$dir/@STALL@" ]; then touch "$dir/stalled"; sleep @HANG_SECS@; fi
+if [ -e "$dir/@PROBE_ERROR@" ]; then cat "$dir/@PROBE_ERROR@"; exit 1; fi
 if grep -q policySettings "$dir/hooks.json"; then
   pwd -P >> "$dir/hook_ran_in"; touch "@SENTINEL@"
   printf '%s\n' '{"type":"system","subtype":"hook_started","hook_event":"SessionStart"}'
@@ -367,7 +371,7 @@ esac
 /// contexts. The plugin works there rather than in the process directory,
 /// so the developer's Claude Code settings in the checkout cannot affect a
 /// test.
-struct Project {
+pub(super) struct Project {
     dir: TempDir,
 }
 
@@ -379,19 +383,19 @@ impl Project {
     }
 
     /// The path as the plugin sees it through `getcwd`.
-    fn path(&self) -> PathBuf {
+    pub(super) fn path(&self) -> PathBuf {
         self.dir.path().canonicalize().unwrap()
     }
 }
 
 /// Each test owns its fake CLI and project so recorded requests cannot overlap.
-struct FakeClaude {
+pub(super) struct FakeClaude {
     dir: TempDir,
-    project: Project,
+    pub(super) project: Project,
 }
 
 impl FakeClaude {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let dir = tempdir().unwrap();
         let script = SCRIPT
             .replace("@ANSWER@", ANSWER)
@@ -403,6 +407,7 @@ impl FakeClaude {
             .replace("@STALL@", STALL)
             .replace("@STALL_VERSION@", STALL_VERSION)
             .replace("@HANG_AFTER_HOOK@", HANG_AFTER_HOOK)
+            .replace("@PROBE_ERROR@", PROBE_ERROR)
             .replace("@UNASKED@", UNASKED)
             .replace("@PROBE_RUNS@", PROBE_RUNS)
             .replace("@REFUSE_SETTINGS@", REFUSE_SETTINGS)
@@ -445,7 +450,7 @@ impl FakeClaude {
         self.path("config").join("settings.json")
     }
 
-    fn log(&self, name: &str) -> String {
+    pub(super) fn log(&self, name: &str) -> String {
         fs::read_to_string(self.path(name)).unwrap_or_default()
     }
 
@@ -495,9 +500,13 @@ impl FakeClaude {
         (registry, host)
     }
 
-    fn ask(&self, prompt: &str) -> Result<String, String> {
+    pub(super) fn ask(&self, prompt: &str) -> Result<String, String> {
+        self.ask_in(prompt, &self.project.path())
+    }
+
+    pub(super) fn ask_in(&self, prompt: &str, cwd: &Path) -> Result<String, String> {
         let (reg, _host) = self.host(ONE_SLOT);
-        output(call(&reg, &self.ctx(None, None), prompt))
+        output(call(&reg, &ctx_in(cwd, None, None), prompt))
     }
 
     fn ctx(&self, events: Option<&EventSender>, tool_use_id: Option<&str>) -> ToolContext {
@@ -560,13 +569,15 @@ fn assert_mentions(text: &str, parts: &[&str]) {
 
 /// Waits until a live view on `rx` shows `line`, and on timeout returns the
 /// views it saw.
-fn wait_for_view_line(rx: &Receiver<Envelope>, line: &str) -> Result<(), Vec<String>> {
+fn wait_for_view_line(rx: &mut UnboundedReceiver<Envelope>, line: &str) -> Result<(), Vec<String>> {
     let mut bodies = Vec::new();
     let seen = wait_until(DEADLINE, || {
-        bodies.extend(rx.drain().filter_map(|env| match env.event {
-            AgentEvent::LiveToolBuf { id, body } => Some((id, body)),
-            _ => None,
-        }));
+        bodies.extend(
+            iter::from_fn(|| rx.try_recv().ok()).filter_map(|env| match env.event {
+                AgentEvent::LiveToolBuf { id, body } => Some((id, body)),
+                _ => None,
+            }),
+        );
         bodies
             .iter()
             .any(|(_, body)| body.take().text().contains(line))
@@ -679,7 +690,7 @@ fn stall_every_start(fake: &FakeClaude) {
 }
 
 fn stall_the_version_check(fake: &FakeClaude) {
-    fake.write(STALL_VERSION, "");
+    fake.write(STALL_VERSION, &HANG_SECS.to_string());
 }
 
 /// Only the hook's event can stop this probe before its time limit, because
@@ -849,10 +860,11 @@ fn a_run_past_its_timeout_is_killed_and_frees_its_slot() {
     let fake = FakeClaude::new();
     let (reg, _host) = fake.host_with_deadlines(STARTUP_TIMEOUT_SECS);
     let ctx = fake.ctx(None, None);
+    assert_eq!(output(call(&reg, &ctx, ANSWERS)).unwrap(), ANSWER);
     let input =
-        json!({ "prompt": USAGE_THEN_HANG, "model": MODEL_ALIAS, "timeout": TEST_TIMEOUT_SECS });
+        json!({ "prompt": USAGE_THEN_HANG, "model": MODEL_ALIAS, "timeout": RUN_TIMEOUT_SECS });
     let err = output(tool_reply(&reg, &ctx, TOOL, input)).unwrap_err();
-    assert_mentions(&err, &[&format!("timed out after {TEST_TIMEOUT_SECS}s")]);
+    assert_mentions(&err, &[&format!("timed out after {RUN_TIMEOUT_SECS}s")]);
     assert_mentions(&err, SPENT_BEFORE_CANCEL);
     assert!(
         group_gone(fake.pid(), DEADLINE),
@@ -870,12 +882,11 @@ fn a_run_past_its_timeout_is_killed_and_frees_its_slot() {
 fn the_view_claims_a_clean_route_only_after_init_passes(scenario: &str, claimed: bool) {
     let fake = FakeClaude::new();
     let (reg, _host) = fake.host(ONE_SLOT);
-    let (tx, rx) = flume::unbounded::<Envelope>();
+    let (tx, mut rx) = unbounded_channel::<Envelope>();
     let events = EventSender::new(tx, 0);
     let ctx = fake.ctx(Some(&events), Some(TOOL_USE_ID));
     let _ = output(call(&reg, &ctx, scenario));
-    let view = rx
-        .drain()
+    let view = iter::from_fn(|| rx.try_recv().ok())
         .filter_map(|env| match env.event {
             AgentEvent::LiveToolBuf { body, .. } => Some(body.take().text()),
             _ => None,
@@ -934,6 +945,10 @@ fn cached_versions_do_not_skip_current_policy_checks() {
             .count(),
         5
     );
+    fake.write(HOOKS_FILE, HOOKS_OFF);
+    log_out(&fake);
+    let error = ask().unwrap_err();
+    assert!(error.contains(LOGIN_HINT), "{error}");
     assert_eq!(
         fake.log("calls")
             .lines()
@@ -941,6 +956,40 @@ fn cached_versions_do_not_skip_current_policy_checks() {
             .count(),
         1
     );
+    fake.write("account.json", ACCOUNT_SUBSCRIPTION);
+    assert_eq!(ask().unwrap(), ANSWER);
+    assert_eq!(
+        fake.log("calls")
+            .lines()
+            .filter(|line| *line == "version")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn failed_probe_results_preserve_the_cause() {
+    let fake = FakeClaude::new();
+    fake.write(
+        PROBE_ERROR,
+        &json!({
+            "type": "result", "subtype": "error_during_execution", "errors": [PROBE_ERROR_TEXT]
+        })
+        .to_string(),
+    );
+    let error = fake.ask(ANSWERS).unwrap_err();
+    assert!(error.contains(PROBE_ERROR_TEXT), "{error}");
+}
+
+#[test]
+fn a_worker_probe_honors_the_configured_startup_deadline() {
+    let fake = FakeClaude::new();
+    stall_every_start(&fake);
+    let (registry, _host) = fake.host_with_deadlines(TEST_TIMEOUT_SECS);
+    let error = output(call(&registry, &fake.ctx(None, None), ANSWERS)).unwrap_err();
+    let expected = WorkerError::ProbeLate(TEST_TIMEOUT_SECS).to_string();
+    assert!(error.contains(&expected), "{error}");
+    assert!(group_gone(fake.pid(), DEADLINE));
 }
 
 /// A conflict at init stops the run, but the usage the run printed right
@@ -966,8 +1015,7 @@ fn the_startup_limit_holds_with_every_slot_taken() {
     let holders: Vec<_> = (1..MAX_INFLIGHT_TOOLS)
         .map(|holder| {
             let mut ctx = fake.ctx(None, None);
-            let (trigger, token) = CancelToken::new();
-            ctx.cancel = token;
+            let trigger = cancel_trigger(&mut ctx);
             let marker = markers.path().join(holder.to_string());
             let inv = reg
                 .get(SLOT_HOLDER_TOOL)
@@ -976,7 +1024,7 @@ fn the_startup_limit_holds_with_every_slot_taken() {
                 .parse(&json!({ "marker": marker }))
                 .expect("input parses");
             let held = thread::spawn(move || {
-                let _ = smol::block_on(inv.execute(&ctx));
+                let _ = maki_lua::test_support::runtime().block_on(inv.execute(&ctx));
             });
             (trigger, held)
         })
@@ -1031,15 +1079,12 @@ fn a_cancelled_run_keeps_what_it_spent() {
     let (scenario, progress, spent) = (USAGE_THEN_HANG, USAGE_PROGRESS, SPENT_BEFORE_CANCEL);
     let fake = FakeClaude::new();
     let (reg, _host) = fake.host(ONE_SLOT);
-    let (tx, rx) = flume::unbounded::<Envelope>();
+    let (tx, mut rx) = unbounded_channel::<Envelope>();
     let mut ctx = fake.ctx(Some(&EventSender::new(tx, 0)), Some(TOOL_USE_ID));
-    let (trigger, token) = CancelToken::new();
-    ctx.cancel = token;
-    let canceller = thread::spawn(move || {
-        if let Err(views) = wait_for_view_line(&rx, progress) {
+    let canceller = cancel_after(&mut ctx, move || {
+        if let Err(views) = wait_for_view_line(&mut rx, progress) {
             panic!("the usage message did not go to the view, which showed {views:?}");
         }
-        trigger.cancel();
     });
 
     let err = output(call(&reg, &ctx, scenario)).unwrap_err();
@@ -1067,12 +1112,11 @@ fn a_cancelled_call_lets_go_only_once_its_processes_end(
     let fake = FakeClaude::new();
     let project = fake.project.path();
     setup(&fake);
-    let (reg, _host) = fake.host(ONE_SLOT);
-    let (tx, rx) = flume::unbounded::<Envelope>();
+    let (reg, _host) = fake.host_with_deadlines(HANG_SECS);
+    let (tx, mut rx) = unbounded_channel::<Envelope>();
     let events = EventSender::new(tx, 0);
     let mut cancelled = fake.ctx(Some(&events), Some(FIRST_ID));
-    let (trigger, token) = CancelToken::new();
-    cancelled.cancel = token;
+    let trigger = cancel_trigger(&mut cancelled);
     let next = fake.ctx(Some(&events), Some(SECOND_ID));
 
     let (first, second) = thread::scope(|scope| {
@@ -1082,14 +1126,20 @@ fn a_cancelled_call_lets_go_only_once_its_processes_end(
             "the call did not start its work"
         );
         let second = scope.spawn(|| output(call(&reg, &next, ANSWERS)));
-        if let Err(views) = wait_for_view_line(&rx, WAITING) {
+        if let Err(views) = wait_for_view_line(&mut rx, WAITING) {
             panic!("the next call did not show that it waits, and the views were {views:?}");
         }
         for stall in [STALL, STALL_VERSION] {
             let _ = fs::remove_file(fake.path(stall));
         }
         trigger.cancel();
-        (first.join().unwrap(), second.join().unwrap())
+        let cancelled_at = Instant::now();
+        let results = (first.join().unwrap(), second.join().unwrap());
+        assert!(
+            cancelled_at.elapsed() < DEADLINE,
+            "cancellation waited for the stalled process to time out"
+        );
+        results
     });
     // When the cancel lands decides the text: the runtime's cancel note, or
     // the error of a process the cancel stopped.
@@ -1116,19 +1166,19 @@ fn a_cancelled_call_lets_go_only_once_its_processes_end(
 #[test]
 fn a_handler_deadline_during_version_check_releases_its_slot_after_reaping() {
     const RELEASE: &str = "version_release";
-    const TIMED_OUT: &str = "runtime error: timeout";
+    const TIMED_OUT: &str = "tool claude_code timed out after 10s";
     let fake = FakeClaude::new();
     stall_the_version_check(&fake);
     let path = fake.path("claude");
     let script = fs::read_to_string(&path).unwrap();
     let held = script.replace(
-        "sleep \"${secs:-30}\"",
+        "sleep \"$secs\"",
         &wait_for_release("\"$dir/version_release\""),
     );
     assert_ne!(held, script);
     executable(fake.dir.path(), "claude", &held);
     let (reg, _host) = fake.host_with_deadlines(STARTUP_TIMEOUT_SECS);
-    let (tx, rx) = flume::unbounded::<Envelope>();
+    let (tx, mut rx) = unbounded_channel::<Envelope>();
     let events = EventSender::new(tx, 0);
     let first = fake.ctx(Some(&events), Some(FIRST_ID));
     let next = fake.ctx(Some(&events), Some(SECOND_ID));
@@ -1145,7 +1195,7 @@ fn a_handler_deadline_during_version_check_releases_its_slot_after_reaping() {
             .path("version_stalled")
             .exists()));
         let next = scope.spawn(|| output(call(&reg, &next, ANSWERS)));
-        wait_for_view_line(&rx, WAITING).unwrap();
+        wait_for_view_line(&mut rx, WAITING).unwrap();
         let first = first.join().unwrap();
         fs::remove_file(fake.path(STALL_VERSION)).unwrap();
         fake.write(RELEASE, "");
@@ -1195,11 +1245,10 @@ fn every_way_a_call_ends_gives_its_slot_back() {
 fn a_finished_answer_expands_in_place() {
     let fake = FakeClaude::new();
     let (reg, host) = fake.host(ONE_SLOT);
-    let (tx, events) = flume::unbounded::<Envelope>();
+    let (tx, mut events) = unbounded_channel::<Envelope>();
     let ctx = fake.ctx(Some(&EventSender::new(tx, 0)), Some(TOOL_USE_ID));
     assert_eq!(output(call(&reg, &ctx, LONG_ANSWERS)).unwrap(), LONG_ANSWER);
-    let view = events
-        .drain()
+    let view = iter::from_fn(|| events.try_recv().ok())
         .filter_map(|env| match env.event {
             AgentEvent::LiveToolBuf { body, .. } => Some(body),
             _ => None,
@@ -1212,7 +1261,7 @@ fn a_finished_answer_expands_in_place() {
         "the view is not closed: {shown}"
     );
 
-    let (fallback_tx, fallback_rx) = flume::unbounded::<Envelope>();
+    let (fallback_tx, mut fallback_rx) = unbounded_channel::<Envelope>();
     host.event_handle().request_click_with_fallback(
         TOOL_USE_ID.to_owned(),
         0,
@@ -1224,8 +1273,7 @@ fn a_finished_answer_expands_in_place() {
     let shown = view.take().text();
     assert!(shown.contains(LAST_ANSWER_LINE), "not expanded: {shown}");
     assert!(
-        !fallback_rx
-            .drain()
+        !iter::from_fn(|| fallback_rx.try_recv().ok())
             .any(|env| matches!(env.event, AgentEvent::ToolSnapshot { .. })),
         "the click made the view again from the saved text"
     );
@@ -1273,7 +1321,7 @@ fn a_restored_answer_rebuilds_its_header() {
     );
 
     let handle = host.event_handle();
-    let (tx, rx) = flume::unbounded::<Envelope>();
+    let (tx, mut rx) = unbounded_channel::<Envelope>();
     handle.request_restore(
         restored(ANSWERS, state, Vec::new()),
         EventSender::new(tx, 0),
@@ -1281,8 +1329,7 @@ fn a_restored_answer_rebuilds_its_header() {
     handle.wait_restore_complete_for_test();
     // An empty load drains the host's queue, so the snapshot has been sent.
     host.load_source("barrier", "").unwrap();
-    let body = rx
-        .drain()
+    let body = iter::from_fn(|| rx.try_recv().ok())
         .find_map(|env| match env.event {
             AgentEvent::ToolSnapshot { snapshot, .. } => Some(snapshot.text()),
             _ => None,

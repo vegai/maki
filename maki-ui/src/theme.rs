@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use arc_swap::{ArcSwap, Guard};
@@ -275,8 +275,6 @@ static THEME: LazyLock<ArcSwap<Theme>> =
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
-static CURSOR_FOCUSED: AtomicBool = AtomicBool::new(true);
-
 static CURRENT_NAME: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn current() -> Guard<Arc<Theme>> {
@@ -291,40 +289,13 @@ pub fn set(theme: Theme) {
     GENERATION.fetch_add(1, Ordering::Release);
 }
 
-/// Tracks terminal focus so the input caret can recolor itself when the user
-/// switches away. Terminals that never report focus keep the focused look.
-pub fn set_cursor_focused(focused: bool) {
-    CURSOR_FOCUSED.store(focused, Ordering::Relaxed);
-}
-
-/// The `[ui] cursor` style while focused, `[ui] cursor_unfocused` otherwise.
-pub fn cursor_style() -> Style {
-    let t = current();
-    if CURSOR_FOCUSED.load(Ordering::Relaxed) {
-        t.cursor
-    } else {
-        t.cursor_unfocused
-    }
-}
-
-/// True for a buffer cell that carries the `cursor_style()` paint, so tests
-/// assert against the theme instead of one theme's hardcoded colors.
-#[cfg(test)]
-pub(crate) fn is_caret_cell(cell: &ratatui::buffer::Cell) -> bool {
-    let cursor = cursor_style();
-    cursor.fg.is_none_or(|fg| cell.fg == fg)
-        && cursor.bg.is_none_or(|bg| cell.bg == bg)
-        && cell.modifier.contains(cursor.add_modifier)
-}
-
 pub fn generation() -> u64 {
     GENERATION.load(Ordering::Acquire)
 }
 
 pub fn load_by_name(name: &str) -> Result<Theme, String> {
-    if let Some(path) = user_themes_dirs()
-        .map(|dir| dir.join(format!("{name}.toml")))
-        .find(|path| path.is_file())
+    if let Some(path) = user_themes_dir().map(|dir| dir.join(format!("{name}.toml")))
+        && path.is_file()
         && let Ok(toml) = std::fs::read_to_string(&path)
     {
         return Theme::from_toml(&toml).map_err(|e| format!("{}: {e}", path.display()));
@@ -336,14 +307,15 @@ pub fn load_by_name(name: &str) -> Result<Theme, String> {
         .unwrap_or_else(|| Err(format!("unknown theme: {name}")))
 }
 
-fn user_themes_dirs() -> impl Iterator<Item = PathBuf> {
-    maki_storage::paths::config_search_dirs()
-        .into_iter()
+fn user_themes_dir() -> Option<PathBuf> {
+    maki_storage::paths::config_dir()
+        .ok()
         .map(|dir| dir.join(THEMES_DIR))
 }
 
 pub fn all_theme_names() -> Vec<String> {
-    let user_names = user_themes_dirs()
+    let user_names = user_themes_dir()
+        .into_iter()
         .filter_map(|dir| std::fs::read_dir(dir).ok())
         .flatten()
         .flatten()
@@ -414,6 +386,8 @@ named_styles!(t => {
     "tool_annotation" => t.tool_annotation,
     "spinner" => t.spinner,
     "thinking" => t.thinking,
+    "user_bg" => t.user_bg,
+    "user_text" => t.user_text,
     "error" => t.error,
     "bold" => t.bold,
     "italic" => t.italic,
@@ -441,10 +415,10 @@ named_styles!(t => {
     "item_match" | "match" => t.item_match,
     "item_match_selected" | "match_selected" => t.item_match_selected,
     "cursor" => t.cursor,
-    "cursor_unfocused" => t.cursor_unfocused,
     "background" => Style::new().bg(t.background),
     "foreground" => Style::new().fg(t.foreground),
     "accent" => t.accent,
+    "shell_prefix" => t.shell_prefix,
     "active" => t.active,
     "keybind_key" => t.keybind_key,
     "keybind_desc" => t.keybind_desc,
@@ -461,6 +435,8 @@ pub struct Theme {
     pub foreground: Color,
 
     pub user: Style,
+    pub user_bg: Style,
+    pub user_text: Style,
     pub assistant: Style,
     pub assistant_prefix: Style,
     pub thinking: Style,
@@ -507,7 +483,6 @@ pub struct Theme {
     pub panel_border: Style,
     pub panel_title: Style,
     pub cursor: Style,
-    pub cursor_unfocused: Style,
     pub input_border: Style,
     pub accent: Style,
     pub active: Style,
@@ -531,6 +506,7 @@ pub struct Theme {
     pub index_keyword: Style,
     pub shell_prefix: Style,
     pub progress_bar: Style,
+    pub scrollbar_thumb: Style,
 
     pub syntax: syntect::highlighting::Theme,
 }
@@ -849,14 +825,10 @@ impl Theme {
             Modifier::BOLD,
         );
 
-        // Themes that leave `cursor` unset get a visible caret everywhere,
-        // including pickers that paint `t.cursor` directly.
+        // The pickers and plugins paint their own carets with `cursor`, so a
+        // theme that leaves it unset still gets a visible one.
         let cursor = match style("cursor") {
             s if s == Style::default() => Style::new().reversed(),
-            s => s,
-        };
-        let cursor_unfocused = match style("cursor_unfocused") {
-            s if s == Style::default() => cursor,
             s => s,
         };
 
@@ -865,6 +837,8 @@ impl Theme {
             foreground: color("foreground"),
 
             user: style("user"),
+            user_bg: style("user_bg"),
+            user_text: style_or("user_text", "assistant"),
             assistant: style("assistant"),
             assistant_prefix: style("assistant_prefix"),
             thinking: brighten_toward(
@@ -956,7 +930,6 @@ impl Theme {
             panel_border: style("panel_border"),
             panel_title: style("panel_title"),
             cursor,
-            cursor_unfocused,
             input_border: style("input_border"),
             accent: style("accent"),
             active: {
@@ -997,6 +970,14 @@ impl Theme {
                 } else {
                     s
                 }
+            },
+            scrollbar_thumb: {
+                // ListPicker paints highlighted rows over the scrollbar track,
+                // so the thumb carries its own bg instead of inheriting row
+                // backgrounds. Defaults to the window's own fg/bg colors.
+                let s = style("scrollbar_thumb");
+                s.fg(s.fg.unwrap_or(color("foreground")))
+                    .bg(s.bg.unwrap_or(color("background")))
             },
             syntax,
         })
@@ -1079,6 +1060,7 @@ mod tests {
         assert_eq!(t.background, Color::Rgb(0x28, 0x2a, 0x36));
         assert_eq!(t.foreground, Color::Rgb(0xf8, 0xf8, 0xf2));
         assert_eq!(t.user.fg, Some(Color::Rgb(0x8b, 0xe9, 0xfd)));
+        assert_eq!(t.user_text.fg, Some(Color::Rgb(0xf8, 0xf8, 0xf2)));
         assert_eq!(t.error.fg, Some(Color::Rgb(0xff, 0x55, 0x55)));
         assert!(t.bold.add_modifier.contains(Modifier::BOLD));
         assert!(t.thinking.add_modifier.contains(Modifier::ITALIC));
@@ -1195,6 +1177,39 @@ mod tests {
     }
 
     #[test]
+    fn a_theme_without_colors_keeps_the_terminal_default_thumb() {
+        let theme = Theme::from_toml("[palette]\n[ui]\n").unwrap();
+        assert_eq!(
+            theme.scrollbar_thumb,
+            Style::new().fg(Color::Reset).bg(Color::Reset)
+        );
+    }
+
+    #[test]
+    fn scrollbar_thumb_defaults_to_the_theme_window_colors() {
+        let t = dracula();
+        assert_eq!(
+            t.scrollbar_thumb,
+            Style::new()
+                .fg(Color::Rgb(0xf8, 0xf8, 0xf2))
+                .bg(Color::Rgb(0x28, 0x2a, 0x36))
+        );
+    }
+
+    #[test]
+    fn scrollbar_thumb_keeps_its_own_explicit_colors() {
+        let toml = r##"
+[palette]
+magenta = "#ff00ff"
+[ui]
+scrollbar_thumb = { fg = "magenta", bg = "default" }
+"##;
+        let t = Theme::from_toml(toml).unwrap();
+        assert_eq!(t.scrollbar_thumb.fg, Some(Color::Rgb(0xff, 0x00, 0xff)));
+        assert_eq!(t.scrollbar_thumb.bg, Some(Color::Reset));
+    }
+
+    #[test]
     fn missing_ui_key_defaults_to_empty_style() {
         let toml = r#"
 [palette]
@@ -1202,6 +1217,8 @@ mod tests {
 "#;
         let theme = Theme::from_toml(toml).unwrap();
         assert_eq!(theme.user, Style::default());
+        assert_eq!(theme.user_bg, Style::default());
+        assert_eq!(theme.user_text, theme.assistant);
     }
 
     #[test]
@@ -1404,6 +1421,8 @@ diff_new_line_nr = { fg = "red" }
     fn style_by_name_resolves() {
         set(dracula());
         let t = current();
+        assert_eq!(style_by_name("user_bg"), t.user_bg);
+        assert_eq!(style_by_name("user_text"), t.user_text);
         assert_eq!(style_by_name("dim"), t.tool_dim);
         assert_eq!(style_by_name("tool_dim"), t.tool_dim);
         assert_eq!(style_by_name("path"), t.tool_path);
@@ -1430,7 +1449,6 @@ diff_new_line_nr = { fg = "red" }
         assert_eq!(style_by_name("item"), t.item);
         assert_eq!(style_by_name("item_desc"), t.item_desc);
         assert_eq!(style_by_name("cursor"), t.cursor);
-        assert_eq!(style_by_name("cursor_unfocused"), t.cursor_unfocused);
         assert_eq!(style_by_name("accent"), t.accent);
         assert_eq!(style_by_name("active"), t.active);
         assert_eq!(style_by_name("foreground"), Style::new().fg(t.foreground));
@@ -1615,25 +1633,39 @@ magenta    = "magenta"
     }
 
     #[test]
-    fn cursor_unfocused_falls_back_to_cursor() {
+    fn item_match_selected_keeps_todays_default_and_yields_to_an_override() {
         let t = Theme::from_toml(
             r##"
+[palette]
+item_fg = "#010203"
+item_bg = "#040506"
+
 [ui]
-"cursor" = { fg = "#ff0000" }
+item_selected = { fg = "item_fg", bg = "item_bg" }
+accent = { fg = "#ff0000" }
 "##,
         )
         .unwrap();
-        assert_eq!(t.cursor_unfocused, t.cursor);
+        assert_eq!(
+            t.item_match_selected.fg, t.accent.fg,
+            "an unset match keeps today's accent ink so no theme changes without opting in"
+        );
+        assert_eq!(t.item_match_selected.bg, t.item_selected.bg);
 
         let t = Theme::from_toml(
             r##"
 [ui]
-"cursor"          = { fg = "#ff0000" }
-"cursor_unfocused" = { fg = "#00ff00" }
+item_selected = { fg = "#010203", bg = "#040506" }
+item_match_selected = { fg = "#040506", bg = "#010203", modifiers = ["underlined"] }
 "##,
         )
         .unwrap();
-        assert_eq!(t.cursor_unfocused.fg, Some(Color::Rgb(0, 255, 0)));
+        assert_eq!(t.item_match_selected.fg, Some(Color::Rgb(4, 5, 6)));
+        assert!(
+            t.item_match_selected
+                .add_modifier
+                .contains(Modifier::UNDERLINED)
+        );
     }
 
     #[test]

@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::InstructionBlock;
-use crate::command::project_ancestor_dirs;
+use crate::command::{git_remote_urls, project_ancestor_dirs};
 use crate::prompt::{PromptId, ResolvedPrompts};
 use crate::template::Vars;
+use maki_config::{InstructionsConfig, project};
 use maki_providers::model::Model;
 
 const INSTRUCTION_FILES: &[&str] = &[
@@ -78,13 +79,21 @@ impl CallInstructions {
 pub struct Instructions {
     pub text: String,
     pub loaded: LoadedInstructions,
+    /// The resolved file list, fixed for the session's lifetime: resolving
+    /// again per subdirectory walk would probe git remotes again.
+    pub files: Arc<Vec<String>>,
 }
 
-pub fn is_instruction_file(name: &str) -> bool {
+/// Whether `name` is an instruction file under the session's resolved list.
+/// Entries match by file name too, so a nested entry like
+/// `.github/copilot-instructions.md` also covers a bare
+/// `copilot-instructions.md`. The local file always counts: it loads
+/// regardless of the list.
+pub fn is_instruction_file(files: &[String], name: &str) -> bool {
     name == LOCAL_INSTRUCTION_FILE
-        || INSTRUCTION_FILES
+        || files
             .iter()
-            .any(|f| *f == name || Path::new(f).file_name().is_some_and(|n| n == name))
+            .any(|f| f == name || Path::new(f).file_name().is_some_and(|n| n == name))
 }
 
 /// Plan mode is left out on purpose. It reaches the model as a context update,
@@ -121,11 +130,38 @@ fn read_instruction(path: &Path, loaded: &LoadedInstructions) -> Option<(PathBuf
     Some((canonical, content))
 }
 
+pub fn default_instruction_files() -> Vec<String> {
+    INSTRUCTION_FILES
+        .iter()
+        .map(|file| file.to_string())
+        .collect()
+}
+
+/// The file list that applies in `cwd`: the configured `instructions.files`,
+/// narrowed by the first `instructions.overrides` entry matching this
+/// checkout, falling back to the built-in list. No `overrides` means the
+/// checkout is never probed: the list cannot depend on it.
+fn resolve_instruction_files(config: &InstructionsConfig, cwd: &Path) -> Vec<String> {
+    if config.overrides.is_empty() {
+        return config
+            .files
+            .clone()
+            .unwrap_or_else(default_instruction_files);
+    }
+    let root = project::project_root(cwd);
+    let remotes = if config.needs_remotes() {
+        git_remote_urls(&root)
+    } else {
+        Vec::new()
+    };
+    config.resolve_files(&root, &remotes, INSTRUCTION_FILES)
+}
+
 fn collect_instruction_files(
     cwd: &str,
-    home: Option<&Path>,
-    xdg_config: Option<&Path>,
+    global_dir: Option<&Path>,
     loaded: &LoadedInstructions,
+    files: &[String],
 ) -> Vec<(String, String)> {
     let mut out = Vec::new();
 
@@ -139,7 +175,7 @@ fn collect_instruction_files(
 
     // Load root instructions first so cwd instructions come last and override on conflicts.
     for dir in project_dirs.into_iter().rev() {
-        for filename in INSTRUCTION_FILES {
+        for filename in files {
             if let Some((canonical, content)) = read_instruction(&dir.join(filename), loaded) {
                 out.push((
                     format!("Project instructions ({})", canonical.display()),
@@ -159,33 +195,35 @@ fn collect_instruction_files(
         }
     }
 
-    for dir in maki_storage::paths::config_search_dirs_from(home, xdg_config) {
-        let path = dir.join(GLOBAL_INSTRUCTION_FILE);
-        if let Some((canonical, content)) = read_instruction(&path, loaded) {
-            let label = format!("Global instructions ({})", canonical.display());
-            out.push((label, content));
-            break;
-        }
+    if let Some(dir) = global_dir
+        && let Some((canonical, content)) =
+            read_instruction(&dir.join(GLOBAL_INSTRUCTION_FILE), loaded)
+    {
+        out.push((
+            format!("Global instructions ({})", canonical.display()),
+            content,
+        ));
     }
 
     out
 }
 
-pub fn load_instruction_text(cwd: &str) -> String {
-    load_instruction_text_with_home(
+pub fn load_instruction_text(cwd: &str, config: &InstructionsConfig) -> String {
+    load_instruction_text_with_global_dir(
         cwd,
-        maki_storage::paths::home().as_deref(),
-        maki_storage::paths::xdg_config_dir().ok().as_deref(),
+        maki_storage::paths::config_dir().ok().as_deref(),
+        config,
     )
 }
 
-pub(crate) fn load_instruction_text_with_home(
+pub(crate) fn load_instruction_text_with_global_dir(
     cwd: &str,
-    home: Option<&Path>,
-    xdg_config: Option<&Path>,
+    global_dir: Option<&Path>,
+    config: &InstructionsConfig,
 ) -> String {
     let loaded = LoadedInstructions::new();
-    let files = collect_instruction_files(cwd, home, xdg_config, &loaded);
+    let names = resolve_instruction_files(config, Path::new(cwd));
+    let files = collect_instruction_files(cwd, global_dir, &loaded, &names);
 
     let mut text = String::new();
     for (label, content) in files {
@@ -194,21 +232,23 @@ pub(crate) fn load_instruction_text_with_home(
     text
 }
 
-pub fn load_instructions(cwd: &str) -> Instructions {
-    load_instructions_with_home(
+pub fn load_instructions(cwd: &str, config: &InstructionsConfig) -> Instructions {
+    load_instructions_with_global_dir(
         cwd,
-        maki_storage::paths::home().as_deref(),
-        maki_storage::paths::xdg_config_dir().ok().as_deref(),
+        maki_storage::paths::config_dir().ok().as_deref(),
+        config,
     )
 }
 
-pub(crate) fn load_instructions_with_home(
+pub(crate) fn load_instructions_with_global_dir(
     cwd: &str,
-    home: Option<&Path>,
-    xdg_config: Option<&Path>,
+    global_dir: Option<&Path>,
+    config: &InstructionsConfig,
 ) -> Instructions {
     let mut instr = Instructions::default();
-    let files = collect_instruction_files(cwd, home, xdg_config, &instr.loaded);
+    let names = resolve_instruction_files(config, Path::new(cwd));
+    let files = collect_instruction_files(cwd, global_dir, &instr.loaded, &names);
+    instr.files = Arc::new(names);
 
     for (label, content) in files {
         instr.text.push_str(&format!("\n\n{label}:\n{content}"));
@@ -223,6 +263,7 @@ pub fn find_subdirectory_instructions(
     dir: &Path,
     cwd: &Path,
     loaded: &LoadedInstructions,
+    files: &[String],
 ) -> Vec<InstructionBlock> {
     let Ok(cwd) = cwd.canonicalize() else {
         return Vec::new();
@@ -238,7 +279,7 @@ pub fn find_subdirectory_instructions(
     let mut results = Vec::new();
     let mut current = dir.as_path();
     while current != cwd {
-        for filename in INSTRUCTION_FILES {
+        for filename in files {
             if let Some((canonical, content)) = read_unseen(&current.join(filename), loaded) {
                 results.push(InstructionBlock {
                     path: canonical.display().to_string(),
@@ -260,12 +301,10 @@ mod tests {
     use crate::prompt::{Slot, SlotEntry};
     use std::fs;
 
+    use maki_config::{InstructionsFileConfig, ProjectOverrideFileConfig};
     use test_case::test_case;
 
     use super::*;
-
-    const LEGACY_RULES: &str = "legacy global rules";
-    const XDG_RULES: &str = "xdg global rules";
 
     #[test]
     fn after_instructions_slot_lands_after_instructions() {
@@ -298,7 +337,22 @@ mod tests {
     #[test_case("random.md",                false ; "unrelated_file")]
     #[test_case("not-AGENTS.md",            false ; "partial_match")]
     fn is_instruction_file_cases(name: &str, expected: bool) {
-        assert_eq!(is_instruction_file(name), expected);
+        assert_eq!(
+            is_instruction_file(&default_instruction_files(), name),
+            expected
+        );
+    }
+
+    #[test]
+    fn is_instruction_file_follows_the_session_list() {
+        let files = file_list(&["RULES.md", ".github/copilot-instructions.md"]);
+        assert!(is_instruction_file(&files, "RULES.md"));
+        assert!(is_instruction_file(&files, "copilot-instructions.md"));
+        assert!(is_instruction_file(&files, "AGENTS.local.md"));
+        assert!(!is_instruction_file(&files, "AGENTS.md"));
+
+        assert!(!is_instruction_file(&[], "AGENTS.md"));
+        assert!(is_instruction_file(&[], "AGENTS.local.md"));
     }
 
     #[test]
@@ -307,7 +361,12 @@ mod tests {
         fs::write(dir.path().join("AGENTS.md"), "team rules").unwrap();
         fs::write(dir.path().join("AGENTS.local.md"), "my preferences").unwrap();
 
-        let text = &load_instructions_with_home(dir.path().to_str().unwrap(), None, None).text;
+        let text = &load_instructions_with_global_dir(
+            dir.path().to_str().unwrap(),
+            None,
+            &InstructionsConfig::default(),
+        )
+        .text;
         assert!(text.contains("team rules"));
         assert!(text.contains("my preferences"));
         assert!(
@@ -321,9 +380,175 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("AGENTS.local.md"), "solo preferences").unwrap();
         assert!(
-            load_instructions_with_home(dir.path().to_str().unwrap(), None, None)
-                .text
-                .contains("solo preferences")
+            load_instructions_with_global_dir(
+                dir.path().to_str().unwrap(),
+                None,
+                &InstructionsConfig::default(),
+            )
+            .text
+            .contains("solo preferences")
+        );
+    }
+
+    fn files_config(files: &[&str]) -> InstructionsConfig {
+        InstructionsConfig::from_file(InstructionsFileConfig {
+            files: Some(files.iter().map(|file| file.to_string()).collect()),
+            overrides: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    fn file_list(files: &[&str]) -> Vec<String> {
+        files.iter().map(|file| file.to_string()).collect()
+    }
+
+    fn project_override(
+        path: Option<String>,
+        remote: Option<String>,
+        files: &[&str],
+    ) -> InstructionsConfig {
+        InstructionsConfig::from_file(InstructionsFileConfig {
+            overrides: vec![ProjectOverrideFileConfig {
+                path,
+                remote,
+                files: Some(files.iter().map(|file| file.to_string()).collect()),
+            }],
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn load_instructions_configured_files_replace_the_default_list() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("AGENTS.md"), "team rules").unwrap();
+        fs::write(dir.path().join("CLAUDE.md"), "claude rules").unwrap();
+
+        let text = &load_instructions_with_global_dir(
+            dir.path().to_str().unwrap(),
+            None,
+            &files_config(&["CLAUDE.md"]),
+        )
+        .text;
+        assert!(text.contains("claude rules"));
+        assert!(
+            !text.contains("team rules"),
+            "the configured list replaces the default, got {text}"
+        );
+    }
+
+    #[test]
+    fn load_instructions_empty_files_skip_project_but_local_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("AGENTS.md"), "team rules").unwrap();
+        fs::write(dir.path().join("AGENTS.local.md"), "my preferences").unwrap();
+
+        let text = &load_instructions_with_global_dir(
+            dir.path().to_str().unwrap(),
+            None,
+            &files_config(&[]),
+        )
+        .text;
+        assert!(text.contains("my preferences"));
+        assert!(
+            !text.contains("team rules"),
+            "an empty files list loads no project instructions, got {text}"
+        );
+    }
+
+    #[test]
+    fn find_subdirectory_instructions_uses_the_configured_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("src");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("AGENTS.md"), "agents rules").unwrap();
+        fs::write(sub.join("CLAUDE.md"), "claude rules").unwrap();
+
+        let loaded = LoadedInstructions::new();
+        let results =
+            find_subdirectory_instructions(&sub, dir.path(), &loaded, &file_list(&["CLAUDE.md"]));
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].path.ends_with("CLAUDE.md"));
+        assert_eq!(results[0].content, "claude rules");
+    }
+
+    #[test]
+    fn load_instructions_project_path_override_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::write(root.join("AGENTS.md"), "team rules").unwrap();
+        fs::write(root.join("AGENTS.local.md"), "my preferences").unwrap();
+
+        let config = project_override(Some(root.to_string_lossy().into_owned()), None, &[]);
+        let text = &load_instructions_with_global_dir(root.to_str().unwrap(), None, &config).text;
+        assert!(text.contains("my preferences"));
+        assert!(
+            !text.contains("team rules"),
+            "a matching overrides entry replaces the file list, got {text}"
+        );
+    }
+
+    #[test]
+    fn load_instructions_project_path_matches_the_git_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::create_dir(root.join(".git")).unwrap();
+        let sub = root.join("crates").join("a");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(root.join("AGENTS.md"), "root rules").unwrap();
+
+        let config = project_override(
+            Some(root.to_string_lossy().into_owned()),
+            None,
+            &["CLAUDE.md"],
+        );
+        let text = &load_instructions_with_global_dir(sub.to_str().unwrap(), None, &config).text;
+        assert!(
+            !text.contains("root rules"),
+            "the override matches the git root from a subdirectory, got {text}"
+        );
+    }
+
+    #[test]
+    fn load_instructions_project_remote_override_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/repo.git",
+            ],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        }
+        fs::write(root.join("AGENTS.md"), "team rules").unwrap();
+
+        let remote = "github.com/example/*".to_owned();
+        let config = project_override(None, Some(remote), &[]);
+        let text = &load_instructions_with_global_dir(root.to_str().unwrap(), None, &config).text;
+        assert!(
+            !text.contains("team rules"),
+            "a matching remote entry replaces the file list, got {text}"
+        );
+
+        let other = project_override(
+            None,
+            Some("github.com/tontinton/*".to_owned()),
+            &["CLAUDE.md"],
+        );
+        let text = &load_instructions_with_global_dir(root.to_str().unwrap(), None, &other).text;
+        assert!(
+            text.contains("team rules"),
+            "a non-matching remote entry keeps the default list, got {text}"
         );
     }
 
@@ -331,56 +556,44 @@ mod tests {
     fn load_instructions_empty_when_no_files() {
         let dir = tempfile::tempdir().unwrap();
         assert!(
-            load_instructions_with_home(dir.path().to_str().unwrap(), None, None)
-                .text
-                .is_empty()
+            load_instructions_with_global_dir(
+                dir.path().to_str().unwrap(),
+                None,
+                &InstructionsConfig::default(),
+            )
+            .text
+            .is_empty()
         );
     }
 
     #[test]
-    fn load_instructions_empty_when_home_has_no_global_file() {
+    fn load_instructions_empty_when_global_dir_has_no_file() {
         let cwd = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
         assert!(
-            load_instructions_with_home(cwd.path().to_str().unwrap(), Some(home.path()), None)
-                .text
-                .is_empty()
+            load_instructions_with_global_dir(
+                cwd.path().to_str().unwrap(),
+                Some(global.path()),
+                &InstructionsConfig::default(),
+            )
+            .text
+            .is_empty()
         );
     }
 
     #[test]
-    fn load_instructions_includes_global_from_home() {
+    fn load_instructions_includes_global_from_config_dir() {
         let cwd = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        fs::create_dir_all(home.path().join(".maki")).unwrap();
-        fs::write(home.path().join(".maki").join("AGENTS.md"), "global rules").unwrap();
+        let global = tempfile::tempdir().unwrap();
+        fs::write(global.path().join("AGENTS.md"), "global rules").unwrap();
 
-        let text =
-            load_instructions_with_home(cwd.path().to_str().unwrap(), Some(home.path()), None).text;
-        assert!(text.contains("global rules"));
-    }
-
-    #[test_case(false, XDG_RULES, LEGACY_RULES ; "xdg_is_searched_even_though_legacy_dir_exists")]
-    #[test_case(true, LEGACY_RULES, XDG_RULES ; "legacy_wins_when_both_have_a_file")]
-    fn load_instructions_global_search_order(write_legacy: bool, wanted: &str, unwanted: &str) {
-        let cwd = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let xdg = tempfile::tempdir().unwrap();
-        let legacy = home.path().join(".maki");
-        fs::create_dir(&legacy).unwrap();
-        if write_legacy {
-            fs::write(legacy.join(GLOBAL_INSTRUCTION_FILE), LEGACY_RULES).unwrap();
-        }
-        fs::write(xdg.path().join(GLOBAL_INSTRUCTION_FILE), XDG_RULES).unwrap();
-
-        let text = load_instructions_with_home(
+        let text = load_instructions_with_global_dir(
             cwd.path().to_str().unwrap(),
-            Some(home.path()),
-            Some(xdg.path()),
+            Some(global.path()),
+            &InstructionsConfig::default(),
         )
         .text;
-        assert!(text.contains(wanted), "got {text}");
-        assert!(!text.contains(unwanted), "got {text}");
+        assert!(text.contains("global rules"));
     }
 
     #[test]
@@ -394,7 +607,12 @@ mod tests {
         fs::write(dir.path().join("AGENTS.md"), "root rules").unwrap();
         fs::write(sub.join("AGENTS.md"), "crate rules").unwrap();
 
-        let text = load_instructions_with_home(sub.to_str().unwrap(), None, None).text;
+        let text = load_instructions_with_global_dir(
+            sub.to_str().unwrap(),
+            None,
+            &InstructionsConfig::default(),
+        )
+        .text;
         assert!(
             text.contains("crate rules"),
             "should load instructions from cwd"
@@ -417,7 +635,8 @@ mod tests {
         fs::write(dir.path().join("src").join("AGENTS.md"), "api rules").unwrap();
 
         let loaded = LoadedInstructions::new();
-        let results = find_subdirectory_instructions(&sub, dir.path(), &loaded);
+        let results =
+            find_subdirectory_instructions(&sub, dir.path(), &loaded, &file_list(&["AGENTS.md"]));
 
         assert_eq!(results.len(), 1);
         assert!(results[0].path.ends_with("AGENTS.md"));
@@ -430,7 +649,12 @@ mod tests {
         fs::write(dir.path().join("AGENTS.md"), "root rules").unwrap();
 
         let loaded = LoadedInstructions::new();
-        let from_root = find_subdirectory_instructions(dir.path(), dir.path(), &loaded);
+        let from_root = find_subdirectory_instructions(
+            dir.path(),
+            dir.path(),
+            &loaded,
+            &file_list(&["AGENTS.md"]),
+        );
         assert!(from_root.is_empty(), "should skip root-level directory");
     }
 
@@ -445,12 +669,15 @@ mod tests {
         let canonical = agents_path.canonicalize().unwrap();
         let loaded = LoadedInstructions::new();
         loaded.contains_or_insert(canonical.clone());
-        let pre_loaded = find_subdirectory_instructions(&sub, dir.path(), &loaded);
+        let pre_loaded =
+            find_subdirectory_instructions(&sub, dir.path(), &loaded, &file_list(&["AGENTS.md"]));
         assert!(pre_loaded.is_empty(), "should skip already-loaded files");
 
         let loaded = LoadedInstructions::new();
-        let first = find_subdirectory_instructions(&sub, dir.path(), &loaded);
-        let second = find_subdirectory_instructions(&sub, dir.path(), &loaded);
+        let first =
+            find_subdirectory_instructions(&sub, dir.path(), &loaded, &file_list(&["AGENTS.md"]));
+        let second =
+            find_subdirectory_instructions(&sub, dir.path(), &loaded, &file_list(&["AGENTS.md"]));
         assert_eq!(first.len(), 1);
         assert_eq!(
             second.len(),
@@ -482,7 +709,11 @@ mod tests {
         let agents_path = dir.path().join("AGENTS.md");
         fs::write(&agents_path, "content").unwrap();
 
-        let instr = load_instructions_with_home(dir.path().to_str().unwrap(), None, None);
+        let instr = load_instructions_with_global_dir(
+            dir.path().to_str().unwrap(),
+            None,
+            &InstructionsConfig::default(),
+        );
         assert!(
             instr
                 .loaded

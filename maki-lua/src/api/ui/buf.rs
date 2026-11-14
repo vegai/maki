@@ -159,6 +159,8 @@ pub(crate) fn buf_from_reply(val: &LuaValue) -> Option<Arc<SharedBuf>> {
 /// resolve, so they follow the user's palette. To mix a named style with colors
 /// of your own, `maki.ui.theme_style` hands back its parts.
 ///
+/// Invalid UTF-8 shows as U+FFFD.
+///
 /// @param line string|table Plain string, or a sequence of spans: `{ {text, style?}, ... }`.
 /// @return
 /// @example
@@ -199,18 +201,29 @@ fn lines(_lua: &Lua, this: &BufHandle, lines: Table) -> LuaResult<()> {
 /// want to redraw the whole buffer, for example after the user toggles
 /// a view.
 ///
+/// `head` counts the leading lines that say what the buffer is about, like
+/// the command above a bash output. When the tool call moves to the
+/// background, its row in the chat keeps only those lines, because the rest
+/// streams in the task's tab. Without a head the row keeps just its title.
+///
 /// @param lines table Sequence of line values, each the same format accepted by `buf:line`.
+/// @param opts table|nil Options: `head` = number of leading lines (default 0).
 /// @return
 /// @example
 /// buf:set_lines({ "new content", "replaces everything" })
+/// buf:set_lines({ "cargo test", "──────", "running 3 tests" }, { head = 1 })
 #[lua_fn]
-fn set_lines(_lua: &Lua, this: &BufHandle, lines: Table) -> LuaResult<()> {
+fn set_lines(_lua: &Lua, this: &BufHandle, lines: Table, opts: Option<Table>) -> LuaResult<()> {
     let mut parsed = Vec::with_capacity(lines.raw_len());
     for i in 1..=lines.raw_len() {
         let val: LuaValue = lines.raw_get(i)?;
         parsed.push(parse_line(&val)?);
     }
-    this.buf.set_lines(parsed);
+    let head = match opts {
+        Some(opts) => opts.opt::<usize>("head")?.unwrap_or(0),
+        None => 0,
+    };
+    this.buf.set_lines_with_head(parsed, head);
     Ok(())
 }
 
@@ -389,7 +402,7 @@ lua_class! {
 pub(crate) fn parse_line(arg: &LuaValue) -> LuaResult<SnapshotLine> {
     match arg {
         LuaValue::String(s) => {
-            let text = s.to_str().map_err(mlua::Error::external)?.to_owned();
+            let text = s.to_string_lossy();
             Ok(SnapshotLine {
                 spans: vec![SnapshotSpan {
                     text,
@@ -417,7 +430,7 @@ fn parse_span(val: &LuaValue) -> LuaResult<SnapshotSpan> {
     };
     let text_val: LuaValue = t.raw_get(1)?;
     let text = match &text_val {
-        LuaValue::String(s) => s.to_str().map_err(mlua::Error::external)?.to_owned(),
+        LuaValue::String(s) => s.to_string_lossy(),
         _ => return Err(mlua::Error::runtime("span[1] must be a string")),
     };
     let style_val: LuaValue = t.raw_get(2)?;
@@ -425,7 +438,7 @@ fn parse_span(val: &LuaValue) -> LuaResult<SnapshotSpan> {
     Ok(SnapshotSpan { text, style })
 }
 
-fn parse_style(val: &LuaValue) -> LuaResult<SpanStyle> {
+pub(crate) fn parse_style(val: &LuaValue) -> LuaResult<SpanStyle> {
     match val {
         LuaValue::Nil => Ok(SpanStyle::Default),
         v if v.is_null() => Ok(SpanStyle::Default),
@@ -521,6 +534,9 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
+    const LEGACY_TEXT: &[u8] = b"caf\xe9";
+    const DISPLAY_TEXT: &str = "caf\u{fffd}";
+
     #[test]
     fn take_removes_buffer_from_store() {
         let mut store = BufferStore::new();
@@ -602,6 +618,21 @@ mod tests {
         assert_eq!(line.spans.len(), 1);
         assert_eq!(line.spans[0].text, "hello world");
         assert_eq!(line.spans[0].style, SpanStyle::Default);
+    }
+
+    #[test_case(false ; "plain")]
+    #[test_case(true ; "span")]
+    fn display_text_replaces_invalid_utf8(in_span: bool) {
+        let lua = test_lua();
+        let text = lua.create_string(LEGACY_TEXT).unwrap();
+        let value = if in_span {
+            let span = lua.create_sequence_from([text]).unwrap();
+            LuaValue::Table(lua.create_sequence_from([span]).unwrap())
+        } else {
+            LuaValue::String(text)
+        };
+        let line = parse_line(&value).unwrap();
+        assert_eq!(line.spans[0].text, DISPLAY_TEXT);
     }
 
     #[test]
@@ -810,6 +841,21 @@ mod tests {
         assert_eq!(store.live_buf().unwrap().len(), 1);
     }
 
+    #[test_case(r#"buf:set_lines({ "cmd", "--", "out" }, { head = 2 })"#, 2 ; "kept")]
+    #[test_case(r#"buf:set_lines({ "cmd" }, { head = 1 }) buf:set_lines({ "out" })"#, 0 ; "cleared_by_a_redraw_without_it")]
+    fn set_lines_head_names_the_leading_lines(script: &str, head: usize) {
+        let lua = test_lua();
+        let handle = lua.app_data_mut::<BufferStore>().unwrap().create();
+        let buf = Arc::clone(&handle.buf);
+        lua.globals()
+            .set("buf", lua.create_userdata(handle).unwrap())
+            .unwrap();
+
+        lua.load(script).exec().unwrap();
+
+        assert_eq!(buf.take().head, head);
+    }
+
     #[test]
     fn set_lines_replaces_content() {
         let lua = test_lua();
@@ -918,28 +964,26 @@ mod tests {
         );
     }
 
-    #[test]
-    fn buf_click_invokes_own_handler_and_noops_without_one() {
+    #[tokio::test]
+    async fn buf_click_invokes_own_handler_and_noops_without_one() {
         let lua = test_lua();
         set_buf_global(&lua);
 
-        smol::block_on(async {
-            lua.load(r#"buf:click({ row = 3 })"#)
-                .exec_async()
-                .await
-                .expect("click without handler is a no-op");
-
-            lua.load(
-                r#"
-                clicked_row = nil
-                buf:on("click", function(ev) clicked_row = ev.row end)
-                buf:click({ row = 3 })
-                "#,
-            )
+        lua.load(r#"buf:click({ row = 3 })"#)
             .exec_async()
             .await
-            .unwrap();
-        });
+            .expect("click without handler is a no-op");
+
+        lua.load(
+            r#"
+            clicked_row = nil
+            buf:on("click", function(ev) clicked_row = ev.row end)
+            buf:click({ row = 3 })
+            "#,
+        )
+        .exec_async()
+        .await
+        .unwrap();
         let row: i64 = lua.globals().get("clicked_row").unwrap();
         assert_eq!(row, 3);
     }
@@ -947,8 +991,8 @@ mod tests {
     /// A foreign wrapper (the shape `on_live_buf` hands to a batch) must
     /// route clicks to the handler the owning task registered: the click
     /// slot lives on the SharedBuf, not on any one handle.
-    #[test]
-    fn foreign_handle_shares_click_handler() {
+    #[tokio::test]
+    async fn foreign_handle_shares_click_handler() {
         let lua = test_lua();
         set_buf_global(&lua);
         lua.load(r#"buf:on("click", function(ev) clicked_row = ev.row end)"#)
@@ -969,12 +1013,10 @@ mod tests {
             )
             .unwrap();
 
-        smol::block_on(async {
-            lua.load(r#"foreign:click({ row = 7 })"#)
-                .exec_async()
-                .await
-                .unwrap();
-        });
+        lua.load(r#"foreign:click({ row = 7 })"#)
+            .exec_async()
+            .await
+            .unwrap();
         let row: i64 = lua.globals().get("clicked_row").unwrap();
         assert_eq!(row, 7);
     }
@@ -982,22 +1024,20 @@ mod tests {
     /// A handler must be able to call back into its own buf (every
     /// ToolView toggle does), so the click method may not hold the
     /// userdata borrow across the handler call.
-    #[test]
-    fn buf_click_handler_can_mutate_own_buf() {
+    #[tokio::test]
+    async fn buf_click_handler_can_mutate_own_buf() {
         let lua = test_lua();
         set_buf_global(&lua);
 
-        smol::block_on(async {
-            lua.load(
-                r#"
-                buf:on("click", function() buf:set_lines({ { { "toggled" } } }) end)
-                buf:click({ row = 1 })
-                "#,
-            )
-            .exec_async()
-            .await
-            .expect("handler mutating its own buf must not fail borrow");
-        });
+        lua.load(
+            r#"
+            buf:on("click", function() buf:set_lines({ { { "toggled" } } }) end)
+            buf:click({ row = 1 })
+            "#,
+        )
+        .exec_async()
+        .await
+        .expect("handler mutating its own buf must not fail borrow");
         let text: String = lua
             .load(r#"return buf:get_lines()[1][1][1]"#)
             .eval()

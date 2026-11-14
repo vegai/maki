@@ -1,6 +1,7 @@
 //! Async agent loop with tools.
 
 pub mod agent;
+pub mod call_scope;
 pub mod cancel;
 pub use maki_providers::process::ChildGuard;
 pub mod file_index;
@@ -13,24 +14,30 @@ pub mod headless;
 pub mod live_session;
 pub mod mcp;
 pub use mcp::config::{McpConfigError, McpConfigErrors, McpServerInfo, McpServerStatus};
-pub use mcp::protocol::PromptRole;
+pub use mcp::transport::PromptRole;
 pub use mcp::{
     McpCommand, McpHandle, McpPromptArg, McpPromptInfo, McpSession, McpSnapshot, McpSnapshotReader,
     ToolDeferral,
 };
-pub mod inbox;
 pub mod session;
-pub use inbox::SubagentInbox;
-pub(crate) mod task_set;
+mod session_control;
+pub use session_control::{Activity, Delivery, EndReason, SessionControl};
+mod session_loop;
 pub use agent::{
-    Agent, AgentParams, AgentRunParams, DisplayItem, History, HistorySnapshot, Instructions,
-    LoadedInstructions, ModelSlot, RunContext, RunContextBuilder, SharedMessages, Transcript,
-    UNAVAILABLE_RESULT, close_dangling_tool_calls, display_order, find_subdirectory_instructions,
-    is_instruction_file, observation_line,
+    Agent, AgentParams, AgentRunParams, Cutter, DisplayItem, History, HistorySnapshot, HostPrompt,
+    Instructions, LoadedInstructions, ModelSlot, RunContext, RunContextBuilder, SharedMessages,
+    Transcript, UNAVAILABLE_RESULT, USER_CANCEL_MARKER, close_dangling_tool_calls, display_order,
+    find_subdirectory_instructions, is_instruction_file, observation_detail, observation_line,
+    unbind_thinking,
 };
-pub use cancel::{CancelMap, CancelToken, CancelTrigger};
-pub use live_session::{AgentSeed, MailboxError, SessionMailbox};
+pub use call_scope::{AlreadyMoved, CallGuard, CallScope, MovedTrigger, SessionStub, TaskHome};
+pub use cancel::{CancelHandle, CancelMap, CancelToken, CancelTrigger};
+pub use live_session::{
+    AgentSeed, BackgroundNotice, MailboxError, SessionMailbox, TaskLabel, receipt_tag,
+    result_notice,
+};
 pub use maki_config::{AgentConfig, PermissionsConfig, SessionDefaults, ToolOutputLines};
+pub use session_loop::{CutShort, TurnHost, run_turns};
 pub mod command;
 pub mod diff;
 pub mod permissions;
@@ -45,13 +52,15 @@ use std::path::{Path, PathBuf};
 
 pub use maki_providers::AgentError;
 use maki_providers::Message;
-pub use maki_providers::{EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, ThinkingConfig};
+pub use maki_providers::{
+    EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, TaskEnd, ThinkingConfig,
+};
 pub use types::{
-    AgentEvent, BufferSnapshot, CallRecord, DoneReason, Envelope, EventSender, EventStreamGuard,
-    GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND, RunLedger,
-    RunTotals, SessionEndReason, SessionEvents, SharedBuf, SnapshotLine, SnapshotSpan, SpanColor,
-    SpanStyle, SteerKind, SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput,
-    ToolStartEvent, TurnCompleteEvent, UiWaker, event_stream,
+    AgentEvent, BufWatch, BufferSnapshot, CallRecord, CostTally, DoneReason, Envelope, EventSender,
+    EventStreamGuard, GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND,
+    PartStatus, RunLedger, RunTotals, SessionEndReason, SessionEvents, SharedBuf, SnapshotLine,
+    SnapshotSpan, SpanColor, SpanStyle, SteerKind, SubagentInfo, TextOutput, ToolDoneEvent,
+    ToolInput, ToolOutput, ToolPart, ToolStartEvent, TurnCompleteEvent, UiWaker, event_stream,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -83,6 +92,11 @@ pub enum ExtractedCommand {
 
 pub trait InterruptSource: Send + Sync {
     fn poll(&self) -> Option<ExtractedCommand>;
+
+    /// Who cut the run, asked only after its token fired.
+    fn cut_by(&self) -> Cutter {
+        Cutter::User
+    }
 }
 
 #[derive(Clone)]
@@ -118,6 +132,16 @@ pub struct EarlierInput {
     pub message: String,
     pub images: Vec<ImageSource>,
     pub preamble: Vec<Message>,
+}
+
+impl From<AgentInput> for EarlierInput {
+    fn from(input: AgentInput) -> Self {
+        Self {
+            message: input.message,
+            images: input.images,
+            preamble: input.preamble,
+        }
+    }
 }
 
 pub struct AgentInput {

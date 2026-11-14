@@ -1,6 +1,9 @@
 #[cfg(unix)]
 use std::env;
 use std::fs;
+use std::io::{Read, Write};
+use std::iter;
+use std::net::TcpListener;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
@@ -8,8 +11,7 @@ use std::path::Path;
 #[cfg(unix)]
 use std::process::Command;
 use std::sync::Arc;
-
-use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+use std::thread::{self, JoinHandle};
 
 use maki_agent::agent::tool_dispatch;
 use maki_agent::permissions::PermissionManager;
@@ -21,9 +23,10 @@ use maki_config::{
     DEFAULT_BUILTINS, Effect, PermissionRule, PermissionsConfig, PluginFileConfig, PluginsConfig,
     ProjectConfig, ToolKey,
 };
+use maki_lua::test_support::runtime;
 use maki_lua::{PluginHost, set_allowed_private_hosts};
 use serde_json::{Value, json};
-use smol::net::TcpListener;
+use tokio::sync::mpsc::unbounded_channel;
 
 const TOOLS: &[&str] = &[
     "bash",
@@ -35,11 +38,20 @@ const TOOLS: &[&str] = &[
     "batch",
     "webfetch",
 ];
+const NO_OUTPUT: &str = "(no output)";
 const MODEL_BYTES: usize = 1024;
 const MODEL_LINES: usize = 8;
 const COMPACT_GLOB_LIMIT: usize = 100;
 const TEST_TIMEOUT_SECS: u64 = 60;
 const LAST_ITEM: &str = "final-item";
+const LATIN1_HTML: &[u8] = b"<h1>caf\xe9</h1>";
+const LOSSY_TEXT: &str = "caf\u{fffd}";
+const LOSSY_MARKDOWN: &str = "# caf\u{fffd}";
+const LEGACY_HTML_TYPE: &str = "text/html; charset=ISO-8859-1";
+const LATIN1_E_ACUTE: u8 = 0xe9;
+const BINARY_TYPE: &str = "application/pdf";
+const BINARY_PAYLOAD: &[u8] = b"%PDF-1.7\n\0\x01\x02";
+const BINARY_ERROR: &str = "error: binary content (application/pdf) cannot be displayed as text";
 const CALL_ID: &str = "output-test";
 const PROMPT_PLUGIN: &str = "guard";
 const ALLOW_EVERY_PROMPT: &str =
@@ -104,7 +116,7 @@ fn setup() -> (Arc<ToolRegistry>, PluginHost, ToolContext) {
 }
 
 fn run(ctx: &ToolContext, name: &str, input: Value) -> Result<String, String> {
-    let done = smol::block_on(tool_dispatch::run(
+    let done = runtime().block_on(tool_dispatch::run(
         CALL_ID.into(),
         name,
         &input,
@@ -151,6 +163,13 @@ fn python_parses_complete_bash_json_with_bounded_final_output() {
     assert!(returned.len() < MODEL_BYTES * 2);
 }
 
+#[test_case::test_case("pass" ; "nothing")]
+#[test_case::test_case("print()" ; "an_empty_line")]
+fn python_without_output_says_so(code: &str) {
+    let (_registry, _host, ctx) = setup();
+    assert_eq!(python(&ctx, code).unwrap(), NO_OUTPUT);
+}
+
 #[test]
 fn final_python_output_keeps_model_limits() {
     let (_registry, _host, ctx) = setup();
@@ -165,8 +184,14 @@ fn final_python_output_keeps_model_limits() {
         ),
     )
     .unwrap();
-    assert!(output.contains("[truncated"));
-    assert!(!output.contains(&format!("\n{}\n", MODEL_LINES * 3 - 1)));
+    let last = MODEL_LINES * 3 - 1;
+    assert!(output.starts_with("0\n1\n"), "head kept: {output}");
+    assert!(output.contains("[truncated "), "middle cut: {output}");
+    assert!(output.contains(&format!("\n{last}")), "tail kept: {output}");
+    assert!(
+        !output.contains(&format!("\n{}\n", MODEL_LINES * 2)),
+        "middle dropped: {output}"
+    );
 }
 
 #[test_case::test_case(1, 0, MODEL_LINES * 3 ; "through_eof")]
@@ -252,7 +277,7 @@ fn python_glob_preserves_all_results_beyond_compact_limit() {
 
 #[test]
 #[cfg(unix)]
-fn python_bash_respects_tail_and_keeps_complete_error_output() {
+fn python_bash_returns_full_output_and_keeps_complete_error_output() {
     let (_registry, _host, ctx) = setup();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("lines.txt");
@@ -261,14 +286,8 @@ fn python_bash_respects_tail_and_keeps_complete_error_output() {
         .collect();
     fs::write(&path, lines.join("\n")).unwrap();
     let command = format!("cat '{}'", path.display());
-    let code = format!(
-        "text = await bash(command={command:?})\ntail = await bash(command={command:?}, tail=2)\nprint(len(text.splitlines()), tail == {:?})",
-        lines[lines.len() - 2..].join("\n")
-    );
-    assert_eq!(
-        python(&ctx, &code).unwrap().trim(),
-        format!("{} True", lines.len())
-    );
+    let code = format!("text = await bash(command={command:?})\nprint(len(text.splitlines()))");
+    assert_eq!(python(&ctx, &code).unwrap().trim(), lines.len().to_string());
     let failing = command + "; exit 7";
     let code = format!(
         "try:\n    await bash(command={failing:?})\nexcept RuntimeError as error:\n    print({:?} in str(error), 'Exit code: 7' in str(error))",
@@ -278,7 +297,10 @@ fn python_bash_respects_tail_and_keeps_complete_error_output() {
     let uncaught = python(&ctx, &format!("await bash(command={failing:?})")).unwrap_err();
     assert!(uncaught.contains("[truncated"));
     assert!(uncaught.len() < MODEL_BYTES);
-    assert!(!uncaught.contains(lines.last().unwrap()));
+    assert!(
+        uncaught.contains("Exit code: 7"),
+        "error tail kept: {uncaught}"
+    );
 }
 
 #[test]
@@ -427,7 +449,7 @@ fn a_write_a_plugin_allowed_inside_python_marks_the_code_execution_row() {
         ProjectConfig::discover(project.path()),
         Arc::default(),
     ));
-    let (event_tx, events) = flume::unbounded();
+    let (event_tx, mut events) = unbounded_channel();
     ctx.event_tx = EventSender::new(event_tx, 0);
     ctx.tool_use_id = Some(CALL_ID.to_owned());
     let path = outside.path().join("allowed.txt");
@@ -442,8 +464,7 @@ fn a_write_a_plugin_allowed_inside_python_marks_the_code_execution_row() {
     .expect("the plugin allowed the write");
 
     assert_eq!(fs::read_to_string(&path).unwrap(), LAST_ITEM);
-    let marked: Vec<(String, String)> = events
-        .try_iter()
+    let marked: Vec<(String, String)> = iter::from_fn(|| events.try_recv().ok())
         .filter_map(|envelope| match envelope.event {
             AgentEvent::AllowedByPlugin { id, plugin } => Some((id, plugin)),
             _ => None,
@@ -452,33 +473,70 @@ fn a_write_a_plugin_allowed_inside_python_marks_the_code_execution_row() {
     assert_eq!(marked, [(CALL_ID.to_owned(), PROMPT_PLUGIN.to_owned())]);
 }
 
-#[test]
-fn python_webfetch_parses_complete_response_text() {
-    let (_registry, _host, ctx) = setup();
+fn serve_once(content_type: &str, payload: &[u8]) -> (String, JoinHandle<()>) {
     set_allowed_private_hosts(&["127.0.0.1".to_owned()]);
-    let listener = smol::block_on(TcpListener::bind(("127.0.0.1", 0))).unwrap();
-    let url = format!("http://{}/payload", listener.local_addr().unwrap());
-    let payload = json!({ "padding": "x".repeat(MODEL_BYTES * 2), "last": LAST_ITEM }).to_string();
-    let server = smol::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        payload.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(payload);
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
         let mut request = Vec::new();
         while !request.ends_with(b"\r\n\r\n") {
             let mut byte = [0];
-            stream.read_exact(&mut byte).await.unwrap();
+            stream.read_exact(&mut byte).unwrap();
             request.push(byte[0]);
         }
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
-            payload.len()
-        );
-        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.write_all(&response).unwrap();
     });
+    (url, server)
+}
+
+#[test]
+fn python_webfetch_parses_complete_response_text() {
+    let (_registry, _host, ctx) = setup();
+    let payload = json!({ "padding": "x".repeat(MODEL_BYTES * 2), "last": LAST_ITEM }).to_string();
+    let (url, server) = serve_once("application/json", payload.as_bytes());
     let code = format!(
         "data = json.loads(await webfetch(url={url:?}, format='text'))\nprint(data['last'])"
     );
     let output = python(&ctx, &code).unwrap();
-    smol::block_on(server);
+    server.join().unwrap();
     assert_eq!(output.trim(), LAST_ITEM);
+}
+
+#[test_case::test_case("markdown", LEGACY_HTML_TYPE, LATIN1_HTML, Ok(LOSSY_MARKDOWN) ; "legacy_html_to_markdown")]
+#[test_case::test_case("text", LEGACY_HTML_TYPE, LATIN1_HTML, Ok(LOSSY_TEXT) ; "legacy_html_to_text")]
+#[test_case::test_case("text", BINARY_TYPE, BINARY_PAYLOAD, Err(BINARY_ERROR) ; "binary_rejected")]
+fn webfetch_decodes_legacy_bytes_for_display(
+    format: &str,
+    content_type: &str,
+    payload: &[u8],
+    expected: Result<&str, &str>,
+) {
+    let (_registry, _host, ctx) = setup();
+    let (url, server) = serve_once(content_type, payload);
+    let output = run(&ctx, "webfetch", json!({ "url": url, "format": format }));
+    server.join().unwrap();
+    assert_eq!(
+        output.as_deref().map(str::trim).map_err(String::as_str),
+        expected
+    );
+}
+
+#[test_case::test_case("text" ; "stripped_html")]
+#[test_case::test_case("html" ; "raw_html")]
+fn webfetch_legacy_bytes_stay_within_the_output_budget(format: &str) {
+    let (_registry, _host, ctx) = setup();
+    let (url, server) = serve_once(LEGACY_HTML_TYPE, &[LATIN1_E_ACUTE; MODEL_BYTES * 2]);
+    let output = run(&ctx, "webfetch", json!({ "url": url, "format": format })).unwrap();
+    server.join().unwrap();
+    assert!(output.contains("[truncated"));
+    assert!(output.len() < MODEL_BYTES * 2);
 }
 
 #[test]

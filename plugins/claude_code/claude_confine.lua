@@ -6,7 +6,6 @@ local NO_STATE_DIR = "maki cannot find its state directory as a UTF-8 path for t
 
 -- Claude Code passes its environment to Bash, in the sandbox too (tested on
 -- 2.1.284), and the sandbox cannot drop a variable.
-local SHELL_TOOL = "Bash"
 -- Logins and keys under the home directory that the sandboxed shell cannot
 -- read. Without `CLAUDE_CONFIG_DIR`, Claude Code keeps its login in
 -- `.claude`, and its global state, MCP server `env` included, in
@@ -14,7 +13,7 @@ local SHELL_TOOL = "Bash"
 -- `mcp.toml`.
 local HOME_CREDENTIALS = {
   ".claude",
-  ".claude.json",
+  native.home_state_prefix,
   ".maki",
   ".config/maki",
   ".ssh",
@@ -73,16 +72,6 @@ local HOME_CREDENTIALS = {
 M.NO_HOME = "maki cannot find your home directory, so it cannot keep the coding worker's shell away from "
   .. "the logins and keys there. Set HOME, or use the read profile."
 
---- Returns why {worker} cannot run with {env}: its shell could read the
---- login token, or a proxy URL with a user or password in it. Names compare
---- in upper case, because `https_proxy` and the like reach the child too.
-function M.shell_secret_problem(worker, env)
-  if not path_utils.set_of(worker.tools)[SHELL_TOOL] then
-    return nil
-  end
-  return native.shell_secret_problem(env)
-end
-
 function M.denied_home_paths(extra)
   return path_utils.comma_list(extra, function(path)
     if path:sub(1, 1) == "/" or path:sub(1, 1) == "~" or path_utils.climbs(path) then
@@ -126,8 +115,8 @@ function M.home_credentials(home, extra, environ)
   if not state_files then
     return nil, "maki cannot inspect Claude Code state copies: " .. tostring(state_err)
   end
-  add(maki.fs.joinpath(home, ".claude.json*"))
-  add(maki.fs.joinpath(resolved_home, ".claude.json*"))
+  add(maki.fs.joinpath(home, native.home_state_prefix .. "*"))
+  add(maki.fs.joinpath(resolved_home, native.home_state_prefix .. "*"))
   for _, path in ipairs(state_files) do
     local resolved = maki.fs.realpath(maki.fs.joinpath(resolved_home, path))
     if resolved and not path_utils.within(resolved, resolved_home) then

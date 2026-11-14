@@ -11,6 +11,9 @@ A Lua package lets you add tools, commands, keybindings, and event handlers
 without copying its code into `init.lua`. Maki can load a package that you put
 on disk, or it can install one from a Git repository and lock it to one commit.
 
+Community packages are listed at [maki.sh/plugins](https://maki.sh/plugins/).
+A repository appears there when it has both the `maki` and `plugin` topics.
+
 A package directory holds sorted `plugin/*.lua` entry files, modules at
 `lua/<module>.lua` or `lua/<module>/init.lua`, and a `plugin.toml` manifest.
 The entry files share one environment and use the API the
@@ -168,6 +171,20 @@ Maki stores a package's [`net_hosts`](/docs/permissions/#plugin-egress-net-hosts
 with its approval. An update that widens the list or drops it asks again before
 it loads. An approval from before Maki stored hosts counts as every host, so
 adding a list to that package never prompts.
+
+A package that registers provider slugs lists them at the top level of
+`plugin.toml`:
+
+```toml
+providers = ["greenpt"]
+```
+
+Maki stores the names with the approval, and the install prompt says the
+package will receive the saved key for each name models.dev serves. An update
+that adds a name asks again. A load that registers a slug models.dev serves
+and the approval never covered is refused. List every slug the package
+registers, so a name models.dev adds later is already approved and the
+catalog client can never take over a working package's slug.
 
 An approval applies only to the same package name and source. Maki keeps
 approvals in `<maki-data>/site/pack-approvals.json`, where `<maki-data>` is the

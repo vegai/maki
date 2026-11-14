@@ -18,11 +18,25 @@ local SEPARATOR = "──────────────────"
 local BODY_INDENT = "  "
 local ANNOTATION_SEP = " · "
 local MARKDOWN_FORMAT = "markdown"
+-- Same floor as the host's plain text path. Errors and tools without a view
+-- end up in this fallback with no line count in their header, so a limit of
+-- 0 still shows their first line.
+local MIN_PLAIN_LINES = 1
 local ERROR_PREFIX = "[ERROR] "
 local EMPTY_ERROR = "provide at least one tool call"
 local NESTED_ERROR = "cannot nest batch inside batch"
 local CANCELLED_ERROR = "cancelled"
 local DISCARDED_ERROR = string.format("maximum of %d tools per batch", MAX_BATCH_SIZE)
+local WAITING_FMT = "batch is waiting on %s"
+local NOTHING_RUNNING = "batch has no running tool left to move"
+local MOVED_HEADER = "Still running in the background, each reports back as it finishes:"
+local BACKGROUND_PARAM = "background"
+local FOREGROUND_NOTE = "Could not start in the background (%s). Ran in the foreground.\n\n"
+local MOVED_ITEM_FMT = "- %s"
+local MOVED_ITEM_HEADER_FMT = ": %s"
+-- A subagent child is a task of its own. Without its id the model has no way
+-- to message or stop it alone.
+local MOVED_ITEM_TASK_FMT = " (task %s)"
 local SECTION_FMT = "## %s\n"
 local SECTION_PAT = "^## (.+)$"
 
@@ -40,6 +54,14 @@ local RESETTLE_FMT = "batch: child %s settled twice (%s -> %s)"
 
 local STATUS = { PENDING = "pending", RUNNING = "running", SUCCESS = "success", ERROR = "error" }
 local TERMINAL = { [STATUS.SUCCESS] = true, [STATUS.ERROR] = true }
+local PART_STATUS = {
+  [STATUS.PENDING] = "working",
+  [STATUS.RUNNING] = "working",
+  [STATUS.SUCCESS] = "done",
+  [STATUS.ERROR] = "error",
+}
+-- A child the stop cut short did not fail on its own, so it reads cancelled.
+local CANCELLED_PART = "cancelled"
 local INDICATOR = {
   [STATUS.PENDING] = { "○ ", "dim" },
   [STATUS.RUNNING] = { "· ", "spinner" },
@@ -132,6 +154,17 @@ local function normalize_entry(entry)
   return { tool = tool, params = params }
 end
 
+-- Whether {params} asks {tool} to run in the background. Only a tool that
+-- offers that input counts, since another tool may use `background` for
+-- something else.
+local function wants_background(tool, params)
+  if params[BACKGROUND_PARAM] ~= true then
+    return false
+  end
+  local t = maki.api.get_tool(tool)
+  return t ~= nil and table.find(t.background_params or {}, BACKGROUND_PARAM) ~= nil
+end
+
 --- Child presentation ------------------------------------------------------
 
 -- Let the child tool draw its own header. A tool with none, or a broken
@@ -173,7 +206,7 @@ local function child_body_buf(c, cctx)
     end
   end
   local tol = cctx.tool_output_lines
-  local opts = { max_lines = tol[c.tool] or tol.other, keep = "head" }
+  local opts = { max_lines = math.max(tol[c.tool] or tol.other, MIN_PLAIN_LINES), keep = "head" }
   if t and t.format == MARKDOWN_FORMAT then
     return ToolView.restore_markdown(output, is_error, opts)
   end
@@ -273,9 +306,10 @@ local function render_children(children)
 end
 
 -- batch_policy.rs pins this exact llm format; keep it byte-identical.
-local function render_llm(children)
+-- Returns the sections and how many of them failed, so the move receipt
+-- can reuse them without the summary line.
+local function render_sections(children)
   local out = {}
-  local total = #children
   local failed = 0
   for _, c in ipairs(children) do
     out[#out + 1] = string.format(SECTION_FMT, c.tool)
@@ -287,12 +321,16 @@ local function render_llm(children)
     end
     out[#out + 1] = "\n\n"
   end
+  return table.concat(out), failed
+end
+
+local function render_llm(children)
+  local total = #children
+  local sections, failed = render_sections(children)
   if failed > 0 then
-    out[#out + 1] = string.format(SUMMARY_MIXED_FMT, total - failed, total, failed)
-  else
-    out[#out + 1] = string.format(SUMMARY_ALL_OK_FMT, total)
+    return sections .. string.format(SUMMARY_MIXED_FMT, total - failed, total, failed)
   end
-  return table.concat(out)
+  return sections .. string.format(SUMMARY_ALL_OK_FMT, total)
 end
 
 local function to_state(children)
@@ -391,7 +429,8 @@ end
 function Batch:rerender()
   local lines, ranges = render_children(self.children)
   self.ranges = ranges
-  self.buf:set_lines(lines)
+  -- All head: a moved batch keeps drawing its children in its row.
+  self.buf:set_lines(lines, { head = #lines })
 end
 
 -- A child's buf keeps changing after we get it (async highlights land
@@ -453,13 +492,17 @@ end
 function Batch:settle(c, status, output)
   if TERMINAL[c.status] and not c.swept then
     -- tostring only placates Luau nonstrict: a non-literal format string rejects generic arguments.
-    error(string.format(RESETTLE_FMT, tostring(c.tool), c.status, status))
+    error(string.format(RESETTLE_FMT, tostring(c.tool), tostring(c.status), tostring(status)))
   end
   c.swept = nil
   c.status = status
   c.output = output
+  c.stopped = status == STATUS.ERROR and self.ctx:cancelled()
   self:attach_body(c)
+  self:report_finished()
   self:rerender()
+  self:publish_parts()
+  self:sync_movable()
 end
 
 function Batch:run_child(c, ctx)
@@ -470,13 +513,14 @@ function Batch:run_child(c, ctx)
   end
   c.status = STATUS.RUNNING
   self:rerender()
-  local text, err = maki.agent.call_tool(ctx, c.tool, c.params, {
+  local text, err, format = maki.agent.call_tool(ctx, c.tool, c.params, {
     output_mode = ctx:output_mode(),
     -- Clicks on a still-streaming child are a no-op: its click handler
     -- lives on the child's own handle, not on this wrapper buf.
     on_live_buf = function(b)
       self:watch(c, b)
       self:rerender()
+      self:publish_parts()
     end,
     on_annotation = function(a)
       self:annotate(c, a)
@@ -484,6 +528,14 @@ function Batch:run_child(c, ctx)
     on_usage = function(usage)
       c.usage = usage
       self:rerender()
+    end,
+    on_movable = function(movable)
+      c.movable = movable
+      self:sync_movable()
+    end,
+    on_task = function(id)
+      c.task_id = id
+      self:publish_parts()
     end,
   })
   -- The sweep may have settled this child mid-call, and the call knows
@@ -499,17 +551,141 @@ function Batch:run_child(c, ctx)
   if err then
     self:settle(c, STATUS.ERROR, err)
   else
+    c.format = format
     self:settle(c, STATUS.SUCCESS, text)
   end
 end
 
+-- The children a reply still owes the model. Before a move that is all of
+-- them. After one, only those the receipt did not already carry. A receipt
+-- the runtime refused after the hook built it never reached the model.
+function Batch:unreported()
+  local moved = self.ctx:backgrounded()
+  local out = {}
+  for _, c in ipairs(self.children) do
+    if not (moved and c.reported) then
+      out[#out + 1] = c
+    end
+  end
+  return out
+end
+
+function Batch:any_running()
+  for _, c in ipairs(self.children) do
+    if not TERMINAL[c.status] then
+      return true
+    end
+  end
+  return false
+end
+
+-- What the hook would answer now, so the row's hint shows only when a
+-- press would move the batch.
+function Batch:movable_now()
+  for _, c in ipairs(self.children) do
+    if not TERMINAL[c.status] and not c.movable then
+      return false
+    end
+  end
+  return self:any_running()
+end
+
+function Batch:sync_movable()
+  if not self.hooked then
+    return
+  end
+  local movable = self:movable_now()
+  if movable ~= self.shown_movable then
+    self.shown_movable = movable
+    self.ctx:set_movable(movable)
+  end
+  self:background_if_due()
+end
+
+-- A child cannot move on its own inside a batch. So when only children that
+-- asked for the background are still running, the batch moves itself for
+-- them, and the model gets the other results right away, just as if it had
+-- made those calls alone. It tries once. A batch that cannot move tells the
+-- model why in its reply.
+function Batch:background_if_due()
+  if self.move_tried or self.ctx:backgrounded() then
+    return
+  end
+  local asked = false
+  for _, c in ipairs(self.children) do
+    if not TERMINAL[c.status] then
+      if not (c.background and c.movable) then
+        return
+      end
+      asked = true
+    end
+  end
+  if not asked then
+    return
+  end
+  self.move_tried = true
+  maki.async.run(function()
+    local moved, err = self.ctx:background()
+    -- Everything finished in the meantime, so there is nothing to explain.
+    if not moved and err ~= NOTHING_RUNNING then
+      self.foreground_reason = err
+    end
+  end)
+end
+
+-- A moved batch's reply becomes a notice, and the transcript can only draw
+-- it as markdown when every child in it replied in markdown.
+local function all_markdown(children)
+  for _, c in ipairs(children) do
+    if c.format ~= MARKDOWN_FORMAT then
+      return false
+    end
+  end
+  return #children > 0
+end
+
 function Batch:reply()
+  local note = self.foreground_reason and string.format(FOREGROUND_NOTE, tostring(self.foreground_reason)) or ""
+  local children = self:unreported()
   return {
-    llm_output = render_llm(self.children),
+    llm_output = note .. render_llm(children),
+    format = all_markdown(children) and MARKDOWN_FORMAT or nil,
     is_error = self.cancelled,
     body = self.buf,
     state = to_state(self.children),
   }
+end
+
+local function header_text(c)
+  local parts = {}
+  for _, s in ipairs(c.header or {}) do
+    parts[#parts + 1] = s[1] or ""
+  end
+  return table.concat(parts)
+end
+
+-- Once the batch moves, each child gets its own row under it in `/tasks`,
+-- with its own body. A batch that can never move never gets a row, so it
+-- reports nothing. A subagent child already has a row of its own.
+function Batch:publish_parts()
+  if not self.hooked then
+    return
+  end
+  local parts = {}
+  for i, c in ipairs(self.children) do
+    if not c.task_id then
+      -- A bash call without a description has an empty title.
+      local header = header_text(c)
+      parts[#parts + 1] = {
+        id = tostring(i),
+        name = header ~= "" and header or c.tool,
+        tool = c.tool,
+        status = c.stopped and CANCELLED_PART or PART_STATUS[c.status],
+        body = c.buf,
+      }
+    end
+  end
+  self.ctx:set_parts(parts)
 end
 
 -- Whatever is still non-terminal becomes a {reason} child, so none is
@@ -521,6 +697,64 @@ function Batch:sweep_cancelled(reason)
       c.swept = true
     end
   end
+end
+
+-- Once the batch moved, a quick child should not wait for a slow one, so
+-- each finished child goes to the model on its own. We send every finished
+-- child not sent yet, not just the one that landed, because a child can
+-- finish while the move is still committing and nobody else would send it.
+-- The last child stays for the final reply, and so does everything after a
+-- stop, since that reply explains the stop. If the runtime refuses a child,
+-- it stays unsent and the final reply carries it.
+function Batch:report_finished()
+  if not self.ctx:backgrounded() or self.ctx:cancelled() or not self:any_running() then
+    return
+  end
+  for _, c in ipairs(self.children) do
+    if TERMINAL[c.status] and not c.reported then
+      c.reported = self.ctx:report_part({
+        tool = c.tool,
+        name = header_text(c),
+        output = c.output,
+        is_error = c.status == STATUS.ERROR,
+        format = c.format,
+      }) == true
+    end
+  end
+end
+
+-- The `ctx:on_background` hook: the whole batch task moves as one, so every
+-- child still running must be able to outlive the turn. Never yields, so the
+-- snapshot it reports is exact: a child that settles after it is listed as
+-- running and arrives on its own or with the final reply, see
+-- `report_finished`. Finished children are marked `reported` only once the
+-- receipt is built, so a decline leaves the batch untouched.
+function Batch:hand_over()
+  local finished, running = {}, {}
+  for _, c in ipairs(self.children) do
+    if TERMINAL[c.status] then
+      finished[#finished + 1] = c
+    elseif c.movable then
+      running[#running + 1] = c
+    else
+      return nil, string.format(WAITING_FMT, c.tool)
+    end
+  end
+  if #running == 0 then
+    return nil, NOTHING_RUNNING
+  end
+  local items = {}
+  for i, c in ipairs(running) do
+    local header = header_text(c)
+    items[i] = string.format(MOVED_ITEM_FMT, c.tool)
+      .. (c.task_id and string.format(MOVED_ITEM_TASK_FMT, c.task_id) or "")
+      .. (header ~= "" and string.format(MOVED_ITEM_HEADER_FMT, header) or "")
+  end
+  local sections = render_sections(finished)
+  for _, c in ipairs(finished) do
+    c.reported = true
+  end
+  return sections .. MOVED_HEADER .. "\n" .. table.concat(items, "\n")
 end
 
 function Batch:run(ctx)
@@ -561,7 +795,28 @@ local function handler(input, ctx)
   end
 
   local batch = Batch.new(children, child_ctx(ctx))
+  batch.ctx = ctx
   ctx:live_buf(batch.buf)
+  -- Registered up front, so a press that cannot move the batch is answered
+  -- with the blocking child's name, while `sync_movable` hides the hint.
+  -- Only a model's call can register. A nested batch simply never moves.
+  -- Registering shows the hint, and no child is running yet to back it.
+  batch.hooked = ctx:on_background(function()
+    return batch:hand_over()
+  end) == true
+  batch.shown_movable = batch.hooked
+  -- A batch that cannot move leaves the ask with the child, which then
+  -- explains for itself why it ran in the foreground.
+  if batch.hooked then
+    for _, c in ipairs(children) do
+      if wants_background(c.tool, c.params) then
+        c.background = true
+        c.params[BACKGROUND_PARAM] = nil
+      end
+    end
+  end
+  batch:publish_parts()
+  batch:sync_movable()
   batch:run(ctx)
 
   return batch:reply()
@@ -571,9 +826,7 @@ end
 local function legacy_restore(children, output, tol)
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, { max_lines = tol.other, keep = "head" })
-  local header = render_children(children)
-  append_separator(header)
-  view:set_header(header)
+  view:set_header(render_children(children))
   for _, line in ipairs(maki.split(output, "\n")) do
     view:append(BODY_INDENT .. line)
   end

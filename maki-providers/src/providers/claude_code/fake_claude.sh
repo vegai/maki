@@ -187,6 +187,50 @@ case $scenario in
   stalled_result | stalled_result_without_usage) init none; generation end_turn; while :; do line '{"type":"keep_alive"}'; sleep 0.2; done ;;
   overloaded) init none; line '{"type":"assistant","error":"unknown","is_api_error_message":true,"message":{"model":"<synthetic>","content":[{"type":"text","text":"Overloaded"}]}}'; line '{"type":"result","subtype":"success","is_error":true,"api_error_status":529,"result":"Overloaded"}'; sleep @WAIT_SECS@ ;;
   cli_retry) init none; event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-haiku-4-5-20251001\"$start_usage}}"; line '{"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"retry_delay_ms":500,"error_status":529,"error":"overloaded"}'; sleep @WAIT_SECS@ ;;
+  restarted)
+    init none
+    event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-haiku-4-5-20251001\"$start_usage}}"
+    event '{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}'
+    block '{"type":"thinking","thinking":"checking"}'
+    event '{"type":"content_block_stop","index":0}'
+    event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"model\":\"claude-haiku-4-5-20251001\"$start_usage}}"
+    sleep @WAIT_SECS@ ;;
+  abandoned)
+    init none
+    event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-haiku-4-5-20251001\"$start_usage}}"
+    event '{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}'
+    block '{"type":"thinking","thinking":"checking"}'
+    event '{"type":"content_block_stop","index":0}'
+    event '{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"mcp__maki__read","input":{}}}'
+    event '{"type":"content_block_stop","index":1}'
+    line '{"type":"stream_event","event":{"type":"message_stop"},"api_message_id":"msg_1","abandoned_blocks":{"api_message_id":"msg_1","from_block_index":1}}'
+    sleep @WAIT_SECS@ ;;
+  no_output | cut_before_output)
+    stop=end_turn; note='[Your previous response had no visible output. Please continue and produce a user-visible response.]'
+    [ "$scenario" = cut_before_output ] && stop=max_tokens && note='Output token limit hit. Resume directly.'
+    init none
+    event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-haiku-4-5-20251001\"$start_usage}}"
+    event '{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}'
+    block '{"type":"thinking","thinking":"checking"}'
+    event '{"type":"content_block_stop","index":0}'
+    event "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"$stop\"}$final_usage}"
+    event '{"type":"message_stop"}'
+    line "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"$note\"}]},\"isSynthetic\":true}"
+    event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"model\":\"claude-haiku-4-5-20251001\"$start_usage}}"
+    sleep @WAIT_SECS@ ;;
+  cut_call)
+    init none
+    event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-haiku-4-5-20251001\"$start_usage}}"
+    event '{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}'
+    event '{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Reading."}}'
+    block '{"type":"text","text":"Reading."}'
+    event '{"type":"content_block_stop","index":0}'
+    event '{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"mcp__maki__read","input":{}}}'
+    event "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}$final_usage}"
+    event '{"type":"message_stop"}'
+    line '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Output token limit hit. Resume directly."}]},"isSynthetic":true}'
+    event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"model\":\"claude-haiku-4-5-20251001\"$start_usage}}"
+    sleep @WAIT_SECS@ ;;
   truncated) init none; generation max_tokens; line '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Output token limit hit. Resume directly."}]},"isSynthetic":true}'; sleep @WAIT_SECS@ ;;
   context_overflow) init none; generation model_context_window_exceeded; sleep @WAIT_SECS@ ;;
   truncated_line) init none; printf '%s' '{"type":"assistant","message":' ;;

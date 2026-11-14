@@ -3,14 +3,19 @@ use std::sync::Arc;
 
 use maki_agent::tools::ToolRegistry;
 use maki_config::{
-    AgentConfig, ConfigField, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES,
-    DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, NetConfig, ProviderConfig, StorageConfig,
-    TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig,
+    AgentConfig, ConfigField, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES, NetConfig,
+    ProviderConfig, StorageConfig, TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig,
 };
 use maki_lua::{PluginHost, PluginOptionSpecs};
 
 use crate::gen_folder_trust::POLICY_EXAMPLE;
+use crate::gen_tools::SECTIONS as TOOL_SECTIONS;
 use crate::lua_util::in_registration_window;
+
+const OTHER_FIELD: &str = "other";
+const OTHER_TOOLS: &str = "Every other tool, MCP tools included";
+/// Fixed so the generated docs don't depend on the build machine's OS.
+const EXAMPLE_MOUSE_SCROLL_LINES: u32 = 5;
 
 type ExtraColumn = (&'static str, fn(&ConfigField) -> String);
 
@@ -113,6 +118,17 @@ fn write_theme_section(out: &mut String) {
          a warning.\n"
     )
     .unwrap();
+    writeln!(
+        out,
+        "To match a light or dark terminal, give a theme for each:\n\n\
+         ```lua\n\
+         theme = {{ light = \"catppuccin_latte\", dark = \"catppuccin_macchiato\" }}\n\
+         ```\n\n\
+         Maki asks the terminal for its background color once at startup, and \
+         uses `dark` if it gets no answer. Restart Maki after your terminal \
+         switches between light and dark.\n"
+    )
+    .unwrap();
     let names = maki_ui::BUNDLED_THEMES
         .iter()
         .map(|t| format!("`{}`", t.name))
@@ -128,6 +144,20 @@ fn write_theme_section(out: &mut String) {
     .unwrap();
     writeln!(
         out,
+        "User messages use `user` for the `you> ` prefix, `user_text` for the \
+         body, and `user_bg` for the full-width background behind both. \
+         `user_text` defaults to `assistant`, and `user_bg` to no background.\n\n\
+         ```toml\n\
+         # themes/<name>.toml\n\
+         [ui]\n\
+         user = {{ fg = \"blue\" }}\n\
+         user_text = {{ fg = \"foreground\" }}\n\
+         user_bg = {{ bg = \"#1d2021\" }}\n\
+         ```\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
         "Diff signs use `diff_old_sign` and `diff_new_sign`, which default to \
          `diff_old` and `diff_new`. These styles are applied after `code_block`, \
          so their properties take precedence. Diff gutters use \
@@ -137,10 +167,9 @@ fn write_theme_section(out: &mut String) {
     .unwrap();
     writeln!(
         out,
-        "The input caret uses `cursor` when the terminal has focus and \
-         `cursor_unfocused` when focus is lost. `cursor_unfocused` defaults \
-         to `cursor`, so themes only need it when the two should differ. \
-         Terminals that do not report focus events keep the focused caret.\n"
+        "The chat input uses your terminal's own cursor, in its shape and \
+         colors. The search, file, list and login pickers paint their caret \
+         with `cursor`.\n"
     )
     .unwrap();
     writeln!(
@@ -235,13 +264,61 @@ fn write_trust_section(out: &mut String) {
     .unwrap();
 }
 
+/// `files` is a list of file names and `overrides` a list of tables, which
+/// the `ConfigValue` table cannot describe, so these sections are prose like
+/// `trust`.
+fn write_instructions_section(out: &mut String) {
+    writeln!(out, "### `instructions`\n").unwrap();
+    writeln!(
+        out,
+        "Which instruction files Maki loads from each project directory. Read \
+         from the global `~/.config/maki/init.lua` only, since a project file \
+         that could pick its own instructions would be trusting itself.\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "`files` replaces the built-in list (`AGENTS.md`, `CLAUDE.md`, \
+         `.github/copilot-instructions.md`, and friends) with your own, in \
+         priority order. An empty list loads no project instruction files at \
+         all, and `AGENTS.local.md` still loads:\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "```lua\nmaki.setup({{\n    instructions = {{ files = {{ \"CLAUDE.md\" }} }},\n}})\n```\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "`overrides` narrows it per checkout, for when one repository wants a \
+         different answer. Each entry matches a checkout by `path` (a glob \
+          against the project root, `~` included, like `trust.paths`) or by \
+          `remote` (a glob against every git remote URL of the project, \
+          normalized to `host/path`: `https://host/a/b.git` and \
+          `git@host:a/b.git` both become `host/a/b`). When both are set, both \
+          must match; an entry with neither matches every project. The first \
+          matching entry wins, and one that sets no `files` still ends the \
+          search, keeping the global `files`:\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "```lua\nmaki.setup({{\n    instructions = {{\n        overrides = {{\n            {{ remote = \"github.com/example/*\", files = {{}} }},\n            {{ path = \"~/src/secret\", files = {{ \"CLAUDE.md\" }} }},\n        }},\n    }},\n}})\n```\n"
+    )
+    .unwrap();
+}
+
 fn write_telemetry_section(out: &mut String) {
     write_section(out, "[telemetry]", TelemetryConfig::FIELDS);
     writeln!(
         out,
-        "Every field also has an environment variable, shown in the Env \
-         column, and the variable wins. See [Telemetry](/docs/telemetry/) \
-         for the full picture.\n"
+        "The Env column names the matching environment variable. For \
+         `enabled`, the exporters, `metrics_include_*`, \
+         `log_user_prompts`, `log_tool_details` and `content_max_length`, \
+         the variable wins. Every other field is passed to the OpenTelemetry SDK and wins \
+         over its variable. See [Telemetry](/docs/telemetry/) for the full \
+         picture.\n"
     )
     .unwrap();
 }
@@ -250,14 +327,33 @@ fn write_tool_output_section(out: &mut String) {
     writeln!(out, "### `ui.tool_output_lines`\n").unwrap();
     writeln!(
         out,
-        "How many lines of output to show per tool in the UI. \
-         All values are `usize` with a minimum of {MIN_TOOL_OUTPUT_LINES}.\n"
+        "Lines of output a tool call shows before it collapses. Click the call \
+         to see all of it.\n\n\
+         With 0 you see only the header. The read, index and list tools default \
+         to 0, because their header already says how many lines or entries came \
+         back. Errors and MCP tools still show their first line.\n"
     )
     .unwrap();
-    writeln!(out, "| Field | Default |").unwrap();
-    writeln!(out, "|-------|---------|").unwrap();
-    for (name, default) in ToolOutputLines::FIELD_DEFAULTS {
-        writeln!(out, "| `{name}` | {default} |",).unwrap();
+    let mut tools: Vec<&str> = TOOL_SECTIONS
+        .iter()
+        .flat_map(|(_, names)| *names)
+        .copied()
+        .collect();
+    tools.sort_unstable();
+    writeln!(out, "| Field | Default | Tools |").unwrap();
+    writeln!(out, "|-------|---------|-------|").unwrap();
+    for (field, default) in ToolOutputLines::FIELD_DEFAULTS {
+        let covered = if *field == OTHER_FIELD {
+            OTHER_TOOLS.to_owned()
+        } else {
+            tools
+                .iter()
+                .filter(|t| ToolOutputLines::field_for(t) == *field)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        writeln!(out, "| `{field}` | {default} | {covered} |").unwrap();
     }
     writeln!(out).unwrap();
 }
@@ -329,7 +425,7 @@ All fields are optional. Typos in field names cause an error right away.
 
 ## Full Reference
 ",
-        mouse_scroll = DEFAULT_MOUSE_SCROLL_LINES + 2,
+        mouse_scroll = EXAMPLE_MOUSE_SCROLL_LINES,
         tol_bash = ToolOutputLines::DEFAULT.bash + 3,
         tol_read = ToolOutputLines::DEFAULT.read + 2,
         max_output_lines = DEFAULT_MAX_OUTPUT_LINES + 1000,
@@ -349,6 +445,7 @@ All fields are optional. Typos in field names cause an error right away.
     write_section(&mut out, "[storage]", StorageConfig::FIELDS);
     write_net_section(&mut out);
     write_trust_section(&mut out);
+    write_instructions_section(&mut out);
     write_telemetry_section(&mut out);
 
     writeln!(out, "## Plugins\n").unwrap();
@@ -415,17 +512,19 @@ Maki follows platform directory conventions. On Linux and macOS that is XDG. On 
 
 Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, folder trust, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\\maki` on Windows; that is separate from these runtime dirs.
 
-`~/.maki/` (or `%USERPROFILE%\\.maki\\`) is checked as a legacy fallback. If that directory still exists, maki uses it for everything until you migrate.
+`~/.maki/` (or `%USERPROFILE%\\.maki\\`) is the layout older versions used. Maki does not read it anymore.
 
-### Migrating from ~/.maki/
+### Moving from ~/.maki/
+
+Maki moves `~/.maki/` into the locations above on the first start that finds it, before it reads or writes anything else, and shows where the files went. Files maki writes go to state. Your own files (`init.lua`, `lua/`, `permissions.toml`, `mcp.toml`, `providers.toml`, `.env`, `AGENTS.md`, `pack-lock.json`, `commands/`, `skills/`, `themes/` and `providers/`) go to config. Logs go to logs. Caches are rebuilt.
+
+When both places hold the same file, folder trust and recent models are merged. For any other file maki keeps the copy written last and moves the other one to `~/.maki.bak/`. The exception is `permissions.toml`: older versions applied the one in `~/.config/maki/`, so that one stays.
+
+Maki does not move a `~/.maki/` that is a symlink, because it most likely points into a dotfiles repository. Run the move yourself, or retry one that failed, with:
 
 ```
 maki migrate xdg
 ```
-
-This safely moves sessions, auth, plans, memories, logs, and preferences to the platform locations above. Where both old and new files exist, they are merged (input history, model tiers, etc.). Nothing is deleted until it has been copied. At the end you get a summary of where everything lives now.
-
-Safe to run more than once.
 
 ## Personal Instructions
 
@@ -433,6 +532,7 @@ On top of the project instruction files Maki loads from the git root down to the
 
 - `AGENTS.local.md` in any of those project directories for per-directory preferences (gitignored)
 - `~/.config/maki/AGENTS.md` for preferences that apply to all projects
+- `instructions.files` in the global `init.lua` to replace the project file list, scoped per checkout with `instructions.overrides` (see [`instructions`](#instructions))
 
 All of these are added to the system prompt at the start of every session.
 

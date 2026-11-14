@@ -4,15 +4,16 @@ use std::sync::Arc;
 use crossterm::event::{KeyCode, KeyEvent};
 use maki_agent::command::CustomCommand;
 use maki_agent::{McpPromptInfo, McpSnapshotReader};
-use maki_lua::{LuaCommandInfo, LuaCommandReader, Missing, Permission, PluginReach};
+use maki_lua::{LuaCommandInfo, LuaCommandReader, Missing, Permission, PluginReach, SENDS_PROMPT};
 use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::{Config, Matcher, Nucleo, Utf32String};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
+use crate::components::input::{COMMAND_PREFIX, sent_text};
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 
@@ -20,8 +21,8 @@ const TICK_TIMEOUT_MS: u64 = 10;
 pub(crate) const USER_ONLY_SUFFIX: &str = " can only be run by you";
 const STARTS_TURNS: PluginAccess = PluginAccess::Needs(&[Permission::Agent]);
 /// A prompt starts a turn and adds to the transcript, like `maki.session.prompt`.
-pub const SUBMITS_PROMPT: PluginAccess =
-    PluginAccess::Needs(&[Permission::Agent, Permission::SessionWrite]);
+pub const SUBMITS_PROMPT: PluginAccess = PluginAccess::Needs(PROMPT_NEEDS);
+pub(crate) const PROMPT_NEEDS: &[Permission] = SENDS_PROMPT;
 const WRITES_SESSION: PluginAccess = PluginAccess::Needs(&[Permission::SessionWrite]);
 const CHANGES_SETTINGS: PluginAccess = PluginAccess::Needs(&[Permission::SessionSettings]);
 
@@ -44,10 +45,19 @@ pub enum PluginAccess {
     UserOnly,
 }
 
-/// Named, because the plugin is often an alias whose author never thought
-/// about what its target reaches.
-pub(crate) fn missing_refusal(command: &str, missing: &Missing) -> String {
-    format!("{command}: {missing}")
+impl PluginAccess {
+    /// Why {caller} may not do {what}, or `None` when it may. Every refusal a
+    /// plugin gets for something the user could have typed reads this way.
+    pub(crate) fn refusal(self, what: &str, caller: &PluginReach) -> Option<String> {
+        match self {
+            Self::Open => None,
+            Self::Needs(needed) => needed
+                .iter()
+                .find(|&&perm| !caller.is_allowed(perm))
+                .map(|&perm| Missing::Permission(perm).refusal(what)),
+            Self::UserOnly => Some(format!("{what}{USER_ONLY_SUFFIX}")),
+        }
+    }
 }
 
 pub struct BuiltinCommand {
@@ -70,9 +80,9 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "/new",
-        description: "Start a new session",
+        description: "Start a new session (! stops background tasks)",
         max_args: 0,
-        bang: false,
+        bang: true,
         plugin_access: WRITES_SESSION,
     },
     BuiltinCommand {
@@ -175,14 +185,14 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "/reload",
-        description: "Reload plugins and config",
+        description: "Reload plugins and config (! stops background tasks)",
         max_args: 0,
-        bang: false,
+        bang: true,
         plugin_access: PluginAccess::Open,
     },
     BuiltinCommand {
         name: "/trust",
-        description: "Trust this folder and load its shared project config",
+        description: "Trust this folder: load its project config and save project answers",
         max_args: 0,
         bang: false,
         plugin_access: PluginAccess::UserOnly,
@@ -366,7 +376,7 @@ impl CommandPalette {
                 self.close();
                 CommandAction::Consumed
             }
-            KeyCode::Enter => match self.confirm(&input.value()) {
+            KeyCode::Enter => match self.confirm(input.value()) {
                 Some(cmd) => {
                     self.close();
                     CommandAction::Execute(cmd)
@@ -391,6 +401,14 @@ impl CommandPalette {
         }
     }
 
+    /// The command Enter would run on {input}, looked up before it does.
+    pub fn enter_target(&mut self, input: &TextBuffer) -> Option<String> {
+        if !self.is_active(input) {
+            return None;
+        }
+        self.filtered.get(self.selected).map(|m| self.item_name(m))
+    }
+
     pub fn is_active(&mut self, input: &TextBuffer) -> bool {
         self.follow(input);
         self.is_open()
@@ -400,13 +418,22 @@ impl CommandPalette {
         !self.filtered.is_empty()
     }
 
+    /// `sync` always leaves a row picked, so a test that wants an Enter the
+    /// palette swallows has to catch up with {input} and take the pick away
+    /// by hand.
+    #[cfg(test)]
+    pub(crate) fn unselect(&mut self, input: &TextBuffer) {
+        self.follow(input);
+        self.selected = self.filtered.len();
+    }
+
     /// The box keeps one buffer for life and its version only climbs, so a
     /// version we have seen means text we already matched.
     fn follow(&mut self, input: &TextBuffer) {
         let version = Some(input.version());
         if self.synced_version != version {
             self.synced_version = version;
-            self.sync(&input.value());
+            self.sync(input.value());
         }
     }
 
@@ -421,7 +448,7 @@ impl CommandPalette {
             self.lua_commands = lua_snap.commands.clone();
             self.nucleo = Self::build_nucleo(&self.custom, &self.mcp_prompts, &self.lua_commands);
         }
-        let Some(stripped) = input.strip_prefix('/') else {
+        let Some(stripped) = sent_text(input).strip_prefix(COMMAND_PREFIX) else {
             self.filtered.clear();
             self.current_arg_count = 0;
             self.current_bang = false;
@@ -434,13 +461,9 @@ impl CommandPalette {
             .strip_suffix('!')
             .map_or((raw_word, false), |word| (word, true));
         self.current_bang = bang;
-        let trailing_space = stripped.ends_with(char::is_whitespace);
-
-        self.current_arg_count = if trailing_space {
-            parts.len()
-        } else {
-            parts.len().saturating_sub(1)
-        };
+        // Read off the trimmed text, so a space after the last word is no
+        // argument yet and the palette stays on the command Enter would run.
+        self.current_arg_count = parts.len().saturating_sub(1);
 
         self.nucleo.pattern.reparse(
             0,
@@ -598,7 +621,7 @@ impl CommandPalette {
     fn confirm(&self, input: &str) -> Option<ParsedCommand> {
         let item = self.filtered.get(self.selected)?;
         let name = self.item_name(item);
-        let args = input
+        let args = sent_text(input)
             .strip_prefix('/')
             .and_then(|s| s.split_once(char::is_whitespace))
             .map(|(_, a)| a.trim())
@@ -637,17 +660,10 @@ impl CommandPalette {
             CommandType::Lua(i) => {
                 return caller
                     .first_missing(&self.lua_commands[i].reach)
-                    .map(|missing| missing_refusal(&item.name, &missing));
+                    .map(|missing| missing.refusal(&item.name));
             }
         };
-        match access {
-            PluginAccess::Open => None,
-            PluginAccess::Needs(needed) => needed
-                .iter()
-                .find(|&&perm| !caller.is_allowed(perm))
-                .map(|&perm| missing_refusal(&item.name, &Missing::Permission(perm))),
-            PluginAccess::UserOnly => Some(format!("{}{USER_ONLY_SUFFIX}", item.name)),
-        }
+        access.refusal(&item.name, caller)
     }
 
     pub fn find_custom_command(&self, display_name: &str) -> Option<&CustomCommand> {
@@ -727,7 +743,8 @@ impl CommandPalette {
 
                 if selected {
                     let s = t.item_selected;
-                    let highlighted_name = self.build_highlighted_spans(&name, &m.indices, s);
+                    let highlighted_name =
+                        highlighted_spans(&name, &m.indices, s, t.item_match_selected);
                     let mut spans = vec![Span::styled(" ".repeat(PAD), s)];
                     spans.extend(highlighted_name);
                     spans.push(Span::styled(" ".repeat(name_pad), s));
@@ -735,7 +752,8 @@ impl CommandPalette {
                     spans.push(Span::styled(" ".repeat(PAD), s));
                     Line::from(spans)
                 } else {
-                    let highlighted_name = self.build_highlighted_spans(&name, &m.indices, t.item);
+                    let highlighted_name =
+                        highlighted_spans(&name, &m.indices, t.item, t.item_match);
                     let mut spans = vec![Span::raw(" ".repeat(PAD))];
                     spans.extend(highlighted_name);
                     spans.push(Span::raw(" ".repeat(name_pad)));
@@ -754,39 +772,39 @@ impl CommandPalette {
 
         Some(popup)
     }
+}
 
-    fn build_highlighted_spans(&self, text: &str, indices: &[u32], base: Style) -> Vec<Span<'_>> {
-        if indices.is_empty() {
-            return vec![Span::styled(text.to_string(), base)];
-        }
-
-        let t = theme::current();
-        let highlight = base
-            .fg(t.accent.fg.unwrap_or_default())
-            .add_modifier(Modifier::BOLD);
-
-        let mut spans = Vec::new();
-        let mut in_match = false;
-        let mut run = String::new();
-
-        for (i, ch) in text.chars().enumerate() {
-            let is_match = indices.binary_search(&(i as u32)).is_ok();
-            if is_match != in_match && !run.is_empty() {
-                spans.push(Span::styled(
-                    mem::take(&mut run),
-                    if in_match { highlight } else { base },
-                ));
-            }
-            in_match = is_match;
-            run.push(ch);
-        }
-
-        if !run.is_empty() {
-            spans.push(Span::styled(run, if in_match { highlight } else { base }));
-        }
-
-        spans
+fn highlighted_spans<'a>(
+    text: &str,
+    indices: &[u32],
+    base: Style,
+    highlight: Style,
+) -> Vec<Span<'a>> {
+    if indices.is_empty() {
+        return vec![Span::styled(text.to_string(), base)];
     }
+
+    let mut spans = Vec::new();
+    let mut in_match = false;
+    let mut run = String::new();
+
+    for (i, ch) in text.chars().enumerate() {
+        let is_match = indices.binary_search(&(i as u32)).is_ok();
+        if is_match != in_match && !run.is_empty() {
+            spans.push(Span::styled(
+                mem::take(&mut run),
+                if in_match { highlight } else { base },
+            ));
+        }
+        in_match = is_match;
+        run.push(ch);
+    }
+
+    if !run.is_empty() {
+        spans.push(Span::styled(run, if in_match { highlight } else { base }));
+    }
+
+    spans
 }
 
 #[cfg(test)]
@@ -797,6 +815,7 @@ mod tests {
     use maki_lua::PluginPermissions;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::{Color, Modifier};
     use test_case::test_case;
 
     fn empty_snapshot() -> McpSnapshotReader {
@@ -919,12 +938,15 @@ mod tests {
         assert_eq!(name, "/cd");
     }
 
-    #[test_case("/help ", false     ; "zero_arg_help_with_space")]
+    #[test_case("/help ", true      ; "zero_arg_help_with_space")]
+    #[test_case(" /help", true      ; "zero_arg_help_after_a_space")]
+    #[test_case("/help me", false   ; "zero_arg_help_with_an_arg")]
     #[test_case("/compact ", true   ; "compact_stays_active_with_space")]
     #[test_case("/cd ", true        ; "one_arg_cmd_with_space")]
     #[test_case("/cd ~/foo", true   ; "one_arg_cmd_mid_arg")]
     #[test_case("/cd  ~/foo", true  ; "one_arg_cmd_double_space")]
-    #[test_case("/cd ~/foo ", false ; "one_arg_cmd_second_space")]
+    #[test_case("/cd ~/foo ", true  ; "one_arg_cmd_second_space")]
+    #[test_case("/cd ~/foo bar", false ; "one_arg_cmd_two_args")]
     #[test_case("/btw hello world", true ; "btw_stays_active_with_many_args")]
     fn sync_respects_nargs(input: &str, expect_active: bool) {
         let p = synced(input);
@@ -938,8 +960,8 @@ mod tests {
     }
 
     #[test]
-    fn custom_command_without_args_hides_on_space() {
-        let p = synced_with_custom("/user:fix ", sample_custom());
+    fn custom_command_without_args_hides_on_an_arg() {
+        let p = synced_with_custom("/user:fix now", sample_custom());
         assert!(!p.is_open());
     }
 
@@ -1029,8 +1051,8 @@ mod tests {
     }
 
     #[test]
-    fn mcp_prompt_without_args_hides_on_space() {
-        let p = synced_with_prompts("/myserver:summarize ");
+    fn mcp_prompt_without_args_hides_on_an_arg() {
+        let p = synced_with_prompts("/myserver:summarize now");
         assert!(
             !p.filtered
                 .iter()
@@ -1265,7 +1287,8 @@ mod tests {
     /// A full name the input rules out empties the palette instead of leaving
     /// its fuzzy neighbors, which Enter would then run.
     #[test_case("/packdel! demo", true ; "bang_on_a_command_that_reads_one")]
-    #[test_case("/reload!", false      ; "bang_on_a_command_that_ignores_it")]
+    #[test_case("/reload!", true        ; "bang_on_reload")]
+    #[test_case("/exit!", false        ; "bang_on_a_command_that_ignores_it")]
     #[test_case("/cd one two", false   ; "more_args_than_the_command_takes")]
     fn bang_and_arg_count_decide_what_the_palette_offers(input: &str, active: bool) {
         assert_eq!(synced(input).is_open(), active);
@@ -1326,10 +1349,10 @@ mod tests {
         p.handle_key(key(KeyCode::Esc), &input);
         assert!(!p.is_active(&input));
 
-        input.set_value("/hel".into());
+        input.set_value("/hel");
         assert!(p.is_active(&input));
 
-        input.set_value("hello".into());
+        input.set_value("hello");
         assert!(!p.is_active(&input));
     }
 
@@ -1418,5 +1441,21 @@ mod tests {
             text.contains(&first_name),
             "window stayed scrolled after the filter shrank the list:\n{text}"
         );
+    }
+
+    #[test]
+    fn match_highlight_marks_only_the_matched_runs() {
+        let base = Style::new().fg(Color::Black).bg(Color::Yellow);
+        let highlight = base.add_modifier(Modifier::UNDERLINED);
+
+        let spans = highlighted_spans("abcd", &[1, 2], base, highlight);
+
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].content.as_ref(), "a");
+        assert_eq!(spans[1].content.as_ref(), "bc");
+        assert_eq!(spans[2].content.as_ref(), "d");
+        assert_eq!(spans[0].style, base);
+        assert_eq!(spans[1].style, highlight, "match keeps the selection bg");
+        assert_eq!(spans[2].style, base);
     }
 }

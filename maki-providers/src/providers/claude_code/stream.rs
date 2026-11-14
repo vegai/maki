@@ -16,7 +16,7 @@ use super::error::{
     Error, Problem, RATE_LIMITED, TOO_MANY_REQUESTS, UNKNOWN_ERROR, preview, shown,
 };
 use super::mcp::Handoff;
-use super::transcript::{BATCH_CALL_TOOL, BATCH_CALLS, BATCH_TOOL, Catalog, SERVER, USER_ROLE};
+use super::transcript::{BATCH_TOOL, Catalog, SERVER, USER_ROLE, map_batch_names};
 use crate::model::is_same_model;
 use crate::providers::anthropic::{LABEL_SESSION, LABEL_WEEK_ALL};
 use crate::{
@@ -44,6 +44,7 @@ const TOOL_PROGRESS_EVENT: &str = "tool_progress";
 const INIT_EVENT: &str = "init";
 const HOOK_STARTED_EVENT: &str = "hook_started";
 const API_RETRY_EVENT: &str = "api_retry";
+const THINKING_TOKENS_EVENT: &str = "thinking_tokens";
 const COMPACT_BOUNDARY_EVENT: &str = "compact_boundary";
 const TOOL_USE_STOP: &str = "tool_use";
 pub const TOOL_USE_BLOCK: &str = "tool_use";
@@ -77,6 +78,13 @@ const CUT_STOPS: [&str; 2] = [MAX_TOKENS_STOP, WINDOW_FULL_STOP];
 const TOOL_RESULT: &str = "tool_result";
 pub(super) const API_ERROR_STATUS: &str = "api_error_status";
 pub(super) const API_ERROR_MARK: &str = "is_api_error_message";
+/// Claude Code 2.1.318 sets it on the `message_stop` of a reply it gave up
+/// on partway, before it restarts the request.
+const ABANDONED_BLOCKS: &str = "abandoned_blocks";
+/// Marks a user event Claude Code wrote itself.
+const SYNTHETIC_MARK: &str = "isSynthetic";
+const ABANDONED_DETAIL: &str = "abandoned";
+const SYNTHETIC_DETAIL: &str = "synthetic";
 /// The plan status of a `rate_limit_event` once the plan's limit is used up.
 const PLAN_REJECTED: &str = "rejected";
 /// As 2.1.280 words it.
@@ -235,8 +243,22 @@ fn result_message(event: &Value) -> String {
     )
 }
 
-pub(super) fn result_failure(event: &Value) -> Option<String> {
-    failed_result(event).then(|| Error::Failed(result_message(event)).to_string())
+pub(super) fn result_failure(event: &Value) -> Option<Error> {
+    failed_result(event).then(|| Error::Failed(result_message(event)))
+}
+
+pub(super) fn generation_model<'a>(
+    message: &'a Value,
+    required: bool,
+    expected: &str,
+) -> Result<Option<&'a str>, Error> {
+    let model = message["model"].as_str();
+    if let Some(model) = model {
+        check_model(model, expected)?;
+    } else if required {
+        return Err(Error::NoModel);
+    }
+    Ok(model)
 }
 
 pub(crate) fn check_model(ran: &str, expected: &str) -> Result<(), Error> {
@@ -298,11 +320,14 @@ pub(crate) struct Turn<'a> {
     /// A reply that stopped with a block missing waits for the result too,
     /// which can name an API error as the cause.
     lost: Option<Error>,
+    /// Claude Code prompted the model again by itself, so the rest of its
+    /// output is a generation maki discards.
+    continued: bool,
     /// Kinds of the latest events, logged when the request fails.
     trace: VecDeque<(String, u32)>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wait {
     Startup,
     Idle,
@@ -467,9 +492,8 @@ impl Handshake {
         &mut self,
         event: &Value,
         plan_usage: &Mutex<Option<ProviderUsage>>,
-        accepted: bool,
     ) -> Result<Step, Error> {
-        let kind = classify(event, StreamMode::Provider, accepted)?;
+        let kind = classify(event, StreamMode::Provider, false)?;
         self.feed_kind(event, &kind, plan_usage)
     }
 
@@ -481,7 +505,10 @@ impl Handshake {
     ) -> Result<Step, Error> {
         Ok(match kind {
             EventKind::ControlResponse => {
-                if self.answer(&event["response"])? {
+                if self.answer(&event["response"], |account, settings, hooks| {
+                    checks::account_problem(account, &[checks::DEFAULT_MODE])
+                        .or_else(|| checks::policy_problem(settings, hooks, true))
+                })? {
                     Step::Ready
                 } else {
                     Step::Nothing
@@ -501,22 +528,29 @@ impl Handshake {
         })
     }
 
-    pub(crate) fn answer(&mut self, response: &Value) -> Result<bool, Error> {
+    pub(crate) fn answer(
+        &mut self,
+        response: &Value,
+        problem: impl FnOnce(&Value, &Value, &Value) -> Option<Problem>,
+    ) -> Result<bool, Error> {
         if !self.record(response)? {
             return Ok(false);
         }
-        self.check(
-            |account| checks::account_problem(account, &[checks::DEFAULT_MODE.to_owned()]),
-            |settings, hooks| checks::policy_problem(settings, hooks, true),
-        )?;
-        Ok(true)
+        match problem(
+            self.account(),
+            &self.answers[SETTINGS_ANSWER],
+            &self.answers[HOOKS_ANSWER],
+        ) {
+            Some(problem) => Err(Error::Check(problem)),
+            None => Ok(true),
+        }
     }
 
     pub(crate) fn account(&self) -> &Value {
         self.answers.get(ACCOUNT_ANSWER).unwrap_or(&Value::Null)
     }
 
-    pub(crate) fn record(&mut self, response: &Value) -> Result<bool, Error> {
+    fn record(&mut self, response: &Value) -> Result<bool, Error> {
         let id = response["request_id"].as_str().unwrap_or_default();
         if !HANDSHAKE.iter().any(|step| step.id == id) || self.answers.contains_key(id) {
             return Err(Error::StrayAnswer(id.to_owned()));
@@ -529,25 +563,7 @@ impl Handshake {
         }
         self.answers
             .insert(id.to_owned(), response["response"].clone());
-        Ok(self.answers.len() == HANDSHAKE.len())
-    }
-
-    pub(crate) fn check(
-        &self,
-        account_problem: impl FnOnce(&Value) -> Option<Problem>,
-        policy_problem: impl FnOnce(&Value, &Value) -> Option<Problem>,
-    ) -> Result<(), Error> {
-        for step in HANDSHAKE {
-            if !self.answers.contains_key(step.id) {
-                return Err(Error::NotAnswered(step.id.to_owned()));
-            }
-        }
-        match account_problem(self.account())
-            .or_else(|| policy_problem(&self.answers[SETTINGS_ANSWER], &self.answers[HOOKS_ANSWER]))
-        {
-            Some(problem) => Err(Error::Check(problem)),
-            None => Ok(()),
-        }
+        Ok(self.complete())
     }
 }
 
@@ -600,6 +616,7 @@ impl<'a> Turn<'a> {
             rejected: false,
             refusal: None,
             lost: None,
+            continued: false,
             trace: VecDeque::with_capacity(TRACE_LEN),
         }
     }
@@ -652,12 +669,18 @@ impl<'a> Turn<'a> {
 
     /// Claude Code then hands maki no call and tells the model to continue.
     /// A reply that filled the context window counts as cut too.
-    pub fn truncated(&self) -> bool {
+    fn truncated(&self) -> bool {
         self.is_complete()
             && self
                 .stop_reason
                 .as_deref()
                 .is_some_and(|reason| CUT_STOPS.contains(&reason))
+    }
+
+    /// Claude Code starts another generation by itself after the reply, so it
+    /// is killed before that one streams.
+    pub fn continues(&self) -> bool {
+        self.truncated() || self.continued
     }
 
     fn is_complete(&self) -> bool {
@@ -668,8 +691,9 @@ impl<'a> Turn<'a> {
         matches!(self.phase, Phase::Streaming | Phase::Complete)
     }
 
-    /// Kinds of the latest events, oldest first, as `type/subtype` or the API
-    /// event's type.
+    /// Kinds of the latest events, oldest first, as `type/subtype`. API events
+    /// add their generation id, block type or stop reason, so a log tells a
+    /// restarted reply from the reply itself.
     pub fn trace(&self) -> String {
         self.trace
             .iter()
@@ -688,16 +712,32 @@ impl<'a> Turn<'a> {
         let Some(outer) = event["type"].as_str() else {
             return;
         };
+        // Claude Code ticks it between thinking deltas, which would split their
+        // run and push the reply's structure out of the trace.
+        if outer == SYSTEM_EVENT && event["subtype"] == THINKING_TOKENS_EVENT {
+            return;
+        }
+        let inner = &event["event"];
         let kind = if outer == STREAM_EVENT {
-            event["event"]["type"].as_str().unwrap_or(STREAM_EVENT)
+            inner["type"].as_str().unwrap_or(STREAM_EVENT)
         } else {
             outer
         };
-        let subtype = (outer == kind).then(|| event["subtype"].as_str()).flatten();
+        let detail = match kind {
+            MESSAGE_START => inner["message"]["id"].as_str(),
+            BLOCK_START => inner["content_block"]["type"].as_str(),
+            MESSAGE_DELTA => inner["delta"]["stop_reason"].as_str(),
+            MESSAGE_STOP => event[ABANDONED_BLOCKS]
+                .is_object()
+                .then_some(ABANDONED_DETAIL),
+            USER_EVENT => (event[SYNTHETIC_MARK] == true).then_some(SYNTHETIC_DETAIL),
+            _ if outer == kind => event["subtype"].as_str(),
+            _ => None,
+        };
         if let Some((previous, count)) = self.trace.back_mut() {
-            let repeated = subtype.map_or_else(
+            let repeated = detail.map_or_else(
                 || previous == kind,
-                |subtype| previous.split_once('/') == Some((kind, subtype)),
+                |detail| previous.split_once('/') == Some((kind, detail)),
             );
             if repeated {
                 *count = count.saturating_add(1);
@@ -707,7 +747,7 @@ impl<'a> Turn<'a> {
         if self.trace.len() == TRACE_LEN {
             self.trace.pop_front();
         }
-        let kind = subtype.map_or_else(|| kind.to_owned(), |subtype| format!("{kind}/{subtype}"));
+        let kind = detail.map_or_else(|| kind.to_owned(), |detail| format!("{kind}/{detail}"));
         self.trace.push_back((kind, 1));
     }
 
@@ -719,10 +759,12 @@ impl<'a> Turn<'a> {
     }
 
     /// SIGTERM can turn held MCP calls into connection-closed results. They describe
-    /// cleanup of the completed handoff, and every other event still has to validate.
+    /// cleanup of the completed handoff. After Claude Code's own prompt to continue,
+    /// the rest belongs to a generation maki discards. Every other event still has
+    /// to validate.
     pub fn feed_stopping(&mut self, line: &str) -> Result<Step, Error> {
         let event = parse_event(line)?;
-        if self.closing_handoffs(&event) {
+        if self.continued || self.closing_handoffs(&event) {
             self.record_event(&event);
             return Ok(Step::Nothing);
         }
@@ -751,9 +793,16 @@ impl<'a> Turn<'a> {
                 });
                 Ok(Step::Nothing)
             }
+            EventKind::Stream if event[ABANDONED_BLOCKS].is_object() => Err(Error::Abandoned),
             EventKind::Stream => self.stream_event(&event["event"]),
             EventKind::Assistant => self.assistant(&mut event["message"]),
-            EventKind::User if self.truncated() && continuation(&event) => Ok(Step::Nothing),
+            EventKind::User
+                if self.is_complete()
+                    && (self.truncated() || !self.calls_tools())
+                    && continuation(&event) =>
+            {
+                self.resumed()
+            }
             EventKind::User if self.answers_calls(&event["message"], &REJECTIONS) => {
                 self.rejected = true;
                 self.settle()
@@ -775,8 +824,8 @@ impl<'a> Turn<'a> {
             event,
             self.expect.version,
             self.expect.cwd,
-            self.expect.tools,
-            &[checks::DEFAULT_MODE.to_owned()],
+            self.expect.tools.iter().map(String::as_str),
+            &[checks::DEFAULT_MODE],
             Some(SERVER),
         ) {
             return Err(Error::Check(problem));
@@ -807,8 +856,7 @@ impl<'a> Turn<'a> {
                 let Some(id) = message["id"].as_str().filter(|id| !id.is_empty()) else {
                     return Err(Error::NoGenerationId);
                 };
-                let ran = message["model"].as_str().ok_or(Error::NoModel)?;
-                check_model(ran, self.expect.model)?;
+                generation_model(message, true, self.expect.model)?;
                 self.message_id = Some(id.to_owned());
                 self.take_usage(&message["usage"], false);
                 Ok(Step::Nothing)
@@ -894,9 +942,7 @@ impl<'a> Turn<'a> {
     /// completed reply is frozen, because a later block could add a call that
     /// Claude Code never hands to maki.
     fn assistant(&mut self, message: &mut Value) -> Result<Step, Error> {
-        if let Some(ran) = message["model"].as_str() {
-            check_model(ran, self.expect.model)?;
-        }
+        generation_model(message, false, self.expect.model)?;
         if self.is_complete() {
             return Err(Error::LateContent);
         }
@@ -915,6 +961,7 @@ impl<'a> Turn<'a> {
                 Some(THINKING_BLOCK) => ContentBlock::Thinking {
                     thinking: text_field(block, THINKING_BLOCK),
                     signature: None,
+                    reasoning_id: None,
                 },
                 Some(REDACTED_THINKING_BLOCK) => ContentBlock::RedactedThinking {
                     data: text_field(block, "data"),
@@ -1004,9 +1051,23 @@ impl<'a> Turn<'a> {
         self.refusal.is_some() || self.lost.is_some()
     }
 
+    /// Claude Code continues by itself after a cut reply or one with no
+    /// visible output. No result follows to explain a block still missing,
+    /// and otherwise the reply is done as it streamed.
+    fn resumed(&mut self) -> Result<Step, Error> {
+        if let Some(error) = self.take_refusal() {
+            return Err(error);
+        }
+        self.continued = true;
+        Ok(Step::Done)
+    }
+
     /// The handoff must be a call from the reply, with the same tool and
     /// arguments.
     pub fn park(&mut self, handoff: Handoff) -> Result<Step, Error> {
+        if self.continued {
+            return Ok(Step::Nothing);
+        }
         let (tool_use_id, name, arguments) = match handoff {
             Handoff::Parked {
                 tool_use_id: Some(id),
@@ -1043,13 +1104,17 @@ impl<'a> Turn<'a> {
             return Ok(Step::Nothing);
         }
         // Claude Code sends blocks before `message_stop`, except those its output filter
-        // removes. Wait for the result to explain any other absent block.
+        // removes and a last call or thinking block the output cap cut, which it never
+        // sends. Wait for the result to explain any other absent block.
         let sendable = self
             .started
             .iter()
             .filter(|text| !text.as_ref().is_some_and(StreamedText::dropped))
             .count();
-        if self.blocks.len() != sendable {
+        let cut = self.truncated()
+            && self.blocks.len() + 1 == sendable
+            && matches!(self.started.last(), Some(None));
+        if self.blocks.len() != sendable && !cut {
             self.lost.get_or_insert(Error::BlockCount {
                 started: self.started.len(),
                 sent: self.blocks.len(),
@@ -1151,18 +1216,22 @@ impl<'a> Turn<'a> {
                 unexpose_batch(self.catalog, input);
             }
         }
+        let message = Message {
+            role: Role::Assistant,
+            content: blocks,
+            ..Default::default()
+        };
+        if stop_reason == StopReason::MaxTokens && message.first_text_content().is_none() {
+            return Err(Error::CutBeforeOutput(output));
+        }
         Ok(StreamResponse {
             input_transformations: Vec::new(),
-            message: Message {
-                role: Role::Assistant,
-                content: blocks,
-                ..Default::default()
-            },
+            message,
             usage: TokenUsage {
-                input,
-                output,
-                cache_creation,
-                cache_read,
+                input: input.into(),
+                output: output.into(),
+                cache_creation: cache_creation.into(),
+                cache_read: cache_read.into(),
                 cost: None,
             },
             stop_reason: Some(stop_reason),
@@ -1173,25 +1242,7 @@ impl<'a> Turn<'a> {
 /// The model names a batch's calls as Claude Code shows the tools, but maki
 /// runs them by its own names. An unknown name stays, so maki reports it.
 fn unexpose_batch(catalog: &Catalog, input: &mut Value) {
-    let Some(calls) = input.get_mut(BATCH_CALLS) else {
-        return;
-    };
-    if let Value::String(encoded) = calls
-        && let Ok(decoded) = serde_json::from_str::<Value>(encoded)
-        && (decoded.is_array() || decoded.is_object())
-    {
-        *calls = decoded;
-    }
-    let unexpose = |call: &mut Value| {
-        if let Some(exposed) = call[BATCH_CALL_TOOL].as_str() {
-            call[BATCH_CALL_TOOL] = Value::from(catalog.maki_name_or_made_up(exposed));
-        }
-    };
-    if let Value::Array(calls) = calls {
-        calls.iter_mut().for_each(unexpose);
-    } else if calls.is_object() {
-        unexpose(calls);
-    }
+    map_batch_names(input, |name| catalog.maki_name_or_made_up(name).to_owned());
 }
 
 struct Refusal {
@@ -1204,10 +1255,10 @@ fn status_of(status: &Value) -> Option<u16> {
     status.as_u64().and_then(|s| u16::try_from(s).ok())
 }
 
-/// The prompt Claude Code writes itself after a reply hits its limit. It
-/// holds only text, so it answers no tool call.
+/// The prompt Claude Code writes itself after a reply hits its limit or
+/// shows nothing. It holds only text, so it answers no tool call.
 fn continuation(event: &Value) -> bool {
-    event["isSynthetic"] == true
+    event[SYNTHETIC_MARK] == true
         && event["message"]["content"]
             .as_array()
             .is_some_and(|blocks| blocks.iter().all(|block| block["type"] == TEXT_BLOCK))
@@ -1269,15 +1320,17 @@ mod tests {
     };
     use super::super::error::Error;
     use super::super::mcp::Handoff;
-    use super::super::transcript::Catalog;
+    use super::super::transcript::{BATCH_CALL_TOOL, BATCH_CALLS, Catalog};
     use super::{
-        ACCOUNT_ANSWER, API_ERROR_MARK, API_ERROR_STATUS, BATCH_CALL_TOOL, BATCH_CALLS, BATCH_TOOL,
-        BLOCK_DELTA, EXTRA_USAGE, EXTRA_USAGE_IN_USE, EventKind, HOOKS_ANSWER, Handshake,
-        INIT_EVENT, INPUT_REJECTED, MAX_TOKENS_STOP, MAX_TURNS_ERROR, MCP_CLOSED, NO_SUCH_TOOL,
+        ABANDONED_BLOCKS, ACCOUNT_ANSWER, API_ERROR_MARK, API_ERROR_STATUS, ASSISTANT_EVENT,
+        BATCH_TOOL, BLOCK_DELTA, BLOCK_START, BLOCK_STOP, EXTRA_USAGE, EXTRA_USAGE_IN_USE,
+        EventKind, HOOKS_ANSWER, Handshake, INIT_EVENT, INPUT_REJECTED, MAX_TOKENS_STOP,
+        MAX_TURNS_ERROR, MCP_CLOSED, MESSAGE_DELTA, MESSAGE_START, MESSAGE_STOP, NO_SUCH_TOOL,
         PLAN_REJECTED, RATE_LIMIT_EVENT, RATE_LIMITED, REFUSAL_STOP, RESULT_EVENT, SETTINGS_ANSWER,
-        SHOWN_TOOL_ERROR_CHARS, STREAM_EVENT, SUCCESS, SYSTEM_EVENT, Step, StreamMode,
-        StreamedText, TOOL_RESULT, TOOL_USE_STOP, TRACE_LEN, Turn, WINDOW_FULL_STOP, answered,
-        classify, result_failure, unexpose_batch, usage_of, user_message,
+        SHOWN_TOOL_ERROR_CHARS, STREAM_EVENT, SUCCESS, SYNTHETIC_DETAIL, SYSTEM_EVENT, Step,
+        StreamMode, StreamedText, THINKING_BLOCK, THINKING_TOKENS_EVENT, TOOL_RESULT,
+        TOOL_USE_STOP, TRACE_LEN, Turn, USER_EVENT, WINDOW_FULL_STOP, answered, classify,
+        result_failure, unexpose_batch, usage_of, user_message,
     };
     use crate::{ContentBlock, StopReason, StreamResponse};
 
@@ -1300,6 +1353,10 @@ mod tests {
     /// As 2.1.284 and the API word them.
     const REFUSAL_EXPLANATION: &str = "This request triggered restrictions on violative cyber content and was blocked under Anthropic's Usage Policy.";
     const CLASSIFIER_NOTE: &str = "Your response above was stopped by a safety classifier. Do not produce that content again, even reworded.";
+    /// As 2.1.310 starts its prompt after a cut reply.
+    const OUTPUT_LIMIT_NOTE: &str = "Output token limit hit. Resume directly.";
+    /// As 2.1.310 prompts after a reply with no visible output.
+    const NO_OUTPUT_NOTE: &str = "[Your previous response had no visible output. Please continue and produce a user-visible response.]";
     const UNASKED: &str = "unasked";
     const ANSWERED: &str = "Claude Code sent the request again without a stream after the stream error, then gave the result of the tool call that it made";
     const ERROR_CHARACTER: &str = "é";
@@ -1445,8 +1502,7 @@ mod tests {
             super::super::worker::WorkerStream::new(
                 VERSION.into(),
                 Path::new(CWD).to_owned(),
-                Vec::new(),
-                Vec::new()
+                &serde_json::from_value(json!({"deny": []})).unwrap()
             )
             .feed(line)
             .is_err()
@@ -1535,7 +1591,7 @@ mod tests {
         assert!(matches!(step, Ok(Step::Done)), "{step:?}");
         let response = response.unwrap().unwrap();
         assert!(matches!(response.message.content.as_slice(), [
-            ContentBlock::Thinking { thinking, signature: None },
+            ContentBlock::Thinking { thinking, signature: None, reasoning_id: None },
             ContentBlock::Text { text }
         ] if thinking == "checking" && text == "done"));
     }
@@ -1546,6 +1602,7 @@ mod tests {
     #[test_case(json!({ "type": "system", "subtype": "hook_started", "hook_event": "Stop" }).to_string() => matches Err(Error::HookStarted(_)) ; "a_hook")]
     #[test_case(json!({ "type": "system", "subtype": "compact_boundary" }).to_string() => matches Err(Error::Compacted) ; "a_compaction")]
     #[test_case(start() => matches Err(Error::SecondGeneration) ; "a_second_start")]
+    #[test_case(json!({ "type": STREAM_EVENT, "event": { "type": MESSAGE_STOP }, ABANDONED_BLOCKS: { "api_message_id": MESSAGE_ID, "from_block_index": 0 } }).to_string() => matches Err(Error::Abandoned) ; "an_abandoned_reply")]
     #[test_case(assistant(json!({ "type": "image", "source": {} })) => matches Err(Error::UnreadableBlock(_)) ; "an_image_block")]
     #[test_case(assistant(json!({ "type": "tool_use", "id": "toolu_x", "name": "", "input": {} })) => matches Err(Error::NotOffered(_)) ; "a_call_without_a_name")]
     #[test_case(json!({ "type": "result", "subtype": "error_during_execution", "is_error": true, "result": "usage limit reached" }).to_string() => matches Err(Error::Failed(_)) ; "an_error_result")]
@@ -1853,7 +1910,45 @@ mod tests {
     }
 
     fn classifier_note() -> String {
-        json!({ "type": "user", "isSynthetic": true, "message": { "role": "user", "content": [{ "type": "text", "text": CLASSIFIER_NOTE }] } }).to_string()
+        synthetic_note(CLASSIFIER_NOTE)
+    }
+
+    fn synthetic_note(text: &str) -> String {
+        json!({ "type": "user", "isSynthetic": true, "message": { "role": "user", "content": [{ "type": "text", "text": text }] } }).to_string()
+    }
+
+    /// The output cap cuts at most the last block, a call Claude Code never
+    /// sends. Its own prompt to continue then ends the reply.
+    #[test_case(1 => matches Ok(Step::Done) ; "one_cut_call")]
+    #[test_case(2 => matches Err(Error::BlockCount { .. }) ; "two_missing_calls")]
+    fn a_cut_reply_may_miss_only_its_last_block(missing: usize) -> Result<Step, Error> {
+        let mut lines = vec![start()];
+        lines.extend(streamed(json!({ "type": "text", "text": "Reading." })));
+        lines.extend((0..missing).map(|_| {
+            stream(json!({ "type": "content_block_start", "content_block": call(FIRST_CALL, "a") }))
+        }));
+        lines.extend(stop(MAX_TOKENS_STOP));
+        lines.push(synthetic_note(OUTPUT_LIMIT_NOTE));
+        run(&lines, Vec::new(), false).0
+    }
+
+    /// Claude Code prompts the model again by itself after a reply that shows
+    /// nothing. maki ends the reply there, and one the output cap cut before
+    /// it showed anything fails.
+    #[test_case(END_TURN, NO_OUTPUT_NOTE => matches Ok(StreamResponse { stop_reason: Some(StopReason::EndTurn), .. }) ; "only_thinking")]
+    #[test_case(MAX_TOKENS_STOP, OUTPUT_LIMIT_NOTE => matches Err(Error::CutBeforeOutput(42)) ; "cut_while_thinking")]
+    fn a_reply_without_visible_output_ends_at_claude_codes_own_prompt(
+        reason: &str,
+        note: &str,
+    ) -> Result<StreamResponse, Error> {
+        let mut lines = reply(
+            &[json!({ "type": THINKING_BLOCK, "thinking": "checking" })],
+            reason,
+        );
+        lines.push(synthetic_note(note));
+        let (step, response) = run(&lines, Vec::new(), false);
+        assert!(matches!(step, Ok(Step::Done)), "{step:?}");
+        response.unwrap()
     }
 
     /// The safety classifier's stop ends the request before Claude Code adds
@@ -1897,6 +1992,48 @@ mod tests {
                     INIT_EVENT
                 )
             );
+        });
+    }
+
+    #[test]
+    fn event_trace_names_each_generation_and_its_stop() {
+        let mut lines = reply(
+            &[json!({ "type": THINKING_BLOCK, "thinking": "checking" })],
+            END_TURN,
+        );
+        lines.push(synthetic_note(NO_OUTPUT_NOTE));
+        lines.push(stream(
+            json!({ "type": MESSAGE_START, "message": { "id": OTHER_MESSAGE_ID, "model": RAN } }),
+        ));
+        with_turn(|mut turn| {
+            turn.trace.clear();
+            for line in &lines {
+                turn.record_event(&serde_json::from_str::<Value>(line).unwrap());
+            }
+            assert_eq!(
+                turn.trace(),
+                format!(
+                    "{MESSAGE_START}/{MESSAGE_ID} {BLOCK_START}/{THINKING_BLOCK} {ASSISTANT_EVENT} \
+                     {BLOCK_STOP} {MESSAGE_DELTA}/{END_TURN} {MESSAGE_STOP} \
+                     {USER_EVENT}/{SYNTHETIC_DETAIL} {MESSAGE_START}/{OTHER_MESSAGE_ID}"
+                )
+            );
+        });
+    }
+
+    #[test]
+    fn event_trace_skips_thinking_progress_between_deltas() {
+        with_turn(|mut turn| {
+            turn.trace.clear();
+            for _ in 0..TRACE_LEN {
+                turn.record_event(
+                    &json!({ "type": STREAM_EVENT, "event": { "type": BLOCK_DELTA } }),
+                );
+                turn.record_event(
+                    &json!({ "type": SYSTEM_EVENT, "subtype": THINKING_TOKENS_EVENT }),
+                );
+            }
+            assert_eq!(turn.trace(), format!("{BLOCK_DELTA}*{TRACE_LEN}"));
         });
     }
 
@@ -2341,9 +2478,33 @@ mod tests {
     #[test_case(ASKED => matches Ok(Step::Nothing) ; "the_model_itself")]
     #[test_case(OPUS => matches Err(Error::OtherModel { .. }) ; "another_model")]
     #[test_case("claude-haiku-4-5-1" => matches Err(Error::OtherModel { .. }) ; "a_point_release")]
-    #[test_case("" => matches Err(Error::OtherModel { .. }) ; "no_model")]
+    #[test_case("" => matches Err(Error::OtherModel { .. }) ; "empty_model")]
     fn a_generation_must_run_the_model_asked_for(model: &str) -> Result<Step, Error> {
         run(&[start_as(model)], Vec::new(), false).0
+    }
+
+    #[test]
+    fn a_generation_without_a_model_is_refused() {
+        let mut event: Value = serde_json::from_str(&start()).unwrap();
+        event["event"]["message"]
+            .as_object_mut()
+            .unwrap()
+            .remove("model");
+        assert!(matches!(
+            run(&[event.to_string()], Vec::new(), false).0,
+            Err(Error::NoModel)
+        ));
+    }
+
+    #[test_case(RAN, true ; "same_model")]
+    #[test_case(OPUS, false ; "different_model")]
+    fn an_assistant_event_must_keep_the_requested_model(model: &str, accepted: bool) {
+        let assistant = json!({ "type": "assistant", "message": { "id": MESSAGE_ID, "model": model, "content": [] } });
+        let result = run(&[start(), assistant.to_string()], Vec::new(), false).0;
+        assert_eq!(result.is_ok(), accepted);
+        if !accepted {
+            assert!(matches!(result, Err(Error::OtherModel { .. })));
+        }
     }
 
     fn handoff_turn(turn: &mut Turn<'_>, complete: bool, held: bool) {

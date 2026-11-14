@@ -29,7 +29,7 @@ Maki builds the system prompt and tool definitions once per session and sends th
 
 When something changes mid-session (the date, the model, plan mode, the directory after `/cd`, a new memory tag), Maki appends a short update before your next message.
 
-A fresh prompt is built only on compaction, or for a change an update cannot carry: different tools (`/reload`, `/workflow`, a model with other capabilities) or a different system prompt passed in [headless](../headless/) mode. Such a change starts the cache over, and Maki tells you when it happens.
+A fresh prompt is built only on compaction, or for a change an update cannot carry: different tools (`/reload`, `/workflow`, a model with other capabilities) or a resume with different [`--system-prompt` or `--append-system-prompt`](/docs/cli/#shared-flags-detail) text. Such a change starts the cache over, and Maki tells you when it happens.
 
 Claude binds each thinking block to the prompt it was written under. Accounts that enforce this reject a request whose prompt moved under earlier thinking. When that happens Maki drops all earlier thinking once, tells you, and the session goes on. Later thinking is bound to the new prompt.
 
@@ -93,8 +93,7 @@ context updates, including with a complete main template. Changing the static
 system or plan replacement policy starts an announced new request frame.
 A changed plan prompt applies when the agent next enters plan mode.
 Side questions use the stored frame when one exists.
-An explicit SDK system-prompt override takes precedence over a plugin's main
-template.
+`--system-prompt` wins over a plugin's main template.
 
 Prompt text does not change tool permissions, plan-mode restrictions, or
 instruction-file discovery. Select tools through plugin configuration and
@@ -130,6 +129,25 @@ After the match it always loads `AGENTS.local.md` from the same directory if pre
 That `web/AGENTS.md` is not dead weight. The first time the agent `read`s a file under a subdirectory whose instruction file was never loaded, Maki pulls it in. Monorepo rules live next to the code they govern and cost nothing until someone works there.
 
 Put coding conventions, repo quirks, and off-limits directories in these files. Keep them short; the next section explains why.
+
+### Your own file list
+
+The table above is the default. `instructions.files` in the global `~/.config/maki/init.lua` replaces it, and `instructions.overrides` narrows it per checkout. Both are personal settings, so a project `init.lua` cannot set them:
+
+```lua
+maki.setup({
+    -- Only load CLAUDE.md, wherever it exists:
+    instructions = {
+        files = { "CLAUDE.md" },
+        -- Except in this checkout, where no project file loads at all:
+        overrides = {
+            { remote = "github.com/example/*", files = {} },
+        },
+    },
+})
+```
+
+An empty `files` list skips every project instruction file, and `AGENTS.local.md` still loads. An `overrides` entry matches by `path` (a glob against the project root) or by `remote` (a glob against the project's git remotes, normalized to `host/path`); an entry with neither matches every project. The first matching entry wins, and one that sets no `files` still ends the search. See [configuration](/docs/configuration/#instructions).
 
 ## Four places to put knowledge
 
@@ -167,12 +185,12 @@ The popup takes these keys only while it is open. Otherwise `↑` and `↓` stil
 
 The inserted path is plain text in your message. Nothing is attached or read until the agent calls `read`.
 
-The plugin is off by default while its file index is tested on large repositories. Turn it on in `init.lua`:
+The popup is on by default. To turn it off, set this in `init.lua`:
 
 ```lua
 maki.setup({
   plugins = {
-    completion = { enabled = true },
+    completion = { enabled = false },
   },
 })
 ```
@@ -183,9 +201,9 @@ Plugins can add their own entries to the popup, such as issues after `#` or peop
 
 ## When the window fills
 
-Long sessions eventually approach the model's context limit. Maki reserves a slice of the window (`agent.compaction_buffer`, default 20%) and before running out it summarizes the older turns and continues from the summary. `/compact` triggers it early, `/compact keep the repro steps` steers that one summary, `/usage` shows where the tokens went, and `agent.compaction_instructions` steers every summary.
+Long sessions eventually approach the model's context limit. Maki reserves a slice of the window (`agent.compaction_buffer`, default 20%) and before running out it summarizes the older turns and continues from the summary. `/compact` triggers it early, `/compact keep the repro steps` steers that one summary, `/usage` shows where the tokens went, and `agent.compaction_instructions` steers every summary. The [compaction tier](/docs/providers/) model writes the summary when one is set. If the summary comes back empty twice, the session stays as it was.
 
-Compaction replaces the older turns in the session's on-disk log with the summary. The dropped turns are not lost: before the rewrite, Maki parks the previous log at `sessions/archive/<session-id>/<n>.jsonl` in the [state directory](/docs/configuration/#directory-layout). It keeps the newest three per session, and at most 32 MB of them. The names count up, so the highest number is the newest.
+Compaction replaces the older turns in the session's on-disk log with the summary. The dropped turns are not lost: before the rewrite, Maki parks the previous log at `sessions/archive/<session-id>/<n>.jsonl` in the [state directory](/docs/configuration/#directory-layout). It holds the dropped turns with their subagent transcripts and tool output, which the live session no longer keeps. Archives stay until you delete the session. The highest number is the newest.
 
 An archive is a complete session file, so `jq` or an editor reads it as it is. To open one in Maki you have to put it back in place of the live log, which drops the session's current state, so move that out of the way first:
 
@@ -200,20 +218,24 @@ maki -r <session-id>
 
 ## Background tasks
 
-By default the [`task`](/docs/tools/#task) tool waits for its subagent. Turn on `allow_background` and the model gets a `background` input:
+The [`task`](/docs/tools/#task) tool has a `background` input. To make every task wait for its subagent, turn it off:
 
 ```lua
 maki.setup({
     plugins = {
-        task = { allow_background = true },
+        task = { allow_background = false },
     },
 })
 ```
 
 With `background = true` the tool answers right away and the parent keeps working. To wait, the parent ends its turn. When the subagent is done, its result arrives as a notice that wakes the parent. Structured output and the partial output of an interrupted run come back the same way.
 
+The receipt names the task id. The parent can pass it to `task_message` to tell a running task something new, like a fresh lead or "wrap up now". The task reads it after its current step as a message from its parent, not the user, and a task still waiting for a slot reads it with its first prompt. Only the chat that started a task can reach it, and a stopped or finished task refuses.
+
+Tasks started in one `batch` move together. The batch id reaches all of them at once, and each task also has an id of its own. See [Background Tasks](/docs/background-tasks/#let-the-model-start-tasks).
+
 To stop a task, open `/tasks`, select it, and press Ctrl+S. The parent still gets the result on its next turn, but the notice does not wake it.
 
-Background and blocking tasks share `plugins.task.max_concurrent`. A background task cannot ask for permission, so its tools need [allow rules](/docs/permissions/) or YOLO. Plan mode still blocks its file writes. Closing the chat or reloading plugins stops the chat's background tasks. Headless, SDK, and ACP runs have no live chat to deliver to, so there the call blocks as usual.
+Background and blocking tasks share `plugins.task.max_concurrent`. Plan mode still blocks its file writes. [Background Tasks](/docs/background-tasks/) covers permission prompts, what stops a task, and headless runs.
 
 Related: [Token Economy](/docs/token-economy/) for why all this frugality exists, [Configuration](/docs/configuration/) for the knobs.

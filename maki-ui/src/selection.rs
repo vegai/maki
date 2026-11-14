@@ -32,12 +32,13 @@ use std::ops::Range;
 use std::time::Instant;
 
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::Line;
 
 use unicode_width::UnicodeWidthStr;
 
+use crate::components::scrollbar::Thumbs;
 use crate::repaint::Cadence;
 use crate::theme;
 use crate::wrap::{self, Break};
@@ -333,22 +334,6 @@ fn get_bit(bits: &[u64], row: u16) -> bool {
 }
 
 impl LineBreaks {
-    pub fn from_heights(heights: impl Iterator<Item = u16>) -> Self {
-        let mut line_starts = Vec::new();
-        let mut row: u16 = 0;
-        for h in heights {
-            if h == 0 {
-                continue;
-            }
-            set_bit(&mut line_starts, row);
-            row = row.saturating_add(h);
-        }
-        Self::Bitmap {
-            line_starts,
-            word_wraps: Vec::new(),
-        }
-    }
-
     pub fn from_lines(lines: &[Line<'_>], width: u16) -> Self {
         if width == 0 {
             return Self::EveryRow;
@@ -458,8 +443,9 @@ fn clip(buf: &Buffer, area: Rect) -> Rect {
     area.intersection(*buf.area())
 }
 
-/// Last column is the scrollbar, so we skip it.
-pub fn apply_highlight(buf: &mut Buffer, area: Rect, ss: &ScreenSelection) {
+/// Thumbs are not highlighted, since the copy takes the text hidden under
+/// them and not the thumb itself.
+pub fn apply_highlight(buf: &mut Buffer, area: Rect, ss: &ScreenSelection, thumbs: &Thumbs) {
     let area = clip(buf, area);
     if area.is_empty() {
         return;
@@ -470,7 +456,11 @@ pub fn apply_highlight(buf: &mut Buffer, area: Rect, ss: &ScreenSelection) {
     for row in row_start..=row_end {
         let (col_start, col_end) = col_range(ss, area.x, right, row);
         for col in col_start..=col_end {
-            let cell = &mut buf[(col, row)];
+            let pos = Position::new(col, row);
+            if thumbs.covers(buf, pos) {
+                continue;
+            }
+            let cell = &mut buf[pos];
             cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
         }
     }
@@ -626,9 +616,20 @@ pub fn extract_selected_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::scrollbar::test_support::{draw_recorded, thumb_cells};
     use ratatui::style::Style;
     use ratatui::text::Span;
     use test_case::test_case;
+
+    /// The last letter of each row sits in the scrollbar column, so the thumb
+    /// hides some of them.
+    const UNDER_SCROLLBAR: [&str; 4] = ["row0x", "row1x", "row2x", "row3x"];
+    const UNDER_SCROLLBAR_COPY: &str = "row0x\nrow1x\nrow2x\nrow3x";
+
+    fn select_all(buf: &Buffer) -> ScreenSelection {
+        let area = buf.area();
+        ss(0, 0, area.bottom() - 1, area.right() - 1)
+    }
 
     fn doc(row: u16, col: u16) -> DocPos {
         DocPos::flat(row, col)
@@ -659,6 +660,20 @@ mod tests {
         buf.set_string(0, 1, "World     ", Style::default());
         buf.set_string(0, 2, "Test      ", Style::default());
         (buf, area)
+    }
+
+    /// Breaks for lines of {heights} rows each, none word wrapped.
+    fn from_heights(heights: &[u16]) -> LineBreaks {
+        let mut line_starts = Vec::new();
+        let mut row: u16 = 0;
+        for &h in heights {
+            set_bit(&mut line_starts, row);
+            row = row.saturating_add(h);
+        }
+        LineBreaks::Bitmap {
+            line_starts,
+            word_wraps: Vec::new(),
+        }
     }
 
     fn ss(sr: u16, sc: u16, er: u16, ec: u16) -> ScreenSelection {
@@ -897,24 +912,9 @@ mod tests {
         assert_eq!(text, "continued");
     }
 
-    #[test_case(&[1, 1, 1], &[0, 1, 2]    ; "no_wrapping")]
-    #[test_case(&[1, 3, 1], &[0, 1, 4]    ; "middle_line_wraps")]
-    #[test_case(&[3, 3],    &[0, 3]        ; "all_lines_wrap")]
-    fn line_breaks_from_heights(heights: &[u16], expected_starts: &[u16]) {
-        let lb = LineBreaks::from_heights(heights.iter().copied());
-        for row in 0..heights.iter().sum::<u16>().max(1) {
-            let should_be_start = expected_starts.contains(&row);
-            assert_eq!(
-                lb.is_line_start(row),
-                should_be_start,
-                "row {row}: expected is_line_start={should_be_start}"
-            );
-        }
-    }
-
     #[test]
     fn line_breaks_beyond_64_rows() {
-        let lb = LineBreaks::from_heights([65, 1].iter().copied());
+        let lb = from_heights(&[65, 1]);
         assert!(lb.is_line_start(0));
         assert!(!lb.is_line_start(64));
         assert!(lb.is_line_start(65));
@@ -958,7 +958,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         buf.set_string(0, 0, "hello               ", Style::default());
         buf.set_string(0, 1, "world               ", Style::default());
-        let breaks = LineBreaks::from_heights([2].iter().copied());
+        let breaks = from_heights(&[2]);
         let region = ContentRegion {
             area,
             line_breaks: breaks,
@@ -977,7 +977,7 @@ mod tests {
         buf.set_string(2, 0, "long_variable_na", Style::default());
         buf.set_string(0, 1, "│", code_style);
         buf.set_string(1, 1, "me_here         ", Style::default());
-        let breaks = LineBreaks::from_heights([2].iter().copied());
+        let breaks = from_heights(&[2]);
         let region = ContentRegion {
             area,
             line_breaks: breaks,
@@ -988,16 +988,8 @@ mod tests {
     }
 
     #[test]
-    fn line_breaks_bitmap_zero_height_ignored() {
-        let lb = LineBreaks::from_heights([1, 0, 0, 1].iter().copied());
-        assert!(lb.is_line_start(0));
-        assert!(lb.is_line_start(1));
-        assert!(!lb.is_line_start(2));
-    }
-
-    #[test]
     fn line_breaks_query_beyond_stored_bits() {
-        let lb = LineBreaks::from_heights([1].iter().copied());
+        let lb = from_heights(&[1]);
         assert!(!lb.is_line_start(100));
         assert!(!lb.needs_space(200));
     }
@@ -1234,5 +1226,29 @@ mod tests {
             &mut RowCarry::default(),
         );
         assert_eq!(out, "好");
+    }
+
+    #[test]
+    fn copy_reads_the_text_beneath_the_thumb() {
+        let (buf, thumbs) = draw_recorded(Buffer::with_lines(UNDER_SCROLLBAR), 1);
+        let region = ContentRegion {
+            area: buf.area,
+            ..Default::default()
+        };
+        let text = extract_selected_text(&thumbs.uncovered(&buf), &select_all(&buf), &[region]);
+        assert_eq!(text, UNDER_SCROLLBAR_COPY);
+    }
+
+    #[test]
+    fn highlight_reverses_all_but_the_thumb() {
+        let (mut buf, thumbs) = draw_recorded(Buffer::with_lines(UNDER_SCROLLBAR), 1);
+        let covered = thumb_cells(&buf, &thumbs);
+        let area = buf.area;
+        let sel = select_all(&buf);
+        apply_highlight(&mut buf, area, &sel, &thumbs);
+        for pos in area.positions() {
+            let reversed = buf[pos].modifier.contains(Modifier::REVERSED);
+            assert_eq!(reversed, !covered.contains(&pos), "{pos:?}");
+        }
     }
 }

@@ -2,6 +2,7 @@
 name = "maki-agent"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 maki-providers = { workspace = true }
@@ -9,6 +10,7 @@ maki-config = { workspace = true }
 maki-otel = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_path_to_error = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 ignore = { workspace = true }
@@ -20,27 +22,26 @@ grep-regex = { workspace = true }
 grep-searcher = { workspace = true }
 similar = { workspace = true }
 jiff = { workspace = true }
-smol = { workspace = true }
-flume = { workspace = true }
+tokio = { workspace = true }
 arc-swap = { workspace = true }
 bitflags = { workspace = true }
-event-listener = { workspace = true }
-futures-lite = { workspace = true }
 toml = { workspace = true }
 toml_edit = { workspace = true }
-isahc = { workspace = true }
-futures-rustls = { workspace = true }
+reqwest = { workspace = true }
+rmcp = { workspace = true }
+oauth2 = { workspace = true }
+async-trait = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+tokio-rustls = { workspace = true }
 rcgen = { workspace = true }
 open = { workspace = true }
 sha2 = { workspace = true }
-serde_yaml = { workspace = true }
-base64 = { workspace = true }
+serde-saphyr = { workspace = true, features = ["deserialize"] }
 url = { workspace = true }
-getrandom = { workspace = true }
 
 
 [dev-dependencies]
-maki-config = { workspace = true, features = ["test-util"] }
 test-case = { workspace = true }
 tempfile = { workspace = true }
 

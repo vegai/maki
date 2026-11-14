@@ -16,7 +16,6 @@ local path_utils = require("claude_paths")
 
 local MODELS = launch.MODELS
 local MS_PER_SEC = jobs.MS_PER_SEC
-local STARTUP_MS = launch.STARTUP_MS
 -- Each step of a coding snapshot, such as the copy, must finish in this time.
 local SNAPSHOT_TIMEOUT_MS = 120 * MS_PER_SEC
 local MAX_SHOWN_CHANGES = 50
@@ -61,7 +60,7 @@ local opts = maki.api.register_options(output_limits.extend({
     default = native.default_provider_max_concurrent,
     min = native.min_provider_max_concurrent,
     desc = "The maximum number of concurrent claude-code provider generations, including subagents. "
-      .. "Independent of max_concurrent. Model listing also takes one slot. Queued generations show a waiting status. Changes to this limit apply to new requests. Active and already queued requests keep their previous limit.",
+      .. "Independent of max_concurrent. Model listing also takes one slot. Queued generations show a waiting status. Changes apply immediately to queued generations. Running generations finish normally.",
   },
   timeout_secs = {
     default = 600,
@@ -159,9 +158,6 @@ local function artifacts_root()
 end
 
 local semaphore = maki.async.semaphore(opts.max_concurrent)
--- Only for the message of a queued call. A call is counted when it arrives,
--- so the count does not depend on when `acquire` resumes.
-local callers = 0
 
 local function refuse(msg)
   return { llm_output = ERROR_PREFIX .. truncate(msg, nil, jobs.ERROR_BYTES), is_error = true }
@@ -237,12 +233,12 @@ local function change_report(call, artifact, project)
 end
 
 local function open_artifact(call, spec, root)
-  local root, root_err = artifacts.resolve_root(root, spec)
+  local root, root_err = native.resolve_root(root, spec.cwd, spec.denied)
   if not root then
     return nil, "maki cannot make a coding artifact: " .. root_err
   end
-  local sweep = jobs.new(SNAPSHOT_TIMEOUT_MS)
-  artifacts.sweep(sweep, root, opts.artifact_ttl_hours)
+  local sweep = jobs.new()
+  artifacts.sweep(sweep, root, opts.artifact_ttl_hours, SNAPSHOT_TIMEOUT_MS)
   sweep:answer()
   local artifact, allocate_err = artifacts.allocate(call, root, spec.env, SNAPSHOT_TIMEOUT_MS)
   if not artifact then
@@ -285,9 +281,15 @@ local function run(input, ctx, call, timeout_secs)
     env.TMPDIR = artifact.tmp
   end
   spec.policy = native.worker_policy({ deny = spec.deny, sandbox = spec.confine })
-  local argv = launch.argv(spec)
-  local probe_problem = launch.probe(call, spec, argv, env)
-  if probe_problem then
+  local argv = native.worker_args(spec.executable, spec.model, spec.policy)
+  local checked, probe_problem = call:wait(function()
+    local ok, err, kept = native.worker_probe(ctx, spec, env, launch.STARTUP_TIMEOUT_SECS)
+    if kept then
+      call:leave(kept)
+    end
+    return ok, err
+  end)
+  if not checked then
     return refuse(probe_problem)
   end
 
@@ -296,7 +298,6 @@ local function run(input, ctx, call, timeout_secs)
     claude.view:append({ { STARTING, "dim" } })
     return claude:build(claude:start(argv, spec.cwd, env, input.prompt))
   end
-  claude.artifact = artifact
   local fill_err = fill_snapshot(call, claude.view, plan, artifact, spec.cwd, env)
   if fill_err then
     return refuse(fill_err)
@@ -309,7 +310,7 @@ local function run(input, ctx, call, timeout_secs)
     task = task .. "\n\nnote: " .. note
   end
   local outcome = claude:start(argv, artifact.snapshot, env, task)
-  if not claude.prompted then
+  if not call.artifact_kept then
     return claude:build(outcome)
   end
   local report = change_report(call, artifact, spec.cwd)
@@ -347,10 +348,8 @@ local function handler(input, ctx)
 
   local timeout_secs = launch.task_timeout(input.timeout, opts.timeout_secs)
 
-  callers = callers + 1
-  local permit
-  local call = jobs.new(STARTUP_MS, function()
-    callers = callers - 1
+  local permit = semaphore:try_acquire()
+  local call = jobs.new(function()
     if permit then
       permit:release()
     end
@@ -364,12 +363,12 @@ local function handler(input, ctx)
       call:answer()
     end)
   end)
-  if callers > opts.max_concurrent then
+  if not permit then
     local buf = maki.ui.buf()
     buf:line({ { WAITING, "dim" } })
     ctx:live_buf(buf)
   end
-  permit = semaphore:acquire()
+  permit = permit or semaphore:acquire()
   -- Start the timeout only after slot acquisition.
   ctx:set_deadline(timeout_secs)
 
@@ -457,7 +456,7 @@ local function import_handler(input, ctx)
   if not project then
     return refuse(launch.NO_SESSION_DIR .. tostring(project_err))
   end
-  local result, err = importer.import(ctx, jobs.new(STARTUP_MS), {
+  local result, err = importer.import(ctx, jobs.new(), {
     id = input.id,
     paths = input.paths,
     project = project,

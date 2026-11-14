@@ -1,7 +1,8 @@
-//! Single source of truth for all tools (Lua plugins and MCP servers). One registry, one lookup
-//! path, no parallel lists that can drift.
+//! Single source of truth for all Lua plugin tools. One registry, one lookup path, no parallel
+//! lists that can drift. MCP tools are not in here, they live in [`crate::mcp`].
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -14,11 +15,11 @@ use maki_config::Permission;
 use serde_json::{Value, json};
 
 use crate::template::Vars;
-use crate::{BufferSnapshot, ToolOutput};
+use crate::{BufferSnapshot, ToolDoneEvent, ToolOutput};
 
 use super::hook::ToolHook;
 use super::schema::sanitize_tool_input_schema;
-use super::{DescriptionContext, LocalTools, ToolContext, ToolKind};
+use super::{DescriptionContext, LocalTools, ToolContext, ToolFilter, ToolKind};
 use crate::agent::AgentHook;
 
 bitflags! {
@@ -36,15 +37,28 @@ bitflags! {
     }
 }
 
-/// What a tool declares it reaches. `permission` is the capability it exposes
-/// to the model, and the price of hooking it, pre-approving it or handing it
-/// to a session. `prompted` tells whether a call ever meets the permission
-/// prompt, because a rule pre-approving a tool that never prompts would never
-/// be consulted.
+/// What a tool declares it reaches: the price of hooking it, pre-approving it
+/// or handing it to a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ToolReach {
-    pub permission: Permission,
-    pub prompted: bool,
+pub enum ToolReach {
+    /// Declared to reach nothing past the conversation it runs in.
+    Inert,
+    /// `permission` is the capability it exposes to the model. `prompted`
+    /// tells whether a call ever meets the permission prompt, because a rule
+    /// pre-approving a tool that never prompts would never be consulted.
+    Capability {
+        permission: Permission,
+        prompted: bool,
+    },
+}
+
+impl ToolReach {
+    pub fn permission(self) -> Option<Permission> {
+        match self {
+            Self::Inert => None,
+            Self::Capability { permission, .. } => Some(permission),
+        }
+    }
 }
 
 impl Default for ToolAudience {
@@ -78,17 +92,13 @@ impl ToolAudience {
 }
 
 #[derive(Clone, Debug)]
-pub enum ToolSource {
-    Mcp { server: Arc<str> },
-    Lua { plugin: Arc<str> },
+pub struct ToolSource {
+    pub plugin: Arc<str>,
 }
 
 impl ToolSource {
     pub fn as_log_field(&self) -> Cow<'static, str> {
-        match self {
-            Self::Mcp { server } => Cow::Owned(format!("mcp:{server}")),
-            Self::Lua { plugin } => Cow::Owned(format!("lua:{plugin}")),
-        }
+        Cow::Owned(format!("lua:{}", self.plugin))
     }
 }
 
@@ -98,6 +108,27 @@ pub struct ToolExecResult {
     pub output: Result<ToolOutput, String>,
     pub annotation: Option<String>,
     pub written_path: Option<String>,
+    /// Set when `output` is a receipt: the call moved and finishes in the
+    /// background.
+    pub moved: Option<MovedCall>,
+}
+
+/// Settles a moved call with its filtered final reply, `None` when there is
+/// none to give.
+pub type MovedLand = Box<dyn FnOnce(Option<ToolDoneEvent>) + Send>;
+
+/// The rest of a call that moved to the background. Dispatch runs the receipt
+/// and then `result` through the output pipeline every call's output takes,
+/// and hands the result to `land`, so no output of a moved call reaches the
+/// model unfiltered.
+pub struct MovedCall {
+    /// `None` when the work ended without a reply.
+    pub result: BoxFuture<'static, Option<ToolExecResult>>,
+    /// Dropped uncalled exactly when the receipt was never published to the
+    /// model: the call never moved as far as anyone was told. Once published,
+    /// it is called exactly once, with `None` when the work or the pipeline
+    /// died, so the model hears what became of the call.
+    pub land: MovedLand,
 }
 
 impl From<Result<ToolOutput, String>> for ToolExecResult {
@@ -106,6 +137,7 @@ impl From<Result<ToolOutput, String>> for ToolExecResult {
             output,
             annotation: None,
             written_path: None,
+            moved: None,
         }
     }
 }
@@ -236,6 +268,14 @@ pub trait Tool: Send + Sync + 'static {
     fn name(&self) -> &str;
     fn description(&self, ctx: &DescriptionContext) -> Cow<'_, str>;
     fn schema(&self) -> Value;
+    /// The schema the model is shown, or `None` to leave the tool out of its
+    /// array. `background` is whether the model can move a call to the
+    /// background itself. A tool that offers a parameter only for that
+    /// narrows it here, so the decision is made when the array is built and
+    /// the array never changes after.
+    fn offered_schema(&self, _background: bool) -> Option<Value> {
+        Some(self.schema())
+    }
     fn examples(&self) -> Option<Value> {
         None
     }
@@ -246,6 +286,7 @@ pub trait Tool: Send + Sync + 'static {
         None
     }
     /// `None` is undeclared reach, which every consumer prices as everything.
+    /// Only an explicit [`ToolReach::Inert`] is free.
     fn reach(&self) -> Option<ToolReach> {
         None
     }
@@ -329,8 +370,8 @@ impl ToolRegistry {
         self.agent_hook.load_full()
     }
 
-    /// The process-wide registry. Every tool in it comes from a Lua plugin
-    /// or an MCP server; Rust itself registers nothing.
+    /// The process-wide registry. Every tool in it comes from a Lua plugin;
+    /// Rust itself registers nothing.
     pub fn global() -> &'static Self {
         Self::global_arc()
     }
@@ -372,51 +413,6 @@ impl ToolRegistry {
         Ok(())
     }
 
-    /// All-or-nothing: a name clash rolls back the whole batch so an MCP server
-    /// never ends up half-registered.
-    pub fn register_many(
-        &self,
-        entries: impl IntoIterator<Item = (Arc<dyn Tool>, ToolSource)>,
-    ) -> Result<(), RegistryError> {
-        let entries: Vec<_> = entries.into_iter().collect();
-        let mut conflict = None;
-        self.tools.rcu(|current| {
-            conflict = None;
-            let mut next = Vec::clone(current);
-            for (tool, source) in &entries {
-                let name = tool.name();
-                if let Some(existing) = next.iter().find(|t| t.name() == name) {
-                    conflict = Some(RegistryError::NameConflict {
-                        name: name.to_owned(),
-                        existing: existing.source.as_log_field().into_owned(),
-                    });
-                    return Vec::clone(current);
-                }
-                next.push(RegisteredTool {
-                    tool: Arc::clone(tool),
-                    source: source.clone(),
-                });
-            }
-            next
-        });
-        if let Some(e) = conflict {
-            return Err(e);
-        }
-        Ok(())
-    }
-
-    pub fn clear_mcp_server(&self, server: &str) {
-        self.tools.rcu(|current| {
-            current
-                .iter()
-                .filter(
-                    |t| !matches!(&t.source, ToolSource::Mcp { server: s } if s.as_ref() == server),
-                )
-                .cloned()
-                .collect::<Vec<_>>()
-        });
-    }
-
     pub fn replace_plugin(
         &self,
         plugin: &str,
@@ -427,9 +423,7 @@ impl ToolRegistry {
             conflict = None;
             let mut next: Vec<RegisteredTool> = current
                 .iter()
-                .filter(
-                    |t| !matches!(&t.source, ToolSource::Lua { plugin: p } if p.as_ref() == plugin),
-                )
+                .filter(|t| t.source.plugin.as_ref() != plugin)
                 .cloned()
                 .collect();
             for (tool, source) in &new_entries {
@@ -455,22 +449,14 @@ impl ToolRegistry {
     }
 
     pub fn clear_lua(&self) {
-        self.tools.rcu(|current| {
-            current
-                .iter()
-                .filter(|t| !matches!(t.source, ToolSource::Lua { .. }))
-                .cloned()
-                .collect::<Vec<_>>()
-        });
+        self.tools.store(Arc::default());
     }
 
     pub fn clear_plugin(&self, plugin: &str) {
         self.tools.rcu(|current| {
             current
                 .iter()
-                .filter(
-                    |t| !matches!(&t.source, ToolSource::Lua { plugin: p } if p.as_ref() == plugin),
-                )
+                .filter(|t| t.source.plugin.as_ref() != plugin)
                 .cloned()
                 .collect::<Vec<_>>()
         });
@@ -479,10 +465,34 @@ impl ToolRegistry {
     /// Human-friendly summary of an invocation; the raw tool name when
     /// there is nothing better.
     pub fn resolve_header(&self, name: &str, input: &Value) -> String {
+        self.start_header(name, input)
+            .map(|header| header.into_ready().text())
+            .unwrap_or_else(|| name.to_owned())
+    }
+
+    /// The header of a call to `name`, which a plugin tool answers later.
+    pub fn start_header(&self, name: &str, input: &Value) -> Option<HeaderFuture> {
         self.get(name)
             .and_then(|e| e.try_parse(input))
-            .map(|inv| inv.start_header().into_ready().text())
-            .unwrap_or_else(|| name.to_owned())
+            .map(|inv| inv.start_header())
+    }
+
+    /// Plugins that registered tools of which `filter` lets none through.
+    pub fn plugins_filtered_out(&self, filter: &ToolFilter) -> Vec<Arc<str>> {
+        let tools = self.tools.load();
+        let mut visible: BTreeMap<&Arc<str>, bool> = BTreeMap::new();
+        for tool in tools.iter() {
+            *visible.entry(&tool.source.plugin).or_default() |= filter.admits(
+                tool.name(),
+                ToolKind::Registry(ToolAudience::all()),
+                ToolAudience::all(),
+            );
+        }
+        visible
+            .into_iter()
+            .filter(|(_, visible)| !visible)
+            .map(|(plugin, _)| Arc::clone(plugin))
+            .collect()
     }
 
     pub fn names(&self) -> Vec<Arc<str>> {
@@ -493,15 +503,27 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Rebuilt each request so tools registered mid-session (MCP handshake) show
-    /// up on the very next turn.
     pub fn definitions(
+        &self,
+        vars: &Vars,
+        ctx: &DescriptionContext,
+        supports_examples: bool,
+    ) -> Value {
+        self.definitions_with_background(vars, ctx, None, supports_examples, true)
+    }
+
+    /// `background` is whether the session can move calls to the background.
+    /// Only the main agent ever moves one itself, so every other audience is
+    /// built as if it were off.
+    pub fn definitions_with_background(
         &self,
         vars: &Vars,
         ctx: &DescriptionContext,
         local_tools: Option<&LocalTools>,
         supports_examples: bool,
+        background: bool,
     ) -> Value {
+        let background = background && ctx.audience.contains(ToolAudience::MAIN);
         let snapshot = self.tools.load();
         let mut out = Vec::with_capacity(snapshot.len());
         for entry in snapshot.iter() {
@@ -513,11 +535,14 @@ impl ToolRegistry {
             if !admitted {
                 continue;
             }
+            let Some(schema) = entry.tool.offered_schema(background) else {
+                continue;
+            };
             let description = vars.apply(&entry.tool.description(ctx)).into_owned();
             let mut def = json!({
                 "name": entry.name(),
                 "description": description,
-                "input_schema": sanitize_tool_input_schema(entry.tool.schema()),
+                "input_schema": sanitize_tool_input_schema(schema),
             });
             if let Some(examples) = entry.tool.examples() {
                 if supports_examples {
@@ -588,9 +613,37 @@ mod tests {
     }
 
     fn lua_source(plugin: &str) -> ToolSource {
-        ToolSource::Lua {
+        ToolSource {
             plugin: plugin.into(),
         }
+    }
+
+    #[test_case(None, Some(vec![]), vec![], true ; "unpublished")]
+    #[test_case(Some(vec!["custom__tool".into()]), None, vec![], false ; "allowed_exactly")]
+    #[test_case(Some(vec!["custom.tool".into()]), None, vec![], true ; "allow_is_not_an_mcp_alias")]
+    #[test_case(None, None, vec!["custom__tool".into()], true ; "excluded_exactly")]
+    #[test_case(None, None, vec!["custom.tool".into()], false ; "exclude_is_not_an_mcp_alias")]
+    fn lua_tool_names_keep_registry_filtering(
+        allowed: Option<Vec<String>>,
+        published: Option<Vec<String>>,
+        excluded: Vec<String>,
+        hidden: bool,
+    ) {
+        const PLUGIN: &str = "custom";
+        const TOOL: &str = "custom__tool";
+        let registry = ToolRegistry::new();
+        registry.register(mock(TOOL), lua_source(PLUGIN)).unwrap();
+        let filter = ToolFilter {
+            allowed,
+            published,
+            excluded,
+        };
+        let expected: Vec<Arc<str>> = if hidden {
+            vec![PLUGIN.into()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(registry.plugins_filtered_out(&filter), expected);
     }
 
     struct ReloadDuringDescription {
@@ -638,7 +691,7 @@ mod tests {
             workflow: false,
             mcp: false,
         };
-        let definitions = registry.definitions(&Vars::new(), &context, None, false);
+        let definitions = registry.definitions(&Vars::new(), &context, false);
         assert_eq!(definitions.as_array().unwrap().len(), 1);
         assert_eq!(definitions[0]["name"], MAIN);
         assert!(registry.iter().iter().next().is_none());
@@ -668,7 +721,7 @@ mod tests {
             workflow: false,
             mcp: false,
         };
-        let defs = reg.definitions(&Vars::new(), &ctx, None, false);
+        let defs = reg.definitions(&Vars::new(), &ctx, false);
         assert_eq!(
             defs[0]["input_schema"],
             json!({"type": "object", "properties": {}}),
@@ -676,18 +729,11 @@ mod tests {
         );
     }
 
-    /// Tools added mid-session must show up in the next `definitions()` call.
-    /// That is the whole reason we build schemas per-request.
     #[test]
     fn definitions_reflects_mid_session_registration() {
         let reg = ToolRegistry::new();
-        reg.register(
-            mock("late_server.probe"),
-            ToolSource::Mcp {
-                server: "late_server".into(),
-            },
-        )
-        .unwrap();
+        reg.register(mock("late_plugin.probe"), lua_source("late_plugin"))
+            .unwrap();
 
         let filter = crate::tools::ToolFilter::default();
         let ctx = DescriptionContext {
@@ -697,11 +743,11 @@ mod tests {
             mcp: false,
         };
         let vars = Vars::new();
-        let defs = reg.definitions(&vars, &ctx, None, false);
+        let defs = reg.definitions(&vars, &ctx, false);
         let arr = defs.as_array().expect("definitions returns array");
         assert!(
             arr.iter()
-                .any(|d| d["name"].as_str() == Some("late_server.probe")),
+                .any(|d| d["name"].as_str() == Some("late_plugin.probe")),
             "mid-session tool missing from definitions"
         );
     }
@@ -710,23 +756,15 @@ mod tests {
     /// `clear_lua` leaves behind becomes a `NameConflict` that breaks every
     /// later reload.
     #[test]
-    fn clear_lua_removes_lua_keeps_mcp_and_allows_reregistration() {
+    fn clear_lua_removes_lua_and_allows_reregistration() {
         let reg = ToolRegistry::new();
         reg.register(mock("lua_a"), lua_source("p1")).unwrap();
         reg.register(mock("lua_b"), lua_source("p2")).unwrap();
-        reg.register(
-            mock("srv.tool"),
-            ToolSource::Mcp {
-                server: "srv".into(),
-            },
-        )
-        .unwrap();
 
         reg.clear_lua();
 
         assert!(!reg.has("lua_a"));
         assert!(!reg.has("lua_b"));
-        assert!(reg.has("srv.tool"));
 
         reg.register(mock("lua_a"), lua_source("p1")).unwrap();
         reg.register(mock("lua_b"), lua_source("p2")).unwrap();
@@ -735,62 +773,17 @@ mod tests {
     }
 
     #[test]
-    fn clear_mcp_server_removes_only_that_server() {
-        let reg = ToolRegistry::new();
-        reg.register(
-            mock("serverA.one"),
-            ToolSource::Mcp {
-                server: "serverA".into(),
-            },
-        )
-        .unwrap();
-        reg.register(
-            mock("serverB.one"),
-            ToolSource::Mcp {
-                server: "serverB".into(),
-            },
-        )
-        .unwrap();
-        reg.register(mock("other_tool"), lua_source("other"))
-            .unwrap();
-
-        reg.clear_mcp_server("serverA");
-
-        assert!(!reg.has("serverA.one"));
-        assert!(reg.has("serverB.one"));
-        assert!(reg.has("other_tool"));
-    }
-
-    #[test]
     fn clear_plugin_removes_only_that_plugin() {
         let reg = ToolRegistry::new();
-        reg.register(
-            mock("pluginA.foo"),
-            ToolSource::Lua {
-                plugin: "pluginA".into(),
-            },
-        )
-        .unwrap();
-        reg.register(
-            mock("pluginB.bar"),
-            ToolSource::Lua {
-                plugin: "pluginB".into(),
-            },
-        )
-        .unwrap();
-        reg.register(
-            mock("mcp.tool"),
-            ToolSource::Mcp {
-                server: "srv".into(),
-            },
-        )
-        .unwrap();
+        reg.register(mock("pluginA.foo"), lua_source("pluginA"))
+            .unwrap();
+        reg.register(mock("pluginB.bar"), lua_source("pluginB"))
+            .unwrap();
 
         reg.clear_plugin("pluginA");
 
         assert!(!reg.has("pluginA.foo"));
         assert!(reg.has("pluginB.bar"));
-        assert!(reg.has("mcp.tool"));
     }
 
     #[test]
@@ -803,7 +796,7 @@ mod tests {
             .unwrap();
 
         let entry = reg.get("mytool").unwrap();
-        assert!(matches!(entry.source, ToolSource::Lua { .. }));
+        assert_eq!(entry.source.plugin.as_ref(), "myplugin");
 
         reg.clear_plugin("myplugin");
         assert!(!reg.has("mytool"));
@@ -812,19 +805,10 @@ mod tests {
     #[test]
     fn replace_plugin_rejects_conflict_with_other_plugin() {
         let reg = ToolRegistry::new();
-        reg.register(mock("shared"), ToolSource::Mcp { server: "s".into() })
-            .unwrap();
+        reg.register(mock("shared"), lua_source("other")).unwrap();
 
         let err = reg
-            .replace_plugin(
-                "myplugin",
-                vec![(
-                    mock("shared"),
-                    ToolSource::Lua {
-                        plugin: "myplugin".into(),
-                    },
-                )],
-            )
+            .replace_plugin("myplugin", vec![(mock("shared"), lua_source("myplugin"))])
             .unwrap_err();
         assert!(matches!(err, RegistryError::NameConflict { .. }));
     }
@@ -861,7 +845,7 @@ mod tests {
                 workflow: false,
                 mcp: false,
             };
-            reg.definitions(&vars, &ctx, None, false)
+            reg.definitions(&vars, &ctx, false)
                 .as_array()
                 .unwrap()
                 .iter()

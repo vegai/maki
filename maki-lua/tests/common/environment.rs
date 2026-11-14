@@ -1,5 +1,5 @@
 use std::env;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::iter;
 use std::path::Path;
 
@@ -15,7 +15,7 @@ pub fn require_nextest() {
 
 pub fn set(name: &str, value: impl AsRef<OsStr>) {
     require_nextest();
-    // SAFETY: nextest isolates each test in its own process. Changes precede plugin threads.
+    // SAFETY: nextest isolates other tests. Callers exclude concurrent native environment reads.
     unsafe { env::set_var(name, value) };
 }
 
@@ -25,30 +25,8 @@ pub fn remove(name: &str) {
     unsafe { env::remove_var(name) };
 }
 
-pub struct EnvVar {
-    name: &'static str,
-    before: Option<OsString>,
-}
-
-impl EnvVar {
-    pub fn prepend_path(dir: &Path) -> Self {
-        let current = env::var_os(PATH).unwrap_or_default();
-        let entries = iter::once(dir.to_path_buf()).chain(env::split_paths(&current));
-        Self::set(PATH, env::join_paths(entries).unwrap())
-    }
-
-    pub fn set(name: &'static str, value: impl AsRef<OsStr>) -> Self {
-        let before = env::var_os(name);
-        set(name, value);
-        Self { name, before }
-    }
-}
-
-impl Drop for EnvVar {
-    fn drop(&mut self) {
-        match &self.before {
-            Some(value) => set(self.name, value),
-            None => remove(self.name),
-        }
-    }
+pub fn prepend_path(dir: &Path) {
+    let current = env::var_os(PATH).unwrap_or_default();
+    let entries = iter::once(dir.to_path_buf()).chain(env::split_paths(&current));
+    set(PATH, env::join_paths(entries).unwrap());
 }

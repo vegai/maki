@@ -25,7 +25,7 @@ local opts = maki.api.register_options(output_limits.extend({
   max_response_bytes = {
     default = 5 * 1024 * 1024,
     min = 1024,
-    desc = "Stop reading a response after this many bytes.",
+    desc = "Stop reading a response after this many bytes, at most 64 MiB.",
   },
 }))
 
@@ -112,8 +112,8 @@ local function search_mcp(query, num_results)
     return nil, err
   end
   local text, sse_err = parse_sse_response(resp.body)
-  if text and provider.clean then
-    text = provider.clean(text)
+  if text and provider.format then
+    text = provider.format(text)
   end
   return text, sse_err
 end

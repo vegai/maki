@@ -17,8 +17,7 @@ use std::path::{Path, PathBuf, absolute};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
-use futures_lite::future;
-use smol::Timer;
+use tokio::time::sleep_until;
 
 #[cfg(unix)]
 use rustix::fs::{Access, access};
@@ -27,17 +26,32 @@ use rustix::io::Errno;
 #[cfg(unix)]
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
 
+pub const STDERR_TAIL_LINES: usize = 10;
+pub const STDERR_LINE_BYTES: usize = 4096;
+pub const STDERR_TRUNCATED: &str = " [truncated]";
+
 const PATH: &str = "PATH";
 #[cfg(windows)]
 const PATHEXT: &str = "PATHEXT";
 const PATHEXT_SEPARATOR: char = ';';
 
+pub fn cap_stderr_line(line: &str) -> String {
+    if line.len() > STDERR_LINE_BYTES {
+        format!(
+            "{}{STDERR_TRUNCATED}",
+            &line[..line.floor_char_boundary(STDERR_LINE_BYTES)]
+        )
+    } else {
+        line.to_owned()
+    }
+}
+
 pub(crate) async fn within<T>(deadline: Instant, work: impl Future<Output = T>) -> Option<T> {
-    future::or(async { Some(work.await) }, async {
-        Timer::at(deadline).await;
-        None
-    })
-    .await
+    tokio::select! {
+        biased;
+        value = work => Some(value),
+        () = sleep_until(deadline.into()) => None,
+    }
 }
 
 /// Returns the absolute path `name` runs as from `cwd`, using maki's `$PATH`
@@ -147,6 +161,23 @@ pub fn wait_without_reaping(pid: u32) -> bool {
     }
 }
 
+/// Check for exit while reserving the child's pid. The caller must prevent concurrent reaps.
+#[cfg(unix)]
+pub fn exited_without_reaping(pid: u32) -> bool {
+    let Some(pid) = pid_of(pid) else {
+        return false;
+    };
+    loop {
+        match waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
+        ) {
+            Err(Errno::INTR) => continue,
+            result => return matches!(result, Ok(Some(_))),
+        }
+    }
+}
+
 /// Kills the process group of leader `pid`. Call it only before the leader
 /// is reaped, because the kernel can hand a reaped pid to another group.
 pub fn kill_group(pid: u32) {
@@ -188,6 +219,23 @@ mod tests {
     const PLAIN_MODE: u32 = 0o644;
     const RUNNABLE_MODE: u32 = 0o755;
     const WINDOWS_EXTENSIONS: &str = ".COM;.EXE;;.BAT";
+
+    #[test_case(false ; "fits")]
+    #[test_case(true ; "cuts_at_a_character_boundary")]
+    fn stderr_tail_entries_remain_single_lines(over_limit: bool) {
+        let original = "x".repeat(super::STDERR_LINE_BYTES - 1);
+        let input = if over_limit {
+            format!("{original}é")
+        } else {
+            original.clone()
+        };
+        let expected = if over_limit {
+            format!("{original}{}", super::STDERR_TRUNCATED)
+        } else {
+            original
+        };
+        assert_eq!(super::cap_stderr_line(&input), expected);
+    }
 
     #[test_case("sh" => true ; "a_name_on_path")]
     #[test_case("no-such-program-maki" => false ; "a_name_not_on_path")]

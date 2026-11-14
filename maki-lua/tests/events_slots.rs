@@ -1,6 +1,10 @@
+use maki_lua::test_support::wait_next;
+use std::cell::Cell;
 use std::future::Future;
+use std::iter;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use maki_agent::AgentMode;
 use maki_agent::agent::{AgentCall, AgentSlot};
@@ -10,13 +14,17 @@ use maki_agent::tools::hook::{self, Authority, HookCall, HookStage, Verdict};
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{CallOrigin, ToolOutputMode, ToolRegistry};
 use maki_lua::agent_autocmd::host_event_fields;
-use maki_lua::test_support::{content_omitted_message, layer_skipped_message};
+use maki_lua::test_support::{
+    content_omitted_message, fire_autocmd, layer_skipped_message, runtime, wait_reply,
+};
 use maki_lua::{
     Permission, PlanActionOutcome, PlanFormRow, PlanMenu, PlanRowAction, PluginHost,
     PluginPermissions, SessionEndReason, UiAction,
 };
 use maki_storage::id::MakiId;
 use test_case::test_case;
+use tokio::join;
+use tokio::time::timeout;
 
 const PROBE_SCHEMA: &str = r#"{ type = "object", properties = {}, additionalProperties = false }"#;
 /// Generous on purpose. A bound a slow machine can trip is a bound that fails
@@ -36,6 +44,10 @@ fn load(host: &PluginHost, name: &str, source: &str) {
 }
 
 fn exec_tool(reg: &ToolRegistry, name: &str) -> String {
+    runtime().block_on(run_tool(reg, name))
+}
+
+async fn run_tool(reg: &ToolRegistry, name: &str) -> String {
     let entry = reg
         .get(name)
         .unwrap_or_else(|| panic!("tool {name} not registered"));
@@ -44,7 +56,9 @@ fn exec_tool(reg: &ToolRegistry, name: &str) -> String {
         .parse(&serde_json::json!({}))
         .expect("parse failed");
     let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
-    let out = smol::block_on(async { inv.execute(&ctx).await })
+    let out = inv
+        .execute(&ctx)
+        .await
         .output
         .unwrap_or_else(|e| panic!("tool {name} failed: {e}"));
     match out {
@@ -105,14 +119,14 @@ fn sorted_keys<'a>(keys: impl Iterator<Item = &'a &'static str>) -> String {
 
 /// Everything flashed up to the first sentinel. Dispatch is sequential on the
 /// Lua thread, so whatever the events before it caused is already in.
-fn flashes_until_sentinel(ui: &flume::Receiver<UiAction>) -> Vec<String> {
+fn flashes_until_sentinel(ui: &mut UnboundedReceiver<UiAction>) -> Vec<String> {
     let mut out = Vec::new();
     loop {
-        match ui.recv_timeout(DISPATCH_TIMEOUT) {
-            Ok(UiAction::Flash(msg)) if msg == SENTINEL_FLASH => return out,
-            Ok(UiAction::Flash(msg)) => out.push(msg),
-            Ok(_) => {}
-            Err(e) => panic!("sentinel never flashed: {e}, got {out:?}"),
+        match wait_next(ui, DISPATCH_TIMEOUT) {
+            Some(UiAction::Flash(msg)) if msg == SENTINEL_FLASH => return out,
+            Some(UiAction::Flash(msg)) => out.push(msg),
+            Some(_) => {}
+            None => panic!("sentinel never flashed, got {out:?}"),
         }
     }
 }
@@ -126,7 +140,7 @@ fn flashes_until_sentinel(ui: &flume::Receiver<UiAction>) -> Vec<String> {
 fn content_fields_are_left_out_without_session_read(event: &str) {
     let fields = host_event_fields(event).expect("a content event is classified");
     let (_reg, host) = host();
-    let ui = host.ui_action_rx();
+    let mut ui = host.take_ui_action_rx().unwrap();
     load(&host, CONTENT_READER, &key_reporter(CONTENT_READER, event));
     load_granted(
         &host,
@@ -142,9 +156,9 @@ fn content_fields_are_left_out_without_session_read(event: &str) {
         .map(|key| ((*key).to_owned(), PAYLOAD_VALUE.into()))
         .collect();
     let events = host.event_handle();
-    events.fire_autocmd(event, payload.clone().into());
-    events.fire_autocmd(event, payload.into());
-    events.fire_autocmd(SENTINEL_EVENT, serde_json::json!({}));
+    fire_autocmd(&events, event, payload.clone().into());
+    fire_autocmd(&events, event, payload.into());
+    fire_autocmd(&events, SENTINEL_EVENT, serde_json::json!({}));
 
     let everything = format!(
         "{CONTENT_READER}:{}",
@@ -153,7 +167,7 @@ fn content_fields_are_left_out_without_session_read(event: &str) {
     let metadata = format!("{CONTENT_BLIND}:{}", sorted_keys(fields.metadata.iter()));
     let warning = content_omitted_message(CONTENT_BLIND, event, fields.content);
     assert_eq!(
-        flashes_until_sentinel(&ui),
+        flashes_until_sentinel(&mut ui),
         [
             everything.clone(),
             warning,
@@ -181,7 +195,7 @@ const CUSTOM_EVENT: &str = "MyPluginEvent";
 #[test_case(CUSTOM_EVENT, true ; "a_plugin_event_arrives_whole")]
 fn only_classified_metadata_reaches_a_plugin_without_session_read(event: &str, whole: bool) {
     let (_reg, host) = host();
-    let ui = host.ui_action_rx();
+    let mut ui = host.take_ui_action_rx().unwrap();
     load_granted(
         &host,
         CONTENT_BLIND,
@@ -190,11 +204,12 @@ fn only_classified_metadata_reaches_a_plugin_without_session_read(event: &str, w
     );
 
     let events = host.event_handle();
-    events.fire_autocmd(
+    fire_autocmd(
+        &events,
         event,
         serde_json::json!({ SESSION_ID_KEY: PAYLOAD_VALUE, UNCLASSIFIED_KEY: PAYLOAD_VALUE }),
     );
-    events.fire_autocmd(SENTINEL_EVENT, serde_json::json!({}));
+    fire_autocmd(&events, SENTINEL_EVENT, serde_json::json!({}));
 
     let expected = if whole {
         vec![format!(
@@ -206,7 +221,7 @@ fn only_classified_metadata_reaches_a_plugin_without_session_read(event: &str, w
             format!("{CONTENT_BLIND}:{SESSION_ID_KEY}"),
         ]
     };
-    assert_eq!(flashes_until_sentinel(&ui), expected);
+    assert_eq!(flashes_until_sentinel(&mut ui), expected);
 }
 
 const KEY_FIRER: &str = "key_firer";
@@ -238,7 +253,7 @@ maki.api.create_autocmd("{SENTINEL_EVENT}", {{
 fn a_key_that_cannot_be_named_does_not_drop_the_event() {
     let event = "TurnEnd";
     let (_reg, host) = host();
-    let ui = host.ui_action_rx();
+    let mut ui = host.take_ui_action_rx().unwrap();
     load(&host, CONTENT_READER, &key_counter(CONTENT_READER, event));
     load_granted(
         &host,
@@ -259,7 +274,7 @@ maki.api.exec_autocmds("{SENTINEL_EVENT}")
     );
 
     assert_eq!(
-        flashes_until_sentinel(&ui),
+        flashes_until_sentinel(&mut ui),
         [
             format!("{CONTENT_READER}:2"),
             content_omitted_message(CONTENT_BLIND, event, &[UNNAMEABLE_KEY]),
@@ -443,14 +458,17 @@ end }})
         probe_tool("probe_turn_end", "return table.concat(log, \";\")")
     );
     load(&host, "listener", &listener);
-    host.event_handle()
-        .fire_autocmd("TurnEnd", serde_json::json!({ "k": "v" }));
+    fire_autocmd(
+        &host.event_handle(),
+        "TurnEnd",
+        serde_json::json!({ "k": "v" }),
+    );
     assert_eq!(exec_tool(&reg, "probe_turn_end"), "TurnEnd|nil|v");
 }
 
 /// A handler has to tell the teardown paths apart, so every reason arrives
 /// naming the session it left behind. Only the paths someone waits on carry a
-/// deadline, and by the time `end_sessions_blocking` is back the handler has
+/// deadline, and by the time `end_sessions` is back the handler has
 /// already had its say.
 #[test]
 fn session_end_carries_session_reason_and_deadline() {
@@ -475,13 +493,13 @@ end }})
         SessionEndReason::Completed,
     ] {
         let session = MakiId::generate();
-        host.event_handle().end_sessions_blocking([session], reason);
+        runtime().block_on(host.event_handle().end_sessions([session], reason));
         expected.push(format!("{session}|{reason}|number"));
     }
     assert_eq!(
         exec_tool(&reg, "probe_session_end"),
         expected.join(";"),
-        "end_sessions_blocking must only return once the handler ran"
+        "end_sessions must only return once the handler ran"
     );
 
     for reason in [
@@ -508,6 +526,49 @@ end }})
         );
         std::thread::sleep(DISPATCH_POLL);
     }
+}
+
+const PARK_POLL_MS: u64 = 1;
+const HANDLER_FINISHED: &str = "finished";
+const WAIT_BLOCKED_THREAD: &str = "end_sessions returned before its thread ran anything else";
+
+/// On one thread the release only runs if the wait yields, and the handler
+/// only finishes once it did.
+#[tokio::test]
+async fn end_sessions_yields_its_thread_while_a_handler_is_parked() {
+    let (reg, host) = host();
+    let parker = format!(
+        r#"
+local released, state = false, "parked"
+maki.api.create_autocmd("SessionEnd", {{ callback = function()
+    while not released do maki.async.sleep({PARK_POLL_MS}) end
+    state = "{HANDLER_FINISHED}"
+end }})
+{}{}
+"#,
+        probe_tool("release_session_end", "released = true return \"\""),
+        probe_tool("probe_parked_session_end", "return state")
+    );
+    load(&host, "parker", &parker);
+
+    let ended = Cell::new(false);
+    join!(
+        async {
+            host.event_handle()
+                .end_sessions([MakiId::generate()], SessionEndReason::Shutdown)
+                .await;
+            ended.set(true);
+        },
+        async {
+            assert!(!ended.get(), "{WAIT_BLOCKED_THREAD}");
+            run_tool(&reg, "release_session_end").await;
+        },
+    );
+
+    assert_eq!(
+        run_tool(&reg, "probe_parked_session_end").await,
+        HANDLER_FINISHED
+    );
 }
 
 #[test]
@@ -589,6 +650,7 @@ fn call_of<'a>(
         origin,
         output_mode: ToolOutputMode::Compact,
         authority,
+        receipt: false,
         cancel,
         deadline: Instant::now() + DISPATCH_TIMEOUT,
     }
@@ -610,14 +672,9 @@ fn fire_call(
 /// Bounded, so a seam that stops answering fails the test instead of hanging
 /// the suite.
 fn within<T>(work: impl Future<Output = T>) -> T {
-    smol::block_on(async {
-        let work = async { Some(work.await) };
-        let give_up = async {
-            smol::Timer::after(DISPATCH_TIMEOUT).await;
-            None
-        };
-        smol::future::or(work, give_up).await.expect(NEVER_ANSWERED)
-    })
+    runtime()
+        .block_on(async { timeout(DISPATCH_TIMEOUT, work).await })
+        .expect(NEVER_ANSWERED)
 }
 
 /// Fires one stage the way `tool_dispatch::run` does, with the authority the
@@ -879,7 +936,7 @@ fn an_output_layer_pays_for_the_content_it_changes(granted: fn() -> PluginPermis
 #[test]
 fn a_skipped_layer_warns_once_per_gap() {
     let (reg, host) = host();
-    let ui = host.ui_action_rx();
+    let mut ui = host.take_ui_action_rx().unwrap();
     guarded_tool(&host);
     let slot = format!("tool.{GUARDED_TOOL}.{}", HookStage::Output.as_str());
 
@@ -900,7 +957,7 @@ fn a_skipped_layer_warns_once_per_gap() {
     assert_eq!(output(&reg, GUARDED_TOOL, "secret", false), None);
 
     let both = [Permission::SessionRead, Permission::SessionWrite];
-    let about_the_slot: Vec<String> = flashes(&ui)
+    let about_the_slot: Vec<String> = flashes(&mut ui)
         .into_iter()
         .filter(|msg| msg.contains(&slot))
         .collect();
@@ -913,8 +970,8 @@ fn a_skipped_layer_warns_once_per_gap() {
     );
 }
 
-fn flashes(ui: &flume::Receiver<UiAction>) -> Vec<String> {
-    ui.try_iter()
+fn flashes(ui: &mut UnboundedReceiver<UiAction>) -> Vec<String> {
+    iter::from_fn(|| ui.try_recv().ok())
         .filter_map(|action| match action {
             UiAction::Flash(msg) => Some(msg),
             _ => None,
@@ -1273,6 +1330,8 @@ const PLUGIN_LABEL: &str = "Commit and implement";
 /// parked on it can only answer after the form has given up on it.
 const PLAN_PARKED_FOR: Duration = Duration::from_secs(15);
 const NO_PICK: &str = "none";
+const PLAN_REQUEST: u64 = 1;
+const NEXT_PLAN_REQUEST: u64 = 2;
 
 /// Stands in for what the UI proposes: one row it knows how to run itself.
 fn builtin_rows() -> Vec<PlanFormRow> {
@@ -1317,14 +1376,17 @@ fn plugin_row(extra: &str) -> String {
 }
 
 fn ask_plan_form(host: &PluginHost) -> Option<PlanMenu> {
-    host.event_handle()
-        .open_plan_form(
-            PLAN_PATH.to_owned(),
-            PLAN_SESSION.to_owned(),
-            builtin_rows(),
-        )
-        .recv_timeout(DISPATCH_TIMEOUT)
-        .expect("the plan form chains must answer")
+    ask_plan_form_request(host, PLAN_REQUEST)
+}
+
+fn ask_plan_form_request(host: &PluginHost, request: u64) -> Option<PlanMenu> {
+    let answer = host.event_handle().open_plan_form(
+        PLAN_PATH.to_owned(),
+        PLAN_SESSION.to_owned(),
+        request,
+        builtin_rows(),
+    );
+    wait_reply(answer, DISPATCH_TIMEOUT).expect("the plan form chains must answer")
 }
 
 fn plan_menu(host: &PluginHost) -> PlanMenu {
@@ -1341,16 +1403,14 @@ fn menu_labels(host: &PluginHost) -> Vec<String> {
 
 /// Picks {row} of {menu} and waits for the host to say what became of it.
 fn pick_row(host: &PluginHost, menu: &PlanMenu, row: usize) -> PlanActionOutcome {
-    host.event_handle()
-        .run_plan_action(
-            PLAN_SESSION.to_owned(),
-            menu.generation,
-            row,
-            PLAN_PATH.to_owned(),
-            true,
-        )
-        .recv_timeout(DISPATCH_TIMEOUT)
-        .expect("a pick must be answered")
+    let answer = host.event_handle().run_plan_action(
+        PLAN_SESSION.to_owned(),
+        menu.generation,
+        row,
+        PLAN_PATH.to_owned(),
+        true,
+    );
+    wait_reply(answer, DISPATCH_TIMEOUT).expect("a pick must be answered")
 }
 
 fn plugin_row_index(menu: &PlanMenu) -> usize {
@@ -1720,9 +1780,8 @@ fn unloading_a_plugin_reaps_the_handlers_of_a_drawn_menu() {
     );
 }
 
-/// A chain that parked and resumed installs its handlers over a menu already
-/// on screen, and the generation keeps a pick out of a menu the user never
-/// saw.
+/// A pick still in flight from a menu a newer request replaced names the old
+/// generation, and so cannot reach the new menu's handlers.
 #[test]
 fn a_pick_from_a_replaced_menu_reaches_no_handler() {
     let (_reg, host) = host();
@@ -1739,8 +1798,8 @@ fn a_pick_from_a_replaced_menu_reaches_no_handler() {
 
     let drawn = plan_menu(&host);
     let row = plugin_row_index(&drawn);
-    let replacement = plan_menu(&host);
-    assert_ne!(drawn.generation, replacement.generation);
+    let replacement =
+        ask_plan_form_request(&host, NEXT_PLAN_REQUEST).expect("the built-in form must open");
 
     assert_eq!(
         pick_row(&host, &drawn, row),
@@ -1750,6 +1809,70 @@ fn a_pick_from_a_replaced_menu_reaches_no_handler() {
     assert_eq!(
         pick_row(&host, &replacement, row),
         PlanActionOutcome::Proceed
+    );
+}
+
+/// A chain that finishes after a newer request went out answers nobody: the
+/// newer request dropped its receiver first, so its rows never replace the
+/// handlers of the menu on screen.
+#[test]
+fn a_chain_that_finishes_late_leaves_the_newer_menu_alone() {
+    let (reg, host) = host();
+    load(
+        &host,
+        PLANNER,
+        &format!(
+            r#"
+local calls, parked, released, finished, picked = 0, false, false, false, "{NO_PICK}"
+maki.api.set_slot("ui.plan_form.actions", function(prev, ev)
+    calls = calls + 1
+    local request = calls
+    if request == {PLAN_REQUEST} then
+        parked = true
+        while not released do maki.async.sleep({PARK_POLL_MS}) end
+    end
+    local rows = prev(ev)
+    table.insert(rows, {})
+    finished = finished or request == {PLAN_REQUEST}
+    return rows
+end)
+{}{}{}
+"#,
+            plugin_row("handler = function() picked = tostring(request) end"),
+            probe_tool(
+                "await_parked_plan_chain",
+                &format!(r#"while not parked do maki.async.sleep({PARK_POLL_MS}) end return """#)
+            ),
+            probe_tool(
+                "release_plan_chain",
+                &format!(
+                    r#"released = true
+                       while not finished do maki.async.sleep({PARK_POLL_MS}) end
+                       return """#
+                )
+            ),
+            probe_tool("probe_picked_plan_row", "return picked")
+        ),
+    );
+
+    drop(host.event_handle().open_plan_form(
+        PLAN_PATH.to_owned(),
+        PLAN_SESSION.to_owned(),
+        PLAN_REQUEST,
+        builtin_rows(),
+    ));
+    exec_tool(&reg, "await_parked_plan_chain");
+    let drawn =
+        ask_plan_form_request(&host, NEXT_PLAN_REQUEST).expect("the built-in form must open");
+    exec_tool(&reg, "release_plan_chain");
+
+    assert_eq!(
+        pick_row(&host, &drawn, plugin_row_index(&drawn)),
+        PlanActionOutcome::Proceed
+    );
+    assert_eq!(
+        exec_tool(&reg, "probe_picked_plan_row"),
+        NEXT_PLAN_REQUEST.to_string()
     );
 }
 
@@ -1888,8 +2011,9 @@ fn wildcard_layers_wrap_every_tool_outside_the_specific_ones() {
     );
 }
 
-#[test]
-fn output_ctx_carries_the_input_and_kind() {
+#[test_case(false ; "final_result")]
+#[test_case(true  ; "receipt_of_a_moved_call")]
+fn output_ctx_carries_the_input_kind_and_receipt(receipt: bool) {
     const KIND: &str = "execute";
     let (reg, host) = host();
     slotted_tool(&host);
@@ -1900,7 +2024,7 @@ fn output_ctx_carries_the_input_and_kind() {
             ANY_TOOL,
             HookStage::Output,
             &format!(
-                r#"value.{text} = ctx.tool_kind .. ":" .. ctx.input.{COMMAND_FIELD}; return prev(value, ctx)"#,
+                r#"value.{text} = ctx.tool_kind .. ":" .. ctx.input.{COMMAND_FIELD} .. ":" .. tostring(ctx.receipt); return prev(value, ctx)"#,
                 text = hook::OUTPUT_TEXT
             ),
         ),
@@ -1910,6 +2034,7 @@ fn output_ctx_carries_the_input_and_kind() {
     let call = HookCall {
         tool_kind: Some(KIND),
         input: Some(&tool_input),
+        receipt,
         ..call_of(SLOT_TOOL, Authority::Unbounded, CallOrigin::Model, &cancel)
     };
 
@@ -1922,7 +2047,10 @@ fn output_ctx_carries_the_input_and_kind() {
     let Verdict::Replaced(value) = verdict else {
         panic!("the layer rewrote the output, got {verdict:?}");
     };
-    assert_eq!(value[hook::OUTPUT_TEXT], format!("{KIND}:{COMMAND}"));
+    assert_eq!(
+        value[hook::OUTPUT_TEXT],
+        format!("{KIND}:{COMMAND}:{receipt}")
+    );
 }
 
 /// Handing the value back untouched is a pass through and not a rewrite, so
@@ -2537,7 +2665,7 @@ fn a_plugin_cannot_price_a_slot_in_a_capability_it_lacks() {
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("prices layers at") && err.contains("not granted"),
+        err.contains("in 'capability'") && err.contains("not granted"),
         "unexpected error: {err}"
     );
 }

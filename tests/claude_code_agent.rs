@@ -11,7 +11,7 @@ use std::fs::{self, Permissions};
 use std::iter;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
 use serde_json::Value;
 use test_case::test_case;
@@ -157,11 +157,7 @@ impl Fixture {
 
     fn maki(&self, model: &str, prompt: &str, format: &str) -> Command {
         let mut command = self.isolation.command();
-        command
-            .args(["-p", "--model", model, "--output-format", format, prompt])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        command.args(["-p", "--model", model, "--output-format", format, prompt]);
         command
     }
 }
@@ -174,10 +170,15 @@ fn run_maki(model: &str) -> Run {
         env::var_os(CLAUDE_CONFIG_ENV).map_or_else(|| real_home.join(".claude"), PathBuf::from);
     let mut command = fixture.maki(model, PROMPT, STREAM_FORMAT);
     command.env(CLAUDE_CONFIG_ENV, claude_config);
-    let Output { stdout, stderr, .. } = finish(&mut command);
+    let Output {
+        status,
+        stdout,
+        stderr,
+    } = finish(&mut command);
     let stderr = String::from_utf8(stderr).unwrap();
     let events = ndjson(&stdout);
     assert!(!events.is_empty(), "maki printed no events: {stderr}");
+    assert!(status.success(), "maki failed: {stderr}\n{events:#?}");
     Run { events }
 }
 

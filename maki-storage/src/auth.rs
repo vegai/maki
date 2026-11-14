@@ -1,8 +1,8 @@
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -28,7 +28,7 @@ const LOCK_POLL: Duration = Duration::from_millis(50);
 /// expires. Atlassian's MCP server registers clients this way.
 const CLIENT_SECRET_NEVER_EXPIRES: u64 = 0;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OAuthTokens {
     pub access: String,
     pub refresh: String,
@@ -47,7 +47,7 @@ impl OAuthTokens {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct McpAuthData {
     pub server_url: String,
     pub tokens: Option<OAuthTokens>,
@@ -61,6 +61,15 @@ pub struct McpAuthData {
     /// cannot redirect the refresh token and client secret elsewhere.
     #[serde(default)]
     pub token_endpoint: Option<String>,
+    /// The auth server's RFC 8414 metadata as discovered at interactive auth,
+    /// pinned for the same reason as `token_endpoint`. Records from before it
+    /// existed fall back to discovery checked against `token_endpoint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_server: Option<serde_json::Value>,
+    /// The RFC 8707 resource named at interactive auth, which refreshes name
+    /// again. Records from before it existed named the server URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -126,8 +135,7 @@ pub fn lock_plugin_store(dir: &StateDir, slug: &str) -> Option<File> {
 }
 
 /// The slugs this process currently holds the credential lock for.
-static HELD_CREDENTIALS: LazyLock<Mutex<HashSet<String>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+static HELD_CREDENTIALS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
 /// One provider's credential lock, re-entrant within this process and released
 /// on drop.
@@ -338,6 +346,8 @@ mod tests {
             client_secret_expires_at: None,
             redirect_uri: None,
             token_endpoint: None,
+            auth_server: None,
+            resource: None,
         }
     }
 

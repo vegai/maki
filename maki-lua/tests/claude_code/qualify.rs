@@ -537,7 +537,7 @@ fn ask(executable: &Path, project: &Path, prompt: &str) -> Result<String, String
     let (reg, _host) = load(opts);
     let session = stub_ctx_in(project, None, None);
     let input = json!({ "prompt": prompt, "model": READ_MODEL });
-    smol::block_on(tool_reply(&reg, &session, TOOL, input))
+    maki_lua::test_support::runtime().block_on(tool_reply(&reg, &session, TOOL, input))
 }
 
 /// Recorded tool calls identify actual denials. Model text alone cannot establish that the
@@ -724,8 +724,9 @@ fn live_a_coding_worker_changes_only_its_snapshot() {
         .replace("@HOME_FILE@", &home_file.to_string_lossy())
         .replace("@LATER@", &later.to_string_lossy());
     let input = json!({ "prompt": prompt, "model": LIVE_MODEL, "profile": "code" });
-    let reply =
-        smol::block_on(tool_reply(&reg, &ctx, TOOL, input)).expect("the run must give a reply");
+    let reply = maki_lua::test_support::runtime()
+        .block_on(tool_reply(&reg, &ctx, TOOL, input))
+        .expect("the run must give a reply");
 
     let raw = fs::read_to_string(root.join(RAW_OUTPUT)).unwrap();
     let attempts = attempts(&raw);
@@ -826,7 +827,8 @@ fn live_a_coding_worker_changes_only_its_snapshot() {
     }
     assert!(contents(&project) == before, "the run changed the checkout");
 
-    smol::block_on(tool_reply(&reg, &ctx, IMPORT_TOOL, json!({ "id": id })))
+    maki_lua::test_support::runtime()
+        .block_on(tool_reply(&reg, &ctx, IMPORT_TOOL, json!({ "id": id })))
         .expect("the import must apply");
     for file in [NOTES, ADDED_FILE] {
         assert_eq!(
@@ -918,15 +920,16 @@ fn live_coding_worker_cannot_connect_to_runtime_sockets() {
     let (reg, _host) = load(opts);
     let ctx = stub_ctx_in(&project, None, None);
     let prompt = format!("{CONNECT_PROMPT}{}", commands.join("\n"));
-    let reply = smol::block_on(tool_reply(
-        &reg,
-        &ctx,
-        TOOL,
-        json!({
-            "prompt": prompt, "profile": "code", "model": LIVE_MODEL,
-        }),
-    ))
-    .unwrap();
+    let reply = maki_lua::test_support::runtime()
+        .block_on(tool_reply(
+            &reg,
+            &ctx,
+            TOOL,
+            json!({
+                "prompt": prompt, "profile": "code", "model": LIVE_MODEL,
+            }),
+        ))
+        .unwrap();
     let raw = fs::read_to_string(root.join(RAW_OUTPUT)).unwrap();
     let attempted = attempts(&raw);
     for command in commands {

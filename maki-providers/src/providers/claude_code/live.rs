@@ -1,20 +1,23 @@
 //! These tests run the claude CLI, so they spend a little of the caller's
 //! subscription. They run only on request: `cargo nextest run -p
-//! maki-providers --run-ignored only -E 'test(/claude_code::linux::live::/)'`.
+//! maki-providers --run-ignored only -E 'test(/claude_code::live::/)'`.
+//! nextest gives every test an empty `$HOME`, so pass the login through
+//! `CLAUDE_CONFIG_DIR` or `CLAUDE_CODE_OAUTH_TOKEN`.
 
 use std::collections::HashSet;
 use std::env;
 use std::fs::{self, Permissions};
+use std::iter;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use flume::Sender;
 use serde_json::{Value, json};
-use smol::Timer;
 use tempfile::{TempDir, tempdir};
 use test_case::test_case;
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::time::sleep;
 
 use super::checks::launch_env;
 use super::error::Error;
@@ -59,7 +62,7 @@ const OVERFLOW_OPT_IN: &str = "MAKI_LIVE_OVERFLOW";
 const FILLER_LINES: usize = 400;
 /// Less than the filler's size, so only a cache hit on the first message can
 /// reach it.
-const MIN_CACHE_GAIN: u32 = 3000;
+const MIN_CACHE_GAIN: u64 = 3000;
 const NOTE_TOOL: &str = "note";
 const FIRST_NOTE: &str = "start";
 /// Slow enough that a long second call keeps the first one held for more than
@@ -108,7 +111,7 @@ impl Live {
         max_output: Option<u32>,
         thinking: Thinking,
     ) -> Result<StreamResponse, Error> {
-        let (events, _received) = flume::unbounded();
+        let (events, _received) = unbounded_channel();
         self.ask_streaming(model, messages, tools, max_output, thinking, &events)
     }
 
@@ -119,9 +122,9 @@ impl Live {
         tools: &Value,
         max_output: Option<u32>,
         thinking: Thinking,
-        events: &Sender<ProviderEvent>,
+        events: &UnboundedSender<ProviderEvent>,
     ) -> Result<StreamResponse, Error> {
-        smol::block_on(request(Request {
+        crate::test_support::runtime().block_on(request(Request {
             launch: Launch {
                 executable: &self.claude,
                 env: &self.env,
@@ -205,20 +208,21 @@ fn live_a_conversation_past_the_window_overflows() {
 #[test]
 #[ignore = "runs the claude CLI"]
 fn live_the_listed_models_are_full_ids_with_a_price() {
-    warm_catalog();
+    crate::test_support::runtime().block_on(warm_catalog());
     let live = Live::new();
-    let listed = smol::block_on(models(
-        &Launch {
-            executable: &live.claude,
-            env: &live.env,
-            project: &live.cwd,
-            denied: &[],
-            temp_dir: &env::temp_dir(),
-            limits: &Limits::new(IDLE),
-        },
-        &Mutex::default(),
-    ))
-    .unwrap();
+    let listed = crate::test_support::runtime()
+        .block_on(models(
+            &Launch {
+                executable: &live.claude,
+                env: &live.env,
+                project: &live.cwd,
+                denied: &[],
+                temp_dir: &env::temp_dir(),
+                limits: &Limits::new(IDLE),
+            },
+            &Mutex::default(),
+        ))
+        .unwrap();
 
     assert!(!listed.is_empty());
     assert!(
@@ -262,7 +266,7 @@ fn live_thinking_settings_are_accepted(model: &str, thinking: Thinking) {
 #[ignore = "runs the claude CLI on the subscription of the caller"]
 fn live_thinking_reaches_maki_as_text() {
     let messages = [Message::user(THINK_FIRST.to_owned())];
-    let (events, received) = flume::unbounded();
+    let (events, mut received) = unbounded_channel();
     let reply = Live::new()
         .ask_streaming(
             MODEL,
@@ -274,8 +278,7 @@ fn live_thinking_reaches_maki_as_text() {
         )
         .unwrap();
     answer(&reply);
-    let thought: String = received
-        .drain()
+    let thought: String = iter::from_fn(|| received.try_recv().ok())
         .filter_map(|event| match event {
             ProviderEvent::ThinkingDelta { text } => Some(text),
             _ => None,
@@ -317,7 +320,7 @@ fn live_a_reply_at_its_output_cap_comes_back_cut() {
         )
         .unwrap();
     assert_eq!(reply.stop_reason, Some(StopReason::MaxTokens));
-    assert_eq!(reply.usage.output, TINY_OUTPUT_CAP);
+    assert_eq!(reply.usage.output, u64::from(TINY_OUTPUT_CAP));
 }
 
 /// Two tool rounds. The history must show the first call's tool under the
@@ -446,21 +449,23 @@ fn live_stopping_a_tool_reply_removes_its_session() {
     let seen = Arc::clone(&observed);
     let pid_log = pids.clone();
     let session_dir = sessions.clone();
-    let observer = smol::spawn(async move {
-        loop {
-            if let Ok(pids) = smol::fs::read_to_string(&pid_log).await {
-                for pid in pids.lines() {
-                    if smol::fs::metadata(session_dir.join(format!("{pid}.json")))
-                        .await
-                        .is_ok()
-                    {
-                        seen.lock().unwrap().insert(pid.to_owned());
+    let observer = tokio_util::task::AbortOnDropHandle::new(crate::test_support::runtime().spawn(
+        async move {
+            loop {
+                if let Ok(pids) = tokio::fs::read_to_string(&pid_log).await {
+                    for pid in pids.lines() {
+                        if tokio::fs::metadata(session_dir.join(format!("{pid}.json")))
+                            .await
+                            .is_ok()
+                        {
+                            seen.lock().unwrap().insert(pid.to_owned());
+                        }
                     }
                 }
+                sleep(SESSION_POLL).await;
             }
-            Timer::after(SESSION_POLL).await;
-        }
-    });
+        },
+    ));
     let reply = live.ask(
         MODEL,
         &[Message::user(format!(
@@ -470,7 +475,8 @@ fn live_stopping_a_tool_reply_removes_its_session() {
         None,
         Thinking::Off,
     );
-    smol::block_on(observer.cancel());
+    observer.abort();
+    let _ = crate::test_support::runtime().block_on(observer);
     let reply = reply.unwrap();
     let _ = lookup_round(&reply, WORD, MEANING);
     assert_eq!(reply.message.tool_uses().count(), 1);

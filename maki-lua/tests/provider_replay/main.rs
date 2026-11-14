@@ -7,16 +7,22 @@
 //! a process of its own. The golden walker gets the same guarantee by
 //! replaying each file in a child process, see [`golden`].
 
+use serde_json::{Map, Value};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc::unbounded_channel;
 
 use maki_agent::tools::ToolRegistry;
-use maki_config::providers::builtin_provider;
+use maki_config::providers::{base_url_env_var, builtin_provider};
 use maki_config::{PROVIDER_BUILTINS, PluginsConfig};
 use maki_lua::PluginHost;
+use maki_lua::test_support::runtime;
 use maki_providers::plugin;
-use maki_providers::{Model, ResolvedAuth, ThinkingSupport, Timeouts};
-use tempfile::TempDir;
+use maki_providers::provider::RequestScope;
+use maki_providers::test_support::{Canned, isolated_home, serve};
+use maki_providers::{Message, Model, RequestOptions, ResolvedAuth, ThinkingSupport, Timeouts};
+use serde_json::json;
 use test_case::test_case;
 
 #[path = "../common/environment.rs"]
@@ -26,40 +32,28 @@ mod environment;
 mod golden;
 
 const MISTRAL: &str = "mistral";
+const OPENROUTER: &str = "openrouter";
 const DEEPSEEK: &str = "deepseek";
 const PUBLISHED_PEAK_HOURS: &str = "2x during 01:00-04:00, 06:00-10:00 UTC, Mon-Fri";
 const MISTRAL_KEY_ENV: &str = "MISTRAL_API_KEY";
 const MISTRAL_KEY: &str = "sk-test";
 const MINISTRAL: &str = "ministral-14b-latest";
 const MEDIUM: &str = "mistral-medium-latest";
-
-const HOME_VARS: &[&str] = &[
-    "HOME",
-    "XDG_STATE_HOME",
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
-    "XDG_CACHE_HOME",
-];
+const STREAMED_COST: f64 = 0.00042;
+const COST_SSE: &[Canned] = &[Canned::sse(
+    "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"cost\":0.00042}}\n\ndata: [DONE]\n",
+)];
 
 const HOST_FAILED: &str = "the plugin host did not start";
 const LOAD_FAILED: &str = "the bundled provider plugin did not load";
-const TEMPDIR_FAILED: &str = "no temporary state directory";
 const UNDECLARED_SLUG: &str =
     "a bundled provider plugin did not declare the slug it is named after";
 const NOT_LISTED_FOR_LOGIN: &str = "a bundled provider plugin is missing from maki auth login";
 const NO_SCHEDULE: &str = "deepseek bills by the clock";
 const UNKNOWN_MODEL: &str = "the model spec did not resolve";
 const NOT_BUILT: &str = "mistral did not build from its declaration";
-
-/// Points every base directory at a throwaway tree, so neither the real
-/// `providers.toml` nor this machine's credentials reach the registration.
-fn isolated_state() -> TempDir {
-    let dir = TempDir::new().expect(TEMPDIR_FAILED);
-    for var in HOME_VARS {
-        environment::set(var, dir.path());
-    }
-    dir
-}
+const STREAM_FAILED: &str = "stream must succeed";
+const PROMPT: &str = "hi";
 
 /// One bundled plugin and no others, so what registers the slug is never
 /// ambiguous, loaded with the permissions its own `plugin.toml` declares, so
@@ -70,13 +64,19 @@ fn isolated_state() -> TempDir {
 /// local gateway. The host comes back instead of being dropped, since a hook
 /// whose host has died answers nothing.
 fn load_bundled(slug: &str) -> PluginHost {
+    load_bundled_with_opts(slug, HashMap::new())
+}
+
+/// `opts` is the `plugins.<name>` table from `maki.setup`, so a golden can
+/// load its plugin the way a user who set that option would.
+fn load_bundled_with_opts(slug: &str, opts: HashMap<String, Map<String, Value>>) -> PluginHost {
     let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).expect(HOST_FAILED);
     plugin::begin_load();
     host.load_builtins(&PluginsConfig {
         enabled: true,
         names: vec![slug.to_owned()],
         packages: Vec::new(),
-        opts: HashMap::new(),
+        opts,
     })
     .expect(LOAD_FAILED);
     plugin::commit_load();
@@ -88,7 +88,7 @@ fn load_bundled(slug: &str) -> PluginHost {
 /// Each one loads alone, so a neighbour can never answer for it.
 #[test]
 fn every_provider_builtin_declares_its_own_slug() {
-    let _state = isolated_state();
+    let _state = isolated_home();
     for &slug in PROVIDER_BUILTINS {
         let _host = load_bundled(slug);
         assert!(plugin::is_registered(slug), "{UNDECLARED_SLUG}: {slug}");
@@ -104,7 +104,7 @@ fn every_provider_builtin_declares_its_own_slug() {
 /// quietly bill at the off-peak rate.
 #[test]
 fn deepseek_bills_the_published_peak_hours() {
-    let _state = isolated_state();
+    let _state = isolated_home();
     let _host = load_bundled(DEEPSEEK);
 
     let schedule = plugin::spec(DEEPSEEK)
@@ -148,7 +148,7 @@ fn routed(model_id: &str) -> Model {
 #[test_case(declared, MEDIUM, true ; "declared_medium")]
 #[test_case(routed, MEDIUM, true ; "routed_medium")]
 fn only_ministral_is_denied_thinking(adjusted: fn(&str) -> Model, model_id: &str, thinks: bool) {
-    let _state = isolated_state();
+    let _state = isolated_home();
     environment::set(MISTRAL_KEY_ENV, MISTRAL_KEY);
     let _host = load_bundled(MISTRAL);
 
@@ -158,4 +158,35 @@ fn only_ministral_is_denied_thinking(adjusted: fn(&str) -> Model, model_id: &str
         !thinks
     );
     assert_eq!(model.supports_thinking(), thinks);
+}
+
+#[test_case(OPENROUTER, "openrouter/openai/gpt-5.5", Some(STREAMED_COST) ; "openrouter_reads_usage_cost")]
+#[test_case(MISTRAL, "mistral/mistral-medium-latest", None ; "mistral_ignores_usage_cost")]
+fn only_opted_in_providers_read_usage_cost(slug: &str, spec: &str, expected: Option<f64>) {
+    let _state = isolated_home();
+    let (base_url, _requests) = serve(COST_SSE);
+    environment::set(&base_url_env_var(slug), base_url);
+    let _host = load_bundled(slug);
+    let key_env = plugin::spec(slug).expect(NOT_BUILT).api_key_env;
+    environment::set(key_env, MISTRAL_KEY);
+
+    let provider = plugin::create(slug, Timeouts::default()).expect(NOT_BUILT);
+    let model = Model::from_spec(spec).expect(UNKNOWN_MODEL);
+    let (tx, _rx) = unbounded_channel();
+    let resp = runtime()
+        .block_on(provider.stream_message(
+            &model,
+            &[Message::user(PROMPT.into())],
+            "",
+            &json!([]),
+            &tx,
+            RequestOptions::default(),
+            RequestScope {
+                session_id: None,
+                cwd: Path::new("."),
+            },
+        ))
+        .expect(STREAM_FAILED);
+
+    assert_eq!(resp.usage.cost, expected);
 }

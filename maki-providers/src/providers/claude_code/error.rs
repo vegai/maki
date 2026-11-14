@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use thiserror::Error;
+use tokio::task::JoinError;
 
 const INVALID_REQUEST: &str = "invalid_request";
 pub(crate) const TOO_MANY_REQUESTS: u16 = 429;
@@ -42,10 +43,14 @@ pub(super) fn preview(text: &str, limit: usize) -> String {
 
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("maki cannot finish a Claude Code background task: {0}")]
+    Task(#[from] JoinError),
     #[error(
         "all Claude Code request slots are busy; retry model discovery after a request finishes"
     )]
     ListingBusy,
+    #[error("Claude Code model discovery is still running; retry once it finishes")]
+    ListingPending,
     #[error("maki cannot serialize Claude Code JSON: {0}")]
     Encode(#[source] serde_json::Error),
     #[error(transparent)]
@@ -96,6 +101,8 @@ pub enum Error {
     ProbeLate(u64),
     #[error("Claude Code stopped its output before its reply was complete")]
     WentQuiet,
+    #[error("Claude Code was stopped after its reply was complete")]
+    StoppedAfterResult,
     #[error("Claude Code did not exit in time")]
     ExitLate,
     #[error("Claude Code could not be reaped within the shutdown grace")]
@@ -119,6 +126,8 @@ pub enum Error {
 
     #[error("Claude Code exited ({0}) before its reply was complete")]
     ExitedEarly(ExitStatus),
+    #[error("Claude Code exited ({0}) after its result")]
+    ExitedAfterResult(ExitStatus),
     #[error("Claude Code exited ({0}) during its checks")]
     ExitedInChecks(ExitStatus),
     #[error("`claude --version` exited ({0})")]
@@ -185,8 +194,15 @@ pub enum Error {
     Refused(String),
     #[error("Claude Code sent more of its reply after the reply was complete")]
     LateContent,
+    /// Claude Code can restart a reply inside its stream, for example after
+    /// its output filter stopped it. No call has run, so maki retries the
+    /// whole request.
     #[error("Claude Code started a second generation in one request")]
     SecondGeneration,
+    /// Claude Code gave up on the reply partway, after a cut connection or a
+    /// tool call cut off by the API, and restarts or ends the request.
+    #[error("Claude Code abandoned its reply partway")]
+    Abandoned,
     #[error("Claude Code started a generation without an id")]
     NoGenerationId,
     #[error("Claude Code sent a message outside the generation it streamed")]
@@ -220,6 +236,11 @@ pub enum Error {
     NoStopReason,
     #[error("the reply has tool calls but stopped for {0}")]
     StoppedFor(String),
+    /// The model spent the whole output cap before it wrote any text, and a
+    /// cut reply hands over no calls, so a retry with the same cap would end
+    /// the same way.
+    #[error("the reply used its whole output limit ({0} tokens) before it wrote any text")]
+    CutBeforeOutput(u32),
     #[error("Claude Code reported no usage for its reply")]
     NoUsage,
     #[error("Claude Code reported no final output count for its reply")]
@@ -350,7 +371,9 @@ impl Error {
                 let status = status.unwrap_or(SERVER_ERROR);
                 is_temporary_status(status).then_some((status, *delay))
             }
-            Self::NoCallsToRun | Self::StoppedFor(_) => Some((SERVER_ERROR, None)),
+            Self::NoCallsToRun | Self::StoppedFor(_) | Self::SecondGeneration | Self::Abandoned => {
+                Some((SERVER_ERROR, None))
+            }
             _ => None,
         }
     }

@@ -1,10 +1,11 @@
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
-use flume::Sender;
 use maki_config::providers::{Protocol, ProviderPlan};
+use reqwest::header::HeaderMap;
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
 use crate::model::{Model, ModelFamily, ThinkingSupport};
@@ -38,6 +39,7 @@ static CONFIG_STANDARD: OpenAiCompatConfig = OpenAiCompatConfig {
     base_url: Cow::Borrowed(BASE_URL),
     max_tokens_field: Cow::Borrowed(MAX_TOKENS_FIELD),
     include_stream_usage: false,
+    usage_cost: false,
     provider_name: Cow::Borrowed(DISPLAY_NAME),
 };
 
@@ -72,9 +74,10 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     family: ModelFamily::Glm,
     supports_thinking: false,
     supports_deferred_tools: false,
-    adaptive_effort: |_| dialect::GLM.adaptive_effort(),
+    sends_thinking: |_, choice| dialect::GLM.sends(choice),
     thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: false,
+    catalog_is_authoritative: false,
     fallback_max_output: Some(16_000),
     fallback_context_window: 128_000,
     models_toml: include_str!("../../../models/zai.toml"),
@@ -223,7 +226,7 @@ impl Provider for Zai {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         _scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -240,7 +243,7 @@ impl Provider for Zai {
             }
             match self
                 .compat
-                .do_stream(model, &[], &body, event_tx, &auth)
+                .do_stream(model, &HeaderMap::new(), &body, event_tx, &auth)
                 .await
             {
                 Err(AgentError::Api {
@@ -276,11 +279,7 @@ impl Provider for Zai {
     }
 
     fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Bearer,
-        ))
+        KeyRotation::over(&self.key_pool, &self.auth, KeyHeader::Bearer)
     }
 
     fn adjust_model(&self, model: &mut Model) {

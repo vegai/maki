@@ -1,21 +1,30 @@
 use shell_words::split;
 use std::io::{Write, stdout};
 use std::path::Path;
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use color_eyre::Result;
 use crossterm::Command;
 use crossterm::ExecutableCommand;
 use crossterm::clipboard::CopyToClipboard;
+use crossterm::cursor::{SetCursorStyle, Show};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 #[cfg(not(windows))]
 use crossterm::event::{DisableFocusChange, EnableFocusChange};
-use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    self, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use maki_config::NotificationMethod;
+use maki_lua::{CursorShape, CursorStyle};
+use tokio::process::Command as ProcessCommand;
+use tokio::time::timeout;
 
 const FALLBACK_NOTIFICATION_MESSAGE: &str = "Maki needs attention";
 const NOTIFICATION_TITLE: &str = "Maki";
@@ -28,6 +37,14 @@ const POP_WINDOW_TITLE_SEQUENCE: &str = "\u{1b}[23;2t";
 /// Raw mode is already on when the tmux query runs, so a wedged tmux server
 /// must not be able to hang startup with Ctrl-C disabled.
 const TMUX_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
+const PROGRAM_STATUS_APP: &str = "maki";
+const PROGRAM_STATUS_TITLE_MAX_BYTES: usize = 192;
+const PROGRAM_STATUS_MSG_MAX_BYTES: usize = 2048;
+const PROGRAM_STATUS_CLEAR: &str = "state=clear";
+const PROGRAM_STATUS_ID_MAX_LEN: usize = 32;
+const PROGRAM_STATUS_ID_PUNCTUATION: &str = "_.+-";
+const TMUX_PANE_VAR: &str = "TMUX_PANE";
+const SCREEN_WINDOW_VAR: &str = "WINDOW";
 
 pub(crate) struct TerminalGuard;
 
@@ -66,8 +83,8 @@ pub(crate) struct TerminalNotifier {
 }
 
 impl TerminalNotifier {
-    pub(crate) fn new(configured: NotificationMethod) -> Option<Self> {
-        let notifier = resolve_notifier(configured, detect_osc9_support)?;
+    pub(crate) async fn new(configured: NotificationMethod) -> Option<Self> {
+        let notifier = resolve_notifier(configured, detect_osc9_support).await?;
         Some(Self {
             notifier,
             mux: TerminalMux::detect(),
@@ -87,7 +104,7 @@ impl TerminalNotifier {
     }
 }
 
-fn detect_osc9_support() -> bool {
+async fn detect_osc9_support() -> bool {
     let term_program = std::env::var("TERM_PROGRAM").ok();
     let term = std::env::var("TERM").ok();
     let env = TerminalEnvironment {
@@ -99,10 +116,10 @@ fn detect_osc9_support() -> bool {
         kitty: std::env::var_os("KITTY_WINDOW_ID").is_some(),
         term: term.as_deref(),
     };
-    let tmux = env
-        .term_program
-        .filter(|value| normalize_terminal_id(value) == "tmux")
-        .and_then(|_| query_tmux_client());
+    let tmux = match env.term_program {
+        Some(value) if normalize_terminal_id(value) == "tmux" => query_tmux_client().await,
+        _ => None,
+    };
     auto_supports_osc9(&env, tmux.as_ref())
 }
 
@@ -131,15 +148,15 @@ fn supports_osc9(value: &str) -> bool {
     )
 }
 
-fn resolve_notifier(
+async fn resolve_notifier(
     configured: NotificationMethod,
-    auto_supports_osc9: impl FnOnce() -> bool,
+    auto_supports_osc9: impl AsyncFnOnce() -> bool,
 ) -> Option<ResolvedNotifier> {
     match configured {
         NotificationMethod::Off => None,
         NotificationMethod::Osc9 => Some(ResolvedNotifier::Osc9),
         NotificationMethod::Bell => Some(ResolvedNotifier::Bell),
-        NotificationMethod::Auto => Some(if auto_supports_osc9() {
+        NotificationMethod::Auto => Some(if auto_supports_osc9().await {
             ResolvedNotifier::Osc9
         } else {
             ResolvedNotifier::Bell
@@ -165,8 +182,8 @@ fn auto_supports_osc9(env: &TerminalEnvironment<'_>, tmux: Option<&TmuxClient>) 
     env.wezterm || env.iterm || env.kitty || env.term.is_some_and(supports_osc9)
 }
 
-fn query_tmux_client() -> Option<TmuxClient> {
-    let mut child = ProcessCommand::new("tmux")
+async fn query_tmux_client() -> Option<TmuxClient> {
+    let child = ProcessCommand::new("tmux")
         .args([
             "display-message",
             "-p",
@@ -175,17 +192,16 @@ fn query_tmux_client() -> Option<TmuxClient> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .spawn()
         .ok()?;
-    match wait_timeout::ChildExt::wait_timeout(&mut child, TMUX_QUERY_TIMEOUT) {
-        Ok(Some(status)) if status.success() => {}
-        _ => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
+    let output = timeout(TMUX_QUERY_TIMEOUT, child.wait_with_output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
-    let output = child.wait_with_output().ok()?;
     let output = String::from_utf8(output.stdout).ok()?;
     let (term_type, term_name) = output.trim_end().split_once('\t')?;
     Some(TmuxClient {
@@ -219,6 +235,147 @@ fn window_title_sequence(mux: TerminalMux, title: &str) -> String {
 
 pub(crate) fn set_window_title(title: &str) -> std::io::Result<()> {
     write_sequence(&window_title_sequence(TerminalMux::detect(), title))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProgramState {
+    Idle,
+    Working,
+    Blocked(BlockedKind),
+    Done,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockedKind {
+    Permission,
+    Question,
+    Auth,
+}
+
+impl ProgramState {
+    fn fields(self) -> &'static str {
+        match self {
+            Self::Idle => "state=idle",
+            Self::Working => "state=working",
+            Self::Blocked(BlockedKind::Permission) => "state=blocked:kind=permission",
+            Self::Blocked(BlockedKind::Question) => "state=blocked:kind=question",
+            Self::Blocked(BlockedKind::Auth) => "state=blocked:kind=auth",
+            Self::Done => "state=done",
+            Self::Error => "state=error",
+        }
+    }
+}
+
+struct ProgramStatusReport {
+    state: ProgramState,
+    title: String,
+    msg: Option<String>,
+}
+
+pub(crate) struct ProgramStatusReporter {
+    mux: TerminalMux,
+    id: Option<String>,
+    last: Option<ProgramStatusReport>,
+}
+
+impl ProgramStatusReporter {
+    pub(crate) fn new() -> Self {
+        let mux = TerminalMux::detect();
+        Self {
+            mux,
+            id: program_status_id(mux, |key| std::env::var(key).ok()),
+            last: None,
+        }
+    }
+
+    pub(crate) fn report(
+        &mut self,
+        state: ProgramState,
+        title: &str,
+        msg: Option<&str>,
+    ) -> std::io::Result<()> {
+        if self.last.as_ref().is_some_and(|last| {
+            last.state == state && last.title == title && last.msg.as_deref() == msg
+        }) {
+            return Ok(());
+        }
+        let body = program_status_body(self.id.as_deref(), state, title, msg);
+        write_sequence(&self.mux.wrap_for_mux(program_status_osc(&body)))?;
+        self.last = Some(ProgramStatusReport {
+            state,
+            title: title.to_owned(),
+            msg: msg.map(str::to_owned),
+        });
+        Ok(())
+    }
+
+    pub(crate) fn clear(&mut self) -> std::io::Result<()> {
+        self.last = None;
+        let body = program_status_clear_body(self.id.as_deref());
+        write_sequence(&self.mux.wrap_for_mux(program_status_osc(&body)))
+    }
+}
+
+fn program_status_id(mux: TerminalMux, var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let raw = match mux {
+        TerminalMux::Tmux => var(TMUX_PANE_VAR)?,
+        TerminalMux::Screen => var(SCREEN_WINDOW_VAR)?,
+        TerminalMux::Zellij | TerminalMux::None => return None,
+    };
+    let id = raw.trim_start_matches('%');
+    let valid = !id.is_empty()
+        && id.len() <= PROGRAM_STATUS_ID_MAX_LEN
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || PROGRAM_STATUS_ID_PUNCTUATION.contains(c));
+    valid.then(|| id.to_owned())
+}
+
+fn program_status_osc(body: &str) -> String {
+    format!("\u{1b}]7501;{body}\u{7}")
+}
+
+fn program_status_clear_body(id: Option<&str>) -> String {
+    let mut body = PROGRAM_STATUS_CLEAR.to_owned();
+    push_program_status_id(&mut body, id);
+    body
+}
+
+fn program_status_body(
+    id: Option<&str>,
+    state: ProgramState,
+    title: &str,
+    msg: Option<&str>,
+) -> String {
+    let mut body = state.fields().to_owned();
+    push_program_status_id(&mut body, id);
+    body.push_str(":app=");
+    body.push_str(PROGRAM_STATUS_APP);
+    push_program_status_text(&mut body, "title", title, PROGRAM_STATUS_TITLE_MAX_BYTES);
+    if let Some(msg) = msg {
+        push_program_status_text(&mut body, "msg", msg, PROGRAM_STATUS_MSG_MAX_BYTES);
+    }
+    body
+}
+
+fn push_program_status_id(body: &mut String, id: Option<&str>) {
+    if let Some(id) = id {
+        body.push_str(":id=");
+        body.push_str(id);
+    }
+}
+
+fn push_program_status_text(body: &mut String, key: &str, text: &str, max_bytes: usize) {
+    let text = visible_text(text);
+    let text = &text[..text.floor_char_boundary(max_bytes)];
+    if text.is_empty() {
+        return;
+    }
+    body.push(':');
+    body.push_str(key);
+    body.push('=');
+    STANDARD.encode_string(text, body);
 }
 
 fn write_mux_sequence(sequence: &str) {
@@ -334,9 +491,37 @@ fn teardown() {
     stdout().flush().ok();
 }
 
+/// Set once a shape was sent. xterm takes the reset for a blinking block, so
+/// a terminal nobody changed the shape of must not be sent one on exit.
+static CURSOR_STYLED: AtomicBool = AtomicBool::new(false);
+
+/// Called where a shape is queued, not where one is picked, since a hidden
+/// cursor is sent none.
+pub(crate) fn mark_cursor_styled() {
+    CURSOR_STYLED.store(true, Ordering::Relaxed);
+}
+
+pub(crate) fn cursor_style(style: CursorStyle) -> SetCursorStyle {
+    match (style.shape, style.blink) {
+        (CursorShape::Default, _) => SetCursorStyle::DefaultUserShape,
+        (CursorShape::Block, false) => SetCursorStyle::SteadyBlock,
+        (CursorShape::Block, true) => SetCursorStyle::BlinkingBlock,
+        (CursorShape::Bar, false) => SetCursorStyle::SteadyBar,
+        (CursorShape::Bar, true) => SetCursorStyle::BlinkingBar,
+        (CursorShape::Underline, false) => SetCursorStyle::SteadyUnderScore,
+        (CursorShape::Underline, true) => SetCursorStyle::BlinkingUnderScore,
+    }
+}
+
 fn pop_terminal_modes() {
     write_mux_sequence(POP_WINDOW_TITLE_SEQUENCE);
-    stdout().execute(crossterm::cursor::Show).ok();
+    // An error or panic mid-frame leaves the synchronized update open, and the
+    // terminal would hold its output until its own timeout.
+    stdout().execute(EndSynchronizedUpdate).ok();
+    if CURSOR_STYLED.load(Ordering::Relaxed) {
+        stdout().execute(SetCursorStyle::DefaultUserShape).ok();
+    }
+    stdout().execute(Show).ok();
     stdout().execute(PopKeyboardEnhancementFlags).ok();
     disable_focus_change();
     stdout().execute(DisableMouseCapture).ok();
@@ -496,30 +681,42 @@ mod tests {
     // at the start and in the middle of the payload.
     const OSC52_WITH_ST: &str = "\u{1b}]52;c;SGVsbG8=\u{1b}\\";
 
-    #[test]
-    fn configured_notification_method_resolves_once() {
+    #[tokio::test]
+    async fn configured_notification_method_resolves_once() {
         assert_eq!(
-            resolve_notifier(NotificationMethod::Osc9, || panic!("auto detection ran")),
+            resolve_notifier(NotificationMethod::Osc9, async || panic!(
+                "auto detection ran"
+            ))
+            .await,
             Some(ResolvedNotifier::Osc9)
         );
         assert_eq!(
-            resolve_notifier(NotificationMethod::Bell, || panic!("auto detection ran")),
+            resolve_notifier(NotificationMethod::Bell, async || panic!(
+                "auto detection ran"
+            ))
+            .await,
             Some(ResolvedNotifier::Bell)
         );
         assert_eq!(
-            resolve_notifier(NotificationMethod::Notify, || panic!("auto detection ran")),
+            resolve_notifier(NotificationMethod::Notify, async || panic!(
+                "auto detection ran"
+            ))
+            .await,
             Some(ResolvedNotifier::Notify),
         );
         assert_eq!(
-            resolve_notifier(NotificationMethod::Off, || panic!("auto detection ran")),
+            resolve_notifier(NotificationMethod::Off, async || panic!(
+                "auto detection ran"
+            ))
+            .await,
             None
         );
         assert_eq!(
-            resolve_notifier(NotificationMethod::Auto, || true),
+            resolve_notifier(NotificationMethod::Auto, async || true).await,
             Some(ResolvedNotifier::Osc9)
         );
         assert_eq!(
-            resolve_notifier(NotificationMethod::Auto, || false),
+            resolve_notifier(NotificationMethod::Auto, async || false).await,
             Some(ResolvedNotifier::Bell)
         );
     }
@@ -591,6 +788,56 @@ mod tests {
         };
         assert!(auto_supports_osc9(&terminal, Some(&ghostty_name)));
         assert!(!auto_supports_osc9(&terminal, None));
+    }
+
+    #[test_case(None, ProgramState::Working, "", None, "state=working:app=maki" ; "empty_title_omitted")]
+    #[test_case(None, ProgramState::Blocked(BlockedKind::Question), "fix\nbug", Some("Ask"), "state=blocked:kind=question:app=maki:title=Zml4IGJ1Zw==:msg=QXNr" ; "blocked_kind_title_and_msg")]
+    #[test_case(Some("3"), ProgramState::Done, "\u{7}\t", None, "state=done:id=3:app=maki" ; "id_and_control_only_title")]
+    fn program_status_body_cases(
+        id: Option<&str>,
+        state: ProgramState,
+        title: &str,
+        msg: Option<&str>,
+        expected: &str,
+    ) {
+        assert_eq!(program_status_body(id, state, title, msg), expected);
+    }
+
+    #[test_case(None, "state=clear" ; "root_clears_everything")]
+    #[test_case(Some("3"), "state=clear:id=3" ; "pane_clears_only_its_record")]
+    fn program_status_clear_body_cases(id: Option<&str>, expected: &str) {
+        assert_eq!(program_status_clear_body(id), expected);
+    }
+
+    #[test_case(TerminalMux::Tmux, Some("%3"), Some("3") ; "tmux_pane_without_percent")]
+    #[test_case(TerminalMux::Screen, Some("2"), Some("2") ; "screen_window")]
+    #[test_case(TerminalMux::None, Some("%3"), None ; "no_mux_uses_root")]
+    #[test_case(TerminalMux::Zellij, Some("%3"), None ; "zellij_uses_root")]
+    #[test_case(TerminalMux::Tmux, Some("%a b"), None ; "invalid_id_uses_root")]
+    #[test_case(TerminalMux::Tmux, None, None ; "missing_var_uses_root")]
+    fn program_status_id_cases(mux: TerminalMux, value: Option<&str>, expected: Option<&str>) {
+        let id = program_status_id(mux, |_| value.map(str::to_owned));
+        assert_eq!(id.as_deref(), expected);
+    }
+
+    #[test]
+    fn program_status_title_caps_decoded_bytes_on_char_boundary() {
+        let long = format!("a{}", "あ".repeat(PROGRAM_STATUS_TITLE_MAX_BYTES));
+        let kept = format!("a{}", "あ".repeat((PROGRAM_STATUS_TITLE_MAX_BYTES - 1) / 3));
+        let body = program_status_body(None, ProgramState::Idle, &long, None);
+        assert!(body.ends_with(&format!(":title={}", STANDARD.encode(&kept))));
+    }
+
+    #[test]
+    fn program_status_roundtrips_mux_passthrough() {
+        let plain = program_status_osc(&program_status_body(
+            Some("3"),
+            ProgramState::Error,
+            "x",
+            None,
+        ));
+        let tmux = TerminalMux::Tmux.wrap_for_mux(plain.clone());
+        assert_eq!(parse_dcs_passthrough(&tmux, "\u{1b}Ptmux;"), plain);
     }
 
     #[test]

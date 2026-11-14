@@ -1,18 +1,21 @@
 use std::sync::Arc;
 
 use crossterm::event::KeyEvent;
-use maki_agent::{SharedBuf, SnapshotLine, SpanStyle};
+use maki_agent::{BufWatch, SharedBuf, SnapshotLine, SpanStyle};
 use maki_lua::{Anchor, Axis, Border, FloatConfig, Key, Split, TitlePos, WinCommand, WinEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::error::TryRecvError;
 use unicode_width::UnicodeWidthStr;
 
 use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::split_layout::SplitReq;
 use crate::components::{
-    Overlay, hint_footer,
+    Caret, Overlay, hint_footer, painted_caret, painted_width,
     scrollbar::render_vertical_scrollbar,
     tool_display::{SPINNER_STYLE_NAME, SPINNER_STYLE_PREFIX, resolve_span_style},
 };
@@ -23,6 +26,8 @@ use crate::theme;
 const STACK_GAP: u16 = 1;
 /// Cells a border takes from a row, one at each end.
 const BORDER_CELLS: u16 = 2;
+/// Plugins paint their caret with this span style.
+pub(crate) const CURSOR_STYLE_NAME: &str = "cursor";
 
 /// A top band, a bottom band, and the scrollable middle. When the window is too
 /// short for both bands the bottom wins, so footers like keybind hints survive
@@ -63,7 +68,7 @@ impl Layout {
 ///    on every frame.
 struct FloatWindow {
     id: u32,
-    buf: Arc<SharedBuf>,
+    buf: BufWatch,
     config: FloatConfig,
     scroll_offset: usize,
     cached_lines: Arc<Vec<SnapshotLine>>,
@@ -86,11 +91,15 @@ struct FloatWindow {
     /// a window nobody can see is a key taken from the user with no footer to
     /// tell them where it went.
     on_screen: bool,
-    event_tx: flume::Sender<WinEvent>,
-    cmd_rx: flume::Receiver<WinCommand>,
+    event_tx: UnboundedSender<WinEvent>,
+    cmd_rx: UnboundedReceiver<WinCommand>,
 }
 
 impl FloatWindow {
+    fn needs_input(&self) -> bool {
+        self.visible && self.config.needs_input
+    }
+
     fn layout(&self) -> Layout {
         Layout::new(
             self.config.reserved_top,
@@ -151,7 +160,15 @@ pub(crate) struct FloatManager {
     windows: Vec<FloatWindow>,
     focused_id: Option<u32>,
     focused_rect: Option<Rect>,
+    /// Where the focused window painted its caret on the last frame.
+    focused_caret: Option<Position>,
+    /// This frame's, swapped in by [`Self::view`] the way `painting` becomes
+    /// `on_screen`, so a window that stops painting a caret leaves none behind.
+    painting_caret: Option<Position>,
     next_id: u32,
+    /// How many times a window started waiting on the user, by opening,
+    /// showing or being reconfigured to need input.
+    prompts_opened: u64,
 }
 
 impl FloatManager {
@@ -160,8 +177,23 @@ impl FloatManager {
             windows: Vec::new(),
             focused_id: None,
             focused_rect: None,
+            focused_caret: None,
+            painting_caret: None,
             next_id: 0,
+            prompts_opened: 0,
         }
+    }
+
+    pub fn prompts_opened(&self) -> u64 {
+        self.prompts_opened
+    }
+
+    pub fn focused_id(&self) -> Option<u32> {
+        self.focused_id
+    }
+
+    pub fn focused_caret(&self) -> Option<Position> {
+        self.focused_caret
     }
 
     /// The windows this frame lays out. A hidden one takes no cells and is
@@ -201,7 +233,7 @@ impl FloatManager {
         self.windows.retain(|w| {
             let remove = should_remove(w);
             if remove {
-                let _ = w.event_tx.try_send(WinEvent::Close);
+                let _ = w.event_tx.send(WinEvent::Close);
             }
             !remove
         });
@@ -222,10 +254,14 @@ impl FloatManager {
         buf: Arc<SharedBuf>,
         config: FloatConfig,
         focus: bool,
-        event_tx: flume::Sender<WinEvent>,
-        cmd_rx: flume::Receiver<WinCommand>,
+        event_tx: UnboundedSender<WinEvent>,
+        cmd_rx: UnboundedReceiver<WinCommand>,
     ) {
-        let cached_lines = buf.read_if_dirty().unwrap_or_default();
+        let mut buf = BufWatch::new(buf);
+        let cached_lines = buf
+            .changed()
+            .map(|snapshot| snapshot.lines)
+            .unwrap_or_default();
         let id = self.next_id;
         self.next_id += 1;
 
@@ -253,6 +289,7 @@ impl FloatManager {
             event_tx,
             cmd_rx,
         };
+        self.prompts_opened += u64::from(win.needs_input());
 
         self.windows.push(win);
         self.windows.sort_by_key(|w| w.config.zindex);
@@ -267,8 +304,8 @@ impl FloatManager {
     pub fn tick(&mut self) -> Dirty {
         let mut dirty = Dirty::NO;
         for win in &mut self.windows {
-            if let Some(lines) = win.buf.read_if_dirty() {
-                win.cached_lines = lines;
+            if let Some(snapshot) = win.buf.changed() {
+                win.cached_lines = snapshot.lines;
                 win.bring_cursor_into_view();
                 dirty = Dirty::YES;
             }
@@ -283,19 +320,22 @@ impl FloatManager {
     /// on the Lua thread, and until that command is drained the window is
     /// still here, still claiming its keys, and the next key would be taken
     /// from the user by a window that is on its way out and hands it to a loop
-    /// that has already stopped reading.
+    /// that has already stopped reading. A key handler's done report and its
+    /// `ev.fallback()` drain too, since nothing orders them with the window's
+    /// own channel.
     ///
     /// A patch that carried a `zindex` re-sorts the list, because z-order is
     /// what decides both who is drawn in front and who answers a claimed key:
     /// a window raised over another and left where it was opened would be drawn
     /// in front while the one underneath went on taking the key. The sort is
     /// stable, so windows sharing a `zindex` keep open order.
-    fn drain_commands(&mut self) -> Dirty {
+    pub fn drain_commands(&mut self) -> Dirty {
         let mut closed_ids = Vec::new();
         let mut dirty = Dirty::NO;
         let mut restack = false;
 
         for win in &mut self.windows {
+            let needed_input = win.needs_input();
             loop {
                 match win.cmd_rx.try_recv() {
                     Ok(WinCommand::SetConfig(patch)) => {
@@ -308,14 +348,15 @@ impl FloatManager {
                     Ok(WinCommand::SetVisible(v)) => {
                         win.visible = v;
                     }
-                    Ok(WinCommand::Close) | Err(flume::TryRecvError::Disconnected) => {
+                    Ok(WinCommand::Close) | Err(TryRecvError::Disconnected) => {
                         closed_ids.push(win.id);
                         break;
                     }
-                    Err(flume::TryRecvError::Empty) => break,
+                    Err(TryRecvError::Empty) => break,
                 }
                 dirty = Dirty::YES;
             }
+            self.prompts_opened += u64::from(!needed_input && win.needs_input());
         }
 
         if restack {
@@ -339,9 +380,7 @@ impl FloatManager {
     /// itself instead of using [`Self::laid_out`], because this is about who
     /// can answer, not about layout. Nobody can answer a window they cannot see.
     pub fn needs_input(&self) -> bool {
-        self.windows
-            .iter()
-            .any(|win| win.visible && win.config.needs_input)
+        self.windows.iter().any(FloatWindow::needs_input)
     }
 
     /// The focused window is handed every key, ahead of every overlay the host
@@ -351,10 +390,7 @@ impl FloatManager {
     /// nothing sent. Letting it through would run a built-in binding on the
     /// chat hidden behind the window.
     pub fn handle_focused_key(&self, key: KeyEvent) -> bool {
-        let Some(win) = self
-            .focused_id
-            .and_then(|fid| self.windows.iter().find(|w| w.id == fid))
-        else {
+        let Some(win) = self.focused() else {
             return false;
         };
         if let Some(key) = Key::from_event(key) {
@@ -363,55 +399,59 @@ impl FloatManager {
         true
     }
 
-    /// The keys an unfocused window declared at open, which it takes only
-    /// after every overlay the host owns has passed: a claim is up while the
-    /// user goes on working under it, so it must not outrank a modal opened
-    /// over it. A key it does claim is consumed here and never also reaches
-    /// the chat input under it, a plugin binding, or a built-in key.
+    fn focused(&self) -> Option<&FloatWindow> {
+        let fid = self.focused_id?;
+        self.windows.iter().find(|w| w.id == fid)
+    }
+
+    pub fn focused_buf(&self) -> Option<Arc<SharedBuf>> {
+        self.focused().map(|w| Arc::clone(w.buf.buf()))
+    }
+
+    /// Front first, so a popup opened over another popup gets the key.
+    /// `windows` is sorted by `zindex`, which is why this walks it backwards.
+    ///
+    /// Being on screen is the whole gate, and it means the last frame painted
+    /// this window into a rect with cells in it. A window sized to nothing, one
+    /// that has not painted yet and a float the plugin hid all paint nothing,
+    /// so none of them takes a key. Otherwise a window nobody can see would
+    /// hold keys for the rest of the run while drawing no footer to say so.
+    pub fn on_screen_bufs(&mut self) -> Vec<(u32, Arc<SharedBuf>)> {
+        // The frame this key was pressed in repaints whatever this drops, so
+        // the debt is already owed and there is nothing to report.
+        let _ = self.drain_commands();
+        self.windows
+            .iter()
+            .rev()
+            .filter(|w| w.on_screen)
+            .map(|w| (w.id, Arc::clone(w.buf.buf())))
+            .collect()
+    }
+
+    /// Hands {key} to window {id} if it declared it in its `keys` at open. A
+    /// claimed key is consumed here and never also reaches the chat input
+    /// under it, a global binding, or a built-in key.
     ///
     /// Nothing has to be released. The claim list lives on the window, so it
     /// goes when the window does, through the one removal path, and a list can
     /// never outlive what the user can see.
-    pub fn handle_claimed_key(&mut self, key: KeyEvent) -> bool {
-        // The frame this key was pressed in repaints whatever this drops, so
-        // the debt is already owed and there is nothing to report.
-        let _ = self.drain_commands();
-        let Some(key) = Key::from_event(key) else {
-            return false;
-        };
-        let Some(win) = self.claimant(key) else {
+    pub fn take_claimed(&self, id: u32, key: Key) -> bool {
+        let Some(win) = self
+            .windows
+            .iter()
+            .find(|w| w.id == id && w.config.keys.contains(&key))
+        else {
             return false;
         };
         send_key(win, key);
         true
     }
 
-    /// The topmost window on screen claiming {key}. `windows` is sorted by
-    /// `zindex`, so walking it backwards is the order the user sees, front
-    /// first, and a popup opened over a popup answers the key.
-    ///
-    /// Being on screen is the whole gate, and it means the last frame painted
-    /// this window into a rect with cells in it. A window sized to nothing, one
-    /// that has not painted yet and a float the plugin hid all paint nothing,
-    /// so all three advertise nothing. Otherwise a window nobody can see would
-    /// hold keys for the rest of the run while drawing no footer to say so, and
-    /// unlike a `maki.keymap.set` binding a claim appears in no list the user
-    /// can read.
-    fn claimant(&self, key: Key) -> Option<&FloatWindow> {
-        self.windows
-            .iter()
-            .rev()
-            .find(|w| w.on_screen && w.config.keys.contains(&key))
-    }
-
     pub fn handle_paste(&self, text: &str) -> bool {
-        let Some(fid) = self.focused_id else {
+        let Some(win) = self.focused() else {
             return false;
         };
-        let Some(win) = self.windows.iter().find(|w| w.id == fid) else {
-            return false;
-        };
-        let _ = win.event_tx.try_send(WinEvent::Paste {
+        let _ = win.event_tx.send(WinEvent::Paste {
             text: text.to_owned(),
         });
         true
@@ -474,6 +514,7 @@ impl FloatManager {
         for win in &mut self.windows {
             win.on_screen = std::mem::take(&mut win.painting);
         }
+        self.focused_caret = std::mem::take(&mut self.painting_caret);
 
         union
     }
@@ -572,7 +613,7 @@ impl FloatManager {
         let content_area = inner;
 
         if win.last_content != content_area {
-            let _ = win.event_tx.try_send(WinEvent::Resize {
+            let _ = win.event_tx.send(WinEvent::Resize {
                 width: content_area.width,
                 height: content_area.height,
             });
@@ -629,21 +670,26 @@ impl FloatManager {
             })
             .collect();
 
+        let focused = Some(win.id) == self.focused_id;
+        let spot_of = |snapshot: &[SnapshotLine], lines: &[Line<'_>], area| {
+            focused.then(|| caret_spot(snapshot, lines, area)).flatten()
+        };
+        let scroll_spot = spot_of(visible, &lines, scroll_area);
         frame.render_widget(Paragraph::new(lines), scroll_area);
 
+        let mut top_spot = None;
         if let Some(pa) = pinned_top_area {
-            let pinned: Vec<Line<'_>> = win.cached_lines[..top]
-                .iter()
-                .map(snapshot_to_line)
-                .collect();
+            let snapshot = &win.cached_lines[..top];
+            let pinned: Vec<Line<'_>> = snapshot.iter().map(snapshot_to_line).collect();
+            top_spot = spot_of(snapshot, &pinned, pa);
             frame.render_widget(Paragraph::new(pinned), pa);
         }
 
+        let mut bottom_spot = None;
         if let Some(pa) = pinned_bot_area {
-            let pinned: Vec<Line<'_>> = win.cached_lines[top + scrollable..]
-                .iter()
-                .map(snapshot_to_line)
-                .collect();
+            let snapshot = &win.cached_lines[top + scrollable..];
+            let pinned: Vec<Line<'_>> = snapshot.iter().map(snapshot_to_line).collect();
+            bottom_spot = spot_of(snapshot, &pinned, pa);
             frame.render_widget(Paragraph::new(pinned), pa);
         }
 
@@ -656,8 +702,11 @@ impl FloatManager {
             );
         }
 
-        if Some(win.id) == self.focused_id {
+        if focused {
             self.focused_rect = Some(popup);
+            self.painting_caret = top_spot.or(scroll_spot).or(bottom_spot).and_then(|spot| {
+                painted_caret(frame.buffer_mut(), spot.area, &spot.caret, spot.row)
+            });
         }
     }
 
@@ -685,7 +734,7 @@ impl FloatManager {
 }
 
 fn send_key(win: &FloatWindow, key: Key) {
-    let _ = win.event_tx.try_send(WinEvent::Key { key });
+    let _ = win.event_tx.send(WinEvent::Key { key });
 }
 
 fn stacks(win: &FloatWindow) -> bool {
@@ -886,6 +935,32 @@ fn snapshot_to_line(sline: &SnapshotLine) -> Line<'_> {
     )
 }
 
+/// Where a caret span should land: its {caret} on {row} of {area}.
+struct CaretSpot {
+    area: Rect,
+    row: usize,
+    caret: Caret,
+}
+
+/// Finds the first caret span among {snapshot}'s rows, painted as {lines}
+/// into {area}. The column comes from the baked line, where a spinner is
+/// already the glyph it paints.
+fn caret_spot(snapshot: &[SnapshotLine], lines: &[Line<'_>], area: Rect) -> Option<CaretSpot> {
+    let (row, idx) = snapshot.iter().enumerate().find_map(|(row, sline)| {
+        let idx = sline.spans.iter().position(
+            |span| matches!(&span.style, SpanStyle::Named(n) if n == CURSOR_STYLE_NAME),
+        )?;
+        Some((row, idx))
+    })?;
+    let spans = &lines.get(row)?.spans;
+    let span = &spans[idx];
+    let caret = Caret {
+        col: painted_width(&spans[..idx]),
+        span: Span::styled(span.content.to_string(), span.style),
+    };
+    Some(CaretSpot { area, row, caret })
+}
+
 fn union_rect(a: Rect, b: Rect) -> Rect {
     if a.width == 0 || a.height == 0 {
         return b;
@@ -907,6 +982,12 @@ impl Drop for FloatManager {
 }
 
 impl Overlay for FloatManager {
+    fn is_prompting(&self) -> bool {
+        self.needs_input()
+    }
+
+    // Unlike the inherent `is_open`, which counts any window, this asks for focus:
+    // an unfocused popup never holds the keys.
     fn is_open(&self) -> bool {
         self.focused_id.is_some()
     }
@@ -933,7 +1014,11 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use maki_agent::SnapshotSpan;
     use maki_lua::{Dimension, FloatConfigPatch};
+    use std::iter;
     use test_case::test_case;
+    use tokio::sync::mpsc::UnboundedReceiver;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::mpsc::unbounded_channel;
 
     const EXPECT_OPEN: &str = "expected manager to have open windows";
     const EXPECT_CLOSED: &str = "expected manager to have no open windows";
@@ -954,6 +1039,19 @@ mod tests {
     const EXPECT_FOCUS_OWNS_KEY: &str = "a focused window spends every key it is handed";
     const EXPECT_NOTHING_SENT: &str = "a key no notation names has no event to send";
 
+    type CaretRow<'a> = &'a [(&'a str, bool)];
+
+    const CARET_WINDOW: Rect = Rect::new(4, 6, 12, 5);
+    const CARET_SCREEN: Rect = Rect::new(0, 0, 40, 20);
+    const SCROLL_ROWS: usize = 8;
+    const LAST_COLUMN_PADDING: &str = "ppppppppppp";
+    const SPINNER_PLACEHOLDER: &str = "xxxxx";
+    const CARET_PREFIX: &str = "> ";
+    const EXPECT_CARET: &str = "a focused window reports the cell of its cursor span";
+    const EXPECT_NO_CARET: &str = "no cursor span on a focused, visible cell reports no caret";
+
+    const PROMPT_ROW: &[CaretRow] = &[&[(CARET_PREFIX, false), ("c", true)]];
+
     fn make_line(text: &str) -> SnapshotLine {
         SnapshotLine {
             spans: vec![SnapshotSpan {
@@ -964,13 +1062,13 @@ mod tests {
     }
 
     fn make_channels() -> (
-        flume::Sender<WinEvent>,
-        flume::Receiver<WinCommand>,
-        flume::Receiver<WinEvent>,
-        flume::Sender<WinCommand>,
+        UnboundedSender<WinEvent>,
+        UnboundedReceiver<WinCommand>,
+        UnboundedReceiver<WinEvent>,
+        UnboundedSender<WinCommand>,
     ) {
-        let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
-        let (cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+        let (event_tx, event_rx) = unbounded_channel::<WinEvent>();
+        let (cmd_tx, cmd_rx) = unbounded_channel::<WinCommand>();
         (event_tx, cmd_rx, event_rx, cmd_tx)
     }
 
@@ -1007,7 +1105,7 @@ mod tests {
     fn open_with_lines(
         mgr: &mut FloatManager,
         lines: &[&str],
-    ) -> (flume::Receiver<WinEvent>, flume::Sender<WinCommand>) {
+    ) -> (UnboundedReceiver<WinEvent>, UnboundedSender<WinCommand>) {
         let (event_tx, cmd_rx, event_rx, cmd_tx) = make_channels();
         let buf = make_buf(lines);
         mgr.open(buf, make_config(), true, event_tx, cmd_rx);
@@ -1519,13 +1617,13 @@ mod tests {
         let mut mgr = FloatManager::new();
         assert!(!mgr.is_open(), "{}", EXPECT_CLOSED);
 
-        let (event_rx, _cmd_tx) = open_with_lines(&mut mgr, &["hello"]);
+        let (mut event_rx, _cmd_tx) = open_with_lines(&mut mgr, &["hello"]);
         assert!(mgr.is_open(), "{}", EXPECT_OPEN);
 
         mgr.close_all();
         assert!(!mgr.is_open(), "{}", EXPECT_CLOSED);
         assert!(
-            event_rx.drain().any(|e| matches!(e, WinEvent::Close)),
+            iter::from_fn(|| event_rx.try_recv().ok()).any(|e| matches!(e, WinEvent::Close)),
             "expected Close event on close_all"
         );
     }
@@ -1648,26 +1746,54 @@ mod tests {
         assert!(!mgr.needs_input());
     }
 
+    /// A question shown again is a prompt the user has not seen yet, so it
+    /// counts as opening once more. Other commands leave the count alone.
+    #[test]
+    fn prompts_opened_counts_each_time_a_window_starts_needing_input() {
+        let mut mgr = FloatManager::new();
+        let (_event_rx, cmd_tx) = open_with_lines(&mut mgr, &["a"]);
+        let needs_input = |on| {
+            WinCommand::SetConfig(FloatConfigPatch {
+                needs_input: Some(on),
+                ..FloatConfigPatch::default()
+            })
+        };
+        let steps = [
+            (needs_input(true), 1),
+            (WinCommand::SetCursor(0), 1),
+            (WinCommand::SetVisible(false), 1),
+            (WinCommand::SetVisible(true), 2),
+            (needs_input(false), 2),
+            (needs_input(true), 3),
+        ];
+        for (command, opened) in steps {
+            cmd_tx.send(command).unwrap();
+            let _ = mgr.tick();
+            assert_eq!(mgr.prompts_opened(), opened);
+        }
+    }
+
     #[test]
     fn close_command_from_lua() {
         let mut mgr = FloatManager::new();
-        let (event_rx, cmd_tx) = open_with_lines(&mut mgr, &["a"]);
+        let (mut event_rx, cmd_tx) = open_with_lines(&mut mgr, &["a"]);
 
         cmd_tx.send(WinCommand::Close).unwrap();
         let _ = mgr.tick();
         assert!(!mgr.is_open(), "{}", EXPECT_CLOSED);
-        assert!(event_rx.drain().any(|e| matches!(e, WinEvent::Close)));
+        assert!(iter::from_fn(|| event_rx.try_recv().ok()).any(|e| matches!(e, WinEvent::Close)));
     }
 
     #[test]
     fn key_forwarded_to_lua() {
         let mut mgr = FloatManager::new();
-        let (event_rx, _cmd_tx) = open_with_lines(&mut mgr, &["line1"]);
+        let (mut event_rx, _cmd_tx) = open_with_lines(&mut mgr, &["line1"]);
 
         let handled = mgr.handle_focused_key(press("a"));
         assert!(handled, "true when a window has focus");
 
-        let evt = event_rx.drain().find(|e| matches!(e, WinEvent::Key { .. }));
+        let evt =
+            iter::from_fn(|| event_rx.try_recv().ok()).find(|e| matches!(e, WinEvent::Key { .. }));
         assert!(evt.is_some(), "key forwarded to lua");
     }
 
@@ -1679,8 +1805,8 @@ mod tests {
             "handle_focused_key should return false with no windows"
         );
         assert!(
-            !mgr.handle_claimed_key(press("a")),
-            "handle_claimed_key should return false with no windows"
+            !claimed(&mut mgr, press("a")),
+            "no window claims anything with no windows"
         );
     }
 
@@ -1718,8 +1844,19 @@ mod tests {
         (event_rx, cmd_tx)
     }
 
-    fn took_a_key(events: &flume::Receiver<WinEvent>) -> bool {
-        events.drain().any(|e| matches!(e, WinEvent::Key { .. }))
+    /// What the app does for unfocused windows when no buffer binding takes
+    /// the key.
+    fn claimed(mgr: &mut FloatManager, press: KeyEvent) -> bool {
+        let Some(key) = Key::from_event(press) else {
+            return false;
+        };
+        mgr.on_screen_bufs()
+            .into_iter()
+            .any(|(id, _)| mgr.take_claimed(id, key))
+    }
+
+    fn took_a_key(events: &mut UnboundedReceiver<WinEvent>) -> bool {
+        iter::from_fn(|| events.try_recv().ok()).any(|e| matches!(e, WinEvent::Key { .. }))
     }
 
     /// The one gap the layer machinery existed to close: an unfocused window
@@ -1728,10 +1865,10 @@ mod tests {
     #[test]
     fn an_unfocused_window_takes_the_keys_it_claimed() {
         let mut mgr = FloatManager::new();
-        let (events, _cmd_tx) = open_claiming(&mut mgr, &["<Tab>"], 50);
+        let (mut events, _cmd_tx) = open_claiming(&mut mgr, &["<Tab>"], 50);
 
-        assert!(mgr.handle_claimed_key(press("<Tab>")));
-        assert!(took_a_key(&events), "{CLAIM_NOT_DELIVERED}");
+        assert!(claimed(&mut mgr, press("<Tab>")));
+        assert!(took_a_key(&mut events), "{CLAIM_NOT_DELIVERED}");
     }
 
     /// Everything else goes on to the chat input, which is where the user is
@@ -1739,10 +1876,10 @@ mod tests {
     #[test]
     fn an_unfocused_window_leaves_every_other_key_alone() {
         let mut mgr = FloatManager::new();
-        let (events, _cmd_tx) = open_claiming(&mut mgr, &["<Tab>"], 50);
+        let (mut events, _cmd_tx) = open_claiming(&mut mgr, &["<Tab>"], 50);
 
-        assert!(!mgr.handle_claimed_key(press("a")));
-        assert!(!took_a_key(&events), "{CLAIM_LEAKED}");
+        assert!(!claimed(&mut mgr, press("a")));
+        assert!(!took_a_key(&mut events), "{CLAIM_LEAKED}");
     }
 
     /// Modifiers are compared exactly, the way a keymap binding is, so a
@@ -1750,10 +1887,10 @@ mod tests {
     #[test]
     fn a_claim_answers_only_its_own_modifiers() {
         let mut mgr = FloatManager::new();
-        let (events, _cmd_tx) = open_claiming(&mut mgr, &["<C-n>"], 50);
+        let (mut events, _cmd_tx) = open_claiming(&mut mgr, &["<C-n>"], 50);
 
-        assert!(!mgr.handle_claimed_key(press("n")));
-        assert!(!took_a_key(&events), "{CLAIM_LEAKED}");
+        assert!(!claimed(&mut mgr, press("n")));
+        assert!(!took_a_key(&mut events), "{CLAIM_LEAKED}");
     }
 
     /// Two popups claiming one key is the ordinary stacking question, and the
@@ -1761,12 +1898,12 @@ mod tests {
     #[test]
     fn the_topmost_claiming_window_takes_the_key() {
         let mut mgr = FloatManager::new();
-        let (under, _under_tx) = open_claiming(&mut mgr, &["<Esc>"], 10);
-        let (over, _over_tx) = open_claiming(&mut mgr, &["<Esc>"], 90);
+        let (mut under, _under_tx) = open_claiming(&mut mgr, &["<Esc>"], 10);
+        let (mut over, _over_tx) = open_claiming(&mut mgr, &["<Esc>"], 90);
 
-        assert!(mgr.handle_claimed_key(press("<Esc>")));
-        assert!(took_a_key(&over), "{CLAIM_NOT_DELIVERED}");
-        assert!(!took_a_key(&under), "{CLAIM_LEAKED}");
+        assert!(claimed(&mut mgr, press("<Esc>")));
+        assert!(took_a_key(&mut over), "{CLAIM_NOT_DELIVERED}");
+        assert!(!took_a_key(&mut under), "{CLAIM_LEAKED}");
     }
 
     /// Raising a popup over another is one `set_config` away, and z-order
@@ -1776,8 +1913,8 @@ mod tests {
     #[test]
     fn raising_a_window_moves_the_claim_with_it() {
         let mut mgr = FloatManager::new();
-        let (under, under_tx) = open_claiming(&mut mgr, &["<CR>"], 10);
-        let (over, _over_tx) = open_claiming(&mut mgr, &["<CR>"], 90);
+        let (mut under, under_tx) = open_claiming(&mut mgr, &["<CR>"], 10);
+        let (mut over, _over_tx) = open_claiming(&mut mgr, &["<CR>"], 90);
 
         under_tx
             .send(WinCommand::SetConfig(FloatConfigPatch {
@@ -1786,9 +1923,9 @@ mod tests {
             }))
             .unwrap();
 
-        assert!(mgr.handle_claimed_key(press("<CR>")));
-        assert!(took_a_key(&under), "{CLAIM_NOT_DELIVERED}");
-        assert!(!took_a_key(&over), "{CLAIM_LEAKED}");
+        assert!(claimed(&mut mgr, press("<CR>")));
+        assert!(took_a_key(&mut under), "{CLAIM_NOT_DELIVERED}");
+        assert!(!took_a_key(&mut over), "{CLAIM_LEAKED}");
     }
 
     /// The sort is stable, so a patch that only levels two windows leaves the
@@ -1796,8 +1933,8 @@ mod tests {
     #[test]
     fn levelling_the_zindex_keeps_open_order() {
         let mut mgr = FloatManager::new();
-        let (under, under_tx) = open_claiming(&mut mgr, &["<Tab>"], 10);
-        let (over, _over_tx) = open_claiming(&mut mgr, &["<Tab>"], 90);
+        let (mut under, under_tx) = open_claiming(&mut mgr, &["<Tab>"], 10);
+        let (mut over, _over_tx) = open_claiming(&mut mgr, &["<Tab>"], 90);
 
         under_tx
             .send(WinCommand::SetConfig(FloatConfigPatch {
@@ -1806,9 +1943,9 @@ mod tests {
             }))
             .unwrap();
 
-        assert!(mgr.handle_claimed_key(press("<Tab>")));
-        assert!(took_a_key(&over), "{CLAIM_NOT_DELIVERED}");
-        assert!(!took_a_key(&under), "{CLAIM_LEAKED}");
+        assert!(claimed(&mut mgr, press("<Tab>")));
+        assert!(took_a_key(&mut over), "{CLAIM_NOT_DELIVERED}");
+        assert!(!took_a_key(&mut under), "{CLAIM_LEAKED}");
     }
 
     /// A terminal that speaks the kitty protocol reports Shift+Tab as
@@ -1822,22 +1959,22 @@ mod tests {
         modifiers: KeyModifiers,
     ) {
         let mut mgr = FloatManager::new();
-        let (events, _cmd_tx) = open_claiming(&mut mgr, &["<S-Tab>"], 50);
+        let (mut events, _cmd_tx) = open_claiming(&mut mgr, &["<S-Tab>"], 50);
 
-        assert!(mgr.handle_claimed_key(KeyEvent::new(code, modifiers)));
-        assert!(took_a_key(&events), "{CLAIM_NOT_DELIVERED}");
+        assert!(claimed(&mut mgr, KeyEvent::new(code, modifiers)));
+        assert!(took_a_key(&mut events), "{CLAIM_NOT_DELIVERED}");
     }
 
     #[test]
     fn a_focused_window_spends_a_key_no_notation_names() {
         let mut mgr = FloatManager::new();
-        let (events, _cmd_tx) = open_with_lines(&mut mgr, &["x"]);
+        let (mut events, _cmd_tx) = open_with_lines(&mut mgr, &["x"]);
 
         assert!(
             mgr.handle_focused_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SUPER)),
             "{EXPECT_FOCUS_OWNS_KEY}"
         );
-        assert!(!took_a_key(&events), "{EXPECT_NOTHING_SENT}");
+        assert!(!took_a_key(&mut events), "{EXPECT_NOTHING_SENT}");
     }
 
     /// No claim can name the press, so an unfocused window lets it through to
@@ -1845,10 +1982,13 @@ mod tests {
     #[test]
     fn a_claim_never_takes_a_key_no_notation_names() {
         let mut mgr = FloatManager::new();
-        let (events, _cmd_tx) = open_claiming(&mut mgr, &["<CR>"], 50);
+        let (mut events, _cmd_tx) = open_claiming(&mut mgr, &["<CR>"], 50);
 
-        assert!(!mgr.handle_claimed_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SUPER)));
-        assert!(!took_a_key(&events), "{CLAIM_LEAKED}");
+        assert!(!claimed(
+            &mut mgr,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SUPER)
+        ));
+        assert!(!took_a_key(&mut events), "{CLAIM_LEAKED}");
     }
 
     /// A plugin compares `ev.key` against the notation it claimed, so the
@@ -1859,11 +1999,10 @@ mod tests {
     #[test_case("a" ; "plain_char")]
     fn a_delivered_key_carries_its_canonical_notation(lhs: &str) {
         let mut mgr = FloatManager::new();
-        let (events, _cmd_tx) = open_claiming(&mut mgr, &[lhs], 50);
+        let (mut events, _cmd_tx) = open_claiming(&mut mgr, &[lhs], 50);
 
-        assert!(mgr.handle_claimed_key(press(lhs)));
-        let delivered = events
-            .drain()
+        assert!(claimed(&mut mgr, press(lhs)));
+        let delivered = iter::from_fn(|| events.try_recv().ok())
             .find_map(|e| match e {
                 WinEvent::Key { key } => Some(key.notation()),
                 _ => None,
@@ -1877,12 +2016,12 @@ mod tests {
     #[test]
     fn a_claim_dies_with_the_window() {
         let mut mgr = FloatManager::new();
-        let (events, _cmd_tx) = open_claiming(&mut mgr, &["<Tab>"], 50);
+        let (mut events, _cmd_tx) = open_claiming(&mut mgr, &["<Tab>"], 50);
 
         mgr.close_all();
 
-        assert!(!mgr.handle_claimed_key(press("<Tab>")));
-        assert!(!took_a_key(&events), "{CLAIM_LEAKED}");
+        assert!(!claimed(&mut mgr, press("<Tab>")));
+        assert!(!took_a_key(&mut events), "{CLAIM_LEAKED}");
     }
 
     /// The close runs on the Lua thread, so between it and the next tick the
@@ -1892,12 +2031,12 @@ mod tests {
     #[test]
     fn a_window_closing_this_instant_claims_nothing() {
         let mut mgr = FloatManager::new();
-        let (events, cmd_tx) = open_claiming(&mut mgr, &["<CR>"], 50);
+        let (mut events, cmd_tx) = open_claiming(&mut mgr, &["<CR>"], 50);
 
         cmd_tx.send(WinCommand::Close).unwrap();
 
-        assert!(!mgr.handle_claimed_key(press("<CR>")));
-        assert!(!took_a_key(&events), "{CLAIM_LEAKED}");
+        assert!(!claimed(&mut mgr, press("<CR>")));
+        assert!(!took_a_key(&mut events), "{CLAIM_LEAKED}");
         assert!(!mgr.is_open(), "{EXPECT_CLOSED}");
     }
 
@@ -1906,7 +2045,7 @@ mod tests {
     #[test]
     fn a_hidden_window_claims_nothing() {
         let mut mgr = FloatManager::new();
-        let (event_tx, cmd_rx, event_rx, _cmd_tx) = make_channels();
+        let (event_tx, cmd_rx, mut event_rx, _cmd_tx) = make_channels();
         let config = FloatConfig {
             visible: false,
             keys: vec![key("<Tab>")],
@@ -1915,8 +2054,8 @@ mod tests {
         mgr.open(make_buf(&["x"]), config, false, event_tx, cmd_rx);
         paint(&mut mgr);
 
-        assert!(!mgr.handle_claimed_key(press("<Tab>")));
-        assert!(!took_a_key(&event_rx), "{CLAIM_LEAKED}");
+        assert!(!claimed(&mut mgr, press("<Tab>")));
+        assert!(!took_a_key(&mut event_rx), "{CLAIM_LEAKED}");
     }
 
     /// The other half of the same rule: a window the plugin hides is not drawn
@@ -1926,7 +2065,7 @@ mod tests {
     #[test]
     fn hiding_a_window_takes_it_off_the_screen_and_out_of_the_claim() {
         let mut mgr = FloatManager::new();
-        let (events, cmd_tx) = open_claiming(&mut mgr, &["<Esc>"], 50);
+        let (mut events, cmd_tx) = open_claiming(&mut mgr, &["<Esc>"], 50);
         assert!(mgr.windows[0].on_screen, "{EXPECT_PAINTED}");
 
         cmd_tx.send(WinCommand::SetVisible(false)).unwrap();
@@ -1941,8 +2080,8 @@ mod tests {
         });
 
         assert!(!mgr.windows[0].on_screen, "{EXPECT_HIDDEN_UNPAINTED}");
-        assert!(!mgr.handle_claimed_key(press("<Esc>")));
-        assert!(!took_a_key(&events), "{CLAIM_LEAKED}");
+        assert!(!claimed(&mut mgr, press("<Esc>")));
+        assert!(!took_a_key(&mut events), "{CLAIM_LEAKED}");
     }
 
     /// `visible` is the plugin's own flag and says nothing about geometry. A
@@ -1952,7 +2091,7 @@ mod tests {
     #[test]
     fn a_window_sized_to_nothing_claims_nothing() {
         let mut mgr = FloatManager::new();
-        let (event_tx, cmd_rx, event_rx, _cmd_tx) = make_channels();
+        let (event_tx, cmd_rx, mut event_rx, _cmd_tx) = make_channels();
         let config = FloatConfig {
             width: Dimension::Abs(0),
             height: Dimension::Abs(0),
@@ -1962,8 +2101,8 @@ mod tests {
         mgr.open(make_buf(&["x"]), config, false, event_tx, cmd_rx);
         paint(&mut mgr);
 
-        assert!(!mgr.handle_claimed_key(press("<CR>")));
-        assert!(!took_a_key(&event_rx), "{CLAIM_LEAKED}");
+        assert!(!claimed(&mut mgr, press("<CR>")));
+        assert!(!took_a_key(&mut event_rx), "{CLAIM_LEAKED}");
     }
 
     /// A claim is armed by the frame that painted it, so a window opened
@@ -1972,20 +2111,20 @@ mod tests {
     #[test]
     fn a_window_that_has_not_painted_yet_claims_nothing() {
         let mut mgr = FloatManager::new();
-        let (event_tx, cmd_rx, event_rx, _cmd_tx) = make_channels();
+        let (event_tx, cmd_rx, mut event_rx, _cmd_tx) = make_channels();
         let config = FloatConfig {
             keys: vec![key("<Tab>")],
             ..FloatConfig::default()
         };
         mgr.open(make_buf(&["x"]), config, false, event_tx, cmd_rx);
 
-        assert!(!mgr.handle_claimed_key(press("<Tab>")));
-        assert!(!took_a_key(&event_rx), "{CLAIM_LEAKED}");
+        assert!(!claimed(&mut mgr, press("<Tab>")));
+        assert!(!took_a_key(&mut event_rx), "{CLAIM_LEAKED}");
 
         paint(&mut mgr);
 
-        assert!(mgr.handle_claimed_key(press("<Tab>")));
-        assert!(took_a_key(&event_rx), "{CLAIM_NOT_DELIVERED}");
+        assert!(claimed(&mut mgr, press("<Tab>")));
+        assert!(took_a_key(&mut event_rx), "{CLAIM_NOT_DELIVERED}");
     }
 
     #[test]
@@ -2092,10 +2231,10 @@ mod tests {
     fn multiple_windows_close_in_same_tick() {
         let mut mgr = FloatManager::new();
 
-        let (tx1, rx1, erx1, cmd_tx1) = make_channels();
+        let (tx1, rx1, mut erx1, cmd_tx1) = make_channels();
         mgr.open(make_buf(&["a"]), make_config(), true, tx1, rx1);
 
-        let (tx2, rx2, erx2, cmd_tx2) = make_channels();
+        let (tx2, rx2, mut erx2, cmd_tx2) = make_channels();
         mgr.open(make_buf(&["b"]), make_config(), true, tx2, rx2);
 
         cmd_tx1.send(WinCommand::Close).unwrap();
@@ -2103,8 +2242,8 @@ mod tests {
         let _ = mgr.tick();
 
         assert!(!mgr.is_open(), "{}", EXPECT_CLOSED);
-        assert!(erx1.drain().any(|e| matches!(e, WinEvent::Close)));
-        assert!(erx2.drain().any(|e| matches!(e, WinEvent::Close)));
+        assert!(iter::from_fn(|| erx1.try_recv().ok()).any(|e| matches!(e, WinEvent::Close)));
+        assert!(iter::from_fn(|| erx2.try_recv().ok()).any(|e| matches!(e, WinEvent::Close)));
         assert_eq!(mgr.focused_id, None);
     }
 
@@ -2180,22 +2319,20 @@ mod tests {
     fn key_only_goes_to_focused_window() {
         let mut mgr = FloatManager::new();
 
-        let (tx1, rx1, erx1, _) = make_channels();
+        let (tx1, rx1, mut erx1, _) = make_channels();
         mgr.open(make_buf(&["a"]), make_config(), true, tx1, rx1);
 
-        let (tx2, rx2, erx2, _) = make_channels();
+        let (tx2, rx2, mut erx2, _) = make_channels();
         mgr.open(make_buf(&["b"]), make_config(), true, tx2, rx2);
 
         assert_eq!(mgr.focused_id, Some(1), "latest focused window");
 
         mgr.handle_focused_key(press("x"));
 
-        let win1_keys: Vec<_> = erx1
-            .drain()
+        let win1_keys: Vec<_> = iter::from_fn(|| erx1.try_recv().ok())
             .filter(|e| matches!(e, WinEvent::Key { .. }))
             .collect();
-        let win2_keys: Vec<_> = erx2
-            .drain()
+        let win2_keys: Vec<_> = iter::from_fn(|| erx2.try_recv().ok())
             .filter(|e| matches!(e, WinEvent::Key { .. }))
             .collect();
         assert!(win1_keys.is_empty(), "unfocused window gets nothing");
@@ -2245,11 +2382,10 @@ mod tests {
     #[test]
     fn handle_paste_forwards_event_to_focused_window() {
         let mut mgr = FloatManager::new();
-        let (event_rx, _cmd_tx) = open_with_lines(&mut mgr, &["a"]);
+        let (mut event_rx, _cmd_tx) = open_with_lines(&mut mgr, &["a"]);
 
         assert!(mgr.handle_paste(PASTE_TEXT), "{EXPECT_PASTE_TRUE}");
-        let found = event_rx
-            .drain()
+        let found = iter::from_fn(|| event_rx.try_recv().ok())
             .any(|e| matches!(e, WinEvent::Paste { text } if text == PASTE_TEXT));
         assert!(found, "expected Paste event with matching text");
     }
@@ -2264,21 +2400,19 @@ mod tests {
     fn paste_only_goes_to_focused_window() {
         let mut mgr = FloatManager::new();
 
-        let (tx1, rx1, erx1, _) = make_channels();
+        let (tx1, rx1, mut erx1, _) = make_channels();
         mgr.open(make_buf(&["a"]), make_config(), true, tx1, rx1);
 
-        let (tx2, rx2, erx2, _) = make_channels();
+        let (tx2, rx2, mut erx2, _) = make_channels();
         mgr.open(make_buf(&["b"]), make_config(), true, tx2, rx2);
 
         assert_eq!(mgr.focused_id, Some(1), "latest focused window");
         assert!(mgr.handle_paste(PASTE_TEXT), "{EXPECT_PASTE_TRUE}");
 
-        let win1_pastes: Vec<_> = erx1
-            .drain()
+        let win1_pastes: Vec<_> = iter::from_fn(|| erx1.try_recv().ok())
             .filter(|e| matches!(e, WinEvent::Paste { .. }))
             .collect();
-        let win2_pastes: Vec<_> = erx2
-            .drain()
+        let win2_pastes: Vec<_> = iter::from_fn(|| erx2.try_recv().ok())
             .filter(|e| matches!(e, WinEvent::Paste { .. }))
             .collect();
         assert!(win1_pastes.is_empty(), "unfocused window gets nothing");
@@ -2491,8 +2625,8 @@ mod tests {
 
     #[test]
     fn drop_sends_close_to_all_windows() {
-        let (tx1, rx1, erx1, _cmd_tx1) = make_channels();
-        let (tx2, rx2, erx2, _cmd_tx2) = make_channels();
+        let (tx1, rx1, mut erx1, _cmd_tx1) = make_channels();
+        let (tx2, rx2, mut erx2, _cmd_tx2) = make_channels();
         {
             let mut mgr = FloatManager::new();
             mgr.open(make_buf(&["a"]), make_config(), true, tx1, rx1);
@@ -2500,11 +2634,11 @@ mod tests {
         }
 
         assert!(
-            erx1.drain().any(|e| matches!(e, WinEvent::Close)),
+            iter::from_fn(|| erx1.try_recv().ok()).any(|e| matches!(e, WinEvent::Close)),
             "Drop must send Close to window 1",
         );
         assert!(
-            erx2.drain().any(|e| matches!(e, WinEvent::Close)),
+            iter::from_fn(|| erx2.try_recv().ok()).any(|e| matches!(e, WinEvent::Close)),
             "Drop must send Close to window 2",
         );
     }
@@ -2514,12 +2648,15 @@ mod tests {
     const OFFSET_IN_RANGE: &str = "scroll_offset must be <= max_offset";
 
     fn make_window_n(line_count: usize) -> FloatWindow {
-        let (event_tx, _event_rx) = flume::bounded::<WinEvent>(8);
-        let (_cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+        let (event_tx, _event_rx) = unbounded_channel::<WinEvent>();
+        let (_cmd_tx, cmd_rx) = unbounded_channel::<WinCommand>();
         let lines: Vec<String> = (0..line_count).map(|i| format!("l{i}")).collect();
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-        let buf = make_buf(&refs);
-        let cached_lines = buf.read_if_dirty().unwrap_or_default();
+        let mut buf = BufWatch::new(make_buf(&refs));
+        let cached_lines = buf
+            .changed()
+            .map(|snapshot| snapshot.lines)
+            .unwrap_or_default();
         FloatWindow {
             id: 0,
             buf,
@@ -2682,7 +2819,7 @@ mod tests {
         (event_rx, cmd_tx)
     }
 
-    type WinChannels = (flume::Receiver<WinEvent>, flume::Sender<WinCommand>);
+    type WinChannels = (UnboundedReceiver<WinEvent>, UnboundedSender<WinCommand>);
 
     fn render_into(
         mgr: &mut FloatManager,
@@ -2715,15 +2852,14 @@ mod tests {
     #[test]
     fn view_skips_split_window() {
         let mut mgr = FloatManager::new();
-        let (event_rx, _ctx) = open_split(&mut mgr, Split::Below, 10, true);
+        let (mut event_rx, _ctx) = open_split(&mut mgr, Split::Below, 10, true);
         let area = Rect::new(0, 0, 80, 40);
         render_into(&mut mgr, area, |m, f| {
             let u = m.view(f, area, NO_CARET);
             assert_eq!(u, Rect::default(), "overlay pass must not draw the split");
         });
         assert!(
-            !event_rx
-                .drain()
+            !iter::from_fn(|| event_rx.try_recv().ok())
                 .any(|e| matches!(e, WinEvent::Resize { .. })),
             "{EXPECT_SPLIT_DRAWN}: overlay pass must leave it undrawn",
         );
@@ -2734,12 +2870,11 @@ mod tests {
         let mut mgr = FloatManager::new();
         let dir = Split::Below;
         let rect = Rect::new(0, 30, 80, 10);
-        let (event_rx, _ctx) = open_split(&mut mgr, dir, 10, true);
+        let (mut event_rx, _ctx) = open_split(&mut mgr, dir, 10, true);
         let area = Rect::new(0, 0, 80, 40);
         render_into(&mut mgr, area, |m, f| m.view_split(f, dir, rect));
 
-        let resize = event_rx
-            .drain()
+        let resize = iter::from_fn(|| event_rx.try_recv().ok())
             .find_map(|e| match e {
                 WinEvent::Resize { width, height } => Some((width, height)),
                 _ => None,
@@ -2756,13 +2891,13 @@ mod tests {
     fn second_split_of_same_direction_replaces_first() {
         let mut mgr = FloatManager::new();
         let dir = Split::Below;
-        let (erx1, _ctx1) = open_split(&mut mgr, dir, 5, true);
+        let (mut erx1, _ctx1) = open_split(&mut mgr, dir, 5, true);
         let _ = open_split(&mut mgr, dir, 5, true);
 
         let split_count = mgr.windows.iter().filter(|w| w.config.split == dir).count();
         assert_eq!(split_count, 1, "{EXPECT_SINGLE_SPLIT}");
         assert!(
-            erx1.drain().any(|e| matches!(e, WinEvent::Close)),
+            iter::from_fn(|| erx1.try_recv().ok()).any(|e| matches!(e, WinEvent::Close)),
             "the replaced split must receive a Close event",
         );
     }
@@ -2770,7 +2905,7 @@ mod tests {
     #[test]
     fn splits_of_different_directions_coexist() {
         let mut mgr = FloatManager::new();
-        let (erx_left, _) = open_split(&mut mgr, Split::Left, 20, true);
+        let (mut erx_left, _) = open_split(&mut mgr, Split::Left, 20, true);
         let (erx_below, _) = open_split(&mut mgr, Split::Below, 10, true);
 
         assert!(
@@ -2779,7 +2914,7 @@ mod tests {
         );
         assert!(mgr.split_window_idx(Split::Below).is_some());
         assert!(
-            !erx_left.drain().any(|e| matches!(e, WinEvent::Close)),
+            !iter::from_fn(|| erx_left.try_recv().ok()).any(|e| matches!(e, WinEvent::Close)),
             "a different-direction split must not evict the left split",
         );
         let _ = erx_below;
@@ -2826,7 +2961,7 @@ mod tests {
     #[test]
     fn a_window_opened_unfocused_is_never_handed_focus() {
         let mut mgr = FloatManager::new();
-        let (events, _cmd_tx) = open_claiming(&mut mgr, &["<Tab>"], 50);
+        let (mut events, _cmd_tx) = open_claiming(&mut mgr, &["<Tab>"], 50);
         let (tx, rx, _erx, _ctx) = make_channels();
         mgr.open(make_buf(&["modal"]), make_config(), true, tx, rx);
         let modal = mgr.windows.last().expect(EXPECT_OPEN).id;
@@ -2835,7 +2970,7 @@ mod tests {
 
         assert_eq!(mgr.focused_id, None, "{EXPECT_NO_PROMOTION}");
         assert!(!mgr.handle_focused_key(press("a")));
-        assert!(!took_a_key(&events), "{CLAIM_LEAKED}");
+        assert!(!took_a_key(&mut events), "{CLAIM_LEAKED}");
     }
 
     const EXPECT_ZERO_RECT_NOOP: &str =
@@ -2846,13 +2981,12 @@ mod tests {
     #[test_case(Rect::new(0, 30, 0, 10) ; "zero_width")]
     fn view_split_zero_size_rect_is_noop(rect: Rect) {
         let mut mgr = FloatManager::new();
-        let (event_rx, _ctx) = open_split(&mut mgr, Split::Below, 10, true);
+        let (mut event_rx, _ctx) = open_split(&mut mgr, Split::Below, 10, true);
         let area = Rect::new(0, 0, 80, 40);
         render_into(&mut mgr, area, |m, f| m.view_split(f, Split::Below, rect));
 
         assert!(
-            !event_rx
-                .drain()
+            !iter::from_fn(|| event_rx.try_recv().ok())
                 .any(|e| matches!(e, WinEvent::Resize { .. })),
             "{EXPECT_ZERO_RECT_NOOP}",
         );
@@ -2865,7 +2999,7 @@ mod tests {
     #[test]
     fn view_overlays_float_and_skips_coexisting_split() {
         let mut mgr = FloatManager::new();
-        let (ftx, frx, ferx, _fctx) = make_channels();
+        let (ftx, frx, mut ferx, _fctx) = make_channels();
         mgr.open(
             make_buf(&["float"]),
             FloatConfig {
@@ -2878,7 +3012,7 @@ mod tests {
             frx,
         );
 
-        let (serx, _sctx) = open_split(&mut mgr, Split::Below, 10, false);
+        let (mut serx, _sctx) = open_split(&mut mgr, Split::Below, 10, false);
 
         let area = Rect::new(0, 0, 80, 40);
         render_into(&mut mgr, area, |m, f| {
@@ -2887,18 +3021,18 @@ mod tests {
         });
 
         assert!(
-            ferx.drain().any(|e| matches!(e, WinEvent::Resize { .. })),
+            iter::from_fn(|| ferx.try_recv().ok()).any(|e| matches!(e, WinEvent::Resize { .. })),
             "the float must be drawn by the overlay pass",
         );
         assert!(
-            !serx.drain().any(|e| matches!(e, WinEvent::Resize { .. })),
+            !iter::from_fn(|| serx.try_recv().ok()).any(|e| matches!(e, WinEvent::Resize { .. })),
             "{EXPECT_SPLIT_DRAWN}: overlay pass must skip the split",
         );
 
         let rect = Rect::new(0, 30, 80, 10);
         render_into(&mut mgr, area, |m, f| m.view_split(f, Split::Below, rect));
         assert!(
-            serx.drain().any(|e| matches!(e, WinEvent::Resize { .. })),
+            iter::from_fn(|| serx.try_recv().ok()).any(|e| matches!(e, WinEvent::Resize { .. })),
             "{EXPECT_SPLIT_DRAWN}: split joins layout via view_split",
         );
     }
@@ -2906,12 +3040,12 @@ mod tests {
     #[test]
     fn close_all_notifies_split_window() {
         let mut mgr = FloatManager::new();
-        let (event_rx, _ctx) = open_split(&mut mgr, Split::Below, 10, true);
+        let (mut event_rx, _ctx) = open_split(&mut mgr, Split::Below, 10, true);
 
         mgr.close_all();
         assert!(!mgr.is_open(), "{EXPECT_CLOSED}");
         assert!(
-            event_rx.drain().any(|e| matches!(e, WinEvent::Close)),
+            iter::from_fn(|| event_rx.try_recv().ok()).any(|e| matches!(e, WinEvent::Close)),
             "{EXPECT_CLOSE_TO_SPLIT}",
         );
     }
@@ -2958,7 +3092,7 @@ mod tests {
     fn a_hidden_window_of_any_kind_is_out_of_the_layout(split: Split) {
         let area = Rect::new(0, 0, 80, 40);
         let mut mgr = FloatManager::new();
-        let (event_tx, cmd_rx, events, cmd_tx) = make_channels();
+        let (event_tx, cmd_rx, mut events, cmd_tx) = make_channels();
         let config = FloatConfig {
             width: Dimension::Abs(HIDDEN_EXTENT),
             height: Dimension::Abs(HIDDEN_EXTENT),
@@ -2972,8 +3106,8 @@ mod tests {
 
         assert_eq!(draw_one_frame(&mut mgr, area), 0, "{EXPECT_NO_ROOM}");
         assert!(!mgr.windows[0].on_screen, "{EXPECT_NO_PAINT}");
-        assert!(!mgr.handle_claimed_key(press("<Tab>")), "{EXPECT_NO_CLAIM}");
-        assert!(!took_a_key(&events), "{EXPECT_NO_CLAIM}");
+        assert!(!claimed(&mut mgr, press("<Tab>")), "{EXPECT_NO_CLAIM}");
+        assert!(!took_a_key(&mut events), "{EXPECT_NO_CLAIM}");
 
         cmd_tx.send(WinCommand::SetVisible(true)).unwrap();
         let _ = mgr.tick();
@@ -2984,11 +3118,8 @@ mod tests {
             "showing it asks for room again, except a float which never does"
         );
         assert!(mgr.windows[0].on_screen, "showing it paints it again");
-        assert!(
-            mgr.handle_claimed_key(press("<Tab>")),
-            "and its claim is back"
-        );
-        assert!(took_a_key(&events), "{CLAIM_NOT_DELIVERED}");
+        assert!(claimed(&mut mgr, press("<Tab>")), "and its claim is back");
+        assert!(took_a_key(&mut events), "{CLAIM_NOT_DELIVERED}");
     }
 
     #[test]
@@ -3041,7 +3172,7 @@ mod tests {
     fn hidden_panel_excluded_from_reqs() {
         let mut mgr = FloatManager::new();
         let (tx, _rx, _, _) = make_channels();
-        let (cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+        let (cmd_tx, cmd_rx) = unbounded_channel::<WinCommand>();
 
         let cfg = FloatConfig {
             split: Split::Panel,
@@ -3092,5 +3223,203 @@ mod tests {
             "focus must not fall back to a panel window"
         );
         assert_eq!(mgr.windows.len(), 1, "panel window must survive");
+    }
+
+    fn caret_row(parts: CaretRow) -> SnapshotLine {
+        SnapshotLine {
+            spans: parts
+                .iter()
+                .map(|&(text, is_caret)| SnapshotSpan {
+                    text: text.to_string(),
+                    style: if is_caret {
+                        SpanStyle::Named(CURSOR_STYLE_NAME.into())
+                    } else {
+                        SpanStyle::Default
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    fn open_lines_in_caret_window(
+        mgr: &mut FloatManager,
+        lines: Vec<SnapshotLine>,
+        config: FloatConfig,
+        focus: bool,
+    ) -> Arc<SharedBuf> {
+        let buf = Arc::new(SharedBuf::new());
+        buf.set_lines(lines);
+        let (event_tx, cmd_rx, _event_rx, _cmd_tx) = make_channels();
+        mgr.open(Arc::clone(&buf), config, focus, event_tx, cmd_rx);
+        buf
+    }
+
+    fn caret_window_config(reserved_top: usize, reserved_bottom: usize) -> FloatConfig {
+        FloatConfig {
+            reserved_top,
+            reserved_bottom,
+            ..split_config(Split::Below, Dimension::Abs(CARET_WINDOW.height))
+        }
+    }
+
+    fn open_caret_window(
+        mgr: &mut FloatManager,
+        rows: &[CaretRow],
+        reserved_top: usize,
+        reserved_bottom: usize,
+        focus: bool,
+    ) -> Arc<SharedBuf> {
+        open_lines_in_caret_window(
+            mgr,
+            rows.iter().map(|row| caret_row(row)).collect(),
+            caret_window_config(reserved_top, reserved_bottom),
+            focus,
+        )
+    }
+
+    fn paint_caret_window(mgr: &mut FloatManager) -> Option<Position> {
+        render_into(mgr, CARET_SCREEN, |m, f| {
+            m.view_split(f, Split::Below, CARET_WINDOW);
+            m.view(f, CARET_SCREEN, NO_CARET);
+        });
+        mgr.focused_caret()
+    }
+
+    fn cell_at(col: u16, row: u16) -> Option<Position> {
+        Some(Position::new(CARET_WINDOW.x + col, CARET_WINDOW.y + row))
+    }
+
+    #[test_case(PROMPT_ROW, 0, 0 => cell_at(2, 0) ; "ascii_prefix")]
+    #[test_case(&[&[("a漢", false), ("b", true)]], 0, 0 => cell_at(3, 0) ; "cjk_before_the_caret")]
+    #[test_case(&[&[("body", false)], &[(CARET_PREFIX, false), ("x", true)]], 0, 1 => cell_at(2, 4) ; "pinned_bottom_row")]
+    #[test_case(&[&[(CARET_PREFIX, false), ("q", true)], &[("body", false)]], 1, 0 => cell_at(2, 0) ; "pinned_top_row")]
+    #[test_case(&[&[("first", true)], &[("second", true)]], 0, 0 => cell_at(0, 0) ; "first_cursor_span_wins")]
+    #[test_case(&[&[(CARET_PREFIX, false), ("q", true)], &[("body ", false), ("z", true)]], 1, 0 => cell_at(2, 0) ; "top_band_beats_body")]
+    #[test_case(&[&[("body ", false), ("z", true)], &[(CARET_PREFIX, false), ("q", true)]], 0, 1 => cell_at(5, 0) ; "body_beats_bottom_band")]
+    #[test_case(&[&[("a\nb", false), ("c", true)]], 0, 0 => cell_at(2, 0) ; "newline_before_the_caret_paints_nothing")]
+    #[test_case(&[&[("abcdefghijklmn", false), ("x", true)]], 0, 0 => None ; "clipped_past_the_right_edge")]
+    #[test_case(&[&[("abcdefghijk", false), ("漢", true)]], 0, 0 => None ; "wide_caret_cut_by_the_edge")]
+    #[test_case(&[&[("no caret here", false)]], 0, 0 => None ; "no_cursor_span")]
+    fn focused_window_reports_its_cursor_span(
+        rows: &[CaretRow],
+        reserved_top: usize,
+        reserved_bottom: usize,
+    ) -> Option<Position> {
+        let mut mgr = FloatManager::new();
+        open_caret_window(&mut mgr, rows, reserved_top, reserved_bottom, true);
+        paint_caret_window(&mut mgr)
+    }
+
+    #[test_case(3, 6 => cell_at(2, 3) ; "caret_row_counts_from_the_scrolled_viewport")]
+    #[test_case(0, 6 => None ; "caret_scrolled_below_the_viewport")]
+    #[test_case(SCROLL_ROWS, 2 => None ; "caret_scrolled_above_the_viewport")]
+    fn scrolled_window_reports_caret_relative_to_the_viewport(
+        scroll_offset: usize,
+        caret_row_idx: usize,
+    ) -> Option<Position> {
+        let mut mgr = FloatManager::new();
+        let lines = (0..SCROLL_ROWS)
+            .map(|i| {
+                if i == caret_row_idx {
+                    caret_row(&[(CARET_PREFIX, false), ("c", true)])
+                } else {
+                    make_line("row")
+                }
+            })
+            .collect();
+        open_lines_in_caret_window(&mut mgr, lines, caret_window_config(0, 0), true);
+        mgr.windows[0].scroll_offset = scroll_offset;
+        paint_caret_window(&mut mgr)
+    }
+
+    #[test]
+    fn caret_under_the_scrollbar_is_not_reported() {
+        let mut mgr = FloatManager::new();
+        let lines = (0..SCROLL_ROWS)
+            .map(|i| {
+                if i == 0 {
+                    caret_row(&[(LAST_COLUMN_PADDING, false), ("c", true)])
+                } else {
+                    make_line("row")
+                }
+            })
+            .collect();
+        open_lines_in_caret_window(&mut mgr, lines, caret_window_config(0, 0), true);
+        assert_eq!(paint_caret_window(&mut mgr), None, "{EXPECT_NO_CARET}");
+    }
+
+    #[test]
+    fn caret_sits_inside_the_border() {
+        let mut mgr = FloatManager::new();
+        let config = FloatConfig {
+            border: Border::Rounded,
+            ..caret_window_config(0, 0)
+        };
+        let lines = PROMPT_ROW.iter().map(|row| caret_row(row)).collect();
+        open_lines_in_caret_window(&mut mgr, lines, config, true);
+        assert_eq!(paint_caret_window(&mut mgr), cell_at(3, 1));
+    }
+
+    #[test]
+    fn caret_is_measured_after_a_spinner_bakes_to_its_glyph() {
+        let mut mgr = FloatManager::new();
+        let spans = [
+            (
+                SPINNER_PLACEHOLDER,
+                SpanStyle::Named(SPINNER_STYLE_NAME.into()),
+            ),
+            ("c", SpanStyle::Named(CURSOR_STYLE_NAME.into())),
+        ]
+        .map(|(text, style)| SnapshotSpan {
+            text: text.into(),
+            style,
+        });
+        let line = SnapshotLine {
+            spans: spans.to_vec(),
+        };
+        open_lines_in_caret_window(&mut mgr, vec![line], caret_window_config(0, 0), true);
+
+        let glyph_cols = spinner_str(animation_elapsed_ms()).width();
+        assert_ne!(glyph_cols, SPINNER_PLACEHOLDER.width());
+        assert_eq!(
+            paint_caret_window(&mut mgr),
+            cell_at(u16::try_from(glyph_cols).unwrap(), 0)
+        );
+    }
+
+    #[test]
+    fn unfocused_window_reports_no_caret() {
+        let mut mgr = FloatManager::new();
+        open_caret_window(&mut mgr, PROMPT_ROW, 0, 0, false);
+        assert_eq!(paint_caret_window(&mut mgr), None, "{EXPECT_NO_CARET}");
+    }
+
+    #[test]
+    fn caret_goes_when_the_span_does() {
+        let mut mgr = FloatManager::new();
+        let buf = open_caret_window(&mut mgr, PROMPT_ROW, 0, 0, true);
+        assert_eq!(
+            paint_caret_window(&mut mgr),
+            cell_at(2, 0),
+            "{EXPECT_CARET}"
+        );
+
+        buf.set_lines(vec![caret_row(&[(CARET_PREFIX, false), ("cd", false)])]);
+        let _ = mgr.tick();
+        assert_eq!(paint_caret_window(&mut mgr), None, "{EXPECT_NO_CARET}");
+    }
+
+    #[test]
+    fn hidden_window_leaves_no_caret_behind() {
+        let mut mgr = FloatManager::new();
+        open_caret_window(&mut mgr, PROMPT_ROW, 0, 0, true);
+        assert_eq!(
+            paint_caret_window(&mut mgr),
+            cell_at(2, 0),
+            "{EXPECT_CARET}"
+        );
+
+        mgr.windows[0].visible = false;
+        assert_eq!(paint_caret_window(&mut mgr), None, "{EXPECT_NO_CARET}");
     }
 }

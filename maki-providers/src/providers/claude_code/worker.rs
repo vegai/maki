@@ -1,12 +1,11 @@
 //! Launch policy shared by the provider and plugin, and the plugin worker protocol.
 
-use super::run::{Launch, Limits};
-use std::collections::{HashMap, HashSet};
-use std::env;
+use super::run::{Launch, Limits, command, private_dir_async, probe_with, supervised};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder};
 use std::future::Future;
-use std::io;
+use std::io::{self, ErrorKind};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf, absolute};
@@ -14,10 +13,11 @@ use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::FutureExt;
 use maki_storage::permissions::{PERMISSION_BITS, PRIVATE_DIR_MODE};
 use rustix::process::geteuid;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tracing::debug;
 
 use crate::ProviderUsage;
@@ -31,16 +31,16 @@ use super::stream::{
 };
 
 pub use super::MAX_EVENT_BYTES;
-pub use super::checks::{GIT_ENTRY, GITDIR_PREFIX, git_directory, inside_checkout};
+pub use super::checks::{
+    GIT_ENTRY, GITDIR_PREFIX, git_directory, handshake_input, inside_checkout,
+};
 pub use super::run::invalidate_version;
-use super::run::private_dir_async;
 use super::settings::{self, base_settings};
 use super::stream::usage_of as plan_usage;
 pub use super::stream::{EventKind, TOOL_USE_BLOCK, user_message};
 
 pub use super::{DEFAULT_EXECUTABLE, DEFAULT_MAX_CONCURRENT, MIN_MAX_CONCURRENT};
 const EXIT_CODE_SHIFT: u32 = 8;
-const UNKNOWN_EXIT_SIGNAL: i32 = 1;
 
 pub(super) const CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 pub(super) const HOME_ENV: &str = "HOME";
@@ -51,7 +51,7 @@ const DEFAULT_CACHE_DIR: &str = ".cache";
 const SCRATCH_DIRECTORY: &str = "maki/claude-code";
 pub(super) const TMPDIR_ENV: &str = "TMPDIR";
 const UNIX_TEMP_DIR: &str = "/tmp";
-const PROBE_PATH_NOT_UTF8: &str = "probe path is not valid UTF-8";
+const LINK_TO_NOWHERE: &str = "is a link to a missing target";
 const BLOCK_OUTSIDE: &str = "blockReadsOutsideWorkingDirectories";
 const DENY: &str = "deny";
 const SANDBOX: &str = "sandbox";
@@ -74,6 +74,8 @@ const ALLOW_LOCAL_BINDING: &str = "allowLocalBinding";
 const DENIED_DOMAINS: &str = "deniedDomains";
 const DENY_WRITE: &str = "denyWrite";
 const ADDITIONAL_DIRECTORIES: &str = "additionalDirectories";
+const READ_CONTRACT: &str = "You are a read-only worker for another coding agent. You can read and search the project, but you cannot edit files or run commands. Reply only with your results. Keep them short, with file:line locations. If the request needs a tool you do not have, say so clearly.";
+const CODE_CONTRACT: &str = "You are a coding worker for another coding agent. You work in a private copy of the project. Make the task's changes there, and run the commands that check them. Its git repository is read-only to you: git can show and diff, but it cannot add, commit or stash. The other agent reviews your changes before it applies them to its own checkout, which you cannot change. Reply with a short summary of your changes and how you checked them. If a check could not run, say so clearly.";
 
 pub fn shell_secret_problem(env: &HashMap<String, String>) -> Option<String> {
     for (name, value) in env {
@@ -98,10 +100,47 @@ pub fn shell_secret_problem(env: &HashMap<String, String>) -> Option<String> {
     None
 }
 
+enum WorkerProfile {
+    Read,
+    Code,
+}
+
+impl WorkerProfile {
+    pub fn tools(&self) -> &'static [&'static str] {
+        match self {
+            Self::Read => &["Read", "Glob", "Grep"],
+            Self::Code => &["Read", "Glob", "Grep", "Edit", "Write", "Bash"],
+        }
+    }
+
+    fn modes(&self) -> &'static [&'static str] {
+        match self {
+            // The CLI can report default even though read workers launch in manual mode.
+            Self::Read => &["default", "manual"],
+            Self::Code => &["acceptEdits"],
+        }
+    }
+
+    fn mode(&self) -> &'static str {
+        match self {
+            Self::Read => "manual",
+            Self::Code => "acceptEdits",
+        }
+    }
+
+    fn contract(&self) -> &'static str {
+        match self {
+            Self::Read => READ_CONTRACT,
+            Self::Code => CODE_CONTRACT,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(from = "PolicyInput")]
 pub struct WorkerPolicy {
     settings: Value,
+    profile: WorkerProfile,
 }
 
 #[derive(Deserialize)]
@@ -120,14 +159,19 @@ struct WorkerPaths {
 }
 
 impl WorkerPolicy {
-    pub fn args(&self, model: &str, tools: &str, mode: &str, contract: &str) -> Vec<String> {
-        let mut args = settings::base_args(model, tools, mode, &self.settings().to_string());
+    pub fn args(&self, model: &str) -> Vec<String> {
+        let mut args = settings::base_args(
+            model,
+            &self.profile.tools().join(","),
+            self.profile.mode(),
+            &self.settings().to_string(),
+        );
         args.extend(
             [
                 settings::MCP_CONFIG_FLAG,
                 settings::EMPTY_MCP_CONFIG,
                 settings::APPEND_SYSTEM_PROMPT_FLAG,
-                contract,
+                self.profile.contract(),
             ]
             .map(str::to_owned),
         );
@@ -160,7 +204,14 @@ impl From<PolicyInput> for WorkerPolicy {
                 },
             });
         }
-        Self { settings }
+        Self {
+            settings,
+            profile: if input.sandbox.is_some() {
+                WorkerProfile::Code
+            } else {
+                WorkerProfile::Read
+            },
+        }
     }
 }
 
@@ -168,40 +219,23 @@ pub fn executable(name: &str, cwd: &Path) -> Result<PathBuf, Error> {
     crate::process::find_program(name, cwd).ok_or_else(|| Error::ExecutableMissing(name.to_owned()))
 }
 
-pub fn probe_exit(status: ExitStatus, complete: bool) -> Result<(), Error> {
-    if status.code().is_none() {
-        return Err(Error::StoppedInChecks);
-    }
-    if !status.success() {
-        return Err(Error::ExitedInChecks(status));
-    }
-    if !complete {
-        return Err(Error::ChecksUnanswered);
-    }
-    Ok(())
-}
-
-fn exit_status(code: i32) -> ExitStatus {
-    ExitStatus::from_raw(if code < 0 {
-        UNKNOWN_EXIT_SIGNAL
-    } else {
-        code << EXIT_CODE_SHIFT
-    })
-}
-
 pub fn startup_late(seconds: u64) -> String {
     Error::Late(stream::Wait::Startup, seconds).to_string()
 }
 
-pub fn worker_exit(code: i32, after_result: bool) -> String {
+pub fn worker_exit(code: i32, after_result: bool) -> Error {
     if code < 0 {
-        return Error::WentQuiet.to_string();
+        return if after_result {
+            Error::StoppedAfterResult
+        } else {
+            Error::WentQuiet
+        };
     }
-    let status = exit_status(code);
+    let status = ExitStatus::from_raw(code << EXIT_CODE_SHIFT);
     if after_result {
-        format!("Claude Code exited ({status}) after its result")
+        Error::ExitedAfterResult(status)
     } else {
-        Error::ExitedEarly(status).to_string()
+        Error::ExitedEarly(status)
     }
 }
 
@@ -211,54 +245,81 @@ pub fn invalidate_on_error(executable: &Path, error: &Error) {
     }
 }
 
-pub fn handshake_input() -> String {
-    checks::HANDSHAKE
-        .iter()
-        .map(|step| stream::control_request(step.id, &json!({ "subtype": step.subtype })))
-        .collect()
+pub struct WorkerProbe {
+    pub executable: PathBuf,
+    pub env: Vec<(String, String)>,
+    pub project: PathBuf,
+    pub denied: Vec<PathBuf>,
+    /// Outside the artifact so hook output survives artifact cleanup.
+    pub temp_dir: PathBuf,
+    pub policy: Arc<WorkerPolicy>,
+    pub model: String,
+    pub startup: Duration,
+}
+
+impl WorkerProbe {
+    pub async fn run(
+        self,
+        cancel: impl Future<Output = ()> + Send,
+    ) -> (Result<(), Error>, Option<PathBuf>) {
+        let (dir, path) = match private_dir_async(&self.temp_dir, &self.project, &self.denied).await
+        {
+            Ok(directory) => directory,
+            Err(error) => return (Err(error), None),
+        };
+        tokio::pin!(cancel);
+        if cancel.as_mut().now_or_never().is_some() {
+            return (Err(Error::Cancelled), dir.close_empty().await);
+        }
+        let args = self.policy.args(&self.model);
+        let mut handshake = WorkerHandshake::new(self.policy);
+        let result = supervised(command(&self.executable, &self.env, &path, &args), async |group| {
+            tokio::select! {
+                biased;
+                _ = cancel => Err(Error::Cancelled),
+                result = probe_with(group, self.startup, |event| handshake.feed(event)) => result,
+            }
+        }).await.inspect_err(|error| invalidate_on_error(&self.executable, error));
+        (result, dir.close_empty().await)
+    }
 }
 
 pub struct WorkerHandshake {
     answers: Handshake,
-    modes: Vec<String>,
     policy: Arc<WorkerPolicy>,
 }
 
 impl WorkerHandshake {
-    pub fn new(modes: Vec<String>, policy: Arc<WorkerPolicy>) -> Self {
+    pub fn new(policy: Arc<WorkerPolicy>) -> Self {
         Self {
             answers: Handshake::default(),
-            modes,
             policy,
         }
     }
 
-    pub fn answer(&mut self, response: &Value) -> Result<bool, Error> {
-        if !self.answers.record(response)? {
-            return Ok(false);
-        }
-        self.finish()?;
-        Ok(true)
-    }
-
-    pub fn finish(&self) -> Result<(), Error> {
-        self.answers.check(
-            |account| checks::account_problem(account, &self.modes),
-            |settings, hooks| {
-                checks::policy_problem(settings, hooks, false)
-                    .or_else(|| worker_problem(&settings[EFFECTIVE], self.policy.settings()))
-            },
-        )
-    }
-
-    pub fn probe_exit(&self, code: Option<i32>, timeout_secs: u64) -> Result<(), Error> {
-        match code {
-            None => Err(Error::ProbeLate(timeout_secs)),
-            Some(code) => {
-                probe_exit(exit_status(code), self.answers.complete())?;
-                self.finish()
+    fn feed(&mut self, event: &Value) -> Result<stream::Step, Error> {
+        Ok(match stream::classify(event, StreamMode::Worker, false)? {
+            EventKind::ControlResponse => {
+                if self.answer(&event["response"])? {
+                    stream::Step::Ready
+                } else {
+                    stream::Step::Nothing
+                }
             }
-        }
+            EventKind::Result => {
+                return Err(stream::result_failure(event).unwrap_or(Error::UncheckedStart));
+            }
+            EventKind::RateLimit | EventKind::Alive | EventKind::System => stream::Step::Nothing,
+            _ => return Err(Error::UncheckedStart),
+        })
+    }
+
+    pub fn answer(&mut self, response: &Value) -> Result<bool, Error> {
+        self.answers.answer(response, |account, settings, hooks| {
+            checks::account_problem(account, self.policy.profile.modes())
+                .or_else(|| checks::policy_problem(settings, hooks, false))
+                .or_else(|| worker_problem(&settings[EFFECTIVE], self.policy.settings()))
+        })
     }
 
     pub fn subscription_type(&self) -> Option<&str> {
@@ -278,14 +339,6 @@ pub struct LaunchPreparation {
     pub denied: Vec<PathBuf>,
 }
 
-fn default_temp_dir() -> PathBuf {
-    let path = env::temp_dir();
-    if path.as_os_str().is_empty() {
-        return PathBuf::from(UNIX_TEMP_DIR);
-    }
-    path
-}
-
 fn env_value(vars: &[(String, String)], name: &str) -> Option<OsString> {
     vars.iter()
         .find(|(key, _)| key == name)
@@ -301,7 +354,7 @@ pub fn prepare_launch(
     let config_dir = login_dir(&vars, configured.as_deref())?;
     let temp_dir = var(TMPDIR_ENV)
         .filter(|path| !path.is_empty())
-        .map_or_else(default_temp_dir, PathBuf::from);
+        .map_or_else(|| PathBuf::from(UNIX_TEMP_DIR), PathBuf::from);
     let temp_dir =
         absolute(&temp_dir).map_err(Error::path("resolve the temporary directory", &temp_dir))?;
     let cache = var(CACHE_HOME_ENV)
@@ -318,6 +371,10 @@ pub fn prepare_launch(
             .map(PathBuf::from)
             .map(|root| root.join(SCRATCH_DIRECTORY)),
         cache.map(|root| root.join(SCRATCH_DIRECTORY)),
+        Some(
+            PathBuf::from(FALLBACK_TEMP_DIR)
+                .join(format!("maki-claude-code-{}", geteuid().as_raw())),
+        ),
     ]
     .into_iter()
     .flatten()
@@ -353,22 +410,19 @@ fn scratch_base(
     denied: &[PathBuf],
     fallbacks: Vec<PathBuf>,
 ) -> Result<PathBuf, Error> {
-    let outside = |path: &Path| !checks::inside_checkout(path, cwd, denied);
+    let outside =
+        |path: &Path| path.to_str().is_some() && !checks::inside_checkout(path, cwd, denied);
     if let Ok(base) = preferred.canonicalize()
         && base.is_dir()
         && outside(&base)
     {
         return Ok(base);
     }
-    let fallbacks = fallbacks
-        .into_iter()
-        .chain([PathBuf::from(FALLBACK_TEMP_DIR)
-            .join(format!("maki-claude-code-{}", geteuid().as_raw()))]);
     for path in fallbacks {
-        let Some(ancestor) = path.ancestors().find_map(|dir| dir.canonicalize().ok()) else {
+        let Ok(resolved) = resolve_missing(&path) else {
             continue;
         };
-        if !outside(&ancestor) {
+        if !outside(&resolved) {
             continue;
         }
         let mut builder = DirBuilder::new();
@@ -411,50 +465,110 @@ pub(super) fn login_dir(
     )
 }
 
-/// Make a worker probe directory with the provider's ownership tag and checkout checks.
-pub async fn private_dir(
-    base: PathBuf,
-    project: PathBuf,
-    denied: Vec<PathBuf>,
-) -> Result<String, Error> {
-    let (dir, path) = private_dir_async(&base, &project, &denied).await?;
-    let name = path
-        .to_str()
-        .ok_or_else(|| Error::Io {
-            what: "name the probe directory",
-            source: io::Error::new(io::ErrorKind::InvalidData, PROBE_PATH_NOT_UTF8),
-        })?
-        .to_owned();
-    dir.keep();
-    Ok(name)
+pub fn resolve_missing(path: &Path) -> io::Result<PathBuf> {
+    let mut existing = path;
+    let mut missing = Vec::new();
+    loop {
+        match existing.canonicalize() {
+            Ok(mut resolved) => {
+                for name in missing.into_iter().rev() {
+                    resolved.push(name);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                match fs::symlink_metadata(existing) {
+                    Ok(_) => {
+                        return Err(io::Error::new(
+                            ErrorKind::NotFound,
+                            format!("{} {LINK_TO_NOWHERE}", existing.display()),
+                        ));
+                    }
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                let Some(name) = existing.file_name() else {
+                    return Err(error);
+                };
+                missing.push(name);
+                let Some(parent) = existing.parent() else {
+                    return Err(error);
+                };
+                existing = parent;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 pub struct WorkerStream {
     version: String,
     cwd: PathBuf,
-    tools: HashSet<String>,
-    modes: Vec<String>,
+    tools: &'static [&'static str],
+    modes: &'static [&'static str],
     model: Option<String>,
     model_checked: bool,
+    prompted: bool,
     accepted: bool,
+    messages: HashMap<String, Value>,
+    result_usage: Option<Value>,
 }
 
 impl WorkerStream {
-    pub fn new(version: String, cwd: PathBuf, tools: Vec<String>, modes: Vec<String>) -> Self {
+    pub fn new(version: String, cwd: PathBuf, policy: &WorkerPolicy) -> Self {
         Self {
             version,
             cwd,
-            tools: tools.into_iter().collect(),
-            modes,
+            tools: policy.profile.tools(),
+            modes: policy.profile.modes(),
             model: None,
             model_checked: false,
+            prompted: false,
             accepted: false,
+            messages: HashMap::new(),
+            result_usage: None,
         }
     }
 
     pub fn set_model(&mut self, model: String) {
         self.model = Some(model);
         self.model_checked = false;
+    }
+
+    pub fn mark_prompted(&mut self) {
+        self.prompted = true;
+    }
+
+    pub fn usage_totals(&self) -> Option<(Value, bool)> {
+        if self.messages.is_empty() && self.result_usage.is_none() {
+            return None;
+        }
+        let mut totals = Map::new();
+        let mut partial = false;
+        for key in [
+            INPUT_TOKENS,
+            CACHE_READ_INPUT_TOKENS,
+            CACHE_CREATION_INPUT_TOKENS,
+            OUTPUT_TOKENS,
+        ] {
+            let reported = self
+                .result_usage
+                .as_ref()
+                .and_then(|usage| usage[key].as_u64());
+            partial |= reported.is_none();
+            let measured = || {
+                if key == OUTPUT_TOKENS || self.messages.is_empty() {
+                    return None;
+                }
+                self.messages
+                    .values()
+                    .try_fold(0_u64, |sum, usage| sum.checked_add(usage[key].as_u64()?))
+            };
+            if let Some(value) = reported.or_else(measured) {
+                totals.insert(key.into(), value.into());
+            }
+        }
+        Some((Value::Object(totals), partial))
     }
 
     pub fn accepted(&self) -> bool {
@@ -465,7 +579,6 @@ impl WorkerStream {
 pub struct WorkerEvent {
     pub kind: Option<EventKind>,
     pub event: Value,
-    pub usage: Option<Value>,
     pub rate_limit: Option<ProviderUsage>,
     pub problem: Option<Error>,
     pub failure: Option<String>,
@@ -490,17 +603,11 @@ impl WorkerStream {
                 } else {
                     &event["message"]
                 };
-                if event_kind == EventKind::Stream
-                    && event["event"]["type"] == stream::MESSAGE_START
-                    && message["model"].as_str().is_none()
-                {
-                    return Err(Error::NoModel);
-                }
-                if event[API_ERROR_MARK] != true
-                    && let Some(ran) = message["model"].as_str()
-                {
-                    stream::check_model(ran, expected)?;
-                    self.model_checked = true;
+                if event[API_ERROR_MARK] != true {
+                    let required = event_kind == EventKind::Stream
+                        && event["event"]["type"] == stream::MESSAGE_START;
+                    self.model_checked |=
+                        stream::generation_model(message, required, expected)?.is_some();
                 }
                 if event_kind == EventKind::Result
                     && !stream::failed_result(&event)
@@ -516,13 +623,16 @@ impl WorkerStream {
             Err(error) => (None, Some(error)),
         };
         if kind == Some(EventKind::Init) {
+            if !self.prompted {
+                problem = Some(Error::UncheckedStart);
+            }
             if problem.is_none() {
                 problem = checks::init_problem(
                     &event,
                     &self.version,
                     &self.cwd,
-                    &self.tools,
-                    &self.modes,
+                    self.tools.iter().copied(),
+                    self.modes,
                     None,
                 )
                 .map(Error::from);
@@ -535,16 +645,24 @@ impl WorkerStream {
             &event["usage"]
         };
         let usage = usage.is_object().then(|| usage_counts(usage));
+        if kind == Some(EventKind::Assistant)
+            && let (Some(id), Some(usage)) = (event["message"]["id"].as_str(), &usage)
+        {
+            self.messages.insert(id.to_owned(), usage.clone());
+        }
+        if kind == Some(EventKind::Result) {
+            self.result_usage = Some(usage.clone().unwrap_or_default());
+        }
         let rate_limit = (kind == Some(EventKind::RateLimit)
             && event["rate_limit_info"].is_object())
         .then(|| plan_usage(&event["rate_limit_info"]));
         let failure = (kind == Some(EventKind::Result))
             .then(|| stream::result_failure(&event))
-            .flatten();
+            .flatten()
+            .map(|error| error.to_string());
         Ok(WorkerEvent {
             kind,
             event,
-            usage,
             rate_limit,
             problem,
             failure,
@@ -721,6 +839,7 @@ pub async fn checked_profile(
     env: &[(String, String)],
     cwd: &Path,
     denied: &[PathBuf],
+    temp_dir: &Path,
     startup_secs: u64,
     cancel: impl Future<Output = ()> + Send,
 ) -> Result<String, Error> {
@@ -728,14 +847,13 @@ pub async fn checked_profile(
         startup: Duration::from_secs(startup_secs),
         ..Limits::new(Duration::ZERO)
     };
-    let temp_dir = env_value(env, TMPDIR_ENV).map_or_else(default_temp_dir, PathBuf::from);
     super::run::checked_profile(
         &Launch {
             executable,
             env,
             project: cwd,
             denied,
-            temp_dir: &temp_dir,
+            temp_dir,
             limits: &limits,
         },
         cancel,
@@ -745,37 +863,116 @@ pub async fn checked_profile(
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, PolicyInput, Problem, WorkerHandshake, WorkerStream, checks, stream};
+    use super::{
+        Error, PolicyInput, Problem, WorkerHandshake, WorkerProbe, WorkerProfile, WorkerStream,
+        checks, stream,
+    };
     use super::{
         SANDBOX, TMPDIR_ENV, WorkerPaths, WorkerPolicy, prepare_launch, sandbox_problem,
-        worker_problem,
+        scratch_base, worker_problem,
     };
     use serde_json::{Value, json};
+    use std::collections::HashMap;
     use std::env;
+    use std::ffi::OsStr;
     use std::fs;
+    use std::future::ready;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::Duration;
     use tempfile::tempdir;
     use test_case::test_case;
 
+    const SECRET: &str = "worker-secret";
     const READ_RULE: &str = "Read(./secrets)";
     const DENIED: &str = "/checkout";
     const OUTSIDE: &str = "/outside";
     const RELATIVE_TEMP: &str = "relative-temp";
+    const SCRATCH_FALLBACK: &str = "fallback";
+    const PRIVATE_SCRATCH_MODE: u32 = 0o700;
+    const UNSAFE_SCRATCH_MODE: u32 = 0o755;
 
     const MODEL: &str = "claude-test-model";
     const OTHER_MODEL: &str = "claude-other-model";
-    const READ_TOOL: &str = "Read";
+
+    #[tokio::test]
+    async fn a_probe_cancelled_during_preparation_never_launches() {
+        let scratch = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let probe = WorkerProbe {
+            executable: scratch.path().join("missing-executable"),
+            env: Vec::new(),
+            project: project.path().to_owned(),
+            denied: Vec::new(),
+            temp_dir: scratch.path().to_owned(),
+            policy: Arc::new(read_policy()),
+            model: MODEL.into(),
+            startup: Duration::ZERO,
+        };
+        let (result, kept) = probe.run(ready(())).await;
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert!(kept.is_none());
+        assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
+    }
+
+    #[test_case(-1, false => matches Error::WentQuiet ; "signal_before_reply")]
+    #[test_case(-1, true => matches Error::StoppedAfterResult ; "signal_after_reply")]
+    #[test_case(2, false => matches Error::ExitedEarly(_) ; "error_before_reply")]
+    #[test_case(2, true => matches Error::ExitedAfterResult(_) ; "error_after_reply")]
+    fn worker_exit_reports_whether_the_reply_completed(code: i32, after_result: bool) -> Error {
+        super::worker_exit(code, after_result)
+    }
+
+    #[test_case(false ; "before_prompt")]
+    #[test_case(true ; "after_prompt")]
+    fn worker_init_requires_a_prompt(prompted: bool) {
+        let version = checks::minimum_version();
+        let mut stream = WorkerStream::new(version.clone(), PathBuf::from(DENIED), &read_policy());
+        if prompted {
+            stream.mark_prompted();
+        }
+        let init = json!({"type":"system", "subtype":"init", "apiKeySource":"none", "claude_code_version":version, "permissionMode":checks::DEFAULT_MODE, "tools": WorkerProfile::Read.tools(), "mcp_servers":[], "plugins":[], "cwd":DENIED});
+        let event = stream.feed(&init.to_string()).unwrap();
+        assert_eq!(
+            matches!(event.problem, Some(Error::UncheckedStart)),
+            !prompted
+        );
+        assert_eq!(stream.accepted(), prompted);
+    }
+
+    #[test_case("CLAUDE_CODE_OAUTH_TOKEN", SECRET, true ; "token")]
+    #[test_case("claude_code_oauth_token", SECRET, true ; "lowercase_token")]
+    #[test_case("HTTPS_PROXY", "http://user:worker-secret@proxy:3128/", true ; "proxy_password")]
+    #[test_case("http_proxy", "worker-secret@proxy:3128", true ; "proxy_without_scheme")]
+    #[test_case("HTTPS_PROXY", "http://proxy:3128/a@b", false ; "path_is_not_a_login")]
+    #[test_case("PATH", "/bin", false ; "no_secret")]
+    fn coding_shell_refuses_secrets_without_disclosing_them(
+        name: &str,
+        value: &str,
+        refused: bool,
+    ) {
+        let problem = super::shell_secret_problem(&HashMap::from([(name.into(), value.into())]));
+        assert_eq!(problem.is_some(), refused);
+        if let Some(problem) = problem {
+            assert!(problem.contains(name));
+            assert!(!problem.contains(SECRET));
+        }
+    }
+
+    fn read_policy() -> WorkerPolicy {
+        WorkerPolicy::from(PolicyInput {
+            deny: Vec::new(),
+            sandbox: None,
+        })
+    }
 
     fn read_stream() -> WorkerStream {
         let version = checks::minimum_version();
-        let mut stream = WorkerStream::new(
-            version.clone(),
-            PathBuf::from(DENIED),
-            vec![READ_TOOL.into()],
-            vec![checks::DEFAULT_MODE.into()],
-        );
-        let init = json!({"type":"system", "subtype":"init", "apiKeySource":"none", "claude_code_version":version, "permissionMode":checks::DEFAULT_MODE, "tools":[READ_TOOL], "mcp_servers":[], "plugins":[], "cwd":DENIED});
+        let mut stream = WorkerStream::new(version.clone(), PathBuf::from(DENIED), &read_policy());
+        stream.mark_prompted();
+        let init = json!({"type":"system", "subtype":"init", "apiKeySource":"none", "claude_code_version":version, "permissionMode":checks::DEFAULT_MODE, "tools": WorkerProfile::Read.tools(), "mcp_servers":[], "plugins":[], "cwd":DENIED});
         assert!(stream.feed(&init.to_string()).unwrap().problem.is_none());
         stream.set_model(MODEL.into());
         stream
@@ -806,19 +1003,8 @@ mod tests {
     }
 
     fn handshake() -> WorkerHandshake {
-        let policy = super::WorkerPolicy::from(PolicyInput {
-            deny: Vec::new(),
-            sandbox: None,
-        });
-        WorkerHandshake::new(vec![checks::DEFAULT_MODE.into()], Arc::new(policy))
-    }
-
-    #[test_case(None => matches Err(Error::ProbeLate(_)) ; "deadline")]
-    #[test_case(Some(-1) => matches Err(Error::StoppedInChecks) ; "unknown_status")]
-    #[test_case(Some(0) => matches Err(Error::ChecksUnanswered) ; "missing_answers")]
-    #[test_case(Some(73) => matches Err(Error::ExitedInChecks(_)) ; "nonzero_exit")]
-    fn probe_exit_preserves_timeout_status_and_completion(code: Option<i32>) -> Result<(), Error> {
-        handshake().probe_exit(code, 1)
+        let policy = read_policy();
+        WorkerHandshake::new(Arc::new(policy))
     }
 
     #[test]
@@ -842,27 +1028,23 @@ mod tests {
     }
 
     #[test]
-    fn a_completed_worker_probe_exits_successfully() {
-        let policy = super::WorkerPolicy::from(PolicyInput {
-            deny: Vec::new(),
-            sandbox: None,
-        });
+    fn a_complete_worker_handshake_accepts_the_policy() {
+        let policy = read_policy();
         let settings = policy.settings().clone();
-        let mut handshake =
-            WorkerHandshake::new(vec![checks::DEFAULT_MODE.into()], Arc::new(policy));
+        let mut handshake = WorkerHandshake::new(Arc::new(policy));
         let responses = [
             json!({"current_permission_mode":"default", "account":{"apiProvider":"firstParty", "subscriptionType":"Claude Pro"}}),
             json!({"effective":settings, "sources":[{"source":"flagSettings", "settings":settings}]}),
             json!({"hooks":[], "policy":{"allDisabled":true,"policyHookCount":0}}),
         ];
-        for (step, response) in checks::HANDSHAKE.iter().zip(responses) {
-            handshake
+        for (index, (step, response)) in checks::HANDSHAKE.iter().zip(responses).enumerate() {
+            let complete = handshake
                 .answer(
                     &json!({"request_id":step.id, "subtype":stream::SUCCESS, "response":response}),
                 )
                 .unwrap();
+            assert_eq!(complete, index == checks::HANDSHAKE.len() - 1);
         }
-        assert!(handshake.probe_exit(Some(0), 1).is_ok());
     }
 
     #[test]
@@ -889,6 +1071,42 @@ mod tests {
             .find(|(name, _)| name == TMPDIR_ENV)
             .unwrap();
         assert_eq!(given, expected.to_str().unwrap());
+    }
+
+    #[test_case(PRIVATE_SCRATCH_MODE, true ; "private_fallback")]
+    #[test_case(UNSAFE_SCRATCH_MODE, false ; "shared_fallback_is_refused")]
+    fn scratch_fallback_requires_private_permissions(mode: u32, accepted: bool) {
+        let project = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let fallback = outside.path().join(SCRATCH_FALLBACK);
+        fs::create_dir(&fallback).unwrap();
+        fs::set_permissions(&fallback, fs::Permissions::from_mode(mode)).unwrap();
+        let result = scratch_base(project.path(), project.path(), &[], vec![fallback.clone()]);
+        if accepted {
+            assert_eq!(result.unwrap(), fallback.canonicalize().unwrap());
+        } else {
+            assert!(matches!(result, Err(Error::NoScratch(path)) if path == project.path()));
+            assert_eq!(
+                fs::metadata(&fallback).unwrap().permissions().mode() & super::PERMISSION_BITS,
+                mode
+            );
+        }
+    }
+
+    #[test_case(false ; "non_utf8_preferred_target")]
+    #[test_case(true ; "non_utf8_fallback_target")]
+    fn scratch_skips_paths_whose_resolved_names_are_not_utf8(fallback: bool) {
+        let project = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let invalid = outside.path().join(OsStr::from_bytes(b"scratch-\xff"));
+        fs::create_dir(&invalid).unwrap();
+        fs::set_permissions(&invalid, fs::Permissions::from_mode(PRIVATE_SCRATCH_MODE)).unwrap();
+        let alias = outside.path().join("alias");
+        symlink(&invalid, &alias).unwrap();
+        let safe = outside.path().join(SCRATCH_FALLBACK);
+        let preferred = if fallback { project.path() } else { &alias };
+        let result = scratch_base(preferred, project.path(), &[], vec![invalid, safe.clone()]);
+        assert_eq!(result.unwrap(), safe.canonicalize().unwrap());
     }
 
     fn expected() -> Value {

@@ -17,12 +17,11 @@ rm -f -- "./$2"
 rmdir -- "$1"
 ]]
 local ARTIFACT_TEMPLATE = "XXXXXX"
-local LINK_TO_NOWHERE = " is a link to a missing target"
 local TMP_DIR = "tmp"
 local OWNER_MARKER = ".maki-claude-code-artifact"
 local SECS_PER_HOUR = 3600
 
-local function remove_artifact(call, dir, released)
+local function remove_artifact(call, dir, timeout_ms, released)
   local function finished(_, code)
     if code ~= 0 then
       call:leave(dir)
@@ -31,14 +30,14 @@ local function remove_artifact(call, dir, released)
       released()
     end
   end
-  if not call:start({ "sh", "-c", SWEEP_CONTENTS, "sh", dir, OWNER_MARKER }, {}, finished) then
+  if not call:start({ "sh", "-c", SWEEP_CONTENTS, "sh", dir, OWNER_MARKER }, { timeout_ms = timeout_ms }, finished) then
     finished()
   end
 end
 
-local function discard_failed_allocation(call, dir)
+local function discard_failed_allocation(call, dir, timeout_ms)
   maki.async.await(1, function(done)
-    remove_artifact(call, dir, function()
+    remove_artifact(call, dir, timeout_ms, function()
       done(true)
     end)
   end)
@@ -47,7 +46,7 @@ end
 --- An import rewrites the manifest, so the sweep keeps the artifact of an
 --- unfinished import. An artifact that stopped before the collect step is
 --- dated by its marker.
-function M.sweep(call, root, ttl_hours)
+function M.sweep(call, root, ttl_hours, timeout_ms)
   -- Artifact locks are unlinked during deletion. Keep this lock outside the deleted tree.
   local sweep_lock, lock_err = maki.fs.try_lock(maki.fs.joinpath(root, SWEEP_LOCK))
   if not sweep_lock then
@@ -79,7 +78,7 @@ function M.sweep(call, root, ttl_hours)
             trash = dir
           end
           if renamed then
-            remove_artifact(call, trash, function()
+            remove_artifact(call, trash, timeout_ms, function()
               lock:close()
             end)
           else
@@ -97,39 +96,6 @@ function M.sweep(call, root, ttl_hours)
   end)
 end
 
---- Returns {root} resolved on disk, even when it is missing. It must lie
---- outside the checkout, so maki creates or removes nothing there until this
---- function accepts it.
-function M.resolve_root(root, spec)
-  local existing, missing = root, {}
-  while true do
-    local meta, meta_err = maki.fs.metadata(existing)
-    if meta then
-      break
-    elseif meta_err then
-      return nil, "maki cannot read " .. existing .. ": " .. meta_err
-    end
-    local name, parent = maki.fs.basename(existing), maki.fs.dirname(existing)
-    local entry, entry_err = maki.fs.metadata(existing, { follow = false })
-    if entry then
-      return nil, existing .. LINK_TO_NOWHERE
-    elseif entry_err then
-      return nil, "maki cannot read " .. existing .. ": " .. entry_err
-    end
-    table.insert(missing, 1, name)
-    existing = parent
-  end
-  local resolved, err = maki.fs.realpath(existing)
-  if not resolved then
-    return nil, err
-  end
-  resolved = maki.fs.joinpath(resolved, unpack(missing))
-  if path_utils.in_checkout(resolved, spec) then
-    return nil, "the artifact directory " .. resolved .. " is in the project"
-  end
-  return resolved
-end
-
 --- `tmp` is the only other place the worker's shell can write.
 function M.allocate(call, root, env, timeout_ms)
   local _, root_err = maki.fs.mkdir(root, { parents = true })
@@ -142,12 +108,12 @@ function M.allocate(call, root, env, timeout_ms)
   end
   local _, mark_err = maki.fs.write(maki.fs.joinpath(dir, OWNER_MARKER), "")
   if mark_err then
-    discard_failed_allocation(call, dir)
+    discard_failed_allocation(call, dir, timeout_ms)
     return nil, "maki cannot mark " .. dir .. " as an artifact: " .. mark_err
   end
   local lock, lock_err = maki.fs.try_lock(maki.fs.joinpath(dir, path_utils.IMPORT_LOCK))
   if not lock then
-    discard_failed_allocation(call, dir)
+    discard_failed_allocation(call, dir, timeout_ms)
     return nil, "maki cannot lock its coding artifact: " .. lock_err
   end
   call:on_released(function()
@@ -168,7 +134,7 @@ function M.allocate(call, root, env, timeout_ms)
   for _, sub in ipairs({ artifact.snapshot, artifact.tmp }) do
     local _, mkdir_err = maki.fs.mkdir(sub)
     if mkdir_err then
-      discard_failed_allocation(call, artifact.dir)
+      discard_failed_allocation(call, artifact.dir, timeout_ms)
       return nil, "maki cannot make " .. sub .. ": " .. mkdir_err
     end
   end
@@ -176,7 +142,7 @@ function M.allocate(call, root, env, timeout_ms)
 end
 
 function M.discard(call, artifact, removed)
-  remove_artifact(call, artifact.dir, removed)
+  remove_artifact(call, artifact.dir, artifact.timeout_ms, removed)
 end
 
 return M

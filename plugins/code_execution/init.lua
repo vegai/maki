@@ -3,7 +3,6 @@
 -- dispatch live in Rust, which exposes primitives only (`maki.api.get_tools`,
 -- `maki.agent.call_tool`); orchestration policy is here.
 
-local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
 local partial = require("maki.partial")
@@ -13,10 +12,12 @@ local DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
 local MAX_SCRIPT_LINES = 2000
 local OPEN_READ_CHECK_LINES = 1
 local READ_INPUT_SLOTS = { "tool.read.input", "tool.*.input" }
+local LIST_INPUT_SLOTS = { "tool.list.input", "tool.*.input" }
 local OPEN_READ_HOOKED_ERR = "open() cannot read while a plugin hooks the read tool, call read() instead"
+local INSPECT_HOOKED_ERR = "os and pathlib cannot look at files while a plugin hooks the list tool, call list() instead"
+local MKDIR_BASH_HINT = ", create the directory with the bash tool instead"
 local OPEN_APPEND_UNSUPPORTED_ERR = "open() cannot append because the write tool has no append option"
 local NO_OUTPUT = "(no output)"
-local SEPARATOR = "──────"
 local CANCELLED_ERR = "cancelled"
 local TIME_LIMIT_SUBSTR = "time limit exceeded"
 -- Same marker the batch tool uses for a failed child, so a failure reads the
@@ -76,7 +77,7 @@ local opts = maki.api.register_options(output_limits.extend({
 }))
 
 local function new_view(ctx, buf)
-  return ToolView.new(buf, { max_lines = ctx:tool_output_lines().code_execution or 30 })
+  return ToolView.new(buf, { max_lines = ctx:tool_output_lines().code_execution or 3 })
 end
 
 -- One body builder for every path (start preview, handler, restore), so the
@@ -103,7 +104,6 @@ local function build_body(ctx, code)
     if shown < total then
       out[#out + 1] = { { "... (" .. (total - shown) .. " lines) (click to expand)", "dim" } }
     end
-    out[#out + 1] = { { SEPARATOR, "dim" } }
     return out
   end
 
@@ -132,7 +132,7 @@ Use for chained/dependent tool calls and filtering/processing results, e.g. filt
 - All tools are async and return strings: `result = await read(path='file.txt', offset=1, limit=0)`. Parse output yourself.
 - Tool results are complete. Only what you print/return is capped.
 - Concurrency: `a, b = await gather(read(path='a.py', offset=1, limit=0), grep(pattern='x'))`. Pass calls directly, never wrapped in `async def`.
-- Available libs: re, asyncio, sys, os, json. No other imports, no classes, no network access. `open()` works on text files.
+- Available libs: re, asyncio, sys, os, json, pathlib. No other imports, no classes, no network access. `open()` works on text files, and `os`/`pathlib` can stat, list, walk, glob and mkdir.
 - Fresh sandbox each run: no state persists between executions.
 - 30s script timeout (`timeout` param); time awaiting tool calls doesn't count.
 - Skip it when a single tool call needs no transformation.
@@ -273,6 +273,16 @@ local function start(input, ctx)
   highlight()
 end
 
+local function hooked(slot_names)
+  local slots = maki.api.get_slots()
+  for _, name in ipairs(slot_names) do
+    if slots[name] and #slots[name].fillers > 0 then
+      return true
+    end
+  end
+  return false
+end
+
 -- `open()` rides on the read and write tools, so hooks, plugins that replace
 -- them, permission prompts, the file lock and plan mode all still apply. The
 -- read tool numbers and caps lines, so we ask it for one line just to get its
@@ -281,15 +291,17 @@ end
 -- installed we refuse rather than read the path it steered away from.
 -- A replacement write tool without `append` would drop the flag and overwrite
 -- the file, so appends are refused there.
-local function file_access(tools, schemas)
+-- Metadata and listings follow the list tool the same way, minus the call,
+-- since it never prompts and a walk would make one call per directory. mkdir
+-- has no tool of its own, so it only goes where the write tool would go
+-- without asking. The sandbox looks before it creates, so mkdir also needs
+-- `inspect`.
+local function file_access(tools, schemas, ctx)
   local files = {}
   if tools.read then
     files.read = function(path)
-      local slots = maki.api.get_slots()
-      for _, name in ipairs(READ_INPUT_SLOTS) do
-        if slots[name] and #slots[name].fillers > 0 then
-          return nil, OPEN_READ_HOOKED_ERR
-        end
+      if hooked(READ_INPUT_SLOTS) then
+        return nil, OPEN_READ_HOOKED_ERR
       end
       local _, err = tools.read({ path = path, offset = 1, limit = OPEN_READ_CHECK_LINES })
       if err then
@@ -306,11 +318,27 @@ local function file_access(tools, schemas)
       end
       return tools.write({ path = path, content = content, append = append })
     end
+    files.mkdir = function(path, parents)
+      local _, err = ctx:can_write(path)
+      if err then
+        return nil, err .. MKDIR_BASH_HINT
+      end
+      return maki.fs.mkdir(path, { parents = parents })
+    end
+  end
+  if tools.list then
+    files.inspect = function()
+      if hooked(LIST_INPUT_SLOTS) then
+        return nil, INSPECT_HOOKED_ERR
+      end
+      return true
+    end
   end
   return files
 end
 
 local function handler(input, ctx)
+  local started_at = os.time()
   local timeout = input.timeout or opts.timeout_secs
 
   local buf, view, highlight = build_body(ctx, input.code)
@@ -319,25 +347,24 @@ local function handler(input, ctx)
 
   view:append({ { "Waiting for output...", "dim" } })
 
+  local max_lines, max_bytes = output_limits.resolve(opts, ctx)
+
   local waiting = true
-  local output_parts = {}
+  local collected = output_limits.collector(max_lines, max_bytes)
   local function show(line)
     if waiting then
       waiting = false
       view:clear()
     end
-    output_parts[#output_parts + 1] = line
+    collected:append(line)
     view:append(line)
   end
-
-  local max_lines, max_bytes = output_limits.resolve(opts, ctx)
 
   -- Memoized, because a cancel reaches us twice: once through the hook and
   -- again as the interpreter's error, and the view is painted only once.
   local cut_reply
   local function cut(reason)
-    cut_reply = cut_reply
-      or partial.cut(view, truncate(table.concat(output_parts, "\n"), max_lines, max_bytes), reason, timeout)
+    cut_reply = cut_reply or partial.cut(view, collected:result(), reason, timeout, started_at)
     return cut_reply
   end
 
@@ -379,7 +406,7 @@ local function handler(input, ctx)
     preamble = PREAMBLE,
     on_output = show,
     tools = tools,
-    files = file_access(tools, schemas),
+    files = file_access(tools, schemas, ctx),
   })
 
   if err then
@@ -397,24 +424,28 @@ local function handler(input, ctx)
     -- The run is already paid for, so point a script that reached for
     -- `asyncio.gather` at the wrapper that would have kept its other results.
     local hint = input.code:find(ASYNCIO_GATHER, 1, true) and GATHER_HINT or ""
-    return { llm_output = truncate(err .. hint, max_lines, max_bytes), is_error = true, body = buf }
+    return { llm_output = output_limits.cut_middle(err .. hint, max_lines, max_bytes), is_error = true, body = buf }
   end
 
-  local output = result.stdout or ""
   if result.output then
     show("return: " .. result.output)
-    output = (#output > 0 and output .. "\n" or "") .. "return: " .. result.output
   end
-  if #output == 0 then
-    output = NO_OUTPUT
+
+  -- Every line already went through `show`, so the collector holds the
+  -- reply and a finished run keeps its tail just like a cut one. Full mode
+  -- promises the whole output, so a cut there is an error.
+  local over_full_limit = not max_bytes and collected:truncated()
+  local llm_output = collected:result()
+  if llm_output == "" then
+    llm_output = NO_OUTPUT
     view:clear()
     view:append({ { "No output", "dim" } })
+  elseif over_full_limit then
+    llm_output = llm_output .. "\n" .. output_limits.FULL_LIMIT_NOTE
   end
-
-  local llm_output = truncate(output, max_lines, max_bytes)
   view:finish()
 
-  return { llm_output = llm_output, body = buf }
+  return { llm_output = llm_output, is_error = over_full_limit, body = buf }
 end
 
 local function header(input)

@@ -1,5 +1,5 @@
--- Everything the blocking and the background path share, from input checks to
--- the prompt loop, so the two cannot drift apart.
+-- What the task tool runs, from input checks to the prompt loop. A background
+-- task is the same call moved off its turn, so it shares all of it.
 --
 -- Structured-output story: the subagent gets a session-local structured_output
 -- tool whose handler validates the result and keeps it in `capture`. Invalid
@@ -23,6 +23,7 @@ local NUDGE_MISSING =
   "You did not call the structured_output tool. Call it now with your final result matching its input schema."
 local NUDGE_SUMMARY =
   "You finished your work but did not provide a summary. Reply with a concise summary of what you did and found."
+local ASSIGNED_MODEL_CONTEXT = "model `%s`, assigned to the %s tier: "
 local INVALID_INPUT_PREFIX =
   "Input does not match the required schema. Fix the errors and call structured_output again:\n"
 
@@ -31,7 +32,7 @@ local Runner = {}
 local opts = maki.api.register_options({
   max_concurrent = { default = 8, min = 1, desc = "Max concurrently running subagents." },
   allow_background = {
-    default = false,
+    default = true,
     desc = "Expose a `background` input that pushes subagent results to the chat when they finish.",
   },
   allow_model = {
@@ -83,13 +84,26 @@ end
 if opts.allow_background then
   schema.properties.background = {
     type = "boolean",
-    description = "Run in the background and continue other work. The result arrives later in a notice. End your turn to wait for it. Background tasks cannot ask for permissions.",
+    description = "Run in the background. The result arrives as a message. Default to true unless your next step needs the result. Launch all in one batch. Never sleep or poll, end your turn when idle.",
+    needs_background = true,
   }
 end
 
 Runner.allow_background = opts.allow_background
 Runner.schema = schema
-Runner.semaphore = maki.async.semaphore(opts.max_concurrent)
+
+local slots = maki.async.semaphore(opts.max_concurrent)
+
+-- {on_wait} runs only when every slot is taken, right before the call parks
+-- for one.
+function Runner.acquire_slot(on_wait)
+  local permit = slots:try_acquire()
+  if permit then
+    return permit
+  end
+  on_wait()
+  return slots:acquire()
+end
 
 local function bounded_errors(errors)
   local out = {}
@@ -132,14 +146,6 @@ function Runner.prepare(input, ctx)
 
   local audience = subagent_type == "research" and "research_sub" or "general_sub"
   local prompt_id = subagent_type == "research" and "research" or "general"
-  local system, system_err = maki.agent.system_prompt(ctx, {
-    prompt_id = prompt_id,
-    instructions = true,
-  })
-  if system_err then
-    return nil, system_err
-  end
-
   local tool_defs, tools_err = maki.agent.tools(ctx, {
     audience = audience,
     spec = model.spec,
@@ -147,6 +153,15 @@ function Runner.prepare(input, ctx)
   })
   if tools_err then
     return nil, tools_err
+  end
+
+  local system, system_err = maki.agent.system_prompt(ctx, {
+    prompt_id = prompt_id,
+    instructions = true,
+    tools = tool_defs,
+  })
+  if system_err then
+    return nil, system_err
   end
 
   local capture = validator and {} or nil
@@ -185,6 +200,10 @@ function Runner.prepare(input, ctx)
     },
     message = input.prompt .. (validator and STRUCTURED_OUTPUT_PROMPT_SUFFIX or ""),
     capture = capture,
+    -- The user may have made the assignment long ago and logged out of its
+    -- provider since. Naming it turns a bare 401 into something they can fix.
+    error_context = model.assigned_tier and string.format(ASSIGNED_MODEL_CONTEXT, model.spec, model.assigned_tier)
+      or "",
   }
 end
 
@@ -205,6 +224,7 @@ function Runner.run(sess, prepared)
   end
 
   if err then
+    err = prepared.error_context .. err
     -- A result alongside the error means the run was cut short after
     -- streaming some text, and half a transcript beats a bare error.
     if result then

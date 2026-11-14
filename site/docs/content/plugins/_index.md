@@ -16,8 +16,7 @@ reference is at the end of this document.
 
 Plugins live in the maki config dir. There are two of them, same layout:
 
-- `~/.config/maki/` - global, every project (if `~/.maki/` exists, maki reads
-  that one first)
+- `~/.config/maki/` - global, every project
 - `<project>/.maki/` - this project only
 
 ```
@@ -28,9 +27,13 @@ plugin.toml     permission grants for every Lua file in the dir
 
 Nothing under `lua/` loads on its own. A module name is its path under `lua/`
 without the extension: `lua/browser.lua` is `require("browser")`,
-`lua/acme/tools.lua` is `require("acme.tools")`. `require` is sandboxed to
-that directory, you cannot reach files outside it. Plugin environments omit
-`getfenv` and `setfenv` so a plugin cannot inspect or replace another environment.
+`lua/acme/tools.lua` is `require("acme.tools")`. `require` cannot reach files
+outside that directory. Plugin environments omit `getfenv` and `setfenv` so a
+plugin cannot inspect or replace another environment.
+
+A module can call `maki.fs` and the other async APIs at its top level. In a
+`require` cycle, the `require` that closes the cycle returns `true` rather than
+the module.
 
 ## Creating a plugin
 
@@ -92,9 +95,10 @@ with full debug info.
 
 ## Conventions
 
-- Fallible runtime calls return a `(value, err)` pair; check `err` before using `value`.
+- Fallible runtime calls return a `(value, err)` pair. Check `err` before using `value`.
 - Tool handlers report failures with `{ llm_output = "error: ...", is_error = true }`, not by raising.
 - The model picks tools by reading `description`, so state precisely what the tool does and when to use it.
+- Give each parameter its own schema field. Models copy a usage line like `` `write path content` `` into a string field.
 - Reusable helpers ship with maki; see "Shared helper modules" in the API reference.
 
 ## A complete real example

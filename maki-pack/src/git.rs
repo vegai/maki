@@ -6,6 +6,9 @@
 //! maki owning any of that.
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+
+use tokio::process::Command;
 
 /// Peels whatever a ref names down to a commit.
 const COMMIT_PEEL: &str = "^{commit}";
@@ -37,9 +40,9 @@ const LOW_SPEED_TIME: u32 = 30;
 /// matters more: a checkout directory on this machine whose `.git/hooks`
 /// something else has written.
 ///
-/// Nothing here can cancel a running git, so the speed limits are what turn a
-/// remote that connects and then goes quiet into a failure instead of a wait
-/// with no end.
+/// No caller gives up on a running git, so the speed limits are what turn an
+/// HTTP remote that connects and then goes quiet into a failure instead of a
+/// wait with no end.
 pub fn hardening_args(empty_hooks_dir: &Path) -> Vec<String> {
     vec![
         "-c".to_owned(),
@@ -213,13 +216,14 @@ pub fn redact(text: &str) -> String {
         .collect()
 }
 
-/// Runs git off the calling thread.
+/// Runs git as a child the runtime waits on, so no thread blocks on it.
 ///
-/// `maki.pack.add` runs while `init.lua` is being sourced, and `init.lua`
-/// executes on the single Lua thread inside an async call. A blocking
-/// `Command::output` there would stall the whole VM, the watchdog included, so
-/// every invocation goes through `smol::unblock` and the caller awaits it. On a
-/// first start a clone can take seconds, which is exactly when this matters.
+/// A first start's clone can take seconds, which a blocking wait would hold a
+/// runtime worker for. Dropping the call kills git itself, not the helpers it started (`git-remote-https`, `ssh`,
+/// `index-pack`), which exit once their pipes close.
+///
+/// Unlike std's, tokio's `output` leaves stdin inherited, and maki's stdin is the
+/// terminal or, in ACP and SDK mode, the protocol stream, so it is closed here.
 ///
 /// The directory is required, never optional. Git reads the config of whatever
 /// repository it stands in, a clone included, and the inherited process
@@ -229,16 +233,14 @@ pub fn redact(text: &str) -> String {
 /// owns and the question goes away.
 pub async fn run(args: Vec<String>, cwd: PathBuf) -> Result<GitOutput, GitError> {
     let display = redact(&args.join(" "));
-    let output = smol::unblock(move || {
-        let mut cmd = std::process::Command::new("git");
-        cmd.args(&args);
-        cmd.current_dir(cwd);
-        for (key, value) in hardening_env() {
-            cmd.env(key, value);
-        }
-        cmd.output()
-    })
-    .await;
+    let output = Command::new("git")
+        .args(&args)
+        .current_dir(cwd)
+        .envs(hardening_env())
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await;
 
     let output = match output {
         Ok(output) => output,
@@ -453,16 +455,17 @@ mod tests {
         assert!(msg.contains("repository not found"));
     }
 
-    #[test]
-    fn a_failing_command_reports_rather_than_panicking() {
+    #[tokio::test]
+    async fn a_failing_command_reports_rather_than_panicking() {
         let dir = tempfile::TempDir::new().unwrap();
         let hooks = dir.path().join("nohooks");
         std::fs::create_dir_all(&hooks).unwrap();
 
-        let result = smol::block_on(run(
+        let result = run(
             rev_parse_args(&hooks, "definitely-not-a-ref"),
             dir.path().to_path_buf(),
-        ));
+        )
+        .await;
         assert!(result.is_err(), "an unknown revision must be an error");
     }
 }

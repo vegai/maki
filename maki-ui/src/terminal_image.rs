@@ -1,13 +1,13 @@
 use std::env;
 use std::io::{Cursor, IsTerminal, stdout};
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
+use std::sync::mpsc::Sender;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use color_eyre::eyre::{Result, ensure};
 use image::{DynamicImage, ImageDecoder, ImageReader, Limits};
+use maki_highlight::pool::{Job, job_thread};
 use maki_providers::ImageSource;
 use ratatui::layout::Size;
 use ratatui_image::{
@@ -15,6 +15,8 @@ use ratatui_image::{
     picker::{Picker, ProtocolType},
     sliced::SlicedProtocol,
 };
+use tokio::sync::oneshot::error::TryRecvError;
+use tokio::sync::oneshot::{self, Receiver};
 
 use crate::image::{MAX_IMAGE_BYTES, MAX_IMAGE_PIXELS};
 use crate::repaint::Dirty;
@@ -23,29 +25,11 @@ const MAX_IMAGE_ROWS: u16 = 20;
 const FALLBACK_FONT_SIZE: FontSize = FontSize::new(10, 20);
 const DECODE_THREAD: &str = "inline-image";
 static GENERATION: AtomicU64 = AtomicU64::new(0);
-static DECODE_JOBS: OnceLock<flume::Sender<DecodeJob>> = OnceLock::new();
 
-type DecodeJob = Box<dyn FnOnce() + Send + 'static>;
-
-/// Decoding gets its own thread rather than `maki_highlight::pool`: that one is
-/// single threaded to bound syntect's regex cache, and a multi-megabyte decode
-/// queued ahead of the transcript's highlight jobs stalls the whole UI.
-fn decode_jobs() -> &'static flume::Sender<DecodeJob> {
-    DECODE_JOBS.get_or_init(|| {
-        let (tx, rx) = flume::unbounded::<DecodeJob>();
-        thread::Builder::new()
-            .name(DECODE_THREAD.into())
-            .spawn(move || {
-                while let Ok(job) = rx.recv() {
-                    if catch_unwind(AssertUnwindSafe(job)).is_err() {
-                        tracing::error!("inline image decode panicked");
-                    }
-                }
-            })
-            .expect("failed to spawn the inline image thread");
-        tx
-    })
-}
+/// Decoding gets a thread of its own rather than the highlight one: that one
+/// is single threaded to bound syntect's regex cache, and a multi-megabyte
+/// decode queued ahead of the transcript's highlight jobs stalls the whole UI.
+static DECODE_JOBS: LazyLock<Sender<Job>> = LazyLock::new(|| job_thread(DECODE_THREAD));
 
 pub(crate) fn invalidate() {
     GENERATION.fetch_add(1, Ordering::Relaxed);
@@ -108,7 +92,7 @@ enum ImageState {
     Pending {
         width: u16,
         height: u16,
-        result: flume::Receiver<Result<SlicedProtocol>>,
+        result: Receiver<Result<SlicedProtocol>>,
     },
     Ready {
         width: u16,
@@ -182,7 +166,7 @@ impl InlineImage {
             } if *encoded_width == width => return,
             _ => {}
         }
-        let (tx, result) = flume::bounded(1);
+        let (tx, result) = oneshot::channel();
         let source = self.source.clone();
         let picker = picker.clone();
         self.state = ImageState::Pending {
@@ -190,21 +174,21 @@ impl InlineImage {
             height: self.height(),
             result,
         };
-        let _ = decode_jobs().send(Box::new(move || {
-            if !tx.is_disconnected() {
+        let _ = DECODE_JOBS.send(Box::new(move || {
+            if !tx.is_closed() {
                 let _ = tx.send(encode(&source, &picker, width));
             }
         }));
     }
 
     pub fn poll(&mut self) -> Dirty {
-        let ImageState::Pending { width, result, .. } = &self.state else {
+        let ImageState::Pending { width, result, .. } = &mut self.state else {
             return Dirty::NO;
         };
         let result = match result.try_recv() {
             Ok(result) => result,
-            Err(flume::TryRecvError::Empty) => return Dirty::NO,
-            Err(flume::TryRecvError::Disconnected) => {
+            Err(TryRecvError::Empty) => return Dirty::NO,
+            Err(TryRecvError::Closed) => {
                 self.state = ImageState::Failed;
                 return Dirty::YES;
             }
@@ -272,6 +256,7 @@ mod tests {
         picker::{Picker, ProtocolType},
     };
     use test_case::test_case;
+    use tokio::sync::oneshot;
 
     use super::{ImageState, InlineImage, encode, protocol_from_env};
     use crate::repaint::Dirty;
@@ -347,8 +332,8 @@ mod tests {
         // Encode here and hand the answer over instead of waiting on the real
         // decode thread, which is how this test would start failing at 3am on a
         // loaded machine.
-        let (tx, result) = flume::bounded(1);
-        tx.send(encode(&source, &picker, IMAGE_WIDTH))?;
+        let (tx, result) = oneshot::channel();
+        assert!(tx.send(encode(&source, &picker, IMAGE_WIDTH)).is_ok());
         image.state = ImageState::Pending {
             width: IMAGE_WIDTH,
             height: 1,

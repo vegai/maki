@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use maki_config::PROVIDER_BUILTINS;
 use maki_config::providers::{BuiltInProvider, Protocol, ProviderPlan};
 
+use crate::AgentError;
 use crate::manifest;
 use crate::model::{Model, ModelEntry, ModelFamily, ModelTier};
 use crate::pricing::PricingSchedule;
@@ -11,8 +12,7 @@ use crate::providers::{
     ResolvedAuth, Timeouts, anthropic, aperture, claude_code, copilot, custom, google, llama_cpp,
     ollama, openai, opencode, plugin, xai, zai,
 };
-use crate::types::ThinkingFallback;
-use crate::{AgentError, Effort};
+use crate::types::{ThinkingConfig, ThinkingFallback};
 
 /// The slugs a plugin may name as its `base`, in documentation order. A `base`
 /// borrows a bespoke `impl Provider` whole, so every entry must be a
@@ -59,15 +59,21 @@ pub struct ProviderSpec {
     /// borrows this row's protocol does not inherit it; see
     /// [`crate::Model::supports_deferred_tools`].
     pub supports_deferred_tools: bool,
-    /// The level a model here is sent `adaptive` as, or `None` where the API
-    /// picks the depth itself. A fn, because one provider can serve both
-    /// kinds of model. Read through [`Model::adaptive_effort`].
-    pub adaptive_effort: fn(&Model) -> Option<Effort>,
+    /// What a model here is sent for a thinking choice, so the badge and the
+    /// picker can show it. A fn, because one provider can serve models with
+    /// different levels. Read through [`crate::ThinkingConfig::shown`].
+    pub sends_thinking: fn(&Model, ThinkingConfig) -> ThinkingConfig,
     /// How the selected endpoint handles modes outside `thinking_fields`.
     /// `None` ignores the fields, `Some` names their fallback. This also says
     /// whether a toggle fragment can carry an explicit token budget.
     pub thinking_fields_fallback: fn(&Model) -> Option<ThinkingFallback>,
     pub accepts_arbitrary_models: bool,
+    /// The live listing is the account's entitlement: an answered listing is
+    /// the whole list, with no curated rows from [`ProviderSpec::models`]
+    /// appended, and tier defaults stay inside it. A 401/403 lists nothing,
+    /// the offline list leaves the provider to discovery, and any other
+    /// failure falls back to the curated rows.
+    pub catalog_is_authoritative: bool,
     pub fallback_max_output: Option<u32>,
     pub fallback_context_window: u32,
     /// This provider's curated table, embedded from `models/<slug>.toml`. Read
@@ -96,9 +102,9 @@ pub struct ProviderSpec {
     pub docs: GeneratedDocs,
 }
 
-/// For a provider whose API has an adaptive mode of its own.
-pub(crate) fn api_decides(_: &Model) -> Option<Effort> {
-    None
+/// For a provider whose API takes every choice as it is, `adaptive` included.
+pub(crate) fn sends_as_chosen(_: &Model, choice: ThinkingConfig) -> ThinkingConfig {
+    choice
 }
 
 /// For a provider whose ids all come from a live catalog.
@@ -314,7 +320,7 @@ impl ProviderRegistry {
 /// knows about a slug: a catalog-backed builtin has a spec row and is still
 /// `Catalog` here.
 pub enum Owner {
-    /// A selected or registered declaration.
+    /// A registered declaration.
     Plugin,
     /// Carries the constructor rather than the spec, so "builtin" and
     /// "buildable" cannot come apart.
@@ -328,17 +334,27 @@ pub enum Owner {
 
 impl Owner {
     pub fn of(slug: &str) -> Self {
-        // Registration refuses a built-in slug, so a declaration never
-        // shadows a row below.
-        if plugin::owns_slug(slug) {
+        // A registered declaration wins over every row below it: a bundled
+        // provider plugin may keep a slug maki also ships (`[openrouter]` with
+        // a `protocol` line in `providers.toml` must not swap the plugin out
+        // for the bare custom client).
+        if plugin::is_registered(slug) {
             return Self::Plugin;
         }
+        // A slug granted to an enabled package stays owned even when its load
+        // fails, so the catalog client cannot take it over and receive the key
+        // saved for it. The grant only blocks the catalog client: registration
+        // refuses the rows above, so a grant on one of them is a leftover from
+        // a refused takeover that must not break the row itself.
         let builtin = ProviderRegistry::compiled(slug);
         if let Some(native) = builtin.and_then(ProviderSpec::native) {
             return Self::Builtin(native.new);
         }
         if custom::base_spec(slug).is_some() {
             return Self::Custom;
+        }
+        if plugin::owns_slug(slug) {
+            return Self::Plugin;
         }
         if builtin.is_some() {
             return Self::Catalog;
@@ -478,5 +494,23 @@ mod tests {
     fn a_spec_row_without_a_constructor_still_belongs_to_the_catalog() {
         assert!(matches!(Owner::of(anthropic::SLUG), Owner::Builtin(_)));
         assert!(matches!(Owner::of(opencode::GO_SLUG), Owner::Catalog));
+    }
+
+    /// Registration refuses a takeover of a built-in or custom slug, but the
+    /// grant is recorded before registration runs and survives the failure.
+    /// Such a leftover grant must not shadow the row itself; it only blocks
+    /// the catalog client.
+    #[test]
+    fn a_leftover_grant_does_not_shadow_a_builtin_or_custom_row() {
+        const CATALOG_SLUG: &str = "leftover-grant-slug";
+
+        plugin::keep_granted(
+            "broken-package",
+            &[anthropic::SLUG.to_owned(), CATALOG_SLUG.to_owned()],
+        );
+        assert!(matches!(Owner::of(anthropic::SLUG), Owner::Builtin(_)));
+        assert!(matches!(Owner::of(CATALOG_SLUG), Owner::Plugin));
+        plugin::release_granted("broken-package");
+        assert!(matches!(Owner::of(CATALOG_SLUG), Owner::Unknown));
     }
 }

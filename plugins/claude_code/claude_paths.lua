@@ -190,10 +190,4 @@ function M.first_non_utf8(paths)
   return nil
 end
 
---- Returns true if {path} is in the checkout of {spec}, which reaches past
---- the session's directory when that is a subdirectory or a worktree.
-function M.in_checkout(path, spec)
-  return native.in_checkout(path, spec.cwd, spec.denied)
-end
-
 return M

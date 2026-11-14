@@ -1,27 +1,30 @@
-use flume::Receiver;
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
 
+use super::wire::RESULT;
+
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(120);
-const RESULT: &str = "result";
 
 pub fn ndjson(bytes: &[u8]) -> Vec<Value> {
     bytes
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
-        .map(|line| {
-            serde_json::from_slice(line).unwrap_or_else(|error| {
-                panic!(
-                    "invalid protocol event: {error}: {}",
-                    String::from_utf8_lossy(line)
-                )
-            })
-        })
+        .map(parse_event)
         .collect()
+}
+
+fn parse_event(line: &[u8]) -> Value {
+    serde_json::from_slice(line).unwrap_or_else(|error| {
+        panic!(
+            "invalid protocol event: {error}: {}",
+            String::from_utf8_lossy(line)
+        )
+    })
 }
 
 pub struct Process {
@@ -38,12 +41,11 @@ impl Process {
             .spawn()
             .unwrap();
         let output = BufReader::new(child.stdout.take().unwrap());
-        let (tx, events) = flume::unbounded();
+        let (tx, events) = mpsc::channel();
         thread::spawn(move || {
             for line in output.lines() {
                 let line = line.expect("cannot read a protocol event from maki");
-                let event = serde_json::from_str(&line)
-                    .unwrap_or_else(|error| panic!("invalid protocol event: {error}: {line}"));
+                let event = parse_event(line.as_bytes());
                 if tx.send(event).is_err() {
                     break;
                 }

@@ -45,19 +45,17 @@ end
 local Run = {}
 Run.__index = Run
 
-function Run.new(ctx, call, spec: { cli: { version: string }, [string]: any }, timeout_secs, opts)
+function Run.new(ctx, call, spec: { version: string, [string]: any }, timeout_secs, opts)
   local self = setmetatable({
     ctx = ctx,
     call = call,
     spec = spec,
     timeout_secs = timeout_secs,
-    route = CHECKING:format(spec.cli.version),
-    handshake = launch.worker_handshake(spec),
+    started_at = os.time(),
+    route = CHECKING:format(spec.version),
+    handshake = native.worker_handshake(spec.policy),
     stderr_tail = {},
     has_progress = false,
-    -- Claude Code sends init after it reads the prompt. An earlier init means it bypassed the
-    -- handshake.
-    prompted = false,
     finished = false,
   }, Run)
   self.max_lines, self.max_bytes = output_limits.resolve(opts, ctx)
@@ -138,7 +136,7 @@ function Run:stop(reason)
     return
   end
   self.stopped = reason
-  self.route = ROUTE_UNCONFIRMED:format(self.spec.cli.version)
+  self.route = ROUTE_UNCONFIRMED:format(self.spec.version)
   maki.fn.jobstop(self.job_id)
 end
 
@@ -156,12 +154,13 @@ function Run:on_answer()
     self:stop(problem)
     return
   end
-  self.stream:set_model(model)
+  self.stream.native:set_model(model)
   local sent, err, queued = jobs.feed_stdin(self.job_id, launch.user_message(self.task, self.spec.instructions))
   if queued then
     -- The worker can act on a queued prompt even if closing stdin fails. Keep its snapshot.
-    self.prompted = true
+    self.stream.native:mark_prompted()
     self.call:keep_artifact()
+    self:restart_clock()
   end
   if not sent then
     self:stop("maki cannot send the task to Claude Code: " .. tostring(err))
@@ -172,7 +171,8 @@ function Run:on_line(line)
   if self.finished then
     return
   end
-  local step, problem, complete = launch.checked_step(self.stream, line, self.handshake)
+  local step = self.stream:feed(line, self.handshake)
+  local problem, complete = step and step.stop, step and step.complete
   if not step or self.stopped then
     return
   end
@@ -182,12 +182,10 @@ function Run:on_line(line)
     if complete then
       self:on_answer()
     end
-  elseif step.init and not self.prompted then
-    self:stop(native.unchecked_start)
   elseif step.init then
     self.clock:stop()
     local subscription = " (" .. self.handshake:subscription_type() .. ")"
-    self.route = ROUTE_OK:format(subscription, self.spec.cli.version :: string)
+    self.route = ROUTE_OK:format(subscription, self.spec.version :: string)
     self.view:set_header(dim_lines(self:header_lines()))
   elseif step.lines then
     if not self.has_progress then
@@ -202,8 +200,8 @@ end
 
 function Run:on_exit(code)
   if self.finished then
-    if self.artifact and self.prompted then
-      local _, problem = snapshot.sanitize(self.artifact, true)
+    if self.call.artifact and self.call.artifact_kept then
+      local _, problem = snapshot.sanitize(self.call.artifact, true)
       if problem then
         maki.notify(ERROR_PREFIX .. "maki could not secure the retained snapshot: " .. problem, "error")
       end
@@ -234,20 +232,35 @@ function Run:on_cancel(reason)
   local lines = self:final_header()
   self.view:set_header(dim_lines(lines))
   local answer = self.stream.result and truncate((self.stream:outcome()), self.max_lines, self.max_bytes) or ""
-  local reply = partial.cut(self.view, answer, reason, self.timeout_secs)
+  local reply = partial.cut(self.view, answer, reason, self.timeout_secs, self.started_at)
   reply.llm_output = self:with_spent(reply.llm_output, true)
-  if self.artifact and self.prompted then
-    reply.llm_output = reply.llm_output .. "\n" .. ABANDONED:format(self.artifact.snapshot :: string)
+  if self.call.artifact and self.call.artifact_kept then
+    reply.llm_output = reply.llm_output .. "\n" .. ABANDONED:format(self.call.artifact.snapshot :: string)
   end
   reply.state = { header = lines }
   self.ctx:finish(reply)
 end
 
+function Run:restart_clock()
+  if self.clock then
+    self.clock:stop()
+  end
+  self.clock = maki.defer_fn(function()
+    if not self.stream.native:accepted() then
+      self:stop(native.startup_late(launch.STARTUP_TIMEOUT_SECS))
+    end
+  end, launch.STARTUP_MS)
+end
+
 -- After a cancel, the hook registered here delivers the call's result.
 function Run:start(argv, cwd, env, task)
   self.task = task
-  self.stream =
-    Stream.new({ cwd = cwd, worker = self.spec.worker, cli = self.spec.cli, executable = self.spec.executable })
+  self.stream = Stream.new({
+    cwd = cwd,
+    policy = self.spec.policy,
+    version = self.spec.version,
+    executable = self.spec.executable,
+  })
   local job_opts = launch.job_opts(cwd, env)
   job_opts.on_stdout = function(_, line)
     self:on_line(line)
@@ -266,11 +279,7 @@ function Run:start(argv, cwd, env, task)
   maki.async.on_cancel(function(reason)
     self:on_cancel(reason)
   end)
-  self.clock = maki.defer_fn(function()
-    if not self.stream:accepted() then
-      self:stop(native.startup_late(launch.STARTUP_TIMEOUT_SECS))
-    end
-  end, launch.STARTUP_MS)
+  self:restart_clock()
   -- A send error would finish the call before the wait starts, so the
   -- handshake is sent from inside the wait.
   return maki.async.await(1, function(done)

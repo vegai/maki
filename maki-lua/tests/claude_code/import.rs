@@ -38,8 +38,7 @@ esac
 "#;
 /// The tool that holds, and the arguments that trigger the hold.
 type Hold = (&'static str, &'static str);
-/// The tool the command reads each blob from the artifact with.
-const STAGING: Hold = ("git", " cat-file ");
+const WITHOUT_HOLD: Hold = ("stat", "");
 const USER_GIT_CONFIG: &str = "gitconfig";
 const REVIEW_SCRIPT: &str = "review.sh";
 const INVALID_GIT_SETTING: &str = "invalid-git-setting";
@@ -84,19 +83,7 @@ local changes = ({
     { path = [==[@PATH@]==], status = "M", old_sha = "@OLD@", new_sha = "@OLD@", old_mode = "100755", new_mode = "100644" },
   },
 })["@CHANGES@"]
-local staged, lines = {}, { "set -e" }
-for _, change in ipairs(changes) do
-  if change.new_sha and not staged[change.new_sha] then
-    staged[change.new_sha] = true
-    local words = git_utils.shell_environment()
-    for _, word in ipairs(git_utils.git({ "--git-dir=@GIT@", "cat-file", "blob", change.new_sha })) do
-      words[#words + 1] = path_utils.shell_quote(word)
-    end
-    lines[#lines + 1] = table.concat(words, " ") .. " > " .. path_utils.shell_quote("@STAGE@/" .. change.new_sha)
-  end
-end
-lines[#lines + 1] = import_scripts.import_script(changes, "@PROJECT@", "@GIT@", "@ARTIFACT@", "@STAGE@")
-maki.fs.write("@OUT@", table.concat(lines, "\n"))
+maki.fs.write("@OUT@", import_scripts.import_script(changes, "@PROJECT@", "@GIT@", "@ARTIFACT@", "@STAGE@"))
 maki.fs.write("@LEFTOVERS@", import_scripts.leftovers_script(changes, "@PROJECT@", "@STAGE@", { [==[@MADE@]==] }))
 maki.fs.write("@REVIEW@", git_utils.diff_command({ git = "@GIT@", snapshot = "@PROJECT@", base = "@OLD@", tree = "@NEW@" }))
 "#;
@@ -146,7 +133,7 @@ struct Import {
     tools: PathBuf,
     script: String,
     leftovers: String,
-    recorded_blob: String,
+    blobs: [(String, &'static str); 2],
 }
 
 impl Import {
@@ -180,7 +167,6 @@ impl Import {
         fs::write(project.join(edited), ORIGINAL).unwrap();
         let git_dir = artifact.join("git");
         let stage = artifact.join(STAGE);
-        fs::create_dir(&stage).unwrap();
         git(&base, &["init", "-q", "--bare", &git_dir.to_string_lossy()]);
         let old = git(
             &base,
@@ -234,7 +220,7 @@ impl Import {
             .replace("@WAIT_FOR_RELEASE@", &wait_for_release("\"@RELEASE@\""))
             .replace("@RELEASE@", &base.join("release").to_string_lossy());
         executable(&tools, tool, &held);
-        Self {
+        let import = Self {
             root,
             edited,
             project,
@@ -243,7 +229,17 @@ impl Import {
             tools,
             script,
             leftovers,
-            recorded_blob: new,
+            blobs: [(old, ORIGINAL), (new, RECORDED)],
+        };
+        import.stage_blobs(STAGE);
+        import
+    }
+
+    fn stage_blobs(&self, name: &str) {
+        let stage = self.artifact.join(name);
+        fs::create_dir_all(&stage).unwrap();
+        for (hash, content) in &self.blobs {
+            fs::write(stage.join(hash), content).unwrap();
         }
     }
 
@@ -315,6 +311,17 @@ impl Import {
     }
 }
 
+#[track_caller]
+fn assert_status(output: &Output, success: bool) {
+    assert_eq!(
+        output.status.success(),
+        success,
+        "{}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// The guard must kill the paused command's entire group if a test fails before release.
 struct Held(Option<Child>);
 
@@ -333,21 +340,18 @@ fn swap_for_a_link(target: &Path, outside: &Path) {
     symlink(outside, target).unwrap();
 }
 
-/// Staging reads the artifact and can take long, so the checks come after
-/// it. A file that changed or became a link during staging stops the
-/// import, which writes nothing, through the link or anywhere else.
+/// A file changed before validation must stop the import before any write.
 #[test_case(false ; "an_edit")]
 #[test_case(true ; "a_link_swapped_in")]
-fn a_change_while_blobs_stage_is_refused(link: bool) {
-    let import = Import::new(STAGING);
+fn a_change_before_import_is_refused(link: bool) {
+    let import = Import::new(WITHOUT_HOLD);
     let outside = import.root.path().join("outside.rs");
-    let child = import.start_held();
     if link {
         swap_for_a_link(&import.target(), &outside);
     } else {
         fs::write(import.target(), NEWER).unwrap();
     }
-    let output = import.release(child);
+    let output = import.run(&import.script);
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(CHANGED_EXIT), "{stderr}");
@@ -372,8 +376,7 @@ fn a_checkout_swapped_for_a_link_after_the_checks_keeps_the_writes() {
     symlink(&decoy, &import.project).unwrap();
     let output = import.release(child);
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{stderr}");
+    assert_status(&output, true);
     assert_eq!(fs::read_to_string(moved.join(TARGET)).unwrap(), RECORDED);
     assert_eq!(fs::read_to_string(moved.join(ADDED)).unwrap(), RECORDED);
     assert_eq!(listing(&decoy.join("src")), [decoy.join(TARGET)]);
@@ -405,11 +408,10 @@ fn a_folder_swapped_for_a_link_after_the_checks_stops_the_import() {
 /// A mode-only change keeps the file's bytes.
 #[test]
 fn a_mode_change_lands_with_the_same_bytes() {
-    let import = Import::with(STAGING, MODE_ONLY, TARGET, ADDED);
+    let import = Import::with(WITHOUT_HOLD, MODE_ONLY, TARGET, ADDED);
     let output = import.run(&import.script);
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{stderr}");
+    assert_status(&output, true);
     assert_eq!(fs::read_to_string(import.target()).unwrap(), ORIGINAL);
     let mode = fs::metadata(import.target()).unwrap().permissions().mode();
     assert_ne!(mode & OWNER_EXECUTE, 0, "mode {mode:o}");
@@ -422,14 +424,10 @@ fn a_mode_change_lands_with_the_same_bytes() {
 #[test_case(0o4755, "077" ; "special_bits_are_cleared")]
 fn an_import_clears_execute_bits_regardless_of_umask(mode: u32, umask: &str) {
     const EXECUTE_BITS: u32 = 0o111;
-    let import = Import::with(STAGING, MODE_CLEARED, TARGET, ADDED);
+    let import = Import::with(WITHOUT_HOLD, MODE_CLEARED, TARGET, ADDED);
     fs::set_permissions(import.target(), fs::Permissions::from_mode(mode)).unwrap();
     let output = import.run(&format!("umask {umask}\n{}", import.script));
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_status(&output, true);
     assert_eq!(fs::read_to_string(import.target()).unwrap(), ORIGINAL);
     assert_eq!(
         fs::metadata(import.target()).unwrap().permissions().mode() & PERMISSION_BITS,
@@ -452,14 +450,10 @@ fn an_import_preserves_each_files_access_permissions(mode: u32) {
     } else {
         EDIT_AND_ADD
     };
-    let import = Import::with(STAGING, changes, TARGET, ADDED);
+    let import = Import::with(WITHOUT_HOLD, changes, TARGET, ADDED);
     fs::set_permissions(import.target(), fs::Permissions::from_mode(mode)).unwrap();
     let output = import.run(&format!("umask {DEFAULT_UMASK}\n{}", import.script));
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_status(&output, true);
     assert_eq!(
         fs::metadata(import.target()).unwrap().permissions().mode() & PERMISSION_BITS,
         mode
@@ -468,7 +462,7 @@ fn an_import_preserves_each_files_access_permissions(mode: u32) {
 
 #[test]
 fn an_import_batches_metadata_permissions_and_folder_staging() {
-    let import = Import::with(STAGING, TWO_EDITS, TARGET, SAME_FOLDER_ADDED);
+    let import = Import::with(WITHOUT_HOLD, TWO_EDITS, TARGET, SAME_FOLDER_ADDED);
     fs::write(import.project.join(SAME_FOLDER_ADDED), ORIGINAL).unwrap();
     let log = import.marker("process-counts");
     for tool in ["stat", "mktemp", "chmod", "cat"] {
@@ -479,11 +473,7 @@ fn an_import_batches_metadata_permissions_and_folder_staging() {
         executable(&import.tools, tool, &script);
     }
     let output = import.run(&import.script);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_status(&output, true);
     let log = fs::read_to_string(log).unwrap();
     let count = |tool| log.lines().filter(|line| *line == tool).count();
     assert_eq!(count("stat"), 1);
@@ -500,37 +490,16 @@ fn an_import_batches_metadata_permissions_and_folder_staging() {
 /// A failed installation preserves earlier changes and all original files.
 #[test]
 fn a_link_that_fails_partway_keeps_what_landed_and_every_original() {
-    let import = Import::new(STAGING);
+    let import = Import::new(WITHOUT_HOLD);
     let added = import.project.join(ADDED);
     import.failing("ln", &Path::new(CURRENT_DIR).join(ADDED));
 
     let out = import.run(&import.script);
-    assert!(
-        !out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert_status(&out, false);
     assert_eq!(fs::read_to_string(import.target()).unwrap(), RECORDED);
     assert!(!added.exists());
     let kept = import.artifact.join(ORIGINALS).join(STAGE).join(TARGET);
     assert_eq!(fs::read_to_string(kept).unwrap(), ORIGINAL);
-}
-
-/// A cancel kills the command at once, so none of its traps run. The staged
-/// files sit in the artifact, where its sweep removes them, rather than in
-/// the temporary directory, which nothing cleans.
-#[test]
-fn a_killed_import_leaves_nothing_outside_its_artifact() {
-    let import = Import::new(STAGING);
-    drop(import.start_held());
-
-    assert_eq!(fs::read_dir(&import.temp).unwrap().count(), 0);
-    assert_eq!(fs::read_to_string(import.target()).unwrap(), ORIGINAL);
-    assert_eq!(
-        fs::read_to_string(import.artifact.join(STAGE).join(&import.recorded_blob)).unwrap(),
-        RECORDED,
-        "the staged blob must wait in the artifact for its expiry"
-    );
 }
 
 /// A write through a descriptor opened before the import lands in the
@@ -551,8 +520,7 @@ fn a_write_through_a_descriptor_opened_before_is_kept_in_the_artifact(hold: Hold
     writer.set_len(NEWER.len() as u64).unwrap();
     let output = import.release(child);
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{stderr}");
+    assert_status(&output, true);
     assert_eq!(fs::read_to_string(import.target()).unwrap(), RECORDED);
     assert_eq!(
         fs::read_to_string(import.artifact.join(ORIGINALS).join(STAGE).join(TARGET)).unwrap(),
@@ -570,12 +538,7 @@ fn an_atomic_editor_save_survives_import(hold: Hold, succeeds: bool) {
     fs::rename(replacement, import.target()).unwrap();
     let output = import.release(child);
 
-    assert_eq!(
-        output.status.success(),
-        succeeds,
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_status(&output, succeeds);
     let saved = if succeeds {
         import.artifact.join(DISPLACED).join(STAGE).join(TARGET)
     } else {
@@ -590,7 +553,7 @@ fn an_atomic_editor_save_survives_import(hold: Hold, succeeds: bool) {
 
 #[test]
 fn a_failed_hard_link_stops_before_any_checkout_write() {
-    let import = Import::new(STAGING);
+    let import = Import::new(WITHOUT_HOLD);
     import.failing("ln", &Path::new(CURRENT_DIR).join(TARGET));
     let mut writer = fs::OpenOptions::new()
         .write(true)
@@ -598,11 +561,7 @@ fn a_failed_hard_link_stops_before_any_checkout_write() {
         .unwrap();
     let output = import.run(&import.script);
 
-    assert!(
-        !output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_status(&output, false);
     assert!(String::from_utf8_lossy(&output.stderr).contains(CANNOT_PRESERVE));
     assert!(String::from_utf8_lossy(&output.stderr).contains(LINK_FAILURE));
     writer.write_all(NEWER.as_bytes()).unwrap();
@@ -617,11 +576,7 @@ fn failed_attempt() -> Import {
     let child = import.start_held();
     fs::write(import.target(), NEWER).unwrap();
     let output = import.release(child);
-    assert!(
-        !output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_status(&output, false);
     assert!(!import.target().exists());
     fs::write(import.target(), ORIGINAL).unwrap();
     import
@@ -630,13 +585,9 @@ fn failed_attempt() -> Import {
 #[test]
 fn a_retry_cannot_overwrite_a_preserved_save() {
     let import = failed_attempt();
-    fs::create_dir(import.artifact.join(STAGE)).unwrap();
+    import.stage_blobs(STAGE);
     let output = import.run(&import.script);
-    assert!(
-        !output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_status(&output, false);
     assert_eq!(fs::read_to_string(import.target()).unwrap(), ORIGINAL);
     for saved in [
         import.artifact.join(ORIGINALS).join(STAGE).join(TARGET),
@@ -652,13 +603,9 @@ const RETRY_STAGE: &str = "stage.d4e5f6";
 fn a_new_attempt_can_import_without_overwriting_earlier_backups() {
     let import = failed_attempt();
     fs::remove_file(import.tools.join("ln")).unwrap();
-    fs::create_dir(import.artifact.join(RETRY_STAGE)).unwrap();
+    import.stage_blobs(RETRY_STAGE);
     let output = import.run(&import.script.replace(STAGE, RETRY_STAGE));
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_status(&output, true);
     assert_eq!(fs::read_to_string(import.target()).unwrap(), RECORDED);
     assert_eq!(
         fs::read_to_string(import.artifact.join(ORIGINALS).join(STAGE).join(TARGET)).unwrap(),
@@ -679,7 +626,7 @@ fn a_new_attempt_can_import_without_overwriting_earlier_backups() {
 
 #[test]
 fn invisible_names_are_visible_in_approval_and_keep_their_bytes_in_a_c_locale() {
-    let import = Import::named(STAGING, BIDI_EDITED, BIDI_ADDED);
+    let import = Import::named(WITHOUT_HOLD, BIDI_EDITED, BIDI_ADDED);
     for hidden in ['\u{202e}', '\u{200b}', '\u{2066}', '\u{e0061}'] {
         assert!(!import.script.contains(hidden));
     }
@@ -689,11 +636,7 @@ fn invisible_names_are_visible_in_approval_and_keep_their_bytes_in_a_c_locale() 
         .env("LC_ALL", "C")
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_status(&output, true);
     assert_eq!(
         fs::read_to_string(import.project.join(BIDI_EDITED)).unwrap(),
         RECORDED
@@ -721,11 +664,7 @@ fn what_a_killed_import_wrote_goes_with_the_cleanup_after_it() {
     fs::write(src.join(OTHER_IMPORTS_TEMP), RECORDED).unwrap();
 
     let output = import.run(&import.leftovers);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_status(&output, true);
     assert_eq!(
         listing(&src),
         [src.join(OTHER_IMPORTS_TEMP), src.join("lib.rs")]
@@ -746,11 +685,7 @@ fn a_cleanup_that_cannot_clear_a_folder_fails() {
     symlink(&moved, &src).unwrap();
 
     let output = import.run(&import.leftovers);
-    assert!(
-        !output.status.success(),
-        "the cleanup exited without an error: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_status(&output, false);
     assert!(
         listing(&moved).len() > 1,
         "the cleanup removed the temporary files through the link: {:?}",
@@ -763,7 +698,7 @@ fn a_cleanup_that_cannot_clear_a_folder_fails() {
 #[test_case("GIT_CONFIG_PARAMETERS" ; "config_parameters")]
 #[test_case("GIT_CONFIG_COUNT" ; "config_count")]
 fn generated_git_commands_ignore_shell_only_variables(variable: &str) {
-    let import = Import::new(STAGING);
+    let import = Import::new(WITHOUT_HOLD);
     let review = fs::read_to_string(import.marker(REVIEW_SCRIPT)).unwrap();
     fs::File::create(import.marker("release")).unwrap();
     for script in [&review, &import.script] {
@@ -772,11 +707,7 @@ fn generated_git_commands_ignore_shell_only_variables(variable: &str) {
             .env(variable, import.marker(INVALID_GIT_SETTING))
             .output()
             .unwrap();
-        assert!(
-            output.status.success(),
-            "{variable}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        assert_status(&output, true);
     }
     assert_eq!(fs::read_to_string(import.target()).unwrap(), RECORDED);
 }
@@ -784,7 +715,7 @@ fn generated_git_commands_ignore_shell_only_variables(variable: &str) {
 /// User git config must not affect the artifact repository or the import.
 #[test]
 fn an_import_runs_git_without_the_users_config() {
-    let import = Import::new(STAGING);
+    let import = Import::new(WITHOUT_HOLD);
     let config = import.root.path().join(USER_GIT_CONFIG);
     fs::write(&config, BROKEN_GIT_CONFIG).unwrap();
     fs::File::create(import.marker("release")).unwrap();
@@ -794,11 +725,7 @@ fn an_import_runs_git_without_the_users_config() {
         .output()
         .unwrap();
 
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_status(&output, true);
     assert_eq!(fs::read_to_string(import.target()).unwrap(), RECORDED);
 }
 
@@ -806,14 +733,10 @@ fn an_import_runs_git_without_the_users_config() {
 /// without execution.
 #[test]
 fn a_hostile_file_name_lands_as_it_is_and_runs_nothing() {
-    let import = Import::named(STAGING, HOSTILE_EDITED, HOSTILE_ADDED);
+    let import = Import::named(WITHOUT_HOLD, HOSTILE_EDITED, HOSTILE_ADDED);
     for script in [&import.script, &import.leftovers] {
         let output = import.run(script);
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        assert_status(&output, true);
     }
 
     assert_eq!(fs::read_to_string(import.target()).unwrap(), RECORDED);

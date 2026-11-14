@@ -27,12 +27,13 @@ main UI opens, listing the gated files it found. It takes three answers:
 
 "Not now" is preselected, so Enter and Escape are both safe. `t` or `y` answers
 Trust, `n` answers Not now, and "Never" needs the arrow keys and Enter. Ctrl-C
-exits Maki. A project that ships no gated file is never asked about.
+exits Maki. A project that ships no gated file gets no card, but it still starts
+untrusted.
 
 One answer covers one project root: the active Git checkout, or the working
-directory outside Git. Linked worktrees answer for themselves. Starting Maki in
-your home directory loads no project configuration, because `~/.maki` there is
-your global configuration.
+directory outside Git. Linked worktrees answer for themselves. Your home
+directory is never a project root, so starting Maki there loads no project
+configuration.
 
 ## What Trust Does Not Cover
 
@@ -54,14 +55,15 @@ what the agent may do inside it.
 
 ## In an Untrusted Folder
 
-Maki writes nothing into a folder you declined, and the status bar carries a
-`[restricted]` indicator for the whole session. A folder with no `.maki` at all
-shows no indicator.
+Maki writes nothing into a folder you declined. The status bar shows
+`[restricted]` when Maki skipped gated files or you declined the folder.
 
 The project answers in a [permission prompt](/docs/permissions/#permission-prompts)
 still work and last until the session ends, labelled `Project (this session)`.
 For an answer that outlives the session, use `A` or `D` to save it in your own
-`~/.config/maki/permissions.toml`, or trust the folder.
+`~/.config/maki/permissions.toml`, or trust the folder. In a folder with no
+gated file, trusting loads nothing and only lets Maki save project answers, so
+the prompt there suggests `/trust`.
 
 ## Managing Trust
 

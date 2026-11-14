@@ -2,9 +2,9 @@ use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::sync::LazyLock;
 
-use flume::Sender;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
 use crate::model::Model;
@@ -66,13 +66,13 @@ pub(crate) const EPHEMERAL: CacheControl = CacheControl {
 #[derive(Deserialize)]
 struct Usage {
     #[serde(default)]
-    input_tokens: u32,
+    input_tokens: u64,
     #[serde(default)]
-    output_tokens: u32,
+    output_tokens: u64,
     #[serde(default)]
-    cache_creation_input_tokens: u32,
+    cache_creation_input_tokens: u64,
     #[serde(default)]
-    cache_read_input_tokens: u32,
+    cache_read_input_tokens: u64,
 }
 
 impl From<Usage> for TokenUsage {
@@ -426,11 +426,11 @@ impl EventParser {
         }
     }
 
-    pub async fn process(
+    pub fn process(
         &mut self,
         event_type: &str,
         data: &str,
-        event_tx: &Sender<ProviderEvent>,
+        event_tx: &UnboundedSender<ProviderEvent>,
     ) -> Result<ControlFlow<(), ()>, AgentError> {
         match event_type {
             "message_start" => {
@@ -456,6 +456,7 @@ impl EventParser {
                             self.content_blocks.push(ContentBlock::Thinking {
                                 thinking: String::new(),
                                 signature: None,
+                                reasoning_id: None,
                             });
                         }
                         SseContentBlock::RedactedThinking { data } => {
@@ -464,12 +465,10 @@ impl EventParser {
                         }
                         SseContentBlock::ToolUse { id, name } => {
                             self.current_tool_json.clear();
-                            event_tx
-                                .send_async(ProviderEvent::ToolUseStart {
-                                    id: id.clone(),
-                                    name: name.clone(),
-                                })
-                                .await?;
+                            event_tx.send(ProviderEvent::ToolUseStart {
+                                id: id.clone(),
+                                name: name.clone(),
+                            })?;
                             self.content_blocks
                                 .push(ContentBlock::tool_use(id, name, Value::Null));
                         }
@@ -487,9 +486,7 @@ impl EventParser {
                                 if let Some(ContentBlock::Text { text: t }) = block {
                                     t.push_str(&text);
                                 }
-                                event_tx
-                                    .send_async(ProviderEvent::TextDelta { text })
-                                    .await?;
+                                event_tx.send(ProviderEvent::TextDelta { text })?;
                             }
                         }
                         Delta::Thinking { thinking } => {
@@ -497,9 +494,7 @@ impl EventParser {
                                 if let Some(ContentBlock::Thinking { thinking: t, .. }) = block {
                                     t.push_str(&thinking);
                                 }
-                                event_tx
-                                    .send_async(ProviderEvent::ThinkingDelta { text: thinking })
-                                    .await?;
+                                event_tx.send(ProviderEvent::ThinkingDelta { text: thinking })?;
                             }
                         }
                         Delta::Signature { signature } => {
@@ -733,6 +728,7 @@ mod tests {
                     ContentBlock::Thinking {
                         thinking: "plan".into(),
                         signature: Some("sig".into()),
+                        reasoning_id: None,
                     },
                     ContentBlock::tool_use(TOOL_USE_ID, TOOL_SEARCH, json!({})),
                 ],

@@ -3,7 +3,9 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::fd::OwnedFd;
 use std::process::Command;
+use std::sync::mpsc::sync_channel;
 use std::thread;
 use std::time::Duration;
 
@@ -14,7 +16,8 @@ use maki_providers::{ContentBlock, ThinkingSupport};
 use maki_storage::StateDir;
 use maki_storage::model::{persist_thinking, read_thinking};
 use maki_storage::sessions::StoredThinking;
-use rustix::process::{Pid, Signal, kill_process};
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::process::{Pid, PidfdFlags, Signal, kill_process, pidfd_open, pidfd_send_signal};
 use serde_json::{Value, json};
 use test_case::test_case;
 
@@ -31,6 +34,8 @@ mod wire;
 use isolation::Isolation;
 use wire::{INIT, RESULT, STREAM_FORMAT, SYSTEM};
 
+const CONFIG_DIR: &str = "config/maki";
+const TOOL_USE_ID: &str = "call1";
 const MODEL: &str = "thinking-fixture/fixture-model";
 const PROMPT: &str = "Reply briefly.";
 const REPLY: &str = "done";
@@ -45,6 +50,15 @@ const INVALID_THINKING: &str = "unknown thinking value \"turbo\"";
 const INVALID_EFFORT: &str = "invalid value 'turbo' for '--effort <EFFORT>'";
 const INVALID_BUDGET: &str = "invalid value '-1' for '--max-thinking-tokens <MAX_THINKING_TOKENS>'";
 const BUDGET_RANGE: &str = "not in 0..=4294967295";
+const PLUGIN_PID: &str = "plugin-job.pid";
+const PLUGIN_JOB: &str = r#"
+local id = assert(maki.fn.jobstart({ "sleep", "300" }, { scope = "plugin" }))
+assert(maki.fs.write(@PID@, tostring(maki.fn.jobinfo(id).pid)))
+"#;
+const DROPPED_PROMPT: &str = "fixture refused this prompt";
+const CATALOG_CACHE_FILE: &str = "models-dev-catalog.json";
+const CATALOG_REFRESH_FAILED: &str = "catalog refresh failed, keeping existing cache";
+const REFUSED_PROXY: &str = "http://127.0.0.1:0";
 const PROTOCOL_TIMEOUT: Duration = Duration::from_secs(30);
 const INITIALIZE_ID: u64 = 1;
 const NEW_SESSION_ID: u64 = 2;
@@ -57,6 +71,14 @@ const STREAM: &[Canned] = &[Canned::sse(concat!(
     "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
     "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
 ))];
+
+struct PluginJob(OwnedFd);
+
+impl Drop for PluginJob {
+    fn drop(&mut self) {
+        let _ = pidfd_send_signal(&self.0, Signal::KILL);
+    }
+}
 
 struct Fixture {
     isolation: Isolation,
@@ -79,7 +101,7 @@ impl Fixture {
             isolation: Isolation::new(),
             requests,
         };
-        let config = fixture.isolation.dir("config/maki");
+        let config = fixture.isolation.dir(CONFIG_DIR);
         let settings =
             configured.map_or_else(String::new, |value| format!("always_thinking = {value:?}"));
         fs::write(
@@ -206,7 +228,7 @@ fn invalid_launch_thinking_exits_before_a_provider_request(flags: &[&str], expec
 #[test_case(&["models", "--effort", "high"] ; "effort")]
 #[test_case(&["models", "--max-thinking-tokens", "0"] ; "budget")]
 fn thinking_flags_require_a_session(flags: &[&str]) {
-    const EXPECTED: &str = "thinking flags apply only to TUI, --print, SDK and ACP sessions";
+    const EXPECTED: &str = "has no effect with this subcommand. It applies to: the TUI, --print, SDK mode (--print --input-format stream-json), maki acp";
     let fixture = Fixture::new(None, Yes);
     let output = finish(fixture.command().args(flags));
     assert!(!output.status.success());
@@ -300,8 +322,8 @@ fn read_http_request(stream: &TcpStream) {
 fn interrupted_print_leaves_a_resumable_prefix(signal: Option<Signal>, sdk: bool) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
-    let (waiting_tx, waiting_rx) = flume::bounded(1);
-    let (release_tx, release_rx) = flume::bounded::<()>(1);
+    let (waiting_tx, waiting_rx) = sync_channel(1);
+    let (release_tx, release_rx) = sync_channel::<()>(1);
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         read_http_request(&stream);
@@ -313,6 +335,22 @@ fn interrupted_print_leaves_a_resumable_prefix(signal: Option<Signal>, sdk: bool
         let _ = release_rx.recv_timeout(PROTOCOL_TIMEOUT);
     });
     let fixture = Fixture::at(None, Yes, url, Requests::default());
+    let config = fixture.isolation.dir(CONFIG_DIR);
+    let pid_path = config.join(PLUGIN_PID);
+    if signal != Some(Signal::KILL) {
+        let init_path = config.join("init.lua");
+        let init = fs::read_to_string(&init_path).unwrap();
+        fs::write(
+            config.join("plugin.toml"),
+            "[permissions]\nrun = true\nfs_read = true\nfs_write = true\n",
+        )
+        .unwrap();
+        fs::write(
+            init_path,
+            init + &PLUGIN_JOB.replace("@PID@", &serde_json::to_string(&pid_path).unwrap()),
+        )
+        .unwrap();
+    }
     let mut command = fixture.command();
     command.args(["-p", "--model", MODEL, "--output-format", STREAM_FORMAT]);
     if sdk {
@@ -322,6 +360,10 @@ fn interrupted_print_leaves_a_resumable_prefix(signal: Option<Signal>, sdk: bool
     }
     let mut process = Process::start(command);
     let init = process.until(|event| event["subtype"] == INIT);
+    let plugin_job = (signal != Some(Signal::KILL)).then(|| {
+        let pid = Pid::from_raw(fs::read_to_string(&pid_path).unwrap().parse().unwrap()).unwrap();
+        PluginJob(pidfd_open(pid, PidfdFlags::empty()).unwrap())
+    });
     if sdk {
         process.send(json!({"type":"user", "message":{"role":"user", "content":PROMPT}}));
     }
@@ -353,6 +395,12 @@ fn interrupted_print_leaves_a_resumable_prefix(signal: Option<Signal>, sdk: bool
         assert_eq!(result["is_error"], true);
     }
     process.finish_status(signal.is_none());
+    if let Some(job) = plugin_job {
+        let mut fds = [PollFd::new(&job.0, PollFlags::IN)];
+        let timeout = Timespec::try_from(PROTOCOL_TIMEOUT).unwrap();
+        let exited = poll(&mut fds, Some(&timeout)).unwrap() > 0;
+        assert!(exited, "plugin job outlived the plugin host");
+    }
     let resumed = StoredSession::load(id, &fixture.storage()).unwrap();
     let saved: Vec<Value> = stored
         .messages()
@@ -393,7 +441,7 @@ const ERROR_STREAM: &[Canned] = &[Canned::json(
 )];
 
 #[test]
-fn provider_failure_is_nonzero_and_persists_an_error_outside_the_transcript() {
+fn provider_failure_is_nonzero_and_stays_outside_the_transcript() {
     let (url, requests) = serve(ERROR_STREAM);
     let fixture = Fixture::at(None, Yes, url, requests);
     let mut command = fixture.command();
@@ -415,17 +463,122 @@ fn provider_failure_is_nonzero_and_persists_an_error_outside_the_transcript() {
         &fixture.storage(),
     )
     .unwrap();
-    assert_eq!(
-        stored
-            .errors()
-            .iter()
-            .map(|error| error.message.as_str())
-            .collect::<Vec<_>>(),
-        &[result[RESULT].as_str().unwrap()]
-    );
     assert!(stored.messages().iter().all(|message| {
         message
             .first_text_content()
             .is_none_or(|text| !text.contains(PROVIDER_FAILURE))
     }));
+}
+
+#[test]
+fn model_refresh_failure_still_lists_configured_models() {
+    let fixture = Fixture::new(None, No);
+    fs::write(
+        fixture.isolation.dir("cache/maki").join(CATALOG_CACHE_FILE),
+        "{}",
+    )
+    .unwrap();
+    let output = finish(
+        fixture
+            .command()
+            .args(["models", "--refresh"])
+            .env("HTTPS_PROXY", REFUSED_PROXY),
+    );
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stdout.contains(MODEL), "{stdout}");
+    assert!(stderr.contains(CATALOG_REFRESH_FAILED), "{stderr}");
+}
+
+#[test_case(false ; "print")]
+#[test_case(true ; "sdk")]
+fn a_dropped_prompt_fails_the_process(sdk: bool) {
+    let fixture = Fixture::new(None, No);
+    let config = fixture.isolation.dir(CONFIG_DIR);
+    fs::write(config.join("plugin.toml"), "[permissions]\n").unwrap();
+    fs::write(config.join("init.lua"), format!(
+        "maki.setup({{}})\nmaki.api.set_slot('agent.user_message', function() return nil, {DROPPED_PROMPT:?} end)"
+    )).unwrap();
+    let mut command = fixture.command();
+    command.args(["-p", "--model", MODEL, "--output-format", STREAM_FORMAT]);
+    if sdk {
+        command.args(["--input-format", STREAM_FORMAT]);
+    } else {
+        command.arg(PROMPT);
+    }
+    let mut process = Process::start(command);
+    if sdk {
+        process.send(json!({"type":"user", "message":{"role":"user", "content":PROMPT}}));
+    }
+    let result = process.until(|event| event["type"] == RESULT);
+    assert_eq!(result["is_error"], true, "{result}");
+    assert!(result.to_string().contains(DROPPED_PROMPT), "{result}");
+    process.finish_status(false);
+    assert!(fixture.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn checkpoints_precede_provider_requests_and_tool_dispatch() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let (waiting_tx, waiting_rx) = sync_channel(1);
+    let (release_tx, release_rx) = sync_channel::<()>(1);
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_http_request(&stream);
+        waiting_tx.send(()).unwrap();
+        release_rx.recv_timeout(PROTOCOL_TIMEOUT).unwrap();
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{TOOL_REPLY}", TOOL_REPLY.len()).unwrap();
+    });
+    let fixture = Fixture::at(None, No, url, Requests::default());
+    let config = fixture.isolation.dir(CONFIG_DIR);
+    fs::write(config.join("plugin.toml"), "[permissions]\n").unwrap();
+    let sessions = fixture.isolation.dir("state/maki/sessions");
+    let observed = config.join("checkpoint.jsonl");
+    fs::write(
+        config.join("init.lua"),
+        format!(
+            r#"
+maki.setup({{}})
+maki.api.set_slot("tool.glob.input", function(prev, input, ctx)
+  local path = maki.fs.joinpath({sessions}, ctx.session_id .. ".jsonl")
+  assert(maki.fs.write({observed}, assert(maki.fs.read(path))))
+  return prev(input, ctx)
+end)
+"#,
+            sessions = serde_json::to_string(&sessions).unwrap(),
+            observed = serde_json::to_string(&observed).unwrap()
+        ),
+    )
+    .unwrap();
+    let mut command = fixture.command();
+    command.args([
+        "-p",
+        "--model",
+        MODEL,
+        "--output-format",
+        STREAM_FORMAT,
+        "--max-turns",
+        "1",
+        PROMPT,
+    ]);
+    let mut process = Process::start(command);
+    let init = process.until(|event| event["subtype"] == INIT);
+    waiting_rx.recv_timeout(PROTOCOL_TIMEOUT).unwrap();
+    let id = init["session_id"].as_str().unwrap().parse().unwrap();
+    let stored = StoredSession::load(id, &fixture.storage()).unwrap();
+    assert!(
+        stored
+            .messages()
+            .iter()
+            .any(|message| message.first_text_content() == Some(PROMPT))
+    );
+    release_tx.send(()).unwrap();
+    process.until(|event| event["type"] == RESULT);
+    process.finish_status(false);
+    let before_dispatch = fs::read_to_string(observed).unwrap();
+    assert!(before_dispatch.contains(TOOL_USE_ID), "{before_dispatch}");
+    assert!(before_dispatch.contains("tool_use"), "{before_dispatch}");
+    server.join().unwrap();
 }

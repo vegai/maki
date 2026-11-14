@@ -38,7 +38,7 @@ Aliasing adds a name, so both stay in the palette. Any command works as a target
 
 const PLUGIN_ACCESS: &str = r#"### What a plugin may run {#plugin-access}
 
-`run_command` only runs what the calling plugin's grants cover. Your `init.lua` counts as a plugin, and its grants come from `~/.config/maki/plugin.toml` (see [plugin permissions](/docs/lua-api/#plugin-permissions)). Commands not listed here run for any plugin."#;
+`run_command` only runs what the calling plugin's grants cover. Your `init.lua` counts as a plugin, and its grants come from `~/.config/maki/plugin.toml` (see [plugin permissions](/docs/lua-api/#plugin-permissions)). Commands not listed here run for any plugin. A command sent with [`maki.ui.input_submit`](/docs/lua-api/#maki-ui-input_submit) follows the same rules."#;
 
 const PLUGIN_COMMAND_ACCESS: &str = r#"A plugin command's handler runs with the grants of the plugin that registered it. The caller picks the arguments, so it must hold at least the same reach:
 
@@ -159,7 +159,7 @@ pub fn generate() -> String {
     writeln!(out).unwrap();
     writeln!(
         out,
-        "Sessions run concurrently. `/new` starts a fresh session while the old one keeps working in the background, and `/sessions` shows the live status of each (working, needs input, idle) so you can jump between them. When a background session finishes or needs input, Maki flashes a note in the status bar. `/rename` renames the current session; in the session picker, `Ctrl+N` / `Ctrl+R` / `Ctrl+D` create, rename, and delete. Deleting the current session starts a fresh one and keeps the picker open."
+        "Sessions run concurrently. `Ctrl+N` in `/sessions` starts a fresh session while the current one keeps working in the background, and `/sessions` shows the live status of each (working, needs input, idle) so you can jump between them. When a background session finishes or needs input, Maki flashes a note in the status bar. `/rename` renames the current session; in the session picker, `Ctrl+N` / `Ctrl+R` / `Ctrl+D` create, rename, and delete. Deleting the current session starts a fresh one and keeps the picker open. `/new` replaces the current session instead, which ends its turn and background tasks."
     )
     .unwrap();
 
@@ -225,11 +225,7 @@ pub fn generate() -> String {
     )
     .unwrap();
     writeln!(out).unwrap();
-    writeln!(
-        out,
-        "1. User config: `~/.config/maki/commands/` (and legacy `~/.maki/commands/` if present)"
-    )
-    .unwrap();
+    writeln!(out, "1. User config: `~/.config/maki/commands/`").unwrap();
     writeln!(out, "2. User third-party: `~/.claude/commands/`").unwrap();
     writeln!(
         out,

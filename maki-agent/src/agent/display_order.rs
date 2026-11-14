@@ -3,6 +3,8 @@
 
 use maki_providers::{Message, Role};
 
+use crate::live_session::notice_body;
+
 /// One step of a session, in the order frontends show it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DisplayItem<'a> {
@@ -22,6 +24,19 @@ pub fn observation_line(message: &Message) -> Option<&str> {
         .display_text
         .as_deref()
         .filter(|text| message.is_observation() && !text.is_empty())
+}
+
+/// What an observation's line unfolds to. A background result opens with a
+/// head that names the task for the model, but the line already names it
+/// for the user, so only the output is left to show.
+pub fn observation_detail(message: &Message) -> Option<&str> {
+    let text = message.first_text_content()?;
+    let detail = if message.answers.is_some() {
+        notice_body(text)
+    } else {
+        text
+    };
+    (!detail.is_empty()).then_some(detail)
 }
 
 /// History keeps an observation ahead of the prompts it landed with, but
@@ -50,6 +65,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::agent::history::USER_CANCEL_MARKER;
 
     const BODY: &str = "Background task find auth finished:\n\nok";
     const LINE: &str = "Background agent finished: find auth";
@@ -57,7 +73,6 @@ mod tests {
     const PROMPT: &str = "what changed";
     const NEXT_PROMPT: &str = "and then";
     const REPLY: &str = "the build is green";
-    const CANCELLED: &str = "[Cancelled by user]";
 
     /// What a test history holds.
     #[derive(Clone, Copy)]
@@ -83,7 +98,7 @@ mod tests {
                 content: vec![ContentBlock::Text { text: REPLY.into() }],
                 ..Default::default()
             },
-            Step::Cancelled => Message::synthetic(CANCELLED.into()),
+            Step::Cancelled => Message::synthetic(USER_CANCEL_MARKER.into()),
         }
     }
 
@@ -100,7 +115,7 @@ mod tests {
             Step::Notice(line) => (Row::Notice, line),
             Step::Prompt(text) => (Row::Prompt, text),
             Step::Reply => (Row::Reply, REPLY),
-            Step::Cancelled => (Row::Hidden, CANCELLED),
+            Step::Cancelled => (Row::Hidden, USER_CANCEL_MARKER),
             Step::Hidden => unreachable!("an unlabelled observation shows nothing"),
         }
     }

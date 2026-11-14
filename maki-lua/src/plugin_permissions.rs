@@ -1,4 +1,3 @@
-use std::fmt;
 use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -16,8 +15,17 @@ pub use maki_config::Permission;
 
 pub(crate) const MANIFEST_FILE: &str = "plugin.toml";
 pub(crate) const NET_HOSTS_KEY: &str = "net_hosts";
+const PROVIDERS_KEY: &str = "providers";
 const MIN_MAKI_VERSION: &str = "min_maki_version";
-const RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
+const PERMISSION_DENIED: &str = "permission denied";
+pub(crate) const OUTSIDE_CEILING: &str =
+    "is not in the capability of the action this code runs for";
+const PROVIDER_ORIGIN_SHORTFALL: &str =
+    "reaches a provider address only its own plugin, or one granted 'run', may use";
+pub(crate) const RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// What sending a chat message takes. Enter sends the text in the chat input,
+/// so writing that text takes it too.
+pub const SENDS_PROMPT: &[Permission] = &[Permission::Agent, Permission::SessionWrite];
 
 /// The hosts a plugin declared it talks to, or `None` when it declared no
 /// list at all.
@@ -44,7 +52,7 @@ pub type OwnedSlugs = Arc<Mutex<Vec<String>>>;
 /// it out made a provider's own `fetch_usage` unreachable for exactly the
 /// users who need it, while the codec went to that very origin with the very
 /// same credentials and was never questioned.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct NetEgress {
     declared: NetHosts,
     providers: OwnedSlugs,
@@ -143,6 +151,9 @@ impl NetEgress {
 pub struct PluginPermissions {
     allowed: [bool; Permission::COUNT],
     net_hosts: NetHosts,
+    /// The plugin whose `maki` global holds these grants, which a
+    /// [`Ceiling`] is matched against. `None` for grants no global holds yet.
+    owner: Option<Arc<str>>,
 }
 
 impl PluginPermissions {
@@ -150,6 +161,7 @@ impl PluginPermissions {
         Self {
             allowed: [true; Permission::COUNT],
             net_hosts: None,
+            owner: None,
         }
     }
 
@@ -157,7 +169,19 @@ impl PluginPermissions {
         Self {
             allowed: [false; Permission::COUNT],
             net_hosts: None,
+            owner: None,
         }
+    }
+
+    /// These grants as {plugin}'s, so the [`Ceiling`] of an action {plugin}
+    /// owns applies to them.
+    pub(crate) fn owned_by(mut self, plugin: Arc<str>) -> Self {
+        self.owner = Some(plugin);
+        self
+    }
+
+    pub fn owner(&self) -> Option<&str> {
+        self.owner.as_deref()
     }
 
     pub fn net_hosts(&self) -> NetHosts {
@@ -194,18 +218,6 @@ impl PluginPermissions {
             .filter(|&perm| !self.is_allowed(perm))
     }
 
-    /// Reaching what nobody declared costs every capability a tool can reach,
-    /// since no narrower price would be honest. `agent` is not one of them:
-    /// it is about starting turns, and every tool already runs inside one, so
-    /// a plugin that may not start turns can still steer a call in one.
-    pub fn holds_all_reach(&self) -> bool {
-        !self.lacking().any(Self::is_reach)
-    }
-
-    pub(crate) fn is_reach(perm: Permission) -> bool {
-        perm != Permission::Agent
-    }
-
     pub fn from_manifest(manifest: &toml::Value) -> Self {
         let perms = manifest.get("permissions");
         let mut allowed = [true; Permission::COUNT];
@@ -218,6 +230,7 @@ impl PluginPermissions {
         Self {
             allowed,
             net_hosts: net_hosts_from_manifest(manifest),
+            owner: None,
         }
     }
 
@@ -230,8 +243,26 @@ impl PluginPermissions {
         needed.iter().copied().find(|&perm| !self.is_allowed(perm))
     }
 
+    /// The grants both this and {other} hold, with this set's hosts and owner.
+    pub(crate) fn intersect(&self, other: &Self) -> Self {
+        let mut out = self.clone();
+        for &perm in Permission::ALL {
+            out.set(perm, self.is_allowed(perm) && other.is_allowed(perm));
+        }
+        out
+    }
+
+    /// This grant as far as the code running now may use it, see [`Ceiling`].
+    pub(crate) fn now(&self, lua: &Lua) -> Self {
+        match lua.app_data_ref::<Ceiling>() {
+            Some(ceiling) if ceiling.binds(self.owner()) => self.intersect(&ceiling.0),
+            _ => self.clone(),
+        }
+    }
+
     /// A function that needs every permission in {needed}. Without one of
-    /// them it is replaced by a stub naming the first one missing.
+    /// them it is replaced by a stub naming the first one missing, and with
+    /// them all it still asks the [`Ceiling`] at every call.
     pub fn guard<F, A, R>(&self, needed: &[Permission], lua: &Lua, f: F) -> LuaResult<Function>
     where
         F: Fn(&Lua, A) -> LuaResult<R> + Send + 'static,
@@ -239,7 +270,14 @@ impl PluginPermissions {
         R: IntoLuaMulti,
     {
         match self.first_denied(needed) {
-            None => lua.create_function(f),
+            None => {
+                let owner = self.owner.clone();
+                let needed: Box<[Permission]> = needed.into();
+                lua.create_function(move |lua, args| {
+                    check_ceiling(lua, owner.as_deref(), &needed)?;
+                    f(lua, args)
+                })
+            }
             Some(perm) => denied_stub(lua, perm),
         }
     }
@@ -257,7 +295,15 @@ impl PluginPermissions {
         R: IntoLuaMulti,
     {
         match self.first_denied(needed) {
-            None => lua.create_async_function(f),
+            None => {
+                let owner = self.owner.clone();
+                let needed: Box<[Permission]> = needed.into();
+                lua.create_async_function(move |lua, args| {
+                    let call =
+                        check_ceiling(&lua, owner.as_deref(), &needed).map(|()| f(lua, args));
+                    async move { call?.await }
+                })
+            }
             Some(perm) => denied_stub(lua, perm),
         }
     }
@@ -269,7 +315,7 @@ impl PluginPermissions {
 /// about each provider as the plugin registers it, so a command has to carry
 /// this very value. A fresh one would know none of them and let through the
 /// borrowing it is meant to catch.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PluginReach {
     permissions: PluginPermissions,
     egress: NetEgress,
@@ -288,12 +334,57 @@ impl PluginReach {
         self.permissions.is_allowed(perm)
     }
 
+    /// The plugin this reach is, `None` for one that no `maki` global holds.
+    pub fn owner(&self) -> Option<&Arc<str>> {
+        self.permissions.owner.as_ref()
+    }
+
+    /// See [`PluginPermissions::owned_by`].
+    pub fn owned_by(&self, plugin: Arc<str>) -> Self {
+        Self {
+            permissions: self.permissions.clone().owned_by(plugin),
+            egress: self.egress.clone(),
+        }
+    }
+
     pub(crate) fn permissions(&self) -> &PluginPermissions {
         &self.permissions
     }
 
     pub(crate) fn egress(&self) -> &NetEgress {
         &self.egress
+    }
+
+    /// This reach as far as the code running now may use it, see [`Ceiling`].
+    pub(crate) fn now(&self, lua: &Lua) -> Self {
+        Self {
+            permissions: self.permissions.now(lua),
+            egress: self.egress.clone(),
+        }
+    }
+
+    /// The grants both this and {other} hold. The egress and owner are this
+    /// reach's, so {other} has to be the same plugin's reach, which shares
+    /// that egress.
+    pub fn intersect(&self, other: &Self) -> Self {
+        Self {
+            permissions: self.permissions.intersect(&other.permissions),
+            egress: self.egress.clone(),
+        }
+    }
+
+    /// This reach cut down to {perms}, the part of it an owner says a caller
+    /// has to match. The egress stays, so a `net` among them is still
+    /// weighed host by host.
+    pub(crate) fn only(&self, perms: &[Permission]) -> Self {
+        let mut permissions = self.permissions.clone();
+        for &perm in Permission::ALL {
+            permissions.set(perm, perms.contains(&perm));
+        }
+        Self {
+            permissions,
+            egress: self.egress.clone(),
+        }
     }
 
     /// Asked when one plugin runs another's command. The handler runs with
@@ -326,21 +417,33 @@ pub enum Missing {
     ProviderOrigin,
 }
 
-impl fmt::Display for Missing {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Missing {
+    /// What the plugin lacks, after the name of what it tried to run.
+    fn shortfall(&self) -> String {
         match self {
-            Self::Permission(perm) => write!(
-                f,
-                "permission denied: '{perm}' not granted for this plugin. {}",
-                grant_hint(&[*perm])
-            ),
-            Self::Hosts => write!(
-                f,
-                "permission denied: the command reaches hosts this plugin's {NET_HOSTS_KEY} leaves out (list them in {MANIFEST_FILE} next to the plugin file)"
-            ),
-            Self::ProviderOrigin => f.write_str(
-                "permission denied: the command reaches a provider address only its own plugin, or one granted 'run', may use",
-            ),
+            Self::Permission(perm) => format!("needs '{perm}'"),
+            Self::Hosts => format!("reaches hosts this plugin's {NET_HOSTS_KEY} leaves out"),
+            Self::ProviderOrigin => PROVIDER_ORIGIN_SHORTFALL.to_owned(),
+        }
+    }
+
+    fn fix(&self) -> Option<String> {
+        let fix = match self {
+            Self::Permission(_) => "grant it",
+            Self::Hosts => "list them",
+            Self::ProviderOrigin => return None,
+        };
+        Some(format!("{fix} in {MANIFEST_FILE} next to the plugin file"))
+    }
+
+    /// The refusal for {name}, short enough to flash: the name, what is
+    /// missing and the fix come first, so a line cut to the screen's width
+    /// still says all three.
+    pub fn refusal(&self, name: &str) -> String {
+        let shortfall = self.shortfall();
+        match self.fix() {
+            Some(fix) => format!("{name} {shortfall}: {fix}"),
+            None => format!("{name} {shortfall}"),
         }
     }
 }
@@ -368,11 +471,20 @@ pub(crate) fn grant_hint(perms: &[Permission]) -> String {
 /// This is a distinct type so an effective grant can never be built by
 /// accident from a request alone.
 #[derive(Debug, Clone)]
-pub struct Requested(PluginPermissions);
+pub struct Requested {
+    permissions: PluginPermissions,
+    /// Catalog provider names the package takes over, as its manifest lists
+    /// them. Shown in the approval prompt so the user sees the package will
+    /// receive the key saved for each name.
+    providers: Vec<String>,
+}
 
 impl Requested {
     pub fn none() -> Self {
-        Self(PluginPermissions::denied())
+        Self {
+            permissions: PluginPermissions::denied(),
+            providers: Vec::new(),
+        }
     }
 
     pub fn from_manifest(manifest: &toml::Value) -> Self {
@@ -384,21 +496,41 @@ impl Requested {
                 .and_then(toml::Value::as_bool)
                 .unwrap_or(false);
         }
-        Self(PluginPermissions {
-            allowed,
-            net_hosts: net_hosts_from_manifest(manifest),
-        })
+        Self {
+            permissions: PluginPermissions {
+                allowed,
+                net_hosts: net_hosts_from_manifest(manifest),
+                owner: None,
+            },
+            providers: providers_from_manifest(manifest),
+        }
     }
 
     pub fn is_requested(&self, perm: Permission) -> bool {
-        self.0.is_allowed(perm)
+        self.permissions.is_allowed(perm)
     }
 
     /// The hosts the manifest asks to reach, `None` for every host. A request,
     /// like every other name in here, so the approval store is what decides
     /// whether they are granted.
     pub fn net_hosts(&self) -> Option<&[String]> {
-        self.0.net_hosts.as_deref()
+        self.permissions.net_hosts.as_deref()
+    }
+
+    /// Every slug the manifest lists as registered by the package.
+    pub fn providers(&self) -> &[String] {
+        &self.providers
+    }
+
+    /// Slugs the request and the approval both name: what a load may
+    /// register. A manifest alone is a request, like every other name in
+    /// here, so a slug the approval never covered stays out.
+    pub fn granted_providers(&self, approved: &[String]) -> Vec<String> {
+        self.providers
+            .iter()
+            .filter(|slug| approved.contains(slug))
+            .cloned()
+            .collect()
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -413,7 +545,7 @@ impl Requested {
     /// user installed by hand, or a plugin bundled into the binary. Only a
     /// package maki downloaded has to be intersected with an approval.
     pub fn granted(self) -> PluginPermissions {
-        self.0
+        self.permissions
     }
 
     /// Effective permissions for a managed package: the request and the user's
@@ -426,11 +558,32 @@ impl Requested {
     pub fn intersect(&self, approved: &PluginPermissions) -> PluginPermissions {
         let mut out = PluginPermissions::denied();
         for &perm in Permission::ALL {
-            out.set(perm, self.0.is_allowed(perm) && approved.is_allowed(perm));
+            out.set(
+                perm,
+                self.permissions.is_allowed(perm) && approved.is_allowed(perm),
+            );
         }
-        out.set_net_hosts(self.0.net_hosts());
+        out.set_net_hosts(self.permissions.net_hosts());
         out
     }
+}
+
+/// `providers = ["greenpt"]` at the top level of `plugin.toml`.
+///
+/// Entries that are not strings are dropped, since a manifest cannot be
+/// trusted to be well formed and a malformed entry must not widen the list
+/// it appears in.
+fn providers_from_manifest(manifest: &toml::Value) -> Vec<String> {
+    manifest
+        .get(PROVIDERS_KEY)
+        .and_then(toml::Value::as_array)
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|slug| slug.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `[permissions] net_hosts = ["api.example.com", "*.example.com"]`.
@@ -499,8 +652,66 @@ fn denied_stub(lua: &Lua, perm: Permission) -> LuaResult<Function> {
     })
 }
 
+/// The most the code of one plugin may use while it runs, kept as Lua app
+/// data.
+///
+/// A plugin action runs for its caller with only its price, the owner's
+/// grants cut down to the capability it declared. The caller set up what the
+/// callback reads, like the chat input, so with the owner's other grants it
+/// could steer them. Every guarded call of the owner checks this, and so does
+/// the reach a call hands to the UI. The tasks and timers the owner starts
+/// meanwhile inherit it. Other plugins' code that runs inside, like an
+/// autocmd the callback fires, keeps its own grants: the owner's grants
+/// were never theirs to lose.
+#[derive(Clone, Debug)]
+pub(crate) struct Ceiling(pub(crate) PluginPermissions);
+
+impl Ceiling {
+    /// The ceiling up now when it binds {plugin}, which a task {plugin}
+    /// starts runs under.
+    pub(crate) fn current_for(lua: &Lua, plugin: &str) -> Option<Self> {
+        lua.app_data_ref::<Self>()
+            .filter(|ceiling| ceiling.binds(Some(plugin)))
+            .map(|ceiling| ceiling.clone())
+    }
+
+    /// Grants no `maki` global holds belong to no plugin, so no ceiling is
+    /// theirs, not even one that lost its owner by mistake.
+    fn binds(&self, owner: Option<&str>) -> bool {
+        owner.is_some() && self.0.owner() == owner
+    }
+}
+
+fn check_ceiling(lua: &Lua, owner: Option<&str>, needed: &[Permission]) -> LuaResult<()> {
+    match lua.app_data_ref::<Ceiling>() {
+        Some(ceiling) if ceiling.binds(owner) => match ceiling.0.first_denied(needed) {
+            Some(perm) => Err(ceiling_error(perm)),
+            None => Ok(()),
+        },
+        _ => Ok(()),
+    }
+}
+
+/// `Err` when {granted}, checked outside [`PluginPermissions::guard`], does
+/// not hold {perm} for the code running now.
+pub(crate) fn require(lua: &Lua, granted: &PluginPermissions, perm: Permission) -> LuaResult<()> {
+    if !granted.is_allowed(perm) {
+        return Err(denied_error(perm));
+    }
+    check_ceiling(lua, granted.owner(), &[perm])
+}
+
+fn ceiling_error(perm: Permission) -> LuaError {
+    let msg = format!("{PERMISSION_DENIED}: '{perm}' {OUTSIDE_CEILING}");
+    warn!(permission = %perm, "{msg}");
+    LuaError::runtime(msg)
+}
+
 pub(crate) fn denied_error(perm: Permission) -> LuaError {
-    let msg = Missing::Permission(perm).to_string();
+    let msg = format!(
+        "{PERMISSION_DENIED}: '{perm}' not granted for this plugin. {}",
+        grant_hint(&[perm])
+    );
     warn!(permission = %perm, "{msg}");
     LuaError::runtime(msg)
 }
@@ -509,6 +720,15 @@ pub(crate) fn load_plugin_permissions(plugin_dir: Option<&Path>) -> PluginPermis
     load_plugin_manifest(plugin_dir)
         .as_ref()
         .map_or_else(PluginPermissions::denied, PluginPermissions::from_manifest)
+}
+
+/// The `providers` list a `plugin.toml` asks for. A plugin loaded straight
+/// from disk has no approval store behind it, so its own manifest is the grant.
+pub(crate) fn load_plugin_granted_providers(plugin_dir: Option<&Path>) -> Vec<String> {
+    load_plugin_manifest(plugin_dir)
+        .as_ref()
+        .map(|manifest| Requested::from_manifest(manifest).providers().to_vec())
+        .unwrap_or_default()
 }
 
 /// Host-side gate, run before any Lua from `plugin_dir` reaches the runtime.
@@ -651,16 +871,6 @@ mod tests {
         assert_denied(&p);
     }
 
-    #[test]
-    fn full_reach_does_not_need_agent_but_misses_any_capability() {
-        let mut p = PluginPermissions::trusted();
-        p.set(Permission::Agent, false);
-        assert!(p.holds_all_reach());
-
-        p.set(Permission::Env, false);
-        assert!(!p.holds_all_reach());
-    }
-
     /// Everything but `run`, which would skip the egress comparison.
     fn with_hosts(hosts: Option<&[&str]>) -> PluginReach {
         let mut p = PluginPermissions::trusted();
@@ -747,6 +957,45 @@ mod tests {
         let value: toml::Value = toml::from_str(manifest).unwrap();
         let hosts = PluginPermissions::from_manifest(&value).net_hosts();
         assert_eq!(hosts.as_deref().map(<[String]>::to_vec), expected);
+    }
+
+    /// `providers` in the same shape: a list that is not there asks for
+    /// nothing, and a malformed entry must not widen what the prompt shows.
+    #[test_case("[package]\nname = \"p\"\n", Vec::new() ; "an_absent_list_takes_over_nothing")]
+    #[test_case(
+        "providers = [\"greenpt\"]\n",
+        vec!["greenpt".to_owned()] ;
+        "declared_names_are_carried"
+    )]
+    #[test_case(
+        "providers = [\"greenpt\", 7]\n",
+        vec!["greenpt".to_owned()] ;
+        "a_malformed_entry_widens_nothing"
+    )]
+    #[test_case("providers = \"greenpt\"\n", Vec::new() ; "not_a_list_takes_over_nothing")]
+    fn providers_from_a_manifest(manifest: &str, expected: Vec<String>) {
+        let value: toml::Value = toml::from_str(manifest).unwrap();
+        assert_eq!(
+            Requested::from_manifest(&value).providers(),
+            expected.as_slice()
+        );
+    }
+
+    /// The catalog names a load may take over are the ones the approval
+    /// covered, not the ones the manifest merely asks for.
+    #[test]
+    fn granted_providers_need_both_request_and_approval() {
+        const APPROVED: &str = "greenpt";
+        const UNAPPROVED: &str = "rival";
+        let value: toml::Value =
+            toml::from_str(&format!("providers = [{APPROVED:?}, {UNAPPROVED:?}]\n")).unwrap();
+        let requested = Requested::from_manifest(&value);
+
+        assert_eq!(
+            requested.granted_providers(&[APPROVED.to_owned()]),
+            [APPROVED.to_owned()]
+        );
+        assert_eq!(requested.granted_providers(&[]), Vec::<String>::new());
     }
 
     #[test]

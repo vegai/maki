@@ -24,8 +24,6 @@ mod transcript;
 pub mod worker;
 #[cfg(all(test, target_os = "linux"))]
 use linux::WAIT;
-#[cfg(target_os = "linux")]
-use linux::within;
 #[cfg(all(test, target_os = "linux"))]
 use linux::{agent_error, utf8_vars};
 #[cfg(target_os = "linux")]
@@ -36,18 +34,21 @@ mod unsupported;
 #[cfg(target_os = "linux")]
 pub use error::Error;
 #[cfg(target_os = "linux")]
+pub(crate) use linux::Factory;
+#[cfg(target_os = "linux")]
 pub use linux::configure_plugin;
 #[cfg(target_os = "linux")]
 use linux::create;
 #[cfg(not(target_os = "linux"))]
-use unsupported::create;
+pub use unsupported::configure_plugin;
 #[cfg(not(target_os = "linux"))]
-pub use unsupported::{Error, configure_plugin};
+use unsupported::create;
 
 use crate::model::ModelFamily;
 use crate::providers::anthropic;
 use crate::spec::{
-    AuthDoc, Build, CatalogDoc, GeneratedDocs, NO_CURATED_MODELS, Native, ProviderSpec, api_decides,
+    AuthDoc, Build, CatalogDoc, GeneratedDocs, NO_CURATED_MODELS, Native, ProviderSpec,
+    sends_as_chosen,
 };
 
 pub(crate) const SLUG: &str = "claude-code";
@@ -55,6 +56,7 @@ pub(crate) const SLUG: &str = "claude-code";
 pub(crate) const OAUTH_TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 
 pub const UNSUPPORTED_SYSTEM: &str = "maki runs Claude Code only on Linux";
+pub const HOME_STATE_PREFIX: &str = ".claude.json";
 pub const DEFAULT_EXECUTABLE: &str = "claude";
 pub const DEFAULT_MAX_CONCURRENT: usize = 8;
 pub const MIN_MAX_CONCURRENT: usize = 1;
@@ -93,9 +95,10 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     family: ModelFamily::Claude,
     supports_thinking: true,
     supports_deferred_tools: false,
-    adaptive_effort: api_decides,
+    sends_thinking: sends_as_chosen,
     thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: false,
+    catalog_is_authoritative: false,
     fallback_max_output: None,
     fallback_context_window: 200_000,
     models_toml: NO_CURATED_MODELS,

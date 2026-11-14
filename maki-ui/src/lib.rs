@@ -1,15 +1,19 @@
-//! Single-threaded ratatui event loop; the agent runs on smol tasks in a separate thread.
-//! `AgentHandles` bundles all flume channels to the agent. `dispatch()` processes
+//! Single-threaded ratatui event loop; the agent runs on tokio tasks off the UI thread.
+//! `AgentHandles` bundles all channels to the agent. `dispatch()` processes
 //! `Action`s returned by `App::update()`. Scroll and drag events are coalesced from
 //! the queue to avoid jank.
 
 pub mod animation;
 pub mod app;
+mod appearance;
+#[doc(hidden)]
+pub mod bench_support;
 pub mod chat;
 mod clipboard;
 mod clock;
 mod color_compat;
 mod components;
+mod decor_worker;
 pub use components::command::{BUILTIN_COMMANDS, BuiltinCommand, PluginAccess, SUBMITS_PROMPT};
 pub use components::keybindings;
 mod highlight;
@@ -25,6 +29,7 @@ mod storage_writer;
 mod text_buffer;
 mod theme;
 mod trust_card;
+mod tty_probe;
 pub use theme::BUNDLED_THEMES;
 pub use trust_card::ask_trust;
 pub mod update;
@@ -33,12 +38,14 @@ pub mod wrap;
 mod agent;
 mod event_loop;
 mod input;
+mod present;
 mod terminal;
 mod terminal_image;
 
 use std::time::Instant;
 
 use color_eyre::Result;
+use maki_agent::SessionMailbox;
 use maki_agent::session::{StoreError, save_new};
 use maki_lua::PackPlan;
 use maki_storage::StateDir;
@@ -97,7 +104,8 @@ pub use event_loop::EventLoopParams;
 
 /// How a UI generation ended. On `Reload`, each tab carries its in-memory
 /// session so the caller reopens everything without re-reading from disk, and
-/// its claim, so no other process can take the session while the UI rebuilds.
+/// its claim, so no other process can take the session while the UI rebuilds,
+/// and their mailboxes, which go back in as `EventLoopParams::handed_over`.
 pub enum RunOutcome {
     Exit {
         session_id: Option<MakiId>,
@@ -107,15 +115,17 @@ pub enum RunOutcome {
         tabs: Vec<OpenSession>,
         focused: usize,
         pack: Option<PackPlan>,
+        mailboxes: Vec<SessionMailbox>,
     },
 }
 
-pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<RunOutcome> {
+pub async fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<RunOutcome> {
     let report = {
         let (_guard, mut terminal) = terminal::TerminalGuard::init()?;
         color_compat::init();
-        let el = event_loop::EventLoop::new(&mut terminal, params)?;
-        el.run(initial_prompt)?
+        appearance::init(params.ui_config.theme.as_ref());
+        let el = event_loop::EventLoop::new(&mut terminal, params).await?;
+        el.run(initial_prompt).await?
     };
     // Nothing is going to ask for a file list after the last frame, and a walk
     // of a large tree has no business burning cores through teardown.
@@ -125,6 +135,7 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
         tabs,
         focused,
         unsaved,
+        mailboxes,
     } = report;
     for id in unsaved {
         eprintln!("{SAVE_FAILED}{id}");
@@ -134,11 +145,13 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
             tabs,
             focused,
             pack: None,
+            mailboxes,
         },
         components::ExitRequest::Pack(request) => RunOutcome::Reload {
             tabs,
             focused,
             pack: Some(request),
+            mailboxes,
         },
         exit => {
             let session_id = tabs

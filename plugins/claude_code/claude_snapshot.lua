@@ -51,18 +51,18 @@ local function note(artifact, format, ...)
   artifact.notes[#artifact.notes + 1] = format:format(...)
 end
 
-local function checkout_git(call, spec, args)
-  return call:run_lines(git_utils.git(args), { env = spec.env, cwd = spec.cwd })
+local function checkout_git(call, artifact, spec, args)
+  return call:run_lines(git_utils.git(args), { env = spec.env, cwd = spec.cwd, timeout_ms = artifact.timeout_ms })
 end
 
-local function list_files(call, spec, args, pathspecs)
+local function list_files(call, artifact, spec, args, pathspecs)
   for _, pathspec in ipairs(pathspecs) do
     args[#args + 1] = pathspec
   end
   for _, pathspec in ipairs(spec.denied_pathspecs) do
     args[#args + 1] = pathspec
   end
-  return checkout_git(call, spec, args)
+  return checkout_git(call, artifact, spec, args)
 end
 
 -- Copies links as links. {reflink} is a `--reflink` flag, or nil. `cp`
@@ -146,12 +146,13 @@ end
 -- Returns the tracked files as they are on disk, plus the untracked files
 -- under {spec.include}. Submodules are left out, with a note in {artifact}.
 local function snapshot_paths(call, artifact, spec)
-  local tracked, tracked_err = list_files(call, spec, { "ls-files", "-t", "-s", "--" }, { "." })
+  local tracked, tracked_err = list_files(call, artifact, spec, { "ls-files", "-t", "-s", "--" }, { "." })
   if not tracked then
     return nil, tracked_err
   end
   local deleted, deleted_err = list_files(
     call,
+    artifact,
     spec,
     { "diff-files", "--relative", "--name-only", "--diff-filter=D", "--" },
     { "." }
@@ -186,7 +187,7 @@ local function snapshot_paths(call, artifact, spec)
       end
       specs[#specs + 1] = ":(literal)" .. path
     end
-    local untracked, untracked_err = list_files(call, spec, { "ls-files", "-o", "--" }, specs)
+    local untracked, untracked_err = list_files(call, artifact, spec, { "ls-files", "-o", "--" }, specs)
     if not untracked then
       return nil, untracked_err
     end
@@ -217,12 +218,17 @@ end
 -- The project's exclusions apply, because the worker's shell can read the
 -- whole copy.
 local function copy_dependencies(call, artifact, spec, paths)
-  local copied, tracked_folders, checked = {}, {}, {}
-  for _, path in ipairs(paths) do
-    tracked_folders[path] = true
-    for folder in path_utils.folders(path) do
-      tracked_folders[folder] = true
+  if #spec.dependencies == 0 then
+    return {}
+  end
+  local copied, checked = {}, {}
+  local function tracked(dir)
+    for _, path in ipairs(paths) do
+      if path_utils.within(path, dir) then
+        return true
+      end
     end
+    return false
   end
   for _, dir in ipairs(spec.dependencies) do
     local source = maki.fs.joinpath(spec.cwd, dir)
@@ -233,12 +239,12 @@ local function copy_dependencies(call, artifact, spec, paths)
       note(artifact, SYMLINKED_DEPENDENCY, dir, path_utils.printable(parent))
     elseif not (meta and meta.is_dir) then
       note(artifact, MISSING_DEPENDENCY, dir)
-    elseif tracked_folders[dir] then
+    elseif tracked(dir) then
       note(artifact, TRACKED_DEPENDENCY, dir)
     elseif maki.fs.metadata(maki.fs.joinpath(source, VENV_MARKER)) then
       note(artifact, VIRTUAL_ENVIRONMENT, dir)
     else
-      local listed, list_err = list_files(call, spec, { "ls-files", "-o", "--" }, { ":(literal)" .. dir })
+      local listed, list_err = list_files(call, artifact, spec, { "ls-files", "-o", "--" }, { ":(literal)" .. dir })
       if not listed then
         return nil, "maki cannot list the dependency " .. dir .. ": " .. list_err
       end
@@ -576,7 +582,7 @@ function M.collect(call, artifact, project)
     imported = {},
   }
   local _, save_err =
-    maki.fs.atomic_write(maki.fs.joinpath(artifact.dir, path_utils.MANIFEST), maki.json.encode(manifest))
+    maki.fs.atomic_write(maki.fs.joinpath(artifact.dir, path_utils.MANIFEST), (maki.json.encode(manifest)))
   if save_err then
     return nil, save_err
   end

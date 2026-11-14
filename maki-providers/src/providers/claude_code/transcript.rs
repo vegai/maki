@@ -164,14 +164,29 @@ fn push_line(out: &mut String, value: &impl Serialize) -> Result<(), Error> {
     Ok(())
 }
 
-fn expose_input(input: &mut Value) {
-    if let Some(calls) = input.get_mut(BATCH_CALLS).and_then(Value::as_array_mut) {
-        for call in calls {
-            if let Some(name) = call[BATCH_CALL_TOOL].as_str() {
-                call[BATCH_CALL_TOOL] = Value::String(exposed_name(name));
-            }
-        }
+pub(super) fn map_batch_names(input: &mut Value, name: impl Fn(&str) -> String) {
+    let Some(calls) = input.get_mut(BATCH_CALLS) else {
+        return;
+    };
+    if let Value::String(encoded) = calls
+        && let Ok(decoded @ (Value::Array(_) | Value::Object(_))) = serde_json::from_str(encoded)
+    {
+        *calls = decoded;
     }
+    let map = |call: &mut Value| {
+        if let Some(tool) = call[BATCH_CALL_TOOL].as_str() {
+            call[BATCH_CALL_TOOL] = Value::String(name(tool));
+        }
+    };
+    match calls {
+        Value::Array(calls) => calls.iter_mut().for_each(map),
+        Value::Object(_) => map(calls),
+        _ => {}
+    }
+}
+
+fn expose_input(input: &mut Value) {
+    map_batch_names(input, exposed_name);
 }
 
 /// Anthropic caches prefixes at block boundaries. Keep each transcript message in a separate
@@ -264,8 +279,8 @@ mod tests {
 
     use super::super::error::Error;
     use super::{
-        Catalog, EXPOSED_PREFIX, MAX_EXPOSED_NAME, SERVER, TRANSCRIPT_HEADER, entry_of,
-        expose_input, fits, server_name, transcript,
+        BATCH_CALL_TOOL, BATCH_CALLS, Catalog, EXPOSED_PREFIX, MAX_EXPOSED_NAME, SERVER,
+        TRANSCRIPT_HEADER, entry_of, expose_input, fits, server_name, transcript,
     };
     use crate::{ContentBlock, ImageMediaType, ImageSource, Message, Role};
 
@@ -370,6 +385,7 @@ mod tests {
                     ContentBlock::Thinking {
                         thinking: "secret plan".into(),
                         signature: Some("sig".into()),
+                        reasoning_id: None,
                     },
                     ContentBlock::Text {
                         text: "Reading.".into(),
@@ -453,6 +469,16 @@ mod tests {
             !text.contains("secret plan"),
             "the transcript must not contain thinking"
         );
+    }
+
+    #[test_case(false ; "object")]
+    #[test_case(true ; "encoded_object")]
+    fn a_single_batch_call_uses_exposed_names(encoded: bool) {
+        let call = json!({ BATCH_CALL_TOOL: "read", "args": {} });
+        let mut input =
+            json!({ BATCH_CALLS: if encoded { Value::String(call.to_string()) } else { call } });
+        expose_input(&mut input);
+        assert_eq!(input[BATCH_CALLS][BATCH_CALL_TOOL], "mcp__maki__read");
     }
 
     #[test]

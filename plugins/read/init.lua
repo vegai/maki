@@ -1,10 +1,8 @@
 local ToolView = require("maki.tool_view")
 local shorten_path = require("maki.shorten_path")
 local output_limits = require("maki.output_limits")
-local helpers = require("read_helpers")
 
-local truncate_bytes = helpers.truncate_bytes
-local split_lines = helpers.split_lines
+local HIGHLIGHT_CONTEXT_LINES = 200
 
 local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed).
 
@@ -27,7 +25,7 @@ local opts = maki.api.register_options({
 
 local function read_view_opts(ctx)
   local tol = ctx:tool_output_lines()
-  return { max_lines = (tol and tol.read) or 10, keep = "head" }
+  return { max_lines = (tol and tol.read) or 0, keep = "head" }
 end
 
 local function apply_highlights(view, lines, ext, prefix)
@@ -46,13 +44,29 @@ local function apply_highlights(view, lines, ext, prefix)
   view:flush()
 end
 
--- Lines above `start` give the highlighter context, so a window that
--- opens inside a block comment or string is coloured right.
-local function highlight_prefix(all_lines, start)
-  if start <= 1 then
-    return nil
+-- We also read some lines above `start`, so the highlighter knows when the
+-- window opens inside a block comment or a string. Everything comes from one
+-- `read_lines` call, so the window, its context and the total always agree.
+-- Lines arrive already cut to `max_line_bytes`, so even a huge file or line
+-- never fills the Lua heap that all plugins share.
+local function read_window(path, start, limit, count, ctx)
+  local first = math.max(start - HIGHLIGHT_CONTEXT_LINES, 1)
+  local context_len = start - first
+  local page, err = maki.fs.read_lines(path, {
+    offset = first,
+    limit = limit and context_len + limit,
+    max_line_bytes = output_limits.line_bytes(opts, ctx),
+    count = count,
+  })
+  if not page then
+    return nil, err
   end
-  return table.concat(all_lines, "\n", 1, math.min(start - 1, #all_lines))
+  local lines = page.lines
+  return {
+    lines = table.move(lines, context_len + 1, #lines, 1, {}),
+    total = page.total,
+    context = table.concat(lines, "\n", 1, math.min(context_len, #lines)),
+  }
 end
 
 local function build_file_view(lines, start_line, total_lines, path, ctx, prefix)
@@ -92,26 +106,18 @@ local function build_file_view(lines, start_line, total_lines, path, ctx, prefix
 end
 
 local function read_file(path, offset, limit, ctx)
-  local content, err = maki.fs.read(path)
-  if not content then
-    return { llm_output = "read error: " .. tostring(err), is_error = true }
-  end
-
-  local all_lines = split_lines(content)
-  local total_lines = #all_lines
-
   local start = math.max(math.floor(offset), 1)
   local max_output_lines = output_limits.resolve(opts, ctx)
-  local max_lines = limit == 0 and total_lines or limit
+  local max_lines = limit > 0 and limit or nil
   if max_output_lines then
-    max_lines = math.min(max_lines, max_output_lines)
+    max_lines = math.min(max_lines or max_output_lines, max_output_lines)
   end
-  local max_line_bytes = output_limits.line_bytes(opts, ctx)
 
-  local lines = {}
-  for i = start, math.min(start + max_lines - 1, total_lines) do
-    lines[#lines + 1] = truncate_bytes(all_lines[i], max_line_bytes)
+  local window, err = read_window(path, start, max_lines, true, ctx)
+  if not window then
+    return { llm_output = "read error: " .. tostring(err), is_error = true }
   end
+  local lines, total_lines = window.lines, window.total
 
   ctx:record_read(path)
 
@@ -121,6 +127,10 @@ local function read_file(path, offset, limit, ctx)
     parts[#parts + 1] = string.format(nr_fmt, start + i - 1, line)
   end
   local llm_output = table.concat(parts, "\n")
+  if #lines == 0 then
+    llm_output = total_lines == 0 and "(empty file)"
+      or ("offset %d is past the end of the file (%d lines)"):format(start, total_lines)
+  end
 
   local trunc_start = start + #lines
   if trunc_start <= total_lines then
@@ -137,8 +147,6 @@ local function read_file(path, offset, limit, ctx)
   local annotation = shown < total_lines and string.format("%d of %d lines", shown, total_lines)
     or string.format("%d lines", shown)
 
-  local prefix = highlight_prefix(all_lines, start)
-
   local basename = path:match("([^/]+)$")
   local parent = maki.fs.dirname(path)
   if parent and not ctx:is_instruction_file(basename) then
@@ -147,7 +155,7 @@ local function read_file(path, offset, limit, ctx)
 
   return {
     llm_output = llm_output,
-    body = build_file_view(lines, start, total_lines, path, ctx, prefix),
+    body = build_file_view(lines, start, total_lines, path, ctx, window.context),
     annotation = annotation,
   }
 end
@@ -200,7 +208,10 @@ maki.api.register_tool({
     return buf
   end,
 
-  restore = function(input, output, _is_error, ctx)
+  restore = function(input, output, is_error, ctx)
+    if is_error then
+      return nil
+    end
     local lines, start_line, total_lines = {}, nil, nil
     for _, raw in ipairs(maki.split(output, "\n")) do
       local nr, text = raw:match("^%s*(%d+): (.*)$")
@@ -224,9 +235,8 @@ maki.api.register_tool({
     -- come from the file as it is now, and a file edited since the call may
     -- colour the window differently than the live call did. Restore runs on
     -- every load and re-render, so read just those lines and not a whole log.
-    local content = start_line > 1 and maki.fs.read(path, { limit = start_line - 1 })
-    local prefix = content and highlight_prefix(split_lines(content), start_line)
-    return build_file_view(lines, start_line, total_lines, path, ctx, prefix)
+    local above = start_line > 1 and read_window(path, start_line, 0, false, ctx)
+    return build_file_view(lines, start_line, total_lines, path, ctx, above and above.context)
   end,
 
   handler = function(input, ctx)

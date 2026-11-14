@@ -21,6 +21,13 @@ const PLUGIN_PROVIDER_MANIFEST: &str =
 
 const TIER_PICKER_NOTE: &str = r#"Open the model picker with `/model` and press `!`, `@`, `#`, or `$` on any row to assign it to strong, medium, weak, or compaction. Press the same key again to remove the assignment. Your overrides are saved to `~/.local/state/maki/model-tiers` and apply across sessions."#;
 
+const COMPACTION_ORDER: &str = r#"Compaction uses the first model it finds:
+
+1. Your `/model` compaction pick.
+2. A `tier = "compaction"` model of the session's provider.
+3. A `tier = "compaction"` model of any other provider, in slug order.
+4. The session model, also used when the chosen model is unavailable."#;
+
 const AUTH_RELOADING: &str = r#"## Auth Reloading
 
 Maki re-reads auth from storage and environment variables each time a new agent spawns (`/new`, retry, session load). If you run `maki auth login` in another terminal or change an env var, the next session picks it up without a restart.
@@ -51,7 +58,7 @@ You can also set `base_url` for a built-in provider in `~/.config/maki/providers
 base_url = "http://xxxx:1234/v1"
 ```
 
-The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discover_models` and `models` are ignored with a warning. Use a custom slug if you need those."#;
+The built-in provider still owns the slug, so `api_key_env`, `discover_models`, `models` and `protocol` are ignored with a warning. Use a custom slug if you need those. `ollama` and `llama-cpp` read `protocol` values `openai` and `openai-responses` to pick the chat or Responses API."#;
 
 const MODEL_IDENTIFIERS: &str = r#"## Model Identifiers
 
@@ -146,7 +153,6 @@ Env `<SLUG>_BASE_URL` still wins over both the plan and a `base_url` in this fil
 
 1. Tweak a built-in (pick a plan, change its base URL, set `enable_free_models` for Opencode).
 2. Declare a custom provider that speaks OpenAI, Anthropic, or Google wire format.
-3. [Pick the plugin package](#select-a-provider-package) that implements a provider.
 
 ```toml
 # Point a built-in at a proxy. Env vars still win over this file.
@@ -185,12 +191,11 @@ supports_vision = false
 |-------|------|-------|
 | `display_name` | string | Shown in pickers and auth status |
 | `protocol` | string | `openai`, `openai-responses`, `anthropic`, or `google`. Required for custom slugs |
-| `plugin` | string | [Package](#select-a-provider-package) that implements this provider. Not allowed with `protocol` |
 | `base_url` | string | Origin of the API. Maki appends the protocol paths |
 | `plan` | string | Built-in plan key (see Plans below). Sets base URL and default model |
 | `api_key_env` | string | Env var that holds the key. Defaults to `<SLUG>_API_KEY` |
 | `api_key` | string | Inline key (prefer the env var or `maki auth login`) |
-| `headers` | table | Extra HTTP headers sent on every request to this provider. Values expand `${{VAR}}` from the environment; an unset or empty variable fails the provider instead of sending a half-filled header. A same-name header (case-insensitive) replaces the built-in auth header and survives key rotation |
+| `headers` | table | Extra HTTP headers for every request to this provider. Values expand `${{VAR}}` from the environment, and an unset or empty variable fails the provider. A header with the same name (case-insensitive) replaces the one maki would send, auth included, and survives key rotation. `anthropic-beta` values add to the betas maki sends |
 | `default_model` | string | Used after login when no model is saved yet. On a custom entry it is also the startup fallback when no built-in or plugin provider is available. Without it, startup picks a declared `strong` or `medium` model |
 | `top_p` | f64 | Nucleus sampling probability, sent as `top_p` in the request body for OpenAI-compatible, Anthropic, Bedrock and Google providers. Claude and GPT models reject it while thinking is on, and Claude Opus 4.7, Claude 5 and later always do, so it is dropped there. Never sent to Copilot or over the OpenAI responses path. Only sent when set, so the provider's own default applies otherwise. Must be in `(0, 1]` |
 | `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
@@ -205,7 +210,7 @@ supports_vision = false
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
 | `id` | string | required | Model id. Spec becomes `{{slug}}/{{id}}` |
-| `tier` | string | `medium` | `weak`, `medium`, `strong`, or `compaction` |
+| `tier` | string | `medium` | `weak`, `medium`, `strong`, or `compaction`. With `discover_models = true`, a declared tier counts only for models the server lists |
 | `context_window` | u32 | protocol default | Tokens of context |
 | `max_output_tokens` | u32 | protocol default | Max completion tokens |
 | `supports_tool_examples` | bool | protocol default | |
@@ -235,7 +240,7 @@ high = {{ reasoning_effort = "xhigh" }}
 max = {{ reasoning_effort = "xhigh" }}
 ```
 
-A mode you left out sends nothing. To get Ollama's own effort words (`low`, `medium`, `high`, and `none` when thinking is off) instead of writing every fragment yourself, use the built-in `ollama` slug: set `[ollama].base_url` (or `OLLAMA_HOST`) and give `[[ollama.models]]` the thinking keys. Only `supports_thinking`, `requires_thinking` and `thinking_fields` overlay onto a built-in slug. The rest of the entry stays ignored, and startup names the keys it dropped.
+A mode you left out sends nothing. The built-in `ollama` slug needs no thinking keys, because it asks Ollama which levels each model takes (see [Ollama](#ollama)). To override that for a model, set `[ollama].base_url` (or `OLLAMA_HOST`) and give `[[ollama.models]]` the thinking keys. Only `supports_thinking`, `requires_thinking` and `thinking_fields` overlay onto a built-in slug. The rest of the entry stays ignored, and startup names the keys it dropped.
 
 Without `thinking_fields`, maki sends `"thinking": {{"type": "disabled"}}` when thinking is off and nothing when it is on. GLM and Kimi gateways need this block to stop reasoning. Declaring `thinking_fields` replaces it, so add an `off` key if your gateway needs one. Some gateways, such as LiteLLM in front of Azure, reject the block. Maki then retries without it, and if the retry works, leaves the block out for that model until restart.
 
@@ -288,9 +293,11 @@ maki.provider.register({{
 }})
 ```
 
-The plugin's `plugin.toml` must grant `net` and list the provider's hosts in `net_hosts`. `api_key_env` also needs `env`:
+The plugin's `plugin.toml` must grant `net`, list the provider's hosts in `net_hosts`, and list the slug under `providers` when models.dev serves that name. `api_key_env` also needs `env`:
 
 ```toml
+providers = ["acme"]
+
 [permissions]
 net = true
 env = true
@@ -301,29 +308,25 @@ Maki sends the provider's credentials only to those hosts, plus any origin you s
 
 The [Lua API](/docs/lua-api/#maki-provider-register) lists every field. This section explains the choices.
 
-### Select a provider package
+### Granted slugs
 
-Maki builds a generic client for each [models.dev](https://models.dev/) provider it has no built-in support for. To have a plugin implement one instead, select its [package](/docs/packages/) in `providers.toml`:
+A third-party plugin that registers a slug models.dev serves has to be granted it: the manifest lists the slug at the top level of its `plugin.toml`, and the install approval covers it. The install approval prompt shows that the package will receive your saved key for each name models.dev serves.
 
 ```toml
-[acme]
-plugin = "acme-provider"
+providers = ["acme"]
+
+[permissions]
+net = true
+net_hosts = ["api.acme.com"]
 ```
 
-Only that package can then register `acme`, and it receives the credentials already saved for `acme`. Built-in names stay [reserved](#slug-rules).
+Maki checks the list against the names models.dev serves today. A load that registers such a slug the manifest does not list, or the approval never covered, is refused. List every slug the package registers, so a name the catalog adds later is already approved and the generic catalog client can never take over a working package's slug and receive the key you saved for it.
 
-The package still needs its usual permission approval. If it is missing, fails to load, or does not register `acme`, the provider is unavailable. Maki does not fall back to the generic client.
+Names Maki ships, built in or as a bundled plugin, stay [reserved](#slug-rules) regardless of this list.
 
-Run `/reload` or restart after changing `plugin`. Remove it to go back to the generic client.
+An approval recorded before this list existed covers no slug. The startup approval check asks again, so update or reinstall the package and answer the prompt to grant the names.
 
-A package that ships several providers can skip the ones you did not select:
-
-```lua
-if not maki.provider.is_selected("acme") then
-  return
-end
--- Register the provider here.
-```
+This replaces the `plugin = "..."` selection field an older release had in `providers.toml`. Maki still reads it: while it is set, the slug stays owned by the named package so the catalog client cannot take it over, and a warning tells you to list the slug under `providers` in the package's `plugin.toml` and remove the `plugin =` line.
 
 ### codec or base
 
@@ -407,7 +410,7 @@ The value is any JSON object. Each slug gets its own file at `~/.local/state/mak
 
 - Starts with a letter or digit, then only letters, digits, `_` and `-`
 - Not a slug Maki ships, built in or as a bundled plugin, even one you turned off. Your plugin would otherwise get the API key saved for that provider
-- Not a models.dev provider name, unless you [selected](#select-a-provider-package) the package for it
+- Listed under `providers` in the package's `plugin.toml` and covered by its install approval when models.dev serves the slug. List every slug the package registers, so a name models.dev adds later cannot break a working package
 - Not a custom provider from `providers.toml` or a slug another plugin registered
 
 ### Migrating from provider scripts
@@ -457,7 +460,7 @@ local function credentials()
   if stored then
     return stored
   end
-  local text = maki.fs.read(maki.fs.normalize("~/.maki/auth/acme.json"))
+  local text = maki.fs.read(maki.fs.normalize("~/.local/state/maki/auth/acme.json"))
   if not text then
     return nil
   end
@@ -627,9 +630,10 @@ fn render() -> String {
         "Maki talks to LLM providers over their HTTP APIs. \
          Models are split into three tiers: **weak** (cheap and fast), \
          **medium** (balanced), and **strong** (highest capability, highest cost). \
-         There is also a **compaction** tier for choosing a dedicated model to summarize context when the conversation grows long.\n"
+         A fourth tier, **compaction**, picks the model that summarizes the conversation when it grows long.\n"
     );
     let _ = writeln!(out, "{TIER_PICKER_NOTE}\n");
+    let _ = writeln!(out, "{COMPACTION_ORDER}\n");
     let _ = writeln!(out, "{AUTH_RELOADING}\n");
     let _ = writeln!(out, "{BASE_URL_OVERRIDES}\n");
     let _ = writeln!(out, "## Built-in Providers\n");

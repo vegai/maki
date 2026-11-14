@@ -13,14 +13,18 @@ pub mod interpreter_bridge;
 pub mod registry;
 pub mod schema;
 
+use crate::Envelope;
 pub use deadline::Deadline;
 pub use file_access::{FileAccess, FileKey};
 pub use hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
 pub use registry::{
-    BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes,
-    RegisteredTool, RegistryError, Tool, ToolAudience, ToolExecResult, ToolInvocation, ToolReach,
-    ToolRegistry, ToolSource,
+    BoxFuture, ExecFuture, HeaderFuture, HeaderResult, MovedCall, MovedLand, ParseError,
+    PermissionScopes, RegisteredTool, RegistryError, Tool, ToolAudience, ToolExecResult,
+    ToolInvocation, ToolReach, ToolRegistry, ToolSource,
 };
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::unbounded_channel;
 
 use std::collections::HashMap;
 use std::env;
@@ -33,9 +37,12 @@ use ignore::WalkBuilder;
 use jiff::fmt::friendly::{Designator, Spacing, SpanPrinter};
 use maki_config::ProjectConfig;
 use serde_json::{Value, json};
+use tokio::sync::Mutex;
 
-use crate::agent::{CallInstructions, LoadedInstructions};
+use crate::agent::{CallInstructions, LoadedInstructions, default_instruction_files};
+use crate::call_scope::CallScope;
 use crate::cancel::{CancelMap, CancelToken};
+use crate::live_session::SessionMailbox;
 use crate::mcp::{
     McpSession, TOOL_SEARCH_TOOL_NAME, is_qualified_name, is_wire_name, same_tool_name,
 };
@@ -52,6 +59,8 @@ pub(crate) const TOOL_NAME_FIELD: &str = "name";
 const COMPACT_DURATION: SpanPrinter = SpanPrinter::new()
     .designator(Designator::Compact)
     .spacing(Spacing::None);
+const COMPACT_DURATION_UNITS: [char; 3] = ['h', 'm', 's'];
+const TIMEOUT_SUFFIX: &str = " timeout";
 /// What `maki.task` calls the session's own chat.
 pub const MAIN_TASK_ID: &str = "main";
 
@@ -147,8 +156,8 @@ impl ToolKind {
 }
 
 impl ToolFilter {
-    pub(crate) fn cache_key(&self) -> Option<Value> {
-        fn sorted(names: &[String]) -> Vec<&str> {
+    pub(crate) fn cache_key(&self) -> Option<String> {
+        fn sorted(names: &[String]) -> String {
             let mut names: Vec<&str> = names
                 .iter()
                 .map(String::as_str)
@@ -157,13 +166,20 @@ impl ToolFilter {
             names.sort_unstable();
             names.dedup();
             names
+                .into_iter()
+                .map(|name| format!("{}:{name}", name.len()))
+                .collect()
         }
         let excluded = sorted(&self.excluded);
         match &self.allowed {
-            Some(allowed) => Some(json!({ "only": sorted(allowed), "excluded": excluded })),
-            None if !excluded.is_empty() => Some(json!({ "excluded": excluded })),
+            Some(allowed) => Some(format!("only:{}|excluded:{excluded}", sorted(allowed))),
+            None if !excluded.is_empty() => Some(format!("excluded:{excluded}")),
             None => None,
         }
+    }
+
+    pub fn admits_name(&self, name: &str) -> bool {
+        self.admits(name, ToolKind::unresolved(name), ToolAudience::all())
     }
 
     pub fn admits(&self, name: &str, kind: ToolKind, caller: ToolAudience) -> bool {
@@ -212,17 +228,17 @@ impl ToolFilter {
     }
 }
 
-/// The tool array one run sends to the model, paired with the filter that
-/// produced it. A run context carries the pair, never a loose array, so the
-/// names dispatch offers in-process (`tool_dispatch::callable`, and through it
-/// the `code_execution` sandbox) cannot drift from what the model was shown.
-#[derive(Default)]
 pub struct RequestSpec<'a> {
+    pub background: bool,
     pub excluded: &'a [&'a str],
     pub workflow: bool,
     pub mcp: bool,
 }
 
+/// The tool array one run sends to the model, paired with the filter that
+/// produced it. A run context carries the pair, never a loose array, so the
+/// names dispatch offers in-process (`tool_dispatch::callable`, and through it
+/// the `code_execution` sandbox) cannot drift from what the model was shown.
 #[derive(Clone)]
 pub struct RequestTools {
     definitions: Value,
@@ -258,11 +274,12 @@ impl RequestTools {
             mcp: spec.mcp,
         };
         Self {
-            definitions: registry.definitions(
+            definitions: registry.definitions_with_background(
                 vars,
                 &ctx,
                 Some(local_tools),
                 model.supports_tool_examples(),
+                spec.background,
             ),
             filter: Arc::new(filter),
         }
@@ -292,13 +309,17 @@ impl RequestTools {
             None => base,
         };
         if let Some(defs) = definitions.as_array_mut() {
+            let registered = registry.iter();
             defs.retain(|def| {
                 def[TOOL_NAME_FIELD].as_str().is_none_or(|name| {
                     filter.admits(
                         name,
                         ToolKind::of(
                             name,
-                            registry.get(name).map(|entry| entry.tool.audience()),
+                            registered
+                                .iter()
+                                .find(|entry| entry.name() == name)
+                                .map(|entry| entry.tool.audience()),
                             Some(local_tools),
                         ),
                         audience,
@@ -357,7 +378,17 @@ pub fn compact_duration(secs: u64) -> String {
 }
 
 pub fn timeout_annotation(secs: u64) -> String {
-    format!("{} timeout", compact_duration(secs))
+    format!("{}{TIMEOUT_SUFFIX}", compact_duration(secs))
+}
+
+/// Whether {note} is what [`timeout_annotation`] writes.
+pub fn is_timeout_annotation(note: &str) -> bool {
+    note.strip_suffix(TIMEOUT_SUFFIX).is_some_and(|span| {
+        !span.is_empty()
+            && span
+                .chars()
+                .all(|c| c.is_ascii_digit() || COMPACT_DURATION_UNITS.contains(&c))
+    })
 }
 
 pub type LocalToolResult = BoxFuture<'static, Result<String, String>>;
@@ -399,21 +430,31 @@ pub struct ToolContext {
     pub session_id: Option<SessionRef>,
     /// See [`crate::AgentParams::background_for`]. Every nested call clones
     /// this context, so batch and code_execution children carry it too.
-    pub background_for: Option<MakiId>,
+    pub background_for: BackgroundFor,
     /// `None` in the agent that owns the session ([`MAIN_TASK_ID`]), the
     /// spawning call's `tool_use_id` in a subagent. A subagent shares
     /// `session_id` with its parent on purpose (provider affinity, hooks,
     /// otel), so this is what tells their chats apart.
     pub task_id: Option<Arc<str>>,
     pub tool_use_id: Option<String>,
-    pub user_response_rx: Option<Arc<smol::lock::Mutex<flume::Receiver<String>>>>,
+    pub user_response_rx: Option<Arc<Mutex<UnboundedReceiver<String>>>>,
     /// See [`crate::Agent::with_reauth`]. Carried here so a subagent session
     /// offers a re-login only where its parent does.
     pub reauth: bool,
     /// Session-wide: a file the model has already seen is never injected again.
     pub loaded_instructions: LoadedInstructions,
+    /// The file list resolved at session start, so a subdirectory walk never
+    /// re-resolves it.
+    pub instruction_files: Arc<Vec<String>>,
     /// Per model call, shared with its nested calls.
     pub call_instructions: CallInstructions,
+    /// The model call this context serves, shared by its nested calls. `None`
+    /// outside a model call (one-shots, plugin-opened sessions).
+    pub call: Option<Arc<CallScope>>,
+    /// Where a call moved off this run reports its result: the run's own
+    /// mailbox. `None` outside an agent run (one-shots, the interpreter), so
+    /// nothing there moves.
+    pub mailbox: Option<SessionMailbox>,
     pub cancel: CancelToken,
     pub mcp: Option<McpSession>,
     pub deadline: Deadline,
@@ -437,7 +478,7 @@ pub struct ToolContext {
     /// Streams a dispatched child's live bufs and annotations back to its
     /// caller (`maki.agent.call_tool`). Never inherited: `to_tool_context`
     /// clears it, and each caller sets it for its own call only.
-    pub live_sink: Option<flume::Sender<ToolLive>>,
+    pub live_sink: Option<UnboundedSender<ToolLive>>,
     pub model_policy: Arc<ModelPolicy>,
 }
 
@@ -448,6 +489,32 @@ pub enum ToolLive {
     Usage(String),
     /// The plugin that answered the child's permission prompt.
     AllowedBy(Arc<str>),
+    /// The child registered (`true`) or lost (`false`) a background hook.
+    Movable(bool),
+    /// The child runs as this subagent task, which `/tasks` lists on its own.
+    Task(String),
+}
+
+/// The chat whose plan mode blocks this work's writes, see
+/// [`crate::AgentSeed::background_write_block`].
+#[derive(Clone, Default)]
+pub enum BackgroundFor {
+    /// Watched by the user: never blocked.
+    #[default]
+    None,
+    Chat(MakiId),
+    /// Foreground until the call moves, then the chat it moved to.
+    Call(Arc<CallScope>),
+}
+
+impl BackgroundFor {
+    pub fn chat(&self) -> Option<MakiId> {
+        match self {
+            Self::None => None,
+            Self::Chat(chat) => Some(*chat),
+            Self::Call(scope) => scope.home().map(|home| home.chat),
+        }
+    }
 }
 
 pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
@@ -585,20 +652,14 @@ pub fn truncate_output(text: String, max_lines: usize, max_bytes: usize) -> Stri
     result
 }
 
-pub fn is_builtin_tool(name: &str) -> bool {
-    let bundled_tool = maki_config::DEFAULT_BUILTINS.contains(&name)
-        && !maki_config::PROVIDER_BUILTINS.contains(&name);
-    bundled_tool || maki_config::EDIT_SUB_TOOLS.contains(&name)
+fn registers_a_tool(name: &str) -> bool {
+    maki_config::DEFAULT_BUILTINS.contains(&name)
+        && !maki_config::PROVIDER_BUILTINS.contains(&name)
+        && !maki_config::NON_TOOL_BUILTINS.contains(&name)
 }
 
-#[cfg(test)]
-fn all_builtin_tool_names() -> Vec<&'static str> {
-    maki_config::DEFAULT_BUILTINS
-        .iter()
-        .filter(|name| !maki_config::PROVIDER_BUILTINS.contains(name))
-        .chain(maki_config::EDIT_SUB_TOOLS.iter())
-        .copied()
-        .collect()
+pub fn is_builtin_tool(name: &str) -> bool {
+    registers_a_tool(name) || maki_config::EDIT_SUB_TOOLS.contains(&name)
 }
 
 use maki_providers::{Message, ProviderEvent, StreamResponse};
@@ -612,7 +673,7 @@ impl Provider for NullProvider {
         _: &'a [Message],
         _: &'a str,
         _: &'a Value,
-        _: &'a flume::Sender<ProviderEvent>,
+        _: &'a UnboundedSender<ProviderEvent>,
         _: RequestOptions,
         _scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
@@ -633,7 +694,7 @@ pub fn interpreter_ctx(
     cancel: CancelToken,
     permissions: Arc<PermissionManager>,
     file_access: Arc<FileAccess>,
-    user_response_rx: Option<Arc<smol::lock::Mutex<flume::Receiver<String>>>>,
+    user_response_rx: Option<Arc<Mutex<UnboundedReceiver<String>>>>,
     registry: Arc<ToolRegistry>,
 ) -> ToolContext {
     static PROVIDER: LazyLock<Arc<dyn Provider>> = LazyLock::new(|| Arc::new(NullProvider));
@@ -645,13 +706,16 @@ pub fn interpreter_ctx(
         event_tx: event_tx.clone(),
         mode: mode.clone(),
         session_id: None,
-        background_for: None,
+        background_for: BackgroundFor::None,
         task_id: None,
         tool_use_id: None,
         user_response_rx,
         reauth: false,
         loaded_instructions: LoadedInstructions::new(),
+        instruction_files: Arc::new(default_instruction_files()),
         call_instructions: CallInstructions::default(),
+        call: None,
+        mailbox: None,
         cancel,
         mcp: None,
         deadline: Deadline::default(),
@@ -678,7 +742,7 @@ pub fn interpreter_ctx(
 /// Minimal ToolContext for CLI one-shot tool execution (e.g. `maki index`).
 /// Allows everything, sends events to a dummy channel, uses no model.
 pub fn cli_tool_ctx() -> ToolContext {
-    let (tx, _rx) = flume::unbounded::<crate::Envelope>();
+    let (tx, _rx) = unbounded_channel::<Envelope>();
     let event_tx = crate::EventSender::new(tx, 0);
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     interpreter_ctx(
@@ -708,6 +772,7 @@ pub mod test_support {
     use maki_config::{DefaultEffect, PermissionsConfig};
     use maki_providers::Timeouts;
     use maki_storage::id::MakiId;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use crate::live_session::AgentSeed;
     use crate::{Envelope, EventSender, ModelSlot, ToolOutput};
@@ -836,7 +901,7 @@ pub mod test_support {
         let event_tx = match event_tx {
             Some(tx) => tx,
             None => {
-                fallback_tx = EventSender::new(flume::unbounded::<Envelope>().0, 0);
+                fallback_tx = EventSender::new(unbounded_channel::<Envelope>().0, 0);
                 &fallback_tx
             }
         };
@@ -900,7 +965,7 @@ pub mod test_support {
         mode: &AgentMode,
         permissions: Arc<PermissionManager>,
     ) -> ToolContext {
-        let (tx, _rx) = flume::unbounded::<crate::Envelope>();
+        let (tx, _rx) = unbounded_channel::<Envelope>();
         let event_tx = EventSender::new(tx, 0);
         let mut ctx = interpreter_ctx(
             mode,
@@ -941,8 +1006,32 @@ mod tests {
 
     use super::*;
 
+    const FIRST_EXTERNAL: &str = "server.one";
+    const SECOND_EXTERNAL: &str = "server.two";
+    const FILTER_KEY: &str = "only:10:server.one10:server.two|excluded:10:server.two";
     const LINE_LIMIT: usize = 500;
     const TEST_MODEL_SPEC: &str = "anthropic/claude-opus-4-8";
+
+    #[test_case(false ; "ordered")]
+    #[test_case(true ; "reordered_with_duplicates_and_native_names")]
+    fn filter_cache_key_has_a_stable_encoding(reordered: bool) {
+        let names = if reordered {
+            vec![
+                SECOND_EXTERNAL,
+                FIRST_EXTERNAL,
+                FIRST_EXTERNAL,
+                READ_TOOL_NAME,
+            ]
+        } else {
+            vec![FIRST_EXTERNAL, SECOND_EXTERNAL]
+        };
+        let filter = ToolFilter {
+            allowed: Some(names.into_iter().map(str::to_owned).collect()),
+            excluded: vec![SECOND_EXTERNAL.into()],
+            ..Default::default()
+        };
+        assert_eq!(filter.cache_key().as_deref(), Some(FILTER_KEY));
+    }
 
     /// The array a host hands in is the whole answer, but only where names can
     /// be read out of it. Something unreadable must not quietly come out as
@@ -997,7 +1086,7 @@ mod tests {
         registry
             .register(
                 test_support::mock_tool(READ_TOOL_NAME, tool_audience),
-                ToolSource::Lua {
+                ToolSource {
                     plugin: Arc::from(READ_TOOL_NAME),
                 },
             )
@@ -1097,6 +1186,7 @@ mod tests {
             &model,
             &config,
             RequestSpec {
+                background: true,
                 excluded: &[],
                 workflow: false,
                 mcp: false,
@@ -1202,6 +1292,14 @@ mod tests {
     #[test_case(90,  "1m30s timeout" ; "mixed")]
     fn timeout_annotation_cases(secs: u64, expected: &str) {
         assert_eq!(timeout_annotation(secs), expected);
+        assert!(is_timeout_annotation(expected));
+    }
+
+    #[test_case("network timeout" ; "words")]
+    #[test_case(" timeout"        ; "no_span")]
+    #[test_case("24 lines"        ; "another_note")]
+    fn is_timeout_annotation_rejects(note: &str) {
+        assert!(!is_timeout_annotation(note));
     }
 
     #[test_case(0,     "0s"     ; "zero")]
@@ -1542,20 +1640,13 @@ mod tests {
     }
 
     #[test]
-    fn all_builtin_names_no_duplicates() {
-        let names = all_builtin_tool_names();
-        let mut seen = std::collections::HashSet::new();
-        for name in &names {
-            assert!(seen.insert(name), "duplicate builtin tool name: {name}");
-        }
-    }
-
-    #[test]
-    fn provider_plugins_are_not_tools() {
-        for &name in maki_config::PROVIDER_BUILTINS {
+    fn provider_and_non_tool_plugins_are_not_tools() {
+        for &name in maki_config::PROVIDER_BUILTINS
+            .iter()
+            .chain(maki_config::NON_TOOL_BUILTINS)
+        {
             assert!(maki_config::DEFAULT_BUILTINS.contains(&name), "{name}");
             assert!(!is_builtin_tool(name), "{name}");
-            assert!(!all_builtin_tool_names().contains(&name), "{name}");
         }
     }
 }

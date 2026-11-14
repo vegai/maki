@@ -1,8 +1,18 @@
+nextest-version = { required = "0.9.98", recommended = "0.9.151" }
+experimental = ["setup-scripts"]
+
+# Tests that don't call `isolated_home` still never see this machine's config.
+[scripts.setup.isolated-home]
+command = ".config/nextest/isolated-home.sh"
+
 [profile.default]
 fail-fast = false
 status-level = "slow"
-test-threads = "num-cpus"
 slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.default.scripts]]
+platform = { host = "cfg(unix)" }
+setup = "isolated-home"
 
 [profile.ci]
 test-threads = 64
@@ -10,4 +20,9 @@ test-threads = 64
 # 2001-line restore, ~200ms slices that 63 neighbours on 4 cores stretch past the Lua watchdog's 5s.
 [[profile.ci.overrides]]
 filter = 'test(=restore_expanded_shows_full_script_beyond_cap)'
+threads-required = 'num-test-threads'
+
+# One 64 MiB line goes through a single Lua slice, which 63 neighbours on 4 cores stretch past the Lua watchdog's 5s.
+[[profile.ci.overrides]]
+filter = 'test(=bash_full_mode_fails_once_output_passes_the_ceiling)'
 threads-required = 'num-test-threads'

@@ -1,34 +1,290 @@
 use std::future::Future;
+use std::iter;
+use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use flume::Receiver;
+use arc_swap::ArcSwap;
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
-use maki_providers::{ThinkingConfig, Timeouts};
+use maki_providers::{Message, RequestOptions, ThinkingConfig, Timeouts};
+#[cfg(test)]
+use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
 use serde_json::Value;
-use smol::lock::Mutex;
-use tracing::error;
+use tokio::sync::Mutex;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::{oneshot, watch};
+use tokio::time::{sleep_until, timeout};
+use tokio_util::task::AbortOnDropHandle;
+use tracing::{error, warn};
 
-use crate::agent::{self, RunContext, RunContextBuilder};
-use crate::cancel::{CancelMap, CancelToken};
+use crate::agent::{self, HostPrompt, RunContext, RunContextBuilder};
+use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedPrompts;
 use crate::session::{Resumed, SessionTrack};
 use crate::template;
-use crate::tools::{FileAccess, LocalTools, RequestSpec, RequestTools, ToolAudience, ToolRegistry};
+use crate::tools::{
+    BackgroundFor, FileAccess, LocalTools, RequestSpec, RequestTools, ToolAudience, ToolRegistry,
+};
 use crate::types::EventSender;
 use crate::{
-    Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, EventStreamGuard,
-    ImageSource, InputSource, McpHandle, McpSession, PermissionsConfig, SessionEvents,
-    SessionMailbox, ToolDeferral, ToolOutputLines, event_stream,
+    Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentSeed,
+    EventStreamGuard, McpHandle, McpSession, ModelSlot, PermissionsConfig, RunLedger, RunTotals,
+    SessionEvents, SessionMailbox, ToolDeferral, ToolOutputLines, event_stream,
 };
 
 const SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const UNREPORTED_HEAD: &str = "background task result(s) never reached the model before";
+const UNREPORTED_TAIL: &str = "Tasks still running are stopped, and resuming this session \
+     tells the model their results are lost.";
+const LAPSED_CAUSE: &str = "--background-timeout ran out";
+const STOPPED_CAUSE: &str = "maki was interrupted";
+const FAILED_CAUSE: &str = "the last run failed";
+
+/// What a session does with tool calls that move off their turn.
+#[derive(Clone, Debug)]
+pub enum BackgroundMode {
+    /// No seed is published, so nothing can move and every call blocks.
+    Blocking,
+    /// Results ride the next prompt. Closing the session stops the work.
+    Detached,
+    /// Like [`Self::Detached`], and once the input ends the session stays up
+    /// to this long, running a turn for each result that wakes it.
+    KeepAlive(Duration),
+}
+
+impl BackgroundMode {
+    /// `None` is a zero `--background-timeout`: background work is off.
+    pub fn from_wait(wait: Option<Duration>) -> Self {
+        wait.map_or(Self::Blocking, Self::KeepAlive)
+    }
+
+    fn seeded(&self) -> bool {
+        !matches!(self, Self::Blocking)
+    }
+}
+
+/// Registered before the first run, so the receipts a stored session left
+/// unsettled come back as lost notices that run reads.
+fn open_mailbox(resumed: &Resumed) -> SessionMailbox {
+    let mailbox = SessionMailbox::register(resumed.id.id());
+    if let Some(session) = &resumed.session {
+        mailbox.restore_lost(&session.meta.pending_background, session.messages());
+    }
+    mailbox
+}
+
+/// The registry holds the seed weakly, so the caller keeps it for the
+/// session's life. Without one no call can move.
+fn publish_seed(
+    mailbox: &SessionMailbox,
+    background: &BackgroundMode,
+    seed: impl FnOnce() -> AgentSeed,
+) -> Option<Arc<AgentSeed>> {
+    background.seeded().then(|| mailbox.publish_seed(seed()))
+}
+
+/// Background work reads the chat's thinking and mode from the seed, and a
+/// run's input is the chat's latest word on both.
+fn adopt_chat_settings(seed: Option<&AgentSeed>, input: &AgentInput) {
+    if let Some(seed) = seed {
+        let opts = RequestOptions {
+            thinking: input.thinking,
+            fast: input.fast,
+        };
+        seed.set_chat_settings(opts, &input.mode);
+    }
+}
+
+fn warn_unreported(unreported: usize, cause: &str) {
+    warn!(unreported, cause, "background results unreported");
+    if unreported > 0 {
+        eprintln!("warning: {unreported} {UNREPORTED_HEAD} {cause}. {UNREPORTED_TAIL}");
+    }
+}
+
+/// Holds a session open once its input ends while background work is out,
+/// so each result can still wake the model. One deadline covers the whole
+/// wait, so a chain of wakes cannot keep the process up for good.
+struct KeepAlive {
+    mailbox: SessionMailbox,
+    /// `None` when the session ends with its input.
+    wait: Option<Duration>,
+    deadline: Option<Instant>,
+    next: AfterInput,
+}
+
+/// What the session does once its input ends.
+enum AfterInput {
+    End,
+    /// Wakes turns under the last run's settings.
+    Wake(AgentInput),
+    /// Ends, warning about what never reached the model.
+    Fail,
+}
+
+impl KeepAlive {
+    fn new(mailbox: SessionMailbox, background: BackgroundMode) -> Self {
+        let wait = match background {
+            BackgroundMode::KeepAlive(wait) => Some(wait),
+            BackgroundMode::Blocking | BackgroundMode::Detached => None,
+        };
+        Self {
+            mailbox,
+            wait,
+            deadline: None,
+            next: AfterInput::End,
+        }
+    }
+
+    fn follow(&mut self, input: &AgentInput) {
+        if self.wait.is_some() {
+            self.next = AfterInput::Wake(woken_input(input));
+        }
+    }
+
+    /// Nobody is left to retry a run that failed once the input ends, and a
+    /// woken turn would most likely fail the same way. A later prompt arms
+    /// the keep-alive again.
+    fn fail(&mut self) {
+        if matches!(self.next, AfterInput::Wake(_)) {
+            self.next = AfterInput::Fail;
+        }
+    }
+
+    /// The host switched after the last run, so a woken turn runs in the
+    /// mode it switched to.
+    fn switch_mode(&mut self, mode: AgentMode) {
+        if let AfterInput::Wake(next) = &mut self.next {
+            next.mode = mode;
+        }
+    }
+
+    /// The notices of the next wake, or `None` once nothing is out and
+    /// nothing woke, or the deadline passed.
+    async fn wake(&mut self) -> Option<Vec<Message>> {
+        let wait = self.wait?;
+        let deadline = *self.deadline.get_or_insert_with(|| Instant::now() + wait);
+        let mailbox = &self.mailbox;
+        // This also counts results that came in but would wake a turn
+        // past the deadline: they die with the process all the same.
+        let lapsed = || {
+            warn_unreported(mailbox.unsettled().len(), LAPSED_CAUSE);
+            None
+        };
+        // Lapsed first: a wake queued during the last turn is ready at once.
+        // A deadline already behind us is checked against the clock, since
+        // the timer only reports it after a trip through the driver.
+        if Instant::now() >= deadline {
+            return lapsed();
+        }
+        tokio::select! {
+            biased;
+            () = sleep_until(deadline.into()) => lapsed(),
+            wake = mailbox.next_wake() => wake,
+        }
+    }
+
+    /// The next woken turn, or `None` once the session may end. What still
+    /// runs at a lapse dies with the process, and the session meta keeps its
+    /// receipts.
+    async fn next_input(&mut self) -> Option<AgentInput> {
+        let mut input = match mem::replace(&mut self.next, AfterInput::End) {
+            AfterInput::End => return None,
+            AfterInput::Fail => {
+                warn_unreported(self.mailbox.unsettled().len(), FAILED_CAUSE);
+                return None;
+            }
+            AfterInput::Wake(input) => input,
+        };
+        input.preamble = self.wake().await?;
+        Some(input)
+    }
+}
+
+enum Next {
+    Prompt(AgentInput),
+    Woken(AgentInput),
+}
+
+impl Next {
+    /// Whether the turn still runs, on the model it had, once a switch
+    /// failed. A prompt's caller has its answer in the error. Woken notices
+    /// are already out of the mailbox, so skipping the turn loses them.
+    fn survives_failed_switch(&self) -> bool {
+        matches!(self, Self::Woken(_))
+    }
+
+    fn into_input(self) -> AgentInput {
+        match self {
+            Self::Prompt(input) | Self::Woken(input) => input,
+        }
+    }
+}
+
+/// Where an interactive session's turns come from.
+struct Inputs {
+    prompts: UnboundedReceiver<AgentInput>,
+    modes: UnboundedReceiver<AgentMode>,
+    keep_alive: KeepAlive,
+    /// Ends the session at once, whatever is still out.
+    stop: CancelToken,
+}
+
+impl Inputs {
+    /// While prompts can come, results ride them and nothing wakes a turn.
+    /// Once they end, the keep-alive wakes turns, in the mode the host last
+    /// switched to. Every prompt carries the mode current when it was sent,
+    /// so the last switch is never older than the last prompt.
+    ///
+    /// The stop wins over an input that is ready in the same poll, so a
+    /// stopped session never takes notices it would not deliver.
+    async fn next(&mut self) -> Option<Next> {
+        let stop = self.stop.clone();
+        let next = async {
+            if let Some(input) = self.prompts.recv().await {
+                return Some(Next::Prompt(input));
+            }
+            if let Some(mode) = iter::from_fn(|| self.modes.try_recv().ok()).last() {
+                self.keep_alive.switch_mode(mode);
+            }
+            self.keep_alive.next_input().await.map(Next::Woken)
+        };
+        tokio::select! {
+            biased;
+            () = stop.cancelled() => None,
+            next = next => next,
+        }
+    }
+
+    /// What never reached the model dies with the process once stopped.
+    fn warn_if_stopped(&self) {
+        if self.stop.is_cancelled() {
+            warn_unreported(self.keep_alive.mailbox.unsettled().len(), STOPPED_CAUSE);
+        }
+    }
+}
+
+/// Nobody prompted this turn: the notices it is woken with are all it says.
+fn woken_input(like: &AgentInput) -> AgentInput {
+    AgentInput {
+        message: String::new(),
+        mode: like.mode.clone(),
+        images: Vec::new(),
+        preamble: Vec::new(),
+        earlier: Vec::new(),
+        thinking: like.thinking,
+        fast: like.fast,
+        workflow: like.workflow,
+        prompt: None,
+        source: like.source,
+    }
+}
 
 /// Resolve a provider, or report the failure on the event stream and let the
 /// caller give up. Every site that reaches a provider comes through here, so a
@@ -43,49 +299,54 @@ async fn connect(
         Ok(p) => Some(Arc::from(p)),
         Err(e) => {
             error!(error = %e, "provider error");
-            let _ = event_tx.send(AgentEvent::error(&e));
+            let _ = event_tx.send(AgentEvent::error(&e, RunTotals::default()));
             None
         }
     }
 }
 
-pub struct HeadlessParams {
-    pub shutdown: CancelToken,
-    pub dry_run: bool,
-    pub model: Model,
-    pub config: AgentConfig,
-    pub permissions_config: PermissionsConfig,
-    pub timeouts: Timeouts,
-    pub prompt: String,
-    pub images: Vec<ImageSource>,
-    pub prompt_slots: ResolvedPrompts,
-    pub excluded_tools: Vec<&'static str>,
-    pub mcp_handle: Option<McpHandle>,
-    pub initial_wd: PathBuf,
-    pub resumed: Resumed,
-    /// The right to write [`Self::resumed`]'s session, taken before its
-    /// transcript was read.
-    pub claim: SessionClaim,
-    /// Launch defaults after CLI, config and saved-state precedence. The model
-    /// gate stays in `RequestOptions::clamped`.
-    pub defaults: SessionDefaults,
-    pub model_policy: Arc<ModelPolicy>,
-    pub plugin_rules: Arc<PluginRuleStore>,
-    pub project_config: ProjectConfig,
+/// Whether the current model has heard back from its provider's listing.
+enum Listing {
+    Due,
+    Answered,
 }
+
+/// Runs under a turn's cancel, so a host's cancel ends this wait and that turn
+/// instead of being dropped as meant for the turn before. A cancelled wait stays
+/// due, so the next turn lists it.
+async fn await_listing(model: &Model, provider: &dyn Provider, cancel: &CancelToken) -> Listing {
+    let Ok(answer) = cancel
+        .race(provider::discover_provider(model, provider))
+        .await
+    else {
+        return Listing::Due;
+    };
+    if let Err(e) = answer {
+        warn!(provider = %model.provider, error = %e, "failed to list models, using static fallback");
+        eprintln!("warning: {}: {e} (using static fallback)", model.provider);
+    }
+    Listing::Answered
+}
+
+/// What a session task ends with, before its MCP is torn down: the track
+/// is out of the task whatever that teardown does, so it never drops on an
+/// executor thread after the caller stopped looking.
+#[derive(Default)]
+pub struct SessionEnd {
+    /// `None` when no provider connected. Drop it once the session's
+    /// background work is stopped: that writes what the work spent after the
+    /// last turn.
+    pub track: Option<SessionTrack>,
+    mcp: Option<McpHandle>,
+}
+
+pub type SessionTask = AbortOnDropHandle<SessionEnd>;
 
 /// Provider-adjusted startup metadata, matching the first request's capabilities.
 pub struct Ready {
     pub model: Model,
     pub tool_names: Vec<String>,
     pub thinking: String,
-}
-
-pub struct HeadlessHandle {
-    pub ready: Receiver<Ready>,
-    pub session_id: SessionRef,
-    pub cwd: String,
-    pub task: smol::Task<()>,
 }
 
 /// Read once at startup. A headless host has no `/cd` and its slots come from
@@ -98,8 +359,8 @@ struct ContextSpec {
     local_tools: LocalTools,
     excluded_tools: Vec<&'static str>,
     mcp: bool,
-    system_override: Option<String>,
-    append_system: Option<String>,
+    background: bool,
+    host_prompt: HostPrompt,
 }
 
 impl ContextSpec {
@@ -122,8 +383,8 @@ impl ContextSpec {
             local_tools,
             excluded_tools,
             mcp: mcp.is_some(),
-            system_override: None,
-            append_system: None,
+            background: true,
+            host_prompt: HostPrompt::default(),
         }
     }
 
@@ -146,6 +407,7 @@ impl ContextSpec {
             model,
             &self.config,
             RequestSpec {
+                background: self.background,
                 excluded: &self.excluded_tools,
                 workflow,
                 mcp: self.mcp,
@@ -155,19 +417,8 @@ impl ContextSpec {
 
     fn render(&self, model: &Model, workflow: bool) -> RunContext {
         let tools = self.tools(model, workflow);
-        let mut context = match &self.system_override {
-            Some(system) => {
-                RunContext::fixed(system.clone(), tools).with_prompt_policy(&self.slots)
-            }
-            None => RunContext::render(&self.vars, &self.instructions, &self.slots, model, tools),
-        };
-        if let Some(append) = &self.append_system {
-            for text in [&mut context.system, &mut context.authored] {
-                text.push('\n');
-                text.push_str(append);
-            }
-        }
-        context
+        self.host_prompt
+            .context(&self.vars, &self.instructions, &self.slots, model, tools)
     }
 
     fn builder(self) -> RunContextBuilder {
@@ -183,114 +434,7 @@ fn advertised_tool_names(tools: &RequestTools, mcp: Option<&McpSession>) -> Vec<
     extract_tool_names(&agent::request_tools(tools, mcp, ToolDeferral::Client))
 }
 
-pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
-    let working_dir = params.initial_wd.to_string_lossy().into_owned();
-    let mode = AgentMode::Build;
-    let vars = template::env_vars();
-    let instructions = agent::load_instructions(&vars.apply("{cwd}"));
-    let prompt_slots = Arc::new(params.prompt_slots);
-    let spec = ContextSpec::new(
-        vars,
-        &instructions,
-        Arc::clone(&prompt_slots),
-        params.config.clone(),
-        params.excluded_tools,
-        params.mcp_handle.as_ref(),
-        LocalTools::default(),
-    );
-    let mcp = params
-        .mcp_handle
-        .clone()
-        .map(|h| McpSession::new(h, &params.resumed.history));
-
-    let (guard, events) = event_stream();
-    let event_tx = guard.sender(0);
-
-    let session_ref = params.resumed.id.clone();
-    let mailbox = SessionMailbox::register(session_ref.id());
-    let run_session_ref = session_ref.clone();
-    let defaults = params.defaults;
-    let working_dir_path = params.initial_wd.clone();
-    let task_working_dir = working_dir.clone();
-    let token = params.shutdown;
-    let (ready_tx, ready_rx) = flume::bounded(1);
-    let task = smol::spawn(run_session(guard, params.mcp_handle.clone(), async move {
-        let mut model = params.model;
-        let provider = connect(&mut model, params.timeouts, &event_tx).await;
-        let Some(provider) = provider else {
-            return;
-        };
-        let _ = ready_tx.send(spec.ready(&model, params.defaults, mcp.as_ref()));
-        if params.dry_run {
-            return;
-        }
-        let context = spec.builder();
-        let mut track = SessionTrack::open(params.resumed, params.claim, &task_working_dir);
-
-        let error_tx = event_tx.clone();
-        let input = AgentInput::from_defaults(
-            params.prompt,
-            mode,
-            params.images,
-            defaults,
-            InputSource::Headless,
-        );
-        // Outlives `agent`, so dropping it writes the transcript once the agent
-        // that produced it is gone, without this body saying so.
-        let mut turn = track.turn(model.spec(), &input);
-        let mut agent = Agent::new(
-            AgentParams {
-                provider,
-                model: model.clone(),
-                config: params.config,
-                tool_output_lines: ToolOutputLines::default(),
-                permissions: Arc::new(PermissionManager::new(
-                    params.permissions_config,
-                    working_dir_path,
-                    params.project_config,
-                    params.plugin_rules,
-                )),
-                session_id: Some(run_session_ref),
-                background_for: None,
-                task_id: None,
-                mailbox: Some(mailbox),
-                timeouts: params.timeouts,
-                file_access: FileAccess::fresh(),
-                prompt_slots: Arc::clone(&prompt_slots),
-                subagent_cancels: Arc::new(CancelMap::new()),
-                ledger: turn.ledger(),
-                registry: Arc::clone(ToolRegistry::global_arc()),
-                audience: ToolAudience::MAIN,
-                model_policy: Arc::clone(&params.model_policy),
-            },
-            turn.run_params(event_tx, context),
-        )
-        .with_cancel(token)
-        .with_loaded_instructions(instructions.loaded)
-        .with_mcp(mcp);
-
-        let result = agent.run(input).await;
-        drop(agent);
-
-        if let Err(e) = result {
-            turn.record_error(e.to_string());
-            error!(error = %e, "agent error");
-            let _ = error_tx.send(AgentEvent::error(&e));
-        }
-    }));
-    (
-        HeadlessHandle {
-            ready: ready_rx,
-            session_id: session_ref,
-            cwd: working_dir,
-            task,
-        },
-        events,
-    )
-}
-
 pub struct InteractiveParams {
-    pub shutdown: CancelToken,
     pub model: Model,
     pub config: AgentConfig,
     pub permissions_config: PermissionsConfig,
@@ -300,11 +444,14 @@ pub struct InteractiveParams {
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
     pub resumed: Resumed,
-    /// See [`HeadlessParams::claim`].
+    /// The right to write [`Self::resumed`]'s session, taken before its
+    /// transcript was read.
     pub claim: SessionClaim,
     pub yolo: bool,
-    pub system_prompt_override: Option<String>,
-    pub append_system_prompt: Option<String>,
+    /// Nobody answers permission prompts, so they are denied at once instead
+    /// of waiting forever.
+    pub unattended: bool,
+    pub host_prompt: HostPrompt,
     /// Resolved launch defaults. `workflow` picks the tool catalog here; the rest
     /// are what a host without toggles puts on every [`AgentInput`] it sends.
     pub defaults: SessionDefaults,
@@ -314,25 +461,49 @@ pub struct InteractiveParams {
     /// Host-side overrides that shadow a registered tool's execution while
     /// keeping its advertised schema (e.g. ACP answers `question` via elicitation).
     pub local_tools: LocalTools,
+    /// While input is open, results ride the next prompt. Only
+    /// [`BackgroundMode::KeepAlive`] wakes the model on its own, and only once
+    /// the input has ended.
+    pub background: BackgroundMode,
+    /// Firing it cancels the run in flight and ends the session without
+    /// waiting for background work. Prompts still queued never run.
+    pub stop: CancelToken,
 }
 
 pub struct InteractiveHandle {
-    pub ready: Receiver<Ready>,
-    pub input_tx: flume::Sender<AgentInput>,
-    pub answer_tx: flume::Sender<String>,
-    pub cancel_tx: flume::Sender<()>,
-    pub model_tx: flume::Sender<Model>,
+    pub input_tx: UnboundedSender<AgentInput>,
+    pub answer_tx: UnboundedSender<String>,
+    pub cancel_tx: watch::Sender<()>,
+    pub model_tx: UnboundedSender<Model>,
+    /// Send through [`Self::switch_mode`], which also tells background work.
+    pub mode_tx: UnboundedSender<AgentMode>,
+    pub ready: oneshot::Receiver<Ready>,
     pub session_id: SessionRef,
     pub permissions: Arc<PermissionManager>,
-    pub task: smol::Task<()>,
+    pub task: SessionTask,
+    /// What the session spends in this process, background work included.
+    /// Final once that work is stopped.
+    pub spend: Arc<RunLedger>,
+}
+
+impl InteractiveHandle {
+    /// A switch between prompts reaches background work at once, so a switch
+    /// to plan mode blocks its next write, and a turn that work wakes once
+    /// the input ended runs in the new mode.
+    pub fn switch_mode(&self, mode: AgentMode) {
+        if let Some(seed) = AgentSeed::live(self.session_id.id()) {
+            seed.set_chat_settings(seed.chat_opts(), &mode);
+        }
+        let _ = self.mode_tx.send(mode);
+    }
 }
 
 pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, SessionEvents) {
     let vars = template::env_vars();
-    let instructions = agent::load_instructions(&vars.apply("{cwd}"));
+    let instructions = agent::load_instructions(&vars.apply("{cwd}"), &params.config.instructions);
     let spec = ContextSpec {
-        system_override: params.system_prompt_override,
-        append_system: params.append_system_prompt,
+        host_prompt: params.host_prompt,
+        background: params.background.seeded(),
         ..ContextSpec::new(
             vars,
             &instructions,
@@ -350,13 +521,14 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 
     let (guard, events) = event_stream();
     let base_tx = guard.sender(0);
-    let (input_tx, input_rx) = flume::unbounded::<AgentInput>();
-    let (answer_tx, answer_rx) = flume::unbounded::<String>();
-    let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
-    let (model_tx, model_rx) = flume::unbounded::<Model>();
+    let (input_tx, input_rx) = unbounded_channel::<AgentInput>();
+    let (answer_tx, answer_rx) = unbounded_channel::<String>();
+    let (cancel_tx, cancel_rx) = watch::channel(());
+    let (model_tx, mut model_rx) = unbounded_channel::<Model>();
+    let (mode_tx, mode_rx) = unbounded_channel::<AgentMode>();
 
     let session_ref = params.resumed.id.clone();
-    let mailbox = SessionMailbox::register(session_ref.id());
+    let mailbox = open_mailbox(&params.resumed);
 
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let mut permissions_config = params.permissions_config;
@@ -369,33 +541,54 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     ));
 
     let answer_rx = Arc::new(Mutex::new(answer_rx));
-    let file_access = FileAccess::fresh();
 
     let session_ref_clone = session_ref.clone();
     let task_permissions = Arc::clone(&permissions);
-    let (ready_tx, ready_rx) = flume::bounded(1);
-    let task = smol::spawn(run_session(guard, params.mcp_handle.clone(), async move {
+    let spend = Arc::<RunLedger>::default();
+    let track_spend = Arc::clone(&spend);
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let task = tokio::spawn(run_session(guard, params.mcp_handle.clone(), async move {
         let mut model = params.model;
-        let provider = connect(&mut model, params.timeouts, &base_tx).await;
-        let Some(mut provider) = provider else {
-            return;
-        };
+        let mut provider = connect(&mut model, params.timeouts, &base_tx).await?;
         let _ = ready_tx.send(spec.ready(&model, params.defaults, mcp.as_ref()));
         let context = spec.builder();
-        let mut track = SessionTrack::open(params.resumed, params.claim, &working_dir);
+        let mut track = SessionTrack::open(
+            params.resumed,
+            params.claim,
+            mailbox.clone(),
+            track_spend,
+            &working_dir,
+        );
+        let seed = publish_seed(&mailbox, &params.background, || {
+            AgentSeed::new(
+                session_ref_clone.clone(),
+                Arc::new(ArcSwap::from_pointee(ModelSlot {
+                    model: model.clone(),
+                    provider: Arc::clone(&provider),
+                })),
+                params.config.clone(),
+                ToolOutputLines::default(),
+                Arc::clone(&task_permissions),
+                mcp.clone(),
+                params.timeouts,
+                Arc::clone(&params.model_policy),
+            )
+        });
+        let file_access = seed
+            .as_ref()
+            .map_or_else(FileAccess::fresh, |seed| Arc::clone(&seed.file_access));
+        let mut inputs = Inputs {
+            prompts: input_rx,
+            modes: mode_rx,
+            keep_alive: KeepAlive::new(mailbox.clone(), params.background),
+            stop: params.stop.clone(),
+        };
         let mut run_id: u64 = 0;
+        let mut listing = Listing::Due;
 
-        while let Ok(Ok(input)) = params.shutdown.race(input_rx.recv_async()).await {
-            let (trigger, cancel) = CancelToken::new();
-            let cancel_task = smol::spawn({
-                let cancel_rx = cancel_rx.clone();
-                let shutdown = params.shutdown.clone();
-                async move {
-                    if !matches!(shutdown.race(cancel_rx.recv_async()).await, Ok(Err(_))) {
-                        trigger.cancel();
-                    }
-                }
-            });
+        while let Some(next) = inputs.next().await {
+            let (trigger, cancel) = params.stop.child();
+            let cancel_task = relay_cancel(&cancel_rx, trigger);
 
             // MCP connects in the background, so a prompt that beats it waits
             // here instead of shipping a turn without the MCP tools. The wait
@@ -407,22 +600,50 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             let event_tx = base_tx.with_run_id(run_id);
             let error_tx = event_tx.clone();
 
-            if let Some(mut new_model) = model_rx
-                .try_iter()
+            if let Some(mut new_model) = iter::from_fn(|| model_rx.try_recv().ok())
                 .last()
                 .filter(|candidate| params.model_policy.allows(&candidate.spec()))
                 && new_model.spec() != model.spec()
             {
-                let Some(switched) = connect(&mut new_model, params.timeouts, &error_tx).await
-                else {
-                    run_id += 1;
-                    continue;
-                };
-                provider = switched;
-                model = new_model;
+                match connect(&mut new_model, params.timeouts, &error_tx).await {
+                    Some(switched) => {
+                        provider = switched;
+                        model = new_model;
+                        listing = Listing::Due;
+                    }
+                    None if !next.survives_failed_switch() => {
+                        run_id += 1;
+                        continue;
+                    }
+                    None => {}
+                }
+            }
+            if matches!(listing, Listing::Due) {
+                listing = await_listing(&model, provider.as_ref(), &cancel).await;
+            }
+            // The host or another session can discover the provider long after
+            // our own listing gave up, so every turn reads the registry again.
+            provider::refresh_model(&mut model, provider.as_ref());
+            // Plugin work started off the seed must run on this turn's model.
+            if let Some(seed) = &seed {
+                seed.model_slot.store(Arc::new(ModelSlot {
+                    model: model.clone(),
+                    provider: Arc::clone(&provider),
+                }));
+            }
+            let input = next.into_input();
+
+            // An ask holds this lock from before its request goes out until
+            // its answer lands, so a free lock means nothing queued has a
+            // taker. A call moved to the background can still be parked on
+            // it after its run ended: then whatever is queued may be its
+            // answer, and the new run must not wait for it to arrive.
+            if let Ok(mut answers) = answer_rx.try_lock() {
+                while answers.try_recv().is_ok() {}
             }
 
-            while answer_rx.lock().await.try_recv().is_ok() {}
+            adopt_chat_settings(seed.as_deref(), &input);
+            inputs.keep_alive.follow(&input);
 
             // Outlives `agent`, so this turn is on disk before the next prompt
             // is read, without the loop body remembering to write it.
@@ -435,7 +656,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                     tool_output_lines: ToolOutputLines::default(),
                     permissions: Arc::clone(&task_permissions),
                     session_id: Some(session_ref_clone.clone()),
-                    background_for: None,
+                    background_for: BackgroundFor::None,
                     task_id: None,
                     mailbox: Some(mailbox.clone()),
                     timeouts: params.timeouts,
@@ -443,30 +664,34 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                     prompt_slots: Arc::clone(&params.prompt_slots),
                     subagent_cancels: Arc::new(CancelMap::new()),
                     ledger: turn.ledger(),
-                    registry: Arc::clone(ToolRegistry::global_arc()),
                     audience: ToolAudience::MAIN,
                     model_policy: Arc::clone(&params.model_policy),
                 },
                 turn.run_params(event_tx, Arc::clone(&context)),
             )
-            .with_loaded_instructions(instructions.loaded.clone())
-            .with_user_response_rx(Arc::clone(&answer_rx))
+            .with_loaded_instructions(instructions.loaded.clone(), instructions.files.clone())
             .with_cancel(cancel)
             .with_local_tools(Arc::clone(&params.local_tools))
             .with_mcp(mcp.clone());
+            if !params.unattended {
+                agent = agent.with_user_response_rx(Arc::clone(&answer_rx));
+            }
 
             let result = agent.run(input).await;
             drop(agent);
-            cancel_task.cancel().await;
+            cancel_task.abort();
+            let _ = cancel_task.await;
 
             if let Err(ref e) = result {
-                turn.record_error(e.to_string());
                 error!(error = %e, "agent error");
-                let _ = error_tx.send(AgentEvent::error(e));
+                let _ = error_tx.send(AgentEvent::error(e, turn.ledger().totals()));
+                inputs.keep_alive.fail();
             }
 
             run_id += 1;
         }
+        inputs.warn_if_stopped();
+        Some(track)
     }));
 
     (
@@ -476,37 +701,58 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             answer_tx,
             cancel_tx,
             model_tx,
+            mode_tx,
             session_id: session_ref,
             permissions,
-            task,
+            task: AbortOnDropHandle::new(task),
+            spend,
         },
         events,
     )
 }
 
-/// Waits for a session task that has nothing left to do but tear MCP down,
-/// dropping it if that wedges. Safe to bound: the event stream already ended
-/// (see [`run_session`]), and dropping the task cannot resurrect it.
-pub async fn await_shutdown(task: smol::Task<()>) {
-    futures_lite::future::or(task, async {
-        smol::Timer::after(SESSION_SHUTDOWN_TIMEOUT).await;
-    })
-    .await;
+/// Fires the turn's token on the host's next cancel. Whatever is in the
+/// channel when a turn starts was sent while none ran, so it is dropped as
+/// meant for the turn before. Prompt and cancel ride separate channels, so a
+/// cancel sent right after a prompt, before the loop picked that prompt up,
+/// is dropped with it.
+fn relay_cancel(cancel_rx: &watch::Receiver<()>, trigger: CancelTrigger) -> AbortOnDropHandle<()> {
+    let mut cancel_rx = cancel_rx.clone();
+    cancel_rx.mark_unchanged();
+    AbortOnDropHandle::new(tokio::spawn(async move {
+        if cancel_rx.changed().await.is_ok() {
+            trigger.cancel();
+        }
+    }))
 }
 
-/// Runs a session body, ends its event stream, then tears MCP down. The stream
-/// ends with the run and not with teardown: a wedged shutdown must not keep a
-/// consumer waiting for events that can no longer come.
+/// Waits for a session task, then tears its MCP down. The task itself is
+/// never bounded: one with work left would drop prompts stdin already queued.
+pub async fn await_shutdown(task: SessionTask) -> Option<SessionTrack> {
+    task.await.expect("session task panicked").shut_down().await
+}
+
+impl SessionEnd {
+    /// Gives up on a teardown that wedges. The track comes back either way.
+    async fn shut_down(self) -> Option<SessionTrack> {
+        if let Some(mcp) = self.mcp {
+            let _ = timeout(SESSION_SHUTDOWN_TIMEOUT, mcp.shutdown()).await;
+        }
+        self.track
+    }
+}
+
+/// Runs a session body and ends its event stream with it. Teardown is
+/// [`await_shutdown`]'s: a wedged shutdown must neither keep a consumer
+/// waiting for events that can no longer come nor hold on to the track.
 async fn run_session(
     guard: EventStreamGuard,
-    mcp_handle: Option<McpHandle>,
-    body: impl Future<Output = ()>,
-) {
-    body.await;
+    mcp: Option<McpHandle>,
+    body: impl Future<Output = Option<SessionTrack>>,
+) -> SessionEnd {
+    let track = body.await;
     drop(guard);
-    if let Some(handle) = mcp_handle {
-        handle.shutdown().await;
-    }
+    SessionEnd { track, mcp }
 }
 
 fn extract_tool_names(tools: &Value) -> Vec<String> {
@@ -522,24 +768,313 @@ fn extract_tool_names(tools: &Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::future::{pending, ready};
     use std::pin::pin;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use futures_lite::future::poll_once;
+    use futures::FutureExt;
+    use maki_config::project::{self, TrustMode};
+    use maki_config::providers::Protocol;
+    use maki_providers::model::ModelTier;
+    use maki_providers::model_registry;
+    use maki_providers::plugin::{
+        self, DeclAuthority, Hook, ProviderDecl, ProviderHooks, Registration,
+    };
+    use maki_providers::provider::{BoxFuture, ModelListing, RequestScope};
+    use maki_providers::{AgentError, ModelInfo, ProviderEvent, StreamResponse};
+    use maki_storage::id::MakiId;
+    use tempfile::TempDir;
     use test_case::test_case;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::mpsc::unbounded_channel;
+    use tokio::sync::oneshot;
+    use tokio::task::yield_now;
 
     use super::*;
+    use crate::live_session::BACKGROUND_PLAN_WRITE_DENIED;
     use crate::mcp::McpCommand;
     use crate::prompt::{PromptId, Slot, SlotEntry};
+    use crate::session::StoredSession;
+    use crate::tools::test_support::stub_seed;
+    use crate::{BackgroundNotice, InputSource, TaskEnd};
 
     const RUN_ID: u64 = 7;
+    const TASK_ID: &str = "toolu_bg";
+    const NOTICE_BODY: &str = "build finished";
+    const PROMPT: &str = "start the build";
+    const PLAN_PATH: &str = "/project/plan.md";
+    const CWD: &str = "/project";
+    const LONG_WAIT: Duration = Duration::from_secs(3600);
+    const WAITS_FOR_WORK: &str = "the keep-alive must wait while a receipt is outstanding";
+    const ENDS_WHEN_IDLE: &str = "nothing out and nothing woke: the session may end";
+    const KEPT_FOR_META: &str = "a lapsed task stays unsettled, so the session meta keeps it";
     const STREAM_ENDED: &str = "the stream must end with the run, not with teardown";
-    const SHUTDOWN_WEDGED: &str = "the MCP shutdown must still be waiting for its ack";
+    const SHUTDOWN_WEDGED: &str = "shutting down must send the MCP shutdown and wait for its ack";
+    const TEARDOWN_AFTER_TRACK: &str =
+        "MCP teardown must not start before the task hands back its track";
+    const TRACK_RETURNED: &str = "shutting down must hand back the track";
     const PROVIDER_ERROR: &str = "provider error";
     const BODY_EVENT: &str = "the body's event must be delivered before the close";
     const STILL_WORKING: &str = "await_shutdown must not return while the task still works";
     const TASK_DROPPED: &str = "await_shutdown dropped a task that had work left";
+    const PROMPT_ARRIVES: &str = "a sent prompt is the next input";
+    const PROMPT_ANSWERED_BY_ERROR: &str = "a failed switch answers a prompt with its error";
+    const NO_WAKE_WHILE_OPEN: &str = "a result must ride the next prompt while input is open";
+    const WAKES_AFTER_INPUT_END: &str = "a waking result runs a turn once the input ended";
+    const WOKEN_NOTICES_KEPT: &str = "a woken turn's notices must survive a failed switch";
+    const RUNS_IN_CURRENT_MODE: &str = "a woken turn must run in the mode the host switched to";
+    const STOP_ENDS_SESSION: &str = "a stop must end the session without another turn";
+    const FAILED_RUN_ENDS_SESSION: &str = "a failed run must not be woken once the input ended";
+    const STALE_CANCEL_IGNORED: &str = "a cancel sent before the turn started must not end it";
+    const LIVE_CANCEL_ENDS_TURN: &str = "a cancel sent during the turn must end it";
+    const DROPPED_RELAY_FREES_CHANNEL: &str =
+        "a dropped relay must not take the next turn's cancel";
+    const RELAY_WAIT: Duration = Duration::from_secs(5);
     const MODEL_SPEC: &str = "anthropic/claude-sonnet-4-5";
+    const LISTED_PROVIDER: &str = "copilot";
+    const LISTED_MODEL: &str = "listed-model";
+    const UNLISTED_MODEL: &str = "unlisted-model";
+    const NEVER_LISTED_PROVIDER: &str = "ollama";
+    const LISTED_WINDOW: u32 = 123_456;
+    const LISTING_FAILED: &str = "no listing";
+    const ONLY_LISTS_MODELS: &str = "only asked for its models";
+    const LISTING_WAITS: &str = "a hung listing holds the turn until it is cancelled";
+    const ANSWERING_SLUG: &str = "answering";
+    const HANGING_SLUG: &str = "hanging";
+    const FAILING_SLUG: &str = "failing";
+    const PLUGIN_ORIGIN: &str = "https://example.com";
+    const PLUGIN_HOST: &str = "example.com";
+    const LISTED_ONCE: &str = "an answered listing must not be asked again for the same model";
+    const LISTING_DUE: &str = "a switch and a cancelled wait must each list before the turn";
+    const TURN_ENDS: &str = "a turn must end by itself or on a cancel";
+    const SEED_PUBLISHED: &str = "a detached session publishes its seed";
+    const DISCOVERY_HEALS: &str =
+        "discovery that lands after a failed listing reaches the next turn";
+
+    type Listed = BoxFuture<'static, Result<Vec<ModelInfo>, AgentError>>;
+
+    struct ListingProvider(fn() -> Listed);
+
+    impl Provider for ListingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _model: &'a Model,
+            _messages: &'a [Message],
+            _system: &'a str,
+            _tools: &'a Value,
+            _event_tx: &'a UnboundedSender<ProviderEvent>,
+            _opts: RequestOptions,
+            _scope: RequestScope<'a>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            unreachable!("{ONLY_LISTS_MODELS}")
+        }
+
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            (self.0)()
+        }
+    }
+
+    fn lists_window() -> Listed {
+        Box::pin(ready(Ok(vec![ModelInfo {
+            context_window: Some(LISTED_WINDOW),
+            ..ModelInfo::id_only(LISTED_MODEL.into())
+        }])))
+    }
+
+    fn fails() -> Listed {
+        Box::pin(ready(Err(AgentError::Config {
+            message: LISTING_FAILED.into(),
+        })))
+    }
+
+    fn hangs() -> Listed {
+        Box::pin(pending())
+    }
+
+    #[test_case(lists_window ; "a_listing_answers")]
+    #[test_case(fails ; "a_failed_listing_is_an_answer_too")]
+    #[tokio::test]
+    async fn an_answered_listing_is_no_longer_due(listing: fn() -> Listed) {
+        let model = Model::from_spec(&format!("{LISTED_PROVIDER}/{LISTED_MODEL}")).unwrap();
+        let answer = await_listing(&model, &ListingProvider(listing), &CancelToken::none()).await;
+        assert!(matches!(answer, Listing::Answered));
+    }
+
+    #[tokio::test]
+    async fn a_cancel_leaves_a_hung_listing_due() {
+        let (trigger, cancel) = CancelToken::new();
+        let model = Model::from_spec(&format!("{NEVER_LISTED_PROVIDER}/{UNLISTED_MODEL}")).unwrap();
+        let provider = ListingProvider(hangs);
+        let mut waiting = pin!(await_listing(&model, &provider, &cancel));
+        assert!(waiting.as_mut().now_or_never().is_none(), "{LISTING_WAITS}");
+        trigger.cancel();
+        assert!(matches!(waiting.await, Listing::Due));
+    }
+
+    struct CalledListing {
+        called: UnboundedSender<()>,
+        listing: fn() -> Listed,
+    }
+
+    impl Hook<(), Vec<ModelInfo>> for CalledListing {
+        fn call(&self, (): ()) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            self.called.send(()).unwrap();
+            (self.listing)()
+        }
+    }
+
+    fn register_listed(slug: &str, listing: fn() -> Listed) -> UnboundedReceiver<()> {
+        let (called, calls) = unbounded_channel();
+        plugin::register(
+            Registration {
+                decl: ProviderDecl {
+                    slug: slug.into(),
+                    display_name: slug.into(),
+                    codec: Some(Protocol::Openai),
+                    base_url: Some(PLUGIN_ORIGIN.into()),
+                    net_hosts: vec![PLUGIN_HOST.into()],
+                    models: vec![
+                        serde_json::from_value(serde_json::json!({
+                            "prefixes": [LISTED_MODEL],
+                            "tier": ModelTier::Strong,
+                        }))
+                        .unwrap(),
+                    ],
+                    ..ProviderDecl::default()
+                },
+                hooks: ProviderHooks {
+                    list_models: Some(Arc::new(CalledListing { called, listing })),
+                    ..ProviderHooks::default()
+                },
+            },
+            DeclAuthority::Config,
+            &[],
+        )
+        .unwrap();
+        calls
+    }
+
+    fn plugin_model(slug: &str) -> Model {
+        Model::from_spec(&format!("{slug}/{LISTED_MODEL}")).unwrap()
+    }
+
+    async fn next_done(events: &mut SessionEvents) {
+        loop {
+            let envelope = timeout(RELAY_WAIT, events.next())
+                .await
+                .expect(TURN_ENDS)
+                .expect(TURN_ENDS);
+            if matches!(envelope.event, AgentEvent::Done { .. }) {
+                return;
+            }
+        }
+    }
+
+    /// A `max_turns` of zero ends every run before it would reach the provider.
+    fn spawn_listing_session(
+        tmp: &TempDir,
+        model: Model,
+        background: BackgroundMode,
+    ) -> (InteractiveHandle, SessionEvents) {
+        let id = MakiId::generate();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        spawn_interactive(InteractiveParams {
+            model,
+            config: AgentConfig {
+                max_turns: Some(0),
+                ..AgentConfig::default()
+            },
+            permissions_config: PermissionsConfig::default(),
+            timeouts: Timeouts::default(),
+            prompt_slots: Arc::default(),
+            excluded_tools: Vec::new(),
+            mcp_handle: None,
+            initial_wd: tmp.path().to_path_buf(),
+            resumed: Resumed::empty(SessionRef::from(id)),
+            claim: SessionClaim::acquire(id, &dir).expect("nothing else holds it"),
+            yolo: false,
+            unattended: true,
+            host_prompt: HostPrompt::default(),
+            defaults: SessionDefaults::default(),
+            model_policy: Arc::default(),
+            plugin_rules: Arc::default(),
+            project_config: project::resolve_noninteractive(tmp.path(), TrustMode::Session)
+                .project_config,
+            local_tools: LocalTools::default(),
+            background,
+            stop: CancelToken::none(),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_session_lists_per_model_and_a_cancel_ends_the_wait() {
+        plugin::begin_load();
+        let answered = register_listed(ANSWERING_SLUG, lists_window);
+        let mut hung = register_listed(HANGING_SLUG, hangs);
+        plugin::commit_load();
+
+        let tmp = TempDir::new().unwrap();
+        let (handle, mut events) =
+            spawn_listing_session(&tmp, plugin_model(ANSWERING_SLUG), BackgroundMode::Blocking);
+
+        for _ in 0..2 {
+            handle.input_tx.send(prompt_in(AgentMode::Build)).unwrap();
+            next_done(&mut events).await;
+        }
+        assert_eq!(answered.len(), 1, "{LISTED_ONCE}");
+
+        handle.model_tx.send(plugin_model(HANGING_SLUG)).unwrap();
+        for _ in 0..2 {
+            handle.input_tx.send(prompt_in(AgentMode::Build)).unwrap();
+            timeout(RELAY_WAIT, hung.recv())
+                .await
+                .expect(LISTING_DUE)
+                .unwrap();
+            handle.cancel_tx.send(()).unwrap();
+            next_done(&mut events).await;
+        }
+    }
+
+    /// #1264: ACP's own discovery often lands seconds after the session's
+    /// listing gave up. The next turn must pick it up instead of keeping the
+    /// fallback window for good.
+    #[tokio::test]
+    async fn a_failed_listing_heals_when_discovery_lands() {
+        plugin::begin_load();
+        let listed = register_listed(FAILING_SLUG, fails);
+        plugin::commit_load();
+
+        let tmp = TempDir::new().unwrap();
+        let (handle, mut events) =
+            spawn_listing_session(&tmp, plugin_model(FAILING_SLUG), BackgroundMode::Detached);
+        let slot_window = || {
+            AgentSeed::live(handle.session_id.id())
+                .expect(SEED_PUBLISHED)
+                .model_slot
+                .load()
+                .model
+                .context_window
+        };
+
+        handle.input_tx.send(prompt_in(AgentMode::Build)).unwrap();
+        next_done(&mut events).await;
+        assert_ne!(slot_window(), LISTED_WINDOW);
+
+        model_registry::set_known_models(
+            FAILING_SLUG,
+            vec![ModelInfo {
+                context_window: Some(LISTED_WINDOW),
+                ..ModelInfo::id_only(LISTED_MODEL.into())
+            }],
+        );
+        handle.input_tx.send(prompt_in(AgentMode::Build)).unwrap();
+        next_done(&mut events).await;
+        assert_eq!(slot_window(), LISTED_WINDOW, "{DISCOVERY_HEALS}");
+        assert_eq!(listed.len(), 1, "{LISTED_ONCE}");
+    }
 
     /// A host-written prompt never had maki's facts in it. If the frame
     /// claimed it did, a later edit would be announced to a model that never
@@ -561,7 +1096,7 @@ mod tests {
             ..Default::default()
         };
         let spec = ContextSpec {
-            system_override: system_override.map(String::from),
+            host_prompt: HostPrompt::new(system_override, None),
             ..ContextSpec::new(
                 template::Vars::new(),
                 &instructions,
@@ -591,7 +1126,7 @@ mod tests {
         let mut prompts = ResolvedPrompts::default();
         prompts.set_template(PromptId::System, PLUGIN_SYSTEM.into());
         let spec = ContextSpec {
-            system_override: explicit.map(String::from),
+            host_prompt: HostPrompt::new(explicit, None),
             ..ContextSpec::new(
                 template::Vars::new(),
                 &agent::Instructions {
@@ -645,74 +1180,389 @@ mod tests {
         assert_eq!(advertised_tool_names(&tools, None), vec!["read"]);
     }
 
-    /// The ordering the SDK exit rests on: the stream ends when the run ends,
-    /// not when MCP teardown does. The handle here takes the `Shutdown` and
-    /// never acks it, so the session future is still parked on its own timeout
-    /// while the consumer already has the body's error and the end of the
-    /// stream. The retained sender is the Lua tool context an idle VM never
-    /// collects.
-    #[test]
-    fn stream_ends_with_the_run_not_with_mcp_teardown() {
+    /// The ordering the SDK and `-p` exits rest on: the stream ends and the
+    /// track is out of the task when the run ends, before MCP teardown
+    /// starts, so a wedged teardown can neither hold the consumer nor drop
+    /// the track on an executor thread. The retained sender is the Lua tool
+    /// context an idle VM never collects.
+    #[tokio::test]
+    async fn the_run_ends_the_stream_and_hands_back_its_track_before_mcp_teardown() {
+        let tmp = TempDir::new().unwrap();
+        let id = MakiId::generate();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let claim = SessionClaim::acquire(id, &dir).expect("nothing else holds it");
+        let mailbox = SessionMailbox::register(id);
+        let track = SessionTrack::open(
+            Resumed::empty(SessionRef::from(id)),
+            claim,
+            mailbox,
+            Arc::default(),
+            CWD,
+        );
         let (guard, mut events) = event_stream();
         let retained = guard.sender(RUN_ID);
         let event_tx = retained.clone();
-        let (cmd_tx, cmd_rx) = flume::unbounded();
-        smol::block_on(async {
-            let mut session = pin!(run_session(
-                guard,
-                Some(McpHandle::for_test(cmd_tx)),
-                async move {
-                    let _ = event_tx.send(AgentEvent::Error {
-                        message: PROVIDER_ERROR.into(),
-                        auth: false,
-                    });
-                }
-            ));
-            assert!(
-                poll_once(session.as_mut()).await.is_none(),
-                "{SHUTDOWN_WEDGED}"
-            );
-            assert!(
-                matches!(cmd_rx.try_recv(), Ok(McpCommand::Shutdown { .. })),
-                "{SHUTDOWN_WEDGED}"
-            );
-            let envelope = events.next().await.expect(BODY_EVENT);
-            assert!(matches!(
-                envelope.event,
-                AgentEvent::Error { message, .. } if message == PROVIDER_ERROR
-            ));
-            assert!(
-                matches!(poll_once(events.next()).await, Some(None)),
-                "{STREAM_ENDED}"
-            );
-        });
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+
+        let ended = run_session(guard, Some(McpHandle::for_test(cmd_tx)), async move {
+            let _ = event_tx.send(AgentEvent::Error {
+                message: PROVIDER_ERROR.into(),
+                auth: false,
+                totals: RunTotals::default(),
+            });
+            Some(track)
+        })
+        .await;
+        assert!(cmd_rx.is_empty(), "{TEARDOWN_AFTER_TRACK}");
+
+        let envelope = events.next().await.expect(BODY_EVENT);
+        assert!(matches!(
+            envelope.event,
+            AgentEvent::Error { message, .. } if message == PROVIDER_ERROR
+        ));
+        assert!(
+            matches!(events.next().now_or_never(), Some(None)),
+            "{STREAM_ENDED}"
+        );
+
+        let mut shutdown = pin!(ended.shut_down());
+        assert!(
+            shutdown.as_mut().now_or_never().is_none(),
+            "{SHUTDOWN_WEDGED}"
+        );
+        let Ok(McpCommand::Shutdown { ack }) = cmd_rx.try_recv() else {
+            panic!("{SHUTDOWN_WEDGED}");
+        };
+        ack.send(()).unwrap();
+        assert!(shutdown.await.is_some(), "{TRACK_RETURNED}");
         assert!(retained.send(AgentEvent::Nudge).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_cancel_sent_between_turns_does_not_end_the_next_one() {
+        let (cancel_tx, cancel_rx) = watch::channel(());
+        cancel_tx.send(()).unwrap();
+        let (trigger, cancel) = CancelToken::none().child();
+        let relay = relay_cancel(&cancel_rx, trigger);
+        yield_now().await;
+        assert!(!cancel.is_cancelled(), "{STALE_CANCEL_IGNORED}");
+
+        cancel_tx.send(()).unwrap();
+        relay.await.unwrap();
+        assert!(cancel.is_cancelled(), "{LIVE_CANCEL_ENDS_TURN}");
+    }
+
+    /// A turn skipped by a failed model switch drops its relay unawaited.
+    #[tokio::test]
+    async fn a_dropped_relay_does_not_take_the_next_turns_cancel() {
+        let (cancel_tx, cancel_rx) = watch::channel(());
+        let (stale_trigger, _stale) = CancelToken::none().child();
+        drop(relay_cancel(&cancel_rx, stale_trigger));
+        let (trigger, cancel) = CancelToken::none().child();
+        let relay = relay_cancel(&cancel_rx, trigger);
+
+        cancel_tx.send(()).unwrap();
+        assert!(
+            timeout(RELAY_WAIT, relay).await.is_ok(),
+            "{DROPPED_RELAY_FREES_CHANNEL}"
+        );
+        assert!(cancel.is_cancelled(), "{LIVE_CANCEL_ENDS_TURN}");
+    }
+
+    fn prompt_input() -> AgentInput {
+        prompt_in(plan_mode())
+    }
+
+    fn plan_mode() -> AgentMode {
+        AgentMode::Plan(PLAN_PATH.into())
+    }
+
+    fn prompt_in(mode: AgentMode) -> AgentInput {
+        AgentInput::from_defaults(
+            PROMPT.into(),
+            mode,
+            Vec::new(),
+            SessionDefaults::default(),
+            InputSource::Headless,
+        )
+    }
+
+    fn settle_waking(mailbox: &SessionMailbox) {
+        mailbox.settle(
+            TASK_ID,
+            Some(BackgroundNotice {
+                markdown: false,
+                text: NOTICE_BODY.into(),
+                display: None,
+                wake: true,
+                end: TaskEnd::Finished,
+            }),
+        );
+    }
+
+    fn inputs_for(
+        mailbox: &SessionMailbox,
+        background: BackgroundMode,
+        stop: CancelToken,
+    ) -> (
+        Inputs,
+        UnboundedSender<AgentInput>,
+        UnboundedSender<AgentMode>,
+    ) {
+        let (prompt_tx, prompts) = unbounded_channel();
+        let (mode_tx, modes) = unbounded_channel();
+        let inputs = Inputs {
+            prompts,
+            modes,
+            keep_alive: KeepAlive::new(mailbox.clone(), background),
+            stop,
+        };
+        (inputs, prompt_tx, mode_tx)
+    }
+
+    /// While the host can still prompt, a result rides its next prompt. Once
+    /// the input ends, the result wakes a turn of its own, and that turn's
+    /// notices are already out of the mailbox, so a failed model switch must
+    /// not skip it the way it skips a prompt.
+    #[tokio::test]
+    async fn only_input_end_wakes_a_turn_and_a_failed_switch_keeps_it() {
+        let mailbox = SessionMailbox::register(MakiId::generate());
+        let (mut inputs, prompt_tx, _mode_tx) = inputs_for(
+            &mailbox,
+            BackgroundMode::KeepAlive(LONG_WAIT),
+            CancelToken::none(),
+        );
+        mailbox.track(TASK_ID);
+
+        prompt_tx.send(prompt_in(AgentMode::Build)).unwrap();
+        let prompt = inputs.next().await.expect(PROMPT_ARRIVES);
+        assert!(
+            !prompt.survives_failed_switch(),
+            "{PROMPT_ANSWERED_BY_ERROR}"
+        );
+        inputs.keep_alive.follow(&prompt.into_input());
+
+        settle_waking(&mailbox);
+        assert!(
+            inputs.next().now_or_never().is_none(),
+            "{NO_WAKE_WHILE_OPEN}"
+        );
+
+        drop(prompt_tx);
+        let woken = inputs.next().await.expect(WAKES_AFTER_INPUT_END);
+        assert!(woken.survives_failed_switch(), "{WOKEN_NOTICES_KEPT}");
+        let woken = woken.into_input();
+        assert_eq!(woken.preamble.len(), 1);
+        assert_eq!(woken.preamble[0].first_text_content(), Some(NOTICE_BODY));
+    }
+
+    /// The host switched to plan mode after its last prompt, then ended its
+    /// input. The woken turn must run in plan mode, and adopting its settings
+    /// must leave background work blocked from writing.
+    #[tokio::test]
+    async fn a_woken_turn_runs_in_the_mode_switched_to_after_the_last_prompt() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        let background = BackgroundMode::KeepAlive(LONG_WAIT);
+        let seed = publish_seed(&mailbox, &background, || stub_seed(id));
+        let (mut inputs, prompt_tx, mode_tx) =
+            inputs_for(&mailbox, background, CancelToken::none());
+        mailbox.track(TASK_ID);
+
+        let woken = async {
+            prompt_tx.send(prompt_in(AgentMode::Build)).unwrap();
+            let prompt = inputs.next().await.expect(PROMPT_ARRIVES).into_input();
+            adopt_chat_settings(seed.as_deref(), &prompt);
+            inputs.keep_alive.follow(&prompt);
+
+            mode_tx.send(plan_mode()).unwrap();
+            drop(prompt_tx);
+            settle_waking(&mailbox);
+            inputs
+                .next()
+                .await
+                .expect(WAKES_AFTER_INPUT_END)
+                .into_input()
+        }
+        .await;
+        adopt_chat_settings(seed.as_deref(), &woken);
+
+        assert_eq!(woken.mode, plan_mode(), "{RUNS_IN_CURRENT_MODE}");
+        assert_eq!(
+            AgentSeed::background_write_block(id).as_deref(),
+            Some(BACKGROUND_PLAN_WRITE_DENIED),
+            "{RUNS_IN_CURRENT_MODE}"
+        );
+    }
+
+    /// `-p` is this with one prompt. A failed run is never woken again, so
+    /// the session ends at once, and the result it would have woken with
+    /// stays unsettled for the warning and the session meta.
+    #[tokio::test]
+    async fn a_failed_run_ends_the_session_once_the_input_ends() {
+        let mailbox = SessionMailbox::register(MakiId::generate());
+        let (mut inputs, prompt_tx, _mode_tx) = inputs_for(
+            &mailbox,
+            BackgroundMode::KeepAlive(LONG_WAIT),
+            CancelToken::none(),
+        );
+        mailbox.track(TASK_ID);
+
+        prompt_tx.send(prompt_in(AgentMode::Build)).unwrap();
+        drop(prompt_tx);
+        let prompt = inputs.next().await.expect(PROMPT_ARRIVES).into_input();
+        inputs.keep_alive.follow(&prompt);
+        inputs.keep_alive.fail();
+
+        settle_waking(&mailbox);
+        assert!(inputs.next().await.is_none(), "{FAILED_RUN_ENDS_SESSION}");
+        assert_eq!(mailbox.unsettled(), [TASK_ID], "{KEPT_FOR_META}");
+    }
+
+    #[test]
+    fn open_mailbox_restores_the_receipts_a_stored_session_left() {
+        let mut stored = StoredSession::new("", CWD);
+        stored.meta.pending_background = vec![TASK_ID.into()];
+        let resumed = Resumed::stored(SessionRef::from(MakiId::generate()), stored);
+
+        let mailbox = open_mailbox(&resumed);
+
+        assert_eq!(mailbox.unsettled(), [TASK_ID]);
+    }
+
+    #[test_case(BackgroundMode::from_wait(None), false ; "zero_timeout")]
+    #[test_case(BackgroundMode::Detached, true ; "detached")]
+    #[test_case(BackgroundMode::from_wait(Some(LONG_WAIT)), true ; "keep_alive")]
+    fn only_a_zero_timeout_publishes_no_seed(background: BackgroundMode, seeded: bool) {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+
+        let seed = publish_seed(&mailbox, &background, || stub_seed(id));
+
+        assert_eq!(seed.is_some(), seeded);
+        assert_eq!(AgentSeed::live(id).is_some(), seeded);
+    }
+
+    #[tokio::test]
+    async fn keep_alive_runs_a_woken_turn_after_a_settled_receipt_then_ends() {
+        let mailbox = SessionMailbox::register(MakiId::generate());
+        let mut keep_alive = KeepAlive::new(mailbox.clone(), BackgroundMode::KeepAlive(LONG_WAIT));
+        mailbox.track(TASK_ID);
+        keep_alive.follow(&prompt_input());
+
+        let woken = {
+            let mut next = pin!(keep_alive.next_input());
+            assert!(next.as_mut().now_or_never().is_none(), "{WAITS_FOR_WORK}");
+            settle_waking(&mailbox);
+            next.await.expect(WAKES_AFTER_INPUT_END)
+        };
+
+        assert!(woken.message.is_empty());
+        assert_eq!(woken.mode, plan_mode());
+        assert_eq!(woken.preamble.len(), 1);
+        assert_eq!(woken.preamble[0].first_text_content(), Some(NOTICE_BODY));
+
+        keep_alive.follow(&woken);
+        assert!(keep_alive.next_input().await.is_none(), "{ENDS_WHEN_IDLE}");
+    }
+
+    /// With a zero wait the deadline has passed by the first wake. A wake
+    /// queued while the last turn ran is ready at once too, and it must not
+    /// outrun the deadline, or a chain of them would keep the process up.
+    #[test_case(false ; "while_work_is_still_out")]
+    #[test_case(true ; "over_a_queued_wake")]
+    #[tokio::test]
+    async fn keep_alive_lapses(wake_queued: bool) {
+        let mailbox = SessionMailbox::register(MakiId::generate());
+        mailbox.track(TASK_ID);
+        if wake_queued {
+            settle_waking(&mailbox);
+        }
+        let mut keep_alive =
+            KeepAlive::new(mailbox.clone(), BackgroundMode::KeepAlive(Duration::ZERO));
+        keep_alive.follow(&prompt_input());
+
+        assert!(keep_alive.next_input().await.is_none());
+        assert_eq!(mailbox.unsettled(), [TASK_ID], "{KEPT_FOR_META}");
+    }
+
+    #[tokio::test]
+    async fn a_stop_ends_the_keep_alive_wait_while_work_is_out() {
+        let mailbox = SessionMailbox::register(MakiId::generate());
+        mailbox.track(TASK_ID);
+        let (trigger, stop) = CancelToken::new();
+        let (mut inputs, prompt_tx, _mode_tx) =
+            inputs_for(&mailbox, BackgroundMode::KeepAlive(LONG_WAIT), stop);
+        drop(prompt_tx);
+        inputs.keep_alive.follow(&prompt_input());
+
+        let mut next = pin!(inputs.next());
+        assert!(next.as_mut().now_or_never().is_none(), "{WAITS_FOR_WORK}");
+        trigger.cancel();
+        assert!(next.await.is_none(), "{STOP_ENDS_SESSION}");
+        assert_eq!(mailbox.unsettled(), [TASK_ID], "{KEPT_FOR_META}");
+    }
+
+    /// A stopped session takes nothing it would not deliver: no prompt still
+    /// queued, and no woken notices, which then stay unsettled for the meta.
+    #[test_case(true ; "a_queued_prompt")]
+    #[test_case(false ; "a_queued_wake")]
+    #[tokio::test]
+    async fn a_stop_wins_over_a_ready_input(prompt_queued: bool) {
+        let mailbox = SessionMailbox::register(MakiId::generate());
+        mailbox.track(TASK_ID);
+        let (trigger, stop) = CancelToken::new();
+        let (mut inputs, prompt_tx, _mode_tx) =
+            inputs_for(&mailbox, BackgroundMode::KeepAlive(LONG_WAIT), stop);
+        if prompt_queued {
+            prompt_tx.send(prompt_input()).unwrap();
+        } else {
+            drop(prompt_tx);
+            inputs.keep_alive.follow(&prompt_input());
+        }
+        settle_waking(&mailbox);
+        trigger.cancel();
+
+        assert!(inputs.next().await.is_none(), "{STOP_ENDS_SESSION}");
+        assert_eq!(mailbox.unsettled(), [TASK_ID], "{KEPT_FOR_META}");
+    }
+
+    /// ACP's mode: results ride the next prompt, and nothing holds the
+    /// session open once its input ends.
+    #[tokio::test]
+    async fn detached_never_keeps_the_session_alive() {
+        let mailbox = SessionMailbox::register(MakiId::generate());
+        mailbox.track(TASK_ID);
+        let mut keep_alive = KeepAlive::new(mailbox, BackgroundMode::Detached);
+
+        keep_alive.follow(&prompt_input());
+
+        assert!(keep_alive.next_input().await.is_none());
     }
 
     /// `await_shutdown` bounds teardown, not the session: a task with work left
     /// runs to completion. Dropping it here would cancel prompts stdin already
     /// queued.
-    #[test]
-    fn await_shutdown_waits_for_a_task_that_still_works() {
-        let (release_tx, release_rx) = flume::bounded::<()>(1);
+    #[tokio::test]
+    async fn await_shutdown_waits_for_a_task_that_still_works() {
+        let (release_tx, release_rx) = oneshot::channel::<()>();
         let finished = Arc::new(AtomicBool::new(false));
-        let task = smol::spawn({
+        let task = AbortOnDropHandle::new(tokio::spawn({
             let finished = Arc::clone(&finished);
             async move {
-                let _ = release_rx.recv_async().await;
+                let _ = release_rx.await;
                 finished.store(true, Ordering::SeqCst);
+                SessionEnd::default()
             }
-        });
+        }));
 
-        smol::block_on(async {
-            let mut shutdown = pin!(await_shutdown(task));
-            assert!(
-                poll_once(shutdown.as_mut()).await.is_none(),
-                "{STILL_WORKING}"
-            );
-            release_tx.send(()).unwrap();
-            shutdown.await;
-        });
+        let mut shutdown = pin!(await_shutdown(task));
+        assert!(
+            shutdown.as_mut().now_or_never().is_none(),
+            "{STILL_WORKING}"
+        );
+        release_tx.send(()).unwrap();
+        shutdown.await;
         assert!(finished.load(Ordering::SeqCst), "{TASK_DROPPED}");
     }
 }

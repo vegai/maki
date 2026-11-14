@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, LazyLock, OnceLock, RwLock};
+
+use arc_swap::ArcSwap;
 
 use syntect::highlighting::{
     FontStyle, HighlightIterator, HighlightState, Highlighter as SynHighlighter, Style as SynStyle,
@@ -16,6 +18,7 @@ pub mod pool;
 const TOKEN_ALIASES: &[(&str, &str)] = &[("jsx", "js")];
 pub const TAB_SPACES: &str = "  ";
 const BLOCK_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const MAX_HIGHLIGHT_PREFIX_BYTES: usize = 16 * 1024;
 
 /// Bat encodes ANSI palette semantics in the syntect alpha channel, and
 /// syntect passes the bytes through untouched. `a = 0` means `r` holds a
@@ -121,18 +124,14 @@ pub fn ansi_color_index(name: &str) -> Option<u8> {
 }
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
-static THEME: OnceLock<RwLock<Arc<Theme>>> = OnceLock::new();
-static UI_STYLES: OnceLock<RwLock<HashMap<String, UiStyle>>> = OnceLock::new();
-static BLOCK_CACHE: OnceLock<RwLock<BlockCache>> = OnceLock::new();
+static THEME: LazyLock<ArcSwap<Theme>> = LazyLock::new(ArcSwap::default);
+static UI_STYLES: LazyLock<ArcSwap<HashMap<String, UiStyle>>> = LazyLock::new(ArcSwap::default);
+static BLOCK_CACHE: LazyLock<RwLock<BlockCache>> = LazyLock::new(RwLock::default);
 static THEME_GEN: AtomicU64 = AtomicU64::new(0);
-
-fn theme_lock() -> &'static RwLock<Arc<Theme>> {
-    THEME.get_or_init(|| RwLock::new(Arc::new(Theme::default())))
-}
 
 pub fn warmup() {
     syntax_set();
-    theme_lock();
+    LazyLock::force(&THEME);
     let mut hl = Highlighter::for_token("bash");
     hl.highlight_line("x");
 }
@@ -142,11 +141,11 @@ pub fn is_ready() -> bool {
 }
 
 pub fn set_theme(theme: Theme) {
-    *theme_lock().write().unwrap_or_else(|e| e.into_inner()) = Arc::new(theme);
+    THEME.store(Arc::new(theme));
     // Bump first: a highlight already in flight read the old generation, so its
     // insert lands under a key nobody will look up again.
     THEME_GEN.fetch_add(1, Ordering::Release);
-    block_cache_lock()
+    BLOCK_CACHE
         .write()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
@@ -157,10 +156,6 @@ pub fn set_theme(theme: Theme) {
 /// this changes.
 pub fn theme_generation() -> u64 {
     THEME_GEN.load(Ordering::Acquire)
-}
-
-fn block_cache_lock() -> &'static RwLock<BlockCache> {
-    BLOCK_CACHE.get_or_init(RwLock::default)
 }
 
 /// The byte length rides along with the hash, so an accidental hit needs both
@@ -245,26 +240,15 @@ impl BlockCache {
 }
 
 pub fn theme() -> Arc<Theme> {
-    theme_lock()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-}
-
-fn ui_styles_lock() -> &'static RwLock<HashMap<String, UiStyle>> {
-    UI_STYLES.get_or_init(RwLock::default)
+    THEME.load_full()
 }
 
 pub fn set_ui_styles(styles: HashMap<String, UiStyle>) {
-    *ui_styles_lock().write().unwrap_or_else(|e| e.into_inner()) = styles;
+    UI_STYLES.store(Arc::new(styles));
 }
 
 pub fn ui_style(name: &str) -> Option<UiStyle> {
-    ui_styles_lock()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(name)
-        .cloned()
+    UI_STYLES.load().get(name).cloned()
 }
 
 /// Colors the syntax theme names itself. UI styles live in [`ui_style`].
@@ -412,11 +396,31 @@ impl StyledSegment {
     }
 }
 
+fn bounded_prefix(prefix: &str) -> &str {
+    let start = prefix.len().saturating_sub(MAX_HIGHLIGHT_PREFIX_BYTES);
+    if start == 0 || prefix.as_bytes()[start - 1] == b'\n' {
+        return &prefix[start..];
+    }
+    // The byte cutoff may split UTF-8. A newline gives us both a character
+    // boundary and a line start without parsing the discarded context.
+    prefix.as_bytes()[start..]
+        .iter()
+        .position(|&byte| byte == b'\n')
+        .map_or("", |newline| &prefix[start + newline + 1..])
+}
+
+/// `prefix` is the lines before `code`, with or without a trailing newline.
+/// Only the nearest lines that fit in 16 KiB are parsed, so a comment or
+/// string opened before them is missed.
 pub fn highlight_code(lang: &str, code: &str, prefix: &str) -> Vec<Vec<StyledSegment>> {
     let mut hl = Highlighter::for_token(lang);
-    if !prefix.is_empty() {
-        for line in LinesWithEndings::from(prefix) {
+    for line in LinesWithEndings::from(bounded_prefix(prefix)) {
+        // Syntaxes close a line comment on its `\n`. Without one, a comment
+        // just above `code` would swallow the first line of `code` too.
+        if line.ends_with('\n') {
             hl.advance(line);
+        } else {
+            hl.advance(&format!("{line}\n"));
         }
     }
     LinesWithEndings::from(code)
@@ -433,7 +437,7 @@ pub fn highlight_code(lang: &str, code: &str, prefix: &str) -> Vec<Vec<StyledSeg
 /// it is incremental, and would miss this cache on every token.
 pub fn highlight_block(lang: &str, code: &str) -> BlockSegments {
     let key = BlockKey::new(lang, code);
-    if let Some(hit) = block_cache_lock()
+    if let Some(hit) = BLOCK_CACHE
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .get(key)
@@ -441,7 +445,7 @@ pub fn highlight_block(lang: &str, code: &str) -> BlockSegments {
         return hit;
     }
     let segments: BlockSegments = Arc::new(highlight_code(lang, code, ""));
-    block_cache_lock()
+    BLOCK_CACHE
         .write()
         .unwrap_or_else(|e| e.into_inner())
         .insert(key, Arc::clone(&segments), BLOCK_CACHE_MAX_BYTES);
@@ -652,6 +656,8 @@ mod tests {
     const RUST: &str = "rust";
     const PYTHON: &str = "python";
     const OPENS_A_STRING: &str = "x = '''";
+    const PREFIX_CODE: &str = "*/ let value = 1;";
+    const RECENT_COMMENT: &str = "/* recent comment\n";
 
     /// The theme and the block cache are process globals. Nextest gives every
     /// test its own process, `cargo test` does not, so tests that swap the theme
@@ -705,6 +711,53 @@ mod tests {
         let trailing = highlight_code("rust", "let x = 1;\n\n\n", "");
         assert_eq!(trailing.len(), 3);
         assert_eq!(segments_text(&trailing[1]), "");
+    }
+
+    #[test_case("x", "\nnearby\n", "nearby\n"; "nearest_line_after_oversized_line")]
+    #[test_case("x", "\none\ntwo\n", "one\ntwo\n"; "nearest_lines")]
+    #[test_case("x", "", ""; "oversized_unterminated_line")]
+    #[test_case("x", "\n", ""; "oversized_terminated_line")]
+    #[test_case("é", "\nx\n", "x\n"; "cutoff_inside_utf8")]
+    #[test_case("x", "\r\nnearby\r\n", "nearby\r\n"; "crlf_lines")]
+    fn prefix_budget_keeps_nearest_complete_lines(padding: &str, tail: &str, expected: &str) {
+        let prefix = format!("{}{tail}", padding.repeat(MAX_HIGHLIGHT_PREFIX_BYTES + 1));
+        assert_eq!(bounded_prefix(&prefix), expected);
+    }
+
+    #[test_case(""; "unterminated")]
+    #[test_case("\n"; "lf")]
+    #[test_case("\r\n"; "crlf")]
+    fn prefix_at_byte_limit_keeps_its_first_line(ending: &str) {
+        let exact = format!(
+            "{}{ending}",
+            "x".repeat(MAX_HIGHLIGHT_PREFIX_BYTES - ending.len())
+        );
+        assert_eq!(bounded_prefix(&exact), exact);
+        assert_eq!(bounded_prefix(&format!("discarded\n{exact}")), exact);
+    }
+
+    #[test_case(""; "discard_expired_context")]
+    #[test_case(RECENT_COMMENT; "retain_nearby_context")]
+    fn highlight_code_uses_only_the_bounded_prefix(recent: &str) {
+        let _globals = exclusive_globals();
+        let prefix = format!("/* {}\n{recent}", "x".repeat(MAX_HIGHLIGHT_PREFIX_BYTES));
+        let expected = highlight_code(RUST, PREFIX_CODE, recent);
+        assert_eq!(highlight_code(RUST, PREFIX_CODE, &prefix), expected);
+        assert_ne!(
+            highlight_code(RUST, PREFIX_CODE, RECENT_COMMENT),
+            highlight_code(RUST, PREFIX_CODE, "")
+        );
+    }
+
+    #[test_case(PYTHON, "# note"; "python")]
+    #[test_case("js", "// note"; "javascript")]
+    fn line_comment_ending_the_prefix_stays_on_its_line(lang: &str, comment: &str) {
+        let _globals = exclusive_globals();
+        let code = "x = 1\n";
+        assert_eq!(
+            highlight_code(lang, code, comment),
+            highlight_code(lang, code, "")
+        );
     }
 
     #[test]
@@ -891,17 +944,16 @@ mod tests {
 
         set_theme(Theme::default());
         assert_eq!(
-            block_cache_lock().read().unwrap().bytes,
+            BLOCK_CACHE.read().unwrap().bytes,
             0,
             "set_theme must clear the cache"
         );
 
         let racing = one_line();
-        block_cache_lock().write().unwrap().insert(
-            stale_key,
-            Arc::clone(&racing),
-            BLOCK_CACHE_MAX_BYTES,
-        );
+        BLOCK_CACHE
+            .write()
+            .unwrap()
+            .insert(stale_key, Arc::clone(&racing), BLOCK_CACHE_MAX_BYTES);
         assert!(
             !Arc::ptr_eq(&racing, &highlight_block(RUST, CODE)),
             "an insert under a key minted before the bump must be unreachable"
@@ -1073,7 +1125,7 @@ mod tests {
             });
         });
 
-        assert_bytes_match_entries(&block_cache_lock().read().unwrap());
+        assert_bytes_match_entries(&BLOCK_CACHE.read().unwrap());
     }
 
     #[test_case("jsx", "js"; "jsx_alias")]

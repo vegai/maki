@@ -24,7 +24,7 @@ jobs:
     name: Create Release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Create draft release
         run: |
@@ -45,21 +45,24 @@ jobs:
             runner: ubuntu-24.04-arm
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Build in Alpine container
+        env:
+          # renovate: datasource=docker depName=alpine
+          ALPINE_VERSION: "3.24"
         run: |
           docker run --rm \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             -e CARGO_TERM_COLOR=always \
             -e CARGO_INCREMENTAL=0 \
-            alpine:3.21 sh -c '
+            "alpine:${ALPINE_VERSION}" sh -c '
               apk add --no-cache gcc g++ musl-dev make linux-headers curl git ca-certificates pkgconf python3-dev
               git config --global --add safe.directory /workspace
               curl --proto "=https" --tlsv1.2 --retry 5 --retry-delay 2 --retry-all-errors -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --target ${{ matrix.target }}
               source "$HOME/.cargo/env"
-              cargo build --release --target ${{ matrix.target }}
+              cargo build --profile release-lto --target ${{ matrix.target }}
             '
           sudo chown -R $(id -u):$(id -g) target/
 
@@ -67,20 +70,21 @@ jobs:
         run: |
           tag="$GITHUB_REF_NAME"
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
-          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
+          cp "target/${{ matrix.target }}/release-lto/${BINARY_NAME}" "${BINARY_NAME}"
           tar czf "${archive}" "${BINARY_NAME}"
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
         run: .github/scripts/retry.sh gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" --clobber
 
-  build-netbsd:
+  build-bsd:
     name: Build (${{ matrix.target }})
     needs: create-release
     runs-on: ubuntu-latest
-    # tier 3 on an unpinned nightly breaks on its own schedule, so a failure
-    # there must not hold back the release of every other target
-    continue-on-error: ${{ matrix.toolchain == 'nightly' }}
+    # best effort rows (tier 3 on an unpinned nightly, FreeBSD) must not
+    # hold back the release of the other targets: a failure ships without
+    # those binaries and the installer 404s on that platform
+    continue-on-error: ${{ matrix.best_effort }}
     strategy:
       fail-fast: false
       matrix:
@@ -89,20 +93,36 @@ jobs:
             zig_target: x86_64-netbsd.10.1
             toolchain: stable
             std: precompiled
+            best_effort: false
           - target: aarch64-unknown-netbsd
             zig_target: aarch64-netbsd.10.1
             toolchain: nightly
             std: build-std
+            best_effort: true
+          # pinned to the oldest supported release so the binaries run on
+          # every one, same policy as the .10.1 netbsd baseline
+          - target: x86_64-unknown-freebsd
+            zig_target: x86_64-freebsd.14.0
+            toolchain: stable
+            std: precompiled
+            best_effort: true
+          - target: aarch64-unknown-freebsd
+            zig_target: aarch64-freebsd.14.0
+            toolchain: stable
+            std: precompiled
+            best_effort: true
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # zig bundles NetBSD 10.1 libc headers, crt objects and stub shared
-      # libraries, so it is a self-contained NetBSD cross toolchain: Ubuntu has
-      # no gcc-*-netbsd packages and NetBSD ships no cross kits for Linux.
+      # zig bundles NetBSD 10.1 and FreeBSD 14 libc headers, crt objects and
+      # stub shared libraries, so it is a self-contained cross toolchain for
+      # both BSDs: Ubuntu has no gcc-*-bsd packages and neither BSD ships a
+      # cross kit for Linux.
       - name: Install zig
         env:
-          ZIG_VERSION: 0.16.0
+          # renovate: datasource=forgejo-tags depName=ziglang/zig registryUrl=https://codeberg.org
+          ZIG_VERSION: 0.17.0
         run: |
           .github/scripts/retry.sh curl -sSfL -o "$RUNNER_TEMP/zig.tar.xz" "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
           tar xJf "$RUNNER_TEMP/zig.tar.xz" -C "$HOME"
@@ -149,9 +169,24 @@ jobs:
           exec zig $zm -target $ZIG_TARGET "\${args[@]}"
           EOF
           done
+          # the FreeBSD precompiled std links libkvm, libmemstat, libprocstat
+          # and libdevstat: zig only stubs the core libraries and no binary
+          # references these, so empty stubs let the link pass and lld's
+          # --as-needed drops the NEEDED entries again
+          link_extra=
+          case "$TARGET" in
+            *-freebsd)
+              mkdir -p "$w/stubs"
+              : > "$w/stub.c"
+              for lib in kvm memstat procstat devstat; do
+                zig cc -target "$ZIG_TARGET" -shared -x c -o "$w/stubs/lib$lib.so" "$w/stub.c"
+              done
+              link_extra="-L$w/stubs"
+              ;;
+          esac
           cat > "$w/linker" <<EOF
           #!/bin/bash
-          exec zig cc -target $ZIG_TARGET "\$@"
+          exec zig cc -target $ZIG_TARGET $link_extra "\$@"
           EOF
           # wrappers, not "AR=zig ar": openssl-src splits a multi-word AR
           printf '#!/bin/sh\nexec zig ar "$@"\n' > "$w/ar"
@@ -165,7 +200,7 @@ jobs:
             echo "CARGO_TARGET_${U}_LINKER=$w/linker"
           } >> "$GITHUB_ENV"
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}-${{ github.ref_name }}
 
@@ -175,16 +210,16 @@ jobs:
           STD: ${{ matrix.std }}
         run: |
           if [ "$STD" = build-std ]; then
-            cargo build --release --locked --target "$TARGET" -Z build-std=std,panic_abort
+            cargo build --profile release-lto --locked --target "$TARGET" -Z build-std=std,panic_abort
           else
-            cargo build --release --locked --target "$TARGET"
+            cargo build --profile release-lto --locked --target "$TARGET"
           fi
 
       - name: Package
         run: |
           tag="$GITHUB_REF_NAME"
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
-          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
+          cp "target/${{ matrix.target }}/release-lto/${BINARY_NAME}" "${BINARY_NAME}"
           tar czf "${archive}" "${BINARY_NAME}"
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
@@ -202,30 +237,30 @@ jobs:
           - target: x86_64-apple-darwin
             runner: macos-15-intel
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}-${{ github.ref_name }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --profile release-lto --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
           tag="$GITHUB_REF_NAME"
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
-          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
+          cp "target/${{ matrix.target }}/release-lto/${BINARY_NAME}" "${BINARY_NAME}"
           tar czf "${archive}" "${BINARY_NAME}"
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
@@ -235,7 +270,7 @@ jobs:
         run: |
           tag="$GITHUB_REF_NAME"
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.zip"
-          cp "target/${{ matrix.target }}/release/${BINARY_NAME}.exe" "${BINARY_NAME}.exe"
+          cp "target/${{ matrix.target }}/release-lto/${BINARY_NAME}.exe" "${BINARY_NAME}.exe"
           7z a "${archive}" "${BINARY_NAME}.exe"
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
@@ -245,10 +280,10 @@ jobs:
 
   publish:
     name: Publish Release
-    needs: [build-linux, build-netbsd, build-other]
+    needs: [build-linux, build-bsd, build-other]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download artifacts
         run: .github/scripts/retry.sh gh release download "$GITHUB_REF_NAME" --dir artifacts

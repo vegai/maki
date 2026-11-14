@@ -10,15 +10,11 @@ Stream.__index = Stream
 local ASSISTANT = "assistant"
 local RESULT = "result"
 local INIT = "init"
-local TOOL_USE = "tool_use"
--- Each step's output count is a placeholder, so only the result has the
--- real count.
-local OUTPUT_FIELD = "output_tokens"
 local USAGE_FIELDS = {
   { key = "input_tokens", label = "in" },
   { key = "cache_read_input_tokens", label = "cache read" },
   { key = "cache_creation_input_tokens", label = "cache write" },
-  { key = OUTPUT_FIELD, label = "out" },
+  { key = "output_tokens", label = "out" },
 }
 local THOUSAND = 1000
 local NO_ANSWER = "Claude Code completed its run without a reply"
@@ -34,17 +30,12 @@ local function count(n)
   return tostring(n)
 end
 
---- {expect}: `cwd`, `cli`, `worker`.
+--- {expect}: `cwd`, `version`, `policy`, and optional `executable`.
 function Stream.new(expect)
   return setmetatable({
     expect = expect,
     native = native.worker_stream(expect),
-    usage_by_message = {},
   }, Stream)
-end
-
-function Stream:set_model(model)
-  self.native:set_model(model)
 end
 
 -- Relative inside the project and absolute outside it, where a run of `..`
@@ -71,10 +62,6 @@ function Stream:tool_line(name, input)
   return tostring(name) .. " " .. target
 end
 
-function Stream:accepted()
-  return self.native:accepted()
-end
-
 --- Returns a control completion, stop reason, init event or progress lines; nil means no update.
 function Stream:feed(line, handshake)
   local classified, problem = self.native:feed(line, handshake)
@@ -82,12 +69,8 @@ function Stream:feed(line, handshake)
     return { stop = problem }
   end
   local ev, kind = classified.event, classified.kind
-  if kind == ASSISTANT and type(ev.message) == "table" and type(ev.message.id) == "string" and classified.usage then
-    self.usage_by_message[ev.message.id] = classified.usage
-  end
   if classified.problem then
-    local init = kind == INIT
-    return { stop = classified.problem, init = init and ev or nil }
+    return { stop = classified.problem }
   end
   if classified.control then
     return { control = true, complete = classified.complete }
@@ -97,13 +80,12 @@ function Stream:feed(line, handshake)
     return nil
   end
   if kind == INIT then
-    return { init = ev }
+    return { init = true }
   end
   if kind == RESULT then
     self.result = ev
     self.failure = classified.failure
-    ev.usage = classified.usage
-    if not self:accepted() then
+    if not self.native:accepted() then
       return { stop = self:outcome() }
     end
     return nil
@@ -113,9 +95,7 @@ function Stream:feed(line, handshake)
   end
   local lines = {}
   for _, block in ipairs(ev.message.content) do
-    if type(block) == "table" and block.type == TOOL_USE then
-      lines[#lines + 1] = self:tool_line(block.name, block.input)
-    end
+    lines[#lines + 1] = self:tool_line(block.name, block.input)
   end
   return #lines > 0 and { lines = lines } or nil
 end
@@ -140,51 +120,9 @@ function Stream:denials()
   return lines
 end
 
--- Input and cache counts over all messages, each message counted once. A
--- sum is known only when every message reports that field.
-function Stream:measured()
-  if next(self.usage_by_message) == nil then
-    return nil
-  end
-  local sums = {}
-  for _, field in ipairs(USAGE_FIELDS) do
-    if field.key ~= OUTPUT_FIELD then
-      sums[field.key] = 0
-    end
-  end
-  for _, usage in pairs(self.usage_by_message) do
-    for key, sum in pairs(sums) do
-      local n = usage[key]
-      sums[key] = n and sum + n or nil
-    end
-  end
-  return sums
-end
-
--- A missing key means the value is unknown, and `partial` marks a field
--- that is below the run's total. The result's total replaces a sum when it
--- has one, so a result without usage keeps the counts maki already has.
-function Stream:usage_totals()
-  local measured = self:measured()
-  if not self.result and not measured then
-    return nil
-  end
-  local reported = self.result and self.result.usage or {}
-  local totals, partial = {}, false
-  for _, field in ipairs(USAGE_FIELDS) do
-    local total = reported[field.key]
-    if not total then
-      partial = true
-      total = measured and measured[field.key]
-    end
-    totals[field.key] = total
-  end
-  return totals, partial
-end
-
 --- The USD value is the API list price of the tokens.
 function Stream:usage_line()
-  local totals, partial = self:usage_totals()
+  local totals, partial = self.native:usage_totals()
   if not totals then
     return nil
   end

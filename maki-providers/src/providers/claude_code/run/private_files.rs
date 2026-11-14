@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::{Mutex, OnceLock, PoisonError};
 use tempfile::TempDir;
+use tokio::runtime::Handle;
 use tracing::{debug, warn};
 
 pub(super) const DIR_PREFIX: &str = "maki-claude-code.";
@@ -23,15 +24,24 @@ const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
 pub(in crate::providers::claude_code) struct PrivateDir(Option<TempDir>);
 
 impl PrivateDir {
-    pub(in crate::providers::claude_code) fn keep(mut self) {
-        if let Some(dir) = self.0.take() {
-            let _ = dir.keep();
-        }
+    pub(crate) async fn close_empty(mut self) -> Option<PathBuf> {
+        let dir = self.0.take()?;
+        tokio::task::spawn_blocking(move || {
+            let path = dir.keep();
+            match fs::remove_dir(&path) {
+                Ok(()) => None,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(_) => Some(path),
+            }
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     pub(super) async fn close(mut self) {
         if let Some(dir) = self.0.take() {
-            smol::unblock(move || drop(dir)).await;
+            let _ = tokio::task::spawn_blocking(move || drop(dir)).await;
         }
     }
 }
@@ -39,7 +49,12 @@ impl PrivateDir {
 impl Drop for PrivateDir {
     fn drop(&mut self) {
         if let Some(dir) = self.0.take() {
-            smol::unblock(move || drop(dir)).detach();
+            match Handle::try_current() {
+                Ok(runtime) => {
+                    runtime.spawn_blocking(move || drop(dir));
+                }
+                Err(_) => drop(dir),
+            }
         }
     }
 }
@@ -94,7 +109,7 @@ pub(in crate::providers::claude_code) async fn private_dir_async(
     let base = base.to_owned();
     let project = project.to_owned();
     let denied = denied.to_vec();
-    smol::unblock(move || private_dir(&base, &project, &denied)).await
+    tokio::task::spawn_blocking(move || private_dir(&base, &project, &denied)).await?
 }
 
 /// Scope owners to this boot and pid namespace, including on shared temporary filesystems.
@@ -126,7 +141,12 @@ fn sweep_once(base: &Path) {
     }
     swept.push(base.to_owned());
     let base = base.to_owned();
-    smol::unblock(move || sweep_dead_owners(&base)).detach();
+    match Handle::try_current() {
+        Ok(runtime) => {
+            runtime.spawn_blocking(move || sweep_dead_owners(&base));
+        }
+        Err(_) => sweep_dead_owners(&base),
+    }
 }
 
 /// Removes the private directories in `base` whose maki is gone. A signal

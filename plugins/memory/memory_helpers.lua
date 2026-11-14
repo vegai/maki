@@ -4,7 +4,7 @@ M.MAX_TAGS = 50
 M.MAX_FILE_BYTES = 20 * 1024
 M.CAP_HINT_REWRITE = "rewrite the memory to fit under the cap"
 M.CAP_HINT_NARROW = "narrow tags or read files by path"
-M.CAP_HINT_FILTER = "pass tags=[...] to filter the list"
+M.CAP_HINT_FILTER = "filter `list` by `tags`"
 M.NO_MEMORIES_MSG = "No memories yet."
 
 local MAX_TAG_LEN = 64
@@ -391,7 +391,7 @@ function M.format_tag_line(dir, max_tags)
   return line
 end
 
--- serde_yaml renders an empty list as an empty mapping; extract_tags treats both as empty.
+-- maki.yaml.encode renders an empty list as an empty mapping; extract_tags treats both as empty.
 function M.encode_frontmatter(tags)
   local yaml, _ = maki.yaml.encode({ tags = tags })
   return "---\n" .. yaml .. "---\n"

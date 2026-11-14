@@ -55,7 +55,7 @@ Deny rules are checked across all layers before anything else, so a deny cannot 
 
 ## Builtin Defaults
 
-File-write tools are pre-allowed inside the project working directory (cwd at session start, canonicalized). Paths outside that tree still need a prompt or an explicit allow rule:
+File-write tools are pre-allowed inside the original project directory (canonicalized). Changing the working directory with `/cd` does not expand these grants. Paths outside the original tree still need a prompt or an explicit allow rule:
 
 | Tool | Scope | Notes |
 |------|-------|-------|
@@ -65,6 +65,7 @@ File-write tools are pre-allowed inside the project working directory (cwd at se
 | `edit_lines` | `<cwd>/**` | Outside cwd requires permission |
 | `insert_lines` | `<cwd>/**` | Same, when the opt-in tool is enabled |
 | `task` | `*` | Subagent spawning always allowed |
+| `read` | `<state>/sessions/data/<session>/bash/**` | The calling session's [bash logs](/docs/background-tasks/#bash-logs). Subagents share their parent's session. Other sessions' logs prompt like any path outside cwd |
 
 The memory plugin uses a plugin rule to pre-allow the file-write tools inside its notes directory (under maki's state dir), so the agent can edit memory notes directly without a prompt.
 
@@ -77,6 +78,8 @@ These tools have no builtin allow rule, so they prompt (or follow your `default`
 Tools that never declare permission scopes (for example `read`, `glob`, `grep`, `index`, `memory`, `skill`, `todo_write`) **skip** the permission manager entirely. They always run. If you need to block one of them, turn the plugin off in `init.lua` (`plugins.read = { enabled = false }`) rather than using `permissions.toml`.
 
 Container tools like `batch` and `code_execution` prompt for each inner tool individually.
+
+Inside `code_execution`, `open()` goes through the `read` and `write` tools, so their rules apply. Metadata and listings (`os.stat`, `os.walk`, `Path.glob`) need the `list` tool and never prompt. Creating a directory also needs `list`, and works only where `write` would run without a prompt. Removing and renaming files needs `bash`.
 
 ## TOML Configuration
 
@@ -180,8 +183,9 @@ When a gated tool needs permission, Maki asks you.
 Session and always-allow / always-deny choices need a second key (`Enter` or `y`) so a fat-finger does not rewrite your rules. Deny-once with `n` lets you type a short reason the agent will see.
 
 The keys are the same in a folder you have not
-[trusted](/docs/folder-trust/), where `a` and `d` last for the session instead
-of reaching `.maki/permissions.toml`.
+[trusted](/docs/folder-trust/#in-an-untrusted-folder), even one with no `.maki`
+files. There `a` and `d` last for the session instead of reaching
+`.maki/permissions.toml`.
 
 ACP clients offer the four options the protocol defines. "Allow always" lasts
 for the session, and "Reject always" is a project answer that follows folder
@@ -236,15 +240,17 @@ Lua plugins have a separate, unrelated gate. A `plugin.toml` manifest next to th
 It runs after [folder trust](/docs/folder-trust/) has let the Lua file load, and
 limits which APIs the file reaches rather than sandboxing the file.
 
+A plugin that changes the chat input needs `input`, and changing its text also needs `agent` and `session_write`, since Enter sends it. `maki.ui.input_edit` needs `session_read` as well. Enter refuses a `/` command or a `!` line when a plugin that wrote it may not run it itself, see [chat input](/docs/lua-api/#chat-input).
+
 ### Session permissions
 
 Three keys cover the session APIs, split by what a call does to the transcript:
 
-- `session_read`: any call that reads what the conversation says, such as `maki.session.export`, `maki.session.messages` and `maki.ui.input`.
+- `session_read`: any call that reads what the conversation says, such as `maki.session.export`, `maki.session.messages`, `maki.ui.input` and `maki.ui.input_edit`. It also covers `ev.input` and `ev.text` in a key handler, and a key binding on a key that types text, in any mode.
 - `session_write`: any call that adds to, removes, or creates conversation content, such as `new`, `prompt`, `notify`, `delete` and `maki.task.remove`.
 - `session_settings`: any call that changes how a session runs without touching its content, such as `set_mode`, `set_title` and `maki.model.set`.
 
-`maki.session.read`, `list`, `live`, `current` and `focus` need none of them. A call that also starts a turn, such as `prompt`, needs `agent` as well. `maki.api.run_command` follows the same rules. The [commands page](/docs/commands/#plugin-access) lists what each command needs.
+`maki.session.read`, `list`, `live`, `current` and `focus` need none of them. A call that also starts a turn, such as `prompt`, needs `agent` as well. So does `new` with a user turn that starts with `/` or `!`, or is `exit`. `maki.api.run_command` follows the same rules. The [commands page](/docs/commands/#plugin-access) lists what each command needs.
 
 A plugin without `session_read` still receives events, with only their metadata fields. That leaves out `data.text` on `TurnStart` and `InputChanged`, `data.input` on `ToolDone`, and `data.summary` on `CompactionDone`. Maki warns once per plugin and event, naming the event and the keys left out. Events a plugin fires under its own names arrive as fired.
 

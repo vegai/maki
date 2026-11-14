@@ -8,27 +8,48 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 use std::sync::{Arc, LazyLock};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
-use maki_agent::ToolOutput;
 use maki_agent::tools::{ToolContext, ToolRegistry};
+use maki_agent::{CancelToken, CancelTrigger, ToolOutput};
 use maki_config::PluginsConfig;
 use maki_lua::PluginHost;
 use rustix::process::{Pid, geteuid, test_kill_process_group};
 use serde_json::{Map, Value};
-use smol::Timer;
-use smol::future::or;
 
 #[path = "../common/environment.rs"]
 #[allow(dead_code)]
 pub mod environment;
 
+pub const DEPENDENCY_DIR: &str = "node_modules";
+pub const DEPENDENCY_FILE: &str = "node_modules/pkg/index.js";
+pub const DEPENDENCY_UNSETTLED: &str = "dependencies changed during the copy";
+pub const ARTIFACT_MARKER: &str = ".maki-claude-code-artifact";
+pub const MANIFEST: &str = "manifest.json";
 pub const STALE_AGE: Duration = Duration::from_hours(48);
 pub const CONTROL_REPLY: &str = r#"reply() { printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":%s}}\n' "$1" "$2"; }"#;
 pub const ACCOUNT_SUBSCRIPTION: &str = r#"{"current_permission_mode":"default","account":{"apiProvider":"firstParty","subscriptionType":"Claude Pro"},"models":[{"value":"sonnet","resolvedModel":"claude-sonnet-5"},{"value":"opus","resolvedModel":"claude-opus-5-5"},{"value":"haiku","resolvedModel":"claude-haiku-4-5-20251001"}]}"#;
 pub const HOOKS_OFF: &str =
     r#"{"hooks":[],"events":[],"policy":{"allDisabled":true,"policyHookCount":0}}"#;
+
+pub fn cancel_trigger(ctx: &mut ToolContext) -> CancelTrigger {
+    let (trigger, token) = CancelToken::new();
+    ctx.cancel = token;
+    trigger
+}
+
+pub fn cancel_after<T: Send + 'static>(
+    ctx: &mut ToolContext,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> JoinHandle<T> {
+    let trigger = cancel_trigger(ctx);
+    thread::spawn(move || {
+        let result = work();
+        trigger.cancel();
+        result
+    })
+}
 
 pub fn backdate(path: &Path) {
     File::open(path)
@@ -289,7 +310,7 @@ pub fn reply(
 }
 
 pub fn output<T>(work: impl Future<Output = T>) -> T {
-    smol::block_on(within(DEADLINE, work))
+    maki_lua::test_support::runtime().block_on(within(DEADLINE, work))
 }
 
 /// Returns a shell loop that makes a fake wait until `release` exists.
@@ -335,11 +356,7 @@ pub fn try_load(opts: Map<String, Value>) -> Result<(Arc<ToolRegistry>, PluginHo
 
 /// A lost reply must fail the test so the suite can continue.
 pub async fn within<T>(limit: Duration, fut: impl Future<Output = T>) -> T {
-    let expired = async {
-        Timer::after(limit).await;
-        None
-    };
-    or(async { Some(fut.await) }, expired)
+    tokio::time::timeout(limit, fut)
         .await
-        .unwrap_or_else(|| panic!("the call did not complete in {limit:?}"))
+        .unwrap_or_else(|_| panic!("the call did not complete in {limit:?}"))
 }

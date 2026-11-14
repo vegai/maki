@@ -2,14 +2,13 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use isahc::ReadResponseExt;
-use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
 use maki_storage::auth::now_millis;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::AgentError;
 use crate::model::{ModelInfo, ModelPricing};
+use crate::providers::status_and_text;
 
 use super::auth;
 
@@ -20,7 +19,6 @@ const CACHE_SCHEMA: u32 = 1;
 const FRESH_TTL_MS: u64 = 15 * 60 * 1000;
 const MAX_STALE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ENTRIES: usize = 256;
 const MAX_MODEL_ID_LEN: usize = 128;
 const MAX_CONTEXT_WINDOW: u32 = 10_000_000;
@@ -32,6 +30,7 @@ const RESPONSES_BACKEND: &str = "responses";
 
 pub(crate) const INVALID_CATALOG: &str = "xAI model catalog response was invalid";
 pub(crate) const CATALOG_UNAUTHORIZED: &str = "xAI model catalog request was unauthorized";
+const CATALOG_UNAVAILABLE: &str = "xAI model catalog could not be fetched";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CachedModel {
@@ -108,15 +107,16 @@ pub(crate) fn cached_model(model_id: &str) -> Option<CachedModel> {
         .find(|model| model.id.eq_ignore_ascii_case(model_id))
 }
 
-pub(crate) fn list_models(access: &str, force: bool) -> Result<Vec<ModelInfo>, AgentError> {
-    Ok(select_models(Some(access), force)?
+pub(crate) async fn list_models(access: &str, force: bool) -> Result<Vec<ModelInfo>, AgentError> {
+    Ok(select_models(access, force)
+        .await?
         .into_iter()
         .map(ModelInfo::from)
         .collect())
 }
 
-pub(crate) fn refresh(access: &str) -> Result<Vec<ModelInfo>, AgentError> {
-    list_models(access, true)
+pub(crate) async fn refresh(access: &str) -> Result<Vec<ModelInfo>, AgentError> {
+    list_models(access, true).await
 }
 
 pub(crate) fn invalidate() {
@@ -125,7 +125,7 @@ pub(crate) fn invalidate() {
     }
 }
 
-fn select_models(access: Option<&str>, force: bool) -> Result<Vec<CachedModel>, AgentError> {
+async fn select_models(access: &str, force: bool) -> Result<Vec<CachedModel>, AgentError> {
     let now = now_millis();
     let cache = load_cache(now);
 
@@ -140,99 +140,65 @@ fn select_models(access: Option<&str>, force: bool) -> Result<Vec<CachedModel>, 
         return Ok(cache.models.clone());
     }
 
-    let Some(access) = access else {
-        return Ok(curated_fallback());
-    };
-
-    match fetch_catalog(access) {
+    match fetch_catalog(access).await {
         FetchOutcome::Success(models) => {
             save_cache(&models, now);
             Ok(models)
         }
         FetchOutcome::Auth => Err(AgentError::api(401, CATALOG_UNAUTHORIZED)),
         FetchOutcome::Permanent => {
-            warn!("xAI catalog refresh rejected, using curated fallback");
             invalidate();
-            Ok(curated_fallback())
+            Err(unavailable())
         }
         FetchOutcome::Transient | FetchOutcome::Invalid => {
             if force {
-                warn!("xAI catalog force refresh failed, using curated fallback");
                 invalidate();
-                return Ok(curated_fallback());
+                return Err(unavailable());
             }
             if let Some(cache) = cache {
                 warn!("xAI catalog refresh failed transiently, using stale cache");
                 return Ok(cache.models);
             }
-            warn!("xAI catalog refresh failed, using curated fallback");
-            Ok(curated_fallback())
+            Err(unavailable())
         }
     }
 }
 
-fn curated_fallback() -> Vec<CachedModel> {
-    super::SPEC
-        .models()
-        .iter()
-        .filter_map(|entry| {
-            Some(CachedModel {
-                id: entry.canonical_id()?.to_string(),
-                reasoning: true,
-                vision: entry.supports_vision.unwrap_or_default(),
-                pricing: entry
-                    .pricing
-                    .as_ref()
-                    .map(ModelPricingDto::from)
-                    .unwrap_or_default(),
-                context_window: entry.context_window?,
-                max_tokens: entry
-                    .max_output_tokens
-                    .unwrap_or(DEFAULT_UNKNOWN_MAX_TOKENS),
-            })
-        })
-        .collect()
+/// A failed listing is not an empty catalog: callers fall back to the static
+/// specs and warn, and discovery must not read it as a live answer.
+fn unavailable() -> AgentError {
+    AgentError::Config {
+        message: CATALOG_UNAVAILABLE.into(),
+    }
 }
 
-fn fetch_catalog(access: &str) -> FetchOutcome {
-    let client = match isahc::HttpClient::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(FETCH_TIMEOUT)
-        .redirect_policy(RedirectPolicy::None)
-        // curl carries http2 for OTLP.
-        .version_negotiation(VersionNegotiation::http11())
-        .build()
-    {
-        Ok(client) => client,
-        Err(_) => return FetchOutcome::Transient,
+async fn fetch_catalog(access: &str) -> FetchOutcome {
+    let Ok(client) = auth::http_client(FETCH_TIMEOUT) else {
+        return FetchOutcome::Transient;
     };
 
-    let request = match isahc::Request::builder()
-        .method("GET")
-        .uri(CLI_MODELS_URL)
+    let Ok(request) = client
+        .get(CLI_MODELS_URL)
         .header("accept", "application/json")
         .header("authorization", format!("Bearer {access}"))
-        .header("user-agent", crate::providers::user_agent())
         .header("x-xai-token-auth", auth::TOKEN_AUTH)
         .header("x-authenticateresponse", auth::AUTHENTICATE_RESPONSE)
         .header("x-grok-client-identifier", auth::CLIENT_IDENTIFIER)
         .header("x-grok-client-version", auth::GROK_CLI_VERSION)
         .header("x-grok-client-mode", "headless")
-        .body(())
-    {
-        Ok(request) => request,
-        Err(_) => return FetchOutcome::Transient,
+        .build()
+    else {
+        return FetchOutcome::Transient;
     };
 
-    let mut resp = match client.send(request) {
-        Ok(resp) => resp,
+    let (status, body) = match status_and_text(&client, request).await {
+        Ok(result) => result,
         Err(e) => {
             debug!(error = %e, "xAI catalog request failed");
             return FetchOutcome::Transient;
         }
     };
 
-    let status = resp.status().as_u16();
     if status == 401 || status == 403 {
         return FetchOutcome::Auth;
     }
@@ -243,10 +209,6 @@ fn fetch_catalog(access: &str) -> FetchOutcome {
         return FetchOutcome::Permanent;
     }
 
-    let body = match resp.text() {
-        Ok(body) => body,
-        Err(_) => return FetchOutcome::Invalid,
-    };
     match normalize_catalog_payload(&body) {
         Ok(models) => FetchOutcome::Success(models),
         Err(_) => FetchOutcome::Invalid,
@@ -627,12 +589,5 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert!(!models[0].reasoning);
         assert_eq!(models[0].context_window, 1_000_000);
-    }
-
-    #[test]
-    fn fallback_models_include_curated_defaults() {
-        let ids: Vec<_> = curated_fallback().into_iter().map(|m| m.id).collect();
-        assert!(ids.contains(&"grok-4.6".into()));
-        assert!(ids.contains(&"grok-4.3".into()));
     }
 }

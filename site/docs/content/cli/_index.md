@@ -27,14 +27,17 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--allowed-tools` / `--disallowed-tools` | yes | yes | yes |
 | `-c` / `--continue`, `-r` / `--resume` | yes | yes | yes |
 | `--exit-on-done` | yes | n/a (always exits) | n/a |
-| `--image` | no (use Ctrl+V paste) | yes | via wire protocol |
+| `--background-timeout` | with `--exit-on-done` | yes (turns moves on) | yes (turns moves on) |
+| `--image` | error (use Ctrl+V paste) | yes | error (send images over the wire protocol) |
 | `--verbose`, `--output-format` | no | yes | stream only |
-| `--system-prompt`, `--append-system-prompt` | no | no | yes |
+| `--system-prompt`, `--append-system-prompt` | yes | yes | yes |
 | `--session-id`, `--fork-session` | yes | yes | yes |
-| `--max-turns`, `--final-answer` | yes | yes | yes |
-| `--dry-run` | no | yes | no |
-| `--permission-mode` | no | no | yes |
+| `--max-turns`, `--final-answer` | error | yes | yes |
+| `--dry-run` | error | yes | error |
+| `--permission-mode` | error | error | yes |
 | `--include-partial-messages` | no | no | yes |
+
+`no` means the flag is ignored. `error` means Maki exits before the run starts. Subcommands reject `--image`, `--max-turns`, `--final-answer`, `--dry-run`, `--permission-mode`, the thinking flags and the system prompt flags. [`maki acp`](#maki-acp) takes the thinking and system prompt flags, and [`maki prompt`](#maki-prompt) takes the system prompt flags.
 
 ### Shared flags (detail)
 
@@ -56,20 +59,23 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--no-jit` | Run plugin Lua on the interpreter with full debug info |
 | `--yolo` | Skip permission prompts on gated tools (alias: `--dangerously-skip-permissions`). Deny rules still apply |
 | `--trust` | Load the project's `.maki` config for this run without asking, recording no decision. See [Folder Trust](/docs/folder-trust/#containers-and-ci) |
-| `--exit-on-done` | Exit when the agent finishes (TUI automation wrappers) |
+| `--exit-on-done` | Exit when the agent finishes (TUI automation wrappers). Waits for running background tasks, bounded by `--background-timeout` |
+| `--background-timeout <SECS>` | How long a run waits for [background tasks](/docs/background-tasks/#headless-sdk-and-acp) after it ends, at most a week. Unset, moves are off in `-p` and SDK mode, on in ACP, and `--exit-on-done` waits `600`. `0` turns moves off everywhere. Global, so it goes before a subcommand |
 | `--allowed-tools <LIST>` | Comma-separated allow list (PascalCase or snake_case) |
 | `--disallowed-tools <LIST>` | Comma-separated deny list |
 | `--session-id <ID>` | Write this run under a chosen id. Errors if a session already exists under it, unless `-r` / `-c` is continuing that same session |
 | `--fork-session` | Copy the resumed session's history under a new id, leaving the original untouched. See [Sessions](/docs/headless/#sessions) |
-| `--max-turns <N>` | Cap model turns. See [bounded runs](/docs/headless/#bounded-runs-and-recovery) |
+| `--max-turns <N>` | Cap model turns in `--print` and SDK mode. See [bounded runs](/docs/headless/#bounded-runs-and-recovery) |
 | `--final-answer` | Ask for a final report on the last allowed turn and prevent further tool execution. Requires `--max-turns` |
-| `--dry-run` | With `-p`, print effective startup metadata without inference |
-| `--system-prompt <TEXT>` | Replace the system prompt (SDK only) |
-| `--append-system-prompt <TEXT>` | Append to the built-in system prompt (SDK only) |
+| `--dry-run` | With `-p`, print effective startup metadata without inference. Conflicts with `--input-format` |
+| `--system-prompt <TEXT>` | Replace the main agent's whole system prompt, so project instructions are dropped too. Subagents keep their own |
+| `--append-system-prompt <TEXT>` | Add text to the end of the main agent's system prompt. Subagents do not get it, so put text they need in `AGENTS.local.md` |
 | `--permission-mode <MODE>` | SDK: `default`, `acceptEdits`, `plan`, or `bypassPermissions` |
 | `--include-partial-messages` | Stream partial deltas in SDK mode |
 
 Thinking flags applied when resuming a TUI session are saved in that session. A later resume without a flag keeps the level. The global `/thinking` default is unchanged.
+
+Pass the system prompt flags again when you resume a session. Other text, or none, rebuilds the prompt and [starts the cache over](/docs/context/#one-prompt-per-session).
 
 ### Tool name lists
 
@@ -133,6 +139,8 @@ maki session import [FILE|-] # store a transcript, print the new id
 ```
 
 Prints stored sessions as a table (id, title, project directory with `$HOME` collapsed to `~`, last update as a relative age), newest first. `--json` prints one JSON array of the same summaries instead, for scripts. A listed id works with `maki -r <id>` to resume it. `delete` removes the session log along with its archives and index entries, and asks for confirmation first unless you pass `-f` / `--force`. Without a terminal to ask on, it refuses outright. A maki that already has the session open will not notice the delete and will lose the rest of that conversation, so close it first. Inside the TUI the same data lives behind `/sessions` (`Ctrl+P`), where `Ctrl+D` deletes.
+
+Resuming a session in the TUI uses the current working directory. All tabs share the process working directory, including changes made with `/cd`.
 
 #### Export and import
 
@@ -214,6 +222,7 @@ maki acp -m anthropic/claude-sonnet-4-6
 maki acp --yolo
 maki acp --thinking xhigh
 maki --no-jit acp
+maki --append-system-prompt "..." acp
 ```
 
 Starts an [ACP](/docs/acp/) server on stdio for editors like Zed. Subcommand flags are `-m` / `--model` and `--yolo`. Thinking flags work before or after `acp`. Other global flags like `--no-jit` must come before the subcommand.
@@ -235,9 +244,10 @@ maki prompt general
 maki prompt --plan           # system prompt + plan-mode reminder (system only)
 maki prompt --tools          # tool definitions as JSON
 maki prompt --tools --names  # tool names only, one per line
+maki --append-system-prompt "..." prompt   # preview with appended text
 ```
 
-Debug helper for inspecting the prompt and tool surface the agent sees. `--plan` is rejected on non-system variants.
+Debug helper for inspecting the prompt and tool surface the agent sees. `--plan` works only on the system variant. The system prompt flags also need the system variant, without `--tools`.
 
 ### `maki migrate`
 
@@ -246,7 +256,7 @@ maki migrate xdg
 maki migrate providers
 ```
 
-`xdg` moves data from `~/.maki/` into platform directories. Safe to re-run. See [Configuration](/docs/configuration/#directory-layout).
+`xdg` moves `~/.maki/` into the platform directories. Maki already does this on startup, so you only need it for a symlinked `~/.maki/` or to retry a move that failed. See [Configuration](/docs/configuration/#moving-from-maki).
 
 `providers` lists the old provider scripts that no Lua plugin replaces yet, and prints a prompt that asks a coding agent to port them. The prompt goes to stdout, so `maki "$(maki migrate providers)"` starts maki on it. See [Migrating from provider scripts](/docs/providers/#migrating-from-provider-scripts).
 

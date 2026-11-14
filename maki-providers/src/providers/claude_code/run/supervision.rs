@@ -1,38 +1,36 @@
 use super::super::MAX_EVENT_BYTES;
 use super::super::error::Error;
 use super::super::mcp::Handoff;
-use super::super::within;
-use super::super::worker::handshake_input;
 use crate::process::guard;
 use crate::process::{ChildExit, ChildGuard};
-use flume::Receiver;
-use futures_lite::future;
-use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use futures_lite::stream;
-use futures_lite::{FutureExt, Stream, StreamExt};
-use smol::process::{ChildStderr, ChildStdin, ChildStdout, Command};
-use smol::{Task, Timer};
+use crate::process::{STDERR_LINE_BYTES, STDERR_TAIL_LINES, cap_stderr_line, within};
+use futures::future;
+use futures::stream;
+use futures::{Stream, StreamExt};
 use std::collections::VecDeque;
 use std::io;
 use std::os::unix::net::UnixStream;
+use std::pin::Pin;
 use std::process::{self, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use thiserror::Error as ThisError;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::time::{Sleep, sleep, sleep_until};
+use tokio_util::task::AbortOnDropHandle;
 use tracing::debug;
 
 pub(super) const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 const STDERR_DRAIN: Duration = Duration::from_secs(1);
-const STDERR_TAIL_LINES: usize = 10;
-const STDERR_LINE_BYTES: usize = 4096;
-const TRUNCATED_LINE: &str = "…";
 
 #[derive(Debug, ThisError)]
 #[error("event exceeds the {MAX_EVENT_BYTES}-byte limit")]
 struct EventTooLarge;
 
 /// Kills the group on drop until reaping starts.
-pub(super) struct Group {
+pub(in crate::providers::claude_code) struct Group {
     child: ChildGuard,
     exit_status: Option<ExitStatus>,
     _lifetime: UnixStream,
@@ -58,8 +56,8 @@ impl Group {
     }
 
     pub(super) async fn spawn(command: process::Command) -> Result<Self, Error> {
-        smol::unblock(move || spawn_piped(command))
-            .await
+        tokio::task::spawn_blocking(move || spawn_piped(command))
+            .await?
             .map_err(Error::io("start Claude Code"))
     }
 
@@ -110,7 +108,7 @@ fn spawn_piped(command: process::Command) -> io::Result<Group> {
         .stderr(Stdio::piped())
         .spawn()?;
     Ok(Group {
-        child: ChildGuard::new(child),
+        child: ChildGuard::new(child)?,
         exit_status: None,
         _lifetime: lifetime,
     })
@@ -120,24 +118,26 @@ type StderrTail = Arc<Mutex<VecDeque<String>>>;
 
 struct Stderr {
     tail: StderrTail,
-    reader: Option<Task<()>>,
+    reader: Option<AbortOnDropHandle<()>>,
 }
 
 impl Stderr {
     async fn explain(self, error: Error) -> Error {
-        if let Some(reader) = self.reader {
-            reader
-                .or(async {
-                    Timer::after(STDERR_DRAIN).await;
-                })
-                .await;
+        if let Some(mut reader) = self.reader {
+            tokio::select! {
+                _ = &mut reader => {},
+                () = sleep(STDERR_DRAIN) => {
+                    reader.abort();
+                    let _ = reader.await;
+                },
+            }
         }
         with_stderr(error, &self.tail)
     }
 }
 
 /// Stops the group and bounds cleanup before attaching stderr to an error.
-pub(super) async fn supervised<T>(
+pub(in crate::providers::claude_code) async fn supervised<T>(
     command: process::Command,
     work: impl AsyncFnOnce(&mut Group) -> Result<T, Error>,
 ) -> Result<T, Error> {
@@ -178,7 +178,7 @@ fn watch_stderr(stderr: Option<ChildStderr>) -> Stderr {
         let lines = Arc::clone(&tail);
         // A line that is not UTF-8 must not stop the reader, or Claude Code
         // blocks once its stderr fills the pipe.
-        smol::spawn(async move {
+        AbortOnDropHandle::new(tokio::spawn(async move {
             let mut reader = BufReader::new(stderr);
             while let Ok(Some(line)) = stderr_line(&mut reader).await {
                 let mut lines = lines.lock().unwrap_or_else(PoisonError::into_inner);
@@ -187,37 +187,33 @@ fn watch_stderr(stderr: Option<ChildStderr>) -> Stderr {
                 }
                 lines.push_back(line);
             }
-        })
+        }))
     });
     Stderr { tail, reader }
 }
 
 async fn stderr_line(reader: &mut (impl AsyncBufRead + Unpin)) -> io::Result<Option<String>> {
     let mut line = Vec::new();
-    let mut truncated = false;
     loop {
         let chunk = reader.fill_buf().await?;
         if chunk.is_empty() {
-            if line.is_empty() && !truncated {
+            if line.is_empty() {
                 return Ok(None);
             }
             break;
         }
         let end = chunk.iter().position(|byte| *byte == b'\n');
         let length = end.unwrap_or(chunk.len());
-        let kept = length.min(STDERR_LINE_BYTES - line.len());
+        let kept = length.min(STDERR_LINE_BYTES + 1 - line.len());
         line.extend_from_slice(&chunk[..kept]);
-        truncated |= kept < length;
         reader.consume(length + usize::from(end.is_some()));
         if end.is_some() {
             break;
         }
     }
-    let mut text = String::from_utf8_lossy(line.strip_suffix(b"\r").unwrap_or(&line)).into_owned();
-    if truncated {
-        text.push_str(TRUNCATED_LINE);
-    }
-    Ok(Some(text))
+    Ok(Some(cap_stderr_line(&String::from_utf8_lossy(
+        line.strip_suffix(b"\r").unwrap_or(&line),
+    ))))
 }
 
 fn with_stderr(error: Error, tail: &StderrTail) -> Error {
@@ -251,14 +247,14 @@ pub(super) enum Next {
 }
 
 pub(super) struct ReadDeadline {
-    timer: Timer,
+    timer: Pin<Box<Sleep>>,
     at: Option<Instant>,
 }
 
 impl ReadDeadline {
     pub(super) fn new(at: Instant) -> Self {
         Self {
-            timer: Timer::at(at),
+            timer: Box::pin(sleep_until(at.into())),
             at: Some(at),
         }
     }
@@ -266,29 +262,32 @@ impl ReadDeadline {
     pub(super) async fn next(
         &mut self,
         lines: &mut (impl Stream<Item = io::Result<String>> + Unpin),
-        handoffs: Option<&Receiver<Handoff>>,
+        mut handoffs: Option<&mut UnboundedReceiver<Handoff>>,
         deadline: Instant,
     ) -> Next {
         if self.at.is_none_or(|at| deadline < at) {
-            self.timer.set_at(deadline);
+            self.timer.as_mut().reset(deadline.into());
             self.at = Some(deadline);
         }
         loop {
-            let next = async { Next::Line(lines.next().await) }
-                .or(async {
-                    match handoffs {
-                        Some(handoffs) => match handoffs.recv_async().await {
-                            Ok(handoff) => Next::Handoff(handoff),
-                            Err(_) => future::pending().await,
+            let next = tokio::select! {
+                biased;
+                line = lines.next() => Next::Line(line),
+                handoff = async {
+                    match handoffs.as_deref_mut() {
+                        Some(handoffs) => match handoffs.recv().await {
+                            Some(handoff) => handoff,
+                            None => future::pending().await,
                         },
                         None => future::pending().await,
                     }
-                })
-                .or(async {
-                    (&mut self.timer).await;
-                    Next::Late
-                })
-                .await;
+                } => Next::Handoff(handoff),
+                () = async {
+                    if Instant::now() < deadline {
+                        (&mut self.timer).await;
+                    }
+                } => Next::Late,
+            };
             if !matches!(next, Next::Late) {
                 return next;
             }
@@ -297,7 +296,7 @@ impl ReadDeadline {
                 return next;
             }
             // Progress extends idle time without registering another alarm on each line.
-            self.timer.set_at(deadline);
+            self.timer.as_mut().reset(deadline.into());
             self.at = Some(deadline);
         }
     }
@@ -341,15 +340,6 @@ pub(super) fn stdout_lines(
     ))
 }
 
-/// Sends the check requests, which Claude Code answers before it reads a
-/// prompt.
-pub(super) async fn send_handshake(
-    stdin: &mut Option<ChildStdin>,
-    deadline: Instant,
-) -> Result<(), Error> {
-    send(stdin, &handshake_input(), deadline).await
-}
-
 /// A process that ignores stdin can block a write larger than the pipe buffer. Bound the
 /// write with a deadline.
 pub(super) async fn send(
@@ -375,14 +365,15 @@ mod tests {
     use std::process::ExitStatus;
     use std::time::{Duration, Instant};
 
-    use futures_lite::future::poll_once;
-    use futures_lite::{io::Cursor, stream};
+    use futures::stream;
+    use std::io::Cursor;
     use test_case::test_case;
 
     use super::{
-        Error, MAX_EVENT_BYTES, Next, ReadDeadline, STDERR_LINE_BYTES, TRUNCATED_LINE, event_line,
-        stderr_line, unreadable, wait_result,
+        Error, MAX_EVENT_BYTES, Next, ReadDeadline, STDERR_LINE_BYTES, event_line, stderr_line,
+        unreadable, wait_result,
     };
+    use crate::process::STDERR_TRUNCATED;
 
     const NEXT_LINE: &str = "next";
 
@@ -407,7 +398,7 @@ mod tests {
 
     #[test]
     fn a_read_deadline_can_be_reused_after_it_expires() {
-        smol::block_on(async {
+        crate::test_support::runtime().block_on(async {
             let later = Instant::now();
             let earlier = later - Duration::from_secs(1);
             let mut timer = ReadDeadline::new(earlier);
@@ -417,7 +408,7 @@ mod tests {
                 Next::Late
             ));
             assert!(matches!(
-                poll_once(timer.next(&mut lines, None, later)).await,
+                futures::FutureExt::now_or_never(timer.next(&mut lines, None, later)),
                 Some(Next::Late)
             ));
         });
@@ -431,7 +422,9 @@ mod tests {
             input.push(b'\n');
         }
         let mut reader = Cursor::new(input);
-        let error = smol::block_on(event_line(&mut reader)).unwrap_err();
+        let error = crate::test_support::runtime()
+            .block_on(event_line(&mut reader))
+            .unwrap_err();
         assert_eq!(reader.position(), (MAX_EVENT_BYTES + 1) as u64);
         assert!(
             matches!(unreadable(error), Error::EventTooLarge { limit } if limit == MAX_EVENT_BYTES)
@@ -446,19 +439,27 @@ mod tests {
             input.push(b'\n');
         }
         let mut reader = Cursor::new(input);
-        let line = smol::block_on(event_line(&mut reader)).unwrap().unwrap();
+        let line = crate::test_support::runtime()
+            .block_on(event_line(&mut reader))
+            .unwrap()
+            .unwrap();
         assert_eq!(line.len(), MAX_EVENT_BYTES);
-        assert!(smol::block_on(event_line(&mut reader)).unwrap().is_none());
+        assert!(
+            crate::test_support::runtime()
+                .block_on(event_line(&mut reader))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn capped_stderr_lines_are_drained_before_the_next_line() {
-        smol::block_on(async {
+        crate::test_support::runtime().block_on(async {
             let input = format!("{}\n{NEXT_LINE}\n", "x".repeat(STDERR_LINE_BYTES * 2));
             let mut reader = Cursor::new(input.as_bytes());
             let line = stderr_line(&mut reader).await.unwrap().unwrap();
-            assert_eq!(line.len(), STDERR_LINE_BYTES + TRUNCATED_LINE.len());
-            assert!(line.ends_with(TRUNCATED_LINE));
+            assert_eq!(line.len(), STDERR_LINE_BYTES + STDERR_TRUNCATED.len());
+            assert!(line.ends_with(STDERR_TRUNCATED));
             assert_eq!(
                 stderr_line(&mut reader).await.unwrap().as_deref(),
                 Some(NEXT_LINE)
@@ -473,7 +474,7 @@ mod process_tests {
     use std::process::Command;
     use std::time::Instant;
 
-    use futures_lite::io::{AsyncBufReadExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, BufReader};
 
     use test_case::test_case;
 
@@ -497,23 +498,24 @@ mod process_tests {
                 FAIL_COMMAND
             },
         ]);
-        let error = smol::block_on(supervised::<()>(command, async |group| {
-            if shutdown {
-                let mut line = String::new();
-                BufReader::new(group.child.child_mut().unwrap().stdout.as_mut().unwrap())
-                    .read_line(&mut line)
-                    .await
-                    .unwrap();
-                if deadline {
-                    assert!(group.wait(Instant::now()).await.is_err());
+        let error = crate::test_support::runtime()
+            .block_on(supervised::<()>(command, async |group| {
+                if shutdown {
+                    let mut line = String::new();
+                    BufReader::new(group.child.child_mut().unwrap().stdout.as_mut().unwrap())
+                        .read_line(&mut line)
+                        .await
+                        .unwrap();
+                    if deadline {
+                        assert!(group.wait(Instant::now()).await.is_err());
+                    }
+                } else {
+                    let status = group.wait(Instant::now() + SHUTDOWN_GRACE).await?;
+                    assert_eq!(status.code(), Some(FAIL_CODE));
                 }
-            } else {
-                let status = group.wait(Instant::now() + SHUTDOWN_GRACE).await?;
-                assert_eq!(status.code(), Some(FAIL_CODE));
-            }
-            Err(Error::Failed(PROCESS_ERROR.into()))
-        }))
-        .unwrap_err();
+                Err(Error::Failed(PROCESS_ERROR.into()))
+            }))
+            .unwrap_err();
         let text = error.to_string();
         assert!(text.contains(PROCESS_ERROR), "{text}");
         assert!(text.contains(PROCESS_STDERR), "{text}");
@@ -532,11 +534,12 @@ mod process_tests {
     fn an_interrupted_exit_reports_the_process_status_once() {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", FAIL_COMMAND]);
-        let error = smol::block_on(supervised::<()>(command, async |group| {
-            let status = group.wait(Instant::now() + SHUTDOWN_GRACE).await?;
-            Err(Error::ExitedEarly(status).after_start(true))
-        }))
-        .unwrap_err();
+        let error = crate::test_support::runtime()
+            .block_on(supervised::<()>(command, async |group| {
+                let status = group.wait(Instant::now() + SHUTDOWN_GRACE).await?;
+                Err(Error::ExitedEarly(status).after_start(true))
+            }))
+            .unwrap_err();
         assert!(
             matches!(&error, Error::Context(failure) if failure.interrupted && matches!(*failure.cause, Error::ExitedEarly(_))),
             "{error:?}"
@@ -549,21 +552,22 @@ mod process_tests {
     fn errors_after_an_explicit_stop_omit_process_status(graceful: bool) {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "printf 'ready\n'; read reply"]);
-        let error = smol::block_on(supervised::<()>(command, async |group| {
-            let mut line = String::new();
-            BufReader::new(group.child.child_mut().unwrap().stdout.as_mut().unwrap())
-                .read_line(&mut line)
-                .await
-                .unwrap();
-            if graceful {
-                group.terminate();
-            } else {
-                group.kill();
-            }
-            group.wait(Instant::now() + SHUTDOWN_GRACE).await?;
-            Err(Error::Failed(PROCESS_ERROR.into()))
-        }))
-        .unwrap_err();
+        let error = crate::test_support::runtime()
+            .block_on(supervised::<()>(command, async |group| {
+                let mut line = String::new();
+                BufReader::new(group.child.child_mut().unwrap().stdout.as_mut().unwrap())
+                    .read_line(&mut line)
+                    .await
+                    .unwrap();
+                if graceful {
+                    group.terminate();
+                } else {
+                    group.kill();
+                }
+                group.wait(Instant::now() + SHUTDOWN_GRACE).await?;
+                Err(Error::Failed(PROCESS_ERROR.into()))
+            }))
+            .unwrap_err();
         assert!(
             matches!(error, Error::Failed(ref message) if message == PROCESS_ERROR),
             "{error:?}"

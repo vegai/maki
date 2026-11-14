@@ -8,33 +8,36 @@
 //! metadata so scripted callers can inspect the effective, model-clamped setting.
 
 use std::io::{self, Read};
+use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, bail, eyre};
-use maki_agent::headless::{self, HeadlessHandle, HeadlessParams, Ready};
+use maki_agent::headless::{self, BackgroundMode, InteractiveHandle, InteractiveParams, Ready};
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::session::Resumed;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
-    AgentConfig, AgentEvent, CancelToken, DoneReason, Envelope, ImageSource, PermissionsConfig,
-    SteerKind,
+    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, HostPrompt, ImageSource,
+    InputSource, PermissionsConfig, SteerKind,
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
+use maki_lua::EventHandle;
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
-use maki_lua::{EventHandle, SessionEndReason};
+use maki_providers::TokenUsage;
 use maki_providers::model::Model;
-use maki_providers::{TokenUsage, add_cost};
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::headless_startup::{start_mcp, startup};
-use crate::shutdown::watch;
+use crate::headless_startup::{shutdown, start_mcp, startup};
+use crate::interrupt::Interrupt;
+use crate::sdk_mode::NOTICE_SUBTYPE;
+use crate::subagent_tasks::{SubagentTasks, TaskMessage};
 use crate::wire::{
     API_RETRY, ERROR_DURING_EXECUTION, INIT, NOTIFICATION, ProviderNotice, SUCCESS,
     failure_subtype, system_event,
@@ -137,11 +140,90 @@ struct UserMessage<'a> {
     content: &'a Value,
 }
 
+/// Claude Code has no event for this, so it takes the SDK's shape. Without it
+/// a woken turn's assistant messages follow the last turn's with nothing
+/// between them that says what woke it.
+#[derive(Serialize)]
+struct NoticeEvent<'a> {
+    text: &'a str,
+}
+
+#[derive(Serialize)]
+struct TaskEvent<'a> {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    subtype: &'static str,
+    #[serde(flatten)]
+    task: TaskMessage,
+    session_id: &'a SessionRef,
+}
+
+impl<'a> TaskEvent<'a> {
+    fn new(task: TaskMessage, session_id: &'a SessionRef) -> Self {
+        Self {
+            event_type: "system",
+            subtype: task.subtype(),
+            task,
+            session_id,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct RetryEvent<'a> {
     attempt: u32,
     retry_delay_ms: u64,
     error: &'a str,
+}
+
+/// What the result reports besides the spend. A turn woken by a background
+/// result belongs to the same invocation, so turns add up over every run,
+/// and the answer is the last one a run gave. A woken run that says nothing
+/// keeps the answer before it.
+#[derive(Default)]
+struct Totals {
+    result_text: String,
+    /// The answer of the run still streaming.
+    run_text: String,
+    is_error: bool,
+    num_turns: u32,
+    stop_reason: Option<DoneReason>,
+}
+
+impl Totals {
+    /// `false` once the invocation failed, which ends it.
+    fn fold(&mut self, event: &AgentEvent, parent_tool_use_id: Option<&str>) -> bool {
+        match event {
+            AgentEvent::TextDelta { text } if parent_tool_use_id.is_none() => {
+                self.run_text.push_str(text);
+            }
+            AgentEvent::Steered { .. } => {
+                if let Some(reason) = dropped_prompt(event, parent_tool_use_id) {
+                    self.is_error = true;
+                    self.run_text = reason.to_owned();
+                }
+            }
+            AgentEvent::Done {
+                num_turns, reason, ..
+            } if parent_tool_use_id.is_none() => {
+                self.num_turns += *num_turns;
+                self.stop_reason = Some(*reason);
+                // Only a stop cancels a run here, and its answer is cut short.
+                self.is_error |= failure_subtype(*reason).is_some();
+                let run_text = mem::take(&mut self.run_text);
+                if !run_text.is_empty() {
+                    self.result_text = run_text;
+                }
+            }
+            AgentEvent::Error { message, .. } if parent_tool_use_id.is_none() => {
+                self.is_error = true;
+                self.result_text = message.clone();
+                return false;
+            }
+            _ => {}
+        }
+        true
+    }
 }
 
 enum VerboseOutput {
@@ -157,12 +239,18 @@ impl VerboseOutput {
         }
         Ok(())
     }
+
+    fn emit_tasks(&mut self, tasks: Vec<TaskMessage>, session_id: &SessionRef) -> Result<()> {
+        tasks
+            .into_iter()
+            .try_for_each(|task| self.emit(&TaskEvent::new(task, session_id)))
+    }
 }
 
 pub struct PrintParams {
     pub dry_run: bool,
     pub model: Model,
-    pub prompt: Option<String>,
+    pub prompt: String,
     pub image_paths: Vec<PathBuf>,
     pub format: OutputFormat,
     pub verbose: bool,
@@ -174,15 +262,31 @@ pub struct PrintParams {
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
     pub project_config: ProjectConfig,
+    pub host_prompt: HostPrompt,
     /// Which session this run continues and writes under, and where. Resolved
     /// by the caller from the same flags every other entry point reads.
     pub resumed: Resumed,
     /// The right to write [`Self::resumed`]'s session, taken when it was
     /// resolved and held for the whole run.
     pub claim: SessionClaim,
+    /// How long to wait for background work once the prompt's run ends.
+    /// `None` runs every call blocking instead.
+    pub background_wait: Option<Duration>,
 }
 
-pub fn run(params: PrintParams) -> Result<()> {
+pub fn read_prompt(prompt: Option<String>, dry_run: bool) -> Result<String> {
+    match prompt {
+        Some(p) => Ok(p),
+        None if dry_run => Ok(String::new()),
+        None => {
+            let mut buf = String::new();
+            io::stdin().read_to_string(&mut buf).context("read stdin")?;
+            Ok(buf)
+        }
+    }
+}
+
+pub async fn run(params: PrintParams, interrupt: &Interrupt) -> Result<()> {
     let PrintParams {
         dry_run,
         model,
@@ -198,54 +302,52 @@ pub fn run(params: PrintParams) -> Result<()> {
         model_policy,
         plugin_rules,
         project_config,
+        host_prompt,
         resumed,
         claim,
+        background_wait,
     } = params;
-
-    let prompt = match prompt {
-        Some(p) => p,
-        None if dry_run => String::new(),
-        None => {
-            let mut buf = String::new();
-            io::stdin().read_to_string(&mut buf).context("read stdin")?;
-            buf
-        }
-    };
 
     let images = load_images(&image_paths)?;
 
-    let prompt_slots = lua_handle.collect_prompt_slots();
+    let prompt_slots = lua_handle
+        .collect_prompt_slots(Some(resumed.id.as_str()))
+        .await;
 
-    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    let (trigger, shutdown) = CancelToken::new();
-    watch(trigger).context("watch termination signals")?;
-    let mcp_handle = start_mcp(&cwd, project_config.clone());
-    let (handle, mut events) = headless::spawn(HeadlessParams {
-        shutdown,
-        dry_run,
-        model,
+    let initial_wd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let cwd = initial_wd.to_string_lossy().into_owned();
+    let mcp_handle = start_mcp(&initial_wd, project_config.clone()).await;
+
+    let (handle, mut events) = headless::spawn_interactive(InteractiveParams {
+        model: model.clone(),
         config,
         permissions_config,
         timeouts,
-        prompt,
-        images,
-        prompt_slots,
+        prompt_slots: Arc::new(prompt_slots),
         excluded_tools: vec![QUESTION_TOOL_NAME],
         mcp_handle,
-        initial_wd: cwd,
+        initial_wd,
         resumed,
         claim,
+        yolo: false,
+        unattended: true,
+        host_prompt,
         defaults,
         model_policy,
         plugin_rules,
         project_config,
+        local_tools: Default::default(),
+        background: BackgroundMode::from_wait(background_wait),
+        stop: interrupt.stop(),
     });
 
-    let HeadlessHandle {
-        ready,
+    let InteractiveHandle {
+        mut ready,
+        input_tx,
         session_id,
-        cwd,
         task,
+        spend,
+        ..
     } = handle;
     let start = Instant::now();
     let mut verbose_out = match format {
@@ -258,11 +360,10 @@ pub fn run(params: PrintParams) -> Result<()> {
         model,
         tool_names,
         thinking,
-    } = match startup(&ready, &mut events) {
+    } = match startup(&mut ready, &mut events).await {
         Ok(started) => started,
         Err(error) => {
-            smol::block_on(headless::await_shutdown(task));
-            lua_handle.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
+            drop(shutdown(task, &lua_handle, &session_id).await);
             if !matches!(format, OutputFormat::Text) {
                 write_result(
                     format,
@@ -274,39 +375,39 @@ pub fn run(params: PrintParams) -> Result<()> {
         }
     };
 
-    {
-        let init = system_event(
-            &session_id,
-            INIT,
-            InitEvent {
-                cwd: &cwd,
-                tools: &tool_names,
-                model: &model.id,
-                thinking,
-            },
-        );
-        if dry_run {
-            smol::block_on(headless::await_shutdown(task));
-            lua_handle.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
-            println!("{}", serde_json::to_string(&init)?);
-            return Ok(());
-        }
-
-        match &mut verbose_out {
-            Some(out) => out.emit(&init)?,
-            // Text mode never says which session it wrote, and a later `-r`
-            // needs it. On stderr so a pipe reading the answer is unaffected.
-            None => eprintln!("{SESSION_LINE_PREFIX}{session_id}"),
-        }
+    let init = system_event(
+        &session_id,
+        INIT,
+        InitEvent {
+            cwd: &cwd,
+            tools: &tool_names,
+            model: &model.id,
+            thinking,
+        },
+    );
+    if dry_run {
+        drop(input_tx);
+        drop(shutdown(task, &lua_handle, &session_id).await);
+        println!("{}", serde_json::to_string(&init)?);
+        return Ok(());
     }
-    let mut result_text = String::new();
-    let mut is_error = false;
-    let mut num_turns: u32 = 0;
-    let mut usage = TokenUsage::default();
-    // Summed as the turns land: rates move mid-run, and only a turn knows the
-    // rate it paid.
-    let mut cost = None;
-    let mut stop_reason: Option<DoneReason> = None;
+    match &mut verbose_out {
+        Some(out) => out.emit(&init)?,
+        None => eprintln!("{SESSION_LINE_PREFIX}{session_id}"),
+    }
+    drop(init);
+    let _ = input_tx.send(AgentInput::from_defaults(
+        prompt,
+        AgentMode::Build,
+        images,
+        defaults,
+        InputSource::Headless,
+    ));
+    drop(input_tx);
+
+    let mut totals = Totals::default();
+    // The stream shows Maki's own tool names, so a task message does too.
+    let mut tasks = SubagentTasks::new(|name| name);
 
     let snapshot = HeadlessSnapshot::default();
     snapshot.install(
@@ -316,21 +417,15 @@ pub fn run(params: PrintParams) -> Result<()> {
             cwd: cwd.clone(),
             model: model.spec(),
         },
-        // `maki -p` always runs the agent in build mode
-        // (`headless::spawn` hardcodes `AgentMode::Build`).
+        // `maki -p` sends its one prompt in build mode and never switches.
         || MODE_BUILD,
     );
 
-    while let Some(envelope) = smol::block_on(events.next()) {
+    while let Some(envelope) = events.next().await {
         // Folded in first, so a plugin handling `TurnEnd` finds the finished
         // totals when it calls `maki.session.read()`.
         snapshot.observe(&envelope);
-        maki_lua::agent_autocmd::dispatch(
-            &lua_handle,
-            &session_id,
-            &envelope,
-            envelope.subagent.is_some(),
-        );
+        maki_lua::agent_autocmd::dispatch(&lua_handle, &session_id, &envelope);
         let Envelope {
             ref event,
             ref subagent,
@@ -338,20 +433,26 @@ pub fn run(params: PrintParams) -> Result<()> {
         } = envelope;
         let parent_tool_use_id = subagent.as_ref().map(|s| s.parent_tool_use_id.as_str());
 
+        if !totals.fold(event, parent_tool_use_id) {
+            break;
+        }
+        let task_messages = tasks.observe(&envelope);
+        if let Some(out) = &mut verbose_out {
+            out.emit_tasks(task_messages.before, &session_id)?;
+        }
         match event {
-            AgentEvent::TextDelta { text } => {
-                if parent_tool_use_id.is_none() {
-                    result_text.push_str(text);
-                }
-            }
-            AgentEvent::ThinkingDelta { .. } => {}
-            AgentEvent::ToolPending { .. }
+            AgentEvent::TextDelta { .. }
+            | AgentEvent::ThinkingDelta { .. }
+            | AgentEvent::ToolPending { .. }
             | AgentEvent::ToolStart(_)
             | AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolDone(_)
+            | AgentEvent::ToolMovable { .. }
+            | AgentEvent::ToolParts { .. }
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueDrained
             | AgentEvent::AutoCompacting { .. }
+            | AgentEvent::CompactionStarted
             | AgentEvent::CompactionDone { .. }
             | AgentEvent::AuthRequired
             | AgentEvent::AllowedByPlugin { .. }
@@ -362,13 +463,21 @@ pub fn run(params: PrintParams) -> Result<()> {
             | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::Nudge
             | AgentEvent::Notice { .. }
-            | AgentEvent::ObservationLine { .. }
             | AgentEvent::PromptProgress { .. }
-            | AgentEvent::StreamClosed => {}
-            AgentEvent::Steered { .. } => {
-                if let Some(reason) = dropped_prompt(event, parent_tool_use_id) {
-                    is_error = true;
-                    result_text = reason.to_owned();
+            | AgentEvent::StreamClosed
+            | AgentEvent::Steered { .. }
+            | AgentEvent::Done { .. }
+            | AgentEvent::Error { .. } => {}
+            AgentEvent::ObservationLine { text, .. } => {
+                if let Some(out) = verbose_out
+                    .as_mut()
+                    .filter(|_| parent_tool_use_id.is_none())
+                {
+                    out.emit(&system_event(
+                        &session_id,
+                        NOTICE_SUBTYPE,
+                        NoticeEvent { text },
+                    ))?;
                 }
             }
             AgentEvent::ProviderWaiting { message } => {
@@ -403,7 +512,6 @@ pub fn run(params: PrintParams) -> Result<()> {
                 }
             }
             AgentEvent::TurnComplete(tc) => {
-                add_cost(&mut cost, tc.cost);
                 if let Some(out) = &mut verbose_out {
                     let content_value = serde_json::to_value(&tc.message.content)?;
                     out.emit(&AssistantEvent {
@@ -433,39 +541,33 @@ pub fn run(params: PrintParams) -> Result<()> {
                     })?;
                 }
             }
-            AgentEvent::Done {
-                usage: u,
-                num_turns: turns,
-                reason,
-                cost: dcost,
-                ..
-            } => {
-                if parent_tool_use_id.is_some() {
-                    continue;
-                }
-                num_turns = *turns;
-                usage = *u;
-                // The agent's own ledger also counts compaction spend, which
-                // summing the turns misses.
-                cost = (*dcost).or(cost);
-                stop_reason = Some(*reason);
-                is_error |= failure_subtype(*reason).is_some();
-                break;
-            }
-            AgentEvent::Error { message, .. } if parent_tool_use_id.is_none() => {
-                is_error = true;
-                result_text = message.clone();
-                break;
-            }
-            AgentEvent::Error { .. } => {}
+        }
+        if let Some(out) = &mut verbose_out {
+            out.emit_tasks(task_messages.after, &session_id)?;
         }
     }
-    smol::block_on(headless::await_shutdown(task));
-    lua_handle.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
+    let track = shutdown(task, &lua_handle, &session_id).await;
+    if let Some(out) = &mut verbose_out {
+        out.emit_tasks(tasks.finish(), &session_id)?;
+    }
+    // Background work and plugin jobs are stopped by now, so nothing spends
+    // any more. Dropping the track saves the full bill, also what no turn
+    // was left to report.
+    drop(track);
+    let spent = spend.totals();
 
     let duration_ms = start.elapsed().as_millis();
+    let Totals {
+        result_text,
+        is_error,
+        num_turns,
+        stop_reason,
+        ..
+    } = totals;
+    // A stop before the session read the prompt runs nothing at all.
+    let is_error = is_error || stop_reason.is_none();
     // Zero on an unpriced model, which is what its turns reported too.
-    let total_cost_usd = cost.unwrap_or_default();
+    let total_cost_usd = spent.cost.unwrap_or_default();
 
     let subtype = stop_reason
         .and_then(failure_subtype)
@@ -487,13 +589,13 @@ pub fn run(params: PrintParams) -> Result<()> {
             stop_reason,
             session_id,
             total_cost_usd,
-            usage,
+            usage: spent.usage,
         },
     )?;
-
     if is_error {
         bail!("headless run ended with {subtype}");
     }
+
     Ok(())
 }
 
@@ -530,6 +632,7 @@ fn dropped_prompt<'a>(event: &'a AgentEvent, parent_tool_use_id: Option<&str>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_agent::RunTotals;
     use maki_providers::{ThinkingConfig, TokenUsage};
     use test_case::test_case;
 
@@ -549,6 +652,73 @@ mod tests {
             text: DROP_REASON.into(),
         };
         assert_eq!(dropped_prompt(&event, parent), expected);
+    }
+
+    const FIRST_ANSWER: &str = "started the build";
+    const WOKEN_ANSWER: &str = "the build passed";
+    const SUBAGENT_TEXT: &str = "child chatter";
+    const ERROR_MESSAGE: &str = "provider error";
+    const RUN_TURNS: u32 = 2;
+    const RUNS: u32 = 2;
+
+    fn text_delta(text: &str) -> AgentEvent {
+        AgentEvent::TextDelta { text: text.into() }
+    }
+
+    fn run_done(reason: DoneReason) -> AgentEvent {
+        AgentEvent::Done {
+            usage: TokenUsage::default(),
+            cost: None,
+            list_cost: None,
+            context_size: 0,
+            context_window: 0,
+            num_turns: RUN_TURNS,
+            reason,
+        }
+    }
+
+    #[test]
+    fn a_run_cut_short_by_a_stop_is_an_error() {
+        let mut totals = Totals::default();
+        assert!(totals.fold(&text_delta(FIRST_ANSWER), None));
+        assert!(totals.fold(&run_done(DoneReason::Cancelled), None));
+
+        assert!(totals.is_error);
+        assert_eq!(totals.result_text, FIRST_ANSWER);
+    }
+
+    /// A woken turn is part of the same invocation: its turns add up, and its
+    /// answer, if it gave one, is the one the caller gets.
+    #[test_case(WOKEN_ANSWER, WOKEN_ANSWER ; "woken_answer_replaces_the_first")]
+    #[test_case("", FIRST_ANSWER ; "silent_woken_run_keeps_the_first")]
+    fn totals_add_up_every_run_and_answer_with_the_last_text(woken: &str, expected: &str) {
+        let mut totals = Totals::default();
+        for answer in [FIRST_ANSWER, woken] {
+            assert!(totals.fold(&text_delta(answer), None));
+            assert!(totals.fold(&text_delta(SUBAGENT_TEXT), Some(PARENT_TOOL_USE_ID)));
+            assert!(totals.fold(&run_done(DoneReason::EndTurn), None));
+        }
+
+        assert_eq!(totals.result_text, expected);
+        assert_eq!(totals.num_turns, RUN_TURNS * RUNS);
+        assert_eq!(totals.stop_reason, Some(DoneReason::EndTurn));
+        assert!(!totals.is_error);
+    }
+
+    #[test]
+    fn an_error_ends_the_invocation_with_its_message() {
+        let mut totals = Totals::default();
+        assert!(totals.fold(&text_delta(FIRST_ANSWER), None));
+
+        let error = AgentEvent::Error {
+            message: ERROR_MESSAGE.into(),
+            auth: false,
+            totals: RunTotals::default(),
+        };
+        assert!(!totals.fold(&error, None));
+
+        assert!(totals.is_error);
+        assert_eq!(totals.result_text, ERROR_MESSAGE);
     }
 
     const PRINT_RESULT_FIELDS: &[&str] = &[
@@ -573,6 +743,8 @@ mod tests {
         "model",
         "thinking",
     ];
+    const NOTICE_EVENT_FIELDS: &[&str] = &["type", "subtype", "text", "session_id"];
+    const NOTICE_TEXT: &str = "Background bash finished: cargo test";
     const RETRY_EVENT_FIELDS: &[&str] = &[
         "uuid",
         "type",
@@ -631,6 +803,12 @@ mod tests {
         let json: Value = serde_json::to_value(&retry).unwrap();
         for field in RETRY_EVENT_FIELDS {
             assert!(json.get(field).is_some(), "RetryEvent missing: {field}");
+        }
+
+        let notice = system_event(&sid, NOTICE_SUBTYPE, NoticeEvent { text: NOTICE_TEXT });
+        let json: Value = serde_json::to_value(&notice).unwrap();
+        for field in NOTICE_EVENT_FIELDS {
+            assert!(json.get(field).is_some(), "NoticeEvent missing: {field}");
         }
     }
 }

@@ -41,6 +41,16 @@ pub enum HostEvent<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
     },
+    TurnComplete {
+        /// Absent when the host does not know the gauge.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context_size: Option<u32>,
+        context_window: u32,
+        /// The task id of the subagent that ran the turn, so a listener can
+        /// tell whose context it is watching. Absent for the main session.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<&'a str>,
+    },
     AutoCompacting {
         context_size: u32,
         context_window: u32,
@@ -109,9 +119,15 @@ pub enum HostEvent<'a> {
     InputChanged {
         text: &'a str,
         cursor: usize,
+        anchor: Option<usize>,
         version: u64,
         source: Option<&'a str>,
         cursor_only: bool,
+    },
+    /// Not about a session: the mode is global.
+    ModeChanged {
+        old_mode: &'static str,
+        new_mode: &'static str,
     },
     FileIndexReady {
         root: Option<&'a str>,
@@ -166,6 +182,7 @@ impl HostEventKind {
                 &["tool_id", "tool", "is_error", "bytes", "duration_ms"],
             ),
             Self::AutoCompacting => (&[], &["context_size", "context_window"]),
+            Self::TurnComplete => (&[], &["context_size", "context_window", "id"]),
             Self::CompactionDone => (
                 &["summary"],
                 &[
@@ -198,7 +215,11 @@ impl HostEventKind {
             Self::TaskStopped => (&[], &["id", "plugin"]),
             Self::TaskFocusChanged => (&[], &["id"]),
             Self::ModelChanged => (&[], &["model", "previous_spec"]),
-            Self::InputChanged => (&["text"], &["cursor", "version", "source", "cursor_only"]),
+            Self::InputChanged => (
+                &["text"],
+                &["cursor", "anchor", "version", "source", "cursor_only"],
+            ),
+            Self::ModeChanged => (&[], &["old_mode", "new_mode"]),
             Self::FileIndexReady => (&[], &["root", "files", "crashed", "truncated"]),
         };
         EventFields { content, metadata }
@@ -211,26 +232,31 @@ pub fn host_event_fields(event: &str) -> Option<EventFields> {
     event.parse().ok().map(HostEventKind::fields)
 }
 
-pub fn dispatch(
-    handle: &EventHandle,
-    session_id: &dyn Display,
-    envelope: &Envelope,
-    subagent_bounded: bool,
-) {
-    if let Some(event) = host_event_for(&envelope.event, subagent_bounded) {
+pub fn dispatch(handle: &EventHandle, session_id: &dyn Display, envelope: &Envelope) {
+    let task_id = envelope
+        .subagent
+        .as_ref()
+        .map(|s| s.parent_tool_use_id.as_str());
+    if let Some(event) = host_event_for(&envelope.event, task_id) {
         handle.fire(Some(session_id), event);
     }
 }
 
 /// Subagent envelopes carry the parent's `session_id`, so firing on them too
 /// would double count every budget and every tool the parent already reported,
-/// and a subagent compacting would look like the main context shrank.
+/// and a subagent compacting would look like the main context shrank. The one
+/// exception is `TurnComplete`: it carries the subagent's own gauge, so
+/// context can be watched mid-turn, and `data.id` says whose context it is
+/// (absent for the main session's own turns).
 ///
 /// This runs on every envelope, streaming deltas included, and almost all of
 /// them map to nothing, so the event borrows and only a mapped one pays for
 /// a payload.
-pub fn host_event_for(event: &AgentEvent, subagent_bounded: bool) -> Option<HostEvent<'_>> {
-    if subagent_bounded {
+pub fn host_event_for<'a>(
+    event: &'a AgentEvent,
+    task_id: Option<&'a str>,
+) -> Option<HostEvent<'a>> {
+    if task_id.is_some() && !matches!(event, AgentEvent::TurnComplete(_)) {
         return None;
     }
     match event {
@@ -246,6 +272,11 @@ pub fn host_event_for(event: &AgentEvent, subagent_bounded: bool) -> Option<Host
             input: e.call.as_ref().map(|call| &call.input),
             duration_ms: e.call.as_ref().map(|call| call.duration.as_millis() as u64),
         }),
+        AgentEvent::TurnComplete(e) => Some(HostEvent::TurnComplete {
+            context_size: e.context_size,
+            context_window: e.context_window,
+            id: task_id,
+        }),
         AgentEvent::AutoCompacting {
             context_size,
             context_window,
@@ -258,6 +289,7 @@ pub fn host_event_for(event: &AgentEvent, subagent_bounded: bool) -> Option<Host
             context_size_after,
             context_window,
             summary,
+            ..
         } => Some(HostEvent::CompactionDone {
             context_size_before: *context_size_before,
             context_size_after: *context_size_after,
@@ -305,7 +337,10 @@ mod tests {
 
     use std::time::Duration;
 
-    use maki_agent::{CallRecord, ToolDoneEvent, ToolOutput, ToolStartEvent};
+    use maki_agent::{
+        CallRecord, RunTotals, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
+    };
+    use maki_providers::Message;
     use serde_json::json;
     use test_case::test_case;
 
@@ -317,7 +352,7 @@ mod tests {
     const TOOL_MILLIS: u64 = 42;
 
     fn fired(event: &AgentEvent) -> Option<(&'static str, Value)> {
-        host_event_for(event, false).map(|e| (e.name(), e.payload(Some(&SESSION))))
+        host_event_for(event, None).map(|e| (e.name(), e.payload(Some(&SESSION))))
     }
 
     fn done(reason: DoneReason) -> AgentEvent {
@@ -336,6 +371,18 @@ mod tests {
         }
     }
 
+    fn turn_complete(context_size: Option<u32>) -> AgentEvent {
+        AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+            message: Message::default(),
+            usage: TokenUsage::default(),
+            model: "m".into(),
+            cost: None,
+            subsidised_list_cost: None,
+            context_size,
+            context_window: 200_000,
+        }))
+    }
+
     fn tool_done() -> AgentEvent {
         AgentEvent::ToolDone(Box::new(ToolDoneEvent {
             id: "t1".into(),
@@ -348,6 +395,7 @@ mod tests {
                 input: json!({ "command": TOOL_COMMAND }),
                 duration: Duration::from_millis(TOOL_MILLIS),
             })),
+            backgrounded: false,
         }))
     }
 
@@ -373,6 +421,7 @@ mod tests {
                 output: None,
             })),
             tool_done(),
+            turn_complete(Some(150_000)),
             AgentEvent::AutoCompacting {
                 context_size: 1,
                 context_window: 2,
@@ -382,11 +431,13 @@ mod tests {
                 context_size_after: 30_000,
                 context_window: 200_000,
                 summary: String::new(),
+                duration_ms: 0,
             },
             done(DoneReason::EndTurn),
             AgentEvent::Error {
                 message: "boom".into(),
                 auth: false,
+                totals: RunTotals::default(),
             },
         ]
     }
@@ -451,6 +502,11 @@ mod tests {
                 context_size: 0,
                 context_window: 0,
             },
+            HostEventKind::TurnComplete => HostEvent::TurnComplete {
+                context_size: Some(0),
+                context_window: 0,
+                id: Some(SAMPLE_TEXT),
+            },
             HostEventKind::CompactionDone => HostEvent::CompactionDone {
                 context_size_before: 0,
                 context_size_after: 0,
@@ -506,9 +562,14 @@ mod tests {
             HostEventKind::InputChanged => HostEvent::InputChanged {
                 text: SAMPLE_TEXT,
                 cursor: 0,
+                anchor: Some(0),
                 version: 0,
                 source: Some(SAMPLE_TEXT),
                 cursor_only: false,
+            },
+            HostEventKind::ModeChanged => HostEvent::ModeChanged {
+                old_mode: SAMPLE_TEXT,
+                new_mode: SAMPLE_TEXT,
             },
             HostEventKind::FileIndexReady => HostEvent::FileIndexReady {
                 root: Some(SAMPLE_TEXT),
@@ -542,12 +603,43 @@ mod tests {
     }
 
     #[test]
-    fn subagent_envelopes_fire_nothing() {
+    fn turn_complete_carries_the_run_gauge() {
+        let data = fired(&turn_complete(Some(150_000)))
+            .expect("TurnComplete fires")
+            .1;
+        assert_eq!(data["context_size"], 150_000);
+        assert_eq!(data["context_window"], 200_000);
+        assert!(
+            data.get("id").is_none(),
+            "the main session has no task to answer"
+        );
+    }
+
+    #[test]
+    fn turn_complete_omits_an_unknown_gauge() {
+        let data = fired(&turn_complete(None)).expect("TurnComplete fires").1;
+        assert!(
+            data.get("context_size").is_none(),
+            "an unknown gauge is absent, not zero"
+        );
+    }
+
+    #[test]
+    fn subagent_envelopes_fire_only_turn_complete() {
         for event in every_event() {
-            assert!(
-                host_event_for(&event, true).is_none(),
+            assert_eq!(
+                host_event_for(&event, Some("toolu_sub")).is_some(),
+                matches!(event, AgentEvent::TurnComplete(_)),
                 "{event:?} leaked from a subagent"
             );
         }
+    }
+
+    #[test]
+    fn subagent_turn_complete_carries_the_task_id() {
+        let data = host_event_for(&turn_complete(Some(150_000)), Some("toolu_sub"))
+            .expect("TurnComplete fires")
+            .payload(Some(&SESSION));
+        assert_eq!(data["id"], "toolu_sub");
     }
 }

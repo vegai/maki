@@ -57,12 +57,117 @@ case("truncate_trailing_newlines_counted", function()
   assert(result:find("%[truncated"), "trailing newlines should count as lines")
 end)
 
-case("output_limits_tail_keeps_the_last_n_lines", function()
-  eq(output_limits.tail("a\nb\nc\nd", 2), "c\nd")
-  eq(output_limits.tail("a\nb\nc\nd", 1), "d")
-  eq(output_limits.tail("a\nb\nc", 3), "a\nb\nc", "fewer lines than asked stays whole")
-  eq(output_limits.tail("", 5), "")
-  eq(output_limits.tail("a\nb\n", 1), "", "a trailing newline is an empty last line")
+local function cut_middle(head, lines, bytes, tail)
+  return head .. "\n\n[truncated " .. lines .. " lines, " .. bytes .. " bytes]" .. (tail and "\n\n" .. tail or "")
+end
+
+case("cut_middle_within_limits_unchanged", function()
+  eq(output_limits.cut_middle("a\nb\nc", 3, 1000), "a\nb\nc")
+  eq(output_limits.cut_middle("a\nb\nc", nil, nil), "a\nb\nc")
+  eq(output_limits.cut_middle("", 1, 1), "")
+end)
+
+case("cut_middle_keeps_both_ends_on_line_limit", function()
+  eq(output_limits.cut_middle("a\nb\nc\nd\ne\nf", 4, 1000), cut_middle("a\nb", 2, 5, "e\nf"))
+  eq(output_limits.cut_middle("a\nb\nc\nd\ne", 3, 1000), cut_middle("a\nb", 2, 5, "e"), "the head gets the odd line")
+end)
+
+case("cut_middle_keeps_both_ends_on_byte_limit", function()
+  local text = "aaaa\nbbbb\ncccc\ndddd\neeee"
+  eq(output_limits.cut_middle(text, 1000, 10), cut_middle("aaaa", 3, 16, "eeee"))
+end)
+
+case("cut_middle_oversized_first_line_keeps_a_utf8_prefix", function()
+  eq(output_limits.cut_middle(string.rep("é", 10), 1000, 6), cut_middle("é", 0, 18))
+  eq(output_limits.cut_middle(string.rep("x", 20) .. "\nok", 1000, 10), cut_middle("xxxxx", 0, 16, "ok"))
+end)
+
+case("cut_middle_unlimited_lines_keeps_tail", function()
+  eq(output_limits.cut_middle("aa\nbb\ncc\ndd\nee", nil, 10), cut_middle("aa", 3, 10, "ee"))
+end)
+
+local function records(n, width)
+  local out = {}
+  for i = 1, n do
+    out[i] = string.rep(string.char(96 + i % 26), (i * 7) % width)
+  end
+  return out
+end
+
+case("cut_middle_drops_lines_over_the_tail_budget", function()
+  local text = "a\n" .. string.rep("x", 50) .. "\nb\n" .. string.rep("y", 50) .. "\nc"
+  eq(output_limits.cut_middle(text, 1000, 20), cut_middle("a", 3, 105, "c"))
+end)
+
+case("collector_result_tracks_the_stream", function()
+  local collector = output_limits.collector(3, 1000)
+  eq(collector:result(), "", "no lines")
+  for _, line in ipairs({ "a", "b", "c", "d", "e" }) do
+    collector:append(line)
+  end
+  eq(collector:result(), output_limits.cut_middle("a\nb\nc\nd\ne", 3, 1000))
+  collector:append("f")
+  eq(collector:result(), cut_middle("a\nb", 3, 7, "f"))
+end)
+
+local function retained_bytes(collector)
+  if not collector.head then
+    return #table.concat(collector.lines, "\n")
+  end
+  return #collector.head + collector.tail_used
+end
+
+case("collector_retention_stays_within_limits", function()
+  local max_bytes = 500
+  local collector = output_limits.collector(20, max_bytes)
+  for i, line in ipairs(records(5000, 40)) do
+    collector:append(line)
+    assert(retained_bytes(collector) <= max_bytes, "over the byte budget after line " .. i)
+  end
+end)
+
+case("collector_full_mode_caps_at_ceiling", function()
+  local mib = string.rep("x", 1024 * 1024)
+  local collector = output_limits.collector(nil, nil)
+  local total = output_limits.FULL_OUTPUT_MAX_BYTES // #mib + 1
+  for _ = 1, total do
+    collector:append(mib)
+  end
+  local out = collector:result()
+  assert(#out <= output_limits.FULL_OUTPUT_MAX_BYTES + 100, "full mode kept " .. #out .. " bytes")
+  th.has(out, "[truncated ")
+end)
+
+case("collector_full_mode_caps_lines", function()
+  local collector = output_limits.collector(nil, nil)
+  for _ = 1, output_limits.FULL_OUTPUT_MAX_LINES + 1 do
+    collector:append("")
+  end
+  th.has(collector:result(), "[truncated 1 lines, ")
+end)
+
+case("collector_counts_the_uncut_bytes_of_a_cut_line", function()
+  local collector = output_limits.collector(1000, 4)
+  collector:append("abcd...", 600)
+  eq(collector:result(), cut_middle("ab", 0, 598))
+end)
+
+case("collector_fits_until_it_would_cut_and_newest_has_no_gap", function()
+  local collector = output_limits.collector(4, 1000)
+  for _, line in ipairs({ "a", "b", "c" }) do
+    collector:append(line)
+  end
+  local newest, before = collector:newest()
+  eq(table.concat(newest, ","), "a,b,c")
+  eq(before, 0)
+  assert(collector:fits(1), "a fourth line fits")
+  collector:append("d")
+  assert(not collector:fits(1), "a fifth line would cut")
+  collector:append("e")
+  collector:append("f")
+  newest, before = collector:newest()
+  eq(table.concat(newest, ","), "e,f")
+  eq(before, 4)
 end)
 
 -- ToolView tests
@@ -112,10 +217,10 @@ end)
 case("tool_view_header_appears_first", function()
   local buf = mock_buf()
   local view = ToolView.new(buf, { max_lines = 5 })
-  view:set_header({ "cmd", { { "---", "dim" } } })
+  view:set_header({ "cmd" })
   view:append("output1")
   eq(buf.lines[1], "cmd")
-  eq(buf.lines[2][1][1], "---")
+  eq(buf.lines[2][1][1], "──────")
   eq(buf.lines[3], "output1")
 end)
 
@@ -130,6 +235,40 @@ case("tool_view_ring_wraparound", function()
   eq(buf.lines[2], "line8")
   eq(buf.lines[3], "line9")
   eq(buf.lines[4], "line10")
+end)
+
+case("tool_view_zero_lines_shows_only_header_until_expanded", function()
+  for _, keep in ipairs({ "head", "tail" }) do
+    for _, count in ipairs({ 1, 5 }) do
+      local label = keep .. " count=" .. count
+      local buf = mock_buf()
+      local view = ToolView.new(buf, { max_lines = 0, keep = keep })
+      view:set_header({ "cmd" })
+      for i = 1, count do
+        view:append("line" .. i)
+      end
+      view:finish()
+      eq(#buf.lines, 1, label)
+      eq(buf.lines[1], "cmd", label)
+      eq(view:visible_count(), 0, label)
+      view:toggle()
+      eq(#buf.lines, count + 2, label) -- header + separator
+      eq(buf.lines[3], "line1", label)
+    end
+  end
+end)
+
+case("tool_view_expanded_shows_lines_appended_past_the_cap", function()
+  for _, opts in ipairs({ { max_lines = 0, keep = "tail" }, { max_lines = 1, keep = "head" } }) do
+    local label = opts.keep .. " max=" .. opts.max_lines
+    local buf = mock_buf()
+    local view = ToolView.new(buf, opts)
+    view:append("line1")
+    view:toggle()
+    view:append("line2")
+    eq(#buf.lines, 2, label)
+    eq(buf.lines[2], "line2", label)
+  end
 end)
 
 case("tool_view_finish_flushes_head_skipped", function()
@@ -239,13 +378,13 @@ end)
 case("tool_view_header_preserved_after_toggle", function()
   local buf = mock_buf()
   local view = ToolView.new(buf, { max_lines = 3, keep = "tail" })
-  view:set_header({ "$ echo hello", { { "---", "dim" } } })
+  view:set_header({ "$ echo hello" })
   for i = 1, 10 do
     view:append("line" .. i)
   end
   view:toggle()
   eq(buf.lines[1], "$ echo hello")
-  eq(buf.lines[2][1][1], "---")
+  eq(buf.lines[2][1][1], "──────")
   eq(buf.lines[3], "line1")
   eq(buf.lines[12], "line10")
 end)
@@ -301,6 +440,32 @@ case("tool_view_max_line_bytes_utf8_safe", function()
   local view = ToolView.new(buf, { max_lines = 3, keep = "tail", max_line_bytes = 10 })
   view:append("éééééééééé")
   eq(buf.lines[1], string.rep("é", 5) .. "…")
+end)
+
+case("tool_view_max_line_bytes_stores_cut_lines", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 3, keep = "tail", max_line_bytes = 5 })
+  view:append(string.rep("a", 1000))
+  view:append({ { string.rep("b", 1000), "dim" }, "tail" })
+  local cut, span = "aaaaa…", "bbbbb…"
+  eq(view.all_lines[1], cut)
+  eq(#view.all_lines[2], 1, "spans past the cap are not stored")
+  eq(view.all_lines[2][1][1], span)
+  eq(buf.lines[1], cut, "a stored cut line renders unchanged")
+  eq(#buf.lines[2], 1)
+  eq(buf.lines[2][1][1], span)
+  eq(buf.lines[2][1][2], "dim")
+end)
+
+case("tool_view_max_line_bytes_stores_cut_updates", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 3, keep = "tail", max_line_bytes = 5 })
+  view:append("short")
+  view:update_line(1, { { string.rep("c", 1000), "keyword" } })
+  view:flush()
+  eq(view.all_lines[1][1][1], "ccccc…")
+  eq(view.ring[1][1][1], "ccccc…")
+  eq(buf.lines[1][1][1], "ccccc…")
 end)
 
 case("tool_view_max_line_bytes_default_off", function()
@@ -1687,6 +1852,225 @@ case("picker_keys_are_normalized_and_bad_ones_are_dropped", function()
   eq(set["R"], true, "a plain char is itself")
   eq(set["<nope>"], nil, "a key maki cannot name is dropped, not stored to never match")
 end)
+
+local ListNav = require("maki.list_nav")
+
+local UP = "<Up>"
+local DOWN = "<Down>"
+local PAGE_UP = "<PageUp>"
+local PAGE_DOWN = "<PageDown>"
+local CTRL_N = "<C-n>"
+local LETTER = "x"
+local UNKNOWN_ACTION_ERROR = "only up, down, page_up and page_down exist"
+
+local function only(...)
+  local rows = {}
+  for _, i in ipairs({ ... }) do
+    rows[i] = true
+  end
+  return function(i)
+    return rows[i] == true
+  end
+end
+
+-- No {want} means the key is taken but the cursor stays.
+local NAV_CASES = {
+  { name = "down_steps_one_row", key = DOWN, cursor = 2, opts = { count = 5 }, want = 3 },
+  { name = "down_wraps_past_the_last_row", key = DOWN, cursor = 5, opts = { count = 5 }, want = 1 },
+  { name = "up_wraps_past_the_first_row", key = UP, cursor = 1, opts = { count = 5 }, want = 5 },
+  { name = "up_without_wrap_stays_on_the_first_row", key = UP, cursor = 1, opts = { count = 5, wrap = false } },
+  { name = "page_down_moves_a_page", key = PAGE_DOWN, cursor = 1, opts = { count = 9, page = 3 }, want = 4 },
+  { name = "page_up_clamps_to_the_first_row", key = PAGE_UP, cursor = 2, opts = { count = 9, page = 3 }, want = 1 },
+  {
+    name = "page_down_on_the_last_row_does_not_wrap",
+    key = PAGE_DOWN,
+    cursor = 9,
+    opts = { count = 9, page = 3 },
+    want = 9,
+  },
+  { name = "page_down_without_page_jumps_to_the_end", key = PAGE_DOWN, cursor = 2, opts = { count = 9 }, want = 9 },
+  {
+    name = "down_skips_unselectable_rows",
+    key = DOWN,
+    cursor = 2,
+    opts = { count = 5, selectable = only(2, 4) },
+    want = 4,
+  },
+  {
+    name = "up_wraps_over_unselectable_rows",
+    key = UP,
+    cursor = 2,
+    opts = { count = 5, selectable = only(2, 4) },
+    want = 4,
+  },
+  {
+    name = "down_without_wrap_stays_when_only_unselectable_rows_follow",
+    key = DOWN,
+    cursor = 4,
+    opts = { count = 5, wrap = false, selectable = only(2, 4) },
+  },
+  {
+    name = "page_down_settles_further_in_its_direction_first",
+    key = PAGE_DOWN,
+    cursor = 1,
+    opts = { count = 5, page = 2, selectable = only(1, 2, 4) },
+    want = 4,
+  },
+  {
+    name = "page_up_settles_back_when_nothing_further_is_selectable",
+    key = PAGE_UP,
+    cursor = 5,
+    opts = { count = 5, page = 3, selectable = only(4, 5) },
+    want = 4,
+  },
+  { name = "down_on_an_empty_list_selects_nothing", key = DOWN, cursor = 1, opts = { count = 0 } },
+  {
+    name = "down_with_no_selectable_row_selects_nothing",
+    key = DOWN,
+    cursor = 1,
+    opts = { count = 3, selectable = only() },
+  },
+  {
+    name = "page_up_with_no_selectable_row_selects_nothing",
+    key = PAGE_UP,
+    cursor = 3,
+    opts = { count = 3, page = 1, selectable = only() },
+  },
+  {
+    name = "up_from_past_a_shrunk_list_lands_back_on_it",
+    key = UP,
+    cursor = 9,
+    opts = { count = 5, wrap = false },
+    want = 4,
+  },
+  { name = "a_letter_is_passed_on", key = LETTER, cursor = 2, opts = { count = 5 }, passed_on = true },
+  -- An empty filter result must still let the user type, or a typo would lock
+  -- the filter.
+  { name = "a_letter_on_an_empty_list_is_passed_on", key = LETTER, cursor = 1, opts = { count = 0 }, passed_on = true },
+  { name = "j_is_passed_on_by_default", key = "j", cursor = 2, opts = { count = 5 }, passed_on = true },
+  { name = "vim_keys_move_with_j", key = "j", cursor = 2, opts = { count = 5, keys = ListNav.VIM_KEYS }, want = 3 },
+  {
+    name = "own_keys_bind_an_action",
+    key = CTRL_N,
+    cursor = 2,
+    opts = { count = 5, keys = { [CTRL_N] = "down" } },
+    want = 3,
+  },
+}
+
+-- Answers whether ListNav took {key} and every row it moved to.
+local function nav(key, cursor, opts)
+  local moves = {}
+  local taken = ListNav.handle_key(key, cursor, opts, function(i)
+    moves[#moves + 1] = i
+  end)
+  return taken, moves
+end
+
+case("list_nav_moves_the_cursor", function()
+  for _, c in ipairs(NAV_CASES) do
+    local taken, moves = nav(c.key, c.cursor, c.opts)
+    eq(taken, not c.passed_on, c.name .. ": taken")
+    eq(table.concat(moves, ","), c.want and tostring(c.want) or "", c.name .. ": moves")
+  end
+end)
+
+-- A typo in an action name would otherwise pass the key on, and it would
+-- quietly type into the filter.
+case("list_nav_throws_on_an_unknown_action", function()
+  local ok, err = pcall(nav, CTRL_N, 2, { count = 5, keys = { [CTRL_N] = "sideways" } })
+  eq(ok, false)
+  th.has(err, UNKNOWN_ACTION_ERROR)
+end)
+
+local PICK_ITEMS = { "alpha", "beta", "gamma" }
+local ENTER = "<CR>"
+local CTRL_D = "<C-d>"
+local BACKSPACE = "<BS>"
+local NO_MATCH_QUERY = "q"
+local FAKE_WIN_WIDTH = 40
+-- Taller than the list, so a page moves past its end and has to clamp.
+local FAKE_WIN_HEIGHT = 20
+local KEYS_RAN_OUT = "picker asked for a key past the scripted ones"
+local KEYS_LEFT_OVER = "picker returned before the scripted keys ran out"
+
+-- Opens ListPicker over PICK_ITEMS and presses {keys}. Running out of keys is
+-- an error, because a nil event looks like the user closing the picker and
+-- would hide a picker that forgot to return.
+local function drive_picker(keys, opts)
+  local queue = {}
+  for i, key in ipairs(keys) do
+    queue[i] = { type = "key", key = key }
+  end
+  local win = { width = FAKE_WIN_WIDTH, height = FAKE_WIN_HEIGHT }
+  function win:recv()
+    return assert(table.remove(queue, 1), KEYS_RAN_OUT)
+  end
+  function win:set_cursor() end
+  function win:set_config() end
+  function win:close() end
+
+  local original = { buf = maki.ui.buf, open_win = maki.ui.open_win, flash = maki.ui.flash }
+  maki.ui.buf = mock_buf
+  maki.ui.open_win = function()
+    return win
+  end
+  maki.ui.flash = function() end
+  local ok, result = pcall(ListPicker.open, PICK_ITEMS, opts)
+  maki.ui.buf, maki.ui.open_win, maki.ui.flash = original.buf, original.open_win, original.flash
+  if not ok then
+    error(result, 0)
+  end
+  eq(#queue, 0, KEYS_LEFT_OVER)
+  return result
+end
+
+local PICKER_KEY_CASES = {
+  { name = "down_then_enter_picks_the_second_row", keys = { DOWN, ENTER }, want = { type = "choice", item = "beta" } },
+  {
+    name = "up_from_the_first_row_wraps_to_the_last",
+    keys = { UP, ENTER },
+    want = { type = "choice", item = "gamma" },
+  },
+  {
+    name = "page_down_clamps_to_the_last_row",
+    keys = { PAGE_DOWN, ENTER },
+    want = { type = "choice", item = "gamma" },
+  },
+  {
+    name = "action_key_on_a_nav_key_wins_over_movement",
+    keys = { DOWN },
+    opts = { action_keys = { DOWN } },
+    want = { type = "key", key = DOWN, item = "alpha" },
+  },
+  {
+    name = "action_key_on_ctrl_d_wins_over_delete",
+    keys = { CTRL_D },
+    opts = { action_keys = { CTRL_D } },
+    want = { type = "key", key = CTRL_D, item = "alpha" },
+  },
+  {
+    name = "ctrl_d_twice_deletes_the_selected_row",
+    keys = { DOWN, CTRL_D, CTRL_D },
+    want = { type = "delete", item = "beta" },
+  },
+  -- With nothing matching, Down must not type into the query or index an
+  -- empty list. Backspace then brings every row back.
+  {
+    name = "nav_key_on_an_empty_filter_is_consumed",
+    keys = { NO_MATCH_QUERY, DOWN, BACKSPACE, ENTER },
+    want = { type = "choice", item = "alpha" },
+  },
+}
+
+for _, c in ipairs(PICKER_KEY_CASES) do
+  case("list_picker_" .. c.name, function()
+    local result = drive_picker(c.keys, c.opts)
+    eq(result.type, c.want.type, "type")
+    eq(result.item, c.want.item, "item")
+    eq(result.key, c.want.key, "key")
+  end)
+end
 
 local parse = require("maki.provider_parse")
 

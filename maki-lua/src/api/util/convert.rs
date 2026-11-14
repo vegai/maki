@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 
 use mlua::{FromLua, Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
-use serde_json::Value as JsonValue;
+use serde_json::{Number, Value as JsonValue};
 
 use crate::api::image::LuaImage;
 
@@ -10,6 +10,9 @@ pub(crate) const UNSUPPORTED_JSON_VALUE_ERR: &str = "cannot convert to JSON a va
 const UNSUPPORTED_JSON_KEY_ERR: &str = "cannot make a JSON object key from a key of type";
 const RECURSIVE_TABLE_ERR: &str = "cannot convert to JSON a table that contains itself";
 const TOO_DEEP_ERR: &str = "cannot convert to JSON tables nested deeper than";
+pub(crate) const UNKNOWN_FIELD_ERR: &str = "unknown field";
+pub(crate) const REQUIRED_ERR: &str = "is required";
+const MAX_EXACT_INTEGER: f64 = 9_007_199_254_740_992.0;
 
 /// How many nulls an array encoding may invent for keys the table does not
 /// hold. A JSON null arrives as an absent Lua key, so a round trip has to be
@@ -56,12 +59,73 @@ pub(crate) trait TableExt {
     fn opt_bool(&self, key: &str) -> Option<bool> {
         self.opt(key).ok().flatten()
     }
+
+    /// A size or a timeout, where `0` means "use the default", so
+    /// it gives `None` like a missing key. There is no ceiling here on purpose:
+    /// sizes are capped where the buffer is taken, so no caller can forget it.
+    /// The error names {key} because mlua's conversion error does not.
+    fn opt_nonzero<T: FromLua + PartialEq + Default>(&self, key: &str) -> LuaResult<Option<T>> {
+        let value = self
+            .opt::<T>(key)
+            .map_err(|e| mlua::Error::runtime(format!("invalid {key}: {e}")))?;
+        Ok(value.filter(|v| *v != T::default()))
+    }
 }
 
 impl TableExt for Table {
     fn opt<T: FromLua>(&self, key: &str) -> LuaResult<Option<T>> {
         Ok(self.get::<NilAsNone<T>>(key)?.0)
     }
+}
+
+/// A missing `opts` table reads like an empty one.
+impl TableExt for Option<&Table> {
+    fn opt<T: FromLua>(&self, key: &str) -> LuaResult<Option<T>> {
+        match self {
+            Some(table) => table.opt(key),
+            None => Ok(None),
+        }
+    }
+}
+
+pub(crate) fn bytes_arg(val: &Value, what: &str) -> LuaResult<Vec<u8>> {
+    match val {
+        Value::String(s) => Ok(s.as_bytes().to_vec()),
+        Value::Buffer(b) => Ok(b.to_vec()),
+        _ => Err(mlua::Error::runtime(format!(
+            "{what}: expected string or buffer, got {}",
+            val.type_name()
+        ))),
+    }
+}
+
+pub(crate) fn required<T: mlua::FromLua>(opts: &Table, context: &str, key: &str) -> LuaResult<T> {
+    opts.opt::<T>(key)?
+        .ok_or_else(|| mlua::Error::runtime(format!("{context}: '{key}' {REQUIRED_ERR}")))
+}
+
+/// Throws on a key of {table} outside {allowed}, so a typo is an error
+/// instead of an option that silently does nothing.
+pub(crate) fn reject_unknown_fields(
+    table: &Table,
+    allowed: &[&str],
+    context: &str,
+) -> LuaResult<()> {
+    for pair in table.pairs::<Value, Value>() {
+        let (key, _) = pair?;
+        let Value::String(key) = key else {
+            return Err(mlua::Error::runtime(format!(
+                "{context}: field names must be strings"
+            )));
+        };
+        let key = key.to_str()?;
+        if !allowed.contains(&key.as_ref()) {
+            return Err(mlua::Error::runtime(format!(
+                "{context}: {UNKNOWN_FIELD_ERR} {key:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn lua_tool_result(values: mlua::MultiValue) -> Result<String, String> {
@@ -128,7 +192,7 @@ pub(crate) fn json_to_lua_with(lua: &Lua, value: &JsonValue, luanil: &Luanil) ->
         JsonValue::Null => Value::NULL,
         JsonValue::Bool(b) => Value::Boolean(*b),
         JsonValue::Number(n) => match (n.as_i64(), n.as_f64()) {
-            (Some(i), _) => Value::Integer(i),
+            (Some(i), _) => lua.pack(i)?,
             (_, Some(f)) => Value::Number(f),
             _ => Value::Nil,
         },
@@ -259,7 +323,10 @@ fn within_template(
         _ if val.is_null() => JsonValue::Null,
         Value::Boolean(b) => JsonValue::Bool(*b),
         Value::Integer(n) => JsonValue::Number((*n).into()),
-        Value::Number(n) => serde_json::Number::from_f64(*n)
+        Value::Number(n) if n.fract() == 0.0 && n.abs() <= MAX_EXACT_INTEGER => {
+            JsonValue::Number((*n as i64).into())
+        }
+        Value::Number(n) => Number::from_f64(*n)
             .map(JsonValue::Number)
             .unwrap_or(JsonValue::Null),
         Value::String(s) => JsonValue::String(s.to_str()?.to_owned()),
@@ -388,7 +455,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use mlua::{Lua, Value};
+    use mlua::{Integer, Lua, Table, Value};
     use regex::Regex;
     use serde_json::Value as JsonValue;
     use test_case::test_case;
@@ -400,16 +467,18 @@ mod tests {
     };
 
     const FLAG_KEY: &str = "flag";
+    const BOUND_KEY: &str = "bound";
 
     const SRC_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
     const TEST_MODULE_ATTR: &str = "#[cfg(test)]";
     /// Table reads that would take `maki.NIL` for a real value: a turbofish
-    /// `get::<Option<..>>` or `get::<bool>`, or a `get` into a binding typed
-    /// `Option<..>` or `bool`. A `HashMap::get` answers an `Option` with no
-    /// `?`, `.ok()` or `.unwrap_or` after it, so it doesn't match.
-    const BYPASS_PATTERN: &str = r"\.(?:raw_)?get::<(?:Option<|bool>)|let\s+(?:mut\s+)?\w+\s*:\s*(?:Option<[^=;]*>|bool)\s*=\s*[\w.]+\s*\.(?:raw_)?get\([^()]*\)\s*(?:\?|\.ok\(\)|\.unwrap_or)";
-    const BYPASS_MSG: &str =
-        "read optional keys with `TableExt::opt` / `opt_bool` so `maki.NIL` counts as absent";
+    /// `get::<Option<..>>` or `get::<bool>`, a `get` into a binding typed
+    /// `Option<..>` or `bool`, or a `get` of a named key whose type is
+    /// inferred from a field, an argument or a match, where an `Option` hides.
+    /// A `HashMap::get` answers an `Option` with no `?`, `.ok()` or
+    /// `.unwrap_or` after it, so it doesn't match.
+    const BYPASS_PATTERN: &str = r#"\.(?:raw_)?get::<(?:Option<|bool>)|let\s+(?:mut\s+)?\w+\s*:\s*(?:Option<[^=;]*>|bool)\s*=\s*[\w.]+\s*\.(?:raw_)?get\([^()]*\)\s*(?:\?|\.ok\(\)|\.unwrap_or)|(?:[(,:]|match)\s*\w+\.(?:raw_)?get\("[^"]*"\)\?"#;
+    const BYPASS_MSG: &str = "read optional keys with `TableExt::opt` / `opt_bool` so `maki.NIL` counts as absent, and spell the type of a required one with `get::<T>`";
 
     /// The name `LAYER_CASES` snippets edit through, standing in for the
     /// `value` argument a real hook layer is handed.
@@ -499,6 +568,25 @@ mod tests {
         assert!(tbl.opt::<String>(FLAG_KEY).is_err());
     }
 
+    #[test_case("{}", None ; "absent_is_none")]
+    #[test_case("{ bound = 0 }", None ; "zero_is_none")]
+    #[test_case("{ bound = 5 }", Some(5) ; "set_value_kept")]
+    fn opt_nonzero_reads_a_bound(table: &str, expected: Option<u64>) {
+        let lua = Lua::new();
+        let tbl: Table = lua.load(format!("return {table}")).eval().unwrap();
+        assert_eq!(tbl.opt_nonzero(BOUND_KEY).unwrap(), expected);
+    }
+
+    #[test_case("{ bound = 'big' }" ; "string")]
+    #[test_case("{ bound = -1 }" ; "negative")]
+    #[test_case("{ bound = math.huge }" ; "infinity")]
+    fn opt_nonzero_rejects_a_non_integer_and_names_the_key(table: &str) {
+        let lua = Lua::new();
+        let tbl: Table = lua.load(format!("return {table}")).eval().unwrap();
+        let error = tbl.opt_nonzero::<u64>(BOUND_KEY).unwrap_err().to_string();
+        assert!(error.contains(BOUND_KEY), "{error}");
+    }
+
     #[test_case(Value::Nil, JsonValue::Null ; "nil_to_null")]
     #[test_case(Value::NULL, JsonValue::Null ; "sentinel_to_null")]
     #[test_case(Value::Boolean(true), JsonValue::Bool(true) ; "bool_true")]
@@ -511,6 +599,40 @@ mod tests {
         assert_eq!(result, expected);
     }
 
+    #[test_case(0.0, "0" ; "zero")]
+    #[test_case(-0.0, "0" ; "negative_zero")]
+    #[test_case(2_147_483_647.0, "2147483647" ; "i32_max")]
+    #[test_case(2_147_483_648.0, "2147483648" ; "above_i32_max")]
+    #[test_case(-2_147_483_648.0, "-2147483648" ; "i32_min")]
+    #[test_case(-2_147_483_649.0, "-2147483649" ; "below_i32_min")]
+    #[test_case(3_000_000_000.0, "3000000000" ; "positive_large_integer")]
+    #[test_case(-3_000_000_000.0, "-3000000000" ; "negative_large_integer")]
+    #[test_case(9_007_199_254_740_991.0, "9007199254740991" ; "below_exact_limit")]
+    #[test_case(-9_007_199_254_740_991.0, "-9007199254740991" ; "above_negative_exact_limit")]
+    #[test_case(9_007_199_254_740_992.0, "9007199254740992" ; "exact_limit")]
+    #[test_case(-9_007_199_254_740_992.0, "-9007199254740992" ; "negative_exact_limit")]
+    #[test_case(9_007_199_254_740_994.0, "9007199254740994.0" ; "past_exact_limit_stays_float")]
+    #[test_case(-9_007_199_254_740_994.0, "-9007199254740994.0" ; "past_negative_exact_limit_stays_float")]
+    #[test_case(1.5, "1.5" ; "positive_fraction")]
+    #[test_case(-1.5, "-1.5" ; "negative_fraction")]
+    fn lua_to_json_numbers_preserve_exact_integers(n: f64, expected: &str) {
+        let lua = Lua::new();
+        let result = lua_to_json(&lua, &Value::Number(n)).unwrap();
+        assert_eq!(serde_json::to_string(&result).unwrap(), expected);
+    }
+
+    #[test_case(0 ; "zero")]
+    #[test_case(i64::from(i32::MAX) ; "i32_max")]
+    #[test_case(i64::from(i32::MIN) ; "i32_min")]
+    #[test_case(i64::from(i32::MAX) + 1 ; "above_i32_max")]
+    #[test_case(i64::from(i32::MIN) - 1 ; "below_i32_min")]
+    fn json_to_lua_integers_use_numbers_when_outside_lua_integer_range(n: i64) {
+        let lua = Lua::new();
+        let value = json_to_lua(&lua, &serde_json::json!(n)).unwrap();
+        assert_eq!(value.is_integer(), Integer::try_from(n).is_ok());
+        assert_eq!(lua.unpack::<i64>(value).unwrap(), n);
+    }
+
     #[test_case(f64::NAN ; "nan")]
     #[test_case(f64::INFINITY ; "positive_infinity")]
     #[test_case(f64::NEG_INFINITY ; "negative_infinity")]
@@ -520,10 +642,10 @@ mod tests {
         assert_eq!(result, JsonValue::Null);
     }
 
-    #[test_case(i64::MAX ; "i64_max")]
-    #[test_case(i64::MIN ; "i64_min")]
+    #[test_case(Integer::MAX ; "integer_max")]
+    #[test_case(Integer::MIN ; "integer_min")]
     #[test_case(0 ; "zero")]
-    fn lua_to_json_integer_boundaries(n: i64) {
+    fn lua_to_json_integer_boundaries(n: Integer) {
         let lua = Lua::new();
         let result = lua_to_json(&lua, &Value::Integer(n)).unwrap();
         assert_eq!(result, serde_json::json!(n));

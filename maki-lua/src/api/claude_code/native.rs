@@ -11,18 +11,20 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::str::from_utf8;
 use std::sync::Arc;
+use std::time::Duration;
 
 use maki_lua_macro::{lua_fn, lua_table};
-use maki_providers::claude_code::Error as WorkerError;
 use maki_providers::claude_code::worker::{
     self, EventKind, WorkerHandshake as NativeHandshake, WorkerPolicy,
 };
+use maki_providers::claude_code::{Error as WorkerError, HOME_STATE_PREFIX};
 use mlua::{
     Error as LuaError, Lua, LuaSerdeExt, LuaString, Result as LuaResult, Table, UserData,
     UserDataMethods, UserDataRef, UserDataRefMut, Value as LuaValue,
 };
 use rustix::io::Errno;
 use serde_json::Value;
+use tokio::task::spawn_blocking;
 
 use crate::api::fs::path_text;
 use crate::api::util::convert::{TableExt, json_to_lua};
@@ -31,7 +33,6 @@ use crate::api::util::pair::{Pair, pair, try_pair};
 use crate::plugin_permissions::PluginPermissions;
 
 const OWNER_EXECUTE: u32 = 0o100;
-const HOME_STATE_PREFIX: &str = ".claude.json";
 const BMP_LIMIT: u32 = 0xffff;
 const MAX_UTF8_BYTES: usize = 4;
 // Fields consumed by claude_stream.tool_line; the bundled progress-line spec checks this boundary.
@@ -46,7 +47,6 @@ const VARIATION_SELECTORS: &[RangeInclusive<u32>] = &[
 pub(super) fn create_table(lua: &Lua, perms: &PluginPermissions) -> LuaResult<Table> {
     let table = create_claude_code_table(lua, perms)?;
     table.set("handshake_input", worker::handshake_input())?;
-    table.set("unchecked_start", WorkerError::UncheckedStart.to_string())?;
     Ok(table)
 }
 
@@ -147,33 +147,12 @@ fn shell_secret_problem(_lua: &Lua, env: HashMap<String, String>) -> LuaResult<O
 #[lua_fn(guard = FsRead)]
 async fn project_git_dir(_lua: Lua, project: String) -> LuaResult<Pair<String>> {
     Ok(pair(
-        smol::unblock(move || {
+        spawn_blocking(move || {
             let project = worker::checkout_root(Path::new(&project)).map_err(IoError::other)?;
             worker::git_directory(&project.join(worker::GIT_ENTRY)).and_then(path_text)
         })
-        .await,
-    ))
-}
-
-/// Create an owned probe directory outside every checkout alias and Git directory.
-/// @param base string Prepared temporary directory.
-/// @param project string Session directory.
-/// @param denied table Checkout aliases and Git directories.
-/// @return (string?, string?) Created directory, or nil and the error. The caller owns cleanup.
-#[lua_fn(guard = FsWrite)]
-async fn private_dir(
-    _lua: Lua,
-    base: String,
-    project: String,
-    denied: Vec<String>,
-) -> LuaResult<Pair<String>> {
-    Ok(pair(
-        worker::private_dir(
-            PathBuf::from(base),
-            PathBuf::from(project),
-            denied.into_iter().map(PathBuf::from).collect(),
-        )
-        .await,
+        .await
+        .map_err(LuaError::external)?,
     ))
 }
 
@@ -183,7 +162,7 @@ async fn private_dir(
 #[lua_fn(guard = FsRead)]
 async fn home_state_files(_lua: Lua, home: String) -> LuaResult<Pair<Vec<String>>> {
     Ok(pair(
-        smol::unblock(move || {
+        spawn_blocking(move || {
             let entries = match fs::read_dir(home) {
                 Ok(entries) => entries,
                 Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
@@ -201,7 +180,8 @@ async fn home_state_files(_lua: Lua, home: String) -> LuaResult<Pair<Vec<String>
             }
             Ok(files)
         })
-        .await,
+        .await
+        .map_err(LuaError::external)?,
     ))
 }
 
@@ -221,9 +201,6 @@ struct WorkerHandshake(NativeHandshake);
 
 impl UserData for WorkerHandshake {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("probe_exit", |_, this, (code, secs): (Option<i32>, u64)| {
-            Ok(pair(this.0.probe_exit(code, secs).map(|()| true)))
-        });
         methods.add_method("resolved_model", |_, this, requested: String| {
             Ok(pair(this.0.resolved_model(&requested).map(str::to_owned)))
         });
@@ -234,38 +211,28 @@ impl UserData for WorkerHandshake {
 }
 
 /// Collect and validate worker control responses with the provider's handshake rules.
-/// @param modes table Allowed permission modes.
 /// @param policy userdata Shared worker policy.
-/// @return (userdata) Handshake with probe_exit, resolved_model and subscription_type methods.
+/// @return (userdata) Handshake with resolved_model and subscription_type methods.
 #[lua_fn]
-fn worker_handshake(
-    _lua: &Lua,
-    modes: Vec<String>,
-    policy: UserDataRef<Policy>,
-) -> LuaResult<WorkerHandshake> {
-    Ok(WorkerHandshake(NativeHandshake::new(
-        modes,
-        Arc::clone(&policy.0),
-    )))
+fn worker_handshake(_lua: &Lua, policy: UserDataRef<Policy>) -> LuaResult<WorkerHandshake> {
+    Ok(WorkerHandshake(NativeHandshake::new(Arc::clone(&policy.0))))
 }
 
 /// Build worker arguments without serializing launch settings through Lua.
+/// @param executable string Absolute worker executable.
 /// @param model string Model name.
-/// @param tools table Claude Code tool names.
-/// @param mode string Permission mode.
 /// @param policy userdata Shared worker policy.
-/// @param contract string Worker instructions.
 /// @return (table) Command-line arguments.
 #[lua_fn]
 fn worker_args(
     _lua: &Lua,
+    executable: String,
     model: String,
-    tools: Vec<String>,
-    mode: String,
     policy: UserDataRef<Policy>,
-    contract: String,
 ) -> LuaResult<Vec<String>> {
-    Ok(policy.0.args(&model, &tools.join(","), &mode, &contract))
+    let mut args = policy.0.args(&model);
+    args.insert(0, executable);
+    Ok(args)
 }
 
 /// Encode prompt blocks in the shared worker protocol.
@@ -289,12 +256,13 @@ async fn prepare_launch(
     cwd: String,
 ) -> LuaResult<Pair<Table>> {
     let prepared = try_pair!(
-        smol::unblock(move || worker::prepare_launch(
+        spawn_blocking(move || worker::prepare_launch(
             environ.into_iter().collect(),
             configured.map(PathBuf::from),
             Path::new(&cwd)
         ))
         .await
+        .map_err(LuaError::external)?
     );
     let result = lua.create_table()?;
     result.set("env", lua.create_table_from(prepared.env)?)?;
@@ -310,15 +278,15 @@ async fn prepare_launch(
         ),
     )?;
     result.set("config_dir", try_pair!(path_text(prepared.config_dir)))?;
+    result.set("temp_dir", try_pair!(path_text(prepared.temp_dir)))?;
     Ok((Some(result), None))
 }
 
 /// Validate the executable version with the shared process supervisor and cache.
 /// @param ctx LuaCtx Calling handler context.
 /// @param executable string Absolute CLI path.
-/// @param env table Validated child environment.
+/// @param prepared table Validated launch preparation.
 /// @param cwd string Session directory.
-/// @param denied table Protected paths.
 /// @param startup_secs integer Startup timeout.
 /// @return (string?, string?) Validated version, or nil and the error.
 #[lua_fn(guard = [FsWrite, Run])]
@@ -326,24 +294,71 @@ async fn checked_profile(
     _lua: Lua,
     ctx: UserDataRef<LuaCtx>,
     executable: String,
-    env: HashMap<String, String>,
+    prepared: Table,
     cwd: String,
-    denied: Vec<String>,
     startup_secs: u64,
 ) -> LuaResult<Pair<String>> {
     let cancel = ctx.cancel.clone();
     drop(ctx);
+    let env = prepared
+        .get::<Table>("env")?
+        .pairs::<String, String>()
+        .collect::<LuaResult<Vec<_>>>()?;
+    let denied = prepared.get::<Vec<PathBuf>>("denied")?;
+    let temp_dir = prepared.get::<PathBuf>("temp_dir")?;
     Ok(pair(
         worker::checked_profile(
             Path::new(&executable),
-            &env.into_iter().collect::<Vec<_>>(),
+            &env,
             Path::new(&cwd),
-            &denied.into_iter().map(PathBuf::from).collect::<Vec<_>>(),
+            &denied,
+            &temp_dir,
             startup_secs,
             cancel.cancelled(),
         )
         .await,
     ))
+}
+
+/// Run the unprompted worker checks under the shared process supervisor.
+/// @param ctx LuaCtx Calling context.
+/// @param spec table Prepared worker launch and immutable policy.
+/// @param env table Child environment.
+/// @param startup_secs integer Startup deadline in seconds.
+/// @return (boolean?, string?, string?) Result, error, and any probe directory kept for its contents.
+#[lua_fn(guard = [FsWrite, Run])]
+async fn worker_probe(
+    _lua: Lua,
+    ctx: UserDataRef<LuaCtx>,
+    spec: Table,
+    env: HashMap<String, String>,
+    startup_secs: u64,
+) -> LuaResult<(Option<bool>, Option<String>, Option<String>)> {
+    let cancel = ctx.cancel.clone();
+    drop(ctx);
+    let policy: UserDataRef<Policy> = spec.get("policy")?;
+    let probe = worker::WorkerProbe {
+        executable: PathBuf::from(spec.get::<String>("executable")?),
+        env: env.into_iter().collect(),
+        project: PathBuf::from(spec.get::<String>("cwd")?),
+        denied: spec
+            .get::<Vec<String>>("denied")?
+            .into_iter()
+            .map(PathBuf::from)
+            .collect(),
+        temp_dir: PathBuf::from(spec.get::<String>("temp_dir")?),
+        policy: Arc::clone(&policy.0),
+        model: spec.get::<String>("model")?,
+        startup: Duration::from_secs(startup_secs),
+    };
+    drop(policy);
+    let (result, kept) = probe.run(cancel.cancelled()).await;
+    let kept = kept
+        .map(path_text)
+        .transpose()
+        .map_err(LuaError::external)?;
+    let (ok, error) = pair(result.map(|()| true));
+    Ok((ok, error, kept))
 }
 
 /// Move Git metadata out of a stopped worker's snapshot and restore its trusted root pointer.
@@ -361,7 +376,7 @@ async fn sanitize_git(
     git: String,
     prune_links: bool,
 ) -> LuaResult<Pair<Table>> {
-    let result = smol::unblock(move || {
+    let result = spawn_blocking(move || {
         snapshot::sanitize_snapshot(
             Path::new(&snapshot),
             Path::new(&quarantine),
@@ -369,7 +384,8 @@ async fn sanitize_git(
             prune_links,
         )
     })
-    .await;
+    .await
+    .map_err(LuaError::external)?;
     let paths = try_pair!(result);
     let result = lua.create_table()?;
     result.set("git_metadata", path_list(&lua, &paths.git_metadata)?)?;
@@ -400,24 +416,41 @@ async fn unpack_blobs(
     hashes: Vec<String>,
 ) -> LuaResult<Pair<bool>> {
     Ok(pair(
-        smol::unblock(move || {
+        spawn_blocking(move || {
             blobs::unpack(Path::new(&batch), Path::new(&stage), &hashes).map(|()| true)
         })
-        .await,
+        .await
+        .map_err(LuaError::external)?,
     ))
 }
 
-/// Check whether a path lies in the checkout or its protected directories.
-/// @param path string Absolute candidate path.
+/// Resolve an artifact root, including a missing tail, outside the checkout.
+/// @param root string Artifact root.
 /// @param cwd string Session directory.
 /// @param denied table Protected checkout directories.
-/// @return (boolean) Whether the candidate is inside the checkout.
-#[lua_fn]
-fn in_checkout(_lua: &Lua, path: String, cwd: String, denied: Vec<String>) -> LuaResult<bool> {
-    Ok(worker::inside_checkout(
-        Path::new(&path),
-        Path::new(&cwd),
-        &denied.into_iter().map(PathBuf::from).collect::<Vec<_>>(),
+/// @return (string?, string?) Resolved path, or nil and the error.
+#[lua_fn(guard = FsRead)]
+async fn resolve_root(
+    _lua: Lua,
+    root: String,
+    cwd: String,
+    denied: Vec<String>,
+) -> LuaResult<Pair<String>> {
+    Ok(pair(
+        spawn_blocking(move || {
+            let resolved = worker::resolve_missing(Path::new(&root))
+                .map_err(|error| format!("maki cannot read {root}: {error}"))?;
+            let denied: Vec<PathBuf> = denied.into_iter().map(PathBuf::from).collect();
+            if worker::inside_checkout(&resolved, Path::new(&cwd), &denied) {
+                return Err(format!(
+                    "the artifact directory {} is in the project",
+                    resolved.display()
+                ));
+            }
+            path_text(resolved).map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(LuaError::external)?,
     ))
 }
 
@@ -427,7 +460,7 @@ fn in_checkout(_lua: &Lua, path: String, cwd: String, denied: Vec<String>) -> Lu
 #[lua_fn(guard = FsRead)]
 async fn checkout_files(lua: Lua, paths: Vec<String>) -> LuaResult<Pair<Table>> {
     let values = try_pair!(
-        smol::unblock(move || paths
+        spawn_blocking(move || paths
             .into_iter()
             .map(|path| {
                 match fs::symlink_metadata(path) {
@@ -447,6 +480,7 @@ async fn checkout_files(lua: Lua, paths: Vec<String>) -> LuaResult<Pair<Table>> 
             })
             .collect::<Result<Vec<_>, IoError>>())
         .await
+        .map_err(LuaError::external)?
     );
     let values = values
         .into_iter()
@@ -475,14 +509,25 @@ struct WorkerStream {
 
 impl UserData for WorkerStream {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("usage_totals", |lua, this, ()| {
+            match this.stream.usage_totals() {
+                Some((totals, partial)) => Ok((json_to_lua(lua, &totals)?, partial)),
+                None => Ok((LuaValue::Nil, false)),
+            }
+        });
         methods.add_method_mut("set_model", |_, this, model: String| {
             this.stream.set_model(model);
+            Ok(())
+        });
+        methods.add_method_mut("mark_prompted", |_, this, ()| {
+            this.stream.mark_prompted();
             Ok(())
         });
         methods.add_method("accepted", |_, this, ()| Ok(this.stream.accepted()));
         methods.add_method_mut(
             "feed",
-            |lua, this, (line, handshake): (String, Option<UserDataRefMut<WorkerHandshake>>)| {
+            |lua, this, (line, handshake): (LuaString, Option<UserDataRefMut<WorkerHandshake>>)| {
+                let line = line.to_str()?;
                 let mut classified = try_pair!(
                     this.stream
                         .feed(&line)
@@ -510,19 +555,17 @@ impl UserData for WorkerStream {
 }
 
 /// Own worker init and model checks for one process.
-/// @param expect table Expected cwd, cli version and worker profile.
+/// @param expect table Expected cwd, CLI version and immutable worker policy.
 /// @return (userdata) Stateful event classifier.
 #[lua_fn]
 fn worker_stream(_lua: &Lua, expect: Table) -> LuaResult<WorkerStream> {
-    let cli: Table = expect.get("cli")?;
-    let worker: Table = expect.get("worker")?;
+    let policy: UserDataRef<Policy> = expect.get("policy")?;
     Ok(WorkerStream {
         executable: expect.opt::<String>("executable")?.map(PathBuf::from),
         stream: worker::WorkerStream::new(
-            cli.get("version")?,
+            expect.get::<String>("version")?,
             PathBuf::from(expect.get::<String>("cwd")?),
-            worker.get("tools")?,
-            worker.get("reported_modes")?,
+            &policy.0,
         ),
     })
 }
@@ -548,7 +591,7 @@ fn event_table(
                 }
             }
         }
-        Some(EventKind::Result | EventKind::RateLimit | EventKind::Init) => {}
+        Some(EventKind::Result) => {}
         _ => {
             if let Some(object) = event.as_object_mut() {
                 object.retain(|key, _| key == "type" || key == "subtype");
@@ -571,9 +614,6 @@ fn event_table(
         classified.problem.as_ref().map(|error| error.to_string()),
     )?;
     result.set("failure", classified.failure.as_deref())?;
-    if let Some(usage) = &classified.usage {
-        result.set("usage", json_to_lua(lua, usage)?)?;
-    }
     if let Some(rate_limit) = &classified.rate_limit {
         result.set("rate_limit", lua.to_value(rate_limit)?)?;
     }
@@ -583,11 +623,16 @@ fn event_table(
 /// Find the configured worker executable.
 /// @param name string Executable name or path.
 #[lua_fn(guard = FsRead)]
-fn executable(_lua: &Lua, name: String) -> LuaResult<Pair<String>> {
-    let cwd = try_pair!(env::current_dir());
-    Ok(pair(
-        worker::executable(&name, &cwd).map(|path| path.display().to_string()),
-    ))
+async fn executable(_lua: Lua, name: String) -> LuaResult<Pair<String>> {
+    let path = try_pair!(
+        spawn_blocking(move || {
+            let cwd = env::current_dir().map_err(|error| error.to_string())?;
+            worker::executable(&name, &cwd).map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(LuaError::external)?
+    );
+    Ok(pair(path_text(path)))
 }
 
 /// Startup deadline diagnostic shared with the provider.
@@ -602,15 +647,15 @@ fn startup_late(_lua: &Lua, seconds: u64) -> LuaResult<String> {
 /// @param after_result boolean Whether the result arrived.
 #[lua_fn]
 fn worker_exit(_lua: &Lua, code: i32, after_result: bool) -> LuaResult<String> {
-    Ok(worker::worker_exit(code, after_result))
+    Ok(worker::worker_exit(code, after_result).to_string())
 }
 
 lua_table! {
     /// Private helpers for the bundled Claude Code plugin. JSON inputs retain
     /// the distinction between null, objects and arrays.
     "maki.claude_code.internal" => pub(crate) fn create_claude_code_table(perms: &PluginPermissions), DOCS [
-        executable(perms), startup_late, worker_exit, shell_secret_problem, escape_path, worker_policy, worker_handshake, worker_args, user_message, prepare_launch(perms), private_dir(perms), home_state_files(perms),
-        worker_stream, in_checkout, checkout_files(perms), checked_profile(perms), sanitize_git(perms), project_git_dir(perms), unpack_blobs(perms),
+        executable(perms), startup_late, worker_exit, shell_secret_problem, escape_path, worker_policy, worker_handshake, worker_args, worker_probe(perms), user_message, prepare_launch(perms), resolve_root(perms), home_state_files(perms),
+        worker_stream, checkout_files(perms), checked_profile(perms), sanitize_git(perms), project_git_dir(perms), unpack_blobs(perms),
     ]
 }
 
@@ -641,11 +686,23 @@ mod tests {
 
     fn worker_stream(lua: &Lua, table: &Table) -> AnyUserData {
         let create: Function = table.get("worker_stream").unwrap();
-        create.call(json_to_lua(lua, &json!({ "cwd": "/workspace", "cli": { "version": "2.1.284" }, "worker": { "tools": [], "reported_modes": [] } })).unwrap()).unwrap()
+        let expect = lua.create_table().unwrap();
+        expect.set("cwd", "/workspace").unwrap();
+        expect.set("version", "2.1.284").unwrap();
+        let policy: Function = table.get("worker_policy").unwrap();
+        let policy: AnyUserData = policy
+            .call(json_to_lua(lua, &json!({"deny": []})).unwrap())
+            .unwrap();
+        expect.set("policy", policy).unwrap();
+        let stream: AnyUserData = create.call(expect).unwrap();
+        stream.call_method::<()>("mark_prompted", ()).unwrap();
+        stream
     }
 
     #[test_case("checked_profile", Permission::Run ; "version_check_requires_run")]
     #[test_case("checked_profile", Permission::FsWrite ; "version_check_requires_temporary_files")]
+    #[test_case("worker_probe", Permission::Run ; "probe_requires_run")]
+    #[test_case("worker_probe", Permission::FsWrite ; "probe_requires_temporary_files")]
     #[test_case("executable", Permission::FsRead ; "executable_lookup_requires_read")]
     fn native_launch_helpers_enforce_permissions(name: &str, permission: Permission) {
         let lua = Lua::new();
@@ -653,7 +710,9 @@ mod tests {
         permissions.set(permission, false);
         let table = create_claude_code_table(&lua, &permissions).unwrap();
         let function: Function = table.get(name).unwrap();
-        let error = smol::block_on(function.call_async::<LuaValue>(())).unwrap_err();
+        let error = crate::test_support::runtime()
+            .block_on(function.call_async::<LuaValue>(()))
+            .unwrap_err();
         assert!(error.to_string().contains(permission.manifest_key()));
     }
 
@@ -678,8 +737,8 @@ mod tests {
         let lua = Lua::new();
         let table = create_claude_code_table(&lua, &PluginPermissions::trusted()).unwrap();
         let sanitize: Function = table.get("sanitize_git").unwrap();
-        let (result, error): (Option<Table>, Option<String>) =
-            smol::block_on(sanitize.call_async((
+        let (result, error): (Option<Table>, Option<String>) = crate::test_support::runtime()
+            .block_on(sanitize.call_async((
                 snapshot.to_str().unwrap(),
                 quarantine.to_str().unwrap(),
                 git.to_str().unwrap(),
@@ -771,9 +830,9 @@ mod tests {
         let lua = Lua::new();
         let table = create_claude_code_table(&lua, &PluginPermissions::trusted()).unwrap();
         let inspect: Function = table.get("checkout_files").unwrap();
-        let (meta, error): (Option<Table>, Option<String>) =
-            smol::block_on(inspect.call_async(vec![parent.join(LINKED).to_str().unwrap()]))
-                .unwrap();
+        let (meta, error): (Option<Table>, Option<String>) = crate::test_support::runtime()
+            .block_on(inspect.call_async(vec![parent.join(LINKED).to_str().unwrap()]))
+            .unwrap();
         assert!(
             !meta
                 .unwrap()
@@ -797,8 +856,9 @@ mod tests {
         let lua = Lua::new();
         let table = create_claude_code_table(&lua, &PluginPermissions::trusted()).unwrap();
         let inspect: Function = table.get("checkout_files").unwrap();
-        let (meta, error): (Option<Table>, Option<String>) =
-            smol::block_on(inspect.call_async(vec![path.to_str().unwrap()])).unwrap();
+        let (meta, error): (Option<Table>, Option<String>) = crate::test_support::runtime()
+            .block_on(inspect.call_async(vec![path.to_str().unwrap()]))
+            .unwrap();
         assert_eq!(error, None);
         let meta: Table = meta.unwrap().get(1).unwrap();
         assert!(meta.get::<bool>("regular").unwrap());
@@ -831,32 +891,6 @@ mod tests {
         assert!(error.unwrap().contains("limit"));
     }
 
-    #[test_case(false ; "direct_denied_directory")]
-    #[test_case(true ; "symlinked_denied_directory")]
-    fn worker_probe_directories_reject_checkout_aliases(through_link: bool) {
-        const DENIED_TEMP: &str = "is in the project";
-        let root = tempdir().unwrap();
-        let project = root.path().join("project");
-        let denied = root.path().join("denied");
-        fs::create_dir(&project).unwrap();
-        fs::create_dir(&denied).unwrap();
-        let alias = root.path().join(LINKED);
-        symlink(&denied, &alias).unwrap();
-        let base = if through_link { &alias } else { &denied };
-        let lua = Lua::new();
-        let table = create_claude_code_table(&lua, &PluginPermissions::trusted()).unwrap();
-        let create: Function = table.get("private_dir").unwrap();
-        let (path, error): (Option<String>, Option<String>) = smol::block_on(create.call_async((
-            base.to_str().unwrap(),
-            project.to_str().unwrap(),
-            vec![denied.to_str().unwrap()],
-        )))
-        .unwrap();
-        assert_eq!(path, None);
-        assert!(error.unwrap().contains(DENIED_TEMP));
-        assert!(fs::read_dir(&denied).unwrap().next().is_none());
-    }
-
     #[test]
     fn home_state_files_include_temporary_copies() {
         let home = tempdir().unwrap();
@@ -873,7 +907,9 @@ mod tests {
         let table = create_claude_code_table(&lua, &PluginPermissions::trusted()).unwrap();
         let list: Function = table.get("home_state_files").unwrap();
         let (mut found, error): (Option<Vec<String>>, Option<String>) =
-            smol::block_on(list.call_async(home.path().to_str().unwrap())).unwrap();
+            crate::test_support::runtime()
+                .block_on(list.call_async(home.path().to_str().unwrap()))
+                .unwrap();
         assert_eq!(error, None);
         found.as_mut().unwrap().sort();
         assert_eq!(found.unwrap(), names);
@@ -901,8 +937,9 @@ mod tests {
         let lua = Lua::new();
         let table = create_claude_code_table(&lua, &PluginPermissions::trusted()).unwrap();
         let resolve: Function = table.get("project_git_dir").unwrap();
-        let (directory, error): (Option<String>, Option<String>) =
-            smol::block_on(resolve.call_async(root.path().join(path).to_str().unwrap())).unwrap();
+        let (directory, error): (Option<String>, Option<String>) = crate::test_support::runtime()
+            .block_on(resolve.call_async(root.path().join(path).to_str().unwrap()))
+            .unwrap();
         assert_eq!(error, None);
         assert_eq!(
             directory.unwrap(),

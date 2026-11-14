@@ -9,18 +9,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use flume::Sender;
-use futures_lite::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use futures_lite::{Stream, StreamExt, future};
+use futures::{Stream, StreamExt, future};
 use serde::Serialize;
 use serde_json::{Value, json};
-use smol::lock::Semaphore;
-use smol::net::{TcpListener, TcpStream};
-use smol::{Task, Timer};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::time::sleep;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::warn;
 
+use super::MAX_EVENT_BYTES;
 use super::error::Error;
-use super::{MAX_EVENT_BYTES, within};
+use crate::process::within;
 
 const ENDPOINT: &str = "/mcp";
 const MAX_HEAD_BYTES: usize = 16 * 1024;
@@ -79,7 +81,7 @@ pub(crate) enum Handoff {
 struct Shared {
     token: String,
     tool_list: String,
-    handoffs: Sender<Handoff>,
+    handoffs: UnboundedSender<Handoff>,
     read_limit: Duration,
     authenticated_slots: Arc<Semaphore>,
     overloaded: AtomicBool,
@@ -90,7 +92,7 @@ impl Shared {
     fn new(
         token: String,
         tools: Vec<McpTool>,
-        handoffs: Sender<Handoff>,
+        handoffs: UnboundedSender<Handoff>,
         read_limit: Duration,
     ) -> Self {
         Self {
@@ -106,7 +108,7 @@ impl Shared {
 }
 
 struct Connection {
-    task: Task<()>,
+    task: AbortOnDropHandle<()>,
     authenticated: Arc<AtomicBool>,
 }
 
@@ -114,7 +116,7 @@ struct Connection {
 pub(crate) struct Server {
     port: u16,
     shared: Arc<Shared>,
-    _accept: Task<()>,
+    _accept: AbortOnDropHandle<()>,
 }
 
 impl Server {
@@ -130,19 +132,28 @@ impl Server {
 pub(crate) async fn serve(
     token: String,
     tools: Vec<McpTool>,
-    handoffs: Sender<Handoff>,
+    handoffs: UnboundedSender<Handoff>,
     read_limit: Duration,
 ) -> io::Result<Server> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let port = listener.local_addr()?.port();
     let shared = Arc::new(Shared::new(token, tools, handoffs, read_limit));
     let server_shared = Arc::clone(&shared);
-    let accept = smol::spawn(async move { accept_loop(listener.incoming(), shared).await });
+    let accept = AbortOnDropHandle::new(tokio::spawn(async move {
+        accept_loop(incoming(listener), shared).await
+    }));
     Ok(Server {
         port,
         shared: server_shared,
         _accept: accept,
     })
+}
+
+fn incoming(listener: TcpListener) -> impl Stream<Item = io::Result<TcpStream>> + Unpin {
+    futures::stream::unfold(listener, |listener| async move {
+        Some((listener.accept().await.map(|(stream, _)| stream), listener))
+    })
+    .boxed()
 }
 
 async fn accept_loop(
@@ -164,7 +175,7 @@ async fn accept_loop(
                     warn!(%error, "claude-code: the handoff server cannot accept a connection");
                     accept_failed = true;
                 }
-                Timer::after(ACCEPT_RETRY).await;
+                sleep(ACCEPT_RETRY).await;
                 continue;
             }
             None => return,
@@ -186,9 +197,9 @@ async fn accept_loop(
         let shared = Arc::clone(&shared);
         let authenticated = Arc::new(AtomicBool::new(false));
         let admission = Arc::clone(&authenticated);
-        let task = smol::spawn(async move {
+        let task = AbortOnDropHandle::new(tokio::spawn(async move {
             connection(stream, shared, admission).await;
-        });
+        }));
         connections.push(Connection {
             task,
             authenticated,
@@ -213,8 +224,8 @@ enum Reply {
 /// hold its slot forever.
 async fn connection(stream: TcpStream, shared: Arc<Shared>, admission: Arc<AtomicBool>) {
     let mut authenticated = None;
-    let mut reader = BufReader::new(stream.clone());
-    let mut writer = stream;
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
     let mut head_limit = shared.read_limit.min(HEAD_TIMEOUT);
     loop {
         // A rejected request's body is never read, so the connection ends.
@@ -231,7 +242,9 @@ async fn connection(stream: TcpStream, shared: Arc<Shared>, admission: Arc<Atomi
             return;
         }
         if authenticated.is_none() {
-            authenticated = shared.authenticated_slots.try_acquire_arc();
+            authenticated = Arc::clone(&shared.authenticated_slots)
+                .try_acquire_owned()
+                .ok();
             if authenticated.is_none() {
                 if !shared.overloaded.swap(true, Ordering::Relaxed) {
                     warn!(
@@ -508,19 +521,23 @@ fn response(status: &str, body: &str) -> Vec<u8> {
 mod tests {
     use std::future::Future;
     use std::io;
-    use std::net::{Ipv4Addr, Shutdown};
+    use std::io::Cursor;
+    use std::iter;
+    use std::net::Ipv4Addr;
     use std::sync::Arc;
     use std::time::Instant;
 
-    use flume::Receiver;
-    use futures_lite::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Cursor};
-    use futures_lite::{StreamExt, future, stream};
+    use super::incoming;
+    use futures::{StreamExt, future, stream};
     use serde_json::{Value, json};
-    use smol::net::{TcpListener, TcpStream};
     use test_case::test_case;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+    use tokio_util::task::AbortOnDropHandle;
 
+    use super::super::WAIT;
     use super::super::error::Error;
-    use super::super::{WAIT, within};
     use super::{
         ACCEPTED, BAD_REQUEST, CONTENT_TOO_LARGE, ENDPOINT, HEADERS_TOO_LARGE, Handoff, INITIALIZE,
         LENGTH_REQUIRED, MAX_BODY_BYTES, MAX_CONNECTIONS, MAX_HEAD_BYTES, MAX_UNAUTHENTICATED,
@@ -528,6 +545,7 @@ mod tests {
         Reply, Server, Shared, TOOL_USE_ID_META, TOOLS_CALL, TOOLS_LIST, UNAUTHORIZED, UNAVAILABLE,
         accept_loop, answer, read_head, serve,
     };
+    use crate::process::within;
 
     const TOKEN: &str = "secret-token";
     const OLDER_VERSION: &str = "2025-06-18";
@@ -542,7 +560,7 @@ mod tests {
     #[test_case("keep-alive", false ; "keep_alive")]
     #[test_case("disclose", false ; "not_a_close_token")]
     fn connection_headers_parse_tokens(value: &str, close: bool) {
-        smol::block_on(async {
+        crate::test_support::runtime().block_on(async {
             let request = head(&format!("Connection: {value}\r\nContent-Length: 0\r\n"));
             let head = read_head(&mut Cursor::new(request)).await.unwrap().unwrap();
             assert_eq!(head.close, close);
@@ -575,26 +593,27 @@ mod tests {
 
     /// The connection sends nothing after `request`, so a cut body ends
     /// there.
-    async fn connected(request: &[u8]) -> (Server, TcpStream, Receiver<Handoff>) {
-        let (tx, rx) = flume::unbounded();
+    async fn connected(request: &[u8]) -> (Server, TcpStream, UnboundedReceiver<Handoff>) {
+        let (tx, rx) = unbounded_channel();
         let server = serve(TOKEN.into(), tools(), tx, WAIT).await.unwrap();
         let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, server.port))
             .await
             .unwrap();
         stream.write_all(request).await.unwrap();
-        stream.shutdown(Shutdown::Write).unwrap();
+        stream.shutdown().await.unwrap();
         (server, stream, rx)
     }
 
     #[test]
     fn two_requests_share_one_authenticated_connection() {
-        smol::block_on(async {
-            let (tx, _handoffs) = flume::unbounded();
+        crate::test_support::runtime().block_on(async {
+            let (tx, _handoffs) = unbounded_channel();
             let server = serve(TOKEN.into(), tools(), tx, WAIT).await.unwrap();
-            let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, server.port))
+            let client = TcpStream::connect((Ipv4Addr::LOCALHOST, server.port))
                 .await
                 .unwrap();
-            let mut reader = BufReader::new(client.clone());
+            let (reader, mut client) = client.into_split();
+            let mut reader = BufReader::new(reader);
             for (id, method) in [(1, INITIALIZE), (2, TOOLS_LIST)] {
                 client
                     .write_all(&post(
@@ -629,16 +648,18 @@ mod tests {
     /// brief shortage of descriptors) the server still serves the next one.
     #[test]
     fn a_failed_accept_keeps_the_server_serving() {
-        smol::block_on(async {
+        crate::test_support::runtime().block_on(async {
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
             let port = listener.local_addr().unwrap().port();
-            let (tx, _handoffs) = flume::unbounded();
+            let (tx, _handoffs) = unbounded_channel();
             let shared = Arc::new(Shared::new(TOKEN.into(), tools(), tx, WAIT));
-            let _serving = smol::spawn(async move {
-                let aborted = stream::once(Err(io::Error::from(io::ErrorKind::ConnectionAborted)));
-                let incoming = aborted.chain(listener.incoming());
+            let _serving = AbortOnDropHandle::new(tokio::spawn(async move {
+                let aborted = stream::once(future::ready(Err(io::Error::from(
+                    io::ErrorKind::ConnectionAborted,
+                ))));
+                let incoming = aborted.chain(incoming(listener));
                 accept_loop(incoming, shared).await;
-            });
+            }));
             let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
                 .await
                 .unwrap();
@@ -654,8 +675,8 @@ mod tests {
 
     #[test]
     fn idle_connection_eviction_preserves_authenticated_calls() {
-        smol::block_on(async {
-            let (tx, handoffs) = flume::unbounded();
+        crate::test_support::runtime().block_on(async {
+            let (tx, mut handoffs) = unbounded_channel();
             let server = serve(TOKEN.into(), tools(), tx, WAIT).await.unwrap();
             let address = (Ipv4Addr::LOCALHOST, server.port);
             let mut held = TcpStream::connect(address).await.unwrap();
@@ -664,7 +685,7 @@ mod tests {
                 "params": { "name": TOOL, "arguments": {}, "_meta": { TOOL_USE_ID_META: TOOL_USE_ID } },
             }), TOKEN)).await.unwrap();
             assert!(matches!(
-                bounded(handoffs.recv_async()).await.unwrap(),
+                bounded(handoffs.recv()).await.unwrap(),
                 Handoff::Parked { .. }
             ));
 
@@ -683,7 +704,7 @@ mod tests {
 
             let mut byte = [0];
             assert_eq!(bounded(idle[0].read(&mut byte)).await.unwrap(), 0);
-            assert!(future::poll_once(held.read(&mut byte)).await.is_none());
+            assert!(futures::FutureExt::now_or_never(held.read(&mut byte)).is_none());
             drop(server);
             assert_eq!(bounded(held.read(&mut byte)).await.unwrap(), 0);
         });
@@ -691,11 +712,15 @@ mod tests {
 
     #[test]
     fn full_authenticated_connections_reply_with_unavailable_and_recover() {
-        smol::block_on(async {
-            let (tx, _handoffs) = flume::unbounded();
+        crate::test_support::runtime().block_on(async {
+            let (tx, _handoffs) = unbounded_channel();
             let server = serve(TOKEN.into(), tools(), tx, WAIT).await.unwrap();
             let mut held: Vec<_> = (0..MAX_CONNECTIONS)
-                .map(|_| server.shared.authenticated_slots.try_acquire_arc().unwrap())
+                .map(|_| {
+                    Arc::clone(&server.shared.authenticated_slots)
+                        .try_acquire_owned()
+                        .unwrap()
+                })
                 .collect();
             for status in [UNAVAILABLE, OK] {
                 let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, server.port))
@@ -747,8 +772,8 @@ mod tests {
 
     /// Also returns the handoffs the server produced by then.
     fn reply_to(request: &[u8]) -> (String, Vec<Handoff>) {
-        smol::block_on(async {
-            let (server, stream, handoffs) = connected(request).await;
+        crate::test_support::runtime().block_on(async {
+            let (server, stream, mut handoffs) = connected(request).await;
             let mut reader = BufReader::new(stream);
             let mut reply = String::new();
             let mut length = 0;
@@ -767,16 +792,16 @@ mod tests {
             bounded(reader.read_exact(&mut body)).await.unwrap();
             reply.push_str(&String::from_utf8(body).unwrap());
             drop(server);
-            (reply, handoffs.try_iter().collect())
+            (reply, iter::from_fn(|| handoffs.try_recv().ok()).collect())
         })
     }
 
     /// Waits for the handoff, drops the server, and returns what the
     /// connection received before it closed.
     fn parked(request: &[u8]) -> (Vec<u8>, Handoff) {
-        smol::block_on(async {
-            let (server, mut stream, handoffs) = connected(request).await;
-            let handoff = bounded(handoffs.recv_async()).await.unwrap();
+        crate::test_support::runtime().block_on(async {
+            let (server, mut stream, mut handoffs) = connected(request).await;
+            let handoff = bounded(handoffs.recv()).await.unwrap();
             drop(server);
             let mut rest = Vec::new();
             bounded(stream.read_to_end(&mut rest)).await.unwrap();
@@ -903,7 +928,7 @@ mod tests {
     #[test]
     fn repeated_call_notifications_queue_only_one_failure() {
         const NOTIFICATIONS: usize = 128;
-        let (sender, handoffs) = flume::unbounded();
+        let (sender, mut handoffs) = unbounded_channel();
         let shared = Shared::new(TOKEN.into(), tools(), sender, WAIT);
         let call = serde_json::to_vec(&json!({ "jsonrpc": "2.0", "method": TOOLS_CALL, "params": { "name": TOOL, "arguments": {} } })).unwrap();
         for _ in 0..NOTIFICATIONS {
@@ -915,7 +940,7 @@ mod tests {
                 }
             ));
         }
-        let handoffs: Vec<_> = handoffs.try_iter().collect();
+        let handoffs: Vec<_> = iter::from_fn(|| handoffs.try_recv().ok()).collect();
         assert!(
             matches!(handoffs.as_slice(), [Handoff::Invalid(Error::NoCallId)]),
             "{handoffs:?}"

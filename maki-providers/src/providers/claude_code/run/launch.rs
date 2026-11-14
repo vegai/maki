@@ -1,4 +1,4 @@
-use super::super::checks;
+use super::super::checks::{self, handshake_input};
 use super::super::error::Error;
 use super::super::settings::{self, MCP_CONFIG_FLAG};
 use super::super::stream::{
@@ -6,13 +6,12 @@ use super::super::stream::{
 };
 use super::super::transcript::SERVER;
 use super::private_files::private_dir_async;
-use super::supervision::{Group, Next, ReadDeadline, send, send_handshake, supervised, unreadable};
+use super::supervision::{Group, Next, ReadDeadline, send, supervised, unreadable};
 use super::{Limits, Listed};
 use crate::ProviderUsage;
 use futures::future::join_all;
-use futures_lite::{Stream, future};
+use futures::{Stream, future};
 use serde_json::{Value, json};
-use smol::process::ChildStdin;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::Metadata;
@@ -20,9 +19,10 @@ use std::future::Future;
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process;
+use std::process::{self, ExitStatus};
 use std::sync::{LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
+use tokio::process::ChildStdin;
 use tracing::warn;
 
 const WINDOW_PROCESSES: usize = 4;
@@ -83,7 +83,7 @@ pub(super) fn base_args(model: &str) -> Vec<String> {
     args
 }
 
-pub(super) fn command(
+pub(crate) fn command(
     executable: &Path,
     env: &[(String, String)],
     cwd: &Path,
@@ -102,16 +102,12 @@ pub(super) fn command(
 /// directory checked to be outside the project.
 async fn unprompted<T>(
     launch: &Launch<'_>,
+    args: &[String],
     work: impl AsyncFnOnce(&mut Group) -> Result<T, Error>,
 ) -> Result<T, Error> {
     let (dir, dir_path) = private_dir_async(launch.temp_dir, launch.project, launch.denied).await?;
-    let mut args = base_args(PROBE_MODEL);
-    args.extend([
-        MCP_CONFIG_FLAG.to_owned(),
-        settings::EMPTY_MCP_CONFIG.to_owned(),
-    ]);
     let result = supervised(
-        command(launch.executable, launch.env, &dir_path, &args),
+        command(launch.executable, launch.env, &dir_path, args),
         work,
     )
     .await;
@@ -119,46 +115,75 @@ async fn unprompted<T>(
     result
 }
 
-/// A hook that policy keeps on runs at startup, so the handshake first runs
-/// in an empty directory, without a prompt.
+fn probe_args() -> Vec<String> {
+    let mut args = base_args(PROBE_MODEL);
+    args.extend([
+        MCP_CONFIG_FLAG.to_owned(),
+        settings::EMPTY_MCP_CONFIG.to_owned(),
+    ]);
+    args
+}
+
+pub(crate) async fn probe_with(
+    group: &mut Group,
+    startup: Duration,
+    mut feed: impl FnMut(&Value) -> Result<Step, Error>,
+) -> Result<(), Error> {
+    let (mut stdin, mut lines) = group.pipes()?;
+    let deadline = Instant::now() + startup;
+    if let Err(error) = send(&mut stdin, &handshake_input(), deadline).await
+        && !matches!(error.cause(), Error::Io { source, .. } if source.kind() == io::ErrorKind::BrokenPipe)
+    {
+        return Err(error);
+    }
+    drop(stdin);
+    let mut passed = false;
+    let mut timer = ReadDeadline::new(deadline);
+    loop {
+        match timer.next(&mut lines, None, deadline).await {
+            Next::Line(Some(Ok(line))) => match feed(&parse_event(&line)?)? {
+                Step::Ready => passed = true,
+                Step::Nothing | Step::Alive => {}
+                _ => return Err(Error::UncheckedStart),
+            },
+            Next::Line(Some(Err(source))) => return Err(unreadable(source)),
+            Next::Line(None) => break,
+            Next::Handoff(_) | Next::Late => return Err(Error::ProbeLate(startup.as_secs())),
+        }
+    }
+    probe_exit(group.wait(deadline).await?, passed)
+}
+
+fn probe_exit(status: ExitStatus, complete: bool) -> Result<(), Error> {
+    if status.code().is_none() {
+        return Err(Error::StoppedInChecks);
+    }
+    if !status.success() {
+        return Err(Error::ExitedInChecks(status));
+    }
+    if !complete {
+        return Err(Error::ChecksUnanswered);
+    }
+    Ok(())
+}
+
 pub(super) async fn probe(
     launch: &Launch<'_>,
     plan_usage: &Mutex<Option<ProviderUsage>>,
 ) -> Result<Handshake, Error> {
-    unprompted(launch, async |group| {
-        let (mut stdin, mut lines) = group.pipes()?;
-        let mut handshake = Handshake::default();
-        let deadline = Instant::now() + launch.limits.startup;
-        send_handshake(&mut stdin, deadline).await?;
-        drop(stdin);
-        let mut passed = false;
-        let mut timer = ReadDeadline::new(deadline);
-        loop {
-            match timer.next(&mut lines, None, deadline).await {
-                Next::Line(Some(Ok(line))) => {
-                    let event = parse_event(&line)?;
-                    match handshake.feed(&event, plan_usage, false)? {
-                        Step::Ready => passed = true,
-                        Step::Nothing | Step::Alive => {}
-                        _ => return Err(Error::UncheckedStart),
-                    }
-                }
-                Next::Line(Some(Err(source))) => return Err(unreadable(source)),
-                Next::Line(None) => break,
-                Next::Handoff(_) | Next::Late => {
-                    return Err(Error::ProbeLate(launch.limits.startup.as_secs()));
-                }
-            }
-        }
-        let status = group.wait(deadline).await?;
-        super::super::worker::probe_exit(status, passed)?;
-        Ok(handshake)
+    let mut handshake = Handshake::default();
+    unprompted(launch, &probe_args(), async |group| {
+        probe_with(group, launch.limits.startup, |event| {
+            handshake.feed(event, plan_usage)
+        })
+        .await
     })
-    .await
+    .await?;
+    Ok(handshake)
 }
 
 async fn executable_identity(executable: &Path) -> Result<ExecutableIdentity, Error> {
-    let metadata = smol::fs::metadata(executable)
+    let metadata = tokio::fs::metadata(executable)
         .await
         .map_err(Error::path("inspect Claude Code", executable))?;
     Ok(ExecutableIdentity::new(&metadata))
@@ -231,7 +256,7 @@ pub(crate) async fn models(
 /// without a prompt, in an empty directory like the probe. The result is
 /// `None` where the answer names a different model.
 async fn windows(launch: &Launch<'_>, models: &[String]) -> Result<Vec<Option<u32>>, Error> {
-    unprompted(launch, async |group| {
+    unprompted(launch, &probe_args(), async |group| {
         let (mut stdin, mut lines) = group.pipes()?;
         let deadline = Instant::now() + launch.limits.startup;
         let initialize = json!({ "subtype": INITIALIZE });
@@ -272,7 +297,10 @@ async fn ask(
                 if event["type"] == CONTROL_RESPONSE && answer["request_id"] == id {
                     return match answer["subtype"] == SUCCESS {
                         true => Ok(answer["response"].clone()),
-                        false => Err(Error::NotAnswered(id.to_owned())),
+                        false => Err(Error::RequestRefused {
+                            id: id.to_owned(),
+                            error: answer["error"].clone(),
+                        }),
                     };
                 }
             }
@@ -293,7 +321,8 @@ async fn version(
 ) -> Result<String, Error> {
     let args = [VERSION_FLAG.to_owned()];
     supervised(command(executable, env, cwd, &args), async |group| {
-        future::or(
+        async {
+            tokio::select! { biased; value =
             async {
                 let (stdin, mut lines) = group.pipes()?;
                 drop(stdin);
@@ -311,13 +340,129 @@ async fn version(
                     return Err(Error::VersionFailed(status));
                 }
                 first.ok_or(Error::NoVersion)
-            },
+            } => value, value =
             async {
                 cancel.await;
                 Err(Error::Cancelled)
-            },
-        )
+            } => value, }
+        }
         .await
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CONTROL_RESPONSE, Error, SUCCESS, ask, command, probe_exit, probe_with, supervised,
+    };
+    use crate::process::wait_without_reaping;
+    use crate::providers::claude_code::stream::result_failure;
+    use futures::stream;
+    use serde_json::json;
+    use std::env;
+    use std::os::unix::process::ExitStatusExt;
+    use std::path::Path;
+    use std::process::ExitStatus;
+    use std::time::{Duration, Instant};
+    use test_case::test_case;
+    use tokio::task::spawn_blocking;
+
+    const FAILED_EXIT_CODE: i32 = 1;
+    const EXIT_ONE: i32 = FAILED_EXIT_CODE << 8;
+    const SIGKILL_STATUS: i32 = 9;
+    const SHELL: &str = "/bin/sh";
+    const STARTUP: Duration = Duration::from_secs(10);
+    const ERROR_TEXT: &str = "probe dependency unavailable";
+    const EXITED_PROBE: &str = r#"if [ -n "$1" ]; then printf '%s\n' "$1"; fi; exit 1"#;
+    const CONTROL_ID: &str = "test_control";
+    const CONTROL_FAILURE: &str = "control request refused";
+    const READS_INPUT: &str = "cat >/dev/null";
+
+    #[test_case(true ; "success")]
+    #[test_case(false ; "refusal_preserves_the_cli_error")]
+    #[tokio::test]
+    async fn control_requests_preserve_the_answer(success: bool) {
+        let cwd = env::current_dir().unwrap();
+        let event = json!({
+            "type": CONTROL_RESPONSE,
+            "response": {
+                "request_id": CONTROL_ID,
+                "subtype": if success { SUCCESS } else { "error" },
+                "response": {},
+                "error": CONTROL_FAILURE,
+            },
+        });
+        let result = supervised(
+            command(Path::new(SHELL), &[], &cwd, &["-c", READS_INPUT]),
+            async |group| {
+                let (mut stdin, _) = group.pipes()?;
+                let mut lines = stream::iter([Ok(event.to_string())]);
+                ask(
+                    &mut stdin,
+                    &mut lines,
+                    &json!({"subtype": CONTROL_ID}),
+                    Instant::now() + STARTUP,
+                )
+                .await
+            },
+        )
+        .await;
+        if success {
+            assert_eq!(result.unwrap(), json!({}));
+        } else {
+            assert!(matches!(
+                result.unwrap_err().cause(),
+                Error::RequestRefused { id, error }
+                    if id == CONTROL_ID && error == CONTROL_FAILURE
+            ));
+        }
+    }
+
+    #[test_case(0, true => matches Ok(()) ; "complete")]
+    #[test_case(0, false => matches Err(Error::ChecksUnanswered) ; "incomplete")]
+    #[test_case(EXIT_ONE, true => matches Err(Error::ExitedInChecks(_)) ; "failed")]
+    #[test_case(SIGKILL_STATUS, true => matches Err(Error::StoppedInChecks) ; "signalled")]
+    fn probe_exit_preserves_status_and_completion(
+        status: i32,
+        complete: bool,
+    ) -> Result<(), Error> {
+        probe_exit(ExitStatus::from_raw(status), complete)
+    }
+
+    #[test_case(false ; "exit_status")]
+    #[test_case(true ; "failure_event")]
+    #[tokio::test]
+    async fn a_probe_that_exits_before_the_handshake_preserves_its_failure(diagnostic: bool) {
+        let cwd = env::current_dir().unwrap();
+        let event = if diagnostic {
+            json!({"type": "result", "subtype": "error_during_execution", "errors": [ERROR_TEXT]})
+                .to_string()
+        } else {
+            String::new()
+        };
+        let args = ["-c", EXITED_PROBE, "probe", &event];
+        let error = supervised(command(Path::new(SHELL), &[], &cwd, &args), async |group| {
+            let pid = group.id();
+            assert!(
+                spawn_blocking(move || wait_without_reaping(pid))
+                    .await
+                    .unwrap()
+            );
+            probe_with(group, STARTUP, |event| Err(result_failure(event).unwrap())).await
+        })
+        .await
+        .unwrap_err();
+        if diagnostic {
+            assert!(
+                matches!(error.cause(), Error::Failed(message) if message.contains(ERROR_TEXT)),
+                "{error}"
+            );
+        } else {
+            assert!(
+                matches!(error.cause(), Error::ExitedInChecks(status) if status.code() == Some(FAILED_EXIT_CODE)),
+                "{error}"
+            );
+        }
+    }
 }

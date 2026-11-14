@@ -4,20 +4,21 @@
 //! nothing decides anything on the way.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use flume::Sender;
 use maki_agent::agent::{AgentCall, AgentHook, AgentSlot};
 use maki_agent::permissions::LayerAnswer;
 use maki_agent::tools::ToolContext;
 use maki_agent::tools::hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
 use maki_agent::tools::registry::BoxFuture;
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot;
 
 use crate::api::slot::{ANY_TOOL, LayerCost, LayeredTools, PERMISSION_PROMPT_SLOT, host_slot_name};
 use crate::api::util::ctx::LuaCtx;
 use crate::plugin_permissions::Permission;
-use crate::runtime::{HookRun, PromptRun, Request};
+use crate::runtime::{HookRun, KILL_GRACE, PromptRun, Request, SLICE_KILL, WATCHDOG_POLL_INTERVAL};
 
 /// Every `agent.*` slot steers what the agent does next: the prompt it
 /// answers, whether it stops, what it remembers after a compaction. No
@@ -33,6 +34,16 @@ const AGENT_SLOT_COST: LayerCost<'static> = LayerCost::TOTAL;
 /// words in front of the model.
 const TOOL_LAYER_CONTENT: &[Permission] = &[Permission::SessionRead, Permission::SessionWrite];
 
+/// How long past a chain's deadline this thread may still answer it. It polls
+/// a chain before it checks the deadline, so a layer that finishes in its
+/// first slice is reported however late it started. That slice may queue
+/// behind another task's, which the watchdog cuts at [`SLICE_KILL`], and may
+/// itself run [`KILL_GRACE`] before it is shot. Each kill lands within a
+/// watchdog poll, which also covers the round trip of the reply.
+const ANSWER_GRACE: Duration = SLICE_KILL
+    .saturating_add(KILL_GRACE)
+    .saturating_add(WATCHDOG_POLL_INTERVAL.saturating_mul(2));
+
 /// What every layer on a tool call pays, `permission.prompt` included: the
 /// call's {authority}, plus [`TOOL_LAYER_CONTENT`].
 fn tool_layer_cost(authority: Authority) -> LayerCost<'static> {
@@ -43,7 +54,7 @@ fn tool_layer_cost(authority: Authority) -> LayerCost<'static> {
 }
 
 pub(crate) struct SlotHook {
-    pub(crate) tx: Sender<Request>,
+    pub(crate) tx: UnboundedSender<Request>,
     pub(crate) layered: Arc<LayeredTools>,
 }
 
@@ -58,13 +69,13 @@ impl SlotHook {
     /// down, leaves the value as it found it. A missing opinion is not a
     /// failure of whatever asked for it.
     fn send(&self, run: HookRun) -> BoxFuture<'_, Verdict> {
-        let (reply, answer) = flume::bounded(1);
+        let (reply, answer) = oneshot::channel();
         let request = Request::RunHook { run, reply };
         Box::pin(async move {
-            if self.tx.send_async(request).await.is_err() {
+            if self.tx.send(request).is_err() {
                 return Verdict::Unchanged;
             }
-            answer.recv_async().await.unwrap_or(Verdict::Unchanged)
+            answer.await.unwrap_or(Verdict::Unchanged)
         })
     }
 }
@@ -72,6 +83,10 @@ impl SlotHook {
 impl ToolHook for SlotHook {
     fn wraps(&self, tool: &str, stage: HookStage) -> bool {
         self.layered.wraps(tool, stage)
+    }
+
+    fn answer_grace(&self) -> Duration {
+        ANSWER_GRACE
     }
 
     fn run<'a>(
@@ -98,6 +113,7 @@ impl ToolHook for SlotHook {
                 "session_id": call.session_id,
                 "origin": call.origin.as_str(),
                 "output_mode": call.output_mode.as_str(),
+                "receipt": call.receipt,
                 "deadline_ms": deadline_ms(call.deadline),
             }),
             may_ask: stage == HookStage::Input,
@@ -115,7 +131,7 @@ impl ToolHook for SlotHook {
             if !self.layered.layers_surface(PERMISSION_PROMPT_SLOT) {
                 return None;
             }
-            let (reply, answer) = flume::bounded(1);
+            let (reply, answer) = oneshot::channel();
             let run = PromptRun {
                 cost: tool_layer_cost(call.authority),
                 cancel: call.cancel.clone(),
@@ -128,11 +144,8 @@ impl ToolHook for SlotHook {
                 }),
                 ctx: Box::new(LuaCtx::handler(ctx)),
             };
-            self.tx
-                .send_async(Request::RunPrompt { run, reply })
-                .await
-                .ok()?;
-            answer.recv_async().await.ok().flatten()
+            self.tx.send(Request::RunPrompt { run, reply }).ok()?;
+            answer.await.ok().flatten()
         })
     }
 }
@@ -140,6 +153,10 @@ impl ToolHook for SlotHook {
 impl AgentHook for SlotHook {
     fn wraps(&self, slot: AgentSlot) -> bool {
         self.layered.layers_surface(slot.name())
+    }
+
+    fn answer_grace(&self) -> Duration {
+        ANSWER_GRACE
     }
 
     fn run<'a>(

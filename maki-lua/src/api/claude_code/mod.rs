@@ -3,67 +3,18 @@ use crate::plugin_permissions::PluginPermissions;
 use maki_providers::claude_code::UNSUPPORTED_SYSTEM;
 use maki_providers::claude_code::{
     CONFIG_DIR_OPTION, DEFAULT_EXECUTABLE, DEFAULT_MAX_CONCURRENT, EXECUTABLE_OPTION,
-    MAX_CONCURRENT_OPTION, MAX_EVENT_BYTES, MIN_MAX_CONCURRENT, STARTUP_TIMEOUT_SECS,
+    HOME_STATE_PREFIX, MAX_CONCURRENT_OPTION, MAX_EVENT_BYTES, MIN_MAX_CONCURRENT,
+    STARTUP_TIMEOUT_SECS,
 };
+use maki_providers::process::{STDERR_LINE_BYTES, STDERR_TAIL_LINES};
 use mlua::{Lua, Result as LuaResult, Table};
-
-#[cfg(target_os = "linux")]
-use rustix::fd::AsFd;
-#[cfg(target_os = "linux")]
-use rustix::fs::{Mode, OFlags, openat};
-#[cfg(target_os = "linux")]
-use rustix::path::Arg;
-#[cfg(target_os = "linux")]
-use std::fs::File;
-#[cfg(target_os = "linux")]
-use std::io;
 
 pub(crate) const MODULE: &str = "maki.claude_code.internal";
 
-#[cfg(target_os = "linux")]
-pub(super) const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
-    .union(OFlags::DIRECTORY)
-    .union(OFlags::NOFOLLOW)
-    .union(OFlags::CLOEXEC);
-#[cfg(target_os = "linux")]
-const READ_FLAGS: OFlags = OFlags::RDONLY
-    .union(OFlags::NOFOLLOW)
-    .union(OFlags::NONBLOCK)
-    .union(OFlags::CLOEXEC);
-#[cfg(target_os = "linux")]
-const CREATE_FLAGS: OFlags = OFlags::WRONLY
-    .union(OFlags::CREATE)
-    .union(OFlags::EXCL)
-    .union(OFlags::NOFOLLOW)
-    .union(OFlags::CLOEXEC);
-#[cfg(target_os = "linux")]
-const EXPECTED_REGULAR_FILE: &str = "expected a regular file";
-
-#[cfg(target_os = "linux")]
-pub(super) fn open_regular(dir: &impl AsFd, name: impl Arg) -> io::Result<File> {
-    let file = File::from(openat(dir, name, READ_FLAGS, Mode::empty())?);
-    if !file.metadata()?.is_file() {
-        return Err(io::Error::other(EXPECTED_REGULAR_FILE));
-    }
-    Ok(file)
-}
-
-#[cfg(target_os = "linux")]
-pub(super) fn create_private(dir: &impl AsFd, name: impl Arg) -> io::Result<File> {
-    Ok(File::from(openat(
-        dir,
-        name,
-        CREATE_FLAGS,
-        Mode::RUSR | Mode::WUSR,
-    )?))
-}
-
-pub(super) fn add_defaults(table: &Table) -> LuaResult<()> {
+fn add_defaults(table: &Table) -> LuaResult<()> {
+    table.set("home_state_prefix", HOME_STATE_PREFIX)?;
     table.set("startup_timeout_secs", STARTUP_TIMEOUT_SECS)?;
-    table.set(
-        "error_bytes",
-        super::r#fn::EXIT_STDERR_BYTES * super::r#fn::EXIT_STDERR_LINES,
-    )?;
+    table.set("error_bytes", STDERR_LINE_BYTES * STDERR_TAIL_LINES)?;
     table.set("max_event_bytes", MAX_EVENT_BYTES)?;
     table.set("default_executable", DEFAULT_EXECUTABLE)?;
     table.set("default_provider_max_concurrent", DEFAULT_MAX_CONCURRENT)?;
@@ -75,6 +26,8 @@ pub(super) fn add_defaults(table: &Table) -> LuaResult<()> {
 
 #[cfg(target_os = "linux")]
 mod blobs;
+#[cfg(target_os = "linux")]
+mod fd;
 #[cfg(target_os = "linux")]
 mod native;
 #[cfg(target_os = "linux")]

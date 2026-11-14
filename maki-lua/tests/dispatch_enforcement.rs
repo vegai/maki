@@ -69,7 +69,9 @@ enum Origin {
 
 fn execute(ctx: &ToolContext, name: &str, input: Value) -> Result<ToolOutput, String> {
     let invocation = ctx.registry.get(name).unwrap().tool.parse(&input).unwrap();
-    smol::block_on(invocation.execute(ctx)).output
+    maki_lua::test_support::runtime()
+        .block_on(invocation.execute(ctx))
+        .output
 }
 
 #[test_case(Origin::Model, true ; "filtered_model_call")]
@@ -100,7 +102,7 @@ fn an_unoffered_tool_never_runs(origin: Origin, filtered: bool) {
     }
     let text = match origin {
         Origin::Model => {
-            let done = smol::block_on(tool_dispatch::run(
+            let done = maki_lua::test_support::runtime().block_on(tool_dispatch::run(
                 CALL_ID.to_owned(),
                 HIDDEN_TOOL,
                 &json!({}),
@@ -118,9 +120,9 @@ fn an_unoffered_tool_never_runs(origin: Origin, filtered: bool) {
         )
         .unwrap()
         .as_text(),
-        Origin::Bridge => {
-            smol::block_on(interpreter_bridge::dispatch(&ctx, HIDDEN_TOOL, &json!({}))).unwrap_err()
-        }
+        Origin::Bridge => maki_lua::test_support::runtime()
+            .block_on(interpreter_bridge::dispatch(&ctx, HIDDEN_TOOL, &json!({})))
+            .unwrap_err(),
         Origin::CodeExecution => {
             execute(&ctx, CODE_EXECUTION, json!({ "code": "hidden_write()" })).unwrap_err()
         }

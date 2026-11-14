@@ -3,29 +3,27 @@ mod launch;
 mod private_files;
 mod supervision;
 
-pub(crate) use self::launch::checked_profile;
 pub use self::launch::invalidate_version;
 pub(crate) use self::launch::{Launch, models};
-use self::launch::{base_args, command, probe};
+use self::launch::{base_args, probe};
+pub(crate) use self::launch::{checked_profile, command, probe_with};
 pub(super) use self::private_files::private_dir_async;
 use self::private_files::{PrivateDir, private_dir, private_file};
-use self::supervision::{
-    Group, Next, ReadDeadline, SHUTDOWN_GRACE, send, send_handshake, supervised, unreadable,
-};
+pub(super) use self::supervision::supervised;
+use self::supervision::{Group, Next, ReadDeadline, SHUTDOWN_GRACE, send, unreadable};
 use super::STARTUP_TIMEOUT_SECS;
-use super::checks::InitExpect;
+use super::checks::{InitExpect, handshake_input};
 use super::error::Error;
 use super::mcp::{self, Handoff};
 use super::settings::MCP_CONFIG_FLAG;
 use super::stream::{Step, Turn, Wait, user_message};
 use super::transcript::{Catalog, SERVER, system_prompt, transcript};
-use super::within;
+use crate::process::within;
 use crate::providers::anthropic::shared::{long_context_window, strip_long_context};
 use crate::providers::oauth_loopback::random_token;
 use crate::{Message, ProviderEvent, ProviderUsage, StreamResponse};
-use flume::{Receiver, Sender};
 use futures::future::try_join;
-use futures_lite::{Stream, future};
+use futures::{Stream, future};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::ffi::OsString;
@@ -33,6 +31,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tracing::{debug, info, warn};
 
 const PROMPT_FILE: &str = "system-prompt.md";
@@ -69,6 +68,15 @@ pub(crate) struct Limits {
 }
 
 impl Limits {
+    fn for_wait(&self, wait: Wait) -> Duration {
+        match wait {
+            Wait::Startup => self.startup,
+            Wait::Idle => self.idle,
+            Wait::Handoff => self.handoff,
+            Wait::Result => self.exit,
+        }
+    }
+
     pub(crate) fn new(idle: Duration) -> Self {
         Self {
             startup: STARTUP,
@@ -90,7 +98,7 @@ pub(crate) struct Exchange<'a> {
     pub system: &'a str,
     pub messages: &'a [Message],
     pub tools: &'a Value,
-    pub events: &'a Sender<ProviderEvent>,
+    pub events: &'a UnboundedSender<ProviderEvent>,
 }
 
 pub(crate) struct Request<'a> {
@@ -134,7 +142,7 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
         Some(_) => format!("{asked}{LONG_CONTEXT_NAME}"),
         None => asked.to_owned(),
     };
-    let (handoff_tx, handoffs) = flume::unbounded();
+    let (handoff_tx, handoffs) = unbounded_channel();
     let server = mcp::serve(token()?, tools, handoff_tx, MCP_READ)
         .await
         .map_err(Error::io("start the handoff server"))?;
@@ -196,6 +204,7 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
         startup_ms = millis(prompted.duration_since(ran)),
         generation_ms = millis(prompted.elapsed()),
         stop_reason = ?response.stop_reason,
+        max_output = ?req.max_output,
         calls = response.message.tool_uses().count(),
         input = usage.input,
         output = usage.output,
@@ -221,14 +230,14 @@ async fn request_files(
     let project = launch.project.to_owned();
     let denied = launch.denied.to_vec();
     let prompt = system_prompt(system);
-    smol::unblock(move || {
+    tokio::task::spawn_blocking(move || {
         let (dir, path) = private_dir(&temp_dir, &project, &denied)?;
         private_file(&path.join(PROMPT_FILE), &prompt)
             .and_then(|()| private_file(&path.join(MCP_FILE), &mcp_config.to_string()))
             .map_err(Error::io("write the request files"))?;
         Ok((dir, path))
     })
-    .await
+    .await?
 }
 
 fn failed(error: Error, accepted: bool, trace: &str) -> Error {
@@ -283,8 +292,8 @@ fn run_args(
 struct Run<'a> {
     turn: Turn<'a>,
     conversation: &'a str,
-    handoffs: Receiver<Handoff>,
-    events: &'a Sender<ProviderEvent>,
+    handoffs: UnboundedReceiver<Handoff>,
+    events: &'a UnboundedSender<ProviderEvent>,
     limits: &'a Limits,
 }
 
@@ -319,7 +328,7 @@ async fn exchange_reply(
     let mut prompted = Instant::now();
     let (mut stdin, mut lines) = group.pipes()?;
     let mut startup = Instant::now() + limits.startup;
-    send_handshake(&mut stdin, startup).await?;
+    send(&mut stdin, &handshake_input(), startup).await?;
     let mut last_event = Instant::now();
     // Set when the reply is complete, and keep-alives must not move it.
     let mut finish_by = None;
@@ -329,19 +338,13 @@ async fn exchange_reply(
         let waiting = turn.waiting();
         let deadline = match waiting {
             Wait::Startup => startup,
-            Wait::Handoff => finish_deadline(
-                &mut finish_by,
-                waiting.clone(),
-                Instant::now() + limits.handoff,
-            ),
-            Wait::Result => finish_deadline(
-                &mut finish_by,
-                waiting.clone(),
-                Instant::now() + limits.exit,
-            ),
+            Wait::Handoff => {
+                finish_deadline(&mut finish_by, waiting, Instant::now() + limits.handoff)
+            }
+            Wait::Result => finish_deadline(&mut finish_by, waiting, Instant::now() + limits.exit),
             Wait::Idle => last_event + limits.idle,
         };
-        let step = match timer.next(&mut lines, Some(handoffs), deadline).await {
+        let step = match timer.next(&mut lines, Some(&mut *handoffs), deadline).await {
             Next::Line(Some(Ok(line))) => turn.feed(&line),
             Next::Line(Some(Err(source))) => Err(unreadable(source)),
             Next::Line(None)
@@ -371,12 +374,7 @@ async fn exchange_reply(
                 Ok(Step::Done)
             }
             Next::Late => {
-                let limit = match waiting {
-                    Wait::Startup => limits.startup,
-                    Wait::Idle => limits.idle,
-                    Wait::Handoff => limits.handoff,
-                    Wait::Result => limits.exit,
-                };
+                let limit = limits.for_wait(waiting);
                 Err(Error::Late(waiting, limit.as_secs()))
             }
         };
@@ -420,17 +418,22 @@ async fn stop_and_drain(
     group: &mut Group,
     turn: &mut Turn<'_>,
     lines: &mut (impl Stream<Item = io::Result<String>> + Unpin),
-    handoffs: &Receiver<Handoff>,
+    handoffs: &mut UnboundedReceiver<Handoff>,
     limits: &Limits,
     server: &mut Option<mcp::Server>,
     result_late: bool,
 ) -> Result<(), Error> {
-    // Claude Code would continue after a handoff or a cut reply, so it is
-    // stopped here. Every event up to the end of the output is still checked,
+    // Claude Code would continue after a handoff, and continues by itself after a
+    // cut reply or one with no visible output, so it is stopped here. Every event up
+    // to the end of the output is still checked, except a generation maki discards,
     // so nothing after the reply can contradict it unnoticed.
-    let stopped = turn.calls_tools() || turn.truncated() || result_late;
+    let stopped = turn.calls_tools() || turn.continues() || result_late;
     let mut deadline = Instant::now() + limits.exit;
-    if turn.truncated() {
+    if turn.continues() {
+        info!(
+            events = turn.trace(),
+            "claude-code: Claude Code would continue the reply by itself, so maki stops it"
+        );
         group.kill();
     } else if stopped {
         group.terminate();
@@ -476,7 +479,7 @@ fn finish_deadline(
     waiting: Wait,
     deadline: Instant,
 ) -> Instant {
-    let current = state.get_or_insert((waiting.clone(), deadline));
+    let current = state.get_or_insert((waiting, deadline));
     if current.0 != waiting {
         *current = (waiting, deadline);
     }
@@ -485,14 +488,13 @@ fn finish_deadline(
 
 async fn queued_handoffs(
     turn: &mut Turn<'_>,
-    handoffs: &Receiver<Handoff>,
+    handoffs: &mut UnboundedReceiver<Handoff>,
     deadline: Instant,
 ) -> Result<(), Error> {
     loop {
-        let handoff = within(deadline, handoffs.recv_async())
+        let handoff = within(deadline, handoffs.recv())
             .await
-            .ok_or(Error::ServerLate)?
-            .ok();
+            .ok_or(Error::ServerLate)?;
         match handoff {
             Some(handoff) => {
                 turn.park(handoff)?;
@@ -507,13 +509,13 @@ async fn queued_handoffs(
 async fn drain(
     turn: &mut Turn<'_>,
     lines: &mut (impl Stream<Item = io::Result<String>> + Unpin),
-    handoffs: &Receiver<Handoff>,
+    handoffs: &mut UnboundedReceiver<Handoff>,
     deadline: Instant,
     stopped: bool,
 ) -> Result<(), Error> {
     let mut timer = ReadDeadline::new(deadline);
     loop {
-        let step = match timer.next(lines, Some(handoffs), deadline).await {
+        let step = match timer.next(lines, Some(&mut *handoffs), deadline).await {
             Next::Line(Some(Ok(line))) => if stopped {
                 turn.feed_stopping(&line)
             } else {
@@ -550,12 +552,13 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use futures_lite::{FutureExt, StreamExt};
+    use futures::StreamExt;
     use rustix::process::{Pid, Signal, kill_process, kill_process_group, test_kill_process_group};
     use serde_json::{Value, error::Category, json};
-    use smol::Timer;
     use tempfile::tempdir;
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
+    use tokio::time::sleep;
 
     use super::super::WAIT;
     use super::super::checks::{InitExpect, profile};
@@ -645,7 +648,7 @@ mod tests {
         let mcp = root.join(super::MCP_FILE);
         let prompt = root.join(super::PROMPT_FILE);
         let limits = Limits::new(IDLE);
-        let (events, _) = flume::unbounded();
+        let (events, _) = unbounded_channel();
         let req = Request {
             launch: Launch {
                 executable: Path::new(SLEEP),
@@ -700,7 +703,7 @@ mod tests {
     #[test_case("rejected_max_turns" ; "a_rejected_call_at_the_turn_limit")]
     fn a_batch_hands_off_whole_and_leaves_nothing(scenario: &str) {
         let fake = Fake::new(scenario);
-        let (result, events) = smol::block_on(fake.request());
+        let (result, events) = crate::test_support::runtime().block_on(fake.request());
         let response = result.unwrap();
 
         let calls: Vec<(String, String)> = response
@@ -721,7 +724,7 @@ mod tests {
             ContentBlock::Text { .. }
         ));
         assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
-        assert_eq!(response.usage.output, FINAL_OUTPUT);
+        assert_eq!(response.usage.output, u64::from(FINAL_OUTPUT));
         assert_eq!(response.usage.cache_read, 222);
         assert!(
             events
@@ -789,7 +792,7 @@ mod tests {
     fn a_refused_request_allows_the_cli_to_clean_its_session() {
         let fake = Fake::new("graceful_refusal");
         fs::write(fake.dir.path().join(TRACK_SESSIONS), "").unwrap();
-        let (result, _) = smol::block_on(fake.request());
+        let (result, _) = crate::test_support::runtime().block_on(fake.request());
         assert!(matches!(result.unwrap_err().cause(), Error::Check(_)));
         assert!(
             fs::read_dir(fake.dir.path().join(SESSIONS))
@@ -810,7 +813,7 @@ mod tests {
     fn a_capped_reply_stops_without_a_cleanup_grace() {
         let fake = Fake::new("graceful_cut");
         fs::write(fake.dir.path().join(TRACK_SESSIONS), "").unwrap();
-        let (reply, _) = smol::block_on(fake.request());
+        let (reply, _) = crate::test_support::runtime().block_on(fake.request());
         assert_eq!(reply.unwrap().stop_reason, Some(StopReason::MaxTokens));
         assert!(
             !fake
@@ -833,10 +836,14 @@ mod tests {
             )
         };
         let held = async {
-            Timer::after(KEPT_OPEN).await;
+            sleep(KEPT_OPEN).await;
             None
         };
-        smol::block_on(request.or(held)).expect("keep-alives kept the reply open")
+        crate::test_support::runtime()
+            .block_on(async {
+                tokio::select! { biased; value = request => value, value = held => value, }
+            })
+            .expect("keep-alives kept the reply open")
     }
 
     /// Once the reply and every usage count have streamed, the result only
@@ -850,7 +857,7 @@ mod tests {
 
         let response = result.unwrap();
         assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
-        assert_eq!(response.usage.output, FINAL_OUTPUT);
+        assert_eq!(response.usage.output, u64::from(FINAL_OUTPUT));
         assert!(fake.group_gone(), "Claude Code continued after the reply");
     }
 
@@ -860,7 +867,7 @@ mod tests {
     #[test_case("text_then_fail" ; "text_then_fail")]
     fn a_reply_without_calls_ends_at_its_result(scenario: &str) {
         let fake = Fake::new(scenario);
-        let (result, _) = smol::block_on(fake.request());
+        let (result, _) = crate::test_support::runtime().block_on(fake.request());
         let response = result.unwrap();
         assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
         assert_eq!(response.message.tool_uses().count(), 0);
@@ -871,12 +878,15 @@ mod tests {
     #[test_case("other_arguments" => matches Error::CallDiffers(_) ; "a_call_that_differs_from_the_reply")]
     #[test_case("overloaded" => matches Error::ApiRefused { status: Some(529), .. } ; "an_overloaded_api")]
     #[test_case("cli_retry" => matches Error::CliRetry { status: Some(529), .. } ; "a_retry_claude_code_wanted")]
+    #[test_case("restarted" => matches Error::SecondGeneration ; "a_reply_restarted_in_its_stream")]
+    #[test_case("abandoned" => matches Error::Abandoned ; "a_reply_claude_code_abandoned")]
+    #[test_case("cut_before_output" => matches Error::CutBeforeOutput(FINAL_OUTPUT) ; "a_reply_cut_before_any_output")]
     #[test_case("no_final_usage" => matches Error::NoFinalOutput ; "a_reply_with_only_the_placeholder_output_count")]
     #[test_case("text_then_api_key" => matches Error::Check(_) ; "a_text_result_then_an_init_that_contradicts_it")]
     #[test_case("text_then_garbage" => matches Error::NotAnEvent { .. } ; "a_text_result_then_a_line_that_is_no_event")]
     fn a_run_maki_cannot_accept_stops_and_is_killed(scenario: &str) -> Error {
         let fake = Fake::new(scenario);
-        let (result, _) = smol::block_on(fake.request());
+        let (result, _) = crate::test_support::runtime().block_on(fake.request());
         assert!(fake.leader_reaped(), "the request returned before the reap");
         assert!(
             fake.group_gone(),
@@ -888,7 +898,7 @@ mod tests {
     #[test]
     fn malformed_tool_json_retries_without_running_a_partial_call() {
         let fake = Fake::new("malformed_arguments");
-        let (result, _) = smol::block_on(fake.request());
+        let (result, _) = crate::test_support::runtime().block_on(fake.request());
         let error = result.unwrap_err();
         assert!(matches!(error.cause(), Error::MalformedArguments(_)));
         assert!(super::super::agent_error(error).is_retryable());
@@ -902,7 +912,7 @@ mod tests {
     #[test_case("status_only_error", true ; "status_only_error")]
     fn incomplete_generations_have_consistent_retry_policy(scenario: &str, retryable: bool) {
         let fake = Fake::new(scenario);
-        let (result, _) = smol::block_on(fake.request_with(
+        let (result, _) = crate::test_support::runtime().block_on(fake.request_with(
             MARKER,
             ALIAS,
             limits(STARTUP, IDLE, SHORT_HANDOFF, SHORT_EXIT),
@@ -922,7 +932,7 @@ mod tests {
     #[test]
     fn a_truncated_line_before_stop_is_diagnosed_and_retryable() {
         let fake = Fake::new("truncated_line");
-        let (result, _) = smol::block_on(fake.request());
+        let (result, _) = crate::test_support::runtime().block_on(fake.request());
         let error = result.unwrap_err();
         assert!(error.temporary().is_some());
         let error = into_cause(error);
@@ -940,7 +950,7 @@ mod tests {
     #[test]
     fn an_api_error_without_its_result_is_the_error() {
         let fake = Fake::new("refused_then_quiet");
-        let (result, _) = smol::block_on(fake.request_with(
+        let (result, _) = crate::test_support::runtime().block_on(fake.request_with(
             &format!("find {MARKER}"),
             ALIAS,
             limits(STARTUP, IDLE, HANDOFF, SHORT_EXIT),
@@ -955,25 +965,20 @@ mod tests {
         assert!(fake.group_gone());
     }
 
-    /// Cancellation can precede spawn completion or channel receipt. An unclaimed process
-    /// group must stop in either case.
-    #[test_case(true ; "before_the_send")]
-    #[test_case(false ; "in_the_channel")]
-    fn a_process_nobody_takes_is_stopped(cancelled_before_the_send: bool) {
+    #[test]
+    fn dropping_an_unreaped_group_stops_its_processes() {
         let here = env::current_dir().unwrap();
         let args = [LONG_SLEEP_SECS.to_owned()];
-        let group = smol::block_on(Group::spawn(command(
-            Path::new(SLEEP),
-            &Fake::env(),
-            &here,
-            &args,
-        )))
-        .unwrap();
+        let group = crate::test_support::runtime()
+            .block_on(Group::spawn(command(
+                Path::new(SLEEP),
+                &Fake::env(),
+                &here,
+                &args,
+            )))
+            .unwrap();
         let pid = Pid::from_raw(group.id().try_into().unwrap()).unwrap();
-        let (reply, answer) = flume::bounded::<io::Result<Group>>(1);
-        let answer = (!cancelled_before_the_send).then_some(answer);
-        let _ = reply.send(Ok(group));
-        drop((reply, answer));
+        drop(group);
         assert!(wait_until(|| test_kill_process_group(pid).is_err()));
     }
 
@@ -985,8 +990,12 @@ mod tests {
         let image = ImageSource::new(ImageMediaType::Png, "AAAA".into());
         let messages = [Message::user_with_images("look".into(), vec![image])];
         let limits = limits(STARTUP, IDLE, HANDOFF, EXIT_LIMIT);
-        let (result, _) =
-            smol::block_on(fake.send_messages(&messages, ALIAS, Thinking::Default, limits));
+        let (result, _) = crate::test_support::runtime().block_on(fake.send_messages(
+            &messages,
+            ALIAS,
+            Thinking::Default,
+            limits,
+        ));
         assert!(matches!(result, Err(Error::Image)), "{result:?}");
         assert_eq!(fake.log("versions"), "", "no process must start");
     }
@@ -996,7 +1005,7 @@ mod tests {
     #[test]
     fn a_stderr_line_that_is_not_utf8_keeps_stderr_flowing() {
         let fake = Fake::new("noisy_stderr");
-        let (result, _) = smol::block_on(fake.request());
+        let (result, _) = crate::test_support::runtime().block_on(fake.request());
         assert!(result.is_ok(), "{result:?}");
     }
 
@@ -1007,7 +1016,7 @@ mod tests {
     #[test_case("text_then_detached_stdout" ; "stdout_open_after_kill")]
     fn a_complete_reply_survives_a_cli_that_does_not_exit(scenario: &str) {
         let fake = Fake::new(scenario);
-        let (result, _) = smol::block_on(fake.request_with(
+        let (result, _) = crate::test_support::runtime().block_on(fake.request_with(
             &format!("find {MARKER}"),
             ALIAS,
             limits(STARTUP, IDLE, HANDOFF, SHORT_EXIT),
@@ -1028,7 +1037,7 @@ mod tests {
     fn a_prompt_nobody_reads_times_out() {
         let fake = Fake::new("stops_reading");
         let prompt = "x".repeat(UNREAD_PROMPT_BYTES);
-        let (result, _) = smol::block_on(fake.request_with(
+        let (result, _) = crate::test_support::runtime().block_on(fake.request_with(
             &prompt,
             ALIAS,
             limits(UNREAD_STARTUP, IDLE, HANDOFF, EXIT_LIMIT),
@@ -1067,7 +1076,7 @@ mod tests {
     #[test]
     fn a_reply_at_its_output_cap_comes_back_cut() {
         let fake = Fake::new("truncated");
-        let (result, _) = smol::block_on(fake.request());
+        let (result, _) = crate::test_support::runtime().block_on(fake.request());
         let response = result.unwrap();
 
         assert_eq!(response.stop_reason, Some(StopReason::MaxTokens));
@@ -1078,10 +1087,36 @@ mod tests {
         );
     }
 
+    /// Claude Code prompts the model again by itself after a reply that shows
+    /// nothing, or one whose last call the output cap cut. maki keeps the
+    /// reply as it streamed and stops Claude Code before the next generation.
+    #[test_case("no_output", StopReason::EndTurn, None ; "a_reply_with_only_thinking")]
+    #[test_case("cut_call", StopReason::MaxTokens, Some(REPLY_TEXT) ; "a_call_cut_at_the_output_cap")]
+    fn a_reply_claude_code_continues_by_itself_comes_back_as_streamed(
+        scenario: &str,
+        stop_reason: StopReason,
+        text: Option<&str>,
+    ) {
+        let fake = Fake::new(scenario);
+        let (result, _) = crate::test_support::runtime().block_on(fake.request());
+        let response = result.unwrap();
+
+        assert_eq!(response.stop_reason, Some(stop_reason));
+        assert_eq!(response.message.first_text_content(), text);
+        assert_eq!(response.message.tool_uses().count(), 0);
+        assert!(
+            fake.group_gone(),
+            "Claude Code must not run its own continuation"
+        );
+    }
+
     #[test]
     fn a_context_overflow_omits_makis_own_kill_status() {
         let fake = Fake::new("context_overflow");
-        let error = smol::block_on(fake.request()).0.unwrap_err();
+        let error = crate::test_support::runtime()
+            .block_on(fake.request())
+            .0
+            .unwrap_err();
         assert!(matches!(error.cause(), Error::ContextOverflow), "{error:?}");
         assert!(fake.group_gone());
     }
@@ -1111,7 +1146,7 @@ mod tests {
         };
         let plan_usage = Mutex::default();
         let mut turn = Turn::new(&catalog, expect, &plan_usage);
-        let (sender, handoffs) = flume::unbounded();
+        let (sender, mut handoffs) = unbounded_channel();
         sender
             .send(Handoff::Parked {
                 tool_use_id: Some(MARKER.into()),
@@ -1120,7 +1155,11 @@ mod tests {
             })
             .unwrap();
         drop(sender);
-        let result = smol::block_on(queued_handoffs(&mut turn, &handoffs, Instant::now() + WAIT));
+        let result = crate::test_support::runtime().block_on(queued_handoffs(
+            &mut turn,
+            &mut handoffs,
+            Instant::now() + WAIT,
+        ));
         assert!(
             matches!(result, Err(Error::NotOffered(ref name)) if name == UNKNOWN_TOOL),
             "{result:?}"
@@ -1132,7 +1171,10 @@ mod tests {
     #[test]
     fn claude_code_neither_compacts_nor_retries_on_its_own() {
         let fake = Fake::new("text");
-        smol::block_on(fake.request()).0.unwrap();
+        crate::test_support::runtime()
+            .block_on(fake.request())
+            .0
+            .unwrap();
 
         assert_eq!(
             fake.log("nonstreaming_fallback"),
@@ -1156,7 +1198,10 @@ mod tests {
     fn a_failed_version_check_says_what_claude_code_printed() {
         let fake = Fake::new("text");
         fs::write(fake.dir.path().join("version_error"), VERSION_ERROR).unwrap();
-        let err = smol::block_on(fake.request()).0.unwrap_err();
+        let err = crate::test_support::runtime()
+            .block_on(fake.request())
+            .0
+            .unwrap_err();
         assert!(
             matches!(&err, Error::Context(failure) if matches!(*failure.cause, Error::VersionFailed(_)) && failure.stderr == VERSION_ERROR.trim_end()),
             "{err:?}"
@@ -1167,7 +1212,10 @@ mod tests {
     fn an_aborted_version_check_names_the_command_and_signal() {
         let fake = Fake::new("text");
         fs::write(fake.dir.path().join("version_abort"), "").unwrap();
-        let error = smol::block_on(fake.request()).0.unwrap_err();
+        let error = crate::test_support::runtime()
+            .block_on(fake.request())
+            .0
+            .unwrap_err();
         assert!(
             matches!(error.cause(), Error::VersionFailed(status) if status.signal() == Some(rustix::process::Signal::ABORT.as_raw()))
         );
@@ -1179,7 +1227,10 @@ mod tests {
     fn an_unreadable_version_line_is_named() {
         let fake = Fake::new("text");
         fs::write(fake.dir.path().join("version"), NOT_UTF8_VERSION).unwrap();
-        let err = smol::block_on(fake.request()).0.unwrap_err();
+        let err = crate::test_support::runtime()
+            .block_on(fake.request())
+            .0
+            .unwrap_err();
         let unreadable = |error: &Error| matches!(error, Error::UnreadableVersion(source) if source.kind() == io::ErrorKind::InvalidData);
         assert!(unreadable(err.cause()), "{err:?}");
     }
@@ -1189,7 +1240,7 @@ mod tests {
     #[test]
     fn output_that_ends_without_an_exit_is_named() {
         let fake = Fake::new("ends_output");
-        let (result, _) = smol::block_on(fake.request_with(
+        let (result, _) = crate::test_support::runtime().block_on(fake.request_with(
             &format!("find {MARKER}"),
             ALIAS,
             limits(STARTUP, IDLE, HANDOFF, SHORT_EXIT),
@@ -1214,14 +1265,15 @@ mod tests {
         off: &str,
     ) {
         let fake = Fake::new("text");
-        smol::block_on(fake.send_messages(
-            &[Message::user(format!("find {MARKER}"))],
-            ALIAS,
-            thinking,
-            limits(STARTUP, IDLE, HANDOFF, EXIT_LIMIT),
-        ))
-        .0
-        .unwrap();
+        crate::test_support::runtime()
+            .block_on(fake.send_messages(
+                &[Message::user(format!("find {MARKER}"))],
+                ALIAS,
+                thinking,
+                limits(STARTUP, IDLE, HANDOFF, EXIT_LIMIT),
+            ))
+            .0
+            .unwrap();
 
         let argv: Vec<String> = fake.log("argv").lines().map(str::to_owned).collect();
         let value_of = |flag: &str| {
@@ -1241,15 +1293,18 @@ mod tests {
     fn a_dropped_request_kills_its_process_group() {
         let fake = Fake::new("hang");
         let hanging = fake.dir.path().join("hanging");
-        let finished = smol::block_on(async {
+        let finished = crate::test_support::runtime().block_on(async {
             let request = async { Some(fake.request().await) };
             let dropped = async {
                 while !hanging.exists() {
-                    Timer::after(POLL).await;
+                    sleep(POLL).await;
                 }
                 None
             };
-            request.or(dropped).await
+            async {
+                tokio::select! { biased; value = request => value, value = dropped => value, }
+            }
+            .await
         });
         assert!(finished.is_none(), "the request must continue to run");
         assert!(
@@ -1271,7 +1326,7 @@ mod tests {
     #[test_case(Signal::KILL ; "sigkill")]
     fn a_killed_maki_takes_claude_code_along(signal: Signal) {
         if env::var_os(MAKI_ROLE).is_some() {
-            let _ = smol::block_on(Fake::new("hang").request());
+            let _ = crate::test_support::runtime().block_on(Fake::new("hang").request());
             return;
         }
         let temp = tempdir().unwrap();
@@ -1356,7 +1411,7 @@ mod tests {
     #[test]
     fn a_probe_that_starts_a_run_is_refused() {
         let fake = Fake::new("probe_runs");
-        let result = smol::block_on(probe(
+        let result = crate::test_support::runtime().block_on(probe(
             &super::Launch {
                 executable: &fake.executable(),
                 env: &Fake::env(),
@@ -1388,18 +1443,19 @@ mod tests {
         if !windows {
             fs::write(fake.dir.path().join(NO_WINDOWS), "").unwrap();
         }
-        let listed = smol::block_on(models(
-            &Launch {
-                executable: &fake.executable(),
-                env: &Fake::env(),
-                project: &fake.project(),
-                denied: &[],
-                temp_dir: &env::temp_dir(),
-                limits: &Limits::new(IDLE),
-            },
-            &fake.plan_usage,
-        ))
-        .unwrap();
+        let listed = crate::test_support::runtime()
+            .block_on(models(
+                &Launch {
+                    executable: &fake.executable(),
+                    env: &Fake::env(),
+                    project: &fake.project(),
+                    denied: &[],
+                    temp_dir: &env::temp_dir(),
+                    limits: &Limits::new(IDLE),
+                },
+                &fake.plan_usage,
+            ))
+            .unwrap();
 
         assert!(
             fs::read_dir(fake.dir.path().join(SESSIONS))
@@ -1432,7 +1488,7 @@ mod tests {
     #[test]
     fn a_1m_id_asks_for_the_long_window() {
         let fake = Fake::new("text");
-        let (result, _) = smol::block_on(fake.request_with(
+        let (result, _) = crate::test_support::runtime().block_on(fake.request_with(
             &format!("find {MARKER}"),
             LONG_CONTEXT_ID,
             limits(STARTUP, IDLE, HANDOFF, EXIT_LIMIT),
@@ -1452,7 +1508,7 @@ mod tests {
     #[test]
     fn a_reply_from_another_model_stops_the_request() {
         let fake = Fake::new("text");
-        let (result, _) = smol::block_on(fake.request_with(
+        let (result, _) = crate::test_support::runtime().block_on(fake.request_with(
             &format!("find {MARKER}"),
             OTHER_MODEL,
             limits(STARTUP, IDLE, HANDOFF, EXIT_LIMIT),
@@ -1472,10 +1528,16 @@ mod tests {
     #[test]
     fn a_hook_policy_turned_on_between_requests_never_reaches_the_project() {
         let fake = Fake::new("text");
-        smol::block_on(fake.request()).0.unwrap();
+        crate::test_support::runtime()
+            .block_on(fake.request())
+            .0
+            .unwrap();
         fs::write(fake.dir.path().join("policy_hook"), "").unwrap();
         let starts = fake.log("calls").lines().count();
-        let err = smol::block_on(fake.request()).0.unwrap_err();
+        let err = crate::test_support::runtime()
+            .block_on(fake.request())
+            .0
+            .unwrap_err();
 
         assert!(matches!(err.cause(), Error::Check(_)), "{err}");
         let ran_in = fake.log("hook_ran_in");
@@ -1499,7 +1561,10 @@ mod tests {
     fn an_unchanged_executable_reuses_its_checked_version() {
         let fake = Fake::new("text");
         for _ in 0..2 {
-            smol::block_on(fake.request()).0.unwrap();
+            crate::test_support::runtime()
+                .block_on(fake.request())
+                .0
+                .unwrap();
         }
         assert_eq!(fake.log("versions").lines().count(), 1);
         assert_eq!(fake.log("calls").lines().count(), 4);
@@ -1509,7 +1574,10 @@ mod tests {
     #[test_case(OLDER_VERSION, false ; "a_downgrade_never_starts")]
     fn a_version_changed_between_requests(version: &str, runs: bool) {
         let fake = Fake::new("text");
-        smol::block_on(fake.request()).0.unwrap();
+        crate::test_support::runtime()
+            .block_on(fake.request())
+            .0
+            .unwrap();
         fs::write(fake.dir.path().join("version"), version).unwrap();
         let script = fs::read(fake.executable()).unwrap();
         let replacement = fake.executable().with_extension("new");
@@ -1521,7 +1589,7 @@ mod tests {
         .unwrap();
         fs::rename(replacement, fake.executable()).unwrap();
         let starts = fake.log("calls").lines().count();
-        let result = smol::block_on(fake.request()).0;
+        let result = crate::test_support::runtime().block_on(fake.request()).0;
 
         if runs {
             result.unwrap();
@@ -1541,7 +1609,10 @@ mod tests {
     #[test]
     fn plan_usage_reaches_the_usage_view() {
         let fake = Fake::new("text_then_limits");
-        smol::block_on(fake.request()).0.unwrap();
+        crate::test_support::runtime()
+            .block_on(fake.request())
+            .0
+            .unwrap();
 
         let usage = fake
             .plan_usage
@@ -1569,10 +1640,17 @@ mod tests {
         let here = env::current_dir().unwrap();
         let args = ["-c".to_owned(), LINGERING_MEMBER.to_owned()];
         let shell = command(Path::new("/bin/sh"), &Fake::env(), &here, &args);
-        let mut group = smol::block_on(Group::spawn(shell)).unwrap();
+        let mut group = crate::test_support::runtime()
+            .block_on(Group::spawn(shell))
+            .unwrap();
         let (_stdin, mut lines) = group.pipes().unwrap();
-        let member: String = smol::block_on(lines.next()).unwrap().unwrap();
-        let status = smol::block_on(group.wait(Instant::now() + WAIT)).unwrap();
+        let member: String = crate::test_support::runtime()
+            .block_on(lines.next())
+            .unwrap()
+            .unwrap();
+        let status = crate::test_support::runtime()
+            .block_on(group.wait(Instant::now() + WAIT))
+            .unwrap();
         assert!(status.success());
         let running = || fs::read(format!("/proc/{member}/cmdline")).is_ok_and(|c| !c.is_empty());
         assert!(

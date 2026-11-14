@@ -32,6 +32,26 @@ pub(crate) fn project_ancestor_dirs(cwd: &Path) -> impl Iterator<Item = PathBuf>
     })
 }
 
+/// Every `remote.*.url` configured for the checkout at `root`, or empty when
+/// git cannot answer (not a checkout, git missing). Only feeds `projects`
+/// remote matching, so a failure to read one reads as "no match".
+pub(crate) fn git_remote_urls(root: &Path) -> Vec<String> {
+    let Ok(output) = std::process::Command::new("git")
+        .args(["config", "--null", "--get-regexp", r"^remote\..+\.url$"])
+        .current_dir(root)
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split('\0')
+        .filter_map(|entry| entry.split_once('\n').map(|(_, url)| url.to_owned()))
+        .collect()
+}
+
 fn parse_frontmatter(content: &str) -> (Frontmatter, &str) {
     let content = content.trim_start();
 
@@ -46,7 +66,7 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, &str) {
     let yaml = &rest[1..end + 1];
     let body = rest[end + 4..].trim();
 
-    let fm = serde_yaml::from_str(yaml).unwrap_or_default();
+    let fm = serde_saphyr::from_str(yaml).unwrap_or_default();
     (fm, body)
 }
 
@@ -87,18 +107,18 @@ pub fn discover_commands(cwd: &Path) -> Vec<CustomCommand> {
     discover_commands_inner(
         cwd,
         maki_storage::paths::home().as_deref(),
-        maki_storage::paths::xdg_config_dir().ok().as_deref(),
+        maki_storage::paths::config_dir().ok().as_deref(),
     )
 }
 
 fn discover_commands_inner(
     cwd: &Path,
     home: Option<&Path>,
-    xdg_config: Option<&Path>,
+    global_config: Option<&Path>,
 ) -> Vec<CustomCommand> {
     let mut commands: HashMap<String, CustomCommand> = HashMap::new();
 
-    for dir in maki_storage::paths::config_search_dirs_from(home, xdg_config) {
+    if let Some(dir) = global_config {
         scan_command_dir(&dir.join(COMMANDS_DIR), CommandScope::User, &mut commands);
     }
     if let Some(home) = home {

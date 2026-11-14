@@ -272,7 +272,7 @@ local function apply_import(ctx, call, artifact, todo)
   local code = call:run_to_end(
     { "bash", "-c", import_scripts.leftovers_script(todo, project, stage, made) },
     { cwd = project },
-    { keep_on_cancel = true, timeout_ms = call.startup_ms }
+    { keep_on_cancel = true, timeout_ms = timeout * jobs.MS_PER_SEC }
   )
   local first, last = err:find(script, 1, true)
   if first then
@@ -330,7 +330,7 @@ local function import_locked(ctx, call, spec)
   for _, change in ipairs(landed) do
     artifact.manifest.imported[change.path] = true
   end
-  local _, record_err = maki.fs.atomic_write(artifact.manifest_path, maki.json.encode(artifact.manifest))
+  local _, record_err = maki.fs.atomic_write(artifact.manifest_path, (maki.json.encode(artifact.manifest)))
   local unrecorded = record_err and UNRECORDED:format(record_err) or nil
   local originals = replaced and maki.fs.joinpath(artifact.dir, path_utils.IMPORT_ORIGINALS) or nil
   local displaced = maki.fs.joinpath(artifact.dir, path_utils.IMPORT_DISPLACED)

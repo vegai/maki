@@ -19,12 +19,13 @@ use serde_json::{Map, Value, json};
 use tempfile::{TempDir, tempdir};
 use test_case::test_case;
 
-use super::support::environment::EnvVar;
+use super::policy::{ANSWER, ANSWERS, FakeClaude};
+use super::support::environment;
 
 use super::support::{
-    DEADLINE, MINIMUM_VERSION, TOOL, WorkingDir, artifact_listing, backdate, commit_all,
-    executable, git, listing, load, on_path, reply, use_fixture_user, wait_for_release, wait_until,
-    write,
+    ARTIFACT_MARKER, DEADLINE, DEPENDENCY_DIR, DEPENDENCY_FILE, DEPENDENCY_UNSETTLED, MANIFEST,
+    MINIMUM_VERSION, TOOL, WorkingDir, artifact_listing, backdate, commit_all, executable, git,
+    listing, load, on_path, reply, use_fixture_user, wait_for_release, wait_until, write,
 };
 
 const HELD_REMOVAL: &str =
@@ -65,10 +66,7 @@ const DISTURBING_CP: &str = "#!/bin/sh\n\"@REAL@\" \"$@\" || exit\ncase \" $* \"
 const EDIT_FILE: &str = "echo edited >> src/lib.rs";
 const MAKE_EXECUTABLE: &str = "chmod +x src/lib.rs";
 const RETARGET_LINK: &str = "ln -sfn other.rs src/link";
-const DEPENDENCY_DIR: &str = "node_modules";
-const DEPENDENCY_FILE: &str = "node_modules/pkg/index.js";
 const EDIT_DEPENDENCY: &str = "echo edited >> node_modules/pkg/index.js";
-const DEPENDENCY_UNSETTLED: &str = "dependencies changed during the copy";
 const CHANGED_DURING_COPY: &str = "the checkout changed during the snapshot: ";
 /// How the refusal names `TMPDIR`, before any file is made there.
 const TMPDIR: &str = "TMPDIR";
@@ -85,6 +83,9 @@ const CONFIG_DIR: &str = "CLAUDE_CONFIG_DIR";
 const LOGIN_LINK: &str = "usual-login";
 const XDG_STATE_HOME: &str = "XDG_STATE_HOME";
 const OAUTH_TOKEN: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+const HTTPS_PROXY: &str = "HTTPS_PROXY";
+const TEST_LOGIN_TOKEN: &str = "not-a-real-token";
+const TEST_PROXY_LOGIN: &str = "http://user:not-a-real-password@proxy:3128/";
 const API_KEY: &str = "ANTHROPIC_API_KEY";
 const BASE_URL: &str = "ANTHROPIC_BASE_URL";
 /// An artifact's repository, next to its snapshot.
@@ -96,8 +97,6 @@ const PATH: &str = "PATH";
 /// A probe's error when the fake answers it with its version line.
 const NO_EVENT_STOP: &str = "printed a line that is not an event";
 /// The plugin's names for an artifact's files.
-const ARTIFACT_MARKER: &str = ".maki-claude-code-artifact";
-const MANIFEST: &str = "manifest.json";
 const SWEEP_TRASH: &str = ".trash-old";
 /// Older than the default artifact time limit of a day.
 const NO_STATE_DIR: &str =
@@ -144,9 +143,8 @@ impl Scenario {
     }
 }
 
-/// Wraps the installed `name` with `template` in `dir`, and returns a guard
-/// that puts `dir` first on the `PATH`.
-fn hold(dir: &Path, name: &str, template: &str, marker: &Path, release: &Path) -> EnvVar {
+/// Wraps the installed `name` with `template` in `dir` and puts `dir` first on the `PATH`.
+fn hold(dir: &Path, name: &str, template: &str, marker: &Path, release: &Path) {
     let real = on_path(name);
     let script = template
         .replace("@REAL@", &real.to_string_lossy())
@@ -154,7 +152,7 @@ fn hold(dir: &Path, name: &str, template: &str, marker: &Path, release: &Path) -
         .replace("@WAIT_FOR_RELEASE@", &wait_for_release("\"@RELEASE@\""))
         .replace("@RELEASE@", &release.to_string_lossy());
     executable(dir, name, &script);
-    EnvVar::prepend_path(dir)
+    environment::prepend_path(dir)
 }
 
 /// A fake `claude` in `dir` that runs `script` and reports the minimum
@@ -175,7 +173,7 @@ fn coding_refuses_a_state_directory_it_cannot_deny() {
     let outside = tempdir().unwrap();
     let state = outside.path().join(OsStr::from_bytes(b"state-\xff"));
     fs::create_dir(&state).unwrap();
-    let _state = EnvVar::set(XDG_STATE_HOME, &state);
+    environment::set(XDG_STATE_HOME, &state);
     let claude = fake_claude(outside.path(), VERSION_ONLY);
     let artifacts = outside.path().join("artifacts");
     let (reg, _host) = fake_host_with(
@@ -214,61 +212,54 @@ fn ask(reg: &ToolRegistry, ctx: &ToolContext) -> Result<String, String> {
     reply(reg, ctx, TOOL, json!({ "prompt": "anything" }))
 }
 
-/// An overlapping TMPDIR uses a scratch base outside the checkout. The
-/// version-only fake then fails at the protocol check, without touching the project.
 #[test_case(false ; "direct_path")]
 #[test_case(true ; "symlink_alias")]
 fn a_temp_dir_that_leads_into_the_project_uses_a_safe_fallback(linked: bool) {
-    let _scenario = Scenario::enter();
-    let project = env::current_dir().unwrap().canonicalize().unwrap();
+    let fake = FakeClaude::new();
+    let project = fake.project.path();
     let outside = tempdir().unwrap();
-    let claude = fake_claude(outside.path(), VERSION_ONLY);
     let link = outside.path().join("tmp");
     symlink(&project, &link).unwrap();
     let before = listing(&project);
-
-    let tmpdir = if linked { &link } else { &project };
-    let _tmpdir = EnvVar::set(TMPDIR, tmpdir);
-    let (reg, _host) = fake_host(&claude, outside.path());
-    let err = ask(&reg, &session_ctx()).unwrap_err();
-    assert!(err.contains(NO_EVENT_STOP), "got: {err}");
-    let prepared = worker::prepare_launch(
-        vec![(TMPDIR.to_owned(), tmpdir.to_string_lossy().into_owned())],
-        Some(outside.path().to_owned()),
-        &project,
-    )
-    .unwrap();
-    assert!(!prepared.temp_dir.starts_with(&project));
-    assert_eq!(
-        listing(&project),
-        before,
-        "maki must make no file in the project"
-    );
+    environment::set(TMPDIR, if linked { &link } else { &project });
+    assert_eq!(fake.ask(ANSWERS).unwrap(), ANSWER);
+    for tmpdir in fake.log("tmpdirs").lines() {
+        assert!(Path::new(tmpdir).is_absolute());
+        assert!(!Path::new(tmpdir).starts_with(&project));
+    }
+    assert!(!fake.log("tmpdirs").is_empty());
+    assert_eq!(listing(&project), before);
 }
 
 #[test]
 fn an_empty_tmpdir_uses_a_safe_default_for_launch_and_worker_checks() {
-    let _scenario = Scenario::enter();
-    let outside = tempdir().unwrap();
-    let claude = fake_claude(outside.path(), VERSION_ONLY);
-    let _tmpdir = EnvVar::set(TMPDIR, "");
-    let prepared = worker::prepare_launch(
-        vec![(TMPDIR.to_owned(), String::new())],
-        Some(outside.path().to_owned()),
-        &env::current_dir().unwrap(),
-    )
-    .unwrap();
-    assert!(prepared.temp_dir.is_absolute());
+    let fake = FakeClaude::new();
+    environment::set(TMPDIR, "");
+    assert_eq!(fake.ask(ANSWERS).unwrap(), ANSWER);
+    let tmpdirs = fake.log("tmpdirs");
+    assert!(!tmpdirs.is_empty());
     assert!(
-        prepared
-            .env
-            .iter()
-            .any(|(name, value)| name == TMPDIR && Path::new(value) == prepared.temp_dir)
+        tmpdirs
+            .lines()
+            .all(|tmpdir| Path::new(tmpdir).is_absolute())
     );
+}
 
-    let (reg, _host) = fake_host(&claude, outside.path());
-    let error = ask(&reg, &session_ctx()).unwrap_err();
-    assert!(error.contains(NO_EVENT_STOP), "{error}");
+#[test]
+fn a_non_utf8_tmpdir_uses_the_validated_default() {
+    let fake = FakeClaude::new();
+    let outside = tempdir().unwrap();
+    let invalid = outside.path().join(OsStr::from_bytes(b"scratch-\xff"));
+    fs::create_dir(&invalid).unwrap();
+    environment::set(TMPDIR, &invalid);
+    assert_eq!(fake.ask(ANSWERS).unwrap(), ANSWER);
+    let tmpdirs = fake.log("tmpdirs");
+    assert!(!tmpdirs.is_empty());
+    assert!(
+        tmpdirs
+            .lines()
+            .all(|tmpdir| { Path::new(tmpdir).is_absolute() && Path::new(tmpdir).is_dir() })
+    );
 }
 
 /// Artifact cleanup can take a long time. It must run outside the Lua thread so subsequent
@@ -292,7 +283,7 @@ fn a_call_does_not_wait_for_the_sweep() {
     }
     let removing = tools.path().join("removing");
     let never = tools.path().join("never");
-    let _path = hold(tools.path(), "rm", HELD_REMOVAL, &removing, &never);
+    hold(tools.path(), "rm", HELD_REMOVAL, &removing, &never);
     let claude = fake_claude(tools.path(), HANDSHAKE_ONLY);
 
     let mut opts = Map::new();
@@ -323,30 +314,22 @@ fn a_call_does_not_wait_for_the_sweep() {
 /// of the session directory.
 #[test]
 fn a_temp_dir_elsewhere_in_the_checkout_uses_a_safe_fallback() {
-    let _scenario = Scenario::enter();
-    let project = env::current_dir().unwrap().canonicalize().unwrap();
+    let fake = FakeClaude::new();
+    let project = fake.project.path();
     let sub = project.join("sub");
     let elsewhere = project.join("elsewhere");
     fs::create_dir(&sub).unwrap();
     fs::create_dir(&elsewhere).unwrap();
-    let outside = tempdir().unwrap();
-    let claude = fake_claude(outside.path(), VERSION_ONLY);
-    let _tmpdir = EnvVar::set(TMPDIR, &elsewhere);
+    environment::set(TMPDIR, &elsewhere);
 
-    let (reg, _host) = fake_host(&claude, outside.path());
-    let err = ask(&reg, &stub_ctx_in(&sub, None, None)).unwrap_err();
-    assert!(err.contains(NO_EVENT_STOP), "got: {err}");
-    let prepared = worker::prepare_launch(
-        vec![(TMPDIR.to_owned(), elsewhere.to_string_lossy().into_owned())],
-        Some(outside.path().to_owned()),
-        &sub,
-    )
-    .unwrap();
-    assert!(!prepared.temp_dir.starts_with(&project));
-    assert!(
-        listing(&elsewhere).is_empty(),
-        "maki must make no file there"
-    );
+    assert_eq!(fake.ask_in(ANSWERS, &sub).unwrap(), ANSWER);
+    let tmpdirs = fake.log("tmpdirs");
+    assert!(!tmpdirs.is_empty());
+    for tmpdir in tmpdirs.lines() {
+        assert!(Path::new(tmpdir).is_absolute());
+        assert!(!Path::new(tmpdir).starts_with(&project));
+    }
+    assert!(listing(&elsewhere).is_empty());
 }
 
 #[test]
@@ -355,8 +338,8 @@ fn probe_cleanup_needs_no_external_helpers() {
     let tools = tempdir().unwrap();
     let base = tempdir().unwrap();
     let claude = fake_claude(tools.path(), VERSION_ONLY);
-    let _path = EnvVar::set(PATH, tools.path());
-    let _tmpdir = EnvVar::set(TMPDIR, base.path());
+    environment::set(PATH, tools.path());
+    environment::set(TMPDIR, base.path());
     let (reg, _host) = fake_host(&claude, tools.path());
     let err = ask(&reg, &session_ctx()).unwrap_err();
     assert!(err.contains(NO_EVENT_STOP), "got: {err}");
@@ -375,7 +358,7 @@ fn a_startup_exit_keeps_its_stderr_and_status() {
         "#!/bin/sh\nif [ \"$1\" = --version ]; then echo '{MINIMUM_VERSION} (Claude Code)'; else echo '{STARTUP_STDERR}' >&2; exit {STARTUP_ERROR_CODE}; fi\n"
     );
     let claude = fake_claude(tools.path(), &source);
-    let _tmpdir = EnvVar::set(TMPDIR, base.path());
+    environment::set(TMPDIR, base.path());
     let (reg, _host) = fake_host(&claude, tools.path());
     let error = ask(&reg, &session_ctx()).unwrap_err();
     assert!(error.contains(STARTUP_STDERR), "{error}");
@@ -445,6 +428,16 @@ struct DisturbedCopy {
     artifacts_left: Vec<PathBuf>,
 }
 
+#[test_case(OAUTH_TOKEN, TEST_LOGIN_TOKEN ; "login_token")]
+#[test_case(HTTPS_PROXY, TEST_PROXY_LOGIN ; "proxy_login")]
+fn read_workers_keep_their_login_environment(name: &str, value: &str) {
+    let fake = FakeClaude::new();
+    environment::set(name, value);
+    assert_eq!(fake.ask(ANSWERS).unwrap(), ANSWER);
+    let expected = format!("{name}={value}");
+    assert!(fake.log("env").lines().any(|line| line == expected));
+}
+
 /// Claude Code passes its environment to its shell, so with a login token in
 /// maki's environment a coding call stops before Claude Code starts.
 #[test]
@@ -456,7 +449,7 @@ fn a_login_token_in_the_environment_keeps_the_coding_worker_from_starting() {
     write(&project.join("src/lib.rs"), "base\n");
     git(&project, &["init", "-q"]);
     commit_all(&project);
-    let _token = EnvVar::set(OAUTH_TOKEN, "not-a-real-token");
+    environment::set(OAUTH_TOKEN, TEST_LOGIN_TOKEN);
     let claude = fake_claude(tools.path(), HANDSHAKE_ONLY);
 
     let (reg, _host) = fake_host(&claude, tools.path());
@@ -476,8 +469,8 @@ fn a_login_token_in_the_environment_keeps_the_coding_worker_from_starting() {
 fn an_api_key_and_address_never_reach_claude_code() {
     let _scenario = Scenario::enter();
     let tools = tempdir().unwrap();
-    let _key = EnvVar::set(API_KEY, "not-a-real-key");
-    let _url = EnvVar::set(BASE_URL, "http://127.0.0.1:9");
+    environment::set(API_KEY, "not-a-real-key");
+    environment::set(BASE_URL, "http://127.0.0.1:9");
     let claude = fake_claude(tools.path(), HANDSHAKE_ONLY);
 
     let (reg, _host) = fake_host(&claude, tools.path());
@@ -522,7 +515,7 @@ fn the_default_artifact_root_hides_all_of_makis_state_but_the_workers_artifact(l
     } else {
         home.path()
     };
-    let _home = EnvVar::set(HOME, visible_home);
+    environment::set(HOME, visible_home);
     let secrets = tools.path().join(SECRET_DIR);
     for path in HOME_DENY_PATHS {
         let target = secrets.join(path);
@@ -539,12 +532,12 @@ fn the_default_artifact_root_hides_all_of_makis_state_but_the_workers_artifact(l
     let login_target = secrets.join(LOGIN_LINK);
     fs::create_dir(&login_target).unwrap();
     symlink(&login_target, &usual_login).unwrap();
-    let _login = EnvVar::set(CONFIG_DIR, LOGIN_LINK);
-    let _state_home = EnvVar::set(XDG_STATE_HOME, state_home.path());
+    environment::set(CONFIG_DIR, LOGIN_LINK);
+    environment::set(XDG_STATE_HOME, state_home.path());
     let runtime = tempdir().unwrap();
     let agent = home.path().join("agent.sock");
-    let _runtime = EnvVar::set("XDG_RUNTIME_DIR", runtime.path());
-    let _agent = EnvVar::set("SSH_AUTH_SOCK", &agent);
+    environment::set("XDG_RUNTIME_DIR", runtime.path());
+    environment::set("SSH_AUTH_SOCK", &agent);
     let state_dir = maki_storage::paths::state_dir().unwrap();
     assert!(
         state_dir.starts_with(state_home.path()),
@@ -643,7 +636,7 @@ fn code_with_cp(cp: &str, dependencies: &str) -> DisturbedCopy {
     git(&project, &["init", "-q"]);
     commit_all(&project);
     write(&project.join(DEPENDENCY_FILE), "module.exports = 1;\n");
-    let _path = hold(
+    hold(
         tools.path(),
         "cp",
         cp,

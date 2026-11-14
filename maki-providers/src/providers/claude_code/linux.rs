@@ -4,7 +4,6 @@
 //! maki executes the calls with its own tools and permissions. The plugin setting enables
 //! both the plugin and the provider.
 
-use std::any::Any;
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
@@ -15,16 +14,17 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::slots::{Permit, Slots};
-pub(super) use crate::process::within;
-use crate::providers::plugin::{NativeFactory, create_native, native_factory, register_native};
-use flume::Sender;
+use crate::process::within;
+use crate::providers::plugin::{native_factory, register_native};
 use maki_storage::auth::now_millis;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use smol::lock::Mutex as AsyncMutex;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, info, warn};
 
 use super::Error;
+#[cfg(test)]
 use super::SLUG;
 use super::SPEC;
 #[cfg(test)]
@@ -39,28 +39,16 @@ use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use crate::providers::anthropic::shared::{
     LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, long_context_window,
 };
+use crate::providers::catalog::CATALOG_CACHE_TTL;
 use crate::providers::{Timeouts, catalog};
-use crate::types::requires_adaptive;
+use crate::types::{dialect, requires_adaptive};
 use crate::{
-    AgentError, Effort, EffortDialect, Message, ProviderEvent, ProviderUsage, RequestOptions,
-    StreamResponse, ThinkingConfig,
+    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
+    ThinkingConfig,
 };
 use maki_storage::atomic_write;
 use run::{Exchange, Launch, Limits, Listed, Request, Thinking};
 use worker::{DEFAULT_EXECUTABLE, DEFAULT_MAX_CONCURRENT, MIN_MAX_CONCURRENT};
-
-const CLAUDE_CODE: EffortDialect = EffortDialect {
-    name: None,
-    supported: &[
-        Effort::Low,
-        Effort::Medium,
-        Effort::High,
-        Effort::XHigh,
-        Effort::Max,
-    ],
-    adaptive: None,
-    off: None,
-};
 
 #[cfg(test)]
 pub(super) const WAIT: Duration = Duration::from_secs(30);
@@ -68,9 +56,6 @@ const PLUGIN_OFF: &str =
     "enable the claude_code plugin in init.lua: `plugins = { claude_code = { enabled = true } }`";
 const WAITING_FOR_SLOT: &str = "waiting for a Claude Code request slot";
 const MODELS_CACHE_FILE: &str = "claude-code-models.json";
-/// Same as the models.dev catalog, because a listing starts several `claude`
-/// processes.
-const MODELS_CACHE_TTL: Duration = Duration::from_secs(86_400);
 const MAX_MODEL_CACHES: usize = 16;
 /// Transient listing failures suppress repeat process launches for this long.
 const FAILED_LISTING_TTL: Duration = Duration::from_secs(300);
@@ -133,39 +118,24 @@ fn reusable_listing(
         })
 }
 
-struct Factory {
+static SLOTS: Slots = Slots::new(DEFAULT_MAX_CONCURRENT);
+type KnownModels = Arc<Mutex<Vec<TimedModels>>>;
+static KNOWN_MODELS: Mutex<BTreeMap<Option<PathBuf>, KnownModels>> = Mutex::new(BTreeMap::new());
+
+pub(crate) struct Factory {
     options: PluginOptions,
-    slots: Arc<Slots>,
     models_cache: Option<PathBuf>,
-    known_models: Arc<Mutex<Vec<TimedModels>>>,
 }
 
 impl Factory {
-    fn new(options: PluginOptions, models_cache: Option<PathBuf>, previous: Option<&Self>) -> Self {
-        let limit = options.max_concurrent.unwrap_or(DEFAULT_MAX_CONCURRENT);
-        let slots = previous
-            .map(|factory| Arc::clone(&factory.slots))
-            .unwrap_or_else(|| Arc::new(Slots::new(limit)));
-        slots.set_limit(limit);
-        let known_models = previous
-            .filter(|factory| factory.models_cache == models_cache)
-            .map(|factory| Arc::clone(&factory.known_models))
-            .unwrap_or_else(|| {
-                Arc::new(Mutex::new(
-                    models_cache.as_deref().map(read_models).unwrap_or_default(),
-                ))
-            });
+    fn new(options: PluginOptions, models_cache: Option<PathBuf>) -> Self {
         Self {
             options,
-            slots,
             models_cache,
-            known_models,
         }
     }
-}
 
-impl NativeFactory for Factory {
-    fn create(&self, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    pub(crate) fn create(&self, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
         let vars = [worker::HOME_ENV, worker::CONFIG_DIR_ENV]
             .into_iter()
             .filter_map(|name| env::var(name).ok().map(|value| (name.to_owned(), value)))
@@ -175,21 +145,15 @@ impl NativeFactory for Factory {
 }
 
 pub fn configure_plugin(enabled: bool, options: Option<&Map<String, Value>>) {
-    let factory = enabled.then(|| {
-        let previous = native_factory(SLUG);
-        let previous = previous
-            .as_deref()
-            .and_then(|factory| (factory as &dyn Any).downcast_ref::<Factory>());
-        Arc::new(Factory::new(
-            PluginOptions::from_table(options),
-            models_cache_path(),
-            previous,
-        )) as Arc<dyn NativeFactory>
-    });
-    register_native(SLUG, factory);
+    if !enabled {
+        return;
+    }
+    let options = PluginOptions::from_table(options);
+    SLOTS.set_limit(options.max_concurrent.unwrap_or(DEFAULT_MAX_CONCURRENT));
+    register_native(Arc::new(Factory::new(options, models_cache_path())));
 }
 
-async fn request_slot<'a>(slots: &'a Slots, events: &Sender<ProviderEvent>) -> Permit<'a> {
+async fn request_slot<'a>(slots: &'a Slots, events: &UnboundedSender<ProviderEvent>) -> Permit<'a> {
     if let Some(slot) = slots.try_acquire() {
         return slot;
     }
@@ -201,7 +165,7 @@ async fn request_slot<'a>(slots: &'a Slots, events: &Sender<ProviderEvent>) -> P
     slots.acquire().await
 }
 
-struct Waiting<'a>(&'a Sender<ProviderEvent>);
+struct Waiting<'a>(&'a UnboundedSender<ProviderEvent>);
 
 impl Drop for Waiting<'_> {
     fn drop(&mut self) {
@@ -250,7 +214,9 @@ pub(super) fn agent_error(error: Error) -> AgentError {
 }
 
 pub(super) fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
-    create_native(SLUG, timeouts).unwrap_or_else(|| Err(config_error(PLUGIN_OFF)))
+    native_factory()
+        .ok_or_else(|| config_error(PLUGIN_OFF))?
+        .create(timeouts)
 }
 
 fn models_cache_path() -> Option<PathBuf> {
@@ -305,7 +271,7 @@ fn saved_models(
 fn remember_models(entries: &mut Vec<TimedModels>, saved: &SavedModels) {
     let now = now_millis();
     entries.retain(|(at, entry)| {
-        Duration::from_millis(now.saturating_sub(*at)) <= MODELS_CACHE_TTL
+        Duration::from_millis(now.saturating_sub(*at)) <= CATALOG_CACHE_TTL
             && (entry.executable != saved.executable || entry.config_dir != saved.config_dir)
     });
     entries.insert(0, (now, saved.clone()));
@@ -369,7 +335,7 @@ fn thinking_for(thinking: ThinkingConfig, model: &Model) -> Thinking {
     match thinking {
         ThinkingConfig::Off => Thinking::Off,
         _ if requires_adaptive(&model.id) => thinking
-            .effort_str(&CLAUDE_CODE, model)
+            .effort_str(&dialect::ANTHROPIC_ADAPTIVE, model)
             .map_or(Thinking::Default, Thinking::Effort),
         _ => thinking
             .request_thinking(model)
@@ -387,7 +353,6 @@ pub(super) fn utf8_vars(vars: impl Iterator<Item = (OsString, OsString)>) -> Vec
 struct ClaudeCode {
     executable: PathBuf,
     limits: Limits,
-    slots: Arc<Slots>,
     known_models: Arc<Mutex<Vec<TimedModels>>>,
     login: Option<PathBuf>,
     models_cache: Option<PathBuf>,
@@ -409,8 +374,21 @@ impl ClaudeCode {
         Ok(Self {
             executable,
             limits: Limits::new(timeouts.stream),
-            slots: Arc::clone(&factory.slots),
-            known_models: Arc::clone(&factory.known_models),
+            known_models: Arc::clone(
+                KNOWN_MODELS
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .entry(factory.models_cache.clone())
+                    .or_insert_with(|| {
+                        Arc::new(Mutex::new(
+                            factory
+                                .models_cache
+                                .as_deref()
+                                .map(read_models)
+                                .unwrap_or_default(),
+                        ))
+                    }),
+            ),
             login,
             models_cache: factory.models_cache.clone(),
             config_dir: options.config_dir.clone(),
@@ -446,7 +424,8 @@ impl ClaudeCode {
         let config_dir = self.config_dir.clone();
         let cwd = cwd.to_owned();
         let prepared =
-            smol::unblock(move || worker::prepare_launch(vars, config_dir, &cwd)).await?;
+            tokio::task::spawn_blocking(move || worker::prepare_launch(vars, config_dir, &cwd))
+                .await??;
         if !prepared.withheld.is_empty() {
             info!(withheld = ?prepared.withheld, "claude-code: maki did not give the route variables to Claude Code");
         }
@@ -468,10 +447,11 @@ impl ClaudeCode {
         let saved = async || {
             let path = self.models_cache.clone()?;
             let (executable, config_dir) = key.clone();
-            let saved = smol::unblock(move || {
-                saved_models(&path, MODELS_CACHE_TTL, &executable, &config_dir)
+            let saved = tokio::task::spawn_blocking(move || {
+                saved_models(&path, CATALOG_CACHE_TTL, &executable, &config_dir)
             })
-            .await?;
+            .await
+            .ok()??;
             self.remember(&saved);
             Some(saved.models)
         };
@@ -491,7 +471,7 @@ impl ClaudeCode {
         let deadline = started + self.limits.startup;
         let mut state = within(deadline, listing_lock.lock())
             .await
-            .ok_or(Error::ListingBusy)?;
+            .ok_or(Error::ListingPending)?;
         if listing == ModelListing::Cached
             && let Some(models) = saved().await
         {
@@ -500,17 +480,17 @@ impl ClaudeCode {
         if let Some(result) = reusable_listing(&state, started, listing) {
             return result;
         }
-        let _slot = match self.slots.try_acquire() {
+        let _slot = match SLOTS.try_acquire() {
             Some(slot) => slot,
             None if listing == ModelListing::Refresh => return Err(Error::ListingBusy),
             None => {
                 drop(state);
-                let slot = within(deadline, self.slots.acquire())
+                let slot = within(deadline, SLOTS.acquire())
                     .await
                     .ok_or(Error::ListingBusy)?;
                 state = within(deadline, listing_lock.lock())
                     .await
-                    .ok_or(Error::ListingBusy)?;
+                    .ok_or(Error::ListingPending)?;
                 if let Some(result) = reusable_listing(&state, started, listing) {
                     return result;
                 }
@@ -573,11 +553,11 @@ impl ClaudeCode {
         self.remember(&saved);
         if let Some(path) = &self.models_cache {
             let path = path.to_owned();
-            return Ok(smol::unblock(move || {
+            return Ok(tokio::task::spawn_blocking(move || {
                 save_models(&path, &saved);
                 saved.models
             })
-            .await);
+            .await?);
         }
         Ok(saved.models)
     }
@@ -591,11 +571,11 @@ impl ClaudeCode {
         vars: Vec<(String, String)>,
     ) -> Result<StreamResponse, Error> {
         // Claude Code reports its directory as `getcwd` does.
-        let cwd = smol::fs::canonicalize(cwd)
+        let cwd = tokio::fs::canonicalize(cwd)
             .await
             .map_err(Error::path("resolve the directory of the session", cwd))?;
         let waiting = Instant::now();
-        let _slot = request_slot(&self.slots, exchange.events).await;
+        let _slot = request_slot(&SLOTS, exchange.events).await;
         debug!(
             slot_wait_ms = run::millis(waiting.elapsed()),
             "claude-code: request slot acquired"
@@ -626,7 +606,7 @@ impl Provider for ClaudeCode {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -657,7 +637,7 @@ impl Provider for ClaudeCode {
         listing: ModelListing,
     ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
-            let cwd = smol::unblock(working_dir).await?;
+            let cwd = tokio::task::spawn_blocking(working_dir).await??;
             let models = self
                 .list(&cwd, listing, utf8_vars(env::vars_os()))
                 .await
@@ -695,28 +675,26 @@ impl Provider for ClaudeCode {
 
 #[cfg(test)]
 mod tests {
-    use std::any::Any;
     use std::env;
     use std::ffi::OsString;
     use std::fs;
     use std::os::unix::ffi::OsStringExt;
     use std::path::Path;
     use std::pin::pin;
-    use std::sync::Arc;
     use std::time::Duration;
 
     use super::Slots;
-    use futures_lite::future::poll_once;
     use serde_json::{Value, json};
     use tempfile::tempdir;
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use super::error::{Error, RATE_LIMITED};
     use super::run::Thinking;
     use super::utf8_vars;
     use super::{
-        ClaudeCode, LONG_CONTEXT_WINDOW, Listed, MAX_MODEL_CACHES, MODELS_CACHE_FILE,
-        MODELS_CACHE_TTL, PLUGIN_OFF, PluginOptions, SLUG, SUBSIDY, SavedModels, WAITING_FOR_SLOT,
+        CATALOG_CACHE_TTL, ClaudeCode, LONG_CONTEXT_WINDOW, Listed, MAX_MODEL_CACHES,
+        MODELS_CACHE_FILE, PLUGIN_OFF, PluginOptions, SLUG, SUBSIDY, SavedModels, WAITING_FOR_SLOT,
         agent_error, backdate_models, create, read_models, request_slot, save_models, saved_models,
         thinking_for, with_long_context,
     };
@@ -732,12 +710,12 @@ mod tests {
 
     #[test]
     fn waiting_for_a_request_slot_is_reported_and_cleared_on_acquisition() {
-        smol::block_on(async {
+        crate::test_support::runtime().block_on(async {
             let slots = Slots::new(1);
             let held = slots.acquire().await;
-            let (events, received) = flume::unbounded();
+            let (events, mut received) = unbounded_channel();
             let mut queued = pin!(request_slot(&slots, &events));
-            assert!(poll_once(&mut queued).await.is_none());
+            assert!(futures::FutureExt::now_or_never(&mut queued).is_none());
             assert_eq!(
                 received.try_recv().unwrap(),
                 ProviderEvent::Waiting {
@@ -754,13 +732,13 @@ mod tests {
     }
     #[test]
     fn cancelling_a_queued_request_clears_its_waiting_status() {
-        smol::block_on(async {
+        crate::test_support::runtime().block_on(async {
             let slots = Slots::new(1);
             let _held = slots.acquire().await;
-            let (events, received) = flume::unbounded();
+            let (events, mut received) = unbounded_channel();
             {
                 let mut queued = pin!(request_slot(&slots, &events));
-                assert!(poll_once(&mut queued).await.is_none());
+                assert!(futures::FutureExt::now_or_never(&mut queued).is_none());
                 assert_eq!(
                     received.try_recv().unwrap(),
                     ProviderEvent::Waiting {
@@ -831,8 +809,8 @@ mod tests {
         }
     }
 
-    /// Preserve overflow errors regardless of stderr. Retry temporary API errors and
-    /// empty tool-call turns. Login errors must stop the request.
+    /// Preserve overflow errors regardless of stderr. Retry temporary API errors, empty
+    /// tool-call turns and restarted generations. Login errors must stop the request.
     #[test_case(Error::ContextOverflow => (true, false) ; "an_exhausted_context_window")]
     #[test_case(refused(INVALID, None) => (true, false) ; "an_overflow")]
     #[test_case(refused(INVALID, None).with_stderr("noise".into()) => (true, false) ; "an_overflow_with_stderr")]
@@ -849,6 +827,9 @@ mod tests {
     #[test_case(Error::ApiRefused { kind: UNKNOWN_KIND.into(), text: "API Error: Stream idle timeout".into(), status: None } => (false, true) ; "a_reported_stream_idle_timeout")]
     #[test_case(Error::NoCallsToRun => (false, true) ; "a_tool_stop_without_calls")]
     #[test_case(Error::StoppedFor("end_turn".into()) => (false, true) ; "calls_with_an_end_turn_stop")]
+    #[test_case(Error::SecondGeneration => (false, true) ; "a_restarted_generation")]
+    #[test_case(Error::Abandoned => (false, true) ; "an_abandoned_reply")]
+    #[test_case(Error::CutBeforeOutput(0) => (false, false) ; "a_reply_cut_before_any_output")]
     fn a_refused_request_reads_as_the_anthropic_provider_reports_it(error: Error) -> (bool, bool) {
         let error = agent_error(error);
         (error.is_context_overflow(), error.is_retryable())
@@ -925,7 +906,7 @@ mod tests {
             },
         );
         ClaudeCode::new(
-            &super::Factory::new(options, Some(cache), None),
+            &super::Factory::new(options, Some(cache)),
             Timeouts::default(),
             &[],
         )
@@ -981,7 +962,7 @@ mod tests {
             models: vec![],
         };
         assert!(save_models(&base, &saved));
-        backdate_models(&base, MODELS_CACHE_TTL + Duration::from_secs(1));
+        backdate_models(&base, CATALOG_CACHE_TTL + Duration::from_secs(1));
         assert!(save_models(
             &base,
             &SavedModels {
@@ -1163,54 +1144,50 @@ mod tests {
             config_dir: login.map(Into::into),
             ..PluginOptions::default()
         };
-        let factory = super::Factory::new(options, None, None);
+        let factory = super::Factory::new(options, None);
         let provider = ClaudeCode::new(&factory, Timeouts::default(), &[]).unwrap();
         assert!(provider.login.is_none());
         assert!(
-            smol::block_on(provider.list(
-                Path::new("/"),
-                crate::provider::ModelListing::Refresh,
-                Vec::new()
-            ))
-            .is_err()
+            crate::test_support::runtime()
+                .block_on(provider.list(
+                    Path::new("/"),
+                    crate::provider::ModelListing::Refresh,
+                    Vec::new()
+                ))
+                .is_err()
         );
     }
 
     #[test]
-    fn registrations_share_slots_across_reload_and_apply_new_limits() {
+    fn registration_reload_applies_new_slot_limits() {
+        let _home = crate::test_support::isolated_home();
         let executable = env::current_exe().unwrap();
         let options = |limit| json!({(super::EXECUTABLE_OPTION):executable, (super::MAX_CONCURRENT_OPTION):limit});
         let load = |limit| {
             crate::providers::plugin::begin_load();
             super::configure_plugin(true, options(limit).as_object());
             crate::providers::plugin::commit_load();
-            let factory = super::native_factory(SLUG).unwrap();
-            Arc::clone(
-                &(factory.as_ref() as &dyn Any)
-                    .downcast_ref::<super::Factory>()
-                    .unwrap()
-                    .slots,
-            )
+            ClaudeCode::new(&super::native_factory().unwrap(), Timeouts::default(), &[]).unwrap()
         };
-        let slots = load(1);
+        load(1);
+        let slots = &super::SLOTS;
         let running = slots.try_acquire().unwrap();
         let first = super::create(Timeouts::default()).unwrap();
         let second = super::create(Timeouts::default()).unwrap();
         for provider in [first, second] {
-            let error =
-                smol::block_on(provider.list_models(crate::provider::ModelListing::Refresh))
-                    .unwrap_err();
+            let error = crate::test_support::runtime()
+                .block_on(provider.list_models(crate::provider::ModelListing::Refresh))
+                .unwrap_err();
             assert!(error.to_string().contains(&Error::ListingBusy.to_string()));
         }
-        let reloaded = load(2);
-        assert!(Arc::ptr_eq(&slots, &reloaded));
-        let additional = reloaded.try_acquire().unwrap();
+        load(2);
+        let additional = super::SLOTS.try_acquire().unwrap();
         assert!(slots.try_acquire().is_none());
         load(1);
         drop(running);
-        assert!(reloaded.try_acquire().is_none());
+        assert!(super::SLOTS.try_acquire().is_none());
         drop(additional);
-        assert!(reloaded.try_acquire().is_some());
+        assert!(super::SLOTS.try_acquire().is_some());
     }
 }
 
@@ -1228,12 +1205,12 @@ mod on_the_fake {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use futures_lite::future::poll_once;
-    use futures_lite::{FutureExt, future};
+    use futures::future;
     use serde_json::json;
-    use smol::Timer;
     use tempfile::tempdir;
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
+    use tokio::time::sleep;
 
     use super::error::{Error, Problem};
     use super::fake::{Fake, HAIKU, IDLE, MARKER, OPUS, SYSTEM, VERSION_ERROR, tools};
@@ -1381,7 +1358,7 @@ mod on_the_fake {
             executable: Some(fake.executable().display().to_string()),
             ..super::PluginOptions::default()
         };
-        let factory = super::Factory::new(options, models_cache, None);
+        let factory = super::Factory::new(options, models_cache);
         let provider = ClaudeCode::new(
             &factory,
             Timeouts {
@@ -1412,13 +1389,20 @@ mod on_the_fake {
             .unwrap() = Some(usage.clone());
         let second = provider_for(&fake, home.path(), &env::temp_dir(), None);
         assert_eq!(
-            smol::block_on(second.fetch_usage()).unwrap(),
+            crate::test_support::runtime()
+                .block_on(second.fetch_usage())
+                .unwrap(),
             Some(usage.clone())
         );
         drop(first);
         drop(second);
         let later = provider_for(&fake, home.path(), &env::temp_dir(), None);
-        assert_eq!(smol::block_on(later.fetch_usage()).unwrap(), Some(usage));
+        assert_eq!(
+            crate::test_support::runtime()
+                .block_on(later.fetch_usage())
+                .unwrap(),
+            Some(usage)
+        );
     }
 
     #[test_case(false ; "another_login")]
@@ -1438,7 +1422,12 @@ mod on_the_fake {
         } else {
             provider_for(&fake, other_home.path(), &env::temp_dir(), None)
         };
-        assert_eq!(smol::block_on(other.fetch_usage()).unwrap(), None);
+        assert_eq!(
+            crate::test_support::runtime()
+                .block_on(other.fetch_usage())
+                .unwrap(),
+            None
+        );
     }
 
     /// The plugin's `config_dir` picks the login, and Claude Code gets it as
@@ -1450,8 +1439,9 @@ mod on_the_fake {
         let mut provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
         provider.config_dir = Some(PathBuf::from(PLUGIN_LOGIN));
 
-        let prepared =
-            smol::block_on(provider.prepare_async(&fake.project(), provider.vars.clone())).unwrap();
+        let prepared = crate::test_support::runtime()
+            .block_on(provider.prepare_async(&fake.project(), provider.vars.clone()))
+            .unwrap();
         let given: Vec<&str> = prepared
             .env
             .iter()
@@ -1472,8 +1462,9 @@ mod on_the_fake {
         vars.push((CONFIG_DIR_VAR.to_owned(), String::new()));
         provider.vars = vars;
 
-        let prepared =
-            smol::block_on(provider.prepare_async(&fake.project(), provider.vars.clone())).unwrap();
+        let prepared = crate::test_support::runtime()
+            .block_on(provider.prepare_async(&fake.project(), provider.vars.clone()))
+            .unwrap();
         assert!(
             prepared.env.iter().all(|(name, _)| name != CONFIG_DIR_VAR),
             "{:?}",
@@ -1502,7 +1493,9 @@ mod on_the_fake {
         backdate_models(&cache, age);
         let provider = provider_for(&fake, home.path(), &env::temp_dir(), Some(cache.clone()));
 
-        let listed = smol::block_on(provider.list(&fake.project(), ModelListing::Cached)).unwrap();
+        let listed = crate::test_support::runtime()
+            .block_on(provider.list(&fake.project(), ModelListing::Cached))
+            .unwrap();
         let want = if asks {
             vec![OPUS, HAIKU]
         } else {
@@ -1549,17 +1542,19 @@ mod on_the_fake {
         assert!(save_models(&cache, &saved));
         let provider = provider_for(&fake, home.path(), &env::temp_dir(), Some(cache.clone()));
         let cwd = fake.project();
-        let slots = Arc::clone(&provider.slots);
+        let slots = &super::SLOTS;
         let held: Vec<_> = iter::from_fn(|| slots.try_acquire()).collect();
-        smol::block_on(async {
-            let error = provider
+        crate::test_support::runtime().block_on(async {
+            let error = async {
+                tokio::select! { biased; value = provider
                 .list(&cwd, ModelListing::Refresh)
-                .or(async {
-                    Timer::after(WAIT).await;
+                 => value, value = async {
+                    sleep(WAIT).await;
                     panic!("model refresh waited for a busy request slot")
-                })
-                .await
-                .unwrap_err();
+                } => value, }
+            }
+            .await
+            .unwrap_err();
             assert!(matches!(error, Error::ListingBusy), "{error}");
             let listed = provider.list(&cwd, ModelListing::Cached).await.unwrap();
             assert_eq!(listed, saved.models);
@@ -1582,11 +1577,12 @@ mod on_the_fake {
         let home = tempdir().unwrap();
         let mut provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
         provider.limits.startup = Duration::ZERO;
-        provider.slots.set_limit(1);
-        let slots = Arc::clone(&provider.slots);
+        super::SLOTS.set_limit(1);
+        let slots = &super::SLOTS;
         let _held = slots.try_acquire().unwrap();
-        let error =
-            smol::block_on(provider.list(&fake.project(), ModelListing::Cached)).unwrap_err();
+        let error = crate::test_support::runtime()
+            .block_on(provider.list(&fake.project(), ModelListing::Cached))
+            .unwrap_err();
         assert!(matches!(error, Error::ListingBusy));
         assert!(fake.log("calls").is_empty());
     }
@@ -1596,26 +1592,28 @@ mod on_the_fake {
         let fake = Fake::new("text");
         let home = tempdir().unwrap();
         let provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
-        smol::block_on(async {
-            let slots = Arc::clone(&provider.slots);
+        crate::test_support::runtime().block_on(async {
+            let slots = &super::SLOTS;
             let held: Vec<_> = iter::from_fn(|| slots.try_acquire()).collect();
             let cwd = fake.project();
             let mut listed = pin!(provider.list(&cwd, ModelListing::Cached));
-            assert!(poll_once(&mut listed).await.is_none());
+            assert!(futures::FutureExt::now_or_never(&mut listed).is_none());
             assert!(fake.log("calls").is_empty());
             let mut refresh = pin!(provider.list(&cwd, ModelListing::Refresh));
             assert!(matches!(
-                poll_once(&mut refresh).await,
+                futures::FutureExt::now_or_never(&mut refresh),
                 Some(Err(Error::ListingBusy))
             ));
             drop(held);
-            let models = listed
-                .or(async {
-                    Timer::after(WAIT).await;
+            let models = async {
+                tokio::select! { biased; value = listed
+                 => value, value = async {
+                    sleep(WAIT).await;
                     panic!("a cached listing did not resume after a slot was released")
-                })
-                .await
-                .unwrap();
+                } => value, }
+            }
+            .await
+            .unwrap();
             assert!(!models.is_empty());
             assert!(models.iter().all(|model| model.id != SAVED_MODEL));
         });
@@ -1642,7 +1640,9 @@ mod on_the_fake {
             provider.window_of(SAVED_MODEL),
             Some(SPEC.fallback_context_window)
         );
-        let listed = smol::block_on(provider.list(&fake.project(), ModelListing::Cached)).unwrap();
+        let listed = crate::test_support::runtime()
+            .block_on(provider.list(&fake.project(), ModelListing::Cached))
+            .unwrap();
         assert!(listed.iter().all(|model| model.id != SAVED_MODEL));
         assert!(!fake.log("calls").is_empty());
     }
@@ -1659,7 +1659,7 @@ mod on_the_fake {
         let provider = provider_for(&fake, home.path(), &env::temp_dir(), cache);
         let cwd = fake.project();
 
-        let (first, second) = smol::block_on(future::zip(
+        let (first, second) = crate::test_support::runtime().block_on(future::join(
             provider.list(&cwd, first),
             provider.list(&cwd, second),
         ));
@@ -1676,24 +1676,27 @@ mod on_the_fake {
     fn a_listing_for_one_login_does_not_block_another() {
         let blocked = Fake::new("text");
         let other = Fake::new("text");
+        let other_cwd = other.project();
         let home = tempdir().unwrap();
         let first = provider_for(&blocked, home.path(), &env::temp_dir(), None);
         let second = provider_for(&other, home.path(), &env::temp_dir(), None);
         let key = (first.executable.clone(), first.login.clone().unwrap());
         let state = Arc::clone(LISTINGS.lock().unwrap().entry(key).or_default());
-        smol::block_on(async {
+        crate::test_support::runtime().block_on(async {
             let _held = state.lock().await;
             let cwd = blocked.project();
             let mut pending = pin!(first.list(&cwd, ModelListing::Cached));
-            assert!(poll_once(&mut pending).await.is_none());
-            let listed = second
-                .list(&other.project(), ModelListing::Cached)
-                .or(async {
-                    Timer::after(WAIT).await;
+            assert!(futures::FutureExt::now_or_never(&mut pending).is_none());
+            let listed = async {
+                tokio::select! { biased; value = second
+                .list(&other_cwd, ModelListing::Cached)
+                 => value, value = async {
+                    sleep(WAIT).await;
                     panic!("an unrelated login was blocked by model discovery");
-                })
-                .await
-                .unwrap();
+                } => value, }
+            }
+            .await
+            .unwrap();
             assert!(!listed.is_empty());
         });
     }
@@ -1709,8 +1712,12 @@ mod on_the_fake {
         let provider = provider_for(&fake, home.path(), &env::temp_dir(), cache);
         let cwd = fake.project();
 
-        let first = smol::block_on(provider.list(&cwd, ModelListing::Cached)).unwrap_err();
-        let again = smol::block_on(provider.list(&cwd, ModelListing::Cached)).unwrap_err();
+        let first = crate::test_support::runtime()
+            .block_on(provider.list(&cwd, ModelListing::Cached))
+            .unwrap_err();
+        let again = crate::test_support::runtime()
+            .block_on(provider.list(&cwd, ModelListing::Cached))
+            .unwrap_err();
         assert!(!matches!(first, Error::ListedRecently { .. }), "{first}");
         assert!(
             matches!(again, Error::ListedRecently { wait, .. } if wait < super::FAILED_LISTING_TTL),
@@ -1719,7 +1726,7 @@ mod on_the_fake {
         assert_eq!(fake.log("versions").lines().count(), 1);
         assert_eq!(fake.log("calls").lines().count(), 1);
 
-        let _ = smol::block_on(provider.list(&cwd, ModelListing::Refresh));
+        let _ = crate::test_support::runtime().block_on(provider.list(&cwd, ModelListing::Refresh));
         assert_eq!(fake.log("versions").lines().count(), 1);
         assert_eq!(fake.log("calls").lines().count(), 2);
     }
@@ -1732,7 +1739,10 @@ mod on_the_fake {
         let provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
         let marker = fake.dir.path().join(file);
         fs::write(&marker, output).unwrap();
-        let list = || smol::block_on(provider.list(&fake.project(), ModelListing::Cached));
+        let list = || {
+            crate::test_support::runtime()
+                .block_on(provider.list(&fake.project(), ModelListing::Cached))
+        };
         assert!(list().unwrap_err().invalidates_version());
         fs::remove_file(marker).unwrap();
         assert!(!list().unwrap().is_empty());
@@ -1744,7 +1754,10 @@ mod on_the_fake {
         let fake = Fake::new("text");
         let home = tempdir().unwrap();
         let provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
-        let list = || smol::block_on(provider.list(&fake.project(), ModelListing::Refresh));
+        let list = || {
+            crate::test_support::runtime()
+                .block_on(provider.list(&fake.project(), ModelListing::Refresh))
+        };
         list().unwrap();
         let hook = fake.dir.path().join("policy_hook");
         fs::write(&hook, "").unwrap();
@@ -1764,14 +1777,19 @@ mod on_the_fake {
         let path = fake.dir.path().join(marker);
         fs::write(&path, "").unwrap();
         let cwd = fake.project();
-        let error = smol::block_on(provider.list(&cwd, ModelListing::Cached)).unwrap_err();
+        let error = crate::test_support::runtime()
+            .block_on(provider.list(&cwd, ModelListing::Cached))
+            .unwrap_err();
         assert!(matches!(error.cause(), Error::Check(_)), "{error}");
         fs::remove_file(path).unwrap();
-        let again = smol::block_on(provider.list(&cwd, ModelListing::Cached)).unwrap_err();
+        let again = crate::test_support::runtime()
+            .block_on(provider.list(&cwd, ModelListing::Cached))
+            .unwrap_err();
         assert!(matches!(again, Error::ListedRecently { .. }), "{again}");
         assert_eq!(fake.log("versions").lines().count(), 1);
         assert!(
-            !smol::block_on(provider.list(&cwd, ModelListing::Refresh))
+            !crate::test_support::runtime()
+                .block_on(provider.list(&cwd, ModelListing::Refresh))
                 .unwrap()
                 .is_empty()
         );
@@ -1785,7 +1803,7 @@ mod on_the_fake {
         let provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
         let model = Model::from_spec(HAIKU_SPEC).unwrap();
         let tools = tools();
-        let (events, _received) = flume::unbounded();
+        let (events, _received) = unbounded_channel();
         for _ in 0..2 {
             let exchange = Exchange {
                 system: SYSTEM,
@@ -1793,13 +1811,9 @@ mod on_the_fake {
                 tools: &tools,
                 events: &events,
             };
-            let error = smol::block_on(provider.request(
-                &model,
-                Thinking::Default,
-                exchange,
-                &fake.project(),
-            ))
-            .unwrap_err();
+            let error = crate::test_support::runtime()
+                .block_on(provider.request(&model, Thinking::Default, exchange, &fake.project()))
+                .unwrap_err();
             assert!(error.temporary().is_some(), "{error}");
         }
         assert_eq!(fake.log("versions").lines().count(), 1);
@@ -1818,13 +1832,18 @@ mod on_the_fake {
         let provider = provider_for(fake, home.path(), temp, None);
         let tools = tools();
         let messages = [Message::user(format!("find {MARKER}"))];
-        let (events, _received) = flume::unbounded();
+        let (events, _received) = unbounded_channel();
         let exchange = Exchange {
             system: SYSTEM,
             messages: &messages,
             tools: &tools,
             events: &events,
         };
-        smol::block_on(provider.request(model, Thinking::Default, exchange, cwd))
+        crate::test_support::runtime().block_on(provider.request(
+            model,
+            Thinking::Default,
+            exchange,
+            cwd,
+        ))
     }
 }

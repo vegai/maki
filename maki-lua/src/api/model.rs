@@ -2,9 +2,12 @@
 //! request options, so most calls round-trip to it; `info` resolves
 //! locally and works without a UI.
 
+use std::fmt::Display;
+
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::{Model, ModelTier, model_registry};
 use mlua::{Error as LuaError, Lua, Result as LuaResult, Table, Value};
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::api::util::command::{ModelRequest, UiAction, ui_json_roundtrip};
 use crate::api::util::convert::TableExt;
@@ -13,9 +16,15 @@ use crate::plugin_permissions::PluginPermissions;
 
 const SET_ARG_ERR: &str = "expected a model spec string or an options table";
 
+/// Shared with `maki.agent.resolve_model`, so a tier assignment that no longer
+/// resolves reads the same wherever it surfaces.
+pub(crate) fn stale_tier_err(tier: ModelTier, spec: &str, cause: impl Display) -> String {
+    format!("tier {tier} points at {spec}: {cause}")
+}
+
 async fn roundtrip(
     lua: Lua,
-    tx: Option<flume::Sender<UiAction>>,
+    tx: Option<UnboundedSender<UiAction>>,
     req: ModelRequest,
 ) -> LuaResult<Pair<Value>> {
     ui_json_roundtrip(&lua, tx.as_ref(), |reply_tx| UiAction::Model {
@@ -95,9 +104,17 @@ fn info(lua: &Lua, spec: String) -> LuaResult<Pair<Table>> {
 }
 
 /// The model maki uses for a tier, the same one a subagent asking for that
-/// tier gets: your pick from the `/model` picker, else the curated default.
-/// `assigned` tells the two apart. Pass `provider` to prefer its models, the
-/// way subagents prefer the session's provider.
+/// tier gets. The first match wins:
+///
+/// 1. The user's pick for that tier in the `/model` picker, from any provider.
+/// 2. The tier default within `provider`, curated or set in `providers.toml`.
+/// 3. The tier default of any provider.
+///
+/// `assigned` tells a pick apart from a default. Pass `provider` the way
+/// subagents pass the session's provider.
+///
+/// Resolving a models.dev model can wait for that catalog to download, so
+/// like `get`, this cannot run in a callback that must not yield.
 ///
 /// @param name string `"weak"`, `"medium"`, `"strong"`, or `"compaction"`.
 /// @param provider string|nil Provider slug to resolve within first.
@@ -109,22 +126,20 @@ fn info(lua: &Lua, spec: String) -> LuaResult<Pair<Table>> {
 /// local m = maki.model.tier("weak", maki.model.get().provider)
 /// if m then maki.model.set(m.spec) end
 #[lua_fn]
-fn tier(lua: &Lua, name: String, provider: Option<String>) -> LuaResult<Pair<Table>> {
+async fn tier(lua: Lua, name: String, provider: Option<String>) -> LuaResult<Pair<Table>> {
     let tier: ModelTier = match name.parse() {
         Ok(tier) => tier,
         Err(e) => return Ok(err_pair(e)),
     };
-    let Some(spec) = provider
-        .and_then(|p| model_registry::spec_for_tier(&p, tier))
-        .or_else(|| model_registry::spec_for_tier_any(tier))
-    else {
-        return Ok((None, None));
+    let spec = match model_registry::resolve_tier(provider.as_deref(), tier) {
+        Some(spec) => spec,
+        None => return Ok((None, None)),
     };
-    let model = match Model::from_spec(&spec) {
+    let model = match Model::from_spec_or_warm_catalog(&spec).await {
         Ok(model) => model,
-        Err(e) => return Ok(err_pair(format!("tier {tier} points at {spec}: {e}"))),
+        Err(e) => return Ok(err_pair(stale_tier_err(tier, &spec, e))),
     };
-    let tbl = model_info_table(lua, &model)?;
+    let tbl = model_info_table(&lua, &model)?;
     tbl.set(
         "assigned",
         model_registry::override_tiers(&spec).contains(&tier),
@@ -137,11 +152,13 @@ fn tier(lua: &Lua, name: String, provider: Option<String>) -> LuaResult<Pair<Tab
 /// can go straight back in.
 ///
 /// `thinking_options` lists named thinking choices, cheapest first, as
-/// `{name, tokens?}` per row. Request paths that use named `thinking_fields`
+/// `{name, tokens?, sends}` per row. Request paths that use named `thinking_fields`
 /// expose those levels without token counts. Toggle-only fields expose
 /// `adaptive` and, when allowed, `off`. Otherwise the generic budget ladder applies.
-/// `tokens` is absent on `off` and `adaptive` too. The list is empty exactly
-/// when `supports_thinking` is false.
+/// `tokens` is absent on `off` and `adaptive` too. `sends` is the row the
+/// request goes out as: the row's own name, or the level a model that does
+/// not take this one snaps it to. The list is empty exactly when
+/// `supports_thinking` is false.
 ///
 /// `thinking` keeps the session's intent and delegation ceiling.
 /// `thinking_shown` names the effective row to highlight, including snapped
@@ -159,10 +176,10 @@ fn tier(lua: &Lua, name: String, provider: Option<String>) -> LuaResult<Pair<Tab
 /// local m = maki.model.get()
 /// if m.spec ~= "anthropic/claude-opus-4-6" then ... end
 /// for _, option in ipairs(m.thinking_options) do
-///   print(option.name, option.tokens)
+///   print(option.name, option.tokens, option.sends)
 /// end
 #[lua_fn]
-async fn get(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
+async fn get(lua: Lua, #[ctx] tx: Option<UnboundedSender<UiAction>>) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, ModelRequest::Get).await
 }
 
@@ -174,7 +191,10 @@ async fn get(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<
 /// @example
 /// local specs = maki.model.available()
 #[lua_fn]
-async fn available(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
+async fn available(
+    lua: Lua,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
+) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, ModelRequest::Available).await
 }
 
@@ -191,11 +211,11 @@ async fn available(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaR
 /// @example
 /// maki.model.set("anthropic/claude-opus-4-6")
 /// maki.model.set({ spec = "zai/glm-5", thinking = "high" })
-/// maki.keymap.set("n", "<M-t>", function() maki.model.set({ thinking = "" }) end)
+/// maki.keymap.set({ "n", "i" }, "<M-t>", function() maki.model.set({ thinking = "" }) end)
 #[lua_fn(guard = SessionSettings)]
 async fn set(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     opts: Value,
 ) -> LuaResult<Pair<Value>> {
     let req = match opts {
@@ -225,7 +245,7 @@ lua_table! {
     /// Without an interactive UI every function returns
     /// `nil, "no interactive UI attached"`.
     "maki.model" => pub(crate) fn create_model_table(
-        tx: Option<flume::Sender<UiAction>>,
+        tx: Option<UnboundedSender<UiAction>>,
         perms: &PluginPermissions,
     ),
     DOCS [get(tx), available(tx), set(perms, tx), tier(), info()]
@@ -241,6 +261,8 @@ mod tests {
     use serde_json::{Value as Json, json};
     use tempfile::TempDir;
     use test_case::test_case;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::mpsc::unbounded_channel;
 
     const SPEC: &str = "anthropic/claude-opus-4-6";
     const THINKING: &str = "high";
@@ -262,7 +284,7 @@ mod tests {
         model_registry::unset_and_persist(&spec, tier, &storage);
     }
 
-    fn lua_with_model(tx: Option<flume::Sender<UiAction>>) -> Lua {
+    fn lua_with_model(tx: Option<UnboundedSender<UiAction>>) -> Lua {
         let lua = Lua::new();
         let t = create_model_table(&lua, tx, &PluginPermissions::trusted()).unwrap();
         lua.globals().set("model", t).unwrap();
@@ -271,7 +293,7 @@ mod tests {
 
     /// The receiver is dropped up front, so the request cannot even leave.
     fn closed_ui() -> Lua {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, rx) = unbounded_channel::<UiAction>();
         drop(rx);
         lua_with_model(Some(tx))
     }
@@ -279,9 +301,9 @@ mod tests {
     /// Answering `None` drops the reply channel, like a UI that took the
     /// request and then vanished.
     fn stub_ui(answer: fn(ModelRequest) -> Option<UiReply>) -> Lua {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         std::thread::spawn(move || {
-            while let Ok(UiAction::Model { req, reply_tx }) = rx.recv() {
+            while let Some(UiAction::Model { req, reply_tx }) = rx.blocking_recv() {
                 if let Some(reply) = answer(req) {
                     let _ = reply_tx.send(reply);
                 }
@@ -305,9 +327,8 @@ mod tests {
     }
 
     /// The value comes back as JSON so assertions outlive the Lua state.
-    fn eval(lua: &Lua, script: &str) -> (Json, Option<String>) {
-        let (val, err): (Value, Option<String>) =
-            smol::block_on(lua.load(script).eval_async()).unwrap();
+    async fn eval(lua: &Lua, script: &str) -> (Json, Option<String>) {
+        let (val, err): (Value, Option<String>) = lua.load(script).eval_async().await.unwrap();
         (lua_to_json(lua, &val).unwrap(), err)
     }
 
@@ -321,8 +342,12 @@ mod tests {
     #[test_case("return model.set({ thinking = 8192, fast = true })", json!({ "thinking": "8192", "fast": true }) ; "set_table_without_spec")]
     #[test_case("return model.set({ thinking = '', fast = false })", json!({ "thinking": "", "fast": false }) ; "set_empty_thinking_and_false_fast")]
     #[test_case("local m = model.get() return model.set(m)", json!({ "spec": SPEC, "thinking": THINKING, "fast": true }) ; "set_fed_by_get")]
-    fn requests_cross_the_channel_and_answer_with_the_new_state(script: &str, expected: Json) {
-        assert_eq!(eval(&stub_ui(echo), script), (expected, None));
+    #[tokio::test]
+    async fn requests_cross_the_channel_and_answer_with_the_new_state(
+        script: &str,
+        expected: Json,
+    ) {
+        assert_eq!(eval(&stub_ui(echo), script).await, (expected, None));
     }
 
     /// Every way of not getting an answer lands in the error slot, instead of
@@ -331,19 +356,20 @@ mod tests {
     #[test_case(closed_ui(), NO_UI_ERR ; "event_loop_closed")]
     #[test_case(stub_ui(|_| None), UI_DROPPED_ERR ; "reply_channel_dropped")]
     #[test_case(stub_ui(|_| Some(Err(UI_FAILURE.to_owned()))), UI_FAILURE ; "ui_refused")]
-    fn unanswered_request_returns_an_error_pair(lua: Lua, expected: &str) {
+    #[tokio::test]
+    async fn unanswered_request_returns_an_error_pair(lua: Lua, expected: &str) {
         assert_eq!(
-            eval(&lua, "return model.get()"),
+            eval(&lua, "return model.get()").await,
             (Json::Null, Some(expected.to_owned()))
         );
     }
 
     /// `info` resolves locally: no UI required, and a builtin model answers
     /// with its identity and price table.
-    #[test]
-    fn info_resolves_a_builtin_model_without_a_ui() {
+    #[tokio::test]
+    async fn info_resolves_a_builtin_model_without_a_ui() {
         let lua = lua_with_model(None);
-        let (val, err) = eval(&lua, "return model.info('anthropic/claude-sonnet-4-5')");
+        let (val, err) = eval(&lua, "return model.info('anthropic/claude-sonnet-4-5')").await;
         assert_eq!(err, None);
         assert_eq!(val["spec"], json!("anthropic/claude-sonnet-4-5"));
         assert_eq!(val["provider"], json!("anthropic"));
@@ -359,19 +385,20 @@ mod tests {
     #[test_case("zai/glm-4.7-flash",       json!(true)  ; "builtin_zero_priced_is_free")]
     #[test_case("anthropic/claude-sonnet-4-5", json!(false) ; "metered_is_not_free")]
     #[test_case("ollama/my-custom-model", Json::Null   ; "no_price_table_is_unknown")]
-    fn info_free_separates_zero_from_unknown(spec: &str, expected: Json) {
+    #[tokio::test]
+    async fn info_free_separates_zero_from_unknown(spec: &str, expected: Json) {
         let lua = lua_with_model(None);
-        let (val, err) = eval(&lua, &format!("return model.info('{spec}')"));
+        let (val, err) = eval(&lua, &format!("return model.info('{spec}')")).await;
         assert_eq!(err, None);
         assert_eq!(val["free"], expected);
     }
 
     /// `tier` answers the assigned model in the same shape `info` does, so a
     /// plugin can hand the spec straight to `set`.
-    #[test]
-    fn tier_returns_the_assigned_model() {
+    #[tokio::test]
+    async fn tier_returns_the_assigned_model() {
         let (lua, tier, spec) = assign_tier(SPEC, ModelTier::Strong);
-        let (val, err) = eval(&lua, "return model.tier('strong')");
+        let (val, err) = eval(&lua, "return model.tier('strong')").await;
         clear_tier(tier, spec);
         assert_eq!(err, None);
         assert_eq!(val["spec"], json!(SPEC));
@@ -381,49 +408,52 @@ mod tests {
 
     /// An untouched slot still answers the curated default a subagent would
     /// get, flagged so a plugin can tell it from a real pick.
-    #[test]
-    fn tier_without_an_assignment_falls_back_to_the_default() {
+    #[tokio::test]
+    async fn tier_without_an_assignment_falls_back_to_the_default() {
         let (val, err) = eval(
             &lua_with_model(None),
             "return model.tier('weak', 'anthropic')",
-        );
+        )
+        .await;
         assert_eq!(err, None);
         assert_eq!(val["provider"], json!("anthropic"));
         assert_eq!(val["tier"], json!("weak"));
         assert_eq!(val["assigned"], json!(false));
     }
 
-    #[test]
-    fn tier_with_nothing_to_resolve_answers_nil() {
-        let (val, err) = eval(&lua_with_model(None), "return model.tier('compaction')");
+    #[tokio::test]
+    async fn tier_with_nothing_to_resolve_answers_nil() {
+        let (val, err) = eval(&lua_with_model(None), "return model.tier('compaction')").await;
         assert_eq!((val, err), (Json::Null, None));
     }
 
     /// A name maki does not know reports through the error slot, the same way
     /// `set` reports a spec it cannot parse.
-    #[test]
-    fn tier_with_an_unknown_name_returns_an_error_pair() {
-        let (val, err) = eval(&lua_with_model(None), "return model.tier('turbo')");
+    #[tokio::test]
+    async fn tier_with_an_unknown_name_returns_an_error_pair() {
+        let (val, err) = eval(&lua_with_model(None), "return model.tier('turbo')").await;
         assert_eq!(val, Json::Null);
         assert!(err.is_some());
     }
 
     /// An assignment left over from a provider that is gone is an error, not a
     /// silent `nil`: the user did pick something, it just no longer resolves.
-    #[test]
-    fn tier_with_a_stale_assignment_returns_an_error_pair() {
-        let (lua, tier, spec) = assign_tier("no-such-provider/nope", ModelTier::Weak);
-        let (val, err) = eval(&lua, "return model.tier('weak')");
+    /// The spec has no provider slug, so it fails before the catalog is
+    /// fetched and the test stays off the network.
+    #[tokio::test]
+    async fn tier_with_a_stale_assignment_returns_an_error_pair() {
+        let (lua, tier, spec) = assign_tier("removed-model", ModelTier::Weak);
+        let (val, err) = eval(&lua, "return model.tier('weak')").await;
         clear_tier(tier, spec);
         assert_eq!(val, Json::Null);
         assert!(err.is_some());
     }
 
     /// An unresolvable spec answers `(nil, err)` instead of throwing.
-    #[test]
-    fn info_unknown_provider_returns_an_error_pair() {
+    #[tokio::test]
+    async fn info_unknown_provider_returns_an_error_pair() {
         let lua = lua_with_model(None);
-        let (val, err) = eval(&lua, "return model.info('no-such-provider/nope')");
+        let (val, err) = eval(&lua, "return model.info('no-such-provider/nope')").await;
         assert_eq!(val, Json::Null);
         assert!(err.is_some());
     }
@@ -459,9 +489,10 @@ mod tests {
     #[test_case("return model.set(42)" ; "number")]
     #[test_case("return model.set()" ; "no_argument")]
     #[test_case("return model.set(nil)" ; "explicit_nil")]
-    fn set_throws_on_a_non_spec_argument(script: &str) {
+    #[tokio::test]
+    async fn set_throws_on_a_non_spec_argument(script: &str) {
         let lua = lua_with_model(None);
-        let err = smol::block_on(lua.load(script).eval_async::<Value>()).unwrap_err();
+        let err = lua.load(script).eval_async::<Value>().await.unwrap_err();
         assert!(err.to_string().contains(SET_ARG_ERR));
     }
 }

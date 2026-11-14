@@ -109,6 +109,7 @@ maki.provider.register({
       .. "e.g. `openrouter/anthropic/claude-sonnet-4`.",
   },
   openai = {
+    usage_cost = true,
     -- `prefer-high` is only for models the listing never described. Each listed
     -- model narrows it with the `effort` on its row.
     thinking = { dialect = "prefer-high", field = "reasoning.effort", requires_support = true },
@@ -116,8 +117,8 @@ maki.provider.register({
     -- Marks the whole prompt as cacheable, for the upstreams that only cache
     -- when asked to.
     extra_body = { cache_control = { type = "ephemeral" } },
-    session_id = { body_field = "session_id" },
   },
+  session_id = { body_field = "session_id" },
 
   list_models = function(ctx)
     local body, err = ctx.get_json(MODELS_PATH)

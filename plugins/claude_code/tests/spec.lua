@@ -3,7 +3,6 @@ local t = require("maki.test_helpers")
 local launch = require("claude_launch")
 local confine = require("claude_confine")
 local Stream = require("claude_stream")
-local snapshot = require("claude_snapshot")
 local importer = require("claude_import")
 local workspace = require("claude_workspace")
 local git_utils = require("claude_git")
@@ -18,23 +17,24 @@ for line in launch.HANDSHAKE_INPUT:gmatch("[^\n]+") do
   HANDSHAKE[#HANDSHAKE + 1] = { id = request.request_id }
 end
 
+local function worker_argv(spec)
+  return native.worker_args(spec.executable, spec.model, spec.policy)
+end
+
 local function worker_settings(spec)
-  local args = launch.argv(spec)
+  local args = worker_argv(spec)
   for i, arg in ipairs(args) do
     if arg == "--settings" then
-      return maki.json.decode(args[i + 1])
+      return (maki.json.decode(args[i + 1]))
     end
   end
   error("worker settings missing")
 end
 
 local CWD = "/work"
-local SECRET = "sk-ant-secret"
 local PROMPT = "--explain the parser"
 local ANSWER = "The parser lives in src/parse.rs:10."
 local OK_VERSION = "2.1.284"
-local LINUX = "Linux"
-local CLI = { version = OK_VERSION }
 local JOB_WAIT_MS = 5000
 local OUTSIDE = "/home/u/.ssh/config"
 -- What 2.1.280 sends with every setting source off.
@@ -42,8 +42,6 @@ local BUILTIN_PLUGINS = {
   { name = "agents-md", path = "builtin", source = "agents-md@builtin" },
   { name = "telemetry", path = "builtin", source = "telemetry@builtin" },
 }
-local MISSING = {}
-local READ = launch.WORKERS.read
 local DEFAULT_DENY_RULES = confine.deny_rules(assert(path_utils.denied_paths("")))
 local HOOKS_OFF = { hooks = maki.json.decode("[]"), policy = { allDisabled = true, policyHookCount = 0 } }
 local CONFINE = {
@@ -75,11 +73,7 @@ local function init_event(overrides)
     cwd = CWD,
   }
   for k, v in pairs(overrides or {}) do
-    if v == MISSING then
-      ev[k] = nil
-    else
-      ev[k] = v
-    end
+    ev[k] = v
   end
   return maki.json.encode(ev)
 end
@@ -88,9 +82,11 @@ local function assistant(id, content, usage)
   return maki.json.encode({ type = "assistant", message = { id = id, content = content, usage = usage } })
 end
 
--- Returns a stream for {worker} (default: the read worker) in CWD.
-local function fresh(worker)
-  return Stream.new({ cwd = CWD, worker = worker or launch.WORKERS.read, cli = CLI })
+local function fresh()
+  local stream =
+    Stream.new({ cwd = CWD, policy = native.worker_policy({ deny = DEFAULT_DENY_RULES }), version = OK_VERSION })
+  stream.native:mark_prompted()
+  return stream
 end
 
 local function started()
@@ -108,47 +104,42 @@ local function contains(list, value)
   return false
 end
 
-local function account_answer(overrides, mode)
-  local account = { apiProvider = "firstParty", subscriptionType = "Claude Pro" }
-  for k, v in pairs(overrides or {}) do
-    account[k] = v ~= MISSING and v or nil
-  end
-  return { current_permission_mode = mode or "default", account = account }
+local function account_answer(mode)
+  return {
+    current_permission_mode = mode or "default",
+    account = { apiProvider = "firstParty", subscriptionType = "Claude Pro" },
+  }
 end
 
-local function handshake_answer(handshake, id, response, subtype)
+local function handshake_answer(handshake, id, response)
   local step = fresh():feed(
     maki.json.encode({
       type = "control_response",
-      response = { request_id = id, subtype = subtype or "success", response = response },
+      response = { request_id = id, subtype = "success", response = response },
     }),
     handshake
   )
   return step.complete, step.stop
 end
 
-local function worker_spec(worker, confine, deny)
+local function worker_spec(confine, deny)
   return {
     model = "sonnet",
     executable = "claude",
-    worker = worker or READ,
-    confine = confine,
-    deny = deny or DEFAULT_DENY_RULES,
     policy = native.worker_policy({ deny = deny or DEFAULT_DENY_RULES, sandbox = confine }),
   }
 end
 
-local function handshake_problem(answers, worker, confine)
-  worker = worker or READ
+local function handshake_problem(answers, confine)
   local responses = {
-    account = account_answer(nil, worker.reported_modes[1]),
-    settings = { effective = worker_settings(worker_spec(worker, confine)), sources = maki.json.decode("[]") },
+    account = account_answer(confine and "acceptEdits" or "default"),
+    settings = { effective = worker_settings(worker_spec(confine)), sources = maki.json.decode("[]") },
     hooks = HOOKS_OFF,
   }
   for id, response in pairs(answers) do
     responses[id] = response
   end
-  local handshake = launch.worker_handshake(worker_spec(worker, confine))
+  local handshake = native.worker_handshake(worker_spec(confine).policy)
   for index, request in ipairs(HANDSHAKE) do
     local complete, problem = handshake_answer(handshake, request.id, responses[request.id])
     if problem then
@@ -202,60 +193,10 @@ end)
 -- ── claude_launch ──
 
 local function sandbox_problem(sandbox, confine)
-  local expected = worker_settings(worker_spec(launch.WORKERS.code, confine))
+  local expected = worker_settings(worker_spec(confine))
   local effective = table.clone(expected)
   effective.sandbox = sandbox
-  return handshake_problem(
-    { settings = { effective = effective, sources = maki.json.decode("[]") } },
-    launch.WORKERS.code,
-    confine
-  )
-end
-
-for _, c in ipairs({
-  {
-    name = "the_code_worker_with_the_token",
-    profile = "code",
-    env = { CLAUDE_CODE_OAUTH_TOKEN = SECRET },
-    want = "CLAUDE_CODE_OAUTH_TOKEN",
-  },
-  {
-    name = "a_lowercase_token",
-    profile = "code",
-    env = { claude_code_oauth_token = SECRET },
-    want = "claude_code_oauth_token",
-  },
-  {
-    name = "a_proxy_with_a_password",
-    profile = "code",
-    env = { HTTPS_PROXY = "http://user:" .. SECRET .. "@proxy:3128/" },
-    want = "HTTPS_PROXY",
-  },
-  {
-    name = "a_lowercase_proxy_without_a_scheme",
-    profile = "code",
-    env = { http_proxy = SECRET .. "@proxy:3128" },
-    want = "http_proxy",
-  },
-  { name = "a_proxy_without_a_login", profile = "code", env = { HTTPS_PROXY = "http://proxy:3128/a@b" }, want = nil },
-  { name = "the_code_worker_without_it", profile = "code", env = { PATH = "/bin" }, want = nil },
-  { name = "the_read_worker_with_it", profile = "read", env = { CLAUDE_CODE_OAUTH_TOKEN = SECRET }, want = nil },
-  {
-    name = "the_read_worker_with_a_proxy_password",
-    profile = "read",
-    env = { HTTPS_PROXY = "http://user:" .. SECRET .. "@proxy:3128" },
-    want = nil,
-  },
-}) do
-  case("shell_secret_problem_" .. c.name, function()
-    local problem = confine.shell_secret_problem(launch.WORKERS[c.profile], c.env)
-    if c.want then
-      has(problem, c.want)
-      eq(problem:find(SECRET, 1, true), nil)
-    else
-      eq(problem, nil)
-    end
-  end)
+  return handshake_problem({ settings = { effective = effective, sources = maki.json.decode("[]") } }, confine)
 end
 
 -- As in `.gitignore`, a pattern without a `/` matches at any depth, and one
@@ -366,20 +307,17 @@ local function has_pair(argv, flag, value)
 end
 
 case("a_coding_worker_expects_accept_edits_and_a_reader_refuses_it", function()
-  eq(handshake_problem({ account = account_answer(nil, "acceptEdits") }, launch.WORKERS.code, CONFINE), nil)
-  has(handshake_problem({ account = account_answer(nil, "acceptEdits") }) or "", "acceptEdits")
-  has(handshake_problem({ account = account_answer() }, launch.WORKERS.code, CONFINE) or "", "default")
+  eq(handshake_problem({ account = account_answer("acceptEdits") }, CONFINE), nil)
+  has(handshake_problem({ account = account_answer("acceptEdits") }) or "", "acceptEdits")
+  has(handshake_problem({ account = account_answer() }, CONFINE) or "", "default")
 end)
 
 -- The values here are literal on purpose. The coding worker gets only these
 -- tools, in this mode, with no bypass, and Bash runs only in its sandbox.
 case("argv_for_a_coding_worker_edits_and_runs_without_bypass", function()
-  local argv = launch.argv({
+  local argv = worker_argv({
     executable = "claude",
     model = "haiku",
-    deny = DEFAULT_DENY_RULES,
-    worker = launch.WORKERS.code,
-    confine = CONFINE,
     policy = native.worker_policy({ deny = DEFAULT_DENY_RULES, sandbox = CONFINE }),
   })
   assert(has_pair(argv, "--tools", "Read,Glob,Grep,Edit,Write,Bash"), "coding tools")
@@ -388,7 +326,7 @@ case("argv_for_a_coding_worker_edits_and_runs_without_bypass", function()
   for _, forbidden in ipairs({ "--add-dir", "bypassPermissions", "--dangerously", "--allowedTools" }) do
     eq(joined:find(forbidden, 1, true), nil, "the argv must not contain " .. forbidden)
   end
-  local settings = worker_settings(worker_spec(launch.WORKERS.code, CONFINE))
+  local settings = worker_settings(worker_spec(CONFINE))
   eq(settings.permissions.allow, nil)
   eq(settings.permissions.blockReadsOutsideWorkingDirectories, true)
   eq(
@@ -408,7 +346,7 @@ end)
 
 -- Returns the sandbox the flags set, after {edit} changes the merged result.
 local function merged_sandbox(edit)
-  local sandbox = maki.json.decode(maki.json.encode(worker_settings(worker_spec(launch.WORKERS.code, CONFINE)).sandbox))
+  local sandbox = maki.json.decode(maki.json.encode(worker_settings(worker_spec(CONFINE)).sandbox))
   if edit then
     edit(sandbox)
   end
@@ -526,20 +464,15 @@ case("a_coding_handshake_checks_the_sandbox_and_a_read_one_does_not", function()
   }
   local hooks = { hooks = maki.json.decode("[]"), policy = { allDisabled = true } }
   eq(handshake_problem({ settings = settings, hooks = hooks }), nil)
-  has(
-    handshake_problem({ settings = settings, hooks = hooks }, launch.WORKERS.code, CONFINE) or "",
-    "outside its sandbox"
-  )
-  settings.effective = worker_settings(worker_spec(launch.WORKERS.code, CONFINE))
-  eq(handshake_problem({ settings = settings, hooks = hooks }, launch.WORKERS.code, CONFINE), nil)
+  has(handshake_problem({ settings = settings, hooks = hooks }, CONFINE) or "", "outside its sandbox")
+  settings.effective = worker_settings(worker_spec(CONFINE))
+  eq(handshake_problem({ settings = settings, hooks = hooks }, CONFINE), nil)
 end)
 
 local function read_argv()
-  return launch.argv({
+  return worker_argv({
     executable = "claude",
     model = "haiku",
-    deny = DEFAULT_DENY_RULES,
-    worker = READ,
     policy = native.worker_policy({ deny = DEFAULT_DENY_RULES }),
   })
 end
@@ -750,7 +683,7 @@ end
 -- dropped and no second ./ added.
 case("settings_deny_the_defaults_and_the_configured_paths", function()
   local settings = worker_settings(
-    worker_spec(READ, nil, confine.deny_rules(assert(path_utils.denied_paths(" config/prod.yml , ./certs/** ,, "))))
+    worker_spec(nil, confine.deny_rules(assert(path_utils.denied_paths(" config/prod.yml , ./certs/** ,, "))))
   )
   eq(
     table.concat(settings.permissions.deny, " "),
@@ -762,24 +695,12 @@ end)
 
 case("a_complete_clean_handshake_passes", function()
   local answers = { account = account_answer(), settings = settings_answer(), hooks = HOOKS_OFF }
-  local handshake = launch.worker_handshake(worker_spec())
+  local handshake = native.worker_handshake(worker_spec().policy)
   for i = #HANDSHAKE, 1, -1 do
     local complete, problem = handshake_answer(handshake, HANDSHAKE[i].id, answers[HANDSHAKE[i].id])
     eq(problem, nil)
     eq(complete, i == 1)
   end
-  local complete, problem = handshake:probe_exit(0, launch.STARTUP_TIMEOUT_SECS)
-  eq(complete, true)
-  eq(problem, nil)
-end)
-
-case("a_missing_handshake_answer_is_refused", function()
-  local handshake = launch.worker_handshake(worker_spec())
-  handshake_answer(handshake, "account", account_answer())
-  handshake_answer(handshake, "hooks", HOOKS_OFF)
-  local complete, problem = handshake:probe_exit(0, launch.STARTUP_TIMEOUT_SECS)
-  eq(complete, nil)
-  has(problem or "", "did not answer every check")
 end)
 
 for _, accepted in ipairs({ false, true }) do
@@ -799,7 +720,7 @@ case("usage_after_a_rejected_init_is_kept_without_accepting_output", function()
     cache_creation_input_tokens = 300,
   }))
   assert(step.stop)
-  eq(stream:accepted(), false)
+  eq(stream.native:accepted(), false)
   eq(stream:usage_line(), "at least: 7 in · 2.0k cache read · 300 cache write · out unknown")
 end)
 
@@ -829,13 +750,13 @@ end
 case("native_init_refusals_reach_the_plugin", function()
   local stream = fresh()
   has(stream:feed(init_event({ apiKeySource = "ANTHROPIC_API_KEY" })).stop or "", "ANTHROPIC_API_KEY")
-  eq(stream:accepted(), false)
+  eq(stream.native:accepted(), false)
 end)
 
 case("a_bad_init_after_a_good_one_still_stops", function()
   local stream = started()
   has(stream:feed(init_event({ apiKeySource = "apiKeyHelper" })).stop, "apiKeyHelper")
-  eq(stream:accepted(), false)
+  eq(stream.native:accepted(), false)
 end)
 
 case("tool_uses_become_progress_lines_relative_to_cwd", function()
@@ -1152,12 +1073,8 @@ case("import_approval_lists_escaped_paths_before_the_script", function()
 end)
 
 case("dependency_dirs_are_project_relative", function()
-  local in_checkout = path_utils.in_checkout
   local dirs = assert(path_utils.dependency_dirs(" node_modules/ , ./web//./node_modules,"))
   eq(table.concat(dirs, "|"), "node_modules|web/node_modules")
-  eq(path_utils.in_checkout, in_checkout)
-  eq(in_checkout("/work/sub/file", { cwd = "/work/sub", denied = { "/work" } }), true)
-  eq(in_checkout("/work-other/file", { cwd = "/work/sub", denied = { "/work" } }), false)
   local dirs_none, err = path_utils.dependency_dirs("../shared")
   eq(dirs_none, nil)
   eq(err, "../shared" .. path_utils.OUTSIDE_PROJECT)
@@ -1516,8 +1433,8 @@ for _, path in ipairs({ ".maki/init.lua", "nested/.MaKi/permissions.toml", ".Cla
 end
 
 case("synthetic_api_errors_preserve_the_result_cause", function()
-  local stream = Stream.new({ cwd = CWD, worker = READ, cli = CLI })
-  stream:set_model("claude-haiku-4-5")
+  local stream = fresh()
+  stream.native:set_model("claude-haiku-4-5")
   stream:feed(init_event())
   local step = stream:feed(maki.json.encode({
     type = "assistant",

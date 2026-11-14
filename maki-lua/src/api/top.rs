@@ -5,16 +5,17 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use maki_lua_macro::{lua_class, lua_fn, lua_table, lua_value};
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
+use tokio::sync::mpsc::UnboundedSender;
+use tokio_util::sync::CancellationToken;
 
 use crate::api::util::callback::call_inline;
 use crate::api::util::command::{UiAction, ui_send};
 use crate::api::util::convert::TableExt;
+use crate::plugin_permissions::Ceiling;
 use crate::runtime::{DeferQueue, DeferredCallback};
 
 /// How deep `maki.deepcopy` follows nested tables before it gives up, so it
@@ -29,7 +30,7 @@ const DEEPCOPY_TOO_DEEP_ERR: &str = "deepcopy: tables nested deeper than";
 /// so [`clear_notify_handler`] can hand the slot back when that plugin is
 /// unloaded, instead of leaving everyone calling into a dead env.
 #[derive(Default)]
-pub(crate) struct NotifyHandler(pub(crate) Mutex<Option<(Arc<str>, RegistryKey)>>);
+pub(crate) struct NotifyHandler(Option<(Arc<str>, RegistryKey)>);
 
 /// Run {callback} once after {ms} milliseconds. It fires even if the tool
 /// call that scheduled it has ended or was cancelled, which is what a
@@ -65,12 +66,14 @@ fn defer_fn(lua: &Lua, #[ctx] plugin: Arc<str>, callback: Function, ms: u64) -> 
         .app_data_ref::<DeferQueue>()
         .ok_or_else(|| mlua::Error::runtime("defer queue not initialized"))?;
     let func = lua.create_registry_value(callback)?;
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = queue.timer_token(&plugin);
+    let ceiling = Ceiling::current_for(lua, &plugin);
     if let Err(rejected) = queue.push(DeferredCallback {
         func,
         delay: Duration::from_millis(ms),
         plugin,
-        cancel: Arc::clone(&cancel),
+        cancel: cancel.clone(),
+        ceiling,
     }) {
         // Reclaim the registry slot, the runtime never got the callback.
         let _ = lua.remove_registry_value(rejected.func);
@@ -79,10 +82,10 @@ fn defer_fn(lua: &Lua, #[ctx] plugin: Arc<str>, callback: Function, ms: u64) -> 
     Ok(Timer { cancel })
 }
 
-/// Handle returned by `maki.defer_fn`. The runtime reads the flag once the
-/// timer goes off, so flipping it before then skips the callback entirely.
+/// Handle returned by `maki.defer_fn`. Stopping it ends the timer's wait, so
+/// the callback never runs.
 pub(crate) struct Timer {
-    cancel: Arc<AtomicBool>,
+    cancel: CancellationToken,
 }
 
 /// Cancel the pending callback. Safe to call more than once, and does
@@ -94,7 +97,7 @@ pub(crate) struct Timer {
 /// h:stop()
 #[lua_fn]
 fn stop(_lua: &Lua, this: &Timer) -> LuaResult<()> {
-    this.cancel.store(true, Ordering::Release);
+    this.cancel.cancel();
     Ok(())
 }
 
@@ -125,7 +128,7 @@ lua_class! {
 #[lua_fn]
 fn notify(
     lua: &Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     #[ctx] plugin: Arc<str>,
     msg: String,
     level: Option<String>,
@@ -136,8 +139,7 @@ fn notify(
         None => None,
     };
     let handler_fn = lua.app_data_ref::<NotifyHandler>().and_then(|slot| {
-        let guard = locked(&slot);
-        let (_, key) = guard.as_ref()?;
+        let (_, key) = slot.0.as_ref()?;
         lua.registry_value::<Function>(key).ok()
     });
     if let Some(func) = handler_fn {
@@ -196,27 +198,23 @@ pub(crate) fn install_notify_handler(lua: &Lua, plugin: Arc<str>, handler: Value
             ));
         }
     };
-    let slot = lua
-        .app_data_ref::<NotifyHandler>()
+    let mut slot = lua
+        .app_data_mut::<NotifyHandler>()
         .ok_or_else(|| mlua::Error::runtime("notify handler slot not initialized"))?;
-    let old = std::mem::replace(&mut *locked(&slot), new_key);
+    let old = std::mem::replace(&mut slot.0, new_key);
     if let Some((_, key)) = old {
         let _ = lua.remove_registry_value(key);
     }
     Ok(())
 }
 
-fn locked(slot: &NotifyHandler) -> std::sync::MutexGuard<'_, Option<(Arc<str>, RegistryKey)>> {
-    slot.0.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 /// Hand the slot back when {plugin} is unloaded. Its handler closes over an
 /// env that is going away, and nobody else knows to clean up after it.
 pub(crate) fn clear_notify_handler(lua: &Lua, plugin: &str) {
-    let Some(slot) = lua.app_data_ref::<NotifyHandler>() else {
+    let Some(mut slot) = lua.app_data_mut::<NotifyHandler>() else {
         return;
     };
-    if let Some((_, key)) = locked(&slot).take_if(|(owner, _)| &**owner == plugin) {
+    if let Some((_, key)) = slot.0.take_if(|(owner, _)| &**owner == plugin) {
         let _ = lua.remove_registry_value(key);
     }
 }
@@ -303,6 +301,9 @@ lua_table! {
 #[cfg(test)]
 mod tests {
     use test_case::test_case;
+    use tokio::sync::mpsc::UnboundedReceiver;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
 
@@ -315,7 +316,7 @@ mod tests {
     /// way `create_maki_global` wires it: `notify` on the metatable's
     /// `__index` so `maki.notify = fn` hits `__newindex` and lands in the
     /// shared slot instead of shadowing it.
-    fn install(lua: &Lua, tx: Option<flume::Sender<UiAction>>, plugin: &str) {
+    fn install(lua: &Lua, tx: Option<UnboundedSender<UiAction>>, plugin: &str) {
         if lua.app_data_ref::<NotifyHandler>().is_none() {
             lua.set_app_data(NotifyHandler::default());
         }
@@ -339,7 +340,7 @@ mod tests {
         lua.globals().set(plugin, maki).unwrap();
     }
 
-    fn flashed(rx: &flume::Receiver<UiAction>) -> String {
+    fn flashed(rx: &mut UnboundedReceiver<UiAction>) -> String {
         match rx.try_recv().expect("a flash") {
             UiAction::Flash(msg) => msg,
             _ => panic!("expected Flash"),
@@ -352,23 +353,23 @@ mod tests {
     #[test_case("maki.set_notify_handler(function() coroutine.yield() end)" ; "a_yielding_handler")]
     fn notify_falls_back_to_flash(prelude: &str) {
         let lua = Lua::new();
-        let (tx, rx) = flume::unbounded();
+        let (tx, mut rx) = unbounded_channel();
         install(&lua, Some(tx), "maki");
         lua.load(format!(r#"{prelude} maki.notify("hi")"#))
             .exec()
             .unwrap();
-        assert_eq!(flashed(&rx), "hi");
+        assert_eq!(flashed(&mut rx), "hi");
     }
 
     #[test]
     fn notify_title_labels_the_flash() {
         let lua = Lua::new();
-        let (tx, rx) = flume::unbounded();
+        let (tx, mut rx) = unbounded_channel();
         install(&lua, Some(tx), "maki");
         lua.load(r#"maki.notify("hi", nil, { title = "make" })"#)
             .exec()
             .unwrap();
-        assert_eq!(flashed(&rx), "make: hi");
+        assert_eq!(flashed(&mut rx), "make: hi");
     }
 
     /// Headless runs (`maki -p`, sdk) have no UI to flash to, and a plugin
@@ -387,7 +388,7 @@ mod tests {
     #[test_case(BY_ASSIGNMENT ; "assignment")]
     fn override_reroutes_every_plugins_notify(install_handler: &str) {
         let lua = Lua::new();
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         install(&lua, Some(tx.clone()), "maki");
         install(&lua, Some(tx), "maki_b");
 
@@ -449,7 +450,7 @@ mod tests {
     #[test]
     fn unloading_the_installer_restores_the_default() {
         let lua = Lua::new();
-        let (tx, rx) = flume::unbounded();
+        let (tx, mut rx) = unbounded_channel();
         install(&lua, Some(tx.clone()), "maki");
         install(&lua, Some(tx), "maki_b");
         lua.load(r#"seen = "" maki_b.set_notify_handler(function(msg) seen = msg end)"#)
@@ -463,13 +464,13 @@ mod tests {
 
         clear_notify_handler(&lua, "maki_b");
         lua.load(r#"maki.notify("back to flash")"#).exec().unwrap();
-        assert_eq!(flashed(&rx), "back to flash");
+        assert_eq!(flashed(&mut rx), "back to flash");
     }
 
     #[test]
     fn notify_assignment_rejects_non_function() {
         let lua = Lua::new();
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         install(&lua, Some(tx), "maki");
         let err = lua
             .load(r#"maki.notify = 42"#)
@@ -483,9 +484,9 @@ mod tests {
     }
 
     /// The sleep-and-dispatch half lives in the runtime, so this only pins
-    /// the contract between the handle and the flag the runtime reads.
+    /// the contract between the handle and the token the runtime waits on.
     #[test]
-    fn defer_handle_stop_marks_cancel_flag() {
+    fn defer_handle_stop_cancels_its_token() {
         let lua = Lua::new();
         lua.set_app_data(DeferQueue::new());
         install(&lua, None, "maki");
@@ -495,11 +496,11 @@ mod tests {
         let cancel = {
             let queue = lua.app_data_ref::<DeferQueue>().unwrap();
             let cb = queue.rx.try_recv().expect("callback queued");
-            Arc::clone(&cb.cancel)
+            cb.cancel.clone()
         };
-        assert!(!cancel.load(Ordering::Acquire));
+        assert!(!cancel.is_cancelled());
         lua.load(r#"H:stop()"#).exec().unwrap();
-        assert!(cancel.load(Ordering::Acquire));
+        assert!(cancel.is_cancelled());
     }
 
     mod deep_copy {

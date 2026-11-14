@@ -1,18 +1,13 @@
 use serde_json::{Map, Value};
-use thiserror::Error as ThisError;
 
 use super::UNSUPPORTED_SYSTEM;
 use crate::provider::Provider;
 use crate::{AgentError, Timeouts};
 
-#[derive(Debug, ThisError)]
-#[error("{UNSUPPORTED_SYSTEM}")]
-pub struct Error;
-
 pub fn configure_plugin(_enabled: bool, _options: Option<&Map<String, Value>>) {}
 
 pub(super) fn create(_timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
     Err(AgentError::Config {
-        message: Error.to_string(),
+        message: UNSUPPORTED_SYSTEM.to_owned(),
     })
 }

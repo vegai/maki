@@ -9,15 +9,19 @@
 //! [`crate::model_registry::discovery_complete`] only ever see this run's
 //! probe.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use maki_config::ModelPolicy;
 use maki_storage::StateDir;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::task::spawn_blocking;
 use tracing::{debug, warn};
 
-use crate::provider::{ModelBatch, ModelListing, fetch_all_models, provider_available};
+use crate::provider::{
+    ModelBatch, ModelListing, ProviderStatus, fetch_all_models, provider_available, provider_of,
+};
 use crate::providers::custom;
 use crate::spec::ProviderRegistry;
 
@@ -45,6 +49,10 @@ struct ModelsCache {
 /// What the model picker should show right now.
 pub struct ModelList {
     pub specs: Vec<String>,
+    /// What each provider that answered this run said. A recent missing from
+    /// `specs` is retired only if its provider is [`ProviderStatus::Live`];
+    /// any other may simply have failed its probe.
+    pub providers: HashMap<String, ProviderStatus>,
     /// Some provider has not answered yet, so the list may still grow.
     pub loading: bool,
 }
@@ -55,47 +63,53 @@ pub struct ModelList {
 struct Listing {
     replayed: Vec<String>,
     live: Vec<String>,
+    providers: HashMap<String, ProviderStatus>,
     /// A provider that cannot be reached warns and falls back to its static
     /// specs, so warnings are how discovery reports a failed probe. Without
     /// this, an empty run reads as "offline" even when the real cause is an
     /// expired token or a revoked key.
     degraded: bool,
+    retained: bool,
 }
 
-fn provider_of(spec: &str) -> &str {
-    spec.split_once('/').map_or(spec, |(provider, _)| provider)
+/// An authoritative catalog fails with no models only when it refuses the
+/// account, so the models cached for it are unusable too.
+fn refused_by_catalog(provider: &str) -> bool {
+    ProviderRegistry::get(provider).is_some_and(|spec| spec.catalog_is_authoritative)
 }
 
 impl Listing {
     /// Replaces rather than merges, so a model the provider dropped since
     /// last run leaves the picker instead of failing when picked.
     fn add_live(&mut self, batch: &ModelBatch) {
-        self.degraded |= !batch.warnings.is_empty();
-        if batch.models.is_empty()
-            && let Some(provider) = batch.failed_provider
-        {
-            // Keep configured but unavailable providers usable offline, including across cache writes.
+        let failed = matches!(batch.status, ProviderStatus::Failed(_));
+        self.degraded |= failed;
+        if failed && batch.models.is_empty() && !refused_by_catalog(&batch.provider) {
+            let provider = batch.provider.as_str();
+            self.retained |= self
+                .replayed
+                .iter()
+                .any(|spec| provider_of(spec) == provider);
             self.live.extend(
                 self.replayed
                     .extract_if(.., |spec| provider_of(spec) == provider),
             );
         }
-        self.replayed.retain(|old| {
-            !batch
-                .models
-                .iter()
-                .any(|new| provider_of(new) == provider_of(old))
-        });
+        self.replayed
+            .retain(|old| provider_of(old) != batch.provider);
         for spec in &batch.models {
             if !self.live.contains(spec) {
                 self.live.push(spec.clone());
             }
         }
+        self.providers
+            .insert(batch.provider.clone(), batch.status.clone());
     }
 
     fn snapshot(&self) -> ModelList {
         ModelList {
             specs: self.live.iter().chain(&self.replayed).cloned().collect(),
+            providers: self.providers.clone(),
             loading: true,
         }
     }
@@ -106,6 +120,7 @@ impl Listing {
         self.replayed.clear();
         ModelList {
             specs: self.live,
+            providers: self.providers,
             loading: false,
         }
     }
@@ -246,11 +261,18 @@ fn store_discovery(path: &Path, listing: &Listing, fingerprint: String, now_ms: 
     if listing.live.is_empty() && listing.degraded {
         return;
     }
+    let written_at = if listing.retained {
+        load_from(path)
+            .filter(|cache| cache.fingerprint == fingerprint)
+            .map_or(now_ms, |cache| cache.written_at)
+    } else {
+        now_ms
+    };
     store_at(
         path,
         &ModelsCache {
             fingerprint,
-            written_at: now_ms,
+            written_at,
             specs: listing.live.clone(),
         },
     );
@@ -258,15 +280,17 @@ fn store_discovery(path: &Path, listing: &Listing, fingerprint: String, now_ms: 
 
 /// Like [`fetch_all_models`], but the first `on_update` comes straight from
 /// the on-disk cache. Every call carries the whole list to show, not a delta,
-/// plus the warnings of the batch that changed it. The last call has
+/// plus the warning of the batch that changed it. The last call has
 /// `loading` off and retains cached models only for failed probes without a fallback.
 pub async fn fetch_all_models_cached(
     policy: &ModelPolicy,
-    mut on_update: impl FnMut(ModelList, Vec<String>),
+    mut on_update: impl FnMut(ModelList, Option<String>),
     listing: ModelListing,
 ) {
     let path = cache_path();
-    let fingerprint = fingerprint();
+    let fingerprint = spawn_blocking(fingerprint)
+        .await
+        .expect("fingerprint task panicked");
     let mut discovered = Listing {
         replayed: path
             .as_deref()
@@ -274,13 +298,17 @@ pub async fn fetch_all_models_cached(
             .unwrap_or_default(),
         ..Listing::default()
     };
-    on_update(discovered.snapshot(), Vec::new());
+    on_update(discovered.snapshot(), None);
 
     fetch_all_models(
         policy,
         |batch| {
             discovered.add_live(&batch);
-            on_update(discovered.snapshot(), batch.warnings);
+            let warning = match batch.status {
+                ProviderStatus::Failed(warning) => Some(warning),
+                ProviderStatus::Live | ProviderStatus::MissingKey => None,
+            };
+            on_update(discovered.snapshot(), warning);
         },
         None,
         listing,
@@ -295,7 +323,7 @@ pub async fn fetch_all_models_cached(
             maki_storage::auth::now_millis(),
         );
     }
-    on_update(discovered.finish(), Vec::new());
+    on_update(discovered.finish(), None);
 }
 
 #[cfg(test)]
@@ -309,6 +337,7 @@ mod tests {
     const NOW: u64 = 1_700_000_000_000;
     const CACHED_CLAUDE: &str = "claude-code/cached";
     const LIVE_CLAUDE: &str = "claude-code/live";
+    const OTHER: &str = "other";
     const OTHER_LIVE: &str = "other/live";
     const LISTING_FAILED: &str = "provider is busy or offline";
 
@@ -331,11 +360,11 @@ mod tests {
         (dir, path)
     }
 
-    fn batch(models: &[&str], warnings: &[&str]) -> ModelBatch {
+    fn batch(provider: &str, models: &[&str], status: ProviderStatus) -> ModelBatch {
         ModelBatch {
+            provider: provider.to_string(),
             models: specs(models),
-            warnings: specs(warnings),
-            failed_provider: None,
+            status,
         }
     }
 
@@ -375,7 +404,7 @@ mod tests {
             replayed: specs(&["a/removed", "a/kept", "b/cached"]),
             ..Listing::default()
         };
-        listing.add_live(&batch(&["a/kept", "a/new"], &[]));
+        listing.add_live(&batch("a", &["a/kept", "a/new"], ProviderStatus::Live));
         let shown = listing.snapshot();
         assert!(shown.loading);
         assert_eq!(shown.specs, ["a/kept", "a/new", "b/cached"]);
@@ -387,6 +416,24 @@ mod tests {
             ["a/kept", "a/new"],
             "a provider that never answered live must not keep its cached specs"
         );
+        assert_eq!(
+            done.providers,
+            HashMap::from([("a".to_string(), ProviderStatus::Live)])
+        );
+    }
+
+    /// A keyless provider answers with no models, and that still clears what
+    /// the cache said about it.
+    #[test]
+    fn a_missing_key_clears_that_providers_cached_specs() {
+        let mut listing = Listing {
+            replayed: specs(&["a/cached", "b/cached"]),
+            ..Listing::default()
+        };
+        listing.add_live(&batch("a", &[], ProviderStatus::MissingKey));
+        let shown = listing.snapshot();
+        assert_eq!(shown.specs, ["b/cached"]);
+        assert_eq!(shown.providers["a"], ProviderStatus::MissingKey);
     }
 
     #[test_case(true, &[], &[OTHER_LIVE, CACHED_CLAUDE] ; "failed_refresh_keeps_cached_models")]
@@ -403,16 +450,13 @@ mod tests {
             replayed: load_from(&path).unwrap().specs,
             ..Listing::default()
         };
-        listing.add_live(&batch(&[OTHER_LIVE], &[]));
-        listing.add_live(&ModelBatch {
-            models: specs(models),
-            warnings: if failed {
-                specs(&[LISTING_FAILED])
-            } else {
-                Vec::new()
-            },
-            failed_provider: failed.then_some(SLUG),
-        });
+        listing.add_live(&batch(OTHER, &[OTHER_LIVE], ProviderStatus::Live));
+        let status = if failed {
+            ProviderStatus::Failed(LISTING_FAILED.into())
+        } else {
+            ProviderStatus::Live
+        };
+        listing.add_live(&batch(SLUG, models, status));
         store_discovery(&path, &listing, FINGERPRINT.into(), NOW);
         assert_eq!(listing.finish().specs, expected);
         assert_eq!(load_from(&path).unwrap().specs, expected);
@@ -432,6 +476,33 @@ mod tests {
         let cache = load_from(&path).unwrap();
         assert_eq!(cache.specs, expected);
         assert_eq!(cache.fingerprint, FINGERPRINT);
+    }
+
+    #[test]
+    fn repeated_failed_discovery_does_not_renew_cached_models() {
+        let (_dir, path) = cache_file(&[CACHED_CLAUDE]);
+        for now in [NOW + 1, NOW + MAX_AGE_MS] {
+            let mut listing = Listing {
+                replayed: load_from(&path).unwrap().specs,
+                ..Listing::default()
+            };
+            listing.add_live(&batch(OTHER, &[OTHER_LIVE], ProviderStatus::Live));
+            listing.add_live(&batch(
+                SLUG,
+                &[],
+                ProviderStatus::Failed(LISTING_FAILED.into()),
+            ));
+            store_discovery(&path, &listing, FINGERPRINT.into(), now);
+        }
+        assert!(
+            replay(
+                &path,
+                &ModelPolicy::default(),
+                FINGERPRINT,
+                NOW + MAX_AGE_MS + 1
+            )
+            .is_empty()
+        );
     }
 
     #[test]

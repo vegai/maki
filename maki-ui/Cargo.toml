@@ -2,6 +2,7 @@
 name = "maki-ui"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 maki-agent = { workspace = true }
@@ -23,14 +24,13 @@ unicode-segmentation = { workspace = true }
 serde_json = { workspace = true }
 arboard = { workspace = true }
 jiff = { workspace = true }
-smol = { workspace = true }
-flume = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 arc-swap = { workspace = true }
 getrandom = { workspace = true }
-futures-lite = { workspace = true }
-wait-timeout = { workspace = true }
 image = { workspace = true, features = ["jpeg", "gif", "webp"] }
 base64 = { workspace = true }
 nucleo = { workspace = true }
@@ -54,10 +54,10 @@ rustix = { workspace = true }
 windows-sys = { workspace = true }
 
 [dev-dependencies]
-maki-config = { workspace = true, features = ["test-util"] }
 test-case = { workspace = true }
 tempfile = { workspace = true }
 criterion = { workspace = true }
+fastrand = { workspace = true }
 
 [[bench]]
 name = "splash"
@@ -69,6 +69,14 @@ harness = false
 
 [[bench]]
 name = "reflow"
+harness = false
+
+[[bench]]
+name = "input"
+harness = false
+
+[[bench]]
+name = "streaming"
 harness = false
 
 [lints]

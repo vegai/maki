@@ -2,15 +2,18 @@
 name = "maki-interpreter"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 monty = { workspace = true }
 monty-types = { workspace = true }
 serde_json = { workspace = true }
+getrandom = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 test-case = { workspace = true }
 
 [lints]

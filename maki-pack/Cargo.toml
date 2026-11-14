@@ -2,11 +2,12 @@
 name = "maki-pack"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 maki-storage = { workspace = true }
 serde = { workspace = true }
-smol = { workspace = true }
+tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
