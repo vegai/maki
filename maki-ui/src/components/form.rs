@@ -37,7 +37,6 @@ pub(crate) fn render_form<'a>(
     let inner = block.inner(area);
     let paragraph = paragraph
         .style(Style::new().fg(t.foreground))
-        .wrap(FORM_WRAP)
         .scroll(scroll);
     frame.render_widget(paragraph.block(block), area);
     inner

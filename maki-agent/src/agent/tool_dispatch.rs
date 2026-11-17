@@ -32,6 +32,7 @@ use crate::{
     ToolStartEvent,
 };
 use maki_config::ToolKey;
+use maki_providers::Message;
 use maki_storage::id::SessionRef;
 
 const DOOM_LOOP_THRESHOLD: usize = 3;
@@ -1378,10 +1379,10 @@ async fn execute_mcp_tool(mcp: &McpSession, tool: Arc<str>, call: Call<'_>) -> T
     )
 }
 
-/// Deduplicates doom-loop repeats, then runs remaining calls in parallel.
-/// `true` when one of them moved to the background.
+/// Runs the tool calls of the message `history` ends with: deduplicates
+/// doom-loop repeats, then runs the rest in parallel. `true` when one of them
+/// moved to the background.
 pub(super) async fn process_tool_calls(
-    tool_uses: Vec<(String, String, Value)>,
     recent_calls: &mut RecentCalls,
     history: &mut super::history::History,
     event_tx: &crate::EventSender,
@@ -1391,7 +1392,12 @@ pub(super) async fn process_tool_calls(
     let mut immediate_errors: Vec<ToolDoneEvent> = Vec::new();
     let mut runnable: Vec<(String, String, Value)> = Vec::new();
 
-    for (id, name, input) in tool_uses {
+    for (id, name, input) in history
+        .as_slice()
+        .last()
+        .into_iter()
+        .flat_map(Message::tool_uses)
+    {
         debug!(
             tool = %name,
             id = %id,
@@ -1399,14 +1405,14 @@ pub(super) async fn process_tool_calls(
             "parsing tool call"
         );
         if let Some(reason) = deny {
-            immediate_errors.push(ToolDoneEvent::error(id.clone(), reason));
-        } else if recent_calls.is_doom_loop(&name, &input) {
+            immediate_errors.push(ToolDoneEvent::error(id.to_owned(), reason));
+        } else if recent_calls.is_doom_loop(name, input) {
             warn!(tool = %name, "doom loop detected, skipping execution");
-            immediate_errors.push(ToolDoneEvent::error(id.clone(), DOOM_LOOP_MESSAGE));
+            immediate_errors.push(ToolDoneEvent::error(id.to_owned(), DOOM_LOOP_MESSAGE));
         } else {
-            runnable.push((id, name.clone(), input.clone()));
+            runnable.push((id.to_owned(), name.to_owned(), input.clone()));
         }
-        recent_calls.record(name, &input);
+        recent_calls.record(name.to_owned(), input);
     }
 
     for err in &immediate_errors {
@@ -3185,6 +3191,22 @@ mod tests {
         ));
     }
 
+    fn built(ctx: &ToolContext, excluded: &[&str], mcp: bool) -> RequestTools {
+        RequestTools::build(
+            &ctx.registry,
+            &ctx.local_tools,
+            &Vars::new(),
+            &ctx.model,
+            &ctx.config,
+            RequestSpec {
+                background: true,
+                excluded,
+                workflow: false,
+                mcp,
+            },
+        )
+    }
+
     fn callable_names(ctx: &ToolContext) -> Vec<String> {
         callable(ctx).into_iter().map(|c| c.name).collect()
     }
@@ -3235,24 +3257,12 @@ mod tests {
         let mut ctx = stub_ctx(&AgentMode::Build);
         ctx.registry = registry_with(&[PROBE_WIRE, OTHER_WIRE]);
         ctx.config.disabled_tools = disabled.iter().map(|n| (*n).to_owned()).collect();
-        let tools = RequestTools::build(
-            &ctx.registry,
-            &ctx.local_tools,
-            &Vars::new(),
-            &ctx.model,
-            &ctx.config,
-            RequestSpec {
-                background: true,
-                excluded,
-                workflow: false,
-                mcp: false,
-            },
-        );
+        let tools = built(&ctx, excluded, false);
         ctx.tool_filter = Arc::clone(tools.filter());
 
         assert_eq!(tool_names(tools.definitions()), [OTHER_WIRE]);
         assert_eq!(callable_names(&ctx), [OTHER_WIRE]);
-        let done = (dispatch(&ctx, PROBE_WIRE, &json!({}))).await;
+        let done = dispatch(&ctx, PROBE_WIRE, &json!({})).await;
         assert!(done.is_error);
         assert_eq!(
             done.output.as_text(),
@@ -3289,7 +3299,7 @@ mod tests {
                 .unwrap()
                 .audience = ToolAudience::MAIN;
         }
-        let done = (run(TEST_ID.to_owned(), CLIENT_NAME, &json!({}), &ctx, origin)).await;
+        let done = run(TEST_ID.to_owned(), CLIENT_NAME, &json!({}), &ctx, origin).await;
         assert!(done.is_error);
         assert_eq!(
             done.output.as_text(),
@@ -3334,19 +3344,7 @@ mod tests {
                 ToolAudience::MAIN,
             )
         } else {
-            RequestTools::build(
-                &ctx.registry,
-                &ctx.local_tools,
-                &Vars::new(),
-                &ctx.model,
-                &ctx.config,
-                RequestSpec {
-                    background: true,
-                    excluded: if excluded { &[CLIENT_NAME] } else { &[] },
-                    workflow: false,
-                    mcp: false,
-                },
-            )
+            built(&ctx, if excluded { &[CLIENT_NAME] } else { &[] }, false)
         };
         ctx.tool_filter = Arc::clone(tools.filter());
         let denied = disabled || excluded;
@@ -3360,7 +3358,7 @@ mod tests {
         );
         for origin in [CallOrigin::Model, CallOrigin::Nested] {
             started.store(false, Ordering::SeqCst);
-            let done = (run(TEST_ID.to_owned(), CLIENT_NAME, &json!({}), &ctx, origin)).await;
+            let done = run(TEST_ID.to_owned(), CLIENT_NAME, &json!({}), &ctx, origin).await;
             assert_eq!(done.is_error, denied);
             assert_eq!(started.load(Ordering::SeqCst), !denied);
             let expected = if denied {
@@ -3384,13 +3382,13 @@ mod tests {
             ..Default::default()
         });
         assert!(!callable_names(&ctx).contains(&name.to_owned()));
-        let done = (run(
+        let done = run(
             TEST_ID.to_owned(),
             name,
             &json!({ SEARCH_QUERY_FIELD: SEARCH_QUERY }),
             &ctx,
             origin,
-        ))
+        )
         .await;
         assert!(done.is_error);
         assert_eq!(
@@ -3416,7 +3414,7 @@ mod tests {
         }
         ctx.tool_filter = Arc::new(ToolFilter::from_config(&ctx.config, &ctx.model, &[]));
         assert!(!callable_names(&ctx).contains(&PROBE_WIRE.to_owned()));
-        let done = (dispatch(&ctx, called, &json!({}))).await;
+        let done = dispatch(&ctx, called, &json!({})).await;
         assert_eq!(
             done.output.as_text(),
             format!("{UNAVAILABLE_TOOL_PREFIX}: {called}")
@@ -3429,27 +3427,15 @@ mod tests {
     async fn a_filtered_mcp_tool_stays_out_of_catalog_and_search(blocked: &str) {
         let mut ctx = mcp_ctx(&stub_mcp(&[PROBE_QUALIFIED, OTHER_QUALIFIED]));
         ctx.config.disabled_tools = vec![blocked.to_owned()];
-        let tools = RequestTools::build(
-            &ctx.registry,
-            &ctx.local_tools,
-            &Vars::new(),
-            &ctx.model,
-            &ctx.config,
-            RequestSpec {
-                background: true,
-                excluded: &[],
-                workflow: false,
-                mcp: true,
-            },
-        );
+        let tools = built(&ctx, &[], true);
         ctx.tool_filter = Arc::clone(tools.filter());
         let definitions = request_tools(&tools, ctx.mcp.as_ref(), ToolDeferral::Client).to_string();
         assert!(!definitions.contains(PROBE_WIRE), "{definitions}");
-        let done = (dispatch(
+        let done = dispatch(
             &ctx,
             TOOL_SEARCH_TOOL_NAME,
             &json!({ SEARCH_QUERY_FIELD: SEARCH_QUERY }),
-        ))
+        )
         .await;
         assert!(!done.is_error);
         assert!(!done.output.as_text().contains(PROBE_WIRE));
@@ -3468,19 +3454,7 @@ mod tests {
     fn an_mcp_allow_list_publishes_the_allowed_tool_without_search(allowed: &str) {
         let mut ctx = mcp_ctx(&stub_mcp(&[PROBE_QUALIFIED, OTHER_QUALIFIED]));
         ctx.config.allowed_tools = vec![allowed.to_owned()];
-        let tools = RequestTools::build(
-            &ctx.registry,
-            &ctx.local_tools,
-            &Vars::new(),
-            &ctx.model,
-            &ctx.config,
-            RequestSpec {
-                background: true,
-                excluded: &[],
-                workflow: false,
-                mcp: true,
-            },
-        );
+        let tools = built(&ctx, &[], true);
         ctx.tool_filter = Arc::clone(tools.filter());
         assert_eq!(
             tool_names(&request_tools(
@@ -3549,7 +3523,7 @@ mod tests {
         ctx.tool_filter = Arc::clone(tools.filter());
         assert!(!callable_names(&ctx).contains(&PROBE_WIRE.to_owned()));
         for name in [PROBE_WIRE, PROBE_QUALIFIED] {
-            let done = (dispatch(&ctx, name, &json!({}))).await;
+            let done = dispatch(&ctx, name, &json!({})).await;
             assert!(done.is_error);
             assert_eq!(
                 done.output.as_text(),
@@ -3926,13 +3900,8 @@ mod tests {
         )]));
 
         process_tool_calls(
-            probe_turn(ids)
-                .message
-                .tool_uses()
-                .map(|(id, name, input)| (id.to_owned(), name.to_owned(), input.clone()))
-                .collect(),
             &mut RecentCalls::new(),
-            &mut History::new(Vec::new()),
+            &mut History::new(vec![probe_turn(ids).message]),
             &event_tx,
             &ctx,
             None,
@@ -3986,22 +3955,11 @@ mod tests {
                 })
             }),
         )]));
-        let mut history = History::new(Vec::new());
+        let mut history = History::new(vec![probe_turn(&[SLOW_ID, PANICKING_ID, FAST_ID]).message]);
 
-        process_tool_calls(
-            probe_turn(&[SLOW_ID, PANICKING_ID, FAST_ID])
-                .message
-                .tool_uses()
-                .map(|(id, name, input)| (id.to_owned(), name.to_owned(), input.clone()))
-                .collect(),
-            &mut RecentCalls::new(),
-            &mut history,
-            &event_tx,
-            &ctx,
-            None,
-        )
-        .await
-        .unwrap();
+        process_tool_calls(&mut RecentCalls::new(), &mut history, &event_tx, &ctx, None)
+            .await
+            .unwrap();
 
         let results = history.as_slice().last().unwrap();
         let answers: Vec<(&str, bool, &str)> = results

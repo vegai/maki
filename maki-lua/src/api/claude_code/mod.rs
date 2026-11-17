@@ -10,12 +10,15 @@ use maki_providers::process::{STDERR_LINE_BYTES, STDERR_TAIL_LINES};
 use mlua::{Lua, Result as LuaResult, Table};
 
 pub(crate) const MODULE: &str = "maki.claude_code.internal";
+/// SHA-1 and SHA-256 hex lengths. An id names a stage file, and the plugin checks manifests with the same set.
+const OBJECT_ID_LENGTHS: &[usize] = &[40, 64];
 
 fn add_defaults(table: &Table) -> LuaResult<()> {
     table.set("home_state_prefix", HOME_STATE_PREFIX)?;
     table.set("startup_timeout_secs", STARTUP_TIMEOUT_SECS)?;
     table.set("error_bytes", STDERR_LINE_BYTES * STDERR_TAIL_LINES)?;
     table.set("max_event_bytes", MAX_EVENT_BYTES)?;
+    table.set("object_id_lengths", OBJECT_ID_LENGTHS)?;
     table.set("default_executable", DEFAULT_EXECUTABLE)?;
     table.set("default_provider_max_concurrent", DEFAULT_MAX_CONCURRENT)?;
     table.set("min_provider_max_concurrent", MIN_MAX_CONCURRENT)?;
@@ -39,7 +42,7 @@ pub(crate) fn create_private_module(
 ) -> LuaResult<(&'static str, Table)> {
     #[cfg(target_os = "linux")]
     {
-        let table = native::create_table(lua, perms)?;
+        let table = native::create_claude_code_table(lua, perms)?;
         add_defaults(&table)?;
         Ok((MODULE, table))
     }

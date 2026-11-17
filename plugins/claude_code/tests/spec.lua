@@ -8,11 +8,12 @@ local workspace = require("claude_workspace")
 local git_utils = require("claude_git")
 local import_scripts = require("claude_import_script")
 local path_utils = require("claude_paths")
+local Run = require("claude_run")
 
 local case, eq, has = t.case, t.eq, t.has
 
 local HANDSHAKE = {}
-for line in launch.HANDSHAKE_INPUT:gmatch("[^\n]+") do
+for line in native.handshake_input:gmatch("[^\n]+") do
   local request = maki.json.decode(line)
   HANDSHAKE[#HANDSHAKE + 1] = { id = request.request_id }
 end
@@ -516,7 +517,7 @@ end)
 
 case("instructions_come_before_the_prompt", function()
   local instructions = "\n\nProject instructions (/r/AGENTS.md):\nRun the linter."
-  local content = maki.json.decode(launch.user_message(PROMPT, instructions)).message.content
+  local content = maki.json.decode(Run.user_message(PROMPT, instructions)).message.content
   has(content[1].text, instructions)
   eq(content[2].text, PROMPT)
 end)

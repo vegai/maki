@@ -173,8 +173,8 @@ impl History {
         self
     }
 
-    pub(crate) fn snapshot(&self) -> HistorySnapshot {
-        self.snapshot.clone()
+    pub(crate) fn snapshot(&self) -> &HistorySnapshot {
+        &self.snapshot
     }
 
     pub fn frame(&self) -> Option<&Arc<StoredFrame>> {

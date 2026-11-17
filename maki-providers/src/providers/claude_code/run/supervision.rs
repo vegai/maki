@@ -3,7 +3,7 @@ use super::super::error::Error;
 use super::super::mcp::Handoff;
 use crate::process::guard;
 use crate::process::{ChildExit, ChildGuard};
-use crate::process::{STDERR_LINE_BYTES, STDERR_TAIL_LINES, cap_stderr_line, within};
+use crate::process::{STDERR_LINE_BYTES, STDERR_TAIL_LINES, cap_stderr_line};
 use futures::future;
 use futures::stream;
 use futures::{Stream, StreamExt};
@@ -18,7 +18,7 @@ use thiserror::Error as ThisError;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::time::{Sleep, sleep, sleep_until};
+use tokio::time::{Sleep, sleep, sleep_until, timeout_at};
 use tokio_util::task::AbortOnDropHandle;
 use tracing::debug;
 
@@ -99,8 +99,7 @@ fn wait_result(
     }
 }
 
-fn spawn_piped(command: process::Command) -> io::Result<Group> {
-    let mut command = command;
+fn spawn_piped(mut command: process::Command) -> io::Result<Group> {
     let lifetime = guard::bind(&mut command)?;
     let child = Command::from(command)
         .stdin(Stdio::piped())
@@ -162,13 +161,7 @@ pub(in crate::providers::claude_code) async fn supervised<T>(
     }
     match result {
         Ok(value) => Ok(value),
-        Err(error) => {
-            let error = match group.exit_status {
-                Some(status) if !error.has_exit_status() => error.with_exit(status),
-                _ => error,
-            };
-            Err(stderr.explain(error).await)
-        }
+        Err(error) => Err(stderr.explain(error.with_exit(group.exit_status)).await),
     }
 }
 
@@ -325,7 +318,7 @@ async fn event_line(reader: &mut (impl AsyncBufRead + Unpin)) -> io::Result<Opti
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-pub(super) fn stdout_lines(
+fn stdout_lines(
     stdout: Option<ChildStdout>,
 ) -> Result<impl Stream<Item = io::Result<String>> + Unpin, Error> {
     let reader = BufReader::new(stdout.ok_or(Error::NoStdout)?);
@@ -348,13 +341,10 @@ pub(super) async fn send(
     deadline: Instant,
 ) -> Result<(), Error> {
     let pipe = stdin.as_mut().ok_or(Error::NoStdin)?;
-    within(deadline, async {
-        pipe.write_all(data.as_bytes())
-            .await
-            .map_err(Error::io("write to Claude Code"))
-    })
-    .await
-    .ok_or(Error::InputNotTaken)?
+    timeout_at(deadline.into(), pipe.write_all(data.as_bytes()))
+        .await
+        .map_err(|_| Error::InputNotTaken)?
+        .map_err(Error::io("write to Claude Code"))
 }
 
 #[cfg(test)]
@@ -541,7 +531,7 @@ mod process_tests {
             }))
             .unwrap_err();
         assert!(
-            matches!(&error, Error::Context(failure) if failure.interrupted && matches!(*failure.cause, Error::ExitedEarly(_))),
+            matches!(&error, Error::Context(failure) if failure.interrupted && failure.exit.is_none() && matches!(*failure.cause, Error::ExitedEarly(_))),
             "{error:?}"
         );
         assert!(error.temporary().is_some());

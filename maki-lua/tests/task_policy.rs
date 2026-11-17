@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use common::{
-    Chat, WAIT, call_ctx, done_text, exec, next_event, next_task_done, request_move, wait_live_buf,
-    wait_movable,
+    Chat, WAIT, assistant_reply, call_ctx, done_text, exec, next_event, next_task_done,
+    request_move, wait_live_buf, wait_movable,
 };
 use maki_agent::agent::tool_dispatch;
 use maki_agent::tools::test_support::stub_ctx;
@@ -23,8 +23,8 @@ use maki_lua::test_support::runtime;
 use maki_lua::{MoveOutcome, PluginHost};
 use maki_providers::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use maki_providers::{
-    AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
-    StopReason, StreamResponse, TokenUsage,
+    AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, StopReason,
+    StreamResponse,
 };
 use serde_json::{Value, json};
 use test_case::test_case;
@@ -946,30 +946,22 @@ impl Provider for StructuredOutputProvider {
                     .iter()
                     .any(|tool| tool["name"].as_str() == Some(STRUCTURED_OUTPUT_TOOL));
             requests.push(tools.clone());
-            Ok(StreamResponse {
-                input_transformations: Vec::new(),
-                message: Message {
-                    role: Role::Assistant,
-                    content: vec![if call {
-                        ContentBlock::ToolUse {
-                            id: STRUCTURED_CALL_ID.to_owned(),
-                            name: STRUCTURED_OUTPUT_TOOL.to_owned(),
-                            input: serde_json::from_str(STRUCTURED_RESULT).unwrap(),
-                            thought_signature: None,
-                        }
-                    } else {
-                        ContentBlock::Text {
-                            text: PLAIN_TEXT.to_owned(),
-                        }
-                    }],
-                    ..Default::default()
-                },
-                usage: TokenUsage::default(),
-                stop_reason: Some(if call {
-                    StopReason::ToolUse
-                } else {
-                    StopReason::EndTurn
-                }),
+            Ok(if call {
+                assistant_reply(
+                    ContentBlock::tool_use(
+                        STRUCTURED_CALL_ID,
+                        STRUCTURED_OUTPUT_TOOL,
+                        serde_json::from_str(STRUCTURED_RESULT).unwrap(),
+                    ),
+                    StopReason::ToolUse,
+                )
+            } else {
+                assistant_reply(
+                    ContentBlock::Text {
+                        text: PLAIN_TEXT.to_owned(),
+                    },
+                    StopReason::EndTurn,
+                )
             })
         })
     }

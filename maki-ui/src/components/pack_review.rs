@@ -3,10 +3,10 @@ use maki_lua::PackPlan;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 
 use crate::components::Overlay;
-use crate::components::form::{content_rows, render_form};
+use crate::components::form::{FORM_WRAP, content_rows, render_form};
 use crate::components::hint_line;
 use crate::components::is_ctrl;
 use crate::components::modal::BORDER;
@@ -92,7 +92,7 @@ impl PackReview {
     }
 
     fn paragraph(&self) -> Paragraph<'static> {
-        Paragraph::new(self.lines()).wrap(Wrap { trim: false })
+        Paragraph::new(self.lines()).wrap(FORM_WRAP)
     }
 
     pub fn view(&self, frame: &mut Frame, area: Rect) {

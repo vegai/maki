@@ -247,11 +247,12 @@ impl SessionTrack {
     fn settle(&mut self) {
         let mut store = self.store.lock().unwrap_or_else(PoisonError::into_inner);
         let saved = store.save(
-            &self.history.snapshot(),
+            self.history.snapshot(),
             self.gauge.size(),
             self.history.has_unsaved(),
         );
         self.history.mark_save_result(saved);
+        store.publish_header(false);
     }
 }
 
@@ -292,11 +293,6 @@ impl Drop for SessionTurn<'_> {
     fn drop(&mut self) {
         self.track.reported += self.ledger.totals();
         self.track.settle();
-        self.track
-            .store
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .publish_header(false);
     }
 }
 
@@ -310,7 +306,7 @@ impl SessionCheckpoint {
         unsaved: bool,
     ) -> bool {
         if let Ok(store) = self.0.try_lock()
-            && !store.needs_save(&snapshot, unsaved)
+            && !store.needs_save(&snapshot, unsaved, store.current_usage())
         {
             return true;
         }
@@ -388,9 +384,8 @@ impl SessionStore {
     /// resolves to, so a run killed before its first turn would leave a dead
     /// entry behind for good. The same guard stops a history that sanitized
     /// down to nothing from replacing the copy it was restored from.
-    fn needs_save(&self, snapshot: &HistorySnapshot, unsaved: bool) -> bool {
-        !snapshot.messages.is_empty()
-            && (unsaved || self.session.token_usage != self.current_usage())
+    fn needs_save(&self, snapshot: &HistorySnapshot, unsaved: bool, usage: TokenUsage) -> bool {
+        !snapshot.messages.is_empty() && (unsaved || self.session.token_usage != usage)
     }
 
     /// `context_size` travels with the messages, since a resumed session seeds
@@ -409,7 +404,8 @@ impl SessionStore {
         fn tool_call_ids(m: &Message) -> Vec<String> {
             m.tool_uses().map(|(id, _, _)| id.to_owned()).collect()
         }
-        if !self.needs_save(snapshot, unsaved) {
+        let usage = self.current_usage();
+        if !self.needs_save(snapshot, unsaved, usage) {
             return true;
         }
         let dropped = self
@@ -417,7 +413,7 @@ impl SessionStore {
             .dropped_tool_ids(&snapshot.messages, tool_call_ids);
         self.session.set_history(snapshot);
         self.session.drop_tool_state_of(&dropped, tool_call_ids);
-        self.session.token_usage = self.current_usage();
+        self.session.token_usage = usage;
         self.session.meta.context_size = context_size;
         self.session.meta.pending_background = self.mailbox.unsettled();
         self.session.update_title_if_default();
@@ -608,10 +604,10 @@ mod tests {
         let params = run_params(&mut turn);
         assert!(!params.history.has_unsaved());
         if checkpoint {
-            (params.history.checkpoint(CONTEXT_SIZE)).await;
+            params.history.checkpoint(CONTEXT_SIZE).await;
             assert_eq!(load(&tmp).token_usage.input, TURN_INPUT_TOKENS);
             let saved = fs::read(log_path(&tmp)).unwrap();
-            (params.history.checkpoint(CONTEXT_SIZE)).await;
+            params.history.checkpoint(CONTEXT_SIZE).await;
             assert_eq!(fs::read(log_path(&tmp)).unwrap(), saved, "{UNTOUCHED}");
         }
         drop(turn);
@@ -640,10 +636,10 @@ mod tests {
         );
         let params = run_params(&mut turn);
         assert!(!params.history.has_unsaved());
-        (params.history.checkpoint(CONTEXT_SIZE)).await;
+        params.history.checkpoint(CONTEXT_SIZE).await;
         assert!(params.history.has_unsaved(), "{RETRIED}");
         fs::remove_dir(blocker).unwrap();
-        (params.history.checkpoint(CONTEXT_SIZE)).await;
+        params.history.checkpoint(CONTEXT_SIZE).await;
         assert!(!params.history.has_unsaved());
         assert_eq!(load(&tmp).token_usage.input, TURN_INPUT_TOKENS);
         drop(turn);
@@ -660,7 +656,7 @@ mod tests {
             Arc::new(|_, _| RunContext::fixed(String::new(), RequestTools::default())),
         );
         params.history.push(Message::user(PROMPT.into()));
-        (params.history.checkpoint(CONTEXT_SIZE)).await;
+        params.history.checkpoint(CONTEXT_SIZE).await;
         assert_eq!(load(&tmp).messages().len(), 1);
         let path = tmp
             .path()
@@ -668,12 +664,12 @@ mod tests {
             .join(format!("{}.jsonl", session_id()));
         let prefix = fs::read(&path).unwrap();
         assert!(!params.history.has_unsaved());
-        (params.history.checkpoint(CONTEXT_SIZE)).await;
+        params.history.checkpoint(CONTEXT_SIZE).await;
         assert_eq!(fs::read(&path).unwrap(), prefix);
         params
             .history
             .push(Message::observation(OBSERVATION.into()));
-        (params.history.checkpoint(CONTEXT_SIZE)).await;
+        params.history.checkpoint(CONTEXT_SIZE).await;
         assert!(fs::read(&path).unwrap().starts_with(&prefix));
         drop(turn);
         let stored = load(&tmp);
@@ -1042,7 +1038,7 @@ mod tests {
             let params = run_params(&mut turn);
             params.history.push(Message::user(PROMPT.into()));
             if checkpoint {
-                (params.history.checkpoint(CONTEXT_SIZE)).await;
+                params.history.checkpoint(CONTEXT_SIZE).await;
                 let stored = StoredSession::load(id, &state_dir(&tmp)).unwrap();
                 assert_eq!(
                     stored.token_usage.input,

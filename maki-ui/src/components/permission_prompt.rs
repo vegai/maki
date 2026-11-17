@@ -84,15 +84,15 @@ const DENY_GUIDANCE_HINTS: &[(&str, &str)] = &[("Enter", "Deny"), ("Esc", "Cance
 const QUEUED_NOTICE: &str = "more request(s) waiting";
 const TITLE: &str = " Permission Required ";
 
-static SCROLL_TITLE: LazyLock<String> = LazyLock::new(scroll_title);
+const GUIDE_LABEL: &str = "guide ";
 
-fn scroll_title() -> String {
+static SCROLL_TITLE: LazyLock<String> = LazyLock::new(|| {
     format!(
         "{TITLE}({}/{}: scroll) ",
         key::SCROLL_PAGE_UP.label,
         key::SCROLL_PAGE_DOWN.label
     )
-}
+});
 
 fn aligned_hint_rows(rows: &[&[(&str, &str)]]) -> Vec<Line<'static>> {
     let t = theme::current();
@@ -446,7 +446,7 @@ impl PermissionPrompt {
             } else {
                 (buffer.value(), buffer.cursor_byte(), Style::default())
             };
-            let prefix = vec![Span::raw("  "), Span::styled("guide ", label_style)];
+            let prefix = vec![Span::raw("  "), Span::styled(GUIDE_LABEL, label_style)];
             let (line, caret) =
                 field_line(prefix, text, cursor_byte, tail_style.reversed(), tail_style);
             field = Some(FieldCaret {
@@ -565,9 +565,9 @@ mod tests {
     use super::{
         CONFIRM_ALLOW_ALL_HINTS, CONFIRM_ALLOW_PROJECT_HINTS, CONFIRM_ALLOW_PROJECT_SESSION_HINTS,
         CONFIRM_DENY_ALL_HINTS, CONFIRM_DENY_PROJECT_HINTS, CONFIRM_DENY_PROJECT_SESSION_HINTS,
-        CONFIRM_SESSION_HINTS, Overlay, PermissionPrompt, ProjectAnswers, PromptState,
-        QUEUED_NOTICE, TRUST_TO_SAVE_NOTICE, UNTRUSTED_DURABLE_ANSWER, UNTRUSTED_NOTICE,
-        scroll_title,
+        CONFIRM_SESSION_HINTS, GUIDE_LABEL, Overlay, PermissionPrompt, ProjectAnswers, PromptState,
+        QUEUED_NOTICE, SCROLL_TITLE, TRUST_TO_SAVE_NOTICE, UNTRUSTED_DURABLE_ANSWER,
+        UNTRUSTED_NOTICE,
     };
 
     const MAIN_ID: &str = "id";
@@ -588,6 +588,21 @@ mod tests {
             project_answers,
             None,
         );
+    }
+
+    fn push_bash(prompt: &mut PermissionPrompt, id: &str, scope: String, subagent: Option<&str>) {
+        prompt.push(
+            id.into(),
+            ToolKey::native("bash"),
+            vec![scope],
+            subagent.map(str::to_owned),
+            ProjectAnswers::Saved,
+            None,
+        );
+    }
+
+    fn long_command() -> String {
+        vec![LONG_COMMAND; LONG_COMMAND_LINES].join("\n")
     }
 
     fn push_subagent_ask(prompt: &mut PermissionPrompt) {
@@ -649,14 +664,7 @@ mod tests {
     fn multiline_scopes_keep_the_change_list_above_the_command() {
         const SCOPE: &str = "# Import changes\n# M src/main.rs\n\nset -e";
         let mut prompt = PermissionPrompt::new();
-        prompt.push(
-            MAIN_ID.into(),
-            ToolKey::native("bash"),
-            vec![SCOPE.into()],
-            None,
-            ProjectAnswers::Saved,
-            None,
-        );
+        push_bash(&mut prompt, MAIN_ID, SCOPE.into(), None);
         let lines: Vec<String> = prompt
             .build_lines()
             .into_iter()
@@ -682,14 +690,7 @@ mod tests {
             COMMAND.to_owned()
         };
         let mut prompt = PermissionPrompt::new();
-        prompt.push(
-            MAIN_ID.into(),
-            ToolKey::native("bash"),
-            vec![scope.clone()],
-            None,
-            ProjectAnswers::Saved,
-            None,
-        );
+        push_bash(&mut prompt, MAIN_ID, scope.clone(), None);
         let visible = draw(&mut prompt, width);
         assert_eq!(visible.contains(CLIPPED_CONTENT), clipped, "{visible}");
         assert_eq!(prompt.queue.front().unwrap().scopes, [scope]);
@@ -707,14 +708,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut prompt = PermissionPrompt::new();
-        prompt.push(
-            MAIN_ID.into(),
-            ToolKey::native("bash"),
-            vec![scope.clone()],
-            None,
-            ProjectAnswers::Saved,
-            None,
-        );
+        push_bash(&mut prompt, MAIN_ID, scope.clone(), None);
         let mut seen = vec![false; markers.len()];
         for _ in 0..LONG_COMMAND_LINES {
             let visible = draw(&mut prompt, width);
@@ -751,16 +745,14 @@ mod tests {
     fn the_next_request_starts_at_the_top(cancelled: bool) {
         let mut prompt = PermissionPrompt::new();
         for id in [SUB_ID, MAIN_ID] {
-            prompt.push(
-                id.into(),
-                ToolKey::native("bash"),
-                vec![vec![LONG_COMMAND; LONG_COMMAND_LINES].join("\n")],
-                (id == SUB_ID).then(|| SUB_AGENT.into()),
-                ProjectAnswers::Saved,
-                None,
+            push_bash(
+                &mut prompt,
+                id,
+                long_command(),
+                (id == SUB_ID).then_some(SUB_AGENT),
             );
         }
-        assert!(draw(&mut prompt, VIEW_WIDTH).contains(&scroll_title()));
+        assert!(draw(&mut prompt, VIEW_WIDTH).contains(SCROLL_TITLE.as_str()));
         prompt.handle_key(binding::SCROLL_BOTTOM.to_key_event());
         assert!(prompt.scroll.offset() > 0);
         if cancelled {
@@ -776,17 +768,10 @@ mod tests {
     #[test]
     fn denying_a_long_command_reveals_the_guidance_editor() {
         let mut prompt = PermissionPrompt::new();
-        prompt.push(
-            MAIN_ID.into(),
-            ToolKey::native("bash"),
-            vec![vec![LONG_COMMAND; LONG_COMMAND_LINES].join("\n")],
-            None,
-            ProjectAnswers::Saved,
-            None,
-        );
+        push_bash(&mut prompt, MAIN_ID, long_command(), None);
         draw(&mut prompt, VIEW_WIDTH);
         prompt.handle_key(key(KeyCode::Char('n')));
-        assert!(draw(&mut prompt, VIEW_WIDTH).contains("guide"));
+        assert!(draw(&mut prompt, VIEW_WIDTH).contains(GUIDE_LABEL));
         prompt.handle_paste(GUIDANCE);
         prompt.handle_key(key(KeyCode::PageUp));
         assert!(draw(&mut prompt, VIEW_WIDTH).contains(CLIPPED_CONTENT));
@@ -1025,14 +1010,7 @@ mod tests {
     #[test_case('s', CONFIRM_SESSION_HINTS[0].1 ; "allow_session")]
     fn a_long_prompt_shows_the_confirmation_before_accepting_an_answer(pressed: char, hint: &str) {
         let mut prompt = PermissionPrompt::new();
-        prompt.push(
-            MAIN_ID.into(),
-            ToolKey::native("bash"),
-            vec![vec![LONG_COMMAND; LONG_COMMAND_LINES].join("\n")],
-            None,
-            ProjectAnswers::Saved,
-            None,
-        );
+        push_bash(&mut prompt, MAIN_ID, long_command(), None);
         draw(&mut prompt, VIEW_WIDTH);
         assert_eq!(answer(&mut prompt, key(KeyCode::Char(pressed))), None);
         let shown = draw(&mut prompt, VIEW_WIDTH);

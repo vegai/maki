@@ -354,35 +354,6 @@ impl From<&str> for Line {
     }
 }
 
-pub(crate) fn next_output_line(reader: &mut impl BufRead, limit: u64) -> IoResult<Option<Line>> {
-    let mut window = limit.saturating_add(1);
-    let mut line = Vec::new();
-    let mut read = reader.by_ref().take(window).read_until(b'\n', &mut line)? as u64;
-    if read == window && line.last() == Some(&b'\r') {
-        window = window.saturating_add(1);
-        read += reader.by_ref().take(1).read_until(b'\n', &mut line)? as u64;
-    }
-    if read == 0 {
-        return Ok(None);
-    }
-    if line.ends_with(b"\n") || read < window {
-        line.pop_if(|b| *b == b'\n');
-        line.pop_if(|b| *b == b'\r');
-    }
-    if line.len() as u64 > limit {
-        return Err(IoError::new(
-            ErrorKind::InvalidData,
-            format!("job: output line exceeds the {limit}-byte limit"),
-        ));
-    }
-    let bytes = line.len() as u64;
-    Ok(Some(Line {
-        text: String::from_utf8(line)
-            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()),
-        bytes,
-    }))
-}
-
 /// The next line without its `\n` or `\r\n`, or `None` at the end of the file.
 /// A line over `max_bytes` is cut and gets [`LINE_CUT_MARKER`]. This is where
 /// the line is buffered, so `max_bytes` is capped at [`MAX_READ_BYTES`] here

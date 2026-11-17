@@ -5222,7 +5222,7 @@ fn cd_command_behavior() {
     let target = TempDir::new().unwrap();
     let _cwd = WorkingDir::current();
     let resolved = maki_storage::paths::canonicalize_clean(target.path());
-    assert_ne!(app.permissions.cwd(), resolved);
+    assert_ne!(*app.permissions.cwd(), resolved);
     app.execute_command(
         ParsedCommand {
             name: "/cd".into(),
@@ -5234,8 +5234,8 @@ fn cd_command_behavior() {
     let flash = app.status_bar.flash_text().unwrap();
     assert_eq!(flash, format!("cd {}", resolved.display()));
     assert_eq!(app.state.session.cwd, resolved.to_string_lossy());
-    assert_eq!(app.permissions.cwd(), resolved);
-    assert_eq!(app.permissions.fork().cwd(), resolved);
+    assert_eq!(*app.permissions.cwd(), resolved);
+    assert_eq!(*app.permissions.fork().cwd(), resolved);
 
     app.execute_command(
         ParsedCommand {

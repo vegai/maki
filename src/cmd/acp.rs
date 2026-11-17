@@ -9,6 +9,7 @@ use maki_config::project::{self, ProjectDecision, TrustAnswer, TrustMode, policy
 use maki_config::{Config, load_env_files};
 use maki_lua::{InitFiles, Interaction, PluginHost};
 use maki_storage::StateDir;
+use maki_storage::model::read_thinking;
 
 use crate::cli::Cli;
 use crate::interrupt::Interrupt;
@@ -90,8 +91,8 @@ pub async fn run(
     super::report_warnings(Vec::from_iter(warning));
     setup::resolve_thinking(
         &mut config.session_defaults,
-        &storage,
         cli.thinking_override(),
+        read_thinking(&storage),
     );
 
     setup::init_logging(&config.storage, trust.project_config.config_root());

@@ -33,6 +33,7 @@ type SignalStream = CtrlC;
 
 pub struct Interrupt {
     stop: CancelToken,
+    /// Held when no signal is watched: a dropped trigger cancels the run.
     _unwatched: Option<CancelTrigger>,
     /// The number of the signal caught first.
     caught: Arc<OnceLock<i32>>,
@@ -171,6 +172,7 @@ mod tests {
 #[cfg(test)]
 mod portability_tests {
     use test_case::test_case;
+    use tokio::task::yield_now;
 
     use super::{Interrupt, watched};
 
@@ -179,6 +181,9 @@ mod portability_tests {
     #[tokio::test]
     async fn installing_the_watcher_keeps_the_run_active(watch: bool) {
         let interrupt = Interrupt::with_signals(if watch { watched() } else { Vec::new() });
+        // Polls the spawned watcher first: a watch that ended at once would
+        // drop its trigger and cancel the run.
+        yield_now().await;
         assert!(!interrupt.stop().is_cancelled());
     }
 }

@@ -9,20 +9,23 @@ use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 
 use maki_agent::command::{self, CustomCommand};
+use maki_agent::mcp::{TOOL_SEARCH_TOOL_NAME, is_qualified_name, is_wire_name};
 use maki_agent::tools::ToolRegistry;
 use maki_config::project::{self, ProjectDecision, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{Config, ProjectConfig, load_env_files, load_permissions};
 use maki_lua::{InitFiles, Interaction, PackPlan, PackReport, PluginHost};
 use maki_providers::model::Model;
 use maki_storage::StateDir;
+use maki_storage::model::read_thinking;
 use maki_storage::sessions::StoredThinking;
 use maki_ui::{OpenSession, RunOutcome};
 
 use crate::cli::Cli;
-use crate::provider_scripts;
+use crate::interrupt::Interrupt;
+use crate::print::{self, PrintParams};
 use crate::resume::{self, Resolved};
-use crate::setup;
-use maki_agent::mcp::{TOOL_SEARCH_TOOL_NAME, is_qualified_name, is_wire_name};
+use crate::sdk_mode::{self, SdkParams};
+use crate::{provider_scripts, setup};
 
 const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
@@ -213,15 +216,16 @@ async fn build_stack(
     )?);
     let commands = discover_commands(cli.no_commands, launch.cwd);
 
-    if cli.print {
-        setup::resolve_headless_thinking(&mut config.session_defaults, cli.thinking_override());
+    let fallback_thinking = if cli.print {
+        setup::HEADLESS_THINKING
     } else {
-        setup::resolve_thinking(
-            &mut config.session_defaults,
-            launch.storage,
-            cli.thinking_override(),
-        );
-    }
+        read_thinking(launch.storage)
+    };
+    setup::resolve_thinking(
+        &mut config.session_defaults,
+        cli.thinking_override(),
+        fallback_thinking,
+    );
     let model_result =
         setup::resolve_model(cli.model.as_deref(), &config.provider, launch.storage).await;
     let (model, needs_login) = match (model_result, fallback_model) {
@@ -441,17 +445,20 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
     let resolved = resume::resolve(&cli, &cwd_str, &storage)?;
     setup::report_session_start(resolved.start_type, Some(&resolved.id));
 
-    if cli.is_sdk_mode() {
-        let prompt_slots = stack
-            .plugin_host
-            .event_handle()
-            .collect_prompt_slots(Some(resolved.id.as_str()))
-            .await;
+    if headless {
         let (resumed, claim) = resolved.into_resumed();
         let timeouts = stack.timeouts();
-        let interrupt = crate::interrupt::Interrupt::install();
-        let result = crate::sdk_mode::run(
-            crate::sdk_mode::SdkParams {
+        let lua_handle = stack.plugin_host.event_handle();
+        let plugin_rules = stack.plugin_host.plugin_rules();
+        let model_policy = Arc::new(stack.config.provider.model_policy.clone());
+        let project_config = trust.project_config.clone();
+        let interrupt;
+        let result = if cli.is_sdk_mode() {
+            let prompt_slots = lua_handle
+                .collect_prompt_slots(Some(resumed.id.as_str()))
+                .await;
+            interrupt = Interrupt::install();
+            let params = SdkParams {
                 cli,
                 resumed,
                 claim,
@@ -461,29 +468,21 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
                 timeouts,
                 prompt_slots,
                 defaults: stack.config.session_defaults,
-                model_policy: Arc::new(stack.config.provider.model_policy.clone()),
-                plugin_rules: stack.plugin_host.plugin_rules(),
-                lua_handle: stack.plugin_host.event_handle(),
-                project_config: trust.project_config.clone(),
-            },
-            &interrupt,
-        )
-        .await;
-        drop(stack.plugin_host);
-        teardown.join();
-        interrupt.exit_if_caught();
-        return result.context("run sdk mode");
-    }
-
-    if cli.print {
-        let (resumed, claim) = resolved.into_resumed();
-        let timeouts = stack.timeouts();
-        let background_wait = cli.background_wait();
-        let prompt = crate::print::read_prompt(cli.initial_prompt.take(), cli.dry_run)?;
-        let host_prompt = cli.host_prompt();
-        let interrupt = crate::interrupt::Interrupt::install();
-        let result = crate::print::run(
-            crate::print::PrintParams {
+                model_policy,
+                plugin_rules,
+                lua_handle,
+                project_config,
+            };
+            sdk_mode::run(params, &interrupt)
+                .await
+                .context("run sdk mode")
+        } else {
+            let prompt = print::read_prompt(cli.initial_prompt.take(), cli.dry_run)?;
+            // After the prompt is read, so a signal still ends a stdin read at once.
+            interrupt = Interrupt::install();
+            let params = PrintParams {
+                host_prompt: cli.host_prompt(),
+                background_wait: cli.background_wait(),
                 dry_run: cli.dry_run,
                 model: stack.model,
                 prompt,
@@ -493,23 +492,22 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
                 config: stack.config.agent,
                 permissions_config: stack.config.permissions,
                 timeouts,
-                lua_handle: stack.plugin_host.event_handle(),
+                lua_handle,
                 defaults: stack.config.session_defaults,
-                model_policy: Arc::new(stack.config.provider.model_policy.clone()),
-                plugin_rules: stack.plugin_host.plugin_rules(),
-                project_config: trust.project_config.clone(),
-                host_prompt,
+                model_policy,
+                plugin_rules,
+                project_config,
                 resumed,
                 claim,
-                background_wait,
-            },
-            &interrupt,
-        )
-        .await;
+            };
+            print::run(params, &interrupt)
+                .await
+                .context("run print mode")
+        };
         drop(stack.plugin_host);
         teardown.join();
         interrupt.exit_if_caught();
-        return result.context("run print mode");
+        return result;
     }
 
     let mut tabs = vec![open_tab(
@@ -720,22 +718,14 @@ mod tests {
         }
     }
 
-    #[test_case(true ; "startup")]
-    #[test_case(false ; "reload")]
-    fn missing_allowed_plugin_tools_only_abort_startup(startup: bool) {
+    /// The startup case is the `unknown_plugin_name` row above.
+    #[test]
+    fn missing_allowed_plugin_tools_only_warn_on_reload() {
         const MISSING_TOOL: &str = "unloaded_plugin_tool";
         let cli = Cli::parse_from(["maki", "--allowed-tools", MISSING_TOOL]);
-        let result = tool_filter_warnings(&cli, &ToolRegistry::new(), startup);
-        if startup {
-            assert_eq!(
-                result.unwrap_err().to_string(),
-                format!("{NO_ALLOWED_TOOLS}: {MISSING_TOOL}")
-            );
-        } else {
-            let warnings = result.unwrap();
-            assert_eq!(warnings.len(), 1);
-            assert!(warnings[0].contains(MISSING_TOOL));
-        }
+        let warnings = tool_filter_warnings(&cli, &ToolRegistry::new(), false).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains(MISSING_TOOL));
     }
 
     fn no_names(_: &PluginHost) -> Result<Vec<String>> {

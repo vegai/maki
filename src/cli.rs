@@ -13,6 +13,7 @@ use maki_config::AgentConfig;
 use maki_storage::sessions::{Effort, StoredThinking, ThinkingParseError};
 
 use crate::print::OutputFormat;
+use crate::wire::claude_to_maki_tool_name;
 
 const DEFAULT_BACKGROUND_TIMEOUT_SECS: u64 = 600;
 /// A week. The deadline is an `Instant`, which panics on overflow.
@@ -625,7 +626,7 @@ fn normalize_tool_name(name: &str) -> String {
                 .is_some_and(|(server, tool)| !server.is_empty() && !tool.is_empty())
         })
         .unwrap_or(name);
-    let local = crate::wire::claude_to_maki_tool_name(name);
+    let local = claude_to_maki_tool_name(name);
     if local != name {
         return local.to_owned();
     }

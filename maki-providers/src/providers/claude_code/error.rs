@@ -1,6 +1,5 @@
 //! Held tool calls cannot run before a complete reply, so interrupted generations can retry.
 
-use super::stream::Wait;
 use std::error::Error as StdError;
 use std::fmt;
 use std::io;
@@ -28,10 +27,18 @@ const TEMPORARY_KINDS: &[(&str, u16)] = &[
 ];
 /// How much of a JSON value a message shows, enough to recognize it.
 const SHOWN_JSON_CHARS: usize = 200;
+/// Room for one character more than a message shows, so a cut value ends in `…`.
+const SHOWN_JSON_BYTES: usize = (SHOWN_JSON_CHARS + 1) * char::MAX_LEN_UTF8;
 
 /// Limit JSON size so malformed CLI output cannot flood the error message.
+/// Serializing stops at the first write that does not fit, so a huge value is
+/// never copied whole.
 pub(super) fn shown(value: &Value) -> String {
-    preview(&value.to_string(), SHOWN_JSON_CHARS)
+    let mut text = [0; SHOWN_JSON_BYTES];
+    let mut rest = text.as_mut_slice();
+    let _ = serde_json::to_writer(&mut rest, value);
+    let end = SHOWN_JSON_BYTES - rest.len();
+    preview(&String::from_utf8_lossy(&text[..end]), SHOWN_JSON_CHARS)
 }
 
 pub(super) fn preview(text: &str, limit: usize) -> String {
@@ -74,6 +81,8 @@ pub enum Error {
     SkippedSettings(Vec<String>),
     #[error("the temporary directory {} is in the project. Set TMPDIR to a different directory.", .0.display())]
     TempInProject(PathBuf),
+    #[error("the artifact directory {} is in the project", .0.display())]
+    ArtifactInProject(PathBuf),
     #[error("maki cannot create a private scratch directory outside the project (requested {}). Set TMPDIR to an existing writable directory outside the project.", .0.display())]
     NoScratch(PathBuf),
     #[error("maki cannot {what} {}: {source}", .path.display())]
@@ -97,8 +106,6 @@ pub enum Error {
     InputNotTaken,
     #[error("{}", timeout(.0, *.1))]
     Late(Wait, u64),
-    #[error("Claude Code did not answer its checks within {0} s")]
-    ProbeLate(u64),
     #[error("Claude Code stopped its output before its reply was complete")]
     WentQuiet,
     #[error("Claude Code was stopped after its reply was complete")]
@@ -236,10 +243,13 @@ pub enum Error {
     NoStopReason,
     #[error("the reply has tool calls but stopped for {0}")]
     StoppedFor(String),
-    /// The model spent the whole output cap before it wrote any text, and a
-    /// cut reply hands over no calls, so a retry with the same cap would end
-    /// the same way.
-    #[error("the reply used its whole output limit ({0} tokens) before it wrote any text")]
+    /// The model spent the whole output cap with no text to keep, and a cut
+    /// reply hands over no calls, so a retry with the same cap would end the
+    /// same way. The agent loop would prompt such a reply to continue, as it
+    /// does for the anthropic provider, and each continuation would spend the
+    /// cap again, so this provider fails instead. The count is the one the API
+    /// reports, since Claude Code may apply its own default cap.
+    #[error("the reply reached its output limit after {0} tokens with no text to keep")]
     CutBeforeOutput(u32),
     #[error("Claude Code reported no usage for its reply")]
     NoUsage,
@@ -292,9 +302,17 @@ impl Error {
         }
     }
 
-    pub(crate) fn with_exit(self, status: ExitStatus) -> Self {
+    /// Adds the status of a natural exit, unless the error names one already.
+    pub(crate) fn with_exit(self, status: Option<ExitStatus>) -> Self {
+        let named = matches!(
+            self.cause(),
+            Self::VersionFailed(_) | Self::ExitedEarly(_) | Self::ExitedInChecks(_)
+        );
+        let Some(status) = status.filter(|_| !named) else {
+            return self;
+        };
         let mut failure = self.into_failure();
-        failure.exit = Some(status);
+        failure.exit.get_or_insert(status);
         Self::Context(failure)
     }
 
@@ -308,14 +326,6 @@ impl Error {
         }
         failure.stderr.push_str(&stderr);
         Self::Context(failure)
-    }
-
-    pub(crate) fn has_exit_status(&self) -> bool {
-        matches!(self, Self::Context(failure) if failure.exit.is_some())
-            || matches!(
-                self.cause(),
-                Self::VersionFailed(_) | Self::ExitedEarly(_) | Self::ExitedInChecks(_)
-            )
     }
 
     pub(crate) fn invalidates_version(&self) -> bool {
@@ -426,6 +436,14 @@ impl StdError for Failure {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wait {
+    Startup,
+    Idle,
+    Handoff,
+    Result,
+}
+
 fn timeout(wait: &Wait, seconds: u64) -> String {
     match wait {
         Wait::Startup => {
@@ -530,7 +548,7 @@ mod tests {
     use serde_json::{Value, json};
     use test_case::test_case;
 
-    use super::{Error, SHOWN_JSON_CHARS};
+    use super::{Error, SHOWN_JSON_CHARS, preview, shown};
 
     const MALFORMED: &str = r#"{"type":"assistant","text":"\uD83D"}"#;
     const TOOL: &str = "read";
@@ -566,21 +584,21 @@ mod tests {
         assert_eq!(error.temporary().is_some(), accepted);
     }
 
-    /// A huge value from Claude Code shows only its start, and a short one
-    /// shows whole.
-    #[test]
-    fn an_error_shows_only_the_start_of_a_huge_value() {
-        let huge = json!("x".repeat(SHOWN_JSON_CHARS * 10));
+    /// A huge value from Claude Code shows only its start, cut as its whole
+    /// text would be, and a short one shows whole.
+    #[test_case("x" ; "ascii")]
+    #[test_case("é" ; "two_byte_characters")]
+    #[test_case("😀" ; "four_byte_characters")]
+    fn an_error_shows_only_the_start_of_a_huge_value(character: &str) {
+        let huge = json!(character.repeat(SHOWN_JSON_CHARS * 10));
+        assert_eq!(shown(&huge), preview(&huge.to_string(), SHOWN_JSON_CHARS));
         let message = Error::NotArguments {
             name: TOOL.into(),
             input: huge,
         }
         .to_string();
-        assert!(
-            message.len() < SHOWN_JSON_CHARS * 2,
-            "{} bytes",
-            message.len()
-        );
+        let chars = message.chars().count();
+        assert!(chars < SHOWN_JSON_CHARS * 2, "{chars} characters");
         assert!(message.contains('…'), "{message}");
         let short = Error::NotOffered(json!(TOOL)).to_string();
         assert!(short.contains(&format!("\"{TOOL}\",")), "{short}");

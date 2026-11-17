@@ -75,6 +75,10 @@ const MAX_LOGGED_PATHS: usize = 5;
 const THINKING_DROPPED: &str =
     "The prompt changed under earlier reasoning, so it was dropped to keep the session going.";
 
+fn is_final_answer_note(message: &Message) -> bool {
+    message.first_text_content() == Some(FINAL_ANSWER_NOTE)
+}
+
 fn served_window_notice(model: &str, served: u32, planned: u32) -> String {
     format!(
         "The server runs {model} with a {served}-token context, below the {planned} tokens maki planned for. Compacting to fit from now on. Raise the server's context length for more room."
@@ -688,8 +692,7 @@ impl<'h> Agent<'h> {
                 .rev()
                 .take_while(|message| message.role != Role::Assistant)
                 .any(|message| {
-                    message.display_text.as_deref() == Some("")
-                        && message.first_text_content() == Some(FINAL_ANSWER_NOTE)
+                    message.display_text.as_deref() == Some("") && is_final_answer_note(message)
                 })
         {
             self.history
@@ -1110,15 +1113,9 @@ impl<'h> Agent<'h> {
             .map(|live| Arc::clone(live.tools.filter()))
             .ok_or_else(no_frame)?;
         let ctx = self.tool_context(filter);
-        let tool_uses = response
-            .message
-            .tool_uses()
-            .map(|(id, name, input)| (id.to_owned(), name.to_owned(), input.clone()))
-            .collect();
         self.history.push(response.message);
         self.history.checkpoint(self.gauge.size()).await;
         tool_dispatch::process_tool_calls(
-            tool_uses,
             &mut self.recent_calls,
             self.history,
             &self.event_tx,
@@ -1347,20 +1344,20 @@ fn interrupt_message(message: String, images: Vec<ImageSource>, source: InputSou
 
 #[cfg(test)]
 pub(crate) mod testing {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::Arc;
 
-    use maki_config::project::{self, TrustMode};
-    use maki_config::{DefaultEffect, ModelPolicy, PermissionsConfig};
+    use maki_config::ModelPolicy;
     use maki_providers::Model;
     use maki_providers::provider::Provider;
 
     use super::AgentParams;
     use crate::agent::frame::RunContext;
     use crate::cancel::CancelMap;
-    use crate::permissions::PermissionManager;
     use crate::prompt::ResolvedPrompts;
-    use crate::tools::{BackgroundFor, FileAccess, RequestTools, ToolAudience};
+    use crate::tools::{
+        BackgroundFor, FileAccess, RequestTools, ToolAudience, allow_all_permissions,
+    };
     use crate::{AgentConfig, RunLedger, ToolOutputLines};
 
     const TEST_DIR: &str = "/tmp";
@@ -1372,17 +1369,7 @@ pub(crate) mod testing {
             model,
             config: AgentConfig::default(),
             tool_output_lines: ToolOutputLines::default(),
-            permissions: Arc::new(PermissionManager::new(
-                PermissionsConfig {
-                    default: DefaultEffect::Allow,
-                    rules: vec![],
-                    ..Default::default()
-                },
-                PathBuf::from(TEST_DIR),
-                project::resolve_noninteractive(Path::new(TEST_DIR), TrustMode::Session)
-                    .project_config,
-                Arc::default(),
-            )),
+            permissions: allow_all_permissions(Path::new(TEST_DIR)),
             session_id: None,
             background_for: BackgroundFor::None,
             task_id: None,
@@ -1439,6 +1426,7 @@ mod tests {
     use crate::session::StoredSession;
     use crate::template::Vars;
     use crate::tools::RequestTools;
+    use crate::tools::test_support::assembled_main;
     use crate::tools::{
         DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, MovedCall, ParseError, Tool,
         ToolExecResult, ToolInvocation, ToolRegistry, ToolSource, local_tool,
@@ -2576,12 +2564,7 @@ mod tests {
                 |event| matches!(&event.event, AgentEvent::ToolStart(call) if call.id == "last")
             )
         );
-        assert!(
-            history
-                .as_slice()
-                .iter()
-                .any(|message| message.first_text_content() == Some(FINAL_ANSWER_NOTE))
-        );
+        assert!(history.as_slice().iter().any(is_final_answer_note));
     }
 
     #[tokio::test]
@@ -2600,7 +2583,7 @@ mod tests {
         let notes: Vec<_> = history
             .as_slice()
             .iter()
-            .filter(|message| message.first_text_content() == Some(FINAL_ANSWER_NOTE))
+            .filter(|message| is_final_answer_note(message))
             .map(|message| message.display_text.as_deref())
             .collect();
         assert_eq!(notes, [None, Some("")]);
@@ -2627,7 +2610,7 @@ mod tests {
                 .history
                 .as_slice()
                 .iter()
-                .filter(|message| message.first_text_content() == Some(FINAL_ANSWER_NOTE))
+                .filter(|message| is_final_answer_note(message))
                 .count(),
             1
         );
@@ -2863,14 +2846,7 @@ mod tests {
             };
             RunContext {
                 system: "system".into(),
-                tools: RequestTools::assembled(
-                    ToolRegistry::global(),
-                    serde_json::json!([{ "name": tool }]),
-                    &LocalTools::default(),
-                    &AgentConfig::default(),
-                    model,
-                    ToolAudience::MAIN,
-                ),
+                tools: assembled_main(serde_json::json!([{ "name": tool }]), model),
                 facts: Some(PromptFacts {
                     model: model.spec(),
                     ..Default::default()
@@ -2931,13 +2907,9 @@ mod tests {
                 };
                 RunContext {
                     system: format!("system {facts:?}"),
-                    tools: RequestTools::assembled(
-                        ToolRegistry::global(),
+                    tools: assembled_main(
                         serde_json::json!([{ "name": *world.tool.lock().unwrap() }]),
-                        &LocalTools::default(),
-                        &AgentConfig::default(),
                         model,
-                        ToolAudience::MAIN,
                     ),
                     facts: (!world.host_written.load(Ordering::Relaxed)).then_some(facts),
                     authored: world.authored.lock().unwrap().to_string(),
@@ -4124,7 +4096,7 @@ mod tests {
                 history
                     .as_slice()
                     .iter()
-                    .filter(|message| message.first_text_content() == Some(FINAL_ANSWER_NOTE))
+                    .filter(|message| is_final_answer_note(message))
                     .count(),
                 1
             );

@@ -9,7 +9,7 @@ use std::fs;
 use std::future::Future;
 use std::iter;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -24,9 +24,10 @@ use test_case::test_case;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use super::support::{
-    ACCOUNT_SUBSCRIPTION, DEADLINE, FIXTURE_GLOBAL_RULE, HOOKS_OFF, LEFT_BEHIND, MINIMUM_VERSION,
-    PROJECT_RULE, TOOL, WorkingDir, cancel_after, cancel_trigger, executable, group_gone, load,
-    output, running, tool_reply, try_load, use_fixture_user, wait_for_release, wait_until,
+    ACCOUNT_SUBSCRIPTION, DEADLINE, FIXTURE_GLOBAL_RULE, Gate, HOOKS_OFF, LEFT_BEHIND,
+    MINIMUM_VERSION, PROJECT_RULE, TOOL, TOUCH_PWNED, WorkingDir, cancel_after, cancel_trigger,
+    executable, group_gone, load, output, reply, running, tool_reply, try_load, use_fixture_user,
+    wait_until,
 };
 
 mod coding;
@@ -57,7 +58,9 @@ pub(super) const ANSWERS: &str = "--answers";
 const LONG_ANSWER: &str = "one\n\ntwo\n\nthree\n\nfour\n\nfive\n\nsix\n\nthe very last line";
 const LAST_ANSWER_LINE: &str = "the very last line";
 const LONG_ANSWERS: &str = "--long-answers";
-const API_KEY: &str = "api_key";
+/// A task the fake has no scenario for, so it exits after it reads it.
+pub(super) const NO_SCENARIO: &str = "anything";
+const API_KEY_AT_INIT: &str = "api_key";
 const INIT_THEN_API_KEY: &str = "init_then_api_key";
 const API_KEY_THEN_USAGE: &str = "api_key_then_usage";
 /// Holds an in-flight slot until its call is cancelled, and writes its marker
@@ -116,14 +119,21 @@ const SETTINGS_REFUSED: &str =
     "Claude Code rejected the settings request: \"settings unavailable\"";
 
 const LOGIN_HINT: &str = "claude auth login";
-const TOO_OLD: &str = "2.1.283 is older than 2.1.284";
+static TOO_OLD: LazyLock<String> =
+    LazyLock::new(|| format!("{OLDER_VERSION} is older than {MINIMUM_VERSION}"));
 const HELPER_CONFLICT: &str = "settings.json: apiKeyHelper";
 const LOCAL_HELPER_CONFLICT: &str = "settings.local.json: apiKeyHelper";
 /// Part of the plugin's settings, so Claude Code loads no instruction file
 /// itself.
 const NO_AMBIENT_INSTRUCTIONS: &str = r#""claudeMdExcludes":["**"]"#;
 const MANAGED_ROOTS_STOP: &str = "Claude Code policy sets permissions.additionalDirectories";
-const CANNOT_READ: &str = "settings.json: maki cannot read it";
+const SETTINGS_UNREADABLE: &str = "settings.json: maki cannot read it";
+const NOT_A_DIRECTORY: &str = "Not a directory";
+const NOT_A_REGULAR_FILE: &str = "path is not a regular file";
+/// A `deny_read` path, and the rule the read worker gets for it and for one
+/// of the defaults.
+const CUSTOM_DENIED: &str = "config/prod.yml";
+const DENY_RULES: [&str; 2] = ["Read(./config/prod.yml)", "Read(./.env*)"];
 const NOT_AN_OBJECT: &str = "settings.json: is not a JSON object";
 /// Where serde reports the end of the broken settings file.
 const SYNTAX_ERROR_AT: &str = "settings.json: EOF while parsing a value at line 2 column 17";
@@ -181,12 +191,14 @@ const CODE_RETYPE: &str = "code_retype";
 const CODE_CLAUDE_CONFIG: &str = "code_claude_config";
 /// A name that survives only with proper shell quoting: a quote, a command
 /// substitution, a space, a glob and a newline.
-const HOSTILE_NAME: &str = "src/it's $(touch pwned) *\nnew.rs";
+pub(super) static HOSTILE_NAME: LazyLock<String> =
+    LazyLock::new(|| format!("src/it's {} *\nnew.rs", *TOUCH_PWNED));
 const RELATIVE_CONFIG_DIR: &str = "claude-config";
 const NOT_ABSOLUTE: &str = "must be an absolute path, not claude-config";
 
 const SCRIPT: &str = r#"#!/bin/sh
 dir=$(dirname "$0")
+env >> "$dir/envs"
 for p in $(cat "$dir/pids" 2>/dev/null); do
   { tr '\0' ' ' < "/proc/$p/cmdline"; } 2>/dev/null | grep -q "$dir/claude" && echo "alive $p" >> "$dir/overlaps"
 done
@@ -396,7 +408,6 @@ pub(super) struct FakeClaude {
 
 impl FakeClaude {
     pub(super) fn new() -> Self {
-        let dir = tempdir().unwrap();
         let script = SCRIPT
             .replace("@ANSWER@", ANSWER)
             .replace(
@@ -416,16 +427,25 @@ impl FakeClaude {
             .replace("@HOSTILE@", &HOSTILE_NAME.replace('$', "\\$"))
             .replace("@WORKING@", WORKING)
             .replace("@HANG_SECS@", &HANG_SECS.to_string());
-        executable(dir.path(), "claude", &script);
-        fs::create_dir(dir.path().join("config")).unwrap();
-        let fake = Self {
-            dir,
-            project: Project::new(),
-        };
+        let fake = Self::running(&script);
         fake.answer_version(MINIMUM_VERSION);
         fake.write("account.json", ACCOUNT_SUBSCRIPTION);
         fake.write(HOOKS_FILE, HOOKS_OFF);
         fake
+    }
+
+    /// A fake that runs `script`, with `@VERSION@` as the oldest version maki
+    /// runs, in place of the scripted one.
+    pub(super) fn running(script: &str) -> Self {
+        use_fixture_user();
+        let dir = tempdir().unwrap();
+        let script = script.replace("@VERSION@", MINIMUM_VERSION);
+        executable(dir.path(), "claude", &script);
+        fs::create_dir(dir.path().join("config")).unwrap();
+        Self {
+            dir,
+            project: Project::new(),
+        }
     }
 
     fn answer_version(&self, version: &str) {
@@ -442,7 +462,7 @@ impl FakeClaude {
         fs::write(self.path(name), content).unwrap();
     }
 
-    fn path(&self, name: &str) -> PathBuf {
+    pub(super) fn path(&self, name: &str) -> PathBuf {
         self.dir.path().join(name)
     }
 
@@ -475,27 +495,33 @@ impl FakeClaude {
             .expect("the run that started wrote its pid")
     }
 
-    fn opts(&self, max_concurrent: u64) -> Map<String, Value> {
-        let mut opts = Map::new();
-        opts.insert("executable".into(), json!(self.path("claude")));
-        opts.insert("config_dir".into(), json!(self.path("config")));
-        opts.insert("max_concurrent".into(), json!(max_concurrent));
+    /// The plugin's options for this fake, with one slot, and then `extra`.
+    pub(super) fn opts(&self, extra: &[(&str, Value)]) -> Map<String, Value> {
+        let mut opts = Map::from_iter([
+            ("executable".into(), json!(self.path("claude"))),
+            ("config_dir".into(), json!(self.path("config"))),
+            ("max_concurrent".into(), json!(ONE_SLOT)),
+        ]);
+        opts.extend(
+            extra
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), value.clone())),
+        );
         opts
     }
 
-    fn host(&self, max_concurrent: u64) -> (Arc<ToolRegistry>, PluginHost) {
-        load(self.opts(max_concurrent))
+    fn host(&self) -> (Arc<ToolRegistry>, PluginHost) {
+        load(self.opts(&[]))
     }
 
     fn host_with_deadlines(&self, startup_timeout_secs: u64) -> (Arc<ToolRegistry>, PluginHost) {
-        use_fixture_user();
         let registry = Arc::new(ToolRegistry::new());
         let host = PluginHost::new(Arc::clone(&registry)).unwrap();
         let source = format!(
             "require(\"maki.claude_code.internal\").startup_timeout_secs = {startup_timeout_secs}\nrequire(\"claude_launch\").MIN_TIMEOUT_SECS = {TEST_TIMEOUT_SECS}\n{}",
             include_str!("../../../plugins/claude_code/init.lua"),
         );
-        host.load_bundled_source(TOOL, &source, self.opts(ONE_SLOT))
+        host.load_bundled_source(TOOL, &source, self.opts(&[]))
             .unwrap();
         (registry, host)
     }
@@ -505,13 +531,58 @@ impl FakeClaude {
     }
 
     pub(super) fn ask_in(&self, prompt: &str, cwd: &Path) -> Result<String, String> {
-        let (reg, _host) = self.host(ONE_SLOT);
+        let (reg, _host) = self.host();
         output(call(&reg, &ctx_in(cwd, None, None), prompt))
     }
 
-    fn ctx(&self, events: Option<&EventSender>, tool_use_id: Option<&str>) -> ToolContext {
+    pub(super) fn ctx(
+        &self,
+        events: Option<&EventSender>,
+        tool_use_id: Option<&str>,
+    ) -> ToolContext {
         ctx_in(&self.project.path(), events, tool_use_id)
     }
+}
+
+/// A session context in `dir` whose nested calls find their tools in `reg`.
+pub(super) fn session_ctx(reg: &Arc<ToolRegistry>, dir: &Path) -> ToolContext {
+    let mut ctx = ctx_in(dir, None, None);
+    ctx.registry = Arc::clone(reg);
+    ctx
+}
+
+/// A coding task on `prompt`, with `include` copied into its snapshot.
+pub(super) fn code_with(
+    reg: &ToolRegistry,
+    ctx: &ToolContext,
+    prompt: &str,
+    include: &[&str],
+) -> Result<String, String> {
+    let input = json!({ "prompt": prompt, "model": MODEL_ALIAS, "profile": CODE_PROFILE, "include": include });
+    reply(reg, ctx, TOOL, input)
+}
+
+/// The `--settings` the fake's last start received.
+pub(super) fn worker_settings(fake: &FakeClaude) -> Value {
+    let argv: Vec<String> = fake.log("argv").lines().map(String::from).collect();
+    argv.windows(2)
+        .find(|w| w[0] == "--settings")
+        .map(|w| serde_json::from_str(&w[1]).unwrap())
+        .expect("the run gives its settings")
+}
+
+pub(super) fn sandbox_filesystem(fake: &FakeClaude) -> Value {
+    worker_settings(fake)["sandbox"]["filesystem"].clone()
+}
+
+pub(super) fn denied_reads(filesystem: &Value) -> Vec<PathBuf> {
+    filesystem["denyRead"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .map(PathBuf::from)
+        .collect()
 }
 
 /// A session context in `dir`, without the bash tool's rtk probe. With rtk
@@ -734,7 +805,7 @@ fn answer_without_the_checks(fake: &FakeClaude) {
 /// went to Anthropic. The probe directory must be gone before the call is
 /// rejected, because maki can exit right after.
 #[test_case(log_out, LOGIN_HINT, PROBED ; "logged_out")]
-#[test_case(move_to_an_older_version, TOO_OLD, "version\n" ; "an_older_version")]
+#[test_case(move_to_an_older_version, TOO_OLD.as_str(), "version\n" ; "an_older_version")]
 #[test_case(skip_a_null_api_key_helper, HELPER_CONFLICT, "" ; "skipped_null_api_key_helper")]
 #[test_case(skip_an_api_key_helper, HELPER_CONFLICT, "" ; "skipped_api_key_helper")]
 #[test_case(add_managed_extra_roots, MANAGED_ROOTS_STOP, PROBED ; "managed_extra_roots")]
@@ -809,17 +880,15 @@ fn a_hook_policy_keeps_on_never_runs_in_the_project() {
 #[test_case("model", json!(FULL_MODEL_ID), BAD_MODEL_OPTION ; "a_full_model_id")]
 fn an_unusable_option_is_refused_at_load(name: &str, value: Value, want: &str) {
     let fake = FakeClaude::new();
-    let mut opts = fake.opts(ONE_SLOT);
-    opts.insert(name.into(), value);
-    let err = try_load(opts).err().unwrap();
+    let err = try_load(fake.opts(&[(name, value)])).err().unwrap();
     assert!(err.to_string().contains(want), "got: {err}");
 }
 
 /// Unreadable settings can hide an API key helper. Use invalid file types because root can
 /// bypass file mode restrictions.
-#[test_case(true, CANNOT_READ ; "config_dir_cannot_be_searched")]
-#[test_case(false, CANNOT_READ ; "settings_file_cannot_be_read")]
-fn settings_that_cannot_be_inspected_are_refused(config_is_a_file: bool, want: &str) {
+#[test_case(true, NOT_A_DIRECTORY ; "config_dir_cannot_be_searched")]
+#[test_case(false, NOT_A_REGULAR_FILE ; "settings_file_cannot_be_read")]
+fn settings_that_cannot_be_inspected_are_refused(config_is_a_file: bool, cause: &str) {
     let fake = FakeClaude::new();
     if config_is_a_file {
         fs::remove_dir(fake.path("config")).unwrap();
@@ -829,8 +898,28 @@ fn settings_that_cannot_be_inspected_are_refused(config_is_a_file: bool, want: &
     }
 
     let err = fake.ask(ANSWERS).unwrap_err();
-    assert!(err.contains(want), "got: {err}");
+    let want = format!("{SETTINGS_UNREADABLE} ({cause}");
+    assert!(err.contains(&want), "got: {err}");
     assert_eq!(fake.log("calls"), "");
+}
+
+/// The read worker has no sandbox, so only its deny rules keep it from the
+/// default and the `deny_read` paths.
+#[test]
+fn read_deny_rules_reach_the_worker() {
+    let fake = FakeClaude::new();
+    let (reg, _host) = load(fake.opts(&[("deny_read", json!(CUSTOM_DENIED))]));
+    assert_eq!(
+        output(call(&reg, &fake.ctx(None, None), ANSWERS)).unwrap(),
+        ANSWER
+    );
+    let deny = &worker_settings(&fake)["permissions"]["deny"];
+    for rule in DENY_RULES {
+        assert!(
+            deny.as_array().unwrap().contains(&json!(rule)),
+            "{rule}: {deny}"
+        );
+    }
 }
 
 /// Settings must be JSON objects so an API key helper cannot bypass the checks.
@@ -877,11 +966,11 @@ fn a_run_past_its_timeout_is_killed_and_frees_its_slot() {
 /// The completed view may claim no route conflict only for a run whose init
 /// passed the checks, with no contradicting event.
 #[test_case(ANSWERS, true ; "an_answered_run")]
-#[test_case(API_KEY, false ; "an_api_key_at_init")]
+#[test_case(API_KEY_AT_INIT, false ; "an_api_key_at_init")]
 #[test_case(INIT_THEN_API_KEY, false ; "an_api_key_after_a_clean_init")]
 fn the_view_claims_a_clean_route_only_after_init_passes(scenario: &str, claimed: bool) {
     let fake = FakeClaude::new();
-    let (reg, _host) = fake.host(ONE_SLOT);
+    let (reg, _host) = fake.host();
     let (tx, mut rx) = unbounded_channel::<Envelope>();
     let events = EventSender::new(tx, 0);
     let ctx = fake.ctx(Some(&events), Some(TOOL_USE_ID));
@@ -923,7 +1012,7 @@ fn a_worker_cannot_return_a_reply_from_another_model() {
 #[test]
 fn cached_versions_do_not_skip_current_policy_checks() {
     let fake = FakeClaude::new();
-    let (reg, _host) = fake.host(ONE_SLOT);
+    let (reg, _host) = fake.host();
     let ctx = fake.ctx(None, None);
     let ask = || output(call(&reg, &ctx, ANSWERS));
     assert_eq!(ask().unwrap(), ANSWER);
@@ -987,7 +1076,7 @@ fn a_worker_probe_honors_the_configured_startup_deadline() {
     stall_every_start(&fake);
     let (registry, _host) = fake.host_with_deadlines(TEST_TIMEOUT_SECS);
     let error = output(call(&registry, &fake.ctx(None, None), ANSWERS)).unwrap_err();
-    let expected = WorkerError::ProbeLate(TEST_TIMEOUT_SECS).to_string();
+    let expected = maki_providers::claude_code::worker::startup_late(TEST_TIMEOUT_SECS);
     assert!(error.contains(&expected), "{error}");
     assert!(group_gone(fake.pid(), DEADLINE));
 }
@@ -1078,7 +1167,7 @@ fn output_after_the_result_is_checked(scenario: &str, want: Option<&str>) {
 fn a_cancelled_run_keeps_what_it_spent() {
     let (scenario, progress, spent) = (USAGE_THEN_HANG, USAGE_PROGRESS, SPENT_BEFORE_CANCEL);
     let fake = FakeClaude::new();
-    let (reg, _host) = fake.host(ONE_SLOT);
+    let (reg, _host) = fake.host();
     let (tx, mut rx) = unbounded_channel::<Envelope>();
     let mut ctx = fake.ctx(Some(&EventSender::new(tx, 0)), Some(TOOL_USE_ID));
     let canceller = cancel_after(&mut ctx, move || {
@@ -1165,16 +1254,12 @@ fn a_cancelled_call_lets_go_only_once_its_processes_end(
 
 #[test]
 fn a_handler_deadline_during_version_check_releases_its_slot_after_reaping() {
-    const RELEASE: &str = "version_release";
     const TIMED_OUT: &str = "tool claude_code timed out after 10s";
     let fake = FakeClaude::new();
     stall_the_version_check(&fake);
-    let path = fake.path("claude");
-    let script = fs::read_to_string(&path).unwrap();
-    let held = script.replace(
-        "sleep \"$secs\"",
-        &wait_for_release("\"$dir/version_release\""),
-    );
+    let gate = Gate::closed();
+    let script = fs::read_to_string(fake.path("claude")).unwrap();
+    let held = script.replace("sleep \"$secs\"", &gate.wait());
     assert_ne!(held, script);
     executable(fake.dir.path(), "claude", &held);
     let (reg, _host) = fake.host_with_deadlines(STARTUP_TIMEOUT_SECS);
@@ -1198,7 +1283,7 @@ fn a_handler_deadline_during_version_check_releases_its_slot_after_reaping() {
         wait_for_view_line(&mut rx, WAITING).unwrap();
         let first = first.join().unwrap();
         fs::remove_file(fake.path(STALL_VERSION)).unwrap();
-        fake.write(RELEASE, "");
+        gate.release();
         (first, next.join().unwrap())
     });
     assert_eq!(first.unwrap_err(), TIMED_OUT);
@@ -1216,17 +1301,17 @@ fn a_handler_deadline_during_version_check_releases_its_slot_after_reaping() {
 fn every_way_a_call_ends_gives_its_slot_back() {
     let failures = [
         (CRASH, CRASH_REPORT),
-        (API_KEY, &[API_KEY_STOP]),
+        (API_KEY_AT_INIT, &[API_KEY_STOP]),
         (ANSWER_THEN_CRASH, LATE_CRASH_REPORT),
     ];
     let fake = FakeClaude::new();
-    let (reg, _host) = fake.host(ONE_SLOT);
+    let (reg, _host) = fake.host();
     let ctx = fake.ctx(None, None);
     let ask = |prompt| output(call(&reg, &ctx, prompt));
 
     move_to_an_older_version(&fake);
     let refused = ask(ANSWERS).unwrap_err();
-    assert!(refused.contains(TOO_OLD), "got: {refused}");
+    assert!(refused.contains(TOO_OLD.as_str()), "got: {refused}");
     fake.answer_version(MINIMUM_VERSION);
     log_out(&fake);
     let refused = ask(ANSWERS).unwrap_err();
@@ -1244,7 +1329,7 @@ fn every_way_a_call_ends_gives_its_slot_back() {
 #[test]
 fn a_finished_answer_expands_in_place() {
     let fake = FakeClaude::new();
-    let (reg, host) = fake.host(ONE_SLOT);
+    let (reg, host) = fake.host();
     let (tx, mut events) = unbounded_channel::<Envelope>();
     let ctx = fake.ctx(Some(&EventSender::new(tx, 0)), Some(TOOL_USE_ID));
     assert_eq!(output(call(&reg, &ctx, LONG_ANSWERS)).unwrap(), LONG_ANSWER);
@@ -1296,7 +1381,7 @@ fn saved_header(output: &ToolOutput) -> Vec<String> {
 fn a_newer_version_runs() {
     let fake = FakeClaude::new();
     fake.answer_version(NEWER_VERSION);
-    let (reg, _host) = fake.host(ONE_SLOT);
+    let (reg, _host) = fake.host();
     let output = output(execute(&reg, &fake.ctx(None, None), ANSWERS)).unwrap();
 
     let header = saved_header(&output);
@@ -1311,7 +1396,7 @@ fn a_newer_version_runs() {
 #[test]
 fn a_restored_answer_rebuilds_its_header() {
     let fake = FakeClaude::new();
-    let (reg, host) = fake.host(ONE_SLOT);
+    let (reg, host) = fake.host();
     let output = output(execute(&reg, &fake.ctx(None, None), ANSWERS)).unwrap();
     let state = output.state().cloned();
     let header = saved_header(&output);
@@ -1377,9 +1462,7 @@ fn a_relative_executable_is_found_from_every_directory() {
         RELATIVE_EXECUTABLE,
         &WRAPPER.replace("@TARGET@", &fake.path("claude").to_string_lossy()),
     );
-    let mut opts = fake.opts(ONE_SLOT);
-    opts.insert("executable".into(), json!(RELATIVE_EXECUTABLE));
-    let (reg, _host) = load(opts);
+    let (reg, _host) = load(fake.opts(&[("executable", json!(RELATIVE_EXECUTABLE))]));
     let answer = output(call(&reg, &fake.ctx(None, None), ANSWERS));
     assert_eq!(answer.unwrap(), ANSWER);
 }
@@ -1404,7 +1487,7 @@ fn a_session_in_another_checkout_is_served_there(setup: fn(&Path), want: Result<
     fs::create_dir(session.path().join(".git")).unwrap();
     let session_dir = session.path().canonicalize().unwrap();
     setup(&session_dir);
-    let (reg, _host) = fake.host(ONE_SLOT);
+    let (reg, _host) = fake.host();
     let ctx = stub_ctx_in(&session_dir, None, None);
     let result = output(call(&reg, &ctx, ANSWERS));
 
@@ -1435,9 +1518,7 @@ fn a_session_in_another_checkout_is_served_there(setup: fn(&Path), want: Result<
 #[test]
 fn a_relative_config_dir_is_refused_before_anything_runs() {
     let fake = FakeClaude::new();
-    let mut opts = fake.opts(ONE_SLOT);
-    opts.insert("config_dir".into(), json!(RELATIVE_CONFIG_DIR));
-    let err = try_load(opts)
+    let err = try_load(fake.opts(&[("config_dir", json!(RELATIVE_CONFIG_DIR))]))
         .err()
         .expect("the plugin must refuse the option");
 

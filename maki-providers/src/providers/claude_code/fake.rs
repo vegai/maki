@@ -9,17 +9,21 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::checks::launch_env;
+use super::checks::{MINIMUM_VERSION, launch_env};
 use rustix::process::{Pid, Signal, kill_process, test_kill_process_group};
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
 use tokio::sync::mpsc::unbounded_channel;
+use tokio::time::timeout;
 
-use super::WAIT;
 use super::error::Error;
 use super::run::{Exchange, Launch, Limits, Request, Thinking, request};
 use crate::{Message, ProviderEvent, ProviderUsage, StreamResponse};
 
+/// Generous for a loaded machine: how long a test waits for something that
+/// must happen.
+pub(super) const WAIT: Duration = Duration::from_secs(30);
+pub(super) const SHELL: &str = "/bin/sh";
 const OWNER_ONLY_MODE: &str = "700";
 const DETACHED_PID: &str = "detached-pid";
 pub(super) const TOOL: &str = "read";
@@ -40,6 +44,17 @@ pub(super) const ALIAS: &str = "haiku";
 pub(super) const OPUS: &str = "claude-opus-5-5";
 pub(super) const HAIKU: &str = "claude-haiku-4-5-20251001";
 pub(super) const VERSION_ERROR: &str = "claude: cannot read the install\n";
+/// Files in the fake's directory: what it logs, and markers that change
+/// what it does.
+pub(super) const VERSIONS: &str = "versions";
+pub(super) const CALLS: &str = "calls";
+pub(super) const PID: &str = "pid";
+pub(super) const ARGV: &str = "argv";
+pub(super) const STDIN_PROMPT: &str = "stdin_prompt";
+pub(super) const HOOK_RAN_IN: &str = "hook_ran_in";
+pub(super) const HANGING: &str = "hanging";
+pub(super) const POLICY_HOOK: &str = "policy_hook";
+pub(super) const VERSION_FILE: &str = "version";
 
 /// Answers the handshake, then plays the scenario in its directory. It
 /// reaches maki's handoff server through bash's `/dev/tcp`.
@@ -66,7 +81,9 @@ impl Fake {
                     dir.path().display().to_string().replace('\'', "'\\''")
                 ),
             )
-            .replace("@WAIT_SECS@", &(EXIT_LIMIT + WAIT).as_secs().to_string());
+            .replace("@WAIT_SECS@", &(EXIT_LIMIT + WAIT).as_secs().to_string())
+            .replace("@VERSION@", MINIMUM_VERSION)
+            .replace("@HAIKU@", HAIKU);
         let source = dir.path().join("claude.sh");
         fs::write(&source, script).unwrap();
         let installed = process::Command::new("install")
@@ -145,8 +162,9 @@ impl Fake {
                 project: &project,
                 denied: &[],
                 temp_dir: &self.temp_base(),
-                limits: &limits,
+                startup: limits.startup,
             },
+            limits: &limits,
             model,
             exchange: Exchange {
                 system: SYSTEM,
@@ -172,15 +190,22 @@ impl Fake {
 
     /// A leader that exited and is not reaped stays in `/proc`.
     pub(super) fn leader_reaped(&self) -> bool {
-        let pid = self.log("pid");
+        let pid = self.log(PID);
         !Path::new(PROC).join(pid.trim()).exists()
     }
 
     pub(super) fn group_gone(&self) -> bool {
-        let pid: i32 = self.log("pid").trim().parse().unwrap();
+        let pid: i32 = self.log(PID).trim().parse().unwrap();
         let pid = Pid::from_raw(pid).unwrap();
         wait_until(|| test_kill_process_group(pid).is_err())
     }
+}
+
+/// Fails the test when `work` takes longer than [`WAIT`].
+pub(super) async fn bounded<T>(work: impl Future<Output = T>) -> T {
+    timeout(WAIT, work)
+        .await
+        .unwrap_or_else(|_| panic!("no event occurred in {WAIT:?}"))
 }
 
 pub(super) fn wait_until(mut done: impl FnMut() -> bool) -> bool {

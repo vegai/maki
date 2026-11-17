@@ -237,10 +237,14 @@ local function open_artifact(call, spec, root)
   if not root then
     return nil, "maki cannot make a coding artifact: " .. root_err
   end
+  -- A cancel must stop neither the sweep, which holds the sweep lock, nor the
+  -- allocation, whose directory {call} removes once it is idle.
   local sweep = jobs.new()
-  artifacts.sweep(sweep, root, opts.artifact_ttl_hours, SNAPSHOT_TIMEOUT_MS)
-  sweep:answer()
-  local artifact, allocate_err = artifacts.allocate(call, root, spec.env, SNAPSHOT_TIMEOUT_MS)
+  sweep:wait(function()
+    artifacts.sweep(sweep, root, opts.artifact_ttl_hours, SNAPSHOT_TIMEOUT_MS)
+    sweep:answer()
+  end)
+  local artifact, allocate_err = call:wait(artifacts.allocate, call, root, spec.env, SNAPSHOT_TIMEOUT_MS)
   if not artifact then
     return nil, "maki cannot make a coding artifact: " .. allocate_err
   end
@@ -271,7 +275,6 @@ local function run(input, ctx, call, timeout_secs)
     if not artifact then
       return refuse(artifact_err)
     end
-    call.artifact = artifact
     local confine_err
     spec.confine, confine_err = confine.coding(spec, artifact)
     if not spec.confine then
@@ -310,7 +313,7 @@ local function run(input, ctx, call, timeout_secs)
     task = task .. "\n\nnote: " .. note
   end
   local outcome = claude:start(argv, artifact.snapshot, env, task)
-  if not call.artifact_kept then
+  if not claude.kept then
     return claude:build(outcome)
   end
   local report = change_report(call, artifact, spec.cwd)
@@ -324,18 +327,18 @@ local function run(input, ctx, call, timeout_secs)
   return claude:build(outcome)
 end
 
--- Wait for all processes before artifact removal. A stopped copy can still write until its
--- process exits.
+-- Wait for all processes and the allocation before artifact removal. A stopped copy can
+-- still write until its process exits.
 local function discard_unkept(call, removed)
-  local artifact = call.artifact
-  if artifact and not call.artifact_kept then
+  call:when_idle(function()
+    local artifact = call.artifact
     call.artifact = nil
-    call:when_idle(function()
+    if artifact then
       artifacts.discard(call, artifact, removed)
-    end)
-  elseif removed then
-    removed()
-  end
+    elseif removed then
+      removed()
+    end
+  end)
 end
 
 local function handler(input, ctx)
@@ -448,19 +451,24 @@ local function import_handler(input, ctx)
   if native.unsupported then
     return refuse(native.unsupported)
   end
-  local artifacts, artifacts_err = artifacts_root()
-  if not artifacts then
-    return refuse(artifacts_err)
+  local root, root_err = artifacts_root()
+  if not root then
+    return refuse(root_err)
   end
   local project, project_err = maki.agent.cwd(ctx)
   if not project then
     return refuse(launch.NO_SESSION_DIR .. tostring(project_err))
   end
+  -- The run resolves the root the same way, so the approved command names the same paths.
+  root, root_err = native.resolve_root(root, project, {})
+  if not root then
+    return refuse(root_err)
+  end
   local result, err = importer.import(ctx, jobs.new(), {
     id = input.id,
     paths = input.paths,
     project = project,
-    root = artifacts,
+    root = root,
   })
   if not result then
     return refuse(err)

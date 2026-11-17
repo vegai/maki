@@ -3,27 +3,25 @@ mod launch;
 mod private_files;
 mod supervision;
 
-pub use self::launch::invalidate_version;
 pub(crate) use self::launch::{Launch, models};
-use self::launch::{base_args, probe};
-pub(crate) use self::launch::{checked_profile, command, probe_with};
+use self::launch::{base_args, request_checks};
+pub(crate) use self::launch::{checked_profile, command, invalidate_version, probe_with};
 pub(super) use self::private_files::private_dir_async;
 use self::private_files::{PrivateDir, private_dir, private_file};
 pub(super) use self::supervision::supervised;
 use self::supervision::{Group, Next, ReadDeadline, SHUTDOWN_GRACE, send, unreadable};
 use super::STARTUP_TIMEOUT_SECS;
 use super::checks::{InitExpect, handshake_input};
-use super::error::Error;
+use super::error::{Error, Wait};
 use super::mcp::{self, Handoff};
 use super::settings::MCP_CONFIG_FLAG;
-use super::stream::{Step, Turn, Wait, user_message};
+use super::stream::{Step, Turn, user_message};
 use super::transcript::{Catalog, SERVER, system_prompt, transcript};
-use crate::process::within;
 use crate::providers::anthropic::shared::{long_context_window, strip_long_context};
 use crate::providers::oauth_loopback::random_token;
 use crate::{Message, ProviderEvent, ProviderUsage, StreamResponse};
+use futures::Stream;
 use futures::future::try_join;
-use futures::{Stream, future};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::ffi::OsString;
@@ -32,6 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::time::timeout_at;
 use tracing::{debug, info, warn};
 
 const PROMPT_FILE: &str = "system-prompt.md";
@@ -103,6 +102,7 @@ pub(crate) struct Exchange<'a> {
 
 pub(crate) struct Request<'a> {
     pub launch: Launch<'a>,
+    pub limits: &'a Limits,
     pub model: &'a str,
     pub exchange: Exchange<'a>,
     pub plan_usage: &'a Mutex<Option<ProviderUsage>>,
@@ -119,18 +119,11 @@ pub(crate) enum Thinking {
     Budget(u32),
 }
 
-fn token() -> Result<String, Error> {
-    random_token().map_err(|error| Error::Io {
-        what: "make a handoff token",
-        source: io::Error::other(error),
-    })
-}
-
 /// Recheck current policy and the executable's identity before starting in the project.
 pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
     let started = Instant::now();
     let launch = &req.launch;
-    let limits = launch.limits;
+    let limits = req.limits;
     // Before any process starts, so a conversation maki cannot send costs
     // none.
     let (catalog, tools) = Catalog::new(req.exchange.tools)?;
@@ -143,16 +136,18 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
         None => asked.to_owned(),
     };
     let (handoff_tx, handoffs) = unbounded_channel();
-    let server = mcp::serve(token()?, tools, handoff_tx, MCP_READ)
+    let token = random_token().map_err(|error| Error::Io {
+        what: "make a handoff token",
+        source: io::Error::other(error),
+    })?;
+    let server = mcp::serve(token, tools, handoff_tx, MCP_READ)
         .await
         .map_err(Error::io("start the handoff server"))?;
-    let checks = async {
-        let profile = checked_profile(launch, future::pending()).await?;
-        let offered = probe(launch, req.plan_usage).await?;
-        Ok::<_, Error>((profile, offered))
-    };
-    let ((profile, offered), (dir, dir_path)) =
-        try_join(checks, request_files(launch, req.exchange.system, &server)).await?;
+    let ((profile, offered), (dir, dir_path)) = try_join(
+        request_checks(launch, req.plan_usage),
+        request_files(launch, req.exchange.system, &server),
+    )
+    .await?;
     // An alias such as `sonnet` runs whatever model the account answer maps
     // it to.
     let runs = offered.resolved_model(asked)?;
@@ -171,7 +166,6 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
         &dir_path.join(MCP_FILE),
         &dir_path.join(PROMPT_FILE),
     );
-    let tools = catalog.exposed();
     let run = Run {
         turn: Turn::new(
             &catalog,
@@ -179,7 +173,6 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
                 version: &profile,
                 model: runs,
                 cwd: launch.project,
-                tools: &tools,
             },
             req.plan_usage,
         ),
@@ -238,11 +231,6 @@ async fn request_files(
         Ok((dir, path))
     })
     .await?
-}
-
-fn failed(error: Error, accepted: bool, trace: &str) -> Error {
-    warn!(%error, events = trace, "claude-code: the request failed");
-    error.after_start(accepted)
 }
 
 pub(super) fn millis(duration: Duration) -> u64 {
@@ -310,7 +298,10 @@ async fn converse(
     let trace = run.turn.trace();
     result
         .and_then(|prompted| Ok((run.turn.response()?, prompted)))
-        .map_err(|error| failed(error, accepted, &trace))
+        .map_err(|error| {
+            warn!(%error, events = trace, "claude-code: the request failed");
+            error.after_start(accepted)
+        })
 }
 
 async fn exchange_reply(
@@ -336,6 +327,7 @@ async fn exchange_reply(
     let mut timer = ReadDeadline::new(startup);
     loop {
         let waiting = turn.waiting();
+        let complete = turn.awaits_result() && turn.has_stream_usage();
         let deadline = match waiting {
             Wait::Startup => startup,
             Wait::Handoff => {
@@ -347,11 +339,7 @@ async fn exchange_reply(
         let step = match timer.next(&mut lines, Some(&mut *handoffs), deadline).await {
             Next::Line(Some(Ok(line))) => turn.feed(&line),
             Next::Line(Some(Err(source))) => Err(unreadable(source)),
-            Next::Line(None)
-                if !turn.is_broken() && turn.awaits_result() && turn.has_stream_usage() =>
-            {
-                Ok(Step::Done)
-            }
+            Next::Line(None) if complete && !turn.is_broken() => Ok(Step::Done),
             Next::Line(None) => {
                 let ended = match group.wait(Instant::now() + limits.exit).await {
                     Ok(status) => Error::ExitedEarly(status),
@@ -365,7 +353,7 @@ async fn exchange_reply(
             // The reply and its usage are complete, so the result only
             // repeats them. Its delay is Claude Code's own business.
             Next::Late if turn.is_broken() => Err(turn.take_refusal().unwrap_or(Error::WentQuiet)),
-            Next::Late if turn.awaits_result() && turn.has_stream_usage() => {
+            Next::Late if complete => {
                 warn!(
                     secs = limits.exit.as_secs(),
                     "claude-code: the result is late after a complete reply, so maki uses the reply as it streamed"
@@ -401,34 +389,28 @@ async fn exchange_reply(
             Step::Nothing | Step::Alive => {}
         }
     }
-    stop_and_drain(
-        group,
-        turn,
-        &mut lines,
-        handoffs,
-        limits,
-        server,
-        result_late,
-    )
-    .await?;
+    stop_and_drain(group, run, &mut lines, server, result_late).await?;
     Ok(prompted)
 }
 
 async fn stop_and_drain(
     group: &mut Group,
-    turn: &mut Turn<'_>,
+    run: &mut Run<'_>,
     lines: &mut (impl Stream<Item = io::Result<String>> + Unpin),
-    handoffs: &mut UnboundedReceiver<Handoff>,
-    limits: &Limits,
     server: &mut Option<mcp::Server>,
     result_late: bool,
 ) -> Result<(), Error> {
+    let Run {
+        turn,
+        handoffs,
+        limits,
+        ..
+    } = run;
     // Claude Code would continue after a handoff, and continues by itself after a
     // cut reply or one with no visible output, so it is stopped here. Every event up
     // to the end of the output is still checked, except a generation maki discards,
     // so nothing after the reply can contradict it unnoticed.
     let stopped = turn.calls_tools() || turn.continues() || result_late;
-    let mut deadline = Instant::now() + limits.exit;
     if turn.continues() {
         info!(
             events = turn.trace(),
@@ -438,21 +420,20 @@ async fn stop_and_drain(
     } else if stopped {
         group.terminate();
     }
-    if stopped {
-        deadline = deadline.min(Instant::now() + SHUTDOWN_GRACE);
-    }
+    let grace = limits.exit.min(SHUTDOWN_GRACE);
+    let mut deadline = Instant::now() + if stopped { grace } else { limits.exit };
     match drain(turn, lines, handoffs, deadline, stopped).await {
         Err(Error::ExitLate) => {
             group.kill();
             warn!("claude-code: output stayed open after a complete reply; stopping the CLI");
-            deadline = Instant::now() + limits.exit.min(SHUTDOWN_GRACE);
+            deadline = Instant::now() + grace;
             match drain(turn, lines, handoffs, deadline, true).await {
                 Err(Error::ExitLate) => {
                     warn!("claude-code: output stayed open after the kill; keeping the reply")
                 }
                 result => result?,
             }
-            deadline = Instant::now() + limits.exit.min(SHUTDOWN_GRACE);
+            deadline = Instant::now() + grace;
         }
         result => result?,
     }
@@ -491,17 +472,13 @@ async fn queued_handoffs(
     handoffs: &mut UnboundedReceiver<Handoff>,
     deadline: Instant,
 ) -> Result<(), Error> {
-    loop {
-        let handoff = within(deadline, handoffs.recv())
-            .await
-            .ok_or(Error::ServerLate)?;
-        match handoff {
-            Some(handoff) => {
-                turn.park(handoff)?;
-            }
-            None => return Ok(()),
-        }
+    while let Some(handoff) = timeout_at(deadline.into(), handoffs.recv())
+        .await
+        .map_err(|_| Error::ServerLate)?
+    {
+        turn.park(handoff)?;
     }
+    Ok(())
 }
 
 /// When Claude Code was `stopped`, the kill can cut its last line, so a
@@ -558,14 +535,14 @@ mod tests {
     use tempfile::tempdir;
     use test_case::test_case;
     use tokio::sync::mpsc::unbounded_channel;
-    use tokio::time::sleep;
+    use tokio::time::{sleep, timeout};
 
-    use super::super::WAIT;
-    use super::super::checks::{InitExpect, profile};
+    use super::super::checks::{InitExpect, MINIMUM_VERSION};
     use super::super::error::Error;
     use super::super::fake::{
-        ALIAS, EXIT_LIMIT, Fake, HAIKU, IDLE, MARKER, OPUS, POLL, TEMP_BASE, TOOL, VERSION_ERROR,
-        wait_until,
+        ALIAS, ARGV, CALLS, EXIT_LIMIT, Fake, HAIKU, HANGING, HOOK_RAN_IN, IDLE, MARKER, OPUS, PID,
+        POLICY_HOOK, POLL, SHELL, STDIN_PROMPT, TEMP_BASE, TOOL, VERSION_ERROR, VERSION_FILE,
+        VERSIONS, WAIT, wait_until,
     };
     use super::super::mcp::Handoff;
     use super::super::stream::Turn;
@@ -575,8 +552,8 @@ mod tests {
         EFFORT_FLAG, Exchange, Group, HANDOFF, HELD_CALL_TIMEOUT_MS, Launch, Limits, Listed,
         MCP_CONFIG_FLAG, NO_AUTO_COMPACT, NO_CLI_RETRIES, NO_MID_CONVERSATION_SYSTEM,
         NO_NONSTREAMING_FALLBACK, NO_THINKING, Request, SHOWN_THINKING, STARTUP,
-        SYSTEM_PROMPT_FILE_FLAG, Thinking, Wait, command, finish_deadline, models, probe,
-        queued_handoffs, run_args,
+        SYSTEM_PROMPT_FILE_FLAG, Thinking, Wait, command, finish_deadline, models, queued_handoffs,
+        request_checks, run_args,
     };
     use crate::providers::anthropic::{LABEL_SESSION, LABEL_WEEK_ALL};
     use crate::{ContentBlock, ImageMediaType, ImageSource, Role, StopReason};
@@ -587,7 +564,6 @@ mod tests {
     const SLEEP: &str = "/bin/sleep";
     const MAKI_ROLE: &str = "MAKI_TEST_PLAYS_MAKI";
     const MEMBER_PID: &str = "member-pid";
-    const LONG_SLEEP_SECS: &str = "30";
     /// Much larger than a pipe buffer, so the write blocks when nobody reads.
     const UNREAD_PROMPT_BYTES: usize = 1 << 20;
     /// The run's handshake, generous for a loaded machine.
@@ -656,8 +632,9 @@ mod tests {
                 project: root,
                 denied: &[],
                 temp_dir: root,
-                limits: &limits,
+                startup: limits.startup,
             },
+            limits: &limits,
             model: ALIAS,
             exchange: Exchange {
                 system: "",
@@ -748,7 +725,7 @@ mod tests {
             fake.log("mcp_status").lines().collect::<Vec<_>>(),
             [MCP_OK, MCP_OK]
         );
-        let argv = fake.log("argv");
+        let argv = fake.log(ARGV);
         assert!(
             !argv.contains(MARKER),
             "the conversation must not be on the command line"
@@ -757,7 +734,7 @@ mod tests {
             !argv.contains(&fake.log("token")),
             "the handoff token must not be on the command line"
         );
-        assert!(fake.log("stdin_prompt").contains(MARKER));
+        assert!(fake.log(STDIN_PROMPT).contains(MARKER));
     }
 
     #[test_case("graceful_batch", true ; "a_cooperative_leader")]
@@ -781,7 +758,7 @@ mod tests {
         assert_eq!(
             fake.log(CLEANED_SESSIONS)
                 .lines()
-                .any(|pid| pid == fake.log("pid").trim()),
+                .any(|pid| pid == fake.log(PID).trim()),
             cleans
         );
         assert!(fake.group_gone());
@@ -803,7 +780,7 @@ mod tests {
         assert!(
             fake.log(CLEANED_SESSIONS)
                 .lines()
-                .any(|pid| pid == fake.log("pid").trim())
+                .any(|pid| pid == fake.log(PID).trim())
         );
         assert!(fake.group_gone());
         assert!(fake.leader_reaped());
@@ -819,7 +796,7 @@ mod tests {
             !fake
                 .log(CLEANED_SESSIONS)
                 .lines()
-                .any(|pid| pid == fake.log("pid").trim())
+                .any(|pid| pid == fake.log(PID).trim())
         );
         assert!(fake.group_gone());
         assert!(fake.leader_reaped());
@@ -828,22 +805,12 @@ mod tests {
     /// Runs a request on a fake that sends keep-alives until it is stopped,
     /// and fails the test if they hold the request open.
     fn through_keep_alives(fake: &Fake, limits: Limits) -> Result<StreamResponse, Error> {
-        let request = async {
-            Some(
-                fake.request_with(&format!("find {MARKER}"), ALIAS, limits)
-                    .await
-                    .0,
-            )
-        };
-        let held = async {
-            sleep(KEPT_OPEN).await;
-            None
-        };
+        let prompt = format!("find {MARKER}");
+        let request = fake.request_with(&prompt, ALIAS, limits);
         crate::test_support::runtime()
-            .block_on(async {
-                tokio::select! { biased; value = request => value, value = held => value, }
-            })
+            .block_on(async { timeout(KEPT_OPEN, request).await })
             .expect("keep-alives kept the reply open")
+            .0
     }
 
     /// Once the reply and every usage count have streamed, the result only
@@ -965,23 +932,6 @@ mod tests {
         assert!(fake.group_gone());
     }
 
-    #[test]
-    fn dropping_an_unreaped_group_stops_its_processes() {
-        let here = env::current_dir().unwrap();
-        let args = [LONG_SLEEP_SECS.to_owned()];
-        let group = crate::test_support::runtime()
-            .block_on(Group::spawn(command(
-                Path::new(SLEEP),
-                &Fake::env(),
-                &here,
-                &args,
-            )))
-            .unwrap();
-        let pid = Pid::from_raw(group.id().try_into().unwrap()).unwrap();
-        drop(group);
-        assert!(wait_until(|| test_kill_process_group(pid).is_err()));
-    }
-
     /// maki cannot send an image to Claude Code, so a conversation with one
     /// fails before any process starts.
     #[test]
@@ -997,7 +947,7 @@ mod tests {
             limits,
         ));
         assert!(matches!(result, Err(Error::Image)), "{result:?}");
-        assert_eq!(fake.log("versions"), "", "no process must start");
+        assert_eq!(fake.log(VERSIONS), "", "no process must start");
     }
 
     /// A stderr line that is not UTF-8 must not stop the reader, or Claude
@@ -1029,7 +979,7 @@ mod tests {
         assert!(
             matches!(response.message.content.as_slice(), [ContentBlock::Text { text }] if text == "Reading.")
         );
-        assert_eq!(fake.log("calls").lines().count(), 2);
+        assert_eq!(fake.log(CALLS).lines().count(), 2);
     }
 
     /// A process that ignores stdin after its checks must not hold a request indefinitely.
@@ -1136,13 +1086,10 @@ mod tests {
     fn a_call_still_queued_at_the_end_is_checked() {
         let (catalog, _) =
             Catalog::new(&json!([{ "name": TOOL, "input_schema": { "type": "object" } }])).unwrap();
-        let tools = catalog.exposed();
-        let profile = profile("2.1.284").unwrap();
         let expect = InitExpect {
-            version: &profile,
+            version: MINIMUM_VERSION,
             model: ALIAS,
             cwd: Path::new(ANY_CWD),
-            tools: &tools,
         };
         let plan_usage = Mutex::default();
         let mut turn = Turn::new(&catalog, expect, &plan_usage);
@@ -1185,9 +1132,9 @@ mod tests {
         let mcp: Value = serde_json::from_str(&fake.log("mcp_config")).unwrap();
         assert_eq!(mcp["mcpServers"][SERVER]["timeout"], HELD_CALL_TIMEOUT_MS);
         assert!(
-            fake.log("argv").contains(NO_AUTO_COMPACT_SETTING),
+            fake.log(ARGV).contains(NO_AUTO_COMPACT_SETTING),
             "{}",
-            fake.log("argv")
+            fake.log(ARGV)
         );
         assert_eq!(fake.log("capabilities"), NO_MID_CONVERSATION_SYSTEM.1);
     }
@@ -1226,7 +1173,7 @@ mod tests {
     #[test]
     fn an_unreadable_version_line_is_named() {
         let fake = Fake::new("text");
-        fs::write(fake.dir.path().join("version"), NOT_UTF8_VERSION).unwrap();
+        fs::write(fake.dir.path().join(VERSION_FILE), NOT_UTF8_VERSION).unwrap();
         let err = crate::test_support::runtime()
             .block_on(fake.request())
             .0
@@ -1275,7 +1222,7 @@ mod tests {
             .0
             .unwrap();
 
-        let argv: Vec<String> = fake.log("argv").lines().map(str::to_owned).collect();
+        let argv: Vec<String> = fake.log(ARGV).lines().map(str::to_owned).collect();
         let value_of = |flag: &str| {
             argv.iter()
                 .position(|arg| arg == flag)
@@ -1292,7 +1239,7 @@ mod tests {
     #[test]
     fn a_dropped_request_kills_its_process_group() {
         let fake = Fake::new("hang");
-        let hanging = fake.dir.path().join("hanging");
+        let hanging = fake.dir.path().join(HANGING);
         let finished = crate::test_support::runtime().block_on(async {
             let request = async { Some(fake.request().await) };
             let dropped = async {
@@ -1301,10 +1248,7 @@ mod tests {
                 }
                 None
             };
-            async {
-                tokio::select! { biased; value = request => value, value = dropped => value, }
-            }
-            .await
+            tokio::select! { biased; value = request => value, value = dropped => value, }
         });
         assert!(finished.is_none(), "the request must continue to run");
         assert!(
@@ -1343,11 +1287,11 @@ mod tests {
             fs::read_dir(temp.path())
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
-                .find(|dir| dir.join("hanging").exists())
+                .find(|dir| dir.join(HANGING).exists())
         };
         assert!(wait_until(|| hanging().is_some()), "Claude Code never ran");
         let fake_dir = hanging().unwrap();
-        let pid = fs::read_to_string(fake_dir.join("pid")).unwrap();
+        let pid = fs::read_to_string(fake_dir.join(PID)).unwrap();
         let pid = Pid::from_raw(pid.trim().parse().unwrap()).unwrap();
         let member = fs::read_to_string(fake_dir.join(MEMBER_PID)).unwrap();
         let running = || {
@@ -1411,21 +1355,18 @@ mod tests {
     #[test]
     fn a_probe_that_starts_a_run_is_refused() {
         let fake = Fake::new("probe_runs");
-        let result = crate::test_support::runtime().block_on(probe(
+        let result = crate::test_support::runtime().block_on(request_checks(
             &super::Launch {
                 executable: &fake.executable(),
                 env: &Fake::env(),
                 project: &fake.project(),
                 denied: &[],
                 temp_dir: &env::temp_dir(),
-                limits: &Limits::new(IDLE),
+                startup: STARTUP,
             },
             &fake.plan_usage,
         ));
-        assert!(
-            fake.log("stdin_prompt").is_empty(),
-            "a probe sends no prompt"
-        );
+        assert!(fake.log(STDIN_PROMPT).is_empty(), "a probe sends no prompt");
         assert!(matches!(
             result.as_ref().map_err(Error::cause),
             Err(Error::UncheckedStart)
@@ -1451,7 +1392,7 @@ mod tests {
                     project: &fake.project(),
                     denied: &[],
                     temp_dir: &env::temp_dir(),
-                    limits: &Limits::new(IDLE),
+                    startup: STARTUP,
                 },
                 &fake.plan_usage,
             ))
@@ -1478,7 +1419,7 @@ mod tests {
             ]
         );
         assert!(
-            fake.log("stdin_prompt").is_empty(),
+            fake.log(STDIN_PROMPT).is_empty(),
             "a model list sends no prompt"
         );
     }
@@ -1495,7 +1436,7 @@ mod tests {
         ));
 
         result.unwrap();
-        let argv = fake.log("argv");
+        let argv = fake.log(ARGV);
         let argv: Vec<&str> = argv.lines().collect();
         assert!(
             argv.windows(2).any(|w| w == ["--model", LONG_CONTEXT_ARG]),
@@ -1532,15 +1473,15 @@ mod tests {
             .block_on(fake.request())
             .0
             .unwrap();
-        fs::write(fake.dir.path().join("policy_hook"), "").unwrap();
-        let starts = fake.log("calls").lines().count();
+        fs::write(fake.dir.path().join(POLICY_HOOK), "").unwrap();
+        let starts = fake.log(CALLS).lines().count();
         let err = crate::test_support::runtime()
             .block_on(fake.request())
             .0
             .unwrap_err();
 
         assert!(matches!(err.cause(), Error::Check(_)), "{err}");
-        let ran_in = fake.log("hook_ran_in");
+        let ran_in = fake.log(HOOK_RAN_IN);
         assert!(
             !ran_in.is_empty(),
             "the hook did not run, so this test proves nothing"
@@ -1550,11 +1491,11 @@ mod tests {
             "the hook ran in the project"
         );
         assert_eq!(
-            fake.log("calls").lines().count(),
+            fake.log(CALLS).lines().count(),
             starts + 1,
             "only the probe can start"
         );
-        assert_eq!(fake.log("versions").lines().count(), 1);
+        assert_eq!(fake.log(VERSIONS).lines().count(), 1);
     }
 
     #[test]
@@ -1566,8 +1507,8 @@ mod tests {
                 .0
                 .unwrap();
         }
-        assert_eq!(fake.log("versions").lines().count(), 1);
-        assert_eq!(fake.log("calls").lines().count(), 4);
+        assert_eq!(fake.log(VERSIONS).lines().count(), 1);
+        assert_eq!(fake.log(CALLS).lines().count(), 4);
     }
 
     #[test_case(NEWER_VERSION, true ; "an_upgrade_runs")]
@@ -1578,7 +1519,7 @@ mod tests {
             .block_on(fake.request())
             .0
             .unwrap();
-        fs::write(fake.dir.path().join("version"), version).unwrap();
+        fs::write(fake.dir.path().join(VERSION_FILE), version).unwrap();
         let script = fs::read(fake.executable()).unwrap();
         let replacement = fake.executable().with_extension("new");
         fs::write(&replacement, script).unwrap();
@@ -1588,7 +1529,7 @@ mod tests {
         )
         .unwrap();
         fs::rename(replacement, fake.executable()).unwrap();
-        let starts = fake.log("calls").lines().count();
+        let starts = fake.log(CALLS).lines().count();
         let result = crate::test_support::runtime().block_on(fake.request()).0;
 
         if runs {
@@ -1597,7 +1538,7 @@ mod tests {
             let err = result.unwrap_err();
             assert!(matches!(err, Error::TooOld { .. }), "{err}");
             assert_eq!(
-                fake.log("calls").lines().count(),
+                fake.log(CALLS).lines().count(),
                 starts,
                 "the version below the minimum started"
             );
@@ -1634,28 +1575,36 @@ mod tests {
         );
     }
 
-    /// The unreaped leader reserves the group pid. Kill remaining group members before the reap.
-    #[test]
-    fn a_leader_that_exits_takes_its_group_along() {
+    /// The unreaped leader reserves the group pid. A leader that exits, or a
+    /// group dropped before its reap, takes every member of the group along.
+    #[test_case(false ; "a_leader_that_exits")]
+    #[test_case(true ; "a_dropped_group")]
+    fn a_group_goes_with_its_leader(dropped: bool) {
         let here = env::current_dir().unwrap();
         let args = ["-c".to_owned(), LINGERING_MEMBER.to_owned()];
-        let shell = command(Path::new("/bin/sh"), &Fake::env(), &here, &args);
+        let shell = command(Path::new(SHELL), &Fake::env(), &here, &args);
         let mut group = crate::test_support::runtime()
             .block_on(Group::spawn(shell))
             .unwrap();
+        let pid = Pid::from_raw(group.id().try_into().unwrap()).unwrap();
         let (_stdin, mut lines) = group.pipes().unwrap();
         let member: String = crate::test_support::runtime()
             .block_on(lines.next())
             .unwrap()
             .unwrap();
-        let status = crate::test_support::runtime()
-            .block_on(group.wait(Instant::now() + WAIT))
-            .unwrap();
-        assert!(status.success());
+        if dropped {
+            drop(group);
+        } else {
+            let status = crate::test_support::runtime()
+                .block_on(group.wait(Instant::now() + WAIT))
+                .unwrap();
+            assert!(status.success());
+        }
         let running = || fs::read(format!("/proc/{member}/cmdline")).is_ok_and(|c| !c.is_empty());
         assert!(
             wait_until(|| !running()),
             "the process in the group continued after its leader"
         );
+        assert!(wait_until(|| test_kill_process_group(pid).is_err()));
     }
 }

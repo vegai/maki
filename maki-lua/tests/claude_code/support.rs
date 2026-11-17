@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 use std::sync::{Arc, LazyLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use maki_agent::tools::{ToolContext, ToolRegistry};
 use maki_agent::{CancelToken, CancelTrigger, ToolOutput};
@@ -18,9 +18,9 @@ use maki_lua::PluginHost;
 use rustix::process::{Pid, geteuid, test_kill_process_group};
 use serde_json::{Map, Value};
 
-#[path = "../common/environment.rs"]
-#[allow(dead_code)]
-pub mod environment;
+pub use maki_providers::claude_code::worker::MINIMUM_VERSION;
+
+pub use super::common::{Gate, environment, wait_until};
 
 pub const DEPENDENCY_DIR: &str = "node_modules";
 pub const DEPENDENCY_FILE: &str = "node_modules/pkg/index.js";
@@ -61,33 +61,31 @@ pub fn backdate(path: &Path) {
 const SWEEP_LOCK: &str = ".sweep.lock";
 
 pub const TOOL: &str = "claude_code";
-/// The Claude Code version the fakes report: the oldest maki runs.
-pub const MINIMUM_VERSION: &str = "2.1.284";
 pub const WRITE_SRC: &str = include_str!("../../../plugins/write/init.lua");
 pub const BASH_SRC: &str = include_str!("../../../plugins/bash/init.lua");
 /// The artifact folder where an import keeps the files it replaced.
 pub const ORIGINALS: &str = "originals";
 /// The artifact folder holding the worker's copy of the project.
 pub const SNAPSHOT_DIR: &str = "snapshot";
+/// An artifact's repository, next to its snapshot.
+pub const ARTIFACT_GIT: &str = "git";
+/// The prefix of every temporary file an import writes.
+pub const IMPORT_TEMP: &str = ".maki-import-";
 pub const NOTHING_IMPORTED: &str = "maki imported no changes";
 pub const IMPORT_TOOL: &str = "claude_code_import";
 /// How the line naming the artifact starts in a coding call's reply.
 pub const ARTIFACT_LINE: &str = "Changes in artifact ";
 pub const PROJECT_RULE: &str = "Run the linter before every commit.";
 pub const LEFT_BEHIND: &str = "maki did not remove: ";
-/// The file a command substitution in a name creates if it runs.
-pub const PWNED: &str = "pwned";
+/// The file the command substitution in a hostile name creates if a shell
+/// runs it. It is absolute, so it shows wherever the command ran.
+pub const PWNED: &str = concat!(env!("CARGO_TARGET_TMPDIR"), "/pwned");
 pub const OWNER_ONLY: u32 = 0o700;
 /// How long a test waits for an event before it counts as hung. Only a hung
 /// test waits this long. CI runs 64 tests at once on 4 cores, where a single
 /// import has taken over 20 s.
 pub const DEADLINE: Duration = Duration::from_secs(120);
-/// How often a shell fake checks for its release, and how many checks fit in
-/// [`DEADLINE`].
-const RELEASE_POLL_MS: u128 = 10;
-const RELEASE_LOOKS: u128 = DEADLINE.as_millis() / RELEASE_POLL_MS;
 const DOT_GIT: &str = ".git";
-const POLL: Duration = Duration::from_millis(10);
 const MODE_BITS_SKIP: &str = "skipping mode-bit assertion: root bypasses filesystem permissions";
 /// The user's home and XDG directories in every test process, all in this
 /// one shared folder.
@@ -95,8 +93,9 @@ const FIXTURE_USER_DIR: &str = concat!(env!("CARGO_TARGET_TMPDIR"), "/claude_cod
 const FIXTURE_CONFIG_DIR: &str = "config";
 /// Each variable naming a user directory, with its folder in
 /// [`FIXTURE_USER_DIR`].
+pub const HOME_ENV: &str = "HOME";
 const USER_DIR_VARS: [(&str, &str); 5] = [
-    ("HOME", "home"),
+    (HOME_ENV, "home"),
     ("XDG_CONFIG_HOME", FIXTURE_CONFIG_DIR),
     ("XDG_STATE_HOME", "state"),
     ("XDG_DATA_HOME", "data"),
@@ -110,6 +109,11 @@ const GLOBAL_INSTRUCTIONS: &str = "maki/AGENTS.md";
 /// avoid test labels so the model treats them as ordinary instructions.
 pub const FIXTURE_GLOBAL_RULE: &str = "Write the replies in English.";
 
+/// Runs `touch PWNED` when a shell expands it. `printf` writes each `/`,
+/// which a file name cannot hold.
+pub static TOUCH_PWNED: LazyLock<String> =
+    LazyLock::new(|| format!("$(touch $(printf '{}'))", PWNED.replace('/', "\\057")));
+
 /// Keep only the developer's Claude Code login. Fixture home and XDG directories isolate maki
 /// config and instruction files.
 static DEVELOPER_LOGIN: LazyLock<PathBuf> = LazyLock::new(|| {
@@ -117,7 +121,7 @@ static DEVELOPER_LOGIN: LazyLock<PathBuf> = LazyLock::new(|| {
     let login = env::var_os(CLAUDE_CONFIG_ENV)
         .filter(|dir| !dir.is_empty())
         .map_or_else(
-            || Path::new(&env::var_os("HOME").expect("HOME is set")).join(CLAUDE_DIR),
+            || Path::new(&env::var_os(HOME_ENV).expect("HOME is set")).join(CLAUDE_DIR),
             PathBuf::from,
         );
     let root = Path::new(FIXTURE_USER_DIR);
@@ -187,6 +191,38 @@ pub fn commit_all(project: &Path) {
     git(project, &["commit", "-q", "-m", "base"]);
 }
 
+/// Makes `project` a repository whose one commit holds `files` and whatever
+/// else is there.
+pub fn commit_repo(project: &Path, files: &[(&str, &str)]) {
+    for (path, content) in files {
+        write(&project.join(path), content);
+    }
+    git(project, &["init", "-q"]);
+    commit_all(project);
+}
+
+/// The id of the artifact a coding call's reply names.
+pub fn artifact_id(reply: &str) -> String {
+    let after = reply
+        .split(ARTIFACT_LINE)
+        .nth(1)
+        .unwrap_or_else(|| panic!("there is no artifact in: {reply}"));
+    after.split(',').next().unwrap().to_owned()
+}
+
+/// A folder in `root` holding `files`, all as old as a stale artifact.
+pub fn old_folder(root: &Path, name: &str, files: &[&str]) -> PathBuf {
+    let dir = root.join(name);
+    fs::create_dir(&dir).unwrap();
+    for file in files {
+        let path = dir.join(file);
+        fs::write(&path, "{}").unwrap();
+        backdate(&path);
+    }
+    backdate(&dir);
+    dir
+}
+
 pub fn write(path: &Path, content: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, content).unwrap();
@@ -228,18 +264,6 @@ pub fn artifact_listing(dir: &Path) -> Vec<PathBuf> {
         .into_iter()
         .filter(|path| path.file_name() != Some(SWEEP_LOCK.as_ref()))
         .collect()
-}
-
-/// Returns true if `done` turned true within `limit`.
-pub fn wait_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + limit;
-    while Instant::now() < deadline {
-        if done() {
-            return true;
-        }
-        thread::sleep(POLL);
-    }
-    false
 }
 
 /// Exclude `.git` because background git maintenance can change it after a commit. Record all
@@ -311,15 +335,6 @@ pub fn reply(
 
 pub fn output<T>(work: impl Future<Output = T>) -> T {
     maki_lua::test_support::runtime().block_on(within(DEADLINE, work))
-}
-
-/// Returns a shell loop that makes a fake wait until `release` exists.
-/// `release` is a quoted path or expression. The loop gives up after
-/// [`DEADLINE`], so a missing release cannot hang the run.
-pub fn wait_for_release(release: &str) -> String {
-    format!(
-        "n=0; until [ -e {release} ] || [ $n -ge {RELEASE_LOOKS} ]; do sleep 0.{RELEASE_POLL_MS:03}; n=$((n+1)); done"
-    )
 }
 
 /// Swaps the user's directories for the fixture, once per process. maki

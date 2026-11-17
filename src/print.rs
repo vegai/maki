@@ -36,11 +36,10 @@ use serde_json::Value;
 
 use crate::headless_startup::{shutdown, start_mcp, startup};
 use crate::interrupt::Interrupt;
-use crate::sdk_mode::NOTICE_SUBTYPE;
 use crate::subagent_tasks::{SubagentTasks, TaskMessage};
 use crate::wire::{
-    API_RETRY, ERROR_DURING_EXECUTION, INIT, NOTIFICATION, ProviderNotice, SUCCESS,
-    failure_subtype, system_event,
+    API_RETRY, ERROR_DURING_EXECUTION, INIT, NOTICE, NOTIFICATION, NoticeEvent, ProviderNotice,
+    RESULT, RetryEvent, SUCCESS, failure_subtype, system_event,
 };
 
 const SESSION_LINE_PREFIX: &str = "session: ";
@@ -84,7 +83,7 @@ struct PrintResult {
 impl PrintResult {
     fn error(session_id: SessionRef, duration_ms: u128, result: String) -> Self {
         Self {
-            result_type: "result",
+            result_type: RESULT,
             subtype: ERROR_DURING_EXECUTION,
             is_error: true,
             duration_ms,
@@ -140,42 +139,6 @@ struct UserMessage<'a> {
     content: &'a Value,
 }
 
-/// Claude Code has no event for this, so it takes the SDK's shape. Without it
-/// a woken turn's assistant messages follow the last turn's with nothing
-/// between them that says what woke it.
-#[derive(Serialize)]
-struct NoticeEvent<'a> {
-    text: &'a str,
-}
-
-#[derive(Serialize)]
-struct TaskEvent<'a> {
-    #[serde(rename = "type")]
-    event_type: &'static str,
-    subtype: &'static str,
-    #[serde(flatten)]
-    task: TaskMessage,
-    session_id: &'a SessionRef,
-}
-
-impl<'a> TaskEvent<'a> {
-    fn new(task: TaskMessage, session_id: &'a SessionRef) -> Self {
-        Self {
-            event_type: "system",
-            subtype: task.subtype(),
-            task,
-            session_id,
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct RetryEvent<'a> {
-    attempt: u32,
-    retry_delay_ms: u64,
-    error: &'a str,
-}
-
 /// What the result reports besides the spend. A turn woken by a background
 /// result belongs to the same invocation, so turns add up over every run,
 /// and the answer is the last one a run gave. A woken run that says nothing
@@ -208,7 +171,8 @@ impl Totals {
             } if parent_tool_use_id.is_none() => {
                 self.num_turns += *num_turns;
                 self.stop_reason = Some(*reason);
-                // Only a stop cancels a run here, and its answer is cut short.
+                // A turn limit, a cancel or a dropped prompt fails the run, and
+                // its answer is cut short.
                 self.is_error |= failure_subtype(*reason).is_some();
                 let run_text = mem::take(&mut self.run_text);
                 if !run_text.is_empty() {
@@ -243,7 +207,7 @@ impl VerboseOutput {
     fn emit_tasks(&mut self, tasks: Vec<TaskMessage>, session_id: &SessionRef) -> Result<()> {
         tasks
             .into_iter()
-            .try_for_each(|task| self.emit(&TaskEvent::new(task, session_id)))
+            .try_for_each(|task| self.emit(&system_event(session_id, task.subtype(), task)))
     }
 }
 
@@ -363,7 +327,7 @@ pub async fn run(params: PrintParams, interrupt: &Interrupt) -> Result<()> {
     } = match startup(&mut ready, &mut events).await {
         Ok(started) => started,
         Err(error) => {
-            drop(shutdown(task, &lua_handle, &session_id).await);
+            shutdown(task, &lua_handle, &session_id).await;
             if !matches!(format, OutputFormat::Text) {
                 write_result(
                     format,
@@ -387,7 +351,7 @@ pub async fn run(params: PrintParams, interrupt: &Interrupt) -> Result<()> {
     );
     if dry_run {
         drop(input_tx);
-        drop(shutdown(task, &lua_handle, &session_id).await);
+        shutdown(task, &lua_handle, &session_id).await;
         println!("{}", serde_json::to_string(&init)?);
         return Ok(());
     }
@@ -395,7 +359,6 @@ pub async fn run(params: PrintParams, interrupt: &Interrupt) -> Result<()> {
         Some(out) => out.emit(&init)?,
         None => eprintln!("{SESSION_LINE_PREFIX}{session_id}"),
     }
-    drop(init);
     let _ = input_tx.send(AgentInput::from_defaults(
         prompt,
         AgentMode::Build,
@@ -473,11 +436,7 @@ pub async fn run(params: PrintParams, interrupt: &Interrupt) -> Result<()> {
                     .as_mut()
                     .filter(|_| parent_tool_use_id.is_none())
                 {
-                    out.emit(&system_event(
-                        &session_id,
-                        NOTICE_SUBTYPE,
-                        NoticeEvent { text },
-                    ))?;
+                    out.emit(&system_event(&session_id, NOTICE, NoticeEvent { text }))?;
                 }
             }
             AgentEvent::ProviderWaiting { message } => {
@@ -546,14 +505,10 @@ pub async fn run(params: PrintParams, interrupt: &Interrupt) -> Result<()> {
             out.emit_tasks(task_messages.after, &session_id)?;
         }
     }
-    let track = shutdown(task, &lua_handle, &session_id).await;
+    shutdown(task, &lua_handle, &session_id).await;
     if let Some(out) = &mut verbose_out {
         out.emit_tasks(tasks.finish(), &session_id)?;
     }
-    // Background work and plugin jobs are stopped by now, so nothing spends
-    // any more. Dropping the track saves the full bill, also what no turn
-    // was left to report.
-    drop(track);
     let spent = spend.totals();
 
     let duration_ms = start.elapsed().as_millis();
@@ -580,7 +535,7 @@ pub async fn run(params: PrintParams, interrupt: &Interrupt) -> Result<()> {
         format,
         verbose_out,
         PrintResult {
-            result_type: "result",
+            result_type: RESULT,
             subtype,
             is_error,
             duration_ms,
@@ -743,7 +698,7 @@ mod tests {
         "model",
         "thinking",
     ];
-    const NOTICE_EVENT_FIELDS: &[&str] = &["type", "subtype", "text", "session_id"];
+    const NOTICE_EVENT_FIELDS: &[&str] = &["uuid", "type", "subtype", "text", "session_id"];
     const NOTICE_TEXT: &str = "Background bash finished: cargo test";
     const RETRY_EVENT_FIELDS: &[&str] = &[
         "uuid",
@@ -758,7 +713,7 @@ mod tests {
     #[test]
     fn wire_format_required_fields() {
         let result = PrintResult {
-            result_type: "result",
+            result_type: RESULT,
             subtype: SUCCESS,
             is_error: false,
             duration_ms: 1234,
@@ -805,7 +760,7 @@ mod tests {
             assert!(json.get(field).is_some(), "RetryEvent missing: {field}");
         }
 
-        let notice = system_event(&sid, NOTICE_SUBTYPE, NoticeEvent { text: NOTICE_TEXT });
+        let notice = system_event(&sid, NOTICE, NoticeEvent { text: NOTICE_TEXT });
         let json: Value = serde_json::to_value(&notice).unwrap();
         for field in NOTICE_EVENT_FIELDS {
             assert!(json.get(field).is_some(), "NoticeEvent missing: {field}");

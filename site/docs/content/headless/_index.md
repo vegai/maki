@@ -85,8 +85,7 @@ checkpoint. Session checkpoints land before
 provider requests, before tool execution, and after each completed turn.
 SIGKILL cannot emit a result, but leaves the last checkpoint resumable with
 `maki -p -r ID`. Text streamed during an unfinished request can be lost on
-SIGKILL. Provider errors are stored as separate `error` records in the session
-log, outside the conversation sent to the model.
+SIGKILL.
 
 Every error result makes plain `-p` exit nonzero. SDK mode exits nonzero if
 a provider error or turn limit occurred, once its input closes. A client
@@ -139,11 +138,8 @@ on stderr to keep stdout clean for pipes. `json` and `stream-json` return it as
 `session_id`.
 
 Maki checkpoints the transcript during a turn and saves when the turn ends.
-An empty run stores nothing. Provider errors are stored separately from model
-messages, with a timestamp and transcript position. The session keeps up to
-256 recent errors, each limited to 16 KiB. If a save fails, for example on a full
-disk, Maki prints
-`maki: failed to save session <id>` on stderr. The exit code ignores save
+An empty run stores nothing. If a save fails, for example on a full disk, Maki
+prints `maki: failed to save session <id>` on stderr. The exit code ignores save
 failures, so check stderr before a script resumes with `-c`.
 
 `--session-id <ID>` picks the id up front. It fails if a session already exists

@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use futures::future::join_all;
-use maki_agent::cancel::CancelToken;
 use maki_agent::tools::interpreter_bridge::build_tool_input;
 use maki_interpreter::error::InterpreterError;
 use maki_interpreter::runner::{self, FileFn, FileOp, ToolFn};
@@ -24,7 +23,7 @@ use tokio::task::{spawn_blocking, yield_now};
 use crate::api::util::convert::{TableExt, json_to_lua, lua_tool_result, required};
 use crate::api::util::pair::Pair;
 use crate::plugin_permissions::{Permission, PluginPermissions, denied_error};
-use crate::runtime::{TaskHandle, lock_cell};
+use crate::runtime::task_cancel;
 
 const INTERPRETER_RUN: &str = "interpreter.run";
 const BRIDGE_CLOSED: &str = "tool bridge closed (cancelled)";
@@ -170,10 +169,7 @@ async fn interpreter_run(
     }
     let names: Vec<String> = fns.keys().cloned().collect();
 
-    let cancel = lua
-        .app_data_ref::<TaskHandle>()
-        .map(|h| lock_cell(&h).cancel.clone())
-        .unwrap_or_else(CancelToken::none);
+    let cancel = task_cancel(&lua);
 
     let timeout = Duration::from_secs(timeout_secs);
     let limits = runner::limits(timeout, max_memory_mb * 1024 * 1024);

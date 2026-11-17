@@ -7,7 +7,7 @@ use std::io;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures::{Stream, StreamExt, future};
 use serde::Serialize;
@@ -16,13 +16,12 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tokio_util::task::AbortOnDropHandle;
 use tracing::warn;
 
 use super::MAX_EVENT_BYTES;
 use super::error::Error;
-use crate::process::within;
 
 const ENDPOINT: &str = "/mcp";
 const MAX_HEAD_BYTES: usize = 16 * 1024;
@@ -229,10 +228,10 @@ async fn connection(stream: TcpStream, shared: Arc<Shared>, admission: Arc<Atomi
     let mut head_limit = shared.read_limit.min(HEAD_TIMEOUT);
     loop {
         // A rejected request's body is never read, so the connection ends.
-        let head = match within(Instant::now() + head_limit, read_head(&mut reader)).await {
-            Some(Ok(Some(head))) => head,
-            Some(Ok(None)) | None => return,
-            Some(Err(status)) => {
+        let head = match timeout(head_limit, read_head(&mut reader)).await {
+            Ok(Ok(Some(head))) => head,
+            Ok(Ok(None)) | Err(_) => return,
+            Ok(Err(status)) => {
                 let _ = writer.write_all(&response(status, "")).await;
                 return;
             }
@@ -257,18 +256,13 @@ async fn connection(stream: TcpStream, shared: Arc<Shared>, admission: Arc<Atomi
             }
             admission.store(true, Ordering::Release);
         }
-        let body = match within(
-            Instant::now() + shared.read_limit,
-            read_body(&mut reader, head.length),
-        )
-        .await
-        {
-            Some(Ok(body)) => body,
-            Some(Err(status)) => {
+        let body = match timeout(shared.read_limit, read_body(&mut reader, head.length)).await {
+            Ok(Ok(body)) => body,
+            Ok(Err(status)) => {
                 let _ = writer.write_all(&response(status, "")).await;
                 return;
             }
-            None => return,
+            Err(_) => return,
         };
         head_limit = shared.read_limit;
         match answer(&shared, &body) {
@@ -519,13 +513,11 @@ fn response(status: &str, body: &str) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use std::future::Future;
     use std::io;
     use std::io::Cursor;
     use std::iter;
     use std::net::Ipv4Addr;
     use std::sync::Arc;
-    use std::time::Instant;
 
     use super::incoming;
     use futures::{StreamExt, future, stream};
@@ -536,8 +528,8 @@ mod tests {
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
     use tokio_util::task::AbortOnDropHandle;
 
-    use super::super::WAIT;
     use super::super::error::Error;
+    use super::super::fake::{WAIT, bounded};
     use super::{
         ACCEPTED, BAD_REQUEST, CONTENT_TOO_LARGE, ENDPOINT, HEADERS_TOO_LARGE, Handoff, INITIALIZE,
         LENGTH_REQUIRED, MAX_BODY_BYTES, MAX_CONNECTIONS, MAX_HEAD_BYTES, MAX_UNAUTHENTICATED,
@@ -545,7 +537,6 @@ mod tests {
         Reply, Server, Shared, TOOL_USE_ID_META, TOOLS_CALL, TOOLS_LIST, UNAUTHORIZED, UNAVAILABLE,
         accept_loop, answer, read_head, serve,
     };
-    use crate::process::within;
 
     const TOKEN: &str = "secret-token";
     const OLDER_VERSION: &str = "2025-06-18";
@@ -583,12 +574,6 @@ mod tests {
             body.len()
         )
         .into_bytes()
-    }
-
-    async fn bounded<T>(fut: impl Future<Output = T>) -> T {
-        within(Instant::now() + WAIT, fut)
-            .await
-            .unwrap_or_else(|| panic!("no event occurred in {WAIT:?}"))
     }
 
     /// The connection sends nothing after `request`, so a cut body ends

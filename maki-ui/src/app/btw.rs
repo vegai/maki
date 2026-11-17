@@ -93,7 +93,7 @@ impl App {
             system,
             tools,
             messages,
-            cwd: self.permissions.cwd(),
+            cwd: self.permissions.cwd().to_path_buf(),
         };
         tokio::spawn(request.run(tx));
     }

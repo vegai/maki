@@ -12,19 +12,20 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 
-use crate::api::fs::expand_tilde;
+use crate::api::fs::{MAX_READ_BYTES, expand_tilde};
 use crate::api::keymap::{InputMode, KeymapWriter};
 use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
 use crate::api::util::convert::TableExt;
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::jobs::{
     CallbackUpdate, CallbackUpdates, JOB_NOT_FOUND_ERR, JobCommand, JobEvent, JobOwner,
-    JobSnapshot, JobSpec, MAX_TAIL_LINES, Redirect, deliver_job_event,
+    JobSnapshot, JobSpec, LineLimit, Redirect, deliver_job_event,
 };
 use crate::plugin_permissions::{Ceiling, Permission, PluginPermissions, require};
 use crate::runtime::{active_task_id, job_task_id, strip_traceback, with_jobs};
 
 const DEFAULT_WAIT_MS: u64 = 30_000;
+const MAX_TAIL_LINES: usize = 1024;
 
 const NO_TASK_SCOPE_ERR: &str =
     "jobstart: no active task; use scope = \"plugin\" or { session = ... }";
@@ -131,10 +132,13 @@ async fn jobstart(
         spec.clear_env = opts.opt::<bool>("clear_env")?.unwrap_or(false);
         spec.guard = opts.opt::<bool>("guard")?.unwrap_or(false);
         spec.timeout = opts.opt::<u64>("timeout_ms")?.map(Duration::from_millis);
-        if let Some(limit) = opts.opt_nonzero("max_line_bytes")? {
-            spec.max_line_bytes = limit;
-        }
-        spec.stop_on_line_limit = opts.opt::<bool>("stop_on_line_limit")?.unwrap_or(false);
+        let limit = opts
+            .opt_nonzero("max_line_bytes")?
+            .unwrap_or(MAX_READ_BYTES);
+        spec.line_limit = match opts.opt::<bool>("stop_on_line_limit")? {
+            Some(true) => LineLimit::Stop(limit),
+            _ => LineLimit::Cut(limit),
+        };
         spec.pipe_stdin = match opts.opt::<String>("stdin")?.as_deref() {
             None | Some(STDIN_NULL) => false,
             Some(STDIN_PIPE) => true,
@@ -154,24 +158,20 @@ async fn jobstart(
         }
     }
 
-    let task_id = active_task_id(&lua);
-    let gate = with_jobs(&lua, |store| Arc::clone(&store.start_gate));
-    let _starting = if spec.name.is_some() {
-        Some(gate.lock().await)
-    } else {
-        None
-    };
-    let available = with_jobs(&lua, |store| {
-        if let Some(ref name) = spec.name
-            && let Some(held) = store.find_named(name, task_id, &plugin)
-        {
-            return Err(format!(
-                "jobstart: name {name:?} is already held by live job {held}"
-            ));
+    let _starting = match &spec.name {
+        Some(name) => {
+            let task_id = active_task_id(&lua);
+            let gate = with_jobs(&lua, |store| Arc::clone(&store.start_gate));
+            let starting = gate.lock_owned().await;
+            if let Some(held) = with_jobs(&lua, |store| store.find_named(name, task_id, &plugin)) {
+                return Ok(err_pair(format!(
+                    "jobstart: name {name:?} is already held by live job {held}"
+                )));
+            }
+            Some(starting)
         }
-        Ok(())
-    });
-    try_pair!(available);
+        None => None,
+    };
     let spawned = try_pair!(
         spawn_blocking(move || spec.spawn())
             .await
@@ -520,10 +520,8 @@ fn chanclose(
         return Err(mlua::Error::runtime(CHANCLOSE_STREAM_ERR));
     }
     let task_id = active_task_id(lua);
-    match with_jobs(lua, |store| store.close_stdin(id, task_id, &plugin)) {
-        Ok(()) => Ok((Some(1), None)),
-        Err(e) => Ok(err_pair(e)),
-    }
+    let closed = with_jobs(lua, |store| store.close_stdin(id, task_id, &plugin));
+    Ok(pair(closed.map(|()| 1)))
 }
 
 /// Drop an exited session-owned job from the store. Running jobs are left

@@ -1,26 +1,25 @@
 use super::super::checks::{self, handshake_input};
-use super::super::error::Error;
+use super::super::error::{Error, Wait};
 use super::super::settings::{self, MCP_CONFIG_FLAG};
 use super::super::stream::{
     CONTROL_RESPONSE, Handshake, INITIALIZE, SUCCESS, Step, control_request, parse_event,
 };
 use super::super::transcript::SERVER;
+use super::Listed;
 use super::private_files::private_dir_async;
 use super::supervision::{Group, Next, ReadDeadline, send, supervised, unreadable};
-use super::{Limits, Listed};
 use crate::ProviderUsage;
 use futures::future::join_all;
 use futures::{Stream, future};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::Metadata;
-use std::future::Future;
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, ExitStatus};
-use std::sync::{LazyLock, Mutex, PoisonError};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::process::ChildStdin;
 use tracing::warn;
@@ -40,10 +39,11 @@ pub(crate) struct Launch<'a> {
     pub project: &'a Path,
     pub denied: &'a [PathBuf],
     pub temp_dir: &'a Path,
-    pub limits: &'a Limits,
+    /// Time for each check process to start and answer.
+    pub startup: Duration,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(PartialEq)]
 struct ExecutableIdentity {
     length: u64,
     modified: Option<SystemTime>,
@@ -64,10 +64,10 @@ impl ExecutableIdentity {
     }
 }
 
-static VERSION_CACHE: LazyLock<Mutex<HashMap<PathBuf, (ExecutableIdentity, String)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static VERSION_CACHE: Mutex<BTreeMap<PathBuf, (ExecutableIdentity, String)>> =
+    Mutex::new(BTreeMap::new());
 
-pub fn invalidate_version(executable: &Path) {
+pub(crate) fn invalidate_version(executable: &Path) {
     VERSION_CACHE
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -148,7 +148,9 @@ pub(crate) async fn probe_with(
             },
             Next::Line(Some(Err(source))) => return Err(unreadable(source)),
             Next::Line(None) => break,
-            Next::Handoff(_) | Next::Late => return Err(Error::ProbeLate(startup.as_secs())),
+            Next::Handoff(_) | Next::Late => {
+                return Err(Error::Late(Wait::Startup, startup.as_secs()));
+            }
         }
     }
     probe_exit(group.wait(deadline).await?, passed)
@@ -167,19 +169,22 @@ fn probe_exit(status: ExitStatus, complete: bool) -> Result<(), Error> {
     Ok(())
 }
 
-pub(super) async fn probe(
+/// The checks a request must pass before it starts in the project: the
+/// executable's version, then a probe of the account and policy.
+pub(super) async fn request_checks(
     launch: &Launch<'_>,
     plan_usage: &Mutex<Option<ProviderUsage>>,
-) -> Result<Handshake, Error> {
+) -> Result<(String, Handshake), Error> {
+    let profile = checked_profile(launch, future::pending()).await?;
     let mut handshake = Handshake::default();
     unprompted(launch, &probe_args(), async |group| {
-        probe_with(group, launch.limits.startup, |event| {
+        probe_with(group, launch.startup, |event| {
             handshake.feed(event, plan_usage)
         })
         .await
     })
     .await?;
-    Ok(handshake)
+    Ok((profile, handshake))
 }
 
 async fn executable_identity(executable: &Path) -> Result<ExecutableIdentity, Error> {
@@ -203,17 +208,15 @@ pub(crate) async fn checked_profile(
     {
         return Ok(version);
     }
-    let (dir, dir_path) = private_dir_async(launch.temp_dir, launch.project, launch.denied).await?;
-    let output = version(
-        launch.executable,
-        launch.env,
-        &dir_path,
-        launch.limits.startup,
-        cancel,
-    )
-    .await;
-    dir.close().await;
-    let profile = checks::profile(&output?)?;
+    let output = unprompted(launch, &[VERSION_FLAG.to_owned()], async |group| {
+        tokio::select! {
+            biased;
+            output = version(group, launch.startup) => output,
+            () = cancel => Err(Error::Cancelled),
+        }
+    })
+    .await?;
+    let profile = checks::profile(&output)?;
     VERSION_CACHE
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -227,13 +230,12 @@ pub(crate) async fn models(
     launch: &Launch<'_>,
     plan_usage: &Mutex<Option<ProviderUsage>>,
 ) -> Result<Vec<Listed>, Error> {
-    checked_profile(launch, future::pending()).await?;
-    let offered = probe(launch, plan_usage).await?;
+    let (_, offered) = request_checks(launch, plan_usage).await?;
     let mut seen = HashSet::new();
-    let ids: Vec<_> = offered
+    let ids: Vec<String> = offered
         .models()
+        .filter(|id| seen.insert(*id))
         .map(str::to_owned)
-        .filter(|id| seen.insert(id.clone()))
         .collect();
     let chunk_size = ids.len().div_ceil(WINDOW_PROCESSES).max(1);
     let chunks = ids.chunks(chunk_size).map(async |models| {
@@ -258,7 +260,7 @@ pub(crate) async fn models(
 async fn windows(launch: &Launch<'_>, models: &[String]) -> Result<Vec<Option<u32>>, Error> {
     unprompted(launch, &probe_args(), async |group| {
         let (mut stdin, mut lines) = group.pipes()?;
-        let deadline = Instant::now() + launch.limits.startup;
+        let deadline = Instant::now() + launch.startup;
         let initialize = json!({ "subtype": INITIALIZE });
         ask(&mut stdin, &mut lines, &initialize, deadline).await?;
         let mut windows = Vec::with_capacity(models.len());
@@ -312,43 +314,24 @@ async fn ask(
     }
 }
 
-async fn version(
-    executable: &Path,
-    env: &[(String, String)],
-    cwd: &Path,
-    startup: Duration,
-    cancel: impl Future<Output = ()> + Send,
-) -> Result<String, Error> {
-    let args = [VERSION_FLAG.to_owned()];
-    supervised(command(executable, env, cwd, &args), async |group| {
-        async {
-            tokio::select! { biased; value =
-            async {
-                let (stdin, mut lines) = group.pipes()?;
-                drop(stdin);
-                let deadline = Instant::now() + startup;
-                let first = match ReadDeadline::new(deadline)
-                    .next(&mut lines, None, deadline)
-                    .await
-                {
-                    Next::Line(Some(Ok(line))) => Some(line),
-                    Next::Line(Some(Err(source))) => return Err(Error::UnreadableVersion(source)),
-                    _ => None,
-                };
-                let status = group.wait(deadline).await?;
-                if !status.success() {
-                    return Err(Error::VersionFailed(status));
-                }
-                first.ok_or(Error::NoVersion)
-            } => value, value =
-            async {
-                cancel.await;
-                Err(Error::Cancelled)
-            } => value, }
-        }
+/// Reads the first line `claude --version` prints, once it exits.
+async fn version(group: &mut Group, startup: Duration) -> Result<String, Error> {
+    let (stdin, mut lines) = group.pipes()?;
+    drop(stdin);
+    let deadline = Instant::now() + startup;
+    let first = match ReadDeadline::new(deadline)
+        .next(&mut lines, None, deadline)
         .await
-    })
-    .await
+    {
+        Next::Line(Some(Ok(line))) => Some(line),
+        Next::Line(Some(Err(source))) => return Err(Error::UnreadableVersion(source)),
+        _ => None,
+    };
+    let status = group.wait(deadline).await?;
+    if !status.success() {
+        return Err(Error::VersionFailed(status));
+    }
+    first.ok_or(Error::NoVersion)
 }
 
 #[cfg(test)]
@@ -357,6 +340,7 @@ mod tests {
         CONTROL_RESPONSE, Error, SUCCESS, ask, command, probe_exit, probe_with, supervised,
     };
     use crate::process::wait_without_reaping;
+    use crate::providers::claude_code::fake::SHELL;
     use crate::providers::claude_code::stream::result_failure;
     use futures::stream;
     use serde_json::json;
@@ -371,7 +355,6 @@ mod tests {
     const FAILED_EXIT_CODE: i32 = 1;
     const EXIT_ONE: i32 = FAILED_EXIT_CODE << 8;
     const SIGKILL_STATUS: i32 = 9;
-    const SHELL: &str = "/bin/sh";
     const STARTUP: Duration = Duration::from_secs(10);
     const ERROR_TEXT: &str = "probe dependency unavailable";
     const EXITED_PROBE: &str = r#"if [ -n "$1" ]; then printf '%s\n' "$1"; fi; exit 1"#;

@@ -861,10 +861,10 @@ mod tests {
     /// `ignored_builtin_fields` in maki-config stays quiet about these values
     /// on a local slug, so each one has to pick its wire here.
     mod protocol_wire {
-        use std::path::Path;
-
         use test_case::test_case;
         use tokio::sync::mpsc::unbounded_channel;
+
+        use crate::test_support::detached_scope;
 
         use super::super::*;
         use crate::Timeouts;
@@ -892,10 +892,7 @@ mod tests {
                     &json!([]),
                     &tx,
                     RequestOptions::default(),
-                    RequestScope {
-                        session_id: None,
-                        cwd: Path::new("."),
-                    },
+                    detached_scope(),
                 )
                 .await;
 

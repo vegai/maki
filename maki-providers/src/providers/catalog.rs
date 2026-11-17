@@ -70,7 +70,7 @@ const QUIRKS: &[(&[&str], ProviderQuirks)] = &[
 
 const CATALOG_URL: &str = "https://models.dev/api.json";
 const CATALOG_CACHE_FILE: &str = "models-dev-catalog.json";
-pub(super) const CATALOG_CACHE_TTL: Duration = Duration::from_secs(86400);
+const CATALOG_CACHE_TTL: Duration = Duration::from_secs(86400);
 
 pub(crate) const ALLOWED_NPM: &[&str] = &["@ai-sdk/openai-compatible", "@ai-sdk/anthropic"];
 
@@ -1113,11 +1113,11 @@ mod tests {
         SessionRef, StateDir, available_if_warm, determine_catalog_format, parse_model, quirks_for,
     };
     use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
-    use crate::provider::{ModelListing, Provider, RequestScope};
+    use crate::provider::{ModelListing, Provider};
     use crate::providers::{ResolvedAuth, Timeouts, anthropic, claude_code, opencode};
     use crate::spec::ProviderRegistry;
+    use crate::test_support::detached_scope;
     use crate::{AgentError, Effort, ModelFamily, ModelTier, RequestOptions};
-    use std::path::Path;
     use test_case::test_case;
 
     const SESSION_HEADER: &str = "x-opencode-session";
@@ -1298,10 +1298,7 @@ mod tests {
                 &serde_json::json!([]),
                 &tx,
                 RequestOptions::default(),
-                RequestScope {
-                    session_id: None,
-                    cwd: Path::new("."),
-                },
+                detached_scope(),
             )
             .await;
         assert!(matches!(

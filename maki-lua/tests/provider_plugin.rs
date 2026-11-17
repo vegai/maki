@@ -23,10 +23,10 @@ use maki_agent::tools::ToolRegistry;
 use maki_lua::test_support::runtime;
 use maki_lua::{DiscoveredPackage, Origin, PluginHost, PluginPermissions, Requested};
 use maki_providers::model::{Model, ModelTier};
-use maki_providers::provider::{ModelListing, Provider, RequestScope};
+use maki_providers::provider::{ModelListing, Provider};
 use maki_providers::retry::RetryKind;
 use maki_providers::test_support::{
-    Canned, JSON_HEADERS, Recorded, Requests, isolated_home, serve,
+    Canned, JSON_HEADERS, Recorded, Requests, detached_scope, isolated_home, serve,
 };
 use maki_providers::{
     AgentError, Effort, Message, ProviderEvent, RequestOptions, StopReason, StreamResponse,
@@ -310,10 +310,7 @@ fn stream(
             thinking,
             fast: false,
         },
-        RequestScope {
-            session_id: None,
-            cwd: Path::new("."),
-        },
+        detached_scope(),
     ));
     drop(tx);
     (iter::from_fn(|| rx.try_recv().ok()).collect(), result)

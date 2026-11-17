@@ -6,6 +6,7 @@ use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{CallOrigin, ToolAudience, ToolContext, ToolFilter, ToolRegistry};
 use maki_agent::{AgentMode, ToolOutput};
 use maki_lua::PluginHost;
+use maki_lua::test_support::runtime;
 use serde_json::{Value, json};
 use test_case::test_case;
 
@@ -69,9 +70,7 @@ enum Origin {
 
 fn execute(ctx: &ToolContext, name: &str, input: Value) -> Result<ToolOutput, String> {
     let invocation = ctx.registry.get(name).unwrap().tool.parse(&input).unwrap();
-    maki_lua::test_support::runtime()
-        .block_on(invocation.execute(ctx))
-        .output
+    runtime().block_on(invocation.execute(ctx)).output
 }
 
 #[test_case(Origin::Model, true ; "filtered_model_call")]
@@ -93,16 +92,13 @@ fn an_unoffered_tool_never_runs(origin: Origin, filtered: bool) {
     let mut ctx = stub_ctx(&AgentMode::Build);
     ctx.registry = registry;
     if filtered {
-        ctx.tool_filter = Arc::new(ToolFilter {
-            excluded: vec![HIDDEN_TOOL.to_owned()],
-            ..Default::default()
-        });
+        ctx.tool_filter = Arc::new(ToolFilter::default().excluding(&[HIDDEN_TOOL]));
     } else {
         ctx.audience = ToolAudience::RESEARCH_SUB;
     }
     let text = match origin {
         Origin::Model => {
-            let done = maki_lua::test_support::runtime().block_on(tool_dispatch::run(
+            let done = runtime().block_on(tool_dispatch::run(
                 CALL_ID.to_owned(),
                 HIDDEN_TOOL,
                 &json!({}),
@@ -120,7 +116,7 @@ fn an_unoffered_tool_never_runs(origin: Origin, filtered: bool) {
         )
         .unwrap()
         .as_text(),
-        Origin::Bridge => maki_lua::test_support::runtime()
+        Origin::Bridge => runtime()
             .block_on(interpreter_bridge::dispatch(&ctx, HIDDEN_TOOL, &json!({})))
             .unwrap_err(),
         Origin::CodeExecution => {
@@ -140,7 +136,7 @@ fn an_unoffered_tool_never_runs(origin: Origin, filtered: bool) {
 }
 
 #[test]
-fn lua_tool_definitions_respect_a_plugin_allow_list() {
+fn lua_tool_definitions_respect_allowed_tools() {
     let registry = Arc::clone(ToolRegistry::global_arc());
     let host = PluginHost::new(Arc::clone(&registry)).unwrap();
     host.load_source("dispatch_fixture", FIXTURE).unwrap();

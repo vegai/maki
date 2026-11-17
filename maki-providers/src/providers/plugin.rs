@@ -1721,6 +1721,7 @@ pub async fn logout(slug: &str) -> Result<bool, AgentError> {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::detached_scope;
     use std::borrow::Cow;
     use std::path::Path;
     use std::sync::atomic::AtomicUsize;
@@ -2544,10 +2545,7 @@ mod tests {
                 &serde_json::json!([]),
                 &tx,
                 RequestOptions::default(),
-                RequestScope {
-                    session_id: None,
-                    cwd: Path::new("."),
-                },
+                detached_scope(),
             )
             .await;
 
@@ -2595,10 +2593,7 @@ mod tests {
                 &serde_json::json!([]),
                 &tx,
                 RequestOptions::default(),
-                RequestScope {
-                    session_id: None,
-                    cwd: Path::new("."),
-                },
+                detached_scope(),
             )
             .await;
 

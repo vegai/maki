@@ -44,12 +44,12 @@ use crate::headless_startup::{shutdown, start_mcp, startup};
 use crate::interrupt::Interrupt;
 use crate::subagent_tasks::{SubagentTasks, TaskMessage};
 use crate::wire::{
-    API_RETRY, ERROR_DURING_EXECUTION, INIT, NOTIFICATION, ProviderNotice, SUCCESS,
-    maki_to_claude_tool_name, system_event, wire_uuid,
+    API_RETRY, ERROR_DURING_EXECUTION, INIT, NOTICE, NOTIFICATION, NoticeEvent, ProviderNotice,
+    RetryEvent, SUCCESS, failure_subtype, maki_to_claude_tool_name, system_event, wire_uuid,
 };
 
-pub(crate) const NOTICE_SUBTYPE: &str = "notice";
 const BACKGROUND_USAGE_SUBTYPE: &str = "background_usage";
+const CONTROL_ERROR: &str = "error";
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum PermissionMode {
@@ -422,7 +422,11 @@ impl SdkWriter {
     ) -> Result<()> {
         self.emit(WireInner::ControlResponse(ControlResponsePayload {
             response: ControlResponseInner {
-                subtype: if error.is_some() { "error" } else { SUCCESS },
+                subtype: if error.is_some() {
+                    CONTROL_ERROR
+                } else {
+                    SUCCESS
+                },
                 request_id: request_id.into(),
                 response,
                 error,
@@ -600,7 +604,7 @@ pub async fn run(params: SdkParams, interrupt: &Interrupt) -> Result<()> {
         Ok(started) => started,
         Err(error) => {
             let emitted = writer.emit(WireInner::Result(ResultPayload::error(error.to_string())));
-            finish(handle, &lua_handle, writer, writer_task).await;
+            finish(handle, &lua_handle, writer, writer_task, None).await?;
             emitted?;
             return Err(error);
         }
@@ -758,31 +762,7 @@ pub async fn run(params: SdkParams, interrupt: &Interrupt) -> Result<()> {
     // and a parked agent never ends the event stream the pump waits on.
     shared.lock().unwrap().permissions.close();
 
-    let InteractiveHandle {
-        input_tx,
-        task,
-        session_id,
-        spend,
-        ..
-    } = handle;
-    drop(input_tx);
-    // Unbounded: the pump ends at the stream marker, which the session
-    // emits once it has answered every prompt stdin queued.
-    let (reported, failed) = pump.await.context("event pump")?;
-    // Reaps session-owned plugin jobs before the writer task ends: an
-    // orphan inheriting stdout would keep an orchestrator's read blocked
-    // after maki exits.
-    let track = shutdown(task, &lua_handle, &session_id).await;
-    // Background work and plugin jobs are stopped by now, so nothing spends
-    // any more. Dropping the track saves the full bill, also what no result
-    // was left to report.
-    drop(track);
-    if let Err(e) = emit_unreported(&writer, spend.totals().since(&reported)) {
-        warn!(error = %e, "failed to report background usage");
-    }
-    drop(writer);
-    let _ = writer_task.await;
-    if failed {
+    if finish(handle, &lua_handle, writer, writer_task, Some(pump)).await? {
         bail!("SDK session ended with an error");
     }
     Ok(())
@@ -803,18 +783,30 @@ fn emit_unreported(writer: &SdkWriter, unreported: RunTotals) -> Result<()> {
     )
 }
 
-/// Reap session jobs before joining the writer, because descendants may retain stdout.
+/// Ends the session and returns whether the pump saw it fail. Session-owned
+/// plugin jobs are reaped before the writer task ends: an orphan inheriting
+/// stdout would keep an orchestrator's read blocked after maki exits.
 async fn finish(
     handle: InteractiveHandle,
     lua: &EventHandle,
     writer: SdkWriter,
     writer_task: JoinHandle<()>,
-) {
+    pump: Option<JoinHandle<(RunTotals, bool)>>,
+) -> Result<bool> {
     drop(handle.input_tx);
-    let track = shutdown(handle.task, lua, &handle.session_id).await;
-    drop(track);
+    // Unbounded: the pump ends at the stream marker, which the session
+    // emits once it has answered every prompt stdin queued.
+    let (reported, failed) = match pump {
+        Some(pump) => pump.await.context("event pump")?,
+        None => (RunTotals::default(), false),
+    };
+    shutdown(handle.task, lua, &handle.session_id).await;
+    if let Err(e) = emit_unreported(&writer, handle.spend.totals().since(&reported)) {
+        warn!(error = %e, "failed to report background usage");
+    }
     drop(writer);
     let _ = writer_task.await;
+    Ok(failed)
 }
 
 fn parse_or_warn<T: serde::de::DeserializeOwned>(payload: Value, what: &str) -> Option<T> {
@@ -1066,10 +1058,9 @@ impl EventPump {
     }
 
     fn emit_tasks(&self, tasks: Vec<TaskMessage>) -> Result<()> {
-        tasks.into_iter().try_for_each(|task| {
-            self.writer
-                .emit_system(task.subtype(), serde_json::to_value(task)?)
-        })
+        tasks
+            .into_iter()
+            .try_for_each(|task| self.writer.emit_system(task.subtype(), task))
     }
 
     fn handle_event(&mut self, envelope: &Envelope) -> Result<()> {
@@ -1145,8 +1136,7 @@ impl EventPump {
             } if parent_tool_use_id.is_none() => self.result_text.clone_from(text),
             AgentEvent::Steered { .. } => {}
             AgentEvent::ObservationLine { text, .. } if parent_tool_use_id.is_none() => {
-                self.writer
-                    .emit_system(NOTICE_SUBTYPE, serde_json::json!({ "text": text }))?;
+                self.writer.emit_system(NOTICE, NoticeEvent { text })?;
             }
             AgentEvent::ObservationLine { .. } => {}
             AgentEvent::ProviderWaiting { message } => {
@@ -1162,11 +1152,11 @@ impl EventPump {
             } => {
                 self.writer.emit_system(
                     API_RETRY,
-                    serde_json::json!({
-                        "attempt": attempt,
-                        "retry_delay_ms": delay_ms,
-                        "error": message,
-                    }),
+                    RetryEvent {
+                        attempt: *attempt,
+                        retry_delay_ms: *delay_ms,
+                        error: message,
+                    },
                 )?;
             }
             AgentEvent::TurnComplete(tc) => {
@@ -1263,7 +1253,7 @@ impl EventPump {
                 if parent_tool_use_id.is_some() {
                     return Ok(());
                 }
-                let failure = crate::wire::failure_subtype(*reason);
+                let failure = failure_subtype(*reason);
                 // A client interrupt ends the request successfully, even though its reply is incomplete.
                 self.failed |= failure.is_some() && *reason != DoneReason::Cancelled;
                 let result = mem::take(&mut self.result_text);
@@ -2059,7 +2049,7 @@ mod tests {
             .collect();
         assert_eq!(wire.len(), 2, "{wire:?}");
         assert_eq!(wire[0]["type"], SYSTEM_TYPE);
-        assert_eq!(wire[0]["subtype"], NOTICE_SUBTYPE);
+        assert_eq!(wire[0]["subtype"], NOTICE);
         assert_eq!(wire[0]["text"], NOTICE_LINE);
         assert_eq!(
             wire[0]["session_id"],

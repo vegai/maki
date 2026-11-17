@@ -62,6 +62,8 @@ pub struct ModelList {
 #[derive(Default)]
 struct Listing {
     replayed: Vec<String>,
+    /// The `written_at` of the replayed file.
+    replayed_at: u64,
     live: Vec<String>,
     providers: HashMap<String, ProviderStatus>,
     /// A provider that cannot be reached warns and falls back to its static
@@ -69,6 +71,8 @@ struct Listing {
     /// this, an empty run reads as "offline" even when the real cause is an
     /// expired token or a revoked key.
     degraded: bool,
+    /// Replayed specs outlived a failed probe, so the file keeps
+    /// [`Self::replayed_at`] and repeated failures cannot renew them.
     retained: bool,
 }
 
@@ -228,26 +232,31 @@ fn store_at(path: &Path, cache: &ModelsCache) {
     }
 }
 
-/// Last run's specs when this run's credentials wrote them and they are not
-/// past [`MAX_AGE_MS`], empty otherwise. A miss is not an error: live
-/// discovery rewrites the file moments later regardless.
-fn replay(path: &Path, policy: &ModelPolicy, fingerprint: &str, now_ms: u64) -> Vec<String> {
+/// A listing that starts from last run's specs when this run's credentials
+/// wrote them and they are not past [`MAX_AGE_MS`], and from nothing
+/// otherwise. A miss is not an error: live discovery rewrites the file
+/// moments later regardless.
+fn replay(path: &Path, policy: &ModelPolicy, fingerprint: &str, now_ms: u64) -> Listing {
     let Some(cache) = load_from(path) else {
-        return Vec::new();
+        return Listing::default();
     };
     if cache.fingerprint != fingerprint {
         debug!("discovered-models cache belongs to other credentials; ignoring");
-        return Vec::new();
+        return Listing::default();
     }
     if now_ms.saturating_sub(cache.written_at) > MAX_AGE_MS {
         debug!("discovered-models cache is past its maximum age; ignoring");
-        return Vec::new();
+        return Listing::default();
     }
     // The policy is applied on replay, not trusted from the cache file:
     // exclusions can change between runs.
-    let mut specs = cache.specs;
-    specs.retain(|spec| policy.allows(spec));
-    specs
+    let mut replayed = cache.specs;
+    replayed.retain(|spec| policy.allows(spec));
+    Listing {
+        replayed,
+        replayed_at: cache.written_at,
+        ..Listing::default()
+    }
 }
 
 /// Rewrite the cache at `path` from a completed live discovery.
@@ -261,18 +270,15 @@ fn store_discovery(path: &Path, listing: &Listing, fingerprint: String, now_ms: 
     if listing.live.is_empty() && listing.degraded {
         return;
     }
-    let written_at = if listing.retained {
-        load_from(path)
-            .filter(|cache| cache.fingerprint == fingerprint)
-            .map_or(now_ms, |cache| cache.written_at)
-    } else {
-        now_ms
-    };
     store_at(
         path,
         &ModelsCache {
             fingerprint,
-            written_at,
+            written_at: if listing.retained {
+                listing.replayed_at
+            } else {
+                now_ms
+            },
             specs: listing.live.clone(),
         },
     );
@@ -287,17 +293,22 @@ pub async fn fetch_all_models_cached(
     mut on_update: impl FnMut(ModelList, Option<String>),
     listing: ModelListing,
 ) {
-    let path = cache_path();
-    let fingerprint = spawn_blocking(fingerprint)
-        .await
-        .expect("fingerprint task panicked");
-    let mut discovered = Listing {
-        replayed: path
-            .as_deref()
-            .map(|p| replay(p, policy, &fingerprint, maki_storage::auth::now_millis()))
-            .unwrap_or_default(),
-        ..Listing::default()
-    };
+    let replay_policy = policy.clone();
+    let (path, fingerprint, mut discovered) = spawn_blocking(move || {
+        let path = cache_path();
+        let fingerprint = fingerprint();
+        let discovered = path.as_deref().map_or_else(Listing::default, |p| {
+            replay(
+                p,
+                &replay_policy,
+                &fingerprint,
+                maki_storage::auth::now_millis(),
+            )
+        });
+        (path, fingerprint, discovered)
+    })
+    .await
+    .expect("models cache replay panicked");
     on_update(discovered.snapshot(), None);
 
     fetch_all_models(
@@ -310,7 +321,6 @@ pub async fn fetch_all_models_cached(
             };
             on_update(discovered.snapshot(), warning);
         },
-        None,
         listing,
     )
     .await;
@@ -332,11 +342,13 @@ mod tests {
 
     use super::*;
     use crate::providers::claude_code::SLUG;
+    use crate::providers::copilot;
 
     const FINGERPRINT: &str = "fingerprint-a";
     const NOW: u64 = 1_700_000_000_000;
     const CACHED_CLAUDE: &str = "claude-code/cached";
     const LIVE_CLAUDE: &str = "claude-code/live";
+    const CACHED_COPILOT: &str = "copilot/cached";
     const OTHER: &str = "other";
     const OTHER_LIVE: &str = "other/live";
     const LISTING_FAILED: &str = "provider is busy or offline";
@@ -381,7 +393,7 @@ mod tests {
         let (_dir, path) = cache_file(&["kept/model-a", "banned/model-b", "kept/model-c"]);
         let policy = ModelPolicy::new(&[], &["banned/*".to_string()]).unwrap();
         assert_eq!(
-            replay(&path, &policy, FINGERPRINT, NOW),
+            replay(&path, &policy, FINGERPRINT, NOW).replayed,
             ["kept/model-a", "kept/model-c"]
         );
     }
@@ -392,10 +404,14 @@ mod tests {
         let (_dir, path) = cache_file(&["old/model"]);
         let policy = ModelPolicy::default();
         assert_eq!(
-            replay(&path, &policy, FINGERPRINT, NOW + MAX_AGE_MS),
+            replay(&path, &policy, FINGERPRINT, NOW + MAX_AGE_MS).replayed,
             ["old/model"]
         );
-        assert!(replay(&path, &policy, fingerprint, now_ms).is_empty());
+        assert!(
+            replay(&path, &policy, fingerprint, now_ms)
+                .replayed
+                .is_empty()
+        );
     }
 
     #[test]
@@ -436,27 +452,26 @@ mod tests {
         assert_eq!(shown.providers["a"], ProviderStatus::MissingKey);
     }
 
-    #[test_case(true, &[], &[OTHER_LIVE, CACHED_CLAUDE] ; "failed_refresh_keeps_cached_models")]
-    #[test_case(false, &[], &[OTHER_LIVE] ; "successful_empty_refresh_removes_cached_models")]
-    #[test_case(true, &[LIVE_CLAUDE], &[OTHER_LIVE, LIVE_CLAUDE] ; "static_fallback_replaces_cached_models")]
-    #[test_case(false, &[LIVE_CLAUDE], &[OTHER_LIVE, LIVE_CLAUDE] ; "successful_refresh_replaces_cached_models")]
-    fn a_failed_provider_survives_mixed_discovery_in_the_picker_and_on_disk(
+    #[test_case(SLUG, true, &[], &[OTHER_LIVE, CACHED_CLAUDE] ; "failed_refresh_keeps_cached_models")]
+    #[test_case(SLUG, false, &[], &[OTHER_LIVE] ; "successful_empty_refresh_removes_cached_models")]
+    #[test_case(SLUG, true, &[LIVE_CLAUDE], &[OTHER_LIVE, LIVE_CLAUDE] ; "static_fallback_replaces_cached_models")]
+    #[test_case(SLUG, false, &[LIVE_CLAUDE], &[OTHER_LIVE, LIVE_CLAUDE] ; "successful_refresh_replaces_cached_models")]
+    #[test_case(copilot::SLUG, true, &[], &[OTHER_LIVE] ; "catalog_refusal_removes_cached_models")]
+    fn cached_models_follow_the_provider_answer(
+        provider: &str,
         failed: bool,
         models: &[&str],
         expected: &[&str],
     ) {
-        let (_dir, path) = cache_file(&[CACHED_CLAUDE, "removed/cached"]);
-        let mut listing = Listing {
-            replayed: load_from(&path).unwrap().specs,
-            ..Listing::default()
-        };
+        let (_dir, path) = cache_file(&[CACHED_CLAUDE, CACHED_COPILOT]);
+        let mut listing = replay(&path, &ModelPolicy::default(), FINGERPRINT, NOW);
         listing.add_live(&batch(OTHER, &[OTHER_LIVE], ProviderStatus::Live));
         let status = if failed {
             ProviderStatus::Failed(LISTING_FAILED.into())
         } else {
             ProviderStatus::Live
         };
-        listing.add_live(&batch(SLUG, models, status));
+        listing.add_live(&batch(provider, models, status));
         store_discovery(&path, &listing, FINGERPRINT.into(), NOW);
         assert_eq!(listing.finish().specs, expected);
         assert_eq!(load_from(&path).unwrap().specs, expected);
@@ -482,10 +497,7 @@ mod tests {
     fn repeated_failed_discovery_does_not_renew_cached_models() {
         let (_dir, path) = cache_file(&[CACHED_CLAUDE]);
         for now in [NOW + 1, NOW + MAX_AGE_MS] {
-            let mut listing = Listing {
-                replayed: load_from(&path).unwrap().specs,
-                ..Listing::default()
-            };
+            let mut listing = replay(&path, &ModelPolicy::default(), FINGERPRINT, now);
             listing.add_live(&batch(OTHER, &[OTHER_LIVE], ProviderStatus::Live));
             listing.add_live(&batch(
                 SLUG,
@@ -501,6 +513,7 @@ mod tests {
                 FINGERPRINT,
                 NOW + MAX_AGE_MS + 1
             )
+            .replayed
             .is_empty()
         );
     }

@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use maki_providers::headers::parse_headers;
 use maki_providers::http::error_chain;
+use maki_providers::process::ChildGuard;
 use maki_providers::strip_provider_keys;
 use maki_storage::StateDir;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderName, HeaderValue};
@@ -45,7 +46,6 @@ use tracing::{info, warn};
 use super::config::{ServerConfig, Transport};
 use super::error::McpError;
 use super::oauth;
-use crate::ChildGuard;
 
 pub(super) const CLIENT_NAME: &str = "maki";
 const TOOL_ERROR_CODE: i64 = -1;
@@ -333,10 +333,7 @@ fn spawn_stdio(
         return Err(start_failed(name, "stdio pipes missing"));
     };
     let process = StdioProcess {
-        child: ChildGuard::new(child).map_err(|error| McpError::StartFailed {
-            server: name.to_owned(),
-            reason: error.to_string(),
-        })?,
+        child: ChildGuard::new(child).map_err(|e| start_failed(name, e))?,
         _stderr: AbortOnDropHandle::new(tokio::spawn(log_stderr(Arc::from(name), stderr))),
     };
     Ok((stdout, stdin, process))

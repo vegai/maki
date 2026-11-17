@@ -429,11 +429,10 @@ fn overlay_declared_tiers(def: &ProviderDef, models: &mut [ModelInfo]) {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::path::Path;
 
     use tokio::sync::mpsc::unbounded_channel;
 
-    use crate::provider::RequestScope;
+    use crate::test_support::detached_scope;
     use maki_storage::sessions::Effort::High;
     use test_case::test_case;
 
@@ -719,10 +718,7 @@ mod tests {
                     &json!([]),
                     &tx,
                     RequestOptions::default(),
-                    RequestScope {
-                        session_id: None,
-                        cwd: Path::new("."),
-                    },
+                    detached_scope(),
                 )
                 .await
         }

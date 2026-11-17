@@ -690,8 +690,7 @@ pub(super) fn auto_compact_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use std::iter;
-    use std::path::Path;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use maki_providers::provider::{BoxFuture, ModelListing, Provider, RequestScope};
     use maki_providers::{
@@ -708,7 +707,8 @@ mod tests {
     use crate::AgentConfig;
     use crate::agent::hook::testing::script;
     use crate::cancel::CancelToken;
-    use crate::tools::{LocalTools, RequestTools, ToolAudience, ToolRegistry};
+    use crate::tools::ToolRegistry;
+    use crate::tools::test_support::assembled_main;
     use maki_config::CompactionBuffer;
 
     #[test]
@@ -786,14 +786,7 @@ mod tests {
     fn bare_context(model: &Model) -> RunContext {
         RunContext::fixed(
             NO_SYSTEM.into(),
-            RequestTools::assembled(
-                ToolRegistry::global(),
-                Value::Array(Vec::new()),
-                &LocalTools::default(),
-                &AgentConfig::default(),
-                model,
-                ToolAudience::MAIN,
-            ),
+            assembled_main(Value::Array(Vec::new()), model),
         )
     }
 
@@ -887,7 +880,7 @@ mod tests {
             model,
             cancel,
             context_size: 0,
-            cwd: Path::new(ANY_CWD).to_owned(),
+            cwd: Arc::new(ANY_CWD.into()),
         }
     }
 
@@ -1445,8 +1438,6 @@ mod tests {
 
     #[tokio::test]
     async fn compact_preparation_removes_orphan_result_and_tool_image() {
-        use std::sync::Arc;
-
         use maki_providers::{ImageMediaType, ImageSource};
 
         let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
@@ -1543,7 +1534,6 @@ mod tests {
     #[test]
     fn strip_images_replaces_with_placeholder() {
         use maki_providers::{ImageMediaType, ImageSource};
-        use std::sync::Arc;
         let source = ImageSource::new(ImageMediaType::Png, Arc::from("abc"));
         let mut messages = vec![Message::user_with_images("hello".into(), vec![source])];
         strip_images(&mut messages);

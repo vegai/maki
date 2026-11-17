@@ -2,7 +2,7 @@ use std::io;
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
-use super::{GroupSignals, within};
+use super::GroupSignals;
 #[cfg(unix)]
 use super::{pid_of, wait_without_reaping};
 #[cfg(unix)]
@@ -11,11 +11,13 @@ use rustix::io::Errno;
 use rustix::process::{Signal, kill_process};
 use tokio::process::Child;
 use tokio::runtime::Handle;
+use tokio::time::timeout_at;
 use tracing::warn;
 
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const ALREADY_REAPED: &str = "child already reaped";
 
+#[cfg(unix)]
 pub enum ChildExit {
     Exited,
     WaitFailed,
@@ -55,28 +57,17 @@ impl ChildGuard {
         self.signalled
     }
 
+    #[cfg(unix)]
     pub async fn exited_by(&self, deadline: Instant) -> ChildExit {
         if !self.can_signal() {
             return ChildExit::WaitFailed;
         }
-        #[cfg(unix)]
-        {
-            let pid = self.id();
-            match within(
-                deadline,
-                tokio::task::spawn_blocking(move || wait_without_reaping(pid)),
-            )
-            .await
-            {
-                Some(Ok(true)) => ChildExit::Exited,
-                Some(Ok(false)) | Some(Err(_)) => ChildExit::WaitFailed,
-                None => ChildExit::TimedOut,
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = deadline;
-            ChildExit::WaitFailed
+        let pid = self.id();
+        let waited = tokio::task::spawn_blocking(move || wait_without_reaping(pid));
+        match timeout_at(deadline.into(), waited).await {
+            Ok(Ok(true)) => ChildExit::Exited,
+            Ok(Ok(false) | Err(_)) => ChildExit::WaitFailed,
+            Err(_) => ChildExit::TimedOut,
         }
     }
 
@@ -102,7 +93,7 @@ impl ChildGuard {
                 ALREADY_REAPED,
             )));
         };
-        let result = within(deadline, child.wait()).await;
+        let result = timeout_at(deadline.into(), child.wait()).await.ok();
         if result.is_none() {
             self.reap_later(child);
         }
@@ -171,6 +162,7 @@ mod tests {
 
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::process::Child;
+    use tokio::time::timeout;
 
     use rustix::process::{
         Signal, WaitId, WaitIdOptions, kill_process, setsid, test_kill_process, waitid,
@@ -212,13 +204,9 @@ mod tests {
                 output.read_line(&mut line).await.unwrap();
                 assert_eq!(line.as_bytes(), PROBE);
             };
-            async {
-                tokio::select! { biased; value = work => value, value = async {
-                    tokio::time::sleep(TEST_TIMEOUT).await;
-                    panic!("background worker did not answer after the shell exited");
-                } => value, }
-            }
-            .await;
+            timeout(TEST_TIMEOUT, work)
+                .await
+                .expect("background worker did not answer after the shell exited");
         });
     }
 
@@ -246,14 +234,14 @@ mod tests {
     }
 
     fn wait_for_death(pid: u32) {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + TEST_TIMEOUT;
         while Instant::now() < deadline {
             if !is_alive(pid) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        panic!("process {pid} still alive after 2s");
+        panic!("process {pid} still alive after {TEST_TIMEOUT:?}");
     }
 
     #[test]

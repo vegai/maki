@@ -4,6 +4,7 @@ local git_utils = require("claude_git")
 local import_scripts = require("claude_import_script")
 local path_utils = require("claude_paths")
 local jobs = require("claude_jobs")
+local artifacts = require("claude_artifact")
 
 local M = {}
 
@@ -15,30 +16,11 @@ local LEFTOVERS_REMAIN = "maki could not remove its temporary files, so files st
 local UNRECORDED = "maki could not record this in the artifact (%s), so a second import will show these files as "
   .. "changed."
 
-local function disk_blobs(call, env, cwd, paths, keep_on_cancel, timeout_ms)
-  if #paths == 0 then
-    return {}
-  end
-  local out, err = call:run_lines(git_utils.git({ "hash-object", "--no-filters", "--stdin-paths" }), {
-    env = env,
-    cwd = cwd,
-    stdin = git_utils.quoted_lines(paths),
-    keep_on_cancel = keep_on_cancel,
-    timeout_ms = timeout_ms,
-  })
-  if not out then
-    return nil, err
-  end
-  return out
-end
-
 -- Maps each path to its `file_state`, false when missing, or a note when it
 -- is not a regular file. Hashes use the object format of {artifact}'s
 -- repository, which can differ from the checkout's.
 local function checkout_state(call, artifact, changes, keep_on_cancel)
   local project = artifact.manifest.project
-  local timeout_ms = import_scripts.import_timeout(changes) * jobs.MS_PER_SEC
-  local git_env = git_utils.snapshot_git_env({}, artifact.git, project)
   local state, files, executable = {}, {}, {}
   local paths = {}
   for i, change in ipairs(changes) do
@@ -59,7 +41,16 @@ local function checkout_state(call, artifact, changes, keep_on_cancel)
       state[change.path] = "not a file"
     end
   end
-  local blobs, err = disk_blobs(call, git_env, project, files, keep_on_cancel, timeout_ms)
+  if #files == 0 then
+    return state
+  end
+  local blobs, err = call:run_lines(git_utils.git({ "hash-object", "--no-filters", "--stdin-paths" }), {
+    env = git_utils.snapshot_git_env({}, artifact.git, project),
+    cwd = project,
+    stdin = git_utils.quoted_lines(files),
+    keep_on_cancel = keep_on_cancel,
+    timeout_ms = import_scripts.import_timeout(changes) * jobs.MS_PER_SEC,
+  })
   if not blobs then
     return nil, err
   end
@@ -76,27 +67,24 @@ end
 --- Manifest fields end up in the command the user approves, so the manifest
 --- must come from a collect step for {spec.project}. The open operation rewrites it,
 --- because the sweep goes by its date and the approval can outlast the
---- artifact's time limit.
-local function open_import(spec)
-  local dir = maki.fs.joinpath(spec.root, spec.id :: string)
-  local manifest_path = maki.fs.joinpath(dir, path_utils.MANIFEST)
-  local text = maki.fs.read(manifest_path)
+--- artifact's time limit. Returns why the import cannot use {artifact}, or nil.
+local function open_import(spec, artifact)
+  local text = maki.fs.read(artifact.manifest_path)
   local manifest = text and maki.json.decode(text)
   if
     type(manifest) ~= "table"
     or manifest.version ~= workspace.MANIFEST_VERSION
     or type(manifest.changes) ~= "table"
   then
-    return nil, missing_artifact(spec.id)
+    return missing_artifact(spec.id)
   end
   if manifest.project ~= spec.project then
-    return nil,
-      "artifact "
-        .. spec.id
-        .. " contains changes for "
-        .. tostring(manifest.project)
-        .. ", and not for "
-        .. spec.project
+    return "artifact "
+      .. spec.id
+      .. " contains changes for "
+      .. tostring(manifest.project)
+      .. ", and not for "
+      .. spec.project
   end
   local seen = {}
   for _, change in ipairs(manifest.changes) do
@@ -105,21 +93,17 @@ local function open_import(spec)
       problem = "duplicate path " .. path_utils.printable(change.path)
     end
     if problem then
-      return nil, "artifact " .. spec.id .. " has a manifest that maki did not write: " .. problem
+      return "artifact " .. spec.id .. " has a manifest that maki did not write: " .. problem
     end
     seen[change.path] = true
   end
-  local _, touch_err = maki.fs.atomic_write(manifest_path, text)
+  local _, touch_err = maki.fs.atomic_write(artifact.manifest_path, text)
   if touch_err then
-    return nil, "maki cannot stop the expiry of artifact " .. spec.id .. " during the import: " .. touch_err
+    return "maki cannot stop the expiry of artifact " .. spec.id .. " during the import: " .. touch_err
   end
   manifest.imported = type(manifest.imported) == "table" and manifest.imported or {}
-  return {
-    dir = dir,
-    git = maki.fs.joinpath(dir, path_utils.GIT_DIR),
-    manifest_path = manifest_path,
-    manifest = manifest,
-  }
+  artifact.manifest = manifest
+  return nil
 end
 
 --- Returns the changes to import, and for every other change the reason it
@@ -181,7 +165,7 @@ local function check_import(call, artifact, todo)
     return "maki imported no changes: these files changed in the checkout after the snapshot: "
       .. path_utils.shown(conflicts)
       .. ". Merge them manually from "
-      .. maki.fs.joinpath(artifact.dir, path_utils.SNAPSHOT_DIR)
+      .. artifact.snapshot
       .. ", or import the remaining changes with `paths`."
   end
 end
@@ -240,7 +224,7 @@ end
 local function apply_import(ctx, call, artifact, todo)
   local project = artifact.manifest.project
   local made = missing_folders(project, todo)
-  local stage, stage_err = maki.fs.mkdtemp(maki.fs.joinpath(artifact.dir, path_utils.STAGE_TEMPLATE))
+  local stage, stage_err = maki.fs.mkdtemp(artifact.stage_template)
   if not stage then
     return nil, "maki cannot make a stage folder in the artifact: " .. stage_err
   end
@@ -269,16 +253,17 @@ local function apply_import(ctx, call, artifact, todo)
   end
   -- This also runs after a cancel, so the cleanup and the read must survive
   -- it.
-  local code = call:run_to_end(
-    { "bash", "-c", import_scripts.leftovers_script(todo, project, stage, made) },
-    { cwd = project },
-    { keep_on_cancel = true, timeout_ms = timeout * jobs.MS_PER_SEC }
-  )
+  local cleaned = call:run_lines({ "bash", "-c", import_scripts.leftovers_script(todo, project, stage, made) }, {
+    cwd = project,
+    inherit_env = true,
+    keep_on_cancel = true,
+    timeout_ms = timeout * jobs.MS_PER_SEC,
+  })
   local first, last = err:find(script, 1, true)
   if first then
     err = err:sub(1, first - 1) .. IMPORT_COMMAND .. err:sub(last + 1)
   end
-  if code ~= 0 then
+  if not cleaned then
     err = err .. "\n" .. LEFTOVERS_REMAIN:format(import_scripts.temp_name(stage))
   end
   local now, now_err = checkout_state(call, artifact, todo, true)
@@ -299,21 +284,21 @@ end
 --- approval can take long. If a file it changes also changed in the checkout
 --- since the snapshot, or in the artifact since the collect step, nothing
 --- applies.
-local function import_locked(ctx, call, spec)
-  local artifact, open_err = open_import(spec)
-  if not artifact then
+local function import_locked(ctx, call, spec, artifact)
+  local open_err = open_import(spec, artifact)
+  if open_err then
     return nil, open_err
   end
   local todo, skipped = select_changes(artifact.manifest, spec.paths)
   if not todo then
     return nil, skipped
   end
+  if #todo == 0 then
+    return { applied = {}, skipped = skipped }
+  end
   local problem = check_import(call, artifact, todo)
   if problem then
     return nil, problem
-  end
-  if #todo == 0 then
-    return { applied = {}, skipped = skipped }
   end
   local landed, failure, matched = apply_import(ctx, call, artifact, todo)
   if not landed then
@@ -332,14 +317,13 @@ local function import_locked(ctx, call, spec)
   end
   local _, record_err = maki.fs.atomic_write(artifact.manifest_path, (maki.json.encode(artifact.manifest)))
   local unrecorded = record_err and UNRECORDED:format(record_err) or nil
-  local originals = replaced and maki.fs.joinpath(artifact.dir, path_utils.IMPORT_ORIGINALS) or nil
-  local displaced = maki.fs.joinpath(artifact.dir, path_utils.IMPORT_DISPLACED)
+  local originals = replaced and artifact.originals or nil
   if #landed + #matched == #todo then
     return {
       applied = workspace.summary(landed),
       skipped = skipped,
       originals = originals,
-      displaced = replaced and displaced or nil,
+      displaced = replaced and artifact.displaced or nil,
       unrecorded = unrecorded,
       -- The command can still fail after its last write, and its error and
       -- any leftovers belong in the reply.
@@ -360,7 +344,8 @@ local function import_locked(ctx, call, spec)
       missed[#missed + 1] = change.path
     end
   end
-  local kept = originals and " The preserved versions are in " .. originals .. " and " .. displaced .. "." or ""
+  local kept = originals and " The preserved versions are in " .. originals .. " and " .. artifact.displaced .. "."
+    or ""
   return nil, M.stopped_partway(applied, missed, kept .. (unrecorded and " " .. unrecorded or ""), failure)
 end
 
@@ -368,14 +353,14 @@ function M.import(ctx, call, spec)
   if type(spec.id) ~= "string" or not spec.id:match(path_utils.ARTIFACT_ID) then
     return nil, "an artifact id contains only the characters A to Z, a to z and 0 to 9"
   end
-  local dir = maki.fs.joinpath(spec.root, spec.id :: string)
+  local artifact = artifacts.layout(maki.fs.joinpath(spec.root, spec.id :: string))
   local missing = missing_artifact(spec.id)
-  if not maki.fs.metadata(dir) then
+  if not maki.fs.metadata(artifact.dir) then
     return nil, missing
   end
-  local lock, lock_err = maki.fs.try_lock(maki.fs.joinpath(dir, path_utils.IMPORT_LOCK))
+  local lock, lock_err = maki.fs.try_lock(artifact.lock)
   if not lock then
-    if not maki.fs.metadata(dir) then
+    if not maki.fs.metadata(artifact.dir) then
       return nil, missing
     end
     return nil, "maki cannot lock artifact " .. spec.id .. ": " .. lock_err
@@ -395,7 +380,7 @@ function M.import(ctx, call, spec)
     end)
     -- Cleanup owns the locks even if the caller is abandoned during cancellation.
     maki.async.spawn(function()
-      local ran, reply, problem = pcall(import_locked, ctx, call, spec)
+      local ran, reply, problem = pcall(import_locked, ctx, call, spec, artifact)
       call:when_idle(function()
         project_lock:close()
         lock:close()

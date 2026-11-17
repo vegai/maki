@@ -643,7 +643,6 @@ pub async fn models(
                 eprintln!("warning: {warning}");
             }
         },
-        None,
         if refresh {
             ModelListing::Refresh
         } else {

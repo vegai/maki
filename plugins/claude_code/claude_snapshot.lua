@@ -9,10 +9,6 @@ local path_utils = require("claude_paths")
 
 local M = {}
 
-local QUARANTINE_DIR = "git-metadata"
-
-local CHECK_INDEX = "consistency-index"
-local COPY_STARTED = "copy-started"
 local VENV_MARKER = "pyvenv.cfg"
 local C_LOCALE = "C"
 -- What `cp --reflink=always` reports when the filesystem cannot clone:
@@ -326,7 +322,7 @@ end
 -- alone.
 local function consistency_problem(call, artifact, spec)
   local env = git_utils.snapshot_git_env(spec.env, artifact.git, spec.cwd)
-  env.GIT_INDEX_FILE = maki.fs.joinpath(artifact.dir, CHECK_INDEX)
+  env.GIT_INDEX_FILE = artifact.check_index
   local changed, err
   for _, args in ipairs({
     { "read-tree", artifact.base },
@@ -359,8 +355,8 @@ local function consistency_problem(call, artifact, spec)
 end
 
 -- Dependencies are too large to compare file by file, so maki compares
--- change times with {marker}, written just before the copy.
-local function unsettled_dependencies(call, artifact, spec, dependencies, marker)
+-- change times with a marker written just before the copy.
+local function unsettled_dependencies(call, artifact, spec, dependencies)
   if #dependencies == 0 then
     return {}
   end
@@ -369,7 +365,7 @@ local function unsettled_dependencies(call, artifact, spec, dependencies, marker
   for _, dir in ipairs(dependencies) do
     argv[#argv + 1] = "./" .. dir
   end
-  for _, arg in ipairs({ "-cnewer", marker, "-print" }) do
+  for _, arg in ipairs({ "-cnewer", artifact.copy_started, "-print" }) do
     argv[#argv + 1] = arg
   end
   local out, err = call:run_lines(argv, { env = spec.env, cwd = spec.cwd, timeout_ms = artifact.timeout_ms })
@@ -392,8 +388,7 @@ function M.fill(call, artifact, spec)
   if not paths then
     return paths_err
   end
-  local marker = maki.fs.joinpath(artifact.dir, COPY_STARTED)
-  local _, marker_err = maki.fs.write(marker, "")
+  local _, marker_err = maki.fs.write(artifact.copy_started, "")
   if marker_err then
     return "maki cannot record the start of the copy: " .. marker_err
   end
@@ -405,8 +400,8 @@ function M.fill(call, artifact, spec)
   if not dependencies then
     return deps_err
   end
-  local unsettled, unsettled_err = unsettled_dependencies(call, artifact, spec, dependencies, marker)
-  maki.fs.rm(marker, { force = true })
+  local unsettled, unsettled_err = unsettled_dependencies(call, artifact, spec, dependencies)
+  maki.fs.rm(artifact.copy_started, { force = true })
   if not unsettled then
     return unsettled_err
   end
@@ -420,20 +415,19 @@ end
 -- outside the work tree, without discarding the worker's files or repository objects.
 -- Prune external or unresolved links unless keep_links is set for worker output.
 function M.sanitize(artifact, keep_links)
-  local quarantine = maki.fs.joinpath(artifact.dir, QUARANTINE_DIR)
-  local paths, err = native.sanitize_git(artifact.snapshot, quarantine, artifact.git, keep_links ~= true)
+  local paths, err = native.sanitize_git(artifact.snapshot, artifact.quarantine, artifact.git, keep_links ~= true)
   if not paths then
     return nil, err
   end
   if #paths.git_metadata > 0 then
-    note(artifact, PRESERVED_GIT, path_utils.shown(paths.git_metadata), quarantine)
+    note(artifact, PRESERVED_GIT, path_utils.shown(paths.git_metadata), artifact.quarantine)
   end
   if #paths.repositories > 0 then
     artifact.repositories = artifact.repositories or {}
     for _, path in ipairs(paths.repositories) do
       artifact.repositories[path] = true
     end
-    note(artifact, QUARANTINED_REPOSITORIES, path_utils.shown(paths.repositories), quarantine)
+    note(artifact, QUARANTINED_REPOSITORIES, path_utils.shown(paths.repositories), artifact.quarantine)
   end
   if paths.private_files > 0 then
     note(artifact, PRIVATE_COPIES, paths.private_files)
@@ -581,8 +575,7 @@ function M.collect(call, artifact, project)
     changes = changes,
     imported = {},
   }
-  local _, save_err =
-    maki.fs.atomic_write(maki.fs.joinpath(artifact.dir, path_utils.MANIFEST), (maki.json.encode(manifest)))
+  local _, save_err = maki.fs.atomic_write(artifact.manifest_path, (maki.json.encode(manifest)))
   if save_err then
     return nil, save_err
   end

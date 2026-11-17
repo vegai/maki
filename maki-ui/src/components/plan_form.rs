@@ -1,4 +1,4 @@
-use crate::components::form::{render_form, selected_prefix};
+use crate::components::form::{FORM_WRAP, render_form, selected_prefix};
 use crate::components::hint_line;
 use crate::components::keybindings::key;
 use crate::components::modal::BORDER;
@@ -340,7 +340,7 @@ impl PlanForm {
             FORM_LABEL,
             frame,
             area,
-            Paragraph::new(lines),
+            Paragraph::new(lines).wrap(FORM_WRAP),
             (0, 0),
             total,
         );

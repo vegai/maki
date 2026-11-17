@@ -79,10 +79,6 @@ function Call:on_released(hook)
   self.release_hooks[#self.release_hooks + 1] = hook
 end
 
-function Call:keep_artifact()
-  self.artifact_kept = true
-end
-
 function Call:answer()
   self.answered = true
   local left_behind = self.left_behind
@@ -93,7 +89,13 @@ function Call:answer()
   self:settle()
 end
 
-function Call:start(argv, job_opts, on_exit)
+--- {on_exit} gets `(id, code, timed_out, stderr_tail)`. A stop ends the job, and a
+--- stopped call starts no job, unless {keep_on_cancel} marks a job that must finish
+--- cleanup after cancellation.
+function Call:start(argv, job_opts, on_exit, keep_on_cancel)
+  if self.stopped and not keep_on_cancel then
+    return nil, M.CANCELLED
+  end
   job_opts.scope = "plugin"
   job_opts.guard = true
   job_opts.on_exit = function(id, code, _, timed_out, stderr_tail)
@@ -109,21 +111,7 @@ function Call:start(argv, job_opts, on_exit)
     return nil, err
   end
   self.alive = self.alive + 1
-  return id
-end
-
---- {how} has `on_exit(id, code, timed_out, stderr_tail)`, `timeout_ms`, and
---- `keep_on_cancel` for a job that must finish cleanup after cancellation.
-function Call:spawn(argv, job_opts, how)
-  if self.stopped and not how.keep_on_cancel then
-    return nil, M.CANCELLED
-  end
-  job_opts.timeout_ms = how.timeout_ms
-  local id, err = self:start(argv, job_opts, how.on_exit)
-  if not id then
-    return nil, err
-  end
-  if not how.keep_on_cancel then
+  if not keep_on_cancel then
     self.stoppable[#self.stoppable + 1] = id
   end
   return id
@@ -154,37 +142,38 @@ function Call:leave(dir)
   end
 end
 
---- Returns the exit code, stdout lines, and any input error.
---- The code is nil after a timeout. Waits for `on_exit`, because a cancel can stop a coroutine that calls `jobwait`.
---- {how} has `started(id)` returning `(ok, err)`, `keep_on_cancel`, `timeout_ms`, and `on_stderr_tail`.
-function Call:run_to_end(argv, job_opts, how)
+--- Returns the stdout lines, or nil, the error, and whether the command timed out.
+--- Waits for `on_exit`, because a cancel can stop a coroutine that calls `jobwait`.
+--- {spec} has `timeout_ms`, `cwd`, `env`, `stdin`, `stdout` and `keep_on_cancel`.
+--- The `inherit_env` option merges `env` into maki's environment without provider keys.
+--- Otherwise `env` supplies the entire child environment.
+--- The `display` option replaces the joined argv in error messages.
+function Call:run_lines(argv, spec)
+  local shown = "`" .. (spec.display or table.concat(argv, " ")) .. "`"
   local lines = {}
-  local input_error
-  if job_opts.stdout == nil then
+  local job_opts = {
+    cwd = spec.cwd,
+    env = spec.env,
+    clear_env = not spec.inherit_env,
+    stdin = spec.stdin and "pipe" or nil,
+    stdout = spec.stdout,
+    timeout_ms = assert(spec.timeout_ms, "a command needs an explicit timeout_ms"),
+  }
+  if spec.stdout == nil then
     job_opts.on_stdout = function(_, line)
       lines[#lines + 1] = line
     end
   end
-  local code = maki.async.await(1, function(done)
-    local function finished(_, exit_code, timed_out, stderr_tail)
-      if how.on_stderr_tail then
-        how.on_stderr_tail(stderr_tail or {})
-      end
-      local result = not timed_out and exit_code or nil
-      done(result, timed_out)
-    end
-    local id, err = self:spawn(argv, job_opts, {
-      keep_on_cancel = how.keep_on_cancel,
-      timeout_ms = how.timeout_ms,
-      on_exit = finished,
-    })
+  local input_error
+  local code, timed_out, stderr_tail = maki.async.await(1, function(done)
+    local id
+    id, input_error = self:start(argv, job_opts, function(_, ...)
+      done(...)
+    end, spec.keep_on_cancel)
     if not id then
-      input_error = err
-      finished()
-      return
-    end
-    if how.started then
-      local _, err = how.started(id)
+      done(nil, false, {})
+    elseif spec.stdin then
+      local _, err = M.feed_stdin(id, spec.stdin)
       if err then
         input_error = err
         local info = maki.fn.jobinfo(id)
@@ -194,39 +183,10 @@ function Call:run_to_end(argv, job_opts, how)
       end
     end
   end)
-  return code, lines, input_error
-end
-
---- The `inherit_env` option merges `env` into maki's environment without provider keys.
---- Otherwise `env` supplies the entire child environment.
---- The `display` option replaces the joined argv in error messages.
-function Call:run_lines(argv, spec)
-  local shown = "`" .. (spec.display or table.concat(argv, " ")) .. "`"
-  local stderr_tail = {}
-  local job_opts = {
-    cwd = spec.cwd,
-    env = spec.env,
-    clear_env = not spec.inherit_env,
-    stdin = spec.stdin and "pipe" or nil,
-    stdout = spec.stdout,
-  }
-  local how = {
-    keep_on_cancel = spec.keep_on_cancel,
-    timeout_ms = assert(spec.timeout_ms, "a command needs an explicit timeout_ms"),
-    on_stderr_tail = function(tail)
-      stderr_tail = tail
-    end,
-  }
-  if spec.stdin then
-    how.started = function(id)
-      return M.feed_stdin(id, spec.stdin)
-    end
+  if input_error then
+    return nil, M.with_stderr("maki cannot run " .. shown .. ": " .. input_error, stderr_tail)
   end
-  local code, lines, run_error = self:run_to_end(argv, job_opts, how)
-  if run_error then
-    return nil, M.with_stderr("maki cannot run " .. shown .. ": " .. run_error, stderr_tail)
-  end
-  if not code then
+  if timed_out then
     return nil, shown .. " did not complete in time", true
   end
   if code ~= 0 then

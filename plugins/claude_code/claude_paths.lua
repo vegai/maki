@@ -4,11 +4,7 @@ local M = {}
 M.ABSOLUTE_PATH = " must be relative to the project"
 M.PATH_NUL = "an input path cannot contain NUL"
 M.OUTSIDE_PROJECT = " goes out of the project"
-M.IMPORT_LOCK = "import.lock"
 M.PROJECT_LOCK = "maki-import.lock"
-M.SNAPSHOT_DIR = "snapshot"
-M.GIT_DIR = "git"
-M.MANIFEST = "manifest.json"
 local DEFAULT_DENY = {
   ".env*",
   "**/.env*",
@@ -25,11 +21,6 @@ local DEFAULT_DENY = {
 }
 
 M.ARTIFACT_ID = "^[A-Za-z0-9]+$"
-
-M.IMPORT_ORIGINALS = "originals"
-M.IMPORT_DISPLACED = "displaced"
--- A unique stage keeps retries from removing another attempt's files.
-M.STAGE_TEMPLATE = "stage.XXXXXX"
 local SHOWN_PATHS = 10
 
 function M.set_of(list)

@@ -206,8 +206,12 @@ jobs:
         with:
           tool: just
       - run: just ${{ matrix.recipe }}
+      # libtest exits 0 when the filter matches nothing, so check that the test ran.
       - if: matrix.recipe == 'build'
-        run: "cargo test -p maki-providers process::child::tests::cancelling_status_keeps_child_killable"
+        shell: bash
+        run: |
+          cargo test -p maki-providers --lib process::child::tests::cancelling_status_keeps_child_killable -- --exact | tee child-test.log
+          grep -q 'test result: ok. 1 passed' child-test.log
 
   ci-pass:
     name: CI
