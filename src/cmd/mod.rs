@@ -102,10 +102,8 @@ async fn load_plugins(
     // the hosts the user exempted from the private-address block.
     maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
     maki_lua::set_shell_preference(config.agent.shell.clone());
-    // Model resolution must wait until the plugin has checked the shared options.
-    let builtins = host.load_builtins(&config.plugins);
 
-    if let Err(e) = builtins {
+    if let Err(e) = host.load_builtins(&config.plugins) {
         let e = color_eyre::eyre::Report::from(e).wrap_err("load builtin plugins");
         match on_builtin_failure {
             BuiltinFailure::Fatal => return Err(e),
@@ -129,14 +127,15 @@ async fn load_plugins(
     // `/reload` only reports what that load found.
     warnings.extend(host.take_key_warning());
 
-    // Publishes this load's providers in one step. Until here every reader
-    // still sees the generation that was serving, so a `/reload` never opens a
-    // window in which a registered provider answers "unknown".
+    // Model resolution must wait until the plugin has checked the shared options.
     let loaded = host.loaded_plugins()?;
     claude_code::configure_plugin(
         loaded.iter().any(|name| name == claude_code::PLUGIN),
         config.plugins.opts.get(claude_code::PLUGIN),
     );
+    // Publishes this load's providers in one step. Until here every reader
+    // still sees the generation that was serving, so a `/reload` never opens a
+    // window in which a registered provider answers "unknown".
     maki_providers::plugin::commit_load();
 
     Ok((config, sanitize_warnings(&warnings)))
@@ -337,6 +336,7 @@ mod tests {
     use maki_agent::tools::ToolRegistry;
     use maki_config::RawConfig;
     use maki_lua::{Interaction, PluginHost};
+    use maki_providers::claude_code::PLUGIN;
     use maki_providers::{Model, Timeouts, provider};
     use serde_json::{Value, json};
     use test_case::test_case;
@@ -344,7 +344,6 @@ mod tests {
 
     use super::{BuiltinFailure, load_plugins};
 
-    const PLUGIN: &str = "claude_code";
     /// A builtin whose `max_file_size_mb` has a minimum.
     const OTHER_PLUGIN: &str = "index";
     const MODEL: &str = "claude-code/claude-haiku-4-5";

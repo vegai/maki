@@ -5,6 +5,8 @@ use std::process::Command;
 
 use tempfile::{TempDir, tempdir};
 
+pub const CONFIG_DIR: &str = "config/maki";
+pub const STATE_DIR: &str = "state/maki";
 const PASSED: &[&str] = &["PATH", "USER", "LANG", "TERM"];
 const USER_DIRS: &[(&str, &str)] = &[
     ("HOME", "home"),

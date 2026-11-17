@@ -21,8 +21,8 @@ use serde_json::{Map, Value, json};
 use tempfile::{tempdir, tempdir_in};
 
 use super::support::{
-    ARTIFACT_LINE, BASH_SRC, CLAUDE_CONFIG_ENV, IMPORT_TOOL, SNAPSHOT_DIR, TOOL, WRITE_SRC,
-    contents, developer_login, executable, git, load, on_path, tool_reply, write,
+    BASH_SRC, CLAUDE_CONFIG_ENV, HOME_ENV, IMPORT_TOOL, SNAPSHOT_DIR, TOOL, WRITE_SRC, artifact_id,
+    commit_repo, contents, developer_login, executable, load, on_path, tool_reply, write,
 };
 
 const RUNTIME_ENV: &str = "XDG_RUNTIME_DIR";
@@ -32,7 +32,6 @@ const CLAUDE: &str = "claude";
 const OUTSIDE_DIR: &str = "outside";
 const PROJECT_DIR: &str = "proj";
 const HOME_DIR: &str = "home";
-const HOME_ENV: &str = "HOME";
 const HOME_FILE: &str = "home-visibility.txt";
 const HOME_CONTENT: &str = "HOME-VISIBILITY-7c2b";
 const OTHER_REPO_DIR: &str = "other";
@@ -186,10 +185,10 @@ const LATER_SECRET: &str = "LATER-SECRET-3";
 /// shows it never changed.
 const MASKED_WRITE: &str = "shell_planted";
 const LINKED_FILE: &str = "linked.md";
-const ADDED_FILE: &str = "src/added.rs";
+const LIVE_ADDED_FILE: &str = "src/added.rs";
 const PLANTED_FILE: &str = "planted.txt";
 const ARTIFACTS_DIR: &str = "artifacts";
-const REPORTED_CHANGES: [&str; 2] = ["M notes.md", "A src/added.rs"];
+const LIVE_CHANGES: [&str; 2] = ["M notes.md", "A src/added.rs"];
 
 /// A tool call on a target: the tool, the input key naming the target, and
 /// the target's path in the fixture root.
@@ -681,6 +680,7 @@ fn live_reads_are_refused_and_instructions_stay_out() {
 #[test]
 #[ignore = "runs the installed claude CLI on the subscription of the caller"]
 fn live_a_coding_worker_changes_only_its_snapshot() {
+    let login = developer_login();
     let home = env::var_os(HOME_ENV).expect("the qualification needs HOME");
     let home_fixture = tempdir_in(home).unwrap();
     let home_file = home_fixture.path().canonicalize().unwrap().join(HOME_FILE);
@@ -689,12 +689,9 @@ fn live_a_coding_worker_changes_only_its_snapshot() {
     let root = fixture_dir.path().canonicalize().unwrap();
     let project = root.join(PROJECT_DIR);
     let outside = root.join(OUTSIDE_DIR);
-    write(&project.join(NOTES), NOTES_BEFORE);
-    write(&project.join(".env"), &format!("API_TOKEN={ENV_SECRET}\n"));
+    let env_file = format!("API_TOKEN={ENV_SECRET}\n");
+    commit_repo(&project, &[(NOTES, NOTES_BEFORE), (".env", &env_file)]);
     fs::create_dir_all(&outside).unwrap();
-    git(&project, &["init", "-q"]);
-    git(&project, &["add", "-A"]);
-    git(&project, &["commit", "-q", "-m", "fixture"]);
     let before = contents(&project);
 
     let later = root
@@ -708,7 +705,7 @@ fn live_a_coding_worker_changes_only_its_snapshot() {
     );
     let mut opts = Map::new();
     opts.insert("executable".into(), json!(recording_claude(&root)));
-    opts.insert("config_dir".into(), json!(developer_login()));
+    opts.insert("config_dir".into(), json!(login));
     opts.insert("artifact_dir".into(), json!(root.join(ARTIFACTS_DIR)));
     opts.insert("prepare".into(), json!(plant_later));
     let (reg, host) = load(opts);
@@ -769,12 +766,8 @@ fn live_a_coding_worker_changes_only_its_snapshot() {
         );
         runs
     };
-    let id = reply
-        .split(ARTIFACT_LINE)
-        .nth(1)
-        .and_then(|rest| rest.split(',').next())
-        .expect("the reply gives its artifact");
-    let recorded = root.join(ARTIFACTS_DIR).join(id).join(SNAPSHOT_DIR);
+    let id = artifact_id(&reply);
+    let recorded = root.join(ARTIFACTS_DIR).join(&id).join(SNAPSHOT_DIR);
     let recorded_dir = recorded.canonicalize().unwrap();
     assert!(
         shell(SHELL_DIR)
@@ -822,7 +815,7 @@ fn live_a_coding_worker_changes_only_its_snapshot() {
         !raw.contains(LATER_SECRET),
         "a file that came next to the artifact after maki set the sandbox went to the model"
     );
-    for change in REPORTED_CHANGES {
+    for change in LIVE_CHANGES {
         assert!(reply.contains(change), "{change} missing from: {reply}");
     }
     assert!(contents(&project) == before, "the run changed the checkout");
@@ -830,7 +823,7 @@ fn live_a_coding_worker_changes_only_its_snapshot() {
     maki_lua::test_support::runtime()
         .block_on(tool_reply(&reg, &ctx, IMPORT_TOOL, json!({ "id": id })))
         .expect("the import must apply");
-    for file in [NOTES, ADDED_FILE] {
+    for file in [NOTES, LIVE_ADDED_FILE] {
         assert_eq!(
             fs::read(project.join(file)).unwrap(),
             fs::read(recorded.join(file)).unwrap(),
@@ -908,10 +901,7 @@ fn live_coding_worker_cannot_connect_to_runtime_sockets() {
     let fixture = tempdir().unwrap();
     let root = fixture.path().canonicalize().unwrap();
     let project = root.join(PROJECT_DIR);
-    write(&project.join(NOTES), NOTES_BEFORE);
-    git(&project, &["init", "-q"]);
-    git(&project, &["add", "-A"]);
-    git(&project, &["commit", "-qm", "fixture"]);
+    commit_repo(&project, &[(NOTES, NOTES_BEFORE)]);
     let opts = Map::from_iter([
         ("executable".into(), json!(recording_claude(&root))),
         ("config_dir".into(), json!(developer_login())),

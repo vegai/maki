@@ -191,7 +191,6 @@ fn discover_models(policy: Arc<ModelPolicy>, tx: WeakUnboundedSender<Incoming>) 
                     let _ = tx.send(Incoming::Models(batch.models));
                 }
             },
-            None,
             ModelListing::Cached,
         )
         .await;

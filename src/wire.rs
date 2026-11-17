@@ -8,7 +8,9 @@ const PRIORITY: &str = "low";
 const PROVIDER_WAITING: &str = "provider_waiting";
 pub const INIT: &str = "init";
 pub const API_RETRY: &str = "api_retry";
+pub const NOTICE: &str = "notice";
 pub const SUCCESS: &str = "success";
+pub const RESULT: &str = "result";
 pub const ERROR_DURING_EXECUTION: &str = "error_during_execution";
 const SYSTEM: &str = "system";
 const ERROR_MAX_TURNS: &str = "error_max_turns";
@@ -68,8 +70,23 @@ impl<'a> ProviderNotice<'a> {
     }
 }
 
+/// Claude Code has no event for this, so it takes the SDK's shape. Without it
+/// a woken turn's assistant messages follow the last turn's with nothing
+/// between them that says what woke it.
 #[derive(Serialize)]
-struct SystemEvent<'a, T> {
+pub struct NoticeEvent<'a> {
+    pub text: &'a str,
+}
+
+#[derive(Serialize)]
+pub struct RetryEvent<'a> {
+    pub attempt: u32,
+    pub retry_delay_ms: u64,
+    pub error: &'a str,
+}
+
+#[derive(Serialize)]
+pub struct SystemEvent<'a, T> {
     #[serde(rename = "type")]
     event_type: &'static str,
     subtype: &'static str,
@@ -79,11 +96,11 @@ struct SystemEvent<'a, T> {
     session_id: &'a SessionRef,
 }
 
-pub fn system_event<T: Serialize>(
-    session_id: &SessionRef,
+pub fn system_event<'a, T: Serialize>(
+    session_id: &'a SessionRef,
     subtype: &'static str,
     extra: T,
-) -> impl Serialize {
+) -> SystemEvent<'a, T> {
     SystemEvent {
         event_type: SYSTEM,
         subtype,
@@ -110,27 +127,18 @@ pub fn failure_subtype(reason: DoneReason) -> Option<&'static str> {
 mod tests {
     use test_case::test_case;
 
-    use super::{claude_to_maki_tool_name, maki_to_claude_tool_name};
+    use std::collections::HashSet;
 
-    #[test_case("bash", "Bash" ; "bash")]
-    #[test_case("read", "Read" ; "read")]
-    #[test_case("edit", "Edit" ; "edit")]
-    #[test_case("write", "Write" ; "write")]
-    #[test_case("grep", "Grep" ; "grep")]
-    #[test_case("glob", "Glob" ; "glob")]
-    #[test_case("todo_write", "TodoWrite" ; "todo_write")]
-    #[test_case("webfetch", "WebFetch" ; "webfetch")]
-    #[test_case("websearch", "WebSearch" ; "websearch")]
-    #[test_case("task", "Task" ; "task")]
-    #[test_case("multiedit", "MultiEdit" ; "multiedit")]
-    #[test_case("code_execution", "CodeExecution" ; "code_execution")]
-    #[test_case("index", "Index" ; "index")]
-    #[test_case("memory", "Memory" ; "memory")]
-    #[test_case("question", "Question" ; "question")]
-    #[test_case("skill", "Skill" ; "skill")]
-    fn sdk_tool_names_round_trip(maki: &str, claude: &str) {
-        assert_eq!(maki_to_claude_tool_name(maki), claude);
-        assert_eq!(claude_to_maki_tool_name(claude), maki);
+    use super::{TOOL_NAME_MAP, claude_to_maki_tool_name, maki_to_claude_tool_name};
+
+    #[test]
+    fn sdk_tool_names_are_unique_and_round_trip() {
+        let mut seen = HashSet::new();
+        for &(maki, claude) in TOOL_NAME_MAP {
+            assert!(seen.insert(maki) && seen.insert(claude), "{maki}/{claude}");
+            assert_eq!(maki_to_claude_tool_name(maki), claude);
+            assert_eq!(claude_to_maki_tool_name(claude), maki);
+        }
     }
 
     #[test_case("unknown_tool" ; "maki_spelling")]

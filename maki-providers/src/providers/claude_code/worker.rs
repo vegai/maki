@@ -1,6 +1,6 @@
 //! Launch policy shared by the provider and plugin, and the plugin worker protocol.
 
-use super::run::{Launch, Limits, command, private_dir_async, probe_with, supervised};
+use super::run::{Launch, command, private_dir_async, probe_with, supervised};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder};
@@ -24,7 +24,7 @@ use crate::ProviderUsage;
 
 use super::OAUTH_TOKEN_ENV;
 use super::checks::{self, DISABLED, EFFECTIVE, PERMISSIONS_KEY};
-use super::error::{Error, Problem};
+use super::error::{Error, Problem, Wait};
 use super::stream::{
     self, API_ERROR_MARK, CACHE_CREATION_INPUT_TOKENS, CACHE_READ_INPUT_TOKENS, Handshake,
     INPUT_TOKENS, OUTPUT_TOKENS, StreamMode, count,
@@ -32,9 +32,9 @@ use super::stream::{
 
 pub use super::MAX_EVENT_BYTES;
 pub use super::checks::{
-    GIT_ENTRY, GITDIR_PREFIX, git_directory, handshake_input, inside_checkout,
+    COMMONDIR, GIT_ENTRY, GITDIR_PREFIX, MINIMUM_VERSION, git_directory, handshake_input,
 };
-pub use super::run::invalidate_version;
+use super::run::invalidate_version;
 use super::settings::{self, base_settings};
 use super::stream::usage_of as plan_usage;
 pub use super::stream::{EventKind, TOOL_USE_BLOCK, user_message};
@@ -164,7 +164,7 @@ impl WorkerPolicy {
             model,
             &self.profile.tools().join(","),
             self.profile.mode(),
-            &self.settings().to_string(),
+            &self.settings.to_string(),
         );
         args.extend(
             [
@@ -178,8 +178,10 @@ impl WorkerPolicy {
         args
     }
 
-    pub fn settings(&self) -> &Value {
-        &self.settings
+    fn problem(&self, account: &Value, settings: &Value, hooks: &Value) -> Option<Problem> {
+        checks::account_problem(account, self.profile.modes())
+            .or_else(|| checks::policy_problem(settings, hooks, false))
+            .or_else(|| worker_problem(&settings[EFFECTIVE], &self.settings))
     }
 }
 
@@ -215,12 +217,23 @@ impl From<PolicyInput> for WorkerPolicy {
     }
 }
 
-pub fn executable(name: &str, cwd: &Path) -> Result<PathBuf, Error> {
-    crate::process::find_program(name, cwd).ok_or_else(|| Error::ExecutableMissing(name.to_owned()))
+pub fn executable(name: &str) -> Result<PathBuf, Error> {
+    let cwd = std::env::current_dir().map_err(Error::io("find the current directory"))?;
+    crate::process::find_program(name, &cwd)
+        .ok_or_else(|| Error::ExecutableMissing(name.to_owned()))
+}
+
+/// Resolves an artifact root, including a missing tail, outside the checkout.
+pub fn artifact_root(root: &Path, cwd: &Path, denied: &[PathBuf]) -> Result<PathBuf, Error> {
+    let resolved = resolve_missing(root).map_err(Error::path("read", root))?;
+    if checks::inside_checkout(&resolved, cwd, denied) {
+        return Err(Error::ArtifactInProject(resolved));
+    }
+    Ok(resolved)
 }
 
 pub fn startup_late(seconds: u64) -> String {
-    Error::Late(stream::Wait::Startup, seconds).to_string()
+    Error::Late(Wait::Startup, seconds).to_string()
 }
 
 pub fn worker_exit(code: i32, after_result: bool) -> Error {
@@ -298,27 +311,16 @@ impl WorkerHandshake {
     }
 
     fn feed(&mut self, event: &Value) -> Result<stream::Step, Error> {
-        Ok(match stream::classify(event, StreamMode::Worker, false)? {
-            EventKind::ControlResponse => {
-                if self.answer(&event["response"])? {
-                    stream::Step::Ready
-                } else {
-                    stream::Step::Nothing
-                }
-            }
-            EventKind::Result => {
-                return Err(stream::result_failure(event).unwrap_or(Error::UncheckedStart));
-            }
-            EventKind::RateLimit | EventKind::Alive | EventKind::System => stream::Step::Nothing,
-            _ => return Err(Error::UncheckedStart),
-        })
+        let kind = stream::classify(event, StreamMode::Worker, false)?;
+        self.answers
+            .feed_kind(event, kind, None, |account, settings, hooks| {
+                self.policy.problem(account, settings, hooks)
+            })
     }
 
     pub fn answer(&mut self, response: &Value) -> Result<bool, Error> {
         self.answers.answer(response, |account, settings, hooks| {
-            checks::account_problem(account, self.policy.profile.modes())
-                .or_else(|| checks::policy_problem(settings, hooks, false))
-                .or_else(|| worker_problem(&settings[EFFECTIVE], self.policy.settings()))
+            self.policy.problem(account, settings, hooks)
         })
     }
 
@@ -339,9 +341,11 @@ pub struct LaunchPreparation {
     pub denied: Vec<PathBuf>,
 }
 
+/// An empty value counts as unset.
 fn env_value(vars: &[(String, String)], name: &str) -> Option<OsString> {
     vars.iter()
         .find(|(key, _)| key == name)
+        .filter(|(_, value)| !value.is_empty())
         .map(|(_, value)| OsString::from(value))
 }
 
@@ -350,39 +354,28 @@ pub fn prepare_launch(
     configured: Option<PathBuf>,
     cwd: &Path,
 ) -> Result<LaunchPreparation, Error> {
-    let var = |name| env_value(&vars, name);
+    let var = |name| env_value(&vars, name).map(PathBuf::from);
     let config_dir = login_dir(&vars, configured.as_deref())?;
-    let temp_dir = var(TMPDIR_ENV)
-        .filter(|path| !path.is_empty())
-        .map_or_else(|| PathBuf::from(UNIX_TEMP_DIR), PathBuf::from);
+    let temp_dir = var(TMPDIR_ENV).unwrap_or_else(|| PathBuf::from(UNIX_TEMP_DIR));
     let temp_dir =
         absolute(&temp_dir).map_err(Error::path("resolve the temporary directory", &temp_dir))?;
-    let cache = var(CACHE_HOME_ENV)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            var(HOME_ENV)
-                .filter(|value| !value.is_empty())
-                .map(|home| PathBuf::from(home).join(DEFAULT_CACHE_DIR))
-        });
     let fallback_dirs = [
-        var(RUNTIME_DIR_ENV)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .map(|root| root.join(SCRATCH_DIRECTORY)),
-        cache.map(|root| root.join(SCRATCH_DIRECTORY)),
-        Some(
-            PathBuf::from(FALLBACK_TEMP_DIR)
-                .join(format!("maki-claude-code-{}", geteuid().as_raw())),
-        ),
+        var(RUNTIME_DIR_ENV),
+        var(CACHE_HOME_ENV).or_else(|| var(HOME_ENV).map(|home| home.join(DEFAULT_CACHE_DIR))),
     ]
     .into_iter()
     .flatten()
+    .map(|root| root.join(SCRATCH_DIRECTORY))
+    .chain([
+        PathBuf::from(FALLBACK_TEMP_DIR).join(format!("maki-claude-code-{}", geteuid().as_raw()))
+    ])
     .collect::<Vec<_>>();
     let (mut env, withheld) = checks::launch_env(vars);
-    env.retain(|(name, value)| name != CONFIG_DIR_ENV || !value.is_empty());
+    env.retain(|(name, value)| {
+        name != TMPDIR_ENV
+            && (name != CONFIG_DIR_ENV || (configured.is_none() && !value.is_empty()))
+    });
     if configured.is_some() {
-        env.retain(|(name, _)| name != CONFIG_DIR_ENV);
         env.push((CONFIG_DIR_ENV.to_owned(), config_dir.display().to_string()));
     }
     let (local_dirs, git_dir) = checks::local_settings_dirs(cwd)?;
@@ -393,7 +386,6 @@ pub fn prepare_launch(
     }
     let denied: Vec<PathBuf> = local_dirs.iter().chain(git_dir.iter()).cloned().collect();
     let temp_dir = scratch_base(&temp_dir, cwd, &denied, fallback_dirs)?;
-    env.retain(|(name, _)| name != TMPDIR_ENV);
     env.push((TMPDIR_ENV.to_owned(), temp_dir.display().to_string()));
     Ok(LaunchPreparation {
         env,
@@ -456,16 +448,15 @@ pub(super) fn login_dir(
     vars: &[(String, String)],
     configured: Option<&Path>,
 ) -> Result<PathBuf, Error> {
-    let var = |name| env_value(vars, name);
     checks::config_dir(
         configured
             .map(OsString::from)
-            .or_else(|| var(CONFIG_DIR_ENV)),
-        var(HOME_ENV),
+            .or_else(|| env_value(vars, CONFIG_DIR_ENV)),
+        env_value(vars, HOME_ENV),
     )
 }
 
-pub fn resolve_missing(path: &Path) -> io::Result<PathBuf> {
+fn resolve_missing(path: &Path) -> io::Result<PathBuf> {
     let mut existing = path;
     let mut missing = Vec::new();
     loop {
@@ -574,19 +565,9 @@ impl WorkerStream {
     pub fn accepted(&self) -> bool {
         self.accepted
     }
-}
 
-pub struct WorkerEvent {
-    pub kind: Option<EventKind>,
-    pub event: Value,
-    pub rate_limit: Option<ProviderUsage>,
-    pub problem: Option<Error>,
-    pub failure: Option<String>,
-}
-
-/// Workers may compact and retry within their own run. Provider turns must preserve maki's
-/// transcript and retry accounting, so their classifier rejects both events.
-impl WorkerStream {
+    /// Workers may compact and retry within their own run. Provider turns must preserve maki's
+    /// transcript and retry accounting, so their classifier rejects both events.
     pub fn feed(&mut self, line: &str) -> Result<WorkerEvent, Error> {
         if line.len() > MAX_EVENT_BYTES {
             return Err(Error::EventTooLarge {
@@ -668,6 +649,14 @@ impl WorkerStream {
             failure,
         })
     }
+}
+
+pub struct WorkerEvent {
+    pub kind: Option<EventKind>,
+    pub event: Value,
+    pub rate_limit: Option<ProviderUsage>,
+    pub problem: Option<Error>,
+    pub failure: Option<String>,
 }
 
 fn usage_counts(usage: &Value) -> Value {
@@ -843,10 +832,6 @@ pub async fn checked_profile(
     startup_secs: u64,
     cancel: impl Future<Output = ()> + Send,
 ) -> Result<String, Error> {
-    let limits = Limits {
-        startup: Duration::from_secs(startup_secs),
-        ..Limits::new(Duration::ZERO)
-    };
     super::run::checked_profile(
         &Launch {
             executable,
@@ -854,7 +839,7 @@ pub async fn checked_profile(
             project: cwd,
             denied,
             temp_dir,
-            limits: &limits,
+            startup: Duration::from_secs(startup_secs),
         },
         cancel,
     )
@@ -864,8 +849,8 @@ pub async fn checked_profile(
 #[cfg(test)]
 mod tests {
     use super::{
-        Error, PolicyInput, Problem, WorkerHandshake, WorkerProbe, WorkerProfile, WorkerStream,
-        checks, stream,
+        Error, PolicyInput, Problem, WorkerEvent, WorkerHandshake, WorkerProbe, WorkerProfile,
+        WorkerStream, checks, stream,
     };
     use super::{
         SANDBOX, TMPDIR_ENV, WorkerPaths, WorkerPolicy, prepare_launch, sandbox_problem,
@@ -895,6 +880,7 @@ mod tests {
     const UNSAFE_SCRATCH_MODE: u32 = 0o755;
 
     const MODEL: &str = "claude-test-model";
+    const SUBSCRIPTION: &str = "Claude Pro";
     const OTHER_MODEL: &str = "claude-other-model";
 
     #[tokio::test]
@@ -928,13 +914,7 @@ mod tests {
     #[test_case(false ; "before_prompt")]
     #[test_case(true ; "after_prompt")]
     fn worker_init_requires_a_prompt(prompted: bool) {
-        let version = checks::minimum_version();
-        let mut stream = WorkerStream::new(version.clone(), PathBuf::from(DENIED), &read_policy());
-        if prompted {
-            stream.mark_prompted();
-        }
-        let init = json!({"type":"system", "subtype":"init", "apiKeySource":"none", "claude_code_version":version, "permissionMode":checks::DEFAULT_MODE, "tools": WorkerProfile::Read.tools(), "mcp_servers":[], "plugins":[], "cwd":DENIED});
-        let event = stream.feed(&init.to_string()).unwrap();
+        let (stream, event) = initialized(prompted);
         assert_eq!(
             matches!(event.problem, Some(Error::UncheckedStart)),
             !prompted
@@ -968,12 +948,21 @@ mod tests {
         })
     }
 
+    /// A read worker's stream after its init, and the event of the init.
+    fn initialized(prompted: bool) -> (WorkerStream, WorkerEvent) {
+        let version = checks::MINIMUM_VERSION;
+        let mut stream = WorkerStream::new(version.into(), PathBuf::from(DENIED), &read_policy());
+        if prompted {
+            stream.mark_prompted();
+        }
+        let init = json!({"type":"system", "subtype":"init", "apiKeySource":checks::NO_KEY_SOURCE, "claude_code_version":version, "permissionMode":checks::DEFAULT_MODE, "tools": WorkerProfile::Read.tools(), "mcp_servers":[], "plugins":[], "cwd":DENIED});
+        let event = stream.feed(&init.to_string()).unwrap();
+        (stream, event)
+    }
+
     fn read_stream() -> WorkerStream {
-        let version = checks::minimum_version();
-        let mut stream = WorkerStream::new(version.clone(), PathBuf::from(DENIED), &read_policy());
-        stream.mark_prompted();
-        let init = json!({"type":"system", "subtype":"init", "apiKeySource":"none", "claude_code_version":version, "permissionMode":checks::DEFAULT_MODE, "tools": WorkerProfile::Read.tools(), "mcp_servers":[], "plugins":[], "cwd":DENIED});
-        assert!(stream.feed(&init.to_string()).unwrap().problem.is_none());
+        let (mut stream, init) = initialized(true);
+        assert!(init.problem.is_none());
         stream.set_model(MODEL.into());
         stream
     }
@@ -1002,16 +991,11 @@ mod tests {
         assert!(matches!(result.problem, Some(Error::NoModel)));
     }
 
-    fn handshake() -> WorkerHandshake {
-        let policy = read_policy();
-        WorkerHandshake::new(Arc::new(policy))
-    }
-
     #[test]
     fn worker_checks_the_account_before_the_policy() {
-        let mut handshake = handshake();
+        let mut handshake = WorkerHandshake::new(Arc::new(read_policy()));
         let responses = [
-            json!({"current_permission_mode":"default", "account":{"apiProvider":"other", "subscriptionType":"Claude Pro"}}),
+            json!({"current_permission_mode":checks::DEFAULT_MODE, "account":{"apiProvider":"other", "subscriptionType":SUBSCRIPTION}}),
             Value::Null,
             Value::Null,
         ];
@@ -1030,11 +1014,11 @@ mod tests {
     #[test]
     fn a_complete_worker_handshake_accepts_the_policy() {
         let policy = read_policy();
-        let settings = policy.settings().clone();
+        let settings = policy.settings.clone();
         let mut handshake = WorkerHandshake::new(Arc::new(policy));
         let responses = [
-            json!({"current_permission_mode":"default", "account":{"apiProvider":"firstParty", "subscriptionType":"Claude Pro"}}),
-            json!({"effective":settings, "sources":[{"source":"flagSettings", "settings":settings}]}),
+            json!({"current_permission_mode":checks::DEFAULT_MODE, "account":{"apiProvider":checks::FIRST_PARTY, "subscriptionType":SUBSCRIPTION}}),
+            json!({"effective":settings, "sources":[{"source":checks::FLAG_SOURCE, "settings":settings}]}),
             json!({"hooks":[], "policy":{"allDisabled":true,"policyHookCount":0}}),
         ];
         for (index, (step, response)) in checks::HANDSHAKE.iter().zip(responses).enumerate() {
@@ -1118,8 +1102,7 @@ mod tests {
                 allow_write: Vec::new(),
             }),
         })
-        .settings()
-        .clone()
+        .settings
     }
 
     #[test_case("/excludedCommands", json!(null), Problem::SandboxOutside ; "null_command_exclusions")]

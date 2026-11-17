@@ -2,7 +2,7 @@
 //! identifiers that Claude Code accepts.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use serde::Serialize;
 
@@ -108,8 +108,8 @@ impl Catalog {
         Ok((catalog, offered))
     }
 
-    pub fn exposed(&self) -> HashSet<String> {
-        self.to_maki.keys().cloned().collect()
+    pub fn exposed(&self) -> impl Iterator<Item = &str> + Clone {
+        self.to_maki.keys().map(String::as_str)
     }
 
     pub fn maki_name(&self, exposed: &str) -> Option<&str> {
@@ -185,10 +185,6 @@ pub(super) fn map_batch_names(input: &mut Value, name: impl Fn(&str) -> String) 
     }
 }
 
-fn expose_input(input: &mut Value) {
-    map_batch_names(input, exposed_name);
-}
-
 /// Anthropic caches prefixes at block boundaries. Keep each transcript message in a separate
 /// block so later requests reuse earlier messages.
 ///
@@ -208,7 +204,7 @@ pub(crate) fn transcript(messages: &[Message]) -> Result<Vec<String>, Error> {
                 } => {
                     let input = if name == BATCH_TOOL {
                         let mut input = input.clone();
-                        expose_input(&mut input);
+                        map_batch_names(&mut input, exposed_name);
                         Cow::Owned(input)
                     } else {
                         Cow::Borrowed(input)
@@ -280,7 +276,7 @@ mod tests {
     use super::super::error::Error;
     use super::{
         BATCH_CALL_TOOL, BATCH_CALLS, Catalog, EXPOSED_PREFIX, MAX_EXPOSED_NAME, SERVER,
-        TRANSCRIPT_HEADER, entry_of, expose_input, fits, server_name, transcript,
+        TRANSCRIPT_HEADER, entry_of, exposed_name, fits, map_batch_names, server_name, transcript,
     };
     use crate::{ContentBlock, ImageMediaType, ImageSource, Message, Role};
 
@@ -308,7 +304,7 @@ mod tests {
     #[test_case(json!(true) ; "boolean")]
     fn malformed_batch_history_is_preserved(mut input: Value) {
         let original = input.clone();
-        expose_input(&mut input);
+        map_batch_names(&mut input, exposed_name);
         assert_eq!(input, original);
     }
 
@@ -350,21 +346,21 @@ mod tests {
     #[test]
     fn a_long_name_is_shortened_to_fit_and_still_maps_back() {
         let (catalog, _) = Catalog::new(&tools(&[LONG_NAME])).unwrap();
-        let exposed = catalog.exposed().into_iter().next().unwrap();
+        let exposed = catalog.exposed().next().unwrap();
         assert!(exposed.len() <= MAX_EXPOSED_NAME, "{exposed}");
-        assert_eq!(catalog.maki_name(&exposed), Some(LONG_NAME));
+        assert_eq!(catalog.maki_name(exposed), Some(LONG_NAME));
     }
 
     #[test_case("a.b" ; "a_dot")]
     #[test_case("a b" ; "a_space")]
     fn a_name_with_a_character_mcp_refuses_is_rewritten(name: &str) {
         let (catalog, _) = Catalog::new(&tools(&[name])).unwrap();
-        let exposed = catalog.exposed().into_iter().next().unwrap();
+        let exposed = catalog.exposed().next().unwrap();
         assert!(
             fits(exposed.trim_start_matches(EXPOSED_PREFIX)),
             "{exposed}"
         );
-        assert_eq!(catalog.maki_name(&exposed), Some(name));
+        assert_eq!(catalog.maki_name(exposed), Some(name));
     }
 
     #[test]
@@ -477,7 +473,7 @@ mod tests {
         let call = json!({ BATCH_CALL_TOOL: "read", "args": {} });
         let mut input =
             json!({ BATCH_CALLS: if encoded { Value::String(call.to_string()) } else { call } });
-        expose_input(&mut input);
+        map_batch_names(&mut input, exposed_name);
         assert_eq!(input[BATCH_CALLS][BATCH_CALL_TOOL], "mcp__maki__read");
     }
 
@@ -520,8 +516,8 @@ mod tests {
     #[test]
     fn a_renamed_tool_keeps_its_exposed_name_in_the_history() {
         let (catalog, _) = Catalog::new(&tools(&[LONG_NAME])).unwrap();
-        let exposed = catalog.exposed().into_iter().next().unwrap();
-        let called = catalog.maki_name(&exposed).unwrap();
+        let exposed = catalog.exposed().next().unwrap();
+        let called = catalog.maki_name(exposed).unwrap();
         let reply = Message {
             role: Role::Assistant,
             content: vec![ContentBlock::tool_use("toolu_1", called, json!({}))],

@@ -2,29 +2,27 @@
 //! group only while the child's pid still names that group.
 
 mod child;
-pub use child::{ChildExit, ChildGuard};
+#[cfg(unix)]
+pub use child::ChildExit;
+pub use child::ChildGuard;
 
 #[cfg(target_os = "linux")]
 pub mod guard;
 
 use std::env;
 use std::ffi::OsStr;
-#[cfg(windows)]
-use std::ffi::OsString;
-use std::future::Future;
 use std::path::{Path, PathBuf, absolute};
 #[cfg(windows)]
 use std::process::{Command, Stdio};
-use std::time::Instant;
-
-use tokio::time::sleep_until;
 
 #[cfg(unix)]
 use rustix::fs::{Access, access};
 #[cfg(unix)]
-use rustix::io::Errno;
+use rustix::io::{self, Errno, retry_on_intr};
 #[cfg(unix)]
-use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
+use rustix::process::{
+    Pid, Signal, WaitId, WaitIdOptions, WaitIdStatus, kill_process_group, waitid,
+};
 
 pub const STDERR_TAIL_LINES: usize = 10;
 pub const STDERR_LINE_BYTES: usize = 4096;
@@ -46,14 +44,6 @@ pub fn cap_stderr_line(line: &str) -> String {
     }
 }
 
-pub(crate) async fn within<T>(deadline: Instant, work: impl Future<Output = T>) -> Option<T> {
-    tokio::select! {
-        biased;
-        value = work => Some(value),
-        () = sleep_until(deadline.into()) => None,
-    }
-}
-
 /// Returns the absolute path `name` runs as from `cwd`, using maki's `$PATH`
 /// (and `$PATHEXT` on Windows).
 pub fn find_program(name: &str, cwd: &Path) -> Option<PathBuf> {
@@ -63,7 +53,7 @@ pub fn find_program(name: &str, cwd: &Path) -> Option<PathBuf> {
 /// Resolve with an explicit PATH, skipping files that cannot run. Windows also uses PATHEXT.
 pub fn find_program_with_path(name: &str, cwd: &Path, path: Option<&OsStr>) -> Option<PathBuf> {
     #[cfg(windows)]
-    let extensions: Option<OsString> = env::var_os(PATHEXT);
+    let extensions = env::var_os(PATHEXT);
     #[cfg(windows)]
     let extensions = extensions.as_deref();
     #[cfg(not(windows))]
@@ -147,35 +137,20 @@ pub fn pid_of(pid: u32) -> Option<Pid> {
 /// group. Return false if the wait fails.
 #[cfg(unix)]
 pub fn wait_without_reaping(pid: u32) -> bool {
-    let Some(pid) = pid_of(pid) else {
-        return false;
-    };
-    loop {
-        match waitid(
-            WaitId::Pid(pid),
-            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
-        ) {
-            Err(Errno::INTR) => continue,
-            result => return result.is_ok(),
-        }
-    }
+    waitid_nowait(pid, WaitIdOptions::empty()).is_ok()
 }
 
 /// Check for exit while reserving the child's pid. The caller must prevent concurrent reaps.
 #[cfg(unix)]
 pub fn exited_without_reaping(pid: u32) -> bool {
-    let Some(pid) = pid_of(pid) else {
-        return false;
-    };
-    loop {
-        match waitid(
-            WaitId::Pid(pid),
-            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
-        ) {
-            Err(Errno::INTR) => continue,
-            result => return matches!(result, Ok(Some(_))),
-        }
-    }
+    matches!(waitid_nowait(pid, WaitIdOptions::NOHANG), Ok(Some(_)))
+}
+
+#[cfg(unix)]
+fn waitid_nowait(pid: u32, options: WaitIdOptions) -> io::Result<Option<WaitIdStatus>> {
+    let pid = pid_of(pid).ok_or(Errno::SRCH)?;
+    let options = options | WaitIdOptions::EXITED | WaitIdOptions::NOWAIT;
+    retry_on_intr(|| waitid(WaitId::Pid(pid), options))
 }
 
 /// Kills the process group of leader `pid`. Call it only before the leader

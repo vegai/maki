@@ -23,9 +23,7 @@ mod transcript;
 #[cfg(target_os = "linux")]
 pub mod worker;
 #[cfg(all(test, target_os = "linux"))]
-use linux::WAIT;
-#[cfg(all(test, target_os = "linux"))]
-use linux::{agent_error, utf8_vars};
+use linux::agent_error;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(not(target_os = "linux"))]

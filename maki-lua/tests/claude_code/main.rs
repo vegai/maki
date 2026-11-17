@@ -2,6 +2,8 @@
 //! tests are ignored by default.
 #![cfg(target_os = "linux")]
 
+#[path = "../common/mod.rs"]
+mod common;
 mod environment;
 mod import;
 mod policy;

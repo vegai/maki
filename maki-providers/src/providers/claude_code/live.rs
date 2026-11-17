@@ -21,10 +21,11 @@ use tokio::time::sleep;
 
 use super::checks::launch_env;
 use super::error::Error;
+use super::linux::{agent_error, utf8_vars};
 use super::run::{Exchange, Launch, Limits, Request, Thinking, models, request};
 use super::transcript::{BATCH_CALL_TOOL, BATCH_CALLS, BATCH_TOOL};
 use super::worker::login_dir;
-use super::{SLUG, agent_error, utf8_vars};
+use super::{SLUG, STARTUP_TIMEOUT_SECS};
 use crate::model::Model;
 use crate::process::find_program;
 use crate::providers::catalog::warm_catalog;
@@ -39,6 +40,7 @@ const OTHER_WORD: &str = "beta";
 const MEANING: &str = "FIRST-LETTER-7";
 const OTHER_MEANING: &str = "SECOND-LETTER-3";
 const IDLE: Duration = Duration::from_secs(120);
+const STARTUP: Duration = Duration::from_secs(STARTUP_TIMEOUT_SECS);
 const TINY_OUTPUT_CAP: u32 = 20;
 const LONG_STORY: &str = "Write a 150-word story about a lighthouse.";
 const ADAPTIVE_MODEL: &str = "claude-sonnet-5";
@@ -131,8 +133,9 @@ impl Live {
                 project: &self.cwd,
                 denied: &[],
                 temp_dir: &env::temp_dir(),
-                limits: &Limits::new(IDLE),
+                startup: STARTUP,
             },
+            limits: &Limits::new(IDLE),
             model,
             exchange: Exchange {
                 system: SYSTEM,
@@ -218,7 +221,7 @@ fn live_the_listed_models_are_full_ids_with_a_price() {
                 project: &live.cwd,
                 denied: &[],
                 temp_dir: &env::temp_dir(),
-                limits: &Limits::new(IDLE),
+                startup: STARTUP,
             },
             &Mutex::default(),
         ))

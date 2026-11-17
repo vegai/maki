@@ -39,6 +39,7 @@ pub struct RequestScope<'a> {
     pub cwd: &'a Path,
 }
 
+/// Ordered weakest first: queued listings coalesce to their max.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ModelListing {
     Cached,
@@ -288,7 +289,6 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
 pub async fn fetch_all_models(
     policy: &ModelPolicy,
     mut on_ready: impl FnMut(ModelBatch),
-    on_done: Option<Box<dyn FnOnce() + Send>>,
     listing: ModelListing,
 ) {
     let (tx, mut rx) = unbounded_channel();
@@ -344,9 +344,6 @@ pub async fn fetch_all_models(
     while let Some(mut batch) = rx.recv().await {
         batch.models.retain(|spec| policy.allows(spec));
         on_ready(batch);
-    }
-    if let Some(done) = on_done {
-        done();
     }
 }
 

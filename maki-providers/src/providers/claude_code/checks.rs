@@ -2,7 +2,6 @@
 //! Native Lua helpers apply these checks to plugin workers.
 //! Here the process hands tool calls to maki and runs no tools itself.
 
-use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read};
@@ -17,7 +16,7 @@ use super::error::{Error, Problem};
 use super::stream::INITIALIZE;
 use super::worker::{CONFIG_DIR_ENV, HOME_ENV, TMPDIR_ENV};
 
-pub(crate) const MINIMUM_VERSION: [u64; 3] = [2, 1, 284];
+pub const MINIMUM_VERSION: &str = "2.1.284";
 pub(crate) const ACCOUNT_ANSWER: &str = "account";
 pub(crate) const SETTINGS_ANSWER: &str = "settings";
 pub(crate) const HOOKS_ANSWER: &str = "hooks";
@@ -136,7 +135,7 @@ pub(crate) const CONNECTED: &str = "connected";
 const UNNAMED_SOURCE: &str = "unnamed";
 pub const GIT_ENTRY: &str = ".git";
 pub const GITDIR_PREFIX: &str = "gitdir:";
-const COMMONDIR_FILE: &str = "commondir";
+pub const COMMONDIR: &str = "commondir";
 
 // The fields of Claude Code's answers and init event that the checks read.
 pub(super) const ACCOUNT: &str = "account";
@@ -174,10 +173,6 @@ pub fn inside_checkout(path: &Path, project: &Path, denied: &[PathBuf]) -> bool 
     path.starts_with(project) || denied.iter().any(|dir| path.starts_with(dir))
 }
 
-pub(super) fn minimum_version() -> String {
-    MINIMUM_VERSION.map(|part| part.to_string()).join(".")
-}
-
 fn version_parts(version: &str) -> Option<[u64; 3]> {
     let mut parts = version.split('.').map(|part| {
         part.bytes()
@@ -193,10 +188,10 @@ fn version_parts(version: &str) -> Option<[u64; 3]> {
 pub(crate) fn profile(output: &str) -> Result<String, Error> {
     let version = output.split_whitespace().next().unwrap_or_default();
     let parts = version_parts(version).ok_or_else(|| Error::UnknownVersion(output.to_owned()))?;
-    if parts < MINIMUM_VERSION {
+    if version_parts(MINIMUM_VERSION).is_some_and(|oldest| parts < oldest) {
         return Err(Error::TooOld {
             version: version.to_owned(),
-            oldest: minimum_version(),
+            oldest: MINIMUM_VERSION.into(),
         });
     }
     Ok(version.to_owned())
@@ -279,7 +274,7 @@ pub fn git_directory(entry: &Path) -> io::Result<PathBuf> {
 fn main_checkout(git_file: &Path) -> io::Result<(Option<PathBuf>, Option<PathBuf>)> {
     let gitdir = git_directory(git_file)?;
     let common = match limited_text(
-        &gitdir.join(COMMONDIR_FILE),
+        &gitdir.join(COMMONDIR),
         MAX_GIT_PATH_BYTES,
         GIT_PATH_TOO_LARGE,
     ) {
@@ -553,7 +548,6 @@ pub(crate) struct InitExpect<'a> {
     /// The model, or a dated snapshot of it.
     pub model: &'a str,
     pub cwd: &'a Path,
-    pub tools: &'a HashSet<String>,
 }
 
 /// Claude Code ships its own plugins, and a version or a feature gate can add
@@ -636,7 +630,6 @@ pub fn handshake_input() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use std::ffi::OsString;
     use std::fs::{self, File};
     use std::io::ErrorKind;
@@ -651,14 +644,14 @@ mod tests {
     use super::super::error::{Error, Problem};
     use super::NOT_A_FILE;
     use super::{
-        COMMONDIR_FILE, CONNECTED, DEFAULT_MODE, ESSENTIAL_TRAFFIC_ONLY, FLAG_SOURCE, GIT_ENTRY,
-        InitExpect, MAX_GIT_PATH_BYTES, MAX_SETTINGS_BYTES, NO_ATTACHMENTS, NO_KEY_SOURCE,
+        COMMONDIR, CONNECTED, DEFAULT_MODE, ESSENTIAL_TRAFFIC_ONLY, FLAG_SOURCE, GIT_ENTRY,
+        MAX_GIT_PATH_BYTES, MAX_SETTINGS_BYTES, MINIMUM_VERSION, NO_ATTACHMENTS, NO_KEY_SOURCE,
         NOT_AN_OBJECT, POLICY_SOURCE, SETTINGS_TOO_LARGE, UNREADABLE_FILE, account_problem,
-        config_dir, file_conflicts, init_problem, launch_env, local_settings_dirs, minimum_version,
-        plugins_problem, policy_problem, profile, settings_conflicts,
+        config_dir, file_conflicts, init_problem, launch_env, local_settings_dirs, plugins_problem,
+        policy_problem, profile, settings_conflicts,
     };
 
-    const VERSION: &str = "2.1.284";
+    const VERSION: &str = MINIMUM_VERSION;
     const SETTINGS_FIXTURE: &str = "settings.json";
 
     #[test]
@@ -702,7 +695,6 @@ mod tests {
     const TOOL: &str = "mcp__maki__read";
     const OTHER_TOOL: &str = "mcp__maki__bash";
     const CWD: &str = "/work";
-    const MODEL: &str = "claude-haiku-4-5";
     const SECRET: &str = "sk-ant-secret";
     const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
     const BEDROCK_ENV: &str = "CLAUDE_CODE_USE_BEDROCK";
@@ -778,7 +770,7 @@ mod tests {
 
     #[test]
     fn the_minimum_version_is_supported() {
-        let version = minimum_version();
+        let version = MINIMUM_VERSION;
         let output = format!("{version} (Claude Code)");
         assert_eq!(profile(&output).unwrap(), version);
     }
@@ -928,7 +920,7 @@ mod tests {
         fs::create_dir_all(root.join("super/.git/modules/sub")).unwrap();
         fs::create_dir_all(&gitdir).unwrap();
         if let Some(commondir) = commondir {
-            fs::write(gitdir.join(COMMONDIR_FILE), commondir).unwrap();
+            fs::write(gitdir.join(COMMONDIR), commondir).unwrap();
         }
         fs::create_dir(&tree).unwrap();
         fs::write(tree.join(GIT_ENTRY), git_file).unwrap();
@@ -940,7 +932,7 @@ mod tests {
     fn oversized_git_paths_fail_closed(common: bool) {
         let (_dir, tree) = worktree(b"gitdir: ../main/.git/worktrees/wt\n", Some(b"../..\n"));
         let path = if common {
-            tree.join("../main/.git/worktrees/wt").join(COMMONDIR_FILE)
+            tree.join("../main/.git/worktrees/wt").join(COMMONDIR)
         } else {
             tree.join(GIT_ENTRY)
         };
@@ -961,7 +953,7 @@ mod tests {
     fn nonregular_git_paths_fail_without_waiting(common: bool, device: bool) {
         let (_dir, tree) = worktree(b"gitdir: ../main/.git/worktrees/wt\n", Some(b"../..\n"));
         let path = if common {
-            tree.join("../main/.git/worktrees/wt").join(COMMONDIR_FILE)
+            tree.join("../main/.git/worktrees/wt").join(COMMONDIR)
         } else {
             tree.join(GIT_ENTRY)
         };
@@ -1069,19 +1061,11 @@ mod tests {
     #[test_case(init(|e| e["plugins"] = Value::Null) => matches Some(Problem::NoPlugins) ; "no_plugin_list")]
     #[test_case(init(|e| e["cwd"] = json!(OTHER_DIR)) => matches Some(Problem::OtherDir(dir)) if dir == OTHER_DIR ; "another_dir")]
     fn init_must_match_the_launch(event: Value) -> Option<Problem> {
-        let profile = profile(VERSION).unwrap();
-        let tools: HashSet<String> = [TOOL.to_owned(), OTHER_TOOL.to_owned()].into();
-        let expect = InitExpect {
-            version: &profile,
-            model: MODEL,
-            cwd: Path::new(CWD),
-            tools: &tools,
-        };
         init_problem(
             &event,
-            expect.version,
-            expect.cwd,
-            expect.tools.iter().map(String::as_str),
+            VERSION,
+            Path::new(CWD),
+            [TOOL, OTHER_TOOL].into_iter(),
             &[DEFAULT_MODE],
             Some(SERVER),
         )

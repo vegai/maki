@@ -9,7 +9,6 @@
 
 use serde_json::{Map, Value};
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -19,8 +18,7 @@ use maki_config::{PROVIDER_BUILTINS, PluginsConfig};
 use maki_lua::PluginHost;
 use maki_lua::test_support::runtime;
 use maki_providers::plugin;
-use maki_providers::provider::RequestScope;
-use maki_providers::test_support::{Canned, isolated_home, serve};
+use maki_providers::test_support::{Canned, detached_scope, isolated_home, serve};
 use maki_providers::{Message, Model, RequestOptions, ResolvedAuth, ThinkingSupport, Timeouts};
 use serde_json::json;
 use test_case::test_case;
@@ -181,10 +179,7 @@ fn only_opted_in_providers_read_usage_cost(slug: &str, spec: &str, expected: Opt
             &json!([]),
             &tx,
             RequestOptions::default(),
-            RequestScope {
-                session_id: None,
-                cwd: Path::new("."),
-            },
+            detached_scope(),
         ))
         .expect(STREAM_FAILED);
 

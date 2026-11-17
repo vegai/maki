@@ -31,10 +31,10 @@ local KNOWN_MODES = {
 }
 -- The snapshot copies neither, and Claude Code config can add hooks.
 local NEVER_COLLECTED = path_utils.set_of(git_utils.NEVER_COLLECTED)
-local OBJECT_ID_LENGTHS = { [40] = true, [64] = true }
+local OBJECT_ID_LENGTHS = path_utils.set_of(require("maki.claude_code.internal").object_id_lengths)
 function M.repository_path(path, repositories)
   for repository in pairs(repositories or {}) do
-    if repository == "." or path == repository or path:sub(1, #repository + 1) == repository .. "/" then
+    if repository == "." or path_utils.within(path, repository) then
       return true
     end
   end

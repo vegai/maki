@@ -275,10 +275,7 @@ fn describe_general_sub_scopes_to_sub_audience() {
 #[test_case::test_case("wf_task" ; "workflow_gated")]
 fn except_filter_removes_tool_from_description(name: &str) {
     let (reg, _host) = setup();
-    let filter = ToolFilter {
-        excluded: vec![name.to_owned()],
-        ..Default::default()
-    };
+    let filter = ToolFilter::default().excluding(&[name]);
     let desc = describe(&reg, &filter, ToolAudience::MAIN, false);
     assert!(!desc.contains(name), "got: {desc}");
 }

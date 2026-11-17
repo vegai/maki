@@ -15,6 +15,7 @@ use std::io::Cursor;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::ops::Index;
+use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
 #[cfg(test)]
 use std::time::Duration;
@@ -27,6 +28,7 @@ use serde_json::Value;
 use tempfile::TempDir;
 use tokio::runtime::{Builder, Runtime};
 
+use crate::provider::RequestScope;
 use crate::providers::plugin::{self, DeclAuthority, ProviderDecl, ProviderHooks, Registration};
 #[cfg(test)]
 use crate::providers::{SseBody, sse_events};
@@ -57,6 +59,7 @@ const USER_DIRS: &[(&str, &str)] = &[
 ];
 const MIXED_SCRIPT: &str =
     "a script is either all routed with `Canned::at` or all sequential, never a mix";
+const DETACHED_CWD: &str = ".";
 
 /// The answer to a routed request no entry is left for. It is written and
 /// recorded rather than dropped, so a stray request shows up in the
@@ -405,6 +408,14 @@ pub fn isolated_home() -> TempDir {
         }
     }
     home
+}
+
+/// The scope of a request made outside any session.
+pub fn detached_scope() -> RequestScope<'static> {
+    RequestScope {
+        session_id: None,
+        cwd: Path::new(DETACHED_CWD),
+    }
 }
 
 #[cfg(test)]

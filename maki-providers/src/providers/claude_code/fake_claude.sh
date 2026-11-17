@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 dir=@QUOTED_DIR@
 echo $$ > "$dir/pid"
-version=$(cat "$dir/version" 2>/dev/null || echo "2.1.284 (Claude Code)")
+version=$(cat "$dir/version" 2>/dev/null || echo "@VERSION@ (Claude Code)")
 if [ "$1" = --version ]; then
   echo version >> "$dir/versions"
   if [ -e "$dir/version_abort" ]; then ulimit -c 0; kill -ABRT "$$"; fi
@@ -60,7 +60,7 @@ case $scenario in
   no_final_usage | stalled_result_without_usage) final_usage= ;;
 esac
 generation() {
-  event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-haiku-4-5-20251001\"$start_usage}}"
+  event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"@HAIKU@\"$start_usage}}"
   event '{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}'
   event '{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Reading."}}'
   block '{"type":"text","text":"Reading."}'
@@ -100,7 +100,7 @@ got=
 while IFS= read -r msg; do
   id=$(printf '%s' "$msg" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
   case "$msg" in
-    *'"subtype":"initialize"'*) if [ -e "$dir/logged_out" ]; then reply "$id" '{"current_permission_mode":"default","account":null}'; else reply "$id" '{"current_permission_mode":"default","account":{"apiProvider":"firstParty","subscriptionType":"Claude Pro"},"models":[{"value":"default","resolvedModel":"claude-opus-5-5"},{"value":"opus","resolvedModel":"claude-opus-5-5"},{"value":"haiku","resolvedModel":"claude-haiku-4-5-20251001"}]}'; fi ;;
+    *'"subtype":"initialize"'*) if [ -e "$dir/logged_out" ]; then reply "$id" '{"current_permission_mode":"default","account":null}'; else reply "$id" '{"current_permission_mode":"default","account":{"apiProvider":"firstParty","subscriptionType":"Claude Pro"},"models":[{"value":"default","resolvedModel":"claude-opus-5-5"},{"value":"opus","resolvedModel":"claude-opus-5-5"},{"value":"haiku","resolvedModel":"@HAIKU@"}]}'; fi ;;
     *'"subtype":"get_settings"'*) reply "$id" "{\"effective\":$flags,\"sources\":[{\"source\":\"flagSettings\",\"settings\":$flags}]}" ;;
     *'"subtype":"set_model"'*) model=$(printf '%s' "$msg" | sed -n 's/.*"model":"\([^"]*\)".*/\1/p'); reply "$id" '{}' ;;
     *'"subtype":"get_context_usage"'*)
@@ -151,14 +151,14 @@ case $scenario in
   cut_line) init none; connect; generation tool_use; printf '{"type":"keep_al'; dispatch a; sleep @WAIT_SECS@ ;;
   missing_block_eof | missing_block_late)
     init none
-    event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-haiku-4-5-20251001\"$start_usage}}"
+    event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"@HAIKU@\"$start_usage}}"
     event '{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"missing"}}'
     event "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}$final_usage}"
     event '{"type":"message_stop"}'
     [ "$scenario" = missing_block_late ] && sleep @WAIT_SECS@ ;;
   malformed_arguments)
     init none
-    event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-haiku-4-5-20251001\"$start_usage}}"
+    event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"@HAIKU@\"$start_usage}}"
     event '{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"mcp__maki__read","input":{}}}'
     block '{"type":"tool_use","id":"toolu_1","name":"mcp__maki__read","input":{"__unparsedToolInput":{"raw":"truncated"}}}'
     sleep @WAIT_SECS@ ;;
@@ -180,24 +180,24 @@ case $scenario in
   text_then_keep_alive) text_reply; line '{"type":"keep_alive"}' ;;
   text_then_limits) text_reply; limits ;;
   stalled_handoff) init none; connect; generation tool_use; while :; do line '{"type":"keep_alive"}'; sleep 0.2; done ;;
-  progress_generation) init none; event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-haiku-4-5-20251001\"$start_usage}}"; while :; do line '{"type":"tool_progress","tool_use_id":"toolu_1","tool_name":"mcp__maki__read","elapsed_time_seconds":1}'; sleep 0.2; done ;;
-  stalled_generation) init none; event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-haiku-4-5-20251001\"$start_usage}}"; while :; do line '{"type":"keep_alive"}'; sleep 0.2; done ;;
+  progress_generation) init none; event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"@HAIKU@\"$start_usage}}"; while :; do line '{"type":"tool_progress","tool_use_id":"toolu_1","tool_name":"mcp__maki__read","elapsed_time_seconds":1}'; sleep 0.2; done ;;
+  stalled_generation) init none; event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"@HAIKU@\"$start_usage}}"; while :; do line '{"type":"keep_alive"}'; sleep 0.2; done ;;
   complete_output) init none; generation end_turn ;;
   ends_output) init none; exec >&-; sleep @WAIT_SECS@ ;;
   stalled_result | stalled_result_without_usage) init none; generation end_turn; while :; do line '{"type":"keep_alive"}'; sleep 0.2; done ;;
   overloaded) init none; line '{"type":"assistant","error":"unknown","is_api_error_message":true,"message":{"model":"<synthetic>","content":[{"type":"text","text":"Overloaded"}]}}'; line '{"type":"result","subtype":"success","is_error":true,"api_error_status":529,"result":"Overloaded"}'; sleep @WAIT_SECS@ ;;
-  cli_retry) init none; event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-haiku-4-5-20251001\"$start_usage}}"; line '{"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"retry_delay_ms":500,"error_status":529,"error":"overloaded"}'; sleep @WAIT_SECS@ ;;
+  cli_retry) init none; event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"@HAIKU@\"$start_usage}}"; line '{"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"retry_delay_ms":500,"error_status":529,"error":"overloaded"}'; sleep @WAIT_SECS@ ;;
   restarted)
     init none
-    event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-haiku-4-5-20251001\"$start_usage}}"
+    event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"@HAIKU@\"$start_usage}}"
     event '{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}'
     block '{"type":"thinking","thinking":"checking"}'
     event '{"type":"content_block_stop","index":0}'
-    event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"model\":\"claude-haiku-4-5-20251001\"$start_usage}}"
+    event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"model\":\"@HAIKU@\"$start_usage}}"
     sleep @WAIT_SECS@ ;;
   abandoned)
     init none
-    event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-haiku-4-5-20251001\"$start_usage}}"
+    event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"@HAIKU@\"$start_usage}}"
     event '{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}'
     block '{"type":"thinking","thinking":"checking"}'
     event '{"type":"content_block_stop","index":0}'
@@ -209,18 +209,18 @@ case $scenario in
     stop=end_turn; note='[Your previous response had no visible output. Please continue and produce a user-visible response.]'
     [ "$scenario" = cut_before_output ] && stop=max_tokens && note='Output token limit hit. Resume directly.'
     init none
-    event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-haiku-4-5-20251001\"$start_usage}}"
+    event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"@HAIKU@\"$start_usage}}"
     event '{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}'
     block '{"type":"thinking","thinking":"checking"}'
     event '{"type":"content_block_stop","index":0}'
     event "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"$stop\"}$final_usage}"
     event '{"type":"message_stop"}'
     line "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"$note\"}]},\"isSynthetic\":true}"
-    event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"model\":\"claude-haiku-4-5-20251001\"$start_usage}}"
+    event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"model\":\"@HAIKU@\"$start_usage}}"
     sleep @WAIT_SECS@ ;;
   cut_call)
     init none
-    event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-haiku-4-5-20251001\"$start_usage}}"
+    event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"@HAIKU@\"$start_usage}}"
     event '{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}'
     event '{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Reading."}}'
     block '{"type":"text","text":"Reading."}'
@@ -229,7 +229,7 @@ case $scenario in
     event "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}$final_usage}"
     event '{"type":"message_stop"}'
     line '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Output token limit hit. Resume directly."}]},"isSynthetic":true}'
-    event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"model\":\"claude-haiku-4-5-20251001\"$start_usage}}"
+    event "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"model\":\"@HAIKU@\"$start_usage}}"
     sleep @WAIT_SECS@ ;;
   truncated) init none; generation max_tokens; line '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Output token limit hit. Resume directly."}]},"isSynthetic":true}'; sleep @WAIT_SECS@ ;;
   context_overflow) init none; generation model_context_window_exceeded; sleep @WAIT_SECS@ ;;

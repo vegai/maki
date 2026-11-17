@@ -14,7 +14,7 @@ use maki_providers::spec::ProviderRegistry;
 use maki_providers::{AgentError, Timeouts, custom, plugin};
 use maki_storage::StateDir;
 use maki_storage::log::RotatingFileWriter;
-use maki_storage::model::{read_model, read_thinking};
+use maki_storage::model::read_model;
 use maki_storage::sessions::{Effort, StoredThinking};
 use serde_json::Value;
 use tracing::{Event, Subscriber};
@@ -29,6 +29,9 @@ use crate::provider_scripts;
 const LOG_ENV: &str = "MAKI_LOG";
 const LOG_ENV_SHARED: &str = "RUST_LOG";
 const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::INFO;
+/// Headless launches have a stable default independent of the TUI's state.
+pub const HEADLESS_THINKING: Option<StoredThinking> =
+    Some(StoredThinking::Effort { level: Effort::Low });
 
 const PROVIDER_PRIORITY: &[&str] = &[
     "anthropic",
@@ -117,23 +120,15 @@ fn provider_ready(slug: &str) -> Result<(), AgentError> {
     provider_for_slug(slug, Timeouts::default()).map(drop)
 }
 
-/// A launch flag overrides config, then the saved `/thinking` level supplies
-/// the fallback. The model reconciles the chosen setting before each request.
+/// A launch flag overrides config, then `fallback` fills in: the saved
+/// `/thinking` level, or [`HEADLESS_THINKING`]. The model reconciles the
+/// chosen setting before each request.
 pub fn resolve_thinking(
     defaults: &mut SessionDefaults,
-    storage: &StateDir,
     explicit: Option<StoredThinking>,
+    fallback: Option<StoredThinking>,
 ) {
-    defaults.thinking = explicit
-        .or(defaults.thinking)
-        .or_else(|| read_thinking(storage));
-}
-
-/// Headless launches have a stable default independent of the TUI's state.
-pub fn resolve_headless_thinking(defaults: &mut SessionDefaults, explicit: Option<StoredThinking>) {
-    defaults.thinking = explicit
-        .or(defaults.thinking)
-        .or(Some(StoredThinking::Effort { level: Effort::Low }));
+    defaults.thinking = explicit.or(defaults.thinking).or(fallback);
 }
 
 async fn from_spec_or_warm_catalog(spec: &str) -> Result<Model> {
@@ -465,7 +460,7 @@ mod tests {
             thinking: configured,
             ..SessionDefaults::default()
         };
-        resolve_thinking(&mut defaults, &storage, explicit);
+        resolve_thinking(&mut defaults, explicit, read_thinking(&storage));
         assert_eq!(defaults.thinking, expected);
         assert_eq!(read_thinking(&storage), saved);
     }

@@ -6393,14 +6393,17 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::{MOVED_CALL_ID, call_scope, moved_home};
     use super::*;
+    use crate::api::r#fn::create_fn_table;
     use crate::api::tool::ToolCallReply;
     use crate::api::util::dispatch::{DepthGuard, MAX_HOOK_DEPTH, Reentry};
-    use crate::jobs::JobSpec;
+    use crate::jobs::{JobSpec, MAX_STDIN_BYTES};
     use crate::loader::HOST_RUNTIME;
     use futures::FutureExt;
     use maki_agent::cancel::CancelTrigger;
+    use std::fs::File;
     use std::future::poll_fn;
     use std::iter;
+    use std::process::Command;
     use std::task::{Context, Poll, Wake, Waker};
     use test_case::test_case;
     use tokio::sync::Notify;
@@ -6519,10 +6522,20 @@ mod tests {
         TaskScope,
         PendingLoad,
         Waiting,
+        /// A named `jobstart` parked in its spawn, holding the start gate.
+        StartGate,
+        /// A `chansend` parked on a full queue, holding the write lock.
+        StdinWriter,
     }
 
     const TEST_MODULE: &str = "slow";
     const OUTER_MODULE: &str = "outer";
+    const SUSPENDED: &str = "suspended";
+    const EXITING_JOB: &str = "exit 0";
+    const MKFIFO: &str = "mkfifo";
+    const SPAWN_FIFO: &str = "spawn.fifo";
+    /// Twice the stdin queue, so the write parks whatever the pipe takes in.
+    const OVERFULL_STDIN: usize = 2 * MAX_STDIN_BYTES;
 
     /// Frees `value` the way the collector frees a coroutine parked on it:
     /// inside `collect_userdata`, where any VM call aborts the process.
@@ -6538,11 +6551,37 @@ mod tests {
         lua.gc_collect().unwrap();
     }
 
+    /// Parks {call} on `f`, the plugin's `maki.fn`, in a coroutine the plugin
+    /// made, runs {parked}, then lets the collector free the coroutine, the
+    /// only thing that ever does.
+    fn collect_parked_call(lua: &Lua, call: &str, parked: impl FnOnce()) {
+        let functions = create_fn_table(
+            lua,
+            TEST_PLUGIN.into(),
+            &PluginPermissions::trusted(),
+            PluginPermissions::trusted(),
+            None,
+        );
+        lua.globals().set("f", functions.unwrap()).unwrap();
+        let park = lua.load(format!(
+            "local co = coroutine.create(function() {call} end)
+             assert(coroutine.resume(co))
+             return coroutine.status(co)"
+        ));
+        let status: String = HOST_RUNTIME.block_on(park.eval_async()).unwrap();
+        assert_eq!(status, SUSPENDED, "the call must park");
+        parked();
+        lua.gc_collect().unwrap();
+        lua.gc_collect().unwrap();
+    }
+
     #[test_case(LuaOwned::WaitLease ; "wait_lease")]
     #[test_case(LuaOwned::DepthGuard ; "depth_guard")]
     #[test_case(LuaOwned::TaskScope ; "task_scope")]
     #[test_case(LuaOwned::PendingLoad ; "pending_load")]
     #[test_case(LuaOwned::Waiting ; "waiting")]
+    #[test_case(LuaOwned::StartGate ; "start_gate")]
+    #[test_case(LuaOwned::StdinWriter ; "stdin_writer")]
     fn dropped_by_collector_releases_its_hold(owned: LuaOwned) {
         let lua = Lua::new();
         match owned {
@@ -6621,6 +6660,50 @@ mod tests {
                     loads.lock_pending()[OUTER_MODULE].waits_for.is_empty(),
                     "the wait must be taken back"
                 );
+            }
+            LuaOwned::StartGate => {
+                let dir = tempfile::tempdir().unwrap();
+                let fifo = dir.path().join(SPAWN_FIFO);
+                assert!(Command::new(MKFIFO).arg(&fifo).status().unwrap().success());
+                let gate = with_jobs(&lua, |store| Arc::clone(&store.start_gate));
+                // Opening the redirect blocks until the FIFO has a reader, so
+                // the start parks in its spawn holding the gate.
+                let start = format!(
+                    r#"f.jobstart("{EXITING_JOB}", {{
+                        scope = "plugin", name = "{TEST_PLUGIN}", stdout = "{}",
+                        on_exit = function() end,
+                    }})"#,
+                    fifo.display()
+                );
+
+                collect_parked_call(&lua, &start, || {
+                    assert!(gate.try_lock().is_err(), "the start must hold the gate");
+                });
+
+                assert!(gate.try_lock().is_ok(), "the start must leave the gate");
+                drop(File::open(&fifo).unwrap());
+            }
+            LuaOwned::StdinWriter => {
+                let owner = JobOwner::Plugin(Arc::from(TEST_PLUGIN));
+                let id = with_jobs(&lua, |store| {
+                    store.start(JobSpec {
+                        pipe_stdin: true,
+                        ..JobSpec::new(owner.clone(), SLEEPING_JOB)
+                    })
+                })
+                .unwrap();
+                let writer =
+                    with_jobs(&lua, |store| store.stdin_writer(id, None, TEST_PLUGIN)).unwrap();
+                let lock_free = || writer.send(&[]).now_or_never().is_some();
+
+                collect_parked_call(
+                    &lua,
+                    &format!(r#"f.chansend({id}, string.rep("x", {OVERFULL_STDIN}))"#),
+                    || assert!(!lock_free(), "the write must hold the lock"),
+                );
+
+                assert!(lock_free(), "the write lock must be given back");
+                with_jobs(&lua, |store| store.kill_owner(&lua, &owner));
             }
         }
     }

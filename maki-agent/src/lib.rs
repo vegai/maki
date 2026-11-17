@@ -3,7 +3,6 @@
 pub mod agent;
 pub mod call_scope;
 pub mod cancel;
-pub use maki_providers::process::ChildGuard;
 pub mod file_index;
 pub use file_index::{
     FILE_MATCH_CONFIG, FileIndex, FileMatch, FileQuery, FileReader, Ranked, WalkEnd,

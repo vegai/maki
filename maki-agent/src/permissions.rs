@@ -486,8 +486,8 @@ impl PermissionManager {
 
     /// The session's working directory, which an ACP client picks per
     /// session.
-    pub fn cwd(&self) -> PathBuf {
-        (**self.cwd.load()).clone()
+    pub fn cwd(&self) -> Arc<PathBuf> {
+        self.cwd.load_full()
     }
 
     pub fn set_cwd(&self, cwd: PathBuf) {
@@ -1302,9 +1302,9 @@ mod tests {
         check_grants();
         manager.set_cwd(target.to_owned());
         check_grants();
-        assert_eq!(manager.cwd(), target);
-        assert_eq!(fork.cwd(), target);
-        assert_eq!(independent.cwd(), original.path());
+        assert_eq!(*manager.cwd(), target);
+        assert_eq!(*fork.cwd(), target);
+        assert_eq!(*independent.cwd(), original.path());
     }
 
     #[tokio::test]

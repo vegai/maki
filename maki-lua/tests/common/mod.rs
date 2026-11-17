@@ -24,7 +24,7 @@ use maki_lua::{EventHandle, MoveOutcome, PluginHost, SessionEndReason, UiAction}
 use maki_providers::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use maki_providers::{
     AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
-    StopReason, StreamResponse, TokenUsage,
+    StopReason, StreamResponse,
 };
 use maki_storage::id::{MakiId, SessionRef};
 use serde_json::Value;
@@ -161,14 +161,42 @@ pub fn end_session(host: &PluginHost, session: MakiId, reason: SessionEndReason)
     runtime().block_on(host.event_handle().end_sessions([session], reason));
 }
 
-pub fn poll_until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
-    let deadline = Instant::now() + WAIT;
+/// Returns true if `done` turned true within `limit`.
+pub fn wait_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + limit;
     loop {
-        if let Some(got) = check() {
-            return got;
+        if done() {
+            return true;
         }
-        assert!(Instant::now() < deadline, "{what}");
+        if Instant::now() >= deadline {
+            return false;
+        }
         thread::sleep(POLL_INTERVAL);
+    }
+}
+
+pub fn poll_until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
+    let mut got = None;
+    assert!(
+        wait_until(WAIT, || {
+            got = check();
+            got.is_some()
+        }),
+        "{what}"
+    );
+    got.unwrap()
+}
+
+/// A one-block assistant reply that ends with `stop`.
+pub fn assistant_reply(block: ContentBlock, stop: StopReason) -> StreamResponse {
+    StreamResponse {
+        message: Message {
+            role: Role::Assistant,
+            content: vec![block],
+            ..Default::default()
+        },
+        stop_reason: Some(stop),
+        ..Default::default()
     }
 }
 
@@ -183,8 +211,14 @@ impl Gate {
 
     /// Runs `before`, then waits for the release, then runs `after`.
     pub fn command(&self, before: &str, after: &str) -> String {
+        format!("{before}; {}; {after}", self.wait())
+    }
+
+    /// A shell loop that ends at the release, or once the gate is gone.
+    pub fn wait(&self) -> String {
         format!(
-            "{before}; while [ ! -e '{}' ]; do sleep {GATE_POLL_SECS}; done; {after}",
+            "while [ -d '{}' ] && [ ! -e '{}' ]; do sleep {GATE_POLL_SECS}; done",
+            self.0.path().display(),
             self.file().display()
         )
     }
@@ -240,16 +274,7 @@ impl Provider for ParkedProvider {
                     StopReason::EndTurn,
                 ),
             };
-            Ok(StreamResponse {
-                message: Message {
-                    role: Role::Assistant,
-                    content: vec![block],
-                    ..Default::default()
-                },
-                usage: TokenUsage::default(),
-                stop_reason: Some(stop_reason),
-                input_transformations: Vec::new(),
-            })
+            Ok(assistant_reply(block, stop_reason))
         })
     }
 

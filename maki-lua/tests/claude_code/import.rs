@@ -9,7 +9,7 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use maki_agent::tools::ToolRegistry;
 use maki_lua::PluginHost;
@@ -19,13 +19,13 @@ use tempfile::{TempDir, tempdir};
 use test_case::test_case;
 
 use super::support::{
-    DEADLINE, NOTHING_IMPORTED, ORIGINALS, PWNED, contents, executable, git, listing, on_path,
-    wait_for_release, wait_until,
+    DEADLINE, Gate, IMPORT_TEMP, NOTHING_IMPORTED, ORIGINALS, PWNED, TOUCH_PWNED, executable, git,
+    listing, on_path, wait_until,
 };
 
 const HELD: &str = r#"#!/bin/sh
 case " $* " in
-*"@HOLD_ON@"*) "@REAL@" "$@" || exit; touch "@HELD@"; @WAIT_FOR_RELEASE@ ;;
+*"@HOLD_ON@"*) "@REAL@" "$@" || exit; touch "@HELD@"; @WAIT@ ;;
 *) exec "@REAL@" "$@" ;;
 esac
 "#;
@@ -54,7 +54,6 @@ const AFTER_MOVE: Hold = ("mv", " ./src/lib.rs ");
 const DISPLACED: &str = "displaced";
 const EDITOR_SAVE: &str = "editor-save";
 const CANNOT_PRESERVE: &str = "cannot preserve open-file writes";
-const NEW_FILE_PREFIX: &str = ".maki-import-";
 /// The last new file gets its mode, in the folder the command made for it,
 /// after the file beside the edited one was written.
 const WRITING: Hold = ("chmod", " ./src/new/");
@@ -96,11 +95,13 @@ const TARGET: &str = "src/lib.rs";
 const ADDED: &str = "src/new/added.rs";
 /// Names that survive only with proper shell quoting: a quote, a command
 /// substitution, a space, a newline and a glob.
-const HOSTILE_EDITED: &str = "src/it's $(touch pwned) *\nlib.rs";
+static HOSTILE_EDITED: LazyLock<String> =
+    LazyLock::new(|| format!("src/it's {} *\nlib.rs", *TOUCH_PWNED));
+static HOSTILE_ADDED: LazyLock<String> =
+    LazyLock::new(|| format!("src/a 'b' {}/*\nadded.rs", *TOUCH_PWNED));
 const BIDI_EDITED: &str = "src/a\u{202e}b\u{200b}.rs";
 const BIDI_ADDED: &str = "src/c\u{2066}d\u{e0061}.rs";
 const LINK_FAILURE: &str = "ln: fixture preservation failure";
-const HOSTILE_ADDED: &str = "src/a 'b' $(touch pwned)/*\nadded.rs";
 /// A temporary file from another import of the same artifact, beside the
 /// target.
 const OTHER_IMPORTS_TEMP: &str = ".maki-import-artifact.x9y8z7.q1w2e3";
@@ -134,6 +135,7 @@ struct Import {
     script: String,
     leftovers: String,
     blobs: [(String, &'static str); 2],
+    gate: Gate,
 }
 
 impl Import {
@@ -213,12 +215,12 @@ impl Import {
             .unwrap();
         let script = fs::read_to_string(&out).unwrap();
         let leftovers = fs::read_to_string(&leftovers).unwrap();
+        let gate = Gate::closed();
         let held = HELD
             .replace("@HOLD_ON@", hold_on)
             .replace("@REAL@", &on_path(tool).to_string_lossy())
             .replace("@HELD@", &base.join("held").to_string_lossy())
-            .replace("@WAIT_FOR_RELEASE@", &wait_for_release("\"@RELEASE@\""))
-            .replace("@RELEASE@", &base.join("release").to_string_lossy());
+            .replace("@WAIT@", &gate.wait());
         executable(&tools, tool, &held);
         let import = Self {
             root,
@@ -230,6 +232,7 @@ impl Import {
             script,
             leftovers,
             blobs: [(old, ORIGINAL), (new, RECORDED)],
+            gate,
         };
         import.stage_blobs(STAGE);
         import
@@ -301,12 +304,12 @@ impl Import {
     }
 
     fn run(&self, script: &str) -> Output {
-        fs::File::create(self.marker("release")).unwrap();
+        self.gate.release();
         self.command(script).output().unwrap()
     }
 
     fn release(&self, mut held: Held) -> Output {
-        fs::File::create(self.marker("release")).unwrap();
+        self.gate.release();
         held.0.take().unwrap().wait_with_output().unwrap()
     }
 }
@@ -572,7 +575,7 @@ fn a_failed_hard_link_stops_before_any_checkout_write() {
 
 fn failed_attempt() -> Import {
     let import = Import::new(LAST_CHECK);
-    import.failing("ln", Path::new(NEW_FILE_PREFIX));
+    import.failing("ln", Path::new(IMPORT_TEMP));
     let child = import.start_held();
     fs::write(import.target(), NEWER).unwrap();
     let output = import.release(child);
@@ -630,7 +633,7 @@ fn invisible_names_are_visible_in_approval_and_keep_their_bytes_in_a_c_locale() 
     for hidden in ['\u{202e}', '\u{200b}', '\u{2066}', '\u{e0061}'] {
         assert!(!import.script.contains(hidden));
     }
-    fs::File::create(import.marker("release")).unwrap();
+    import.gate.release();
     let output = import
         .command(&import.script)
         .env("LC_ALL", "C")
@@ -700,7 +703,7 @@ fn a_cleanup_that_cannot_clear_a_folder_fails() {
 fn generated_git_commands_ignore_shell_only_variables(variable: &str) {
     let import = Import::new(WITHOUT_HOLD);
     let review = fs::read_to_string(import.marker(REVIEW_SCRIPT)).unwrap();
-    fs::File::create(import.marker("release")).unwrap();
+    import.gate.release();
     for script in [&review, &import.script] {
         let output = import
             .command(script)
@@ -718,7 +721,7 @@ fn an_import_runs_git_without_the_users_config() {
     let import = Import::new(WITHOUT_HOLD);
     let config = import.root.path().join(USER_GIT_CONFIG);
     fs::write(&config, BROKEN_GIT_CONFIG).unwrap();
-    fs::File::create(import.marker("release")).unwrap();
+    import.gate.release();
     let output = import
         .command(&import.script)
         .env("GIT_CONFIG_GLOBAL", &config)
@@ -733,7 +736,7 @@ fn an_import_runs_git_without_the_users_config() {
 /// without execution.
 #[test]
 fn a_hostile_file_name_lands_as_it_is_and_runs_nothing() {
-    let import = Import::named(WITHOUT_HOLD, HOSTILE_EDITED, HOSTILE_ADDED);
+    let import = Import::named(WITHOUT_HOLD, &HOSTILE_EDITED, &HOSTILE_ADDED);
     for script in [&import.script, &import.leftovers] {
         let output = import.run(script);
         assert_status(&output, true);
@@ -741,10 +744,8 @@ fn a_hostile_file_name_lands_as_it_is_and_runs_nothing() {
 
     assert_eq!(fs::read_to_string(import.target()).unwrap(), RECORDED);
     assert_eq!(
-        fs::read_to_string(import.project.join(HOSTILE_ADDED)).unwrap(),
+        fs::read_to_string(import.project.join(&*HOSTILE_ADDED)).unwrap(),
         RECORDED
     );
-    for path in contents(import.root.path()).keys() {
-        assert_ne!(path.file_name().unwrap(), PWNED, "a name ran a command");
-    }
+    assert!(!Path::new(PWNED).exists(), "a name ran a command: {PWNED}");
 }

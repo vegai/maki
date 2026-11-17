@@ -3,16 +3,16 @@ local t = require("maki.test_helpers")
 local jobs = require("claude_jobs")
 
 local case, eq, has = t.case, t.eq, t.has
-local STARTUP_MS = 30000
+local TIMEOUT_MS = 30000
 local COMMAND = { "cat" }
 local OUTPUT = "complete"
 local CALLBACK_ERROR = "exit callback failed"
 local SEND_ERROR = "stdin send failed"
+local START_ERROR = "job start failed"
 local CLOSE_ERROR = "stdin close failed"
 local DIRECTORY = "/probe/hook-output"
 local SUCCESS_CODE = 0
 local STOPPED_CODE = 137
-local SWEEP_LOCK = ".sweep.lock"
 
 local function with_jobs(run)
   local state = { started = {}, stopped = {}, notices = {}, cancel = {}, closes = 0 }
@@ -135,10 +135,10 @@ case("a_native_deadline_reports_a_timeout", function()
   with_jobs(function(state)
     local call = jobs.new(function() end)
     state.finish = function()
-      eq(state.started[1].opts.timeout_ms, STARTUP_MS)
+      eq(state.started[1].opts.timeout_ms, TIMEOUT_MS)
       state.started[1].opts.on_exit(1, STOPPED_CODE, "exit", true)
     end
-    local output, err, timed_out = call:run_lines(COMMAND, { timeout_ms = STARTUP_MS })
+    local output, err, timed_out = call:run_lines(COMMAND, { timeout_ms = TIMEOUT_MS })
     eq(output, nil)
     has(err, "did not complete in time")
     eq(timed_out, true)
@@ -152,7 +152,7 @@ case("a_completed_job_reports_its_output", function()
       state.started[1].opts.on_stdout(1, OUTPUT)
       state.started[1].opts.on_exit(1, SUCCESS_CODE)
     end
-    local output, err = call:run_lines(COMMAND, { timeout_ms = STARTUP_MS })
+    local output, err = call:run_lines(COMMAND, { timeout_ms = TIMEOUT_MS })
     eq(output[1], OUTPUT)
     eq(#output, 1)
     eq(err, nil)
@@ -177,9 +177,9 @@ for _, cancel_job in ipairs({ false, true }) do
         eq(state.stopped[1], true)
         state.started[1].opts.on_exit(1, STOPPED_CODE)
       end
-      call:run_lines(COMMAND, { timeout_ms = STARTUP_MS })
+      call:run_lines(COMMAND, { timeout_ms = TIMEOUT_MS })
 
-      local output, err = call:run_lines(COMMAND, { timeout_ms = STARTUP_MS })
+      local output, err = call:run_lines(COMMAND, { timeout_ms = TIMEOUT_MS })
       eq(output, nil)
       eq(#state.started, 1)
       has(err, jobs.CANCELLED)
@@ -188,7 +188,7 @@ for _, cancel_job in ipairs({ false, true }) do
         state.started[2].opts.on_stdout(2, OUTPUT)
         state.started[2].opts.on_exit(2, SUCCESS_CODE)
       end
-      output, err = call:run_lines(COMMAND, { keep_on_cancel = true, timeout_ms = STARTUP_MS })
+      output, err = call:run_lines(COMMAND, { keep_on_cancel = true, timeout_ms = TIMEOUT_MS })
       eq(output[1], OUTPUT)
       eq(#output, 1)
       eq(err, nil)
@@ -203,7 +203,7 @@ end
 case("redirected_output_keeps_the_guard_and_explicit_timeout", function()
   with_jobs(function(state)
     local call = jobs.new()
-    local timeout = STARTUP_MS * 2
+    local timeout = TIMEOUT_MS * 2
     state.finish = function()
       local opts = state.started[1].opts
       eq(opts.stdout, DIRECTORY)
@@ -253,7 +253,7 @@ for _, failure in ipairs({ "send", "close" }) do
         eq(state.stopped[1], true)
         state.started[1].opts.on_exit(1, SUCCESS_CODE)
       end
-      local output, err = call:run_lines(COMMAND, { stdin = OUTPUT, timeout_ms = STARTUP_MS })
+      local output, err = call:run_lines(COMMAND, { stdin = OUTPUT, timeout_ms = TIMEOUT_MS })
       eq(output, nil)
       has(err, failure == "send" and SEND_ERROR or CLOSE_ERROR)
       eq(state.closes, failure == "send" and 0 or 1)
@@ -271,7 +271,7 @@ for _, exited in ipairs({ false, true }) do
         eq(state.stopped[1] == true, not exited)
         state.started[1].opts.on_exit(1, SUCCESS_CODE, "exit", false, { CALLBACK_ERROR })
       end
-      local output, err = call:run_lines(COMMAND, { stdin = OUTPUT, timeout_ms = STARTUP_MS })
+      local output, err = call:run_lines(COMMAND, { stdin = OUTPUT, timeout_ms = TIMEOUT_MS })
       eq(output, nil)
       has(err, SEND_ERROR)
       has(err, CALLBACK_ERROR)
@@ -319,12 +319,12 @@ for _, code in ipairs({ SUCCESS_CODE, STOPPED_CODE }) do
       end)
       call:stop()
       local removed = 0
-      artifacts.discard(call, { dir = DIRECTORY, timeout_ms = STARTUP_MS }, function()
+      artifacts.discard(call, { dir = DIRECTORY, timeout_ms = TIMEOUT_MS }, function()
         removed = removed + 1
       end)
       eq(call.alive, 1)
       eq(state.started[1].opts.guard, true)
-      eq(state.started[1].opts.timeout_ms, STARTUP_MS)
+      eq(state.started[1].opts.timeout_ms, TIMEOUT_MS)
       eq(state.stopped[1], nil)
       call:answer()
       eq(releases, 0)
@@ -343,18 +343,18 @@ end
 
 case("a_failed_start_returns_an_error_pair", function()
   with_jobs(function(state)
-    state.start_error = SEND_ERROR
+    state.start_error = START_ERROR
     local call = jobs.new()
-    local output, err = call:run_lines(COMMAND, { timeout_ms = STARTUP_MS })
+    local output, err = call:run_lines(COMMAND, { timeout_ms = TIMEOUT_MS })
     eq(output, nil)
-    has(err, SEND_ERROR)
+    has(err, START_ERROR)
     eq(call.alive, 0)
   end)
 end)
 
 case("artifact_cleanup_reports_a_failed_start", function()
   with_jobs(function(state)
-    state.start_error = CALLBACK_ERROR
+    state.start_error = START_ERROR
     local call = jobs.new()
     artifacts.discard(call, { dir = DIRECTORY })
     eq(call.alive, 0)
@@ -369,13 +369,13 @@ case("a_sweep_keeps_an_active_coding_artifact_until_its_call_settles", function(
   local root = t.mktmpdir("cc_active_artifact")
   with_jobs(function(state)
     local call = jobs.new()
-    local artifact = assert(artifacts.allocate(call, root, {}, STARTUP_MS))
+    assert(artifacts.allocate(call, root, {}, TIMEOUT_MS))
     local sweep = jobs.new()
-    artifacts.sweep(sweep, root, -1, STARTUP_MS)
+    artifacts.sweep(sweep, root, -1, TIMEOUT_MS)
     eq(#state.started, 0)
     sweep:answer()
     call:answer()
-    artifacts.sweep(jobs.new(), root, -1, STARTUP_MS)
+    artifacts.sweep(jobs.new(), root, -1, TIMEOUT_MS)
     eq(#state.started, 1)
     state.started[1].opts.on_exit(1, SUCCESS_CODE)
   end)
@@ -384,12 +384,12 @@ end)
 
 case("a_sweep_lock_error_is_reported", function()
   local root = t.mktmpdir("cc_sweep_error")
-  local lock_path = maki.fs.joinpath(root, SWEEP_LOCK)
+  local lock_path = maki.fs.joinpath(root, artifacts.SWEEP_LOCK)
   assert(maki.fs.mkdir(lock_path))
   with_jobs(function(state)
     local _, lock_err = maki.fs.try_lock(lock_path)
     assert(lock_err)
-    artifacts.sweep(jobs.new(), root, -1, STARTUP_MS)
+    artifacts.sweep(jobs.new(), root, -1, TIMEOUT_MS)
     eq(#state.started, 0)
     eq(#state.notices, 1)
     eq(state.notices[1].level, "warn")
@@ -402,7 +402,7 @@ case("a_missing_artifact_root_needs_no_cleanup", function()
   local parent = t.mktmpdir("cc_sweep_missing")
   local root = maki.fs.joinpath(parent, "missing")
   with_jobs(function(state)
-    artifacts.sweep(jobs.new(), root, -1, STARTUP_MS)
+    artifacts.sweep(jobs.new(), root, -1, TIMEOUT_MS)
     eq(#state.started, 0)
     eq(#state.notices, 0)
     eq(maki.fs.metadata(root), nil)
@@ -413,22 +413,23 @@ end)
 for _, trashed in ipairs({ false, true }) do
   case("one_sweep_owns_a_tree_until_deletion_finishes_" .. tostring(trashed), function()
     local root = t.mktmpdir("cc_sweep")
-    local artifact = maki.fs.joinpath(root, trashed and ".trash-old" or "old")
-    assert(maki.fs.mkdir(artifact))
-    assert(maki.fs.write(maki.fs.joinpath(artifact, ".maki-claude-code-artifact"), ""))
+    local trash = artifacts.layout(maki.fs.joinpath(root, artifacts.TRASH_PREFIX .. "old"))
+    local artifact = artifacts.layout(trashed and trash.dir or maki.fs.joinpath(root, "old"))
+    assert(maki.fs.mkdir(artifact.dir))
+    assert(maki.fs.write(artifact.marker, ""))
     with_jobs(function(state)
       local first, second = jobs.new(), jobs.new()
-      artifacts.sweep(first, root, -1, STARTUP_MS)
+      artifacts.sweep(first, root, -1, TIMEOUT_MS)
       eq(#state.started, 1)
+      assert(table.find(state.started[1].argv, trash.dir))
       -- The deletion command unlinks the artifact lock before exiting.
-      local deleting = state.started[1].argv[5]
-      assert(maki.fs.rm(maki.fs.joinpath(deleting, "import.lock")))
-      artifacts.sweep(second, root, -1, STARTUP_MS)
+      assert(maki.fs.rm(trash.lock))
+      artifacts.sweep(second, root, -1, TIMEOUT_MS)
       eq(#state.started, 1)
       eq(#second.left_behind, 0)
       eq(#state.notices, 0)
       state.started[1].opts.on_exit(1, SUCCESS_CODE)
-      artifacts.sweep(second, root, -1, STARTUP_MS)
+      artifacts.sweep(second, root, -1, TIMEOUT_MS)
       eq(#state.started, 2)
       state.started[2].opts.on_exit(2, SUCCESS_CODE)
     end)

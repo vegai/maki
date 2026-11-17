@@ -576,17 +576,16 @@ async fn resolve_model(
     Ok((Some(tbl), None))
 }
 
-fn session_cwd(ctx: &LuaCtx, method: &str) -> Result<PathBuf, String> {
-    Ok(dispatch_ctx(ctx, method)?.permissions.cwd())
-}
-
 /// The calling session's canonical working directory. Under ACP it can differ from
 /// the process directory. Outside a handler, returns nil and an error.
 /// @param ctx LuaCtx Agent context.
 /// @return (string?, string?) Session directory, or nil and an error.
 #[lua_fn(guard = FsRead)]
 async fn cwd(_lua: Lua, ctx: UserDataRef<LuaCtx>) -> LuaResult<Pair<String>> {
-    let path = try_pair!(session_cwd(&ctx, "cwd"));
+    let path = try_pair!(dispatch_ctx(&ctx, "cwd"))
+        .permissions
+        .cwd()
+        .to_path_buf();
     drop(ctx);
     Ok(pair(canonical_path(path).await))
 }
@@ -597,11 +596,9 @@ async fn cwd(_lua: Lua, ctx: UserDataRef<LuaCtx>) -> LuaResult<Pair<String>> {
 /// @return (string?, string?) Instruction text, or nil and an error.
 #[lua_fn(guard = FsRead)]
 async fn instructions(_lua: Lua, ctx: UserDataRef<LuaCtx>) -> LuaResult<Pair<String>> {
-    let config = try_pair!(dispatch_ctx(&ctx, "instructions"))
-        .config
-        .instructions
-        .clone();
-    let path = try_pair!(session_cwd(&ctx, "instructions"));
+    let agent = try_pair!(dispatch_ctx(&ctx, "instructions"));
+    let config = agent.config.instructions.clone();
+    let path = agent.permissions.cwd().to_path_buf();
     drop(ctx);
     Ok(pair(instruction_text(path, config).await))
 }
@@ -667,7 +664,7 @@ async fn system_prompt(
         },
         None => Arc::new(ToolFilter::from_config(&agent.config, &agent.model, &[])),
     };
-    let cwd = try_pair!(session_cwd(&ctx, "system_prompt"));
+    let cwd = agent.permissions.cwd().to_path_buf();
     // Nothing may hold the ctx borrow across the wait: a cancel hook firing
     // meanwhile needs `ctx:finish`, which takes it mutably.
     drop(ctx);
@@ -683,7 +680,7 @@ async fn system_prompt(
     let instructions_val: LuaValue = opts.get("instructions")?;
     let instructions = match instructions_val {
         LuaValue::Boolean(true) => {
-            crate::plugin_permissions::require(&lua, &perms, Permission::FsRead)?;
+            require(&lua, &perms, Permission::FsRead)?;
             try_pair!(instruction_text(cwd, instructions_config).await)
         }
         LuaValue::Boolean(false) | LuaValue::Nil => String::new(),
@@ -775,7 +772,10 @@ async fn tools(
 
     let base = ToolFilter::from_config(&agent.config, model, &[]);
     let filter = match (only, except) {
-        (Some(names), _) => base.publishing(names),
+        (Some(names), _) => ToolFilter {
+            published: Some(names),
+            ..base
+        },
         (_, Some(names)) => base.excluding(&names.iter().map(String::as_str).collect::<Vec<_>>()),
         _ => base,
     };

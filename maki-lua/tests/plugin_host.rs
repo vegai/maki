@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
 use std::time::{Duration, Instant};
 
-use common::{end_session, environment, poll_until};
+use common::{assistant_reply, end_session, environment, poll_until};
 use maki_agent::live_session::BACKGROUND_PLAN_WRITE_DENIED;
 use maki_agent::template::Vars;
 use maki_agent::tools::test_support::stub_seed;
@@ -65,6 +65,8 @@ end
 #[cfg(unix)]
 const JOB_THAT_COMPLETES: &str = "true";
 const JOB_THAT_WAITS: &str = "sleep 30";
+/// Generous for a job whose stdin is closed, which exits at once.
+const CLOSED_JOB_WAIT_MS: u64 = 5000;
 const NARGS_ERR: &str = r#"'nargs' must be 0, 1, "?", "*", or "+""#;
 const GLOBAL_PACK_ONLY_ERR: &str = "only available in the global init.lua";
 const USAGE_TOOL_NAME: &str = "usage_child";
@@ -3546,49 +3548,32 @@ maki.api.register_tool({{
     end_session(&host, session, SessionEndReason::Shutdown);
 }
 
-/// A stdin mode, stream or payload a job cannot use is an error.
-#[test_case(r#"maki.fn.jobstart("true", { stdin = "file" })"#, STDIN_MODE_ERR ; "an_unknown_stdin_mode")]
-#[test_case(r#"maki.fn.chanclose(1, "stdout")"#, CHANCLOSE_STREAM_ERR ; "closing_stdout")]
-#[test_case("maki.fn.chansend(1, 42)", CHANSEND_DATA_ERR ; "a_number_to_send")]
-fn job_input_it_cannot_take_is_refused(call: &str, expected: &str) {
+/// A stdin mode, stream, payload or job option that a job cannot use is an
+/// error.
+#[test_case(r#"maki.fn.jobstart("true", { stdin = "file" })"#, Some(STDIN_MODE_ERR) ; "an_unknown_stdin_mode")]
+#[test_case(r#"maki.fn.chanclose(1, "stdout")"#, Some(CHANCLOSE_STREAM_ERR) ; "closing_stdout")]
+#[test_case("maki.fn.chansend(1, 42)", Some(CHANSEND_DATA_ERR) ; "a_number_to_send")]
+#[test_case(r#"maki.fn.jobstart("true", { env = false })"#, Some("boolean") ; "boolean_env")]
+#[test_case(r#"maki.fn.jobstart("true", { env = { SECRET = {} } })"#, Some("table") ; "table_value")]
+#[test_case(r#"maki.fn.jobstart("true", { env = { SECRET = false } })"#, Some("boolean") ; "boolean_value")]
+#[test_case(r#"maki.fn.jobstart("true", { cwd = false })"#, Some("boolean") ; "boolean_cwd")]
+#[test_case(r#"maki.fn.jobstart("true", { cwd = {} })"#, Some("table") ; "table_cwd")]
+#[test_case(r#"maki.fn.jobstart("true", { tail = false })"#, Some("boolean") ; "boolean_tail")]
+#[test_case(r#"maki.fn.jobstart("true", { tail = {} })"#, Some("table") ; "table_tail")]
+#[test_case(r#"maki.fn.jobstart("true", { tail = -1 })"#, Some("out of range") ; "negative_tail")]
+#[test_case(r#"maki.fn.jobstart("true", { tail = 1.5 })"#, Some("out of range") ; "fractional_tail")]
+#[test_case(r#"maki.fn.jobstart("true", { on_stdout = false })"#, Some("boolean") ; "boolean_stdout_callback")]
+#[test_case(r#"maki.fn.jobstart("true", { on_stderr = {} })"#, Some("table") ; "table_stderr_callback")]
+#[test_case(r#"maki.fn.jobstart("true", { on_exit = 42 })"#, Some("function") ; "numeric_exit_callback")]
+#[test_case(r#"maki.fn.jobstart("true", { env = {}, tail = 0, on_exit = function() end })"#, None ; "valid_options")]
+fn job_input_it_cannot_take_is_refused(call: &str, expected: Option<&str>) {
     const TOOL: &str = "job_input";
-    let mut perms = maki_lua::PluginPermissions::denied();
-    perms.set(maki_lua::Permission::Run, true);
-    let src = perm_tool_src(
-        TOOL,
-        &format!(
-            r#"local ok, err = pcall(function() {call} end)
-                return tostring(ok) .. ":" .. tostring(err)"#
-        ),
-    );
-
-    let result = exec_tool_with_perms(perms, &src, TOOL, json!({})).unwrap();
-
-    assert!(result.starts_with("false"), "got: {result}");
-    assert!(result.contains(expected), "got: {result}");
-}
-
-#[test_case("{ env = false }", Some("boolean") ; "boolean_env")]
-#[test_case("{ env = { SECRET = {} } }", Some("table") ; "table_value")]
-#[test_case("{ env = { SECRET = false } }", Some("boolean") ; "boolean_value")]
-#[test_case("{ cwd = false }", Some("boolean") ; "boolean_cwd")]
-#[test_case("{ cwd = {} }", Some("table") ; "table_cwd")]
-#[test_case("{ tail = false }", Some("boolean") ; "boolean_tail")]
-#[test_case("{ tail = {} }", Some("table") ; "table_tail")]
-#[test_case("{ tail = -1 }", Some("out of range") ; "negative_tail")]
-#[test_case("{ tail = 1.5 }", Some("out of range") ; "fractional_tail")]
-#[test_case("{ on_stdout = false }", Some("boolean") ; "boolean_stdout_callback")]
-#[test_case("{ on_stderr = {} }", Some("table") ; "table_stderr_callback")]
-#[test_case("{ on_exit = 42 }", Some("function") ; "numeric_exit_callback")]
-#[test_case("{ env = {}, tail = 0, on_exit = function() end }", None ; "valid_options")]
-fn malformed_job_options_are_refused(opts: &str, expected: Option<&str>) {
-    const TOOL: &str = "bad_job_options";
     let mut perms = PluginPermissions::denied();
-    perms.set(maki_lua::Permission::Run, true);
+    perms.set(Permission::Run, true);
     let source = perm_tool_src(
         TOOL,
         &format!(
-            r#"local ok, err = pcall(function() return assert(maki.fn.jobstart("true", {opts})) end)
+            r#"local ok, err = pcall(function() return assert({call}) end)
         return tostring(ok) .. ":" .. tostring(err)"#,
         ),
     );
@@ -5910,22 +5895,6 @@ fn ctx_set_deadline_twice_errors() {
 const CANCEL_TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 const PARKED_DEADLINE_REPLY: &str = "partial: timeout";
-const PARKED_DEADLINE_PLUGIN: &str = r#"
-maki.api.register_tool({
-    name = "parked_deadline",
-    description = "parks past its deadline, finishing from its cancel hook",
-    schema = { type = "object", properties = {}, additionalProperties = false },
-    audiences = { "main" },
-    handler = function(input, ctx)
-        ctx:set_deadline(1)
-        maki.async.on_cancel(function(reason)
-            ctx:finish({ llm_output = "partial: " .. reason, is_error = true })
-        end)
-        maki.fn.jobwait(maki.fn.jobstart("@JOB_THAT_WAITS@"))
-        return "unreachable"
-    end,
-})
-"#;
 
 /// A handler parked in an await runs no Lua when its deadline lapses, so the
 /// host is what ends it, by raising inside the await. Its cancel hooks still
@@ -5936,11 +5905,25 @@ maki.api.register_tool({
 fn parked_handler_reports_its_hook_finish_reply_on_deadline() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_source(
-        "parked_deadline_plugin",
-        &PARKED_DEADLINE_PLUGIN.replace("@JOB_THAT_WAITS@", JOB_THAT_WAITS),
-    )
-    .unwrap();
+    let source = format!(
+        r#"
+maki.api.register_tool({{
+    name = "parked_deadline",
+    description = "parks past its deadline, finishing from its cancel hook",
+    schema = {{ type = "object", properties = {{}}, additionalProperties = false }},
+    audiences = {{ "main" }},
+    handler = function(input, ctx)
+        ctx:set_deadline(1)
+        maki.async.on_cancel(function(reason)
+            ctx:finish({{ llm_output = "partial: " .. reason, is_error = true }})
+        end)
+        maki.fn.jobwait(maki.fn.jobstart("{JOB_THAT_WAITS}"))
+        return "unreachable"
+    end,
+}})
+"#
+    );
+    host.load_source("parked_deadline_plugin", &source).unwrap();
 
     let result = exec_tool(&reg, "parked_deadline", json!({}));
 
@@ -6382,15 +6365,16 @@ fn session_metadata_needs_no_permission(call: &str) {
 fn chanclose_returns_one_like_neovim() {
     let src = perm_tool_src(
         "chanclose_value",
-        r#"local id = maki.fn.jobstart({ "cat" }, { stdin = "pipe" })
+        &format!(
+            r#"local id = maki.fn.jobstart({{ "cat" }}, {{ stdin = "pipe" }})
                 local closed = maki.fn.chanclose(id, "stdin")
-                maki.fn.jobwait(id, 5000)
-                return "closed=" .. tostring(closed)"#,
+                maki.fn.jobwait(id, {CLOSED_JOB_WAIT_MS})
+                return "closed=" .. tostring(closed)"#
+        ),
     );
-    let mut perms = maki_lua::PluginPermissions::denied();
-    perms.set(maki_lua::Permission::Run, true);
-    let result =
-        exec_tool_with_perms(perms, &src, "chanclose_value", serde_json::json!({})).unwrap();
+    let mut perms = PluginPermissions::denied();
+    perms.set(Permission::Run, true);
+    let result = exec_tool_with_perms(perms, &src, "chanclose_value", json!({})).unwrap();
     assert!(result.contains("closed=1"), "got: {result}");
 }
 
@@ -6456,8 +6440,8 @@ fn system_prompts_without_file_reads_do_not_need_fs_read(instructions: &str) {
         ),
     );
     let mut perms = PluginPermissions::denied();
-    perms.set(maki_lua::Permission::Agent, true);
-    let prompt = exec_tool_with_perms(perms, &src, TOOL, serde_json::json!({})).unwrap();
+    perms.set(Permission::Agent, true);
+    let prompt = exec_tool_with_perms(perms, &src, TOOL, json!({})).unwrap();
     assert!(!prompt.trim().is_empty());
 }
 
@@ -8426,21 +8410,14 @@ impl Provider for TurnThenPark {
         }
         Box::pin(async {
             Ok(StreamResponse {
-                message: Message {
-                    role: Role::Assistant,
-                    content: vec![ContentBlock::tool_use(
-                        PAID_TOOL_USE_ID,
-                        PAID_TOOL_NAME,
-                        json!({}),
-                    )],
-                    ..Default::default()
-                },
                 usage: TokenUsage {
                     input: PAID_TURN_INPUT,
                     ..Default::default()
                 },
-                stop_reason: Some(StopReason::ToolUse),
-                input_transformations: Vec::new(),
+                ..assistant_reply(
+                    ContentBlock::tool_use(PAID_TOOL_USE_ID, PAID_TOOL_NAME, json!({})),
+                    StopReason::ToolUse,
+                )
             })
         })
     }
@@ -8969,18 +8946,7 @@ impl Provider for CallOnce {
                 StopReason::ToolUse,
             )
         };
-        Box::pin(async move {
-            Ok(StreamResponse {
-                message: Message {
-                    role: Role::Assistant,
-                    content: vec![block],
-                    ..Default::default()
-                },
-                usage: TokenUsage::default(),
-                stop_reason: Some(stop),
-                input_transformations: Vec::new(),
-            })
-        })
+        Box::pin(async move { Ok(assistant_reply(block, stop)) })
     }
 
     fn list_models(

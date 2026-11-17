@@ -795,7 +795,7 @@ mod tests {
     use crate::mcp::McpCommand;
     use crate::prompt::{PromptId, Slot, SlotEntry};
     use crate::session::StoredSession;
-    use crate::tools::test_support::stub_seed;
+    use crate::tools::test_support::{assembled_main, stub_seed};
     use crate::{BackgroundNotice, InputSource, TaskEnd};
 
     const RUN_ID: u64 = 7;
@@ -1156,14 +1156,7 @@ mod tests {
     #[test]
     fn advertised_names_show_tool_search_not_deferred_tools() {
         let base = serde_json::json!([{"name": "read"}]);
-        let tools = RequestTools::assembled(
-            ToolRegistry::global(),
-            base.clone(),
-            &LocalTools::default(),
-            &AgentConfig::default(),
-            &Model::from_spec(MODEL_SPEC).unwrap(),
-            ToolAudience::MAIN,
-        );
+        let tools = assembled_main(base.clone(), &Model::from_spec(MODEL_SPEC).unwrap());
         let mcp =
             crate::mcp::test_support::stub_session(&[("srv.fetch_issue", "Fetch a GitHub issue")]);
         let names = advertised_tool_names(&tools, Some(&mcp));

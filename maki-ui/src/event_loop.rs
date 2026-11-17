@@ -9,16 +9,14 @@
 //! it runs under `block_on` on the main thread.
 
 use std::env;
-use std::future::{Future, pending, ready};
+use std::future::{pending, ready};
 use std::mem;
-use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
-use futures::FutureExt;
 
 use crossterm::event::{
     Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
@@ -56,7 +54,7 @@ use maki_storage::sessions::normalize_title;
 use ratatui::layout::Rect;
 use serde_json::json;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::oneshot;
 use tokio::task::coop::unconstrained;
 use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::timeout;
@@ -95,6 +93,7 @@ const PACK_PREPARING: &str = "Checking packages...";
 const PACK_BUSY_ERR: &str = "a package command is already running";
 const UNKNOWN_MODE_ERR: &str = "unknown mode; expected \"build\" or \"plan\"";
 const PACK_PANIC_ERR: &str = "the package command stopped unexpectedly";
+const MODEL_FETCH_PANIC_ERR: &str = "model discovery panicked; refresh to try again";
 const FORKED_MSG: &str = "Forked, {key} to switch back";
 /// A `/reload` cannot ask the terminal: its input reader owns the tty.
 const RESTART_FOR_BACKGROUND: &str =
@@ -483,7 +482,8 @@ impl SpawnCtx {
         let session = &open.session;
         let resumed = !session.messages().is_empty();
         let permissions = Arc::new(self.permissions.fork());
-        permissions.set_cwd(env::current_dir().unwrap_or_else(|_| self.permissions.cwd()));
+        permissions
+            .set_cwd(env::current_dir().unwrap_or_else(|_| self.permissions.cwd().to_path_buf()));
         let cell = Arc::new(ArcSwap::from(Arc::clone(&slot)));
         let handles = AgentHandles::spawn(
             &cell,
@@ -565,7 +565,6 @@ pub(crate) struct EventLoop<'t> {
     input: InputReader,
     warn_rx: UnboundedReceiver<String>,
     warn_tx: UnboundedSender<String>,
-    models_fetched: Arc<Notify>,
     ui_action_rx: UnboundedReceiver<UiAction>,
     ui_waker: UiWaker,
     /// One package command at a time. The work runs as its own task, so a
@@ -591,7 +590,10 @@ enum Wake {
     Shell(usize, ShellEvent),
     Warn(String),
     Pack(Box<PackPreparation>),
-    ModelsDiscovered,
+    ModelsDiscovered {
+        warning: Option<&'static str>,
+        next: Option<ModelListing>,
+    },
 }
 
 /// A value from the channel, or never, once it is closed: a closed channel
@@ -651,7 +653,6 @@ struct BackgroundModels {
     available: Arc<ArcSwapOption<ModelList>>,
     warn_rx: UnboundedReceiver<String>,
     warn_tx: UnboundedSender<String>,
-    models_fetched: Arc<Notify>,
     fetch: ModelFetch,
 }
 
@@ -674,26 +675,31 @@ impl ModelFetch {
         }
     }
 
-    fn finished(&mut self) -> Option<ModelListing> {
+    /// Never while idle. Once the running discovery ends, a panic included,
+    /// the warning for a panic and the refresh queued behind it. The task is
+    /// only cleared once it has answered, so a `select!` that drops this
+    /// future for another wake leaves it running.
+    async fn finished(&mut self) -> (Option<&'static str>, Option<ModelListing>) {
+        let Some(task) = &mut self.task else {
+            return pending().await;
+        };
+        let warning = task.await.is_err().then_some(MODEL_FETCH_PANIC_ERR);
         self.task = None;
-        self.pending.take()
+        (warning, self.pending.take())
     }
 }
 
 /// The one way discovery starts, so startup and `/models refresh` cannot drift
 /// apart. [`ModelFetch`] runs one at a time and coalesces the refreshes queued
-/// behind it. It only reports that it finished, panics included, and leaves
-/// rebuilding to the UI thread over a `Notify`, so the loop wakes on it instead
-/// of noticing at the next tick.
+/// behind it. The loop wakes on the task's end and rebuilds on the UI thread.
 fn fetch_models(
     available: Arc<ArcSwapOption<ModelList>>,
     policy: Arc<ModelPolicy>,
     warn_tx: UnboundedSender<String>,
-    models_fetched: Arc<Notify>,
     listing: ModelListing,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let fetch = fetch_all_models_cached(
+        fetch_all_models_cached(
             &policy,
             |list, warning| {
                 if let Some(warning) = warning {
@@ -702,41 +708,22 @@ fn fetch_models(
                 available.store(Some(Arc::new(list)));
             },
             listing,
-        );
-        complete_model_fetch(fetch, &warn_tx, &models_fetched).await;
+        )
+        .await;
     })
-}
-
-async fn complete_model_fetch(
-    fetch: impl Future<Output = ()>,
-    warn_tx: &UnboundedSender<String>,
-    models_fetched: &Notify,
-) {
-    if AssertUnwindSafe(fetch).catch_unwind().await.is_err() {
-        let _ = warn_tx.send("model discovery panicked; refresh to try again".to_owned());
-    }
-    models_fetched.notify_one();
 }
 
 fn spawn_model_fetch(policy: Arc<ModelPolicy>) -> BackgroundModels {
     let available: Arc<ArcSwapOption<ModelList>> = Arc::new(ArcSwapOption::empty());
     let (warn_tx, warn_rx) = unbounded_channel::<String>();
-    let models_fetched = Arc::new(Notify::new());
     let mut fetch = ModelFetch::default();
     fetch.request(ModelListing::Cached, |listing| {
-        fetch_models(
-            Arc::clone(&available),
-            policy,
-            warn_tx.clone(),
-            Arc::clone(&models_fetched),
-            listing,
-        )
+        fetch_models(Arc::clone(&available), policy, warn_tx.clone(), listing)
     });
     BackgroundModels {
         available,
         warn_rx,
         warn_tx,
-        models_fetched,
         fetch,
     }
 }
@@ -893,7 +880,6 @@ impl<'t> EventLoop<'t> {
             input: InputReader::new().context("watch terminal input")?,
             warn_rx: bg.warn_rx,
             warn_tx: bg.warn_tx,
-            models_fetched: bg.models_fetched,
             ui_action_rx,
             ui_waker,
             pack: None,
@@ -1021,7 +1007,7 @@ impl<'t> EventLoop<'t> {
             () = decor_worker::wakes().woken() => Wake::Decor,
             Some(warning) = self.warn_rx.recv() => Wake::Warn(warning),
             preparation = pack_done(&mut self.pack) => Wake::Pack(Box::new(preparation)),
-            () = self.models_fetched.notified() => Wake::ModelsDiscovered,
+            (warning, next) = self.model_fetch.finished() => Wake::ModelsDiscovered { warning, next },
             wake = session_wake(&mut self.sessions) => wake,
         }
     }
@@ -1036,9 +1022,12 @@ impl<'t> EventLoop<'t> {
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
             Wake::Warn(warning) => self.focused_app().flash(warning),
             Wake::Pack(preparation) => self.finish_pack(*preparation),
-            Wake::ModelsDiscovered => {
+            Wake::ModelsDiscovered { warning, next } => {
+                if let Some(warning) = warning {
+                    self.focused_app().flash(warning.to_owned());
+                }
                 self.rebuild_models();
-                if let Some(listing) = self.model_fetch.finished() {
+                if let Some(listing) = next {
                     self.refresh_models(listing);
                 }
             }
@@ -2246,7 +2235,6 @@ impl<'t> EventLoop<'t> {
                 Arc::clone(&self.ctx.available_models),
                 Arc::clone(&self.ctx.model_policy),
                 self.warn_tx.clone(),
-                Arc::clone(&self.models_fetched),
                 listing,
             )
         });
@@ -2390,7 +2378,6 @@ mod tests {
     use maki_config::PermissionsConfig;
     use maki_config::project::{self, TrustMode};
     use maki_providers::TokenUsage;
-    use std::future::pending;
     use tempfile::tempdir;
     use test_case::test_case;
     use tokio::sync::oneshot;
@@ -2454,8 +2441,8 @@ mod tests {
         }
         let current = env::current_dir().unwrap();
         assert_ne!(first.app.state.session.cwd, current.to_string_lossy());
-        assert_eq!(first.app.permissions.cwd(), current);
-        assert_eq!(second.app.permissions.cwd(), current);
+        assert_eq!(*first.app.permissions.cwd(), current);
+        assert_eq!(*second.app.permissions.cwd(), current);
         let command = format!("/cd {}", target.path().display());
         for character in command.chars() {
             first.app.update(Msg::Key(key(KeyCode::Char(character))));
@@ -2463,49 +2450,22 @@ mod tests {
         first.app.update(Msg::Key(key(KeyCode::Enter)));
         let cwd = target.path().canonicalize().unwrap();
         for permissions in [&first.app.permissions, &second.app.permissions, &prototype] {
-            assert_eq!(permissions.cwd(), cwd);
+            assert_eq!(*permissions.cwd(), cwd);
         }
         let opened = ctx.spawn_runtime(
             OpenSession::fresh(&slot.model.spec(), &root.path().to_string_lossy(), &storage),
             slot,
         );
-        assert_eq!(opened.app.permissions.cwd(), cwd);
+        assert_eq!(*opened.app.permissions.cwd(), cwd);
     }
 
-    #[test]
-    fn a_panicked_model_fetch_completes_and_allows_the_queued_refresh() {
-        let models_fetched = Arc::new(Notify::new());
-        let (warn_tx, mut warn_rx) = unbounded_channel();
-        let mut fetch = ModelFetch {
-            task: None,
-            pending: None,
-        };
-        let notify = Arc::clone(&models_fetched);
-        fetch.request(ModelListing::Cached, |_| {
-            maki_lua::test_support::runtime().spawn(async move {
-                complete_model_fetch(async { panic!("discovery failed") }, &warn_tx, &notify).await;
-            })
-        });
-        fetch.request(ModelListing::Refresh, |_| unreachable!());
-        maki_lua::test_support::runtime().block_on(models_fetched.notified());
-        assert!(
-            warn_rx
-                .try_recv()
-                .unwrap()
-                .contains("model discovery panicked")
-        );
-        let next = fetch.finished().unwrap();
-        assert_eq!(next, ModelListing::Refresh);
-        fetch.request(next, |_| maki_lua::test_support::runtime().spawn(pending()));
-        assert!(fetch.task.is_some());
-    }
-
-    #[test]
-    fn model_refresh_waits_for_discovery_and_coalesces_with_priority() {
-        let mut fetch = ModelFetch {
-            task: None,
-            pending: None,
-        };
+    /// A panicked discovery still ends, or the refresh queued behind it, and
+    /// every later one, would wait until the next `/reload`.
+    #[test_case(false ; "finished")]
+    #[test_case(true ; "panicked")]
+    fn model_refresh_waits_for_discovery_and_coalesces_with_priority(panics: bool) {
+        let runtime = maki_lua::test_support::runtime();
+        let mut fetch = ModelFetch::default();
         let mut started = Vec::new();
         for listing in [
             ModelListing::Cached,
@@ -2515,18 +2475,23 @@ mod tests {
         ] {
             fetch.request(listing, |listing| {
                 started.push(listing);
-                maki_lua::test_support::runtime().spawn(pending())
+                runtime.spawn(async move { assert!(!panics, "discovery failed") })
             });
         }
         assert_eq!(started, [ModelListing::Cached]);
-        let next = fetch.finished().unwrap();
-        assert_eq!(next, ModelListing::Refresh);
-        fetch.request(next, |listing| {
+        assert_eq!(
+            runtime.block_on(fetch.finished()),
+            (
+                panics.then_some(MODEL_FETCH_PANIC_ERR),
+                Some(ModelListing::Refresh)
+            )
+        );
+        fetch.request(ModelListing::Refresh, |listing| {
             started.push(listing);
-            maki_lua::test_support::runtime().spawn(pending())
+            runtime.spawn(async {})
         });
         assert_eq!(started, [ModelListing::Cached, ModelListing::Refresh]);
-        assert_eq!(fetch.finished(), None);
+        assert_eq!(runtime.block_on(fetch.finished()), (None, None));
     }
 
     fn done_event() -> AgentEvent {

@@ -14,6 +14,7 @@ local CHECKING = "Validate the login and policy of Claude Code %s"
 local ROUTE_OK = "claude.ai subscription%s on Claude Code %s, maki found no route conflict"
 local ROUTE_UNCONFIRMED = "maki could not confirm the route on Claude Code %s"
 local ERROR_PREFIX = jobs.ERROR_PREFIX
+local INSTRUCTIONS_HEADING = "The instructions maki loaded for this task, from the project and the user:"
 
 local function view_opts(ctx, keep)
   local tol = ctx:tool_output_lines()
@@ -148,6 +149,17 @@ function Run:send(data)
   return sent
 end
 
+--- Sent on stdin, so the process list never shows the task.
+--- {instructions} come first, because Claude Code loads none by itself.
+function Run.user_message(prompt, instructions)
+  local blocks = {}
+  if instructions and instructions ~= "" then
+    blocks[#blocks + 1] = INSTRUCTIONS_HEADING .. instructions
+  end
+  blocks[#blocks + 1] = prompt
+  return native.user_message(blocks)
+end
+
 function Run:on_answer()
   local model, problem = self.handshake:resolved_model(self.spec.model)
   if not model then
@@ -155,11 +167,12 @@ function Run:on_answer()
     return
   end
   self.stream.native:set_model(model)
-  local sent, err, queued = jobs.feed_stdin(self.job_id, launch.user_message(self.task, self.spec.instructions))
+  local sent, err, queued = jobs.feed_stdin(self.job_id, Run.user_message(self.task, self.spec.instructions))
   if queued then
-    -- The worker can act on a queued prompt even if closing stdin fails. Keep its snapshot.
+    -- The worker can act on a queued prompt even if closing stdin fails. The run then
+    -- takes the snapshot from the call, which removes only artifacts it still holds.
     self.stream.native:mark_prompted()
-    self.call:keep_artifact()
+    self.kept, self.call.artifact = self.call.artifact, nil
     self:restart_clock()
   end
   if not sent then
@@ -200,8 +213,8 @@ end
 
 function Run:on_exit(code)
   if self.finished then
-    if self.call.artifact and self.call.artifact_kept then
-      local _, problem = snapshot.sanitize(self.call.artifact, true)
+    if self.kept then
+      local _, problem = snapshot.sanitize(self.kept, true)
       if problem then
         maki.notify(ERROR_PREFIX .. "maki could not secure the retained snapshot: " .. problem, "error")
       end
@@ -234,8 +247,8 @@ function Run:on_cancel(reason)
   local answer = self.stream.result and truncate((self.stream:outcome()), self.max_lines, self.max_bytes) or ""
   local reply = partial.cut(self.view, answer, reason, self.timeout_secs, self.started_at)
   reply.llm_output = self:with_spent(reply.llm_output, true)
-  if self.call.artifact and self.call.artifact_kept then
-    reply.llm_output = reply.llm_output .. "\n" .. ABANDONED:format(self.call.artifact.snapshot :: string)
+  if self.kept then
+    reply.llm_output = reply.llm_output .. "\n" .. ABANDONED:format(self.kept.snapshot :: string)
   end
   reply.state = { header = lines }
   self.ctx:finish(reply)
@@ -249,7 +262,7 @@ function Run:restart_clock()
     if not self.stream.native:accepted() then
       self:stop(native.startup_late(launch.STARTUP_TIMEOUT_SECS))
     end
-  end, launch.STARTUP_MS)
+  end, launch.STARTUP_TIMEOUT_SECS * jobs.MS_PER_SEC)
 end
 
 -- After a cancel, the hook registered here delivers the call's result.
@@ -261,16 +274,21 @@ function Run:start(argv, cwd, env, task)
     version = self.spec.version,
     executable = self.spec.executable,
   })
-  local job_opts = launch.job_opts(cwd, env)
-  job_opts.on_stdout = function(_, line)
-    self:on_line(line)
-  end
-  local id, err = self.call:spawn(argv, job_opts, {
-    on_exit = function(_, code, _, stderr_tail)
-      self.stderr_tail = stderr_tail
-      self:on_exit(code)
+  local job_opts = {
+    max_line_bytes = native.max_event_bytes,
+    stop_on_line_limit = true,
+    cwd = cwd,
+    env = env,
+    clear_env = true,
+    stdin = "pipe",
+    on_stdout = function(_, line)
+      self:on_line(line)
     end,
-  })
+  }
+  local id, err = self.call:start(argv, job_opts, function(_, code, _, stderr_tail)
+    self.stderr_tail = stderr_tail
+    self:on_exit(code)
+  end)
   if not id then
     local text = "maki cannot start Claude Code: " .. tostring(err)
     return { llm_output = truncate(text, self.max_lines, self.max_bytes), shown = text, is_error = true }
@@ -281,10 +299,12 @@ function Run:start(argv, cwd, env, task)
   end)
   self:restart_clock()
   -- A send error would finish the call before the wait starts, so the
-  -- handshake is sent from inside the wait.
+  -- handshake is sent from inside the wait. The process that runs the task
+  -- answers it, so the answers cover every settings source it merged,
+  -- managed policy included.
   return maki.async.await(1, function(done)
     self.resolve = done
-    self:send(launch.HANDSHAKE_INPUT)
+    self:send(native.handshake_input)
   end)
 end
 

@@ -434,6 +434,7 @@ mod tests {
     use crate::AgentConfig;
     use crate::mcp::test_support::stub_session;
     use crate::tools::LocalTools;
+    use crate::tools::test_support::assembled_main;
     use arc_swap::ArcSwap;
     use serde_json::json;
     use test_case::test_case;
@@ -499,14 +500,7 @@ mod tests {
     fn context(tools: &str, authored: &str) -> RunContext {
         RunContext::fixed(
             authored.into(),
-            RequestTools::assembled(
-                ToolRegistry::global(),
-                json!([{ "name": tools }]),
-                &LocalTools::default(),
-                &AgentConfig::default(),
-                &model(NATIVE_MODEL),
-                ToolAudience::MAIN,
-            ),
+            assembled_main(json!([{ "name": tools }]), &model(NATIVE_MODEL)),
         )
     }
 

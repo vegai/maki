@@ -4,7 +4,6 @@ use color_eyre::Result;
 use color_eyre::eyre::eyre;
 use maki_agent::headless::{Ready, SessionTask, await_shutdown};
 use maki_agent::mcp::{self, McpHandle};
-use maki_agent::session::SessionTrack;
 use maki_agent::{AgentEvent, SessionEvents};
 use maki_config::ProjectConfig;
 use maki_lua::{EventHandle, SessionEndReason};
@@ -34,13 +33,11 @@ pub async fn startup(
     Err(eyre!("provider startup ended before it was ready"))
 }
 
-pub async fn shutdown(
-    task: SessionTask,
-    lua: &EventHandle,
-    session: &SessionRef,
-) -> Option<SessionTrack> {
-    let track = await_shutdown(task).await;
+/// Stops the session and reaps its plugin jobs. Background work and plugin
+/// jobs are stopped by the time the track drops, so nothing spends any more
+/// and dropping it saves the full bill, also what no turn was left to report.
+pub async fn shutdown(task: SessionTask, lua: &EventHandle, session: &SessionRef) {
+    let _track = await_shutdown(task).await;
     lua.end_sessions([session.id()], SessionEndReason::Completed)
         .await;
-    track
 }

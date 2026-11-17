@@ -4,7 +4,6 @@ local native = require("maki.claude_code.internal")
 -- subscription is the only route. Pay-per-token users have maki's anthropic
 -- provider.
 
-local jobs = require("claude_jobs")
 local path_utils = require("claude_paths")
 local confine = require("claude_confine")
 
@@ -13,7 +12,6 @@ local M = {}
 M.MODELS = { "sonnet", "opus", "haiku", "fable" }
 M.MODEL_SET = path_utils.set_of(M.MODELS)
 M.STARTUP_TIMEOUT_SECS = native.startup_timeout_secs
-M.STARTUP_MS = M.STARTUP_TIMEOUT_SECS * jobs.MS_PER_SEC
 M.READ_PROFILE = "read"
 M.CODE_PROFILE = "code"
 M.NO_SESSION_DIR = "maki cannot find the session's working directory: "
@@ -21,38 +19,11 @@ M.NO_SESSION_DIR = "maki cannot find the session's working directory: "
 -- Limits for a call's `timeout` and for the option.
 M.MIN_TIMEOUT_SECS = 30
 M.MAX_TIMEOUT_SECS = 1800
--- The process that runs the task answers these requests, so the answers
--- cover every settings source it merged, managed policy included.
-M.HANDSHAKE_INPUT = native.handshake_input
-
-local INSTRUCTIONS_HEADING = "The instructions maki loaded for this task, from the project and the user:"
 
 --- Returns how many whole seconds a call can run: {requested} or
 --- {configured}, clamped to the limits.
 function M.task_timeout(requested, configured)
   return math.floor(math.clamp(requested or configured, M.MIN_TIMEOUT_SECS, M.MAX_TIMEOUT_SECS))
-end
-
---- Sent on stdin, so the process list never shows the task.
---- {instructions} come first, because Claude Code loads none by itself.
-function M.user_message(prompt, instructions)
-  local blocks = {}
-  if instructions and instructions ~= "" then
-    blocks[#blocks + 1] = INSTRUCTIONS_HEADING .. instructions
-  end
-  blocks[#blocks + 1] = prompt
-  return native.user_message(blocks)
-end
-
-function M.job_opts(cwd, env)
-  return {
-    max_line_bytes = native.max_event_bytes,
-    stop_on_line_limit = true,
-    cwd = cwd,
-    env = env,
-    clear_env = true,
-    stdin = "pipe",
-  }
 end
 
 function M.preflight(input, ctx, call, opts)

@@ -5,6 +5,7 @@
 //! stops where stopping makes sense.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use maki_providers::Model;
@@ -78,7 +79,7 @@ pub struct AgentHooks<'a> {
     pub model: &'a Model,
     pub cancel: &'a CancelToken,
     pub context_size: u32,
-    pub cwd: PathBuf,
+    pub cwd: Arc<PathBuf>,
 }
 
 impl AgentHooks<'_> {

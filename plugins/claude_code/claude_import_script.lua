@@ -1,5 +1,6 @@
 local git_utils = require("claude_git")
 local path_utils = require("claude_paths")
+local artifacts = require("claude_artifact")
 
 local M = {}
 
@@ -112,6 +113,7 @@ function M.import_script(changes, project, git_dir, artifact, stage)
     words[#words + 1] = path_utils.shell_quote(word)
   end
   local quoted_project = path_utils.shell_quote(project)
+  local layout, stage_name = artifacts.layout(artifact), maki.fs.basename(stage)
   local lines = { "# Import changes into " .. path_utils.printable(project) }
   for _, change in ipairs(changes) do
     lines[#lines + 1] = "# " .. change.status .. " " .. path_utils.printable(change.path)
@@ -126,10 +128,8 @@ function M.import_script(changes, project, git_dir, artifact, stage)
     "hash_note=" .. path_utils.shell_quote(HASH_FAILED),
     "checkout_note=" .. path_utils.shell_quote(CHECKOUT_GONE),
     "changed_exit=" .. IMPORT_CHANGED_EXIT,
-    "originals="
-      .. path_utils.shell_quote(artifact .. "/" .. path_utils.IMPORT_ORIGINALS .. "/" .. stage:match("[^/]+$")),
-    "displaced="
-      .. path_utils.shell_quote(artifact .. "/" .. path_utils.IMPORT_DISPLACED .. "/" .. stage:match("[^/]+$")),
+    "originals=" .. path_utils.shell_quote(maki.fs.joinpath(layout.originals, stage_name)),
+    "displaced=" .. path_utils.shell_quote(maki.fs.joinpath(layout.displaced, stage_name)),
     "stage=" .. path_utils.shell_quote(stage),
     "receipt=" .. path_utils.shell_quote(M.receipt_path(artifact, stage)),
     "temp_template=" .. path_utils.shell_quote(M.temp_name(stage) .. TEMP_RANDOM),

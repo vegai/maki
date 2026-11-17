@@ -6,16 +6,15 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
-use maki_storage::permissions::PERMISSION_BITS;
-
 use maki_storage::id::MakiId;
+use maki_storage::permissions::PERMISSION_BITS;
 use rustix::fd::{AsFd, BorrowedFd};
 use rustix::fs::{AtFlags, CWD, Dir, FileType, Stat, renameat, statat, unlinkat};
 use rustix::io::Errno;
 use rustix::path::Arg;
 
 use super::fd::{create_private, directory, open_regular};
-use maki_providers::claude_code::worker::{GIT_ENTRY, GITDIR_PREFIX};
+use maki_providers::claude_code::worker::{COMMONDIR, GIT_ENTRY, GITDIR_PREFIX};
 
 const MAX_DEPTH: usize = 64;
 const BASE_RESOLUTION_STEPS: usize = 64 * 1024;
@@ -24,7 +23,6 @@ const DEPTH_EXCEEDED: &str = "snapshot exceeds";
 const MAX_FAILURES: usize = 10;
 const CONFIG: &str = "config";
 const HEAD: &str = "HEAD";
-const COMMONDIR: &str = "commondir";
 const REPOSITORY_ENTRIES: &[&str] = &["objects", "refs"];
 const QUARANTINE_PREFIX: &str = "repository.";
 const QUARANTINE_ENTRY: &str = "metadata";
@@ -290,6 +288,7 @@ fn depth_error() -> io::Error {
     io::Error::other(format!("{DEPTH_EXCEEDED} {MAX_DEPTH} directory levels"))
 }
 
+/// `resolve_links` reads links by path, so call this only while nothing writes the snapshot.
 pub fn sanitize_snapshot(
     snapshot: &Path,
     quarantine: &Path,
@@ -387,8 +386,8 @@ pub fn sanitize_snapshot(
 mod tests {
     use super::{
         BASE_RESOLUTION_STEPS, COMMONDIR, CONFIG, DEPTH_EXCEEDED, GIT_ENTRY, GITDIR_PREFIX, HEAD,
-        MAX_DEPTH, MAX_FAILURES, QUARANTINE_ENTRY, Visit, quarantine_entry, resolve_links,
-        sanitize_snapshot, walk,
+        MAX_DEPTH, MAX_FAILURES, QUARANTINE_ENTRY, SnapshotMetadata, Visit, quarantine_entry,
+        resolve_links, sanitize_snapshot, walk,
     };
     use rustix::io::Errno;
     use rustix::process::geteuid;
@@ -400,7 +399,7 @@ mod tests {
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
     use test_case::test_case;
 
     const REPOSITORY: &str = "fixtures/x.git";
@@ -415,6 +414,40 @@ mod tests {
     const RESOLUTION_LINK: &str = "link";
     const REALPATH: &str = "realpath";
 
+    /// An existing snapshot, with its quarantine and trusted repository beside it.
+    struct Fixture {
+        dir: TempDir,
+        snapshot: PathBuf,
+        quarantine: PathBuf,
+        git: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir = tempdir().unwrap();
+            let snapshot = dir.path().join("snapshot");
+            fs::create_dir(&snapshot).unwrap();
+            Self {
+                quarantine: dir.path().join("quarantine"),
+                git: dir.path().join("repository"),
+                snapshot,
+                dir,
+            }
+        }
+
+        fn beside(&self, name: &str) -> PathBuf {
+            self.dir.path().join(name)
+        }
+
+        fn sanitize(&self, prune_links: bool) -> io::Result<SnapshotMetadata> {
+            sanitize_snapshot(&self.snapshot, &self.quarantine, &self.git, prune_links)
+        }
+
+        fn pointer(&self) -> String {
+            format!("{GITDIR_PREFIX} {}\n", self.git.display())
+        }
+    }
+
     #[test_case(b"inside/file" ; "internal")]
     #[test_case(b"missing/file" ; "missing_internal_target")]
     #[test_case(b"../outside/missing" ; "missing_external_target")]
@@ -424,11 +457,11 @@ mod tests {
     #[test_case(b"chain0" ; "long_link_chain")]
     #[test_case(b"missing/\xff" ; "non_utf8_target")]
     fn link_resolution_and_removal_match_realpath(target: &[u8]) {
-        let dir = tempdir().unwrap();
-        let snapshot = dir.path().join("snapshot");
-        let outside = dir.path().join("outside");
-        fs::create_dir_all(snapshot.join("inside")).unwrap();
-        fs::create_dir_all(&outside).unwrap();
+        let fixture = Fixture::new();
+        let snapshot = &fixture.snapshot;
+        let outside = fixture.beside("outside");
+        fs::create_dir(snapshot.join("inside")).unwrap();
+        fs::create_dir(&outside).unwrap();
         fs::write(snapshot.join("inside/file"), CONTENT).unwrap();
         symlink(".", snapshot.join("dot")).unwrap();
         symlink("../outside", snapshot.join("escape")).unwrap();
@@ -453,25 +486,14 @@ mod tests {
                 output.stdout.strip_suffix(&[0]).unwrap().to_vec(),
             ))
         });
+        let root = snapshot.canonicalize().unwrap();
         let mut remaining = BASE_RESOLUTION_STEPS;
         assert_eq!(
-            resolve_links(
-                &snapshot.canonicalize().unwrap(),
-                Path::new(RESOLUTION_LINK),
-                &mut remaining
-            )
-            .ok(),
+            resolve_links(&root, Path::new(RESOLUTION_LINK), &mut remaining).ok(),
             expected
         );
-        let dropped =
-            expected.is_none_or(|path| !path.starts_with(snapshot.canonicalize().unwrap()));
-        let metadata = sanitize_snapshot(
-            &snapshot,
-            &dir.path().join("quarantine"),
-            &dir.path().join("repository"),
-            true,
-        )
-        .unwrap();
+        let dropped = expected.is_none_or(|path| !path.starts_with(&root));
+        let metadata = fixture.sanitize(true).unwrap();
         assert_eq!(
             metadata
                 .dropped_links
@@ -480,13 +502,13 @@ mod tests {
         );
         assert_eq!(fs::symlink_metadata(link).is_err(), dropped);
     }
+
     #[test_case("loop" ; "self_cycle")]
     #[test_case("loop/again" ; "growing_cycle")]
     fn cyclic_links_are_unresolved_and_pruned(target: &str) {
         const LOOP: &str = "loop";
-        let dir = tempdir().unwrap();
-        let snapshot = dir.path().join("snapshot");
-        fs::create_dir(&snapshot).unwrap();
+        let fixture = Fixture::new();
+        let snapshot = &fixture.snapshot;
         symlink(target, snapshot.join(LOOP)).unwrap();
         symlink(LOOP, snapshot.join(RESOLUTION_LINK)).unwrap();
         let mut remaining = BASE_RESOLUTION_STEPS;
@@ -497,13 +519,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.raw_os_error(), Some(Errno::LOOP.raw_os_error()));
-        let metadata = sanitize_snapshot(
-            &snapshot,
-            &dir.path().join("quarantine"),
-            &dir.path().join("repository"),
-            true,
-        )
-        .unwrap();
+        let metadata = fixture.sanitize(true).unwrap();
         for name in [LOOP, RESOLUTION_LINK] {
             assert!(metadata.dropped_links.contains(&PathBuf::from(name)));
             assert_eq!(
@@ -568,11 +584,9 @@ mod tests {
         const CHAIN: usize = 8;
         const PADDING: usize = 256;
         const ALIAS_PREFIX: &str = "alias";
-        let dir = tempdir().unwrap();
-        let snapshot = dir.path().join("snapshot");
-        let quarantine = dir.path().join("quarantine");
-        let git = dir.path().join("repository");
-        fs::create_dir_all(snapshot.join("d")).unwrap();
+        let fixture = Fixture::new();
+        let snapshot = &fixture.snapshot;
+        fs::create_dir(snapshot.join("d")).unwrap();
         let padding = "d/../".repeat(PADDING);
         for level in 0..CHAIN {
             let target = if level == 0 {
@@ -593,9 +607,9 @@ mod tests {
             )
             .unwrap();
         }
-        let collected = sanitize_snapshot(&snapshot, &quarantine, &git, false).unwrap();
+        let collected = fixture.sanitize(false).unwrap();
         assert!(collected.dropped_links.is_empty());
-        let prepared = sanitize_snapshot(&snapshot, &quarantine, &git, true).unwrap();
+        let prepared = fixture.sanitize(true).unwrap();
         let dropped = prepared
             .dropped_links
             .iter()
@@ -624,8 +638,8 @@ mod tests {
         const ROOT_DEPTH: usize = 12;
         const DEPENDENCY_DEPTH: usize = 12;
         const TARGET: &str = "../../target@1.0.0/node_modules/target";
-        let dir = tempdir().unwrap();
-        let snapshot = dir.path().join("root/".repeat(ROOT_DEPTH));
+        let fixture = Fixture::new();
+        let snapshot = fixture.snapshot.join("root/".repeat(ROOT_DEPTH));
         let dependencies = snapshot
             .join("nested/".repeat(DEPENDENCY_DEPTH))
             .join("node_modules/.pnpm");
@@ -635,13 +649,8 @@ mod tests {
             fs::create_dir_all(&modules).unwrap();
             symlink(TARGET, modules.join("target")).unwrap();
         }
-        let metadata = sanitize_snapshot(
-            &snapshot,
-            &dir.path().join("quarantine"),
-            &dir.path().join("repository"),
-            true,
-        )
-        .unwrap();
+        let metadata =
+            sanitize_snapshot(&snapshot, &fixture.quarantine, &fixture.git, true).unwrap();
         assert!(
             metadata.dropped_links.is_empty(),
             "{} safe links removed",
@@ -661,17 +670,15 @@ mod tests {
 
     #[test]
     fn the_trusted_git_pointer_cannot_share_an_external_inode() {
-        let dir = tempdir().unwrap();
-        let snapshot = dir.path().join("snapshot");
-        let git = dir.path().join("repository");
-        let outside = dir.path().join(GIT_ENTRY);
-        fs::create_dir(&snapshot).unwrap();
-        let expected = format!("{} {}\n", GITDIR_PREFIX, git.display());
+        let fixture = Fixture::new();
+        let pointer = fixture.snapshot.join(GIT_ENTRY);
+        let outside = fixture.beside(GIT_ENTRY);
+        let expected = fixture.pointer();
         fs::write(&outside, &expected).unwrap();
-        fs::hard_link(&outside, snapshot.join(GIT_ENTRY)).unwrap();
-        sanitize_snapshot(&snapshot, &dir.path().join("quarantine"), &git, true).unwrap();
-        assert_eq!(fs::metadata(snapshot.join(GIT_ENTRY)).unwrap().nlink(), 1);
-        fs::write(snapshot.join(GIT_ENTRY), CONTENT).unwrap();
+        fs::hard_link(&outside, &pointer).unwrap();
+        fixture.sanitize(true).unwrap();
+        assert_eq!(fs::metadata(&pointer).unwrap().nlink(), 1);
+        fs::write(pointer, CONTENT).unwrap();
         assert_eq!(fs::read_to_string(outside).unwrap(), expected);
     }
 
@@ -679,27 +686,18 @@ mod tests {
     #[test_case(true, 0o751 ; "tracked_alias")]
     #[test_case(false, 0o6751 ; "special_bits_are_removed")]
     fn sanitizing_hard_links_preserves_contents_modes_and_timestamps(internal: bool, mode: u32) {
-        let dir = tempdir().unwrap();
-        let snapshot = dir.path().join("snapshot");
-        let quarantine = dir.path().join("quarantine");
-        let git = dir.path().join("repository");
-        fs::create_dir(&snapshot).unwrap();
+        let fixture = Fixture::new();
         let source = if internal {
-            snapshot.join(HEAD)
+            fixture.snapshot.join(HEAD)
         } else {
-            dir.path().join(HEAD)
+            fixture.beside(HEAD)
         };
         fs::write(&source, CONTENT).unwrap();
         fs::set_permissions(&source, Permissions::from_mode(mode)).unwrap();
         let before = fs::metadata(&source).unwrap();
-        let copied = snapshot.join(CONFIG);
+        let copied = fixture.snapshot.join(CONFIG);
         fs::hard_link(&source, &copied).unwrap();
-        assert!(
-            sanitize_snapshot(&snapshot, &quarantine, &git, true)
-                .unwrap()
-                .private_files
-                > 0
-        );
+        assert!(fixture.sanitize(true).unwrap().private_files > 0);
         let after = fs::metadata(&copied).unwrap();
         assert_eq!(after.nlink(), 1);
         assert_eq!(
@@ -716,46 +714,39 @@ mod tests {
     #[test_case(".git" ; "lowercase")]
     #[test_case(".GiT" ; "mixed_case")]
     fn sanitize_keeps_the_trusted_pointer_and_moves_nested_metadata(name: &str) {
-        let dir = tempdir().unwrap();
-        let snapshot = dir.path().join("snapshot");
-        let quarantine = dir.path().join("quarantine");
-        let git = dir.path().join("repository");
-        fs::create_dir_all(snapshot.join("nested")).unwrap();
-        let pointer = format!("{} {}\n", GITDIR_PREFIX, git.display());
+        let fixture = Fixture::new();
+        let snapshot = &fixture.snapshot;
+        fs::create_dir(snapshot.join("nested")).unwrap();
+        let pointer = fixture.pointer();
         fs::write(snapshot.join(GIT_ENTRY), &pointer).unwrap();
         fs::write(snapshot.join("nested").join(name), "untrusted metadata").unwrap();
         assert_eq!(
-            sanitize_snapshot(&snapshot, &quarantine, &git, true)
-                .unwrap()
-                .git_metadata,
+            fixture.sanitize(true).unwrap().git_metadata,
             [PathBuf::from(format!("nested/{name}"))]
         );
         assert_eq!(
             fs::read_to_string(snapshot.join(GIT_ENTRY)).unwrap(),
             pointer
         );
-        assert_eq!(fs::read_dir(&quarantine).unwrap().count(), 1);
-        let metadata = sanitize_snapshot(&snapshot, &quarantine, &git, true).unwrap();
+        assert_eq!(fs::read_dir(&fixture.quarantine).unwrap().count(), 1);
+        let metadata = fixture.sanitize(true).unwrap();
         assert!(metadata.git_metadata.is_empty());
         assert!(metadata.dropped_links.is_empty());
-        assert_eq!(fs::read_dir(&quarantine).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&fixture.quarantine).unwrap().count(), 1);
     }
 
     #[test]
     fn sanitize_moves_metadata_links_without_following_directory_links() {
-        let dir = tempdir().unwrap();
-        let snapshot = dir.path().join("snapshot");
-        let quarantine = dir.path().join("quarantine");
-        let git = dir.path().join("repository");
-        let outside = dir.path().join("outside");
-        fs::create_dir_all(&snapshot).unwrap();
-        fs::create_dir_all(&outside).unwrap();
+        let fixture = Fixture::new();
+        let snapshot = &fixture.snapshot;
+        let outside = fixture.beside("outside");
+        fs::create_dir(&outside).unwrap();
         let target = outside.join(GIT_ENTRY);
-        let pointer = format!("{} {}\n", GITDIR_PREFIX, git.display());
+        let pointer = fixture.pointer();
         fs::write(&target, &pointer).unwrap();
         symlink(&target, snapshot.join(GIT_ENTRY)).unwrap();
         symlink(&outside, snapshot.join("linked")).unwrap();
-        let metadata = sanitize_snapshot(&snapshot, &quarantine, &git, true).unwrap();
+        let metadata = fixture.sanitize(true).unwrap();
         assert!(metadata.git_metadata.is_empty());
         assert_eq!(metadata.dropped_links, [PathBuf::from("linked")]);
         assert_eq!(fs::read_to_string(&target).unwrap(), pointer);
@@ -764,7 +755,7 @@ mod tests {
                 .unwrap()
                 .is_file()
         );
-        assert_eq!(fs::read_dir(&quarantine).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&fixture.quarantine).unwrap().count(), 1);
         assert!(fs::symlink_metadata(snapshot.join("linked")).is_err());
     }
 
@@ -772,10 +763,8 @@ mod tests {
     #[test_case("refs" ; "refs")]
     #[test_case(COMMONDIR ; "shared_objects")]
     fn embedded_repositories_and_their_configs_are_quarantined(layout: &str) {
-        let dir = tempdir().unwrap();
-        let snapshot = dir.path().join("snapshot");
-        let quarantine = dir.path().join("quarantine");
-        let git = dir.path().join("repository");
+        let fixture = Fixture::new();
+        let snapshot = &fixture.snapshot;
         let repository = snapshot.join(REPOSITORY);
         if layout == COMMONDIR {
             fs::create_dir_all(&repository).unwrap();
@@ -788,10 +777,10 @@ mod tests {
         }
         fs::write(repository.join(HEAD), CONTENT).unwrap();
         fs::write(repository.join(CONFIG), CONTENT).unwrap();
-        let paths = sanitize_snapshot(&snapshot, &quarantine, &git, true).unwrap();
+        let paths = fixture.sanitize(true).unwrap();
         assert_eq!(paths.repositories, [PathBuf::from(REPOSITORY)]);
         assert!(!repository.exists());
-        let entries: Vec<_> = fs::read_dir(&quarantine)
+        let entries: Vec<_> = fs::read_dir(&fixture.quarantine)
             .unwrap()
             .map(|entry| entry.unwrap().path().join(QUARANTINE_ENTRY))
             .collect();
@@ -841,9 +830,8 @@ mod tests {
     #[test_case(false ; "directories")]
     #[test_case(true ; "symlink_markers")]
     fn quarantined_repositories_share_the_depth_limit(linked: bool) {
-        let root = tempdir().unwrap();
-        let snapshot = root.path().join("snapshot");
-        let mut nested = snapshot.join(GIT_ENTRY);
+        let fixture = Fixture::new();
+        let mut nested = fixture.snapshot.join(GIT_ENTRY);
         for _ in 0..=MAX_DEPTH {
             fs::create_dir_all(&nested).unwrap();
             fs::write(nested.join(HEAD), CONTENT).unwrap();
@@ -854,14 +842,7 @@ mod tests {
             }
             nested.push(CONFIG);
         }
-        let error = sanitize_snapshot(
-            &snapshot,
-            &root.path().join("quarantine"),
-            &root.path().join("repository"),
-            true,
-        )
-        .err()
-        .unwrap();
+        let error = fixture.sanitize(true).err().unwrap();
         assert!(error.to_string().contains(DEPTH_EXCEEDED));
     }
 
@@ -886,10 +867,8 @@ mod tests {
             );
             return;
         }
-        let root = tempdir().unwrap();
-        let snapshot = root.path().join("snapshot");
-        let quarantine = root.path().join("quarantine");
-        let repository = snapshot.join(GIT_ENTRY);
+        let fixture = Fixture::new();
+        let repository = fixture.snapshot.join(GIT_ENTRY);
         fs::create_dir_all(repository.join("objects")).unwrap();
         fs::write(repository.join(HEAD), CONTENT).unwrap();
         for index in 0..PENDING_REPOSITORIES {
@@ -899,15 +878,9 @@ mod tests {
             fs::write(child.join(HEAD), CONTENT).unwrap();
             fs::write(child.join(CONFIG).join(HEAD), CONTENT).unwrap();
         }
-        sanitize_snapshot(
-            &snapshot,
-            &quarantine,
-            &root.path().join("repository"),
-            true,
-        )
-        .unwrap();
+        fixture.sanitize(true).unwrap();
         assert_eq!(
-            fs::read_dir(quarantine).unwrap().count(),
+            fs::read_dir(&fixture.quarantine).unwrap().count(),
             PENDING_REPOSITORIES + 1
         );
     }
@@ -935,16 +908,14 @@ mod tests {
         if geteuid().is_root() {
             return;
         }
-        let dir = tempdir().unwrap();
-        let snapshot = dir.path().join("snapshot");
-        let quarantine = dir.path().join("quarantine");
-        let git = dir.path().join("repository");
+        let fixture = Fixture::new();
+        let snapshot = &fixture.snapshot;
         let unreadable = snapshot.join(UNREADABLE);
-        fs::create_dir_all(&unreadable).unwrap();
+        fs::create_dir(&unreadable).unwrap();
         fs::create_dir(snapshot.join("nested")).unwrap();
         fs::write(snapshot.join("nested/.git"), CONTENT).unwrap();
         fs::set_permissions(&unreadable, Permissions::from_mode(0o0)).unwrap();
-        let result = sanitize_snapshot(&snapshot, &quarantine, &git, true);
+        let result = fixture.sanitize(true);
         fs::set_permissions(&unreadable, Permissions::from_mode(0o700)).unwrap();
         assert!(result.is_err());
         assert!(!snapshot.join("nested/.git").exists());
@@ -952,21 +923,15 @@ mod tests {
 
     #[test]
     fn a_large_root_pointer_is_preserved_without_reading_it() {
-        let dir = tempdir().unwrap();
-        let snapshot = dir.path().join("snapshot");
-        let quarantine = dir.path().join("quarantine");
-        let git = dir.path().join("repository");
-        fs::create_dir(&snapshot).unwrap();
-        File::create(snapshot.join(GIT_ENTRY))
+        let fixture = Fixture::new();
+        let pointer = fixture.snapshot.join(GIT_ENTRY);
+        File::create(&pointer)
             .unwrap()
             .set_len(LARGE_POINTER_BYTES)
             .unwrap();
-        sanitize_snapshot(&snapshot, &quarantine, &git, true).unwrap();
-        assert_eq!(
-            fs::read_to_string(snapshot.join(GIT_ENTRY)).unwrap(),
-            format!("{} {}\n", GITDIR_PREFIX, git.display())
-        );
-        let preserved = fs::read_dir(&quarantine)
+        fixture.sanitize(true).unwrap();
+        assert_eq!(fs::read_to_string(pointer).unwrap(), fixture.pointer());
+        let preserved = fs::read_dir(&fixture.quarantine)
             .unwrap()
             .next()
             .unwrap()
@@ -975,26 +940,26 @@ mod tests {
             .join(QUARANTINE_ENTRY);
         assert_eq!(fs::metadata(preserved).unwrap().len(), LARGE_POINTER_BYTES);
     }
+
     #[test]
     fn renaming_a_parent_cannot_redirect_quarantine() {
-        let dir = tempdir().unwrap();
-        let snapshot = dir.path().join("snapshot");
-        let quarantine = dir.path().join("quarantine");
-        let outside = dir.path().join("outside");
-        let moved = dir.path().join("moved");
-        fs::create_dir_all(snapshot.join("nested")).unwrap();
+        let fixture = Fixture::new();
+        let snapshot = &fixture.snapshot;
+        let outside = fixture.beside("outside");
+        let moved = fixture.beside("moved");
+        fs::create_dir(snapshot.join("nested")).unwrap();
         fs::create_dir(&outside).unwrap();
-        fs::create_dir(&quarantine).unwrap();
+        fs::create_dir(&fixture.quarantine).unwrap();
         fs::write(snapshot.join("nested/.git"), CONTENT).unwrap();
         fs::write(outside.join(GIT_ENTRY), CONTENT).unwrap();
         walk(
-            File::open(&snapshot).unwrap(),
+            File::open(snapshot).unwrap(),
             0,
             |parent, name, path, _metadata| {
                 if path == Path::new("nested/.git") {
                     fs::rename(snapshot.join("nested"), &moved)?;
                     symlink(&outside, snapshot.join("nested"))?;
-                    quarantine_entry(parent, name, &quarantine, path.components().count())?;
+                    quarantine_entry(parent, name, &fixture.quarantine, path.components().count())?;
                     return Ok(Visit::Skip);
                 }
                 Ok(Visit::Scan)
@@ -1007,17 +972,16 @@ mod tests {
             CONTENT
         );
     }
+
     #[test]
     fn the_snapshot_root_cannot_import_bare_metadata() {
-        let dir = tempdir().unwrap();
-        let snapshot = dir.path().join("snapshot");
-        let quarantine = dir.path().join("quarantine");
-        let git = dir.path().join("repository");
-        fs::create_dir_all(snapshot.join("objects")).unwrap();
+        let fixture = Fixture::new();
+        let snapshot = &fixture.snapshot;
+        fs::create_dir(snapshot.join("objects")).unwrap();
         fs::write(snapshot.join(HEAD), CONTENT).unwrap();
         fs::write(snapshot.join(CONFIG), CONTENT).unwrap();
         fs::write(snapshot.join("work.txt"), CONTENT).unwrap();
-        let result = sanitize_snapshot(&snapshot, &quarantine, &git, true).unwrap();
+        let result = fixture.sanitize(true).unwrap();
         assert_eq!(result.repositories, [PathBuf::from(".")]);
         assert!(!snapshot.join(HEAD).exists());
         assert!(!snapshot.join(CONFIG).exists());

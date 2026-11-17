@@ -9,53 +9,22 @@ use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use maki_agent::tools::test_support::stub_ctx_in;
-use maki_agent::tools::{ToolContext, ToolRegistry};
-use maki_lua::PluginHost;
-use maki_providers::claude_code::worker;
+use maki_providers::claude_code::{DEFAULT_EXECUTABLE, DEFAULT_MAX_CONCURRENT, MIN_MAX_CONCURRENT};
 use serde_json::{Map, Value, json};
-use tempfile::{TempDir, tempdir};
+use tempfile::tempdir;
 use test_case::test_case;
 
-use super::policy::{ANSWER, ANSWERS, FakeClaude};
-use super::support::environment;
-
+use super::policy::{ANSWER, ANSWERS, FakeClaude, NO_SCENARIO, code_with, sandbox_filesystem};
 use super::support::{
-    ARTIFACT_MARKER, DEADLINE, DEPENDENCY_DIR, DEPENDENCY_FILE, DEPENDENCY_UNSETTLED, MANIFEST,
-    MINIMUM_VERSION, TOOL, WorkingDir, artifact_listing, backdate, commit_all, executable, git,
-    listing, load, on_path, reply, use_fixture_user, wait_for_release, wait_until, write,
+    ARTIFACT_GIT, ARTIFACT_MARKER, CLAUDE_CONFIG_ENV, DEADLINE, DEPENDENCY_DIR, DEPENDENCY_FILE,
+    DEPENDENCY_UNSETTLED, Gate, HOME_ENV, MANIFEST, TOOL, WorkingDir, artifact_listing,
+    commit_repo, contents, environment, executable, listing, load, old_folder, on_path, wait_until,
+    write,
 };
 
-const HELD_REMOVAL: &str =
-    "#!/bin/sh\ntouch \"@MARKER@\"\n@WAIT_FOR_RELEASE@\nexec \"@REAL@\" \"$@\"\n";
+const HELD_REMOVAL: &str = "#!/bin/sh\ntouch \"@MARKER@\"\n@WAIT@\nexec \"@REAL@\" \"$@\"\n";
 const VERSION_ONLY: &str = "#!/bin/sh\necho '@VERSION@ (Claude Code)'\n";
-/// Answers the handshake like a clean subscription login, in the mode it was
-/// started in, and runs no task. It saves its settings, the prompt it gets
-/// and each start's environment next to itself.
-const HANDSHAKE_ONLY: &str = r#"#!/bin/sh
-env >> "$(dirname "$0")/env"
-if [ "$1" = --version ]; then echo '@VERSION@ (Claude Code)'; exit 0; fi
-flags=; mode=; prev=
-for arg; do
-  [ "$prev" = --settings ] && flags=$arg
-  [ "$prev" = --permission-mode ] && mode=$arg
-  prev=$arg
-done
-[ "$mode" = manual ] && mode=default
-printf '%s' "$flags" > "$(dirname "$0")/settings"
-@CONTROL_REPLY@
-while IFS= read -r msg; do
-  id=$(printf '%s' "$msg" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
-  case "$msg" in
-    *'"type":"user"'*) printf '%s\n' "$msg" > "$(dirname "$0")/prompt" ;;
-    *'"initialize"'*) reply "$id" "$(printf '%s' '@ACCOUNT_SUBSCRIPTION@' | sed "s/\"current_permission_mode\":\"default\"/\"current_permission_mode\":\"$mode\"/")" ;;
-    *'"get_settings"'*) reply "$id" "{\"effective\":$flags,\"sources\":[{\"source\":\"flagSettings\",\"settings\":$flags}]}" ;;
-    *'"get_hooks_listing"'*) reply "$id" '@HOOKS_OFF@' ;;
-  esac
-done
-"#;
 /// Refuses to clone with the given cause, naming itself by its full path as a
 /// `cp` run from a path does, and copies normally otherwise.
 const CLONE_REFUSING_CP: &str = "#!/bin/sh\ncase \" $* \" in *\" --reflink=always \"*) echo \"$0: failed to clone 'x' from 'y': @REFUSED@\" >&2; exit 1 ;; esac\nexec \"@REAL@\" \"$@\"\n";
@@ -68,9 +37,10 @@ const MAKE_EXECUTABLE: &str = "chmod +x src/lib.rs";
 const RETARGET_LINK: &str = "ln -sfn other.rs src/link";
 const EDIT_DEPENDENCY: &str = "echo edited >> node_modules/pkg/index.js";
 const CHANGED_DURING_COPY: &str = "the checkout changed during the snapshot: ";
+/// The checkout's tracked file.
+const LIB: (&str, &str) = ("src/lib.rs", "base\n");
 /// How the refusal names `TMPDIR`, before any file is made there.
 const TMPDIR: &str = "TMPDIR";
-const HOME: &str = "HOME";
 const HOME_LINK: &str = "linked-home";
 const HOME_DENY_PATHS: [&str; 4] = [
     ".ssh",
@@ -79,7 +49,6 @@ const HOME_DENY_PATHS: [&str; 4] = [
     ".claude.json.tmp.42.random",
 ];
 const SECRET_DIR: &str = "credentials";
-const CONFIG_DIR: &str = "CLAUDE_CONFIG_DIR";
 const LOGIN_LINK: &str = "usual-login";
 const XDG_STATE_HOME: &str = "XDG_STATE_HOME";
 const OAUTH_TOKEN: &str = "CLAUDE_CODE_OAUTH_TOKEN";
@@ -88,19 +57,18 @@ const TEST_LOGIN_TOKEN: &str = "not-a-real-token";
 const TEST_PROXY_LOGIN: &str = "http://user:not-a-real-password@proxy:3128/";
 const API_KEY: &str = "ANTHROPIC_API_KEY";
 const BASE_URL: &str = "ANTHROPIC_BASE_URL";
-/// An artifact's repository, next to its snapshot.
-const GIT_DIR: &str = "git";
 /// Where artifacts go in maki's state directory when `artifact_dir` is
 /// unset.
 const DEFAULT_ARTIFACT_ROOT: &str = "claude_code/changes";
 const PATH: &str = "PATH";
 /// A probe's error when the fake answers it with its version line.
 const NO_EVENT_STOP: &str = "printed a line that is not an event";
-/// The plugin's names for an artifact's files.
+/// Where a sweep moves the artifacts it removes.
 const SWEEP_TRASH: &str = ".trash-old";
-/// Older than the default artifact time limit of a day.
 const NO_STATE_DIR: &str =
     "maki cannot find its state directory as a UTF-8 path for the coding sandbox";
+const STARTUP_STDERR: &str = "fixture: unsupported startup flag";
+const STARTUP_ERROR_CODE: i32 = 73;
 
 #[test]
 fn the_plugin_schema_uses_the_provider_defaults() {
@@ -108,189 +76,98 @@ fn the_plugin_schema_uses_the_provider_defaults() {
     let schemas = host.plugin_options().unwrap();
     let schema = schemas.get(TOOL).unwrap();
     for (name, default) in [
-        ("executable", json!(worker::DEFAULT_EXECUTABLE)),
+        ("executable", json!(DEFAULT_EXECUTABLE)),
         ("config_dir", json!("")),
-        (
-            "provider_max_concurrent",
-            json!(worker::DEFAULT_MAX_CONCURRENT),
-        ),
+        ("provider_max_concurrent", json!(DEFAULT_MAX_CONCURRENT)),
     ] {
         let option = schema.iter().find(|option| option.name == name).unwrap();
         assert_eq!(option.default.as_ref(), Some(&default), "{name}");
         if name == "provider_max_concurrent" {
-            assert_eq!(option.min, Some(worker::MIN_MAX_CONCURRENT as f64));
+            assert_eq!(option.min, Some(MIN_MAX_CONCURRENT as f64));
         }
     }
 }
 
-/// A test's turn on the process: inside an empty repository, with the
-/// fixture as the user's directories, until it drops.
-struct Scenario {
-    _in_project: WorkingDir,
-    _project: TempDir,
-}
-
-impl Scenario {
-    fn enter() -> Self {
-        super::support::environment::require_nextest();
-        use_fixture_user();
-        let project = tempdir().unwrap();
-        fs::create_dir(project.path().join(".git")).unwrap();
-        Self {
-            _in_project: WorkingDir::enter(project.path()),
-            _project: project,
-        }
-    }
-}
-
-/// Wraps the installed `name` with `template` in `dir` and puts `dir` first on the `PATH`.
-fn hold(dir: &Path, name: &str, template: &str, marker: &Path, release: &Path) {
-    let real = on_path(name);
-    let script = template
-        .replace("@REAL@", &real.to_string_lossy())
-        .replace("@MARKER@", &marker.to_string_lossy())
-        .replace("@WAIT_FOR_RELEASE@", &wait_for_release("\"@RELEASE@\""))
-        .replace("@RELEASE@", &release.to_string_lossy());
-    executable(dir, name, &script);
+/// Puts `script`, wrapping the installed `name`, first on the `PATH`.
+fn hold(dir: &Path, name: &str, script: &str) {
+    executable(
+        dir,
+        name,
+        &script.replace("@REAL@", &on_path(name).to_string_lossy()),
+    );
     environment::prepend_path(dir)
 }
 
-/// A fake `claude` in `dir` that runs `script` and reports the minimum
-/// version.
-fn fake_claude(dir: &Path, script: &str) -> PathBuf {
-    executable(dir, "claude", &script.replace("@VERSION@", MINIMUM_VERSION))
-}
-
-/// Keep the host alive until call cleanup completes. Host shutdown kills all jobs,
-/// including cleanup processes.
-fn fake_host(claude: &Path, config_dir: &Path) -> (Arc<ToolRegistry>, PluginHost) {
-    fake_host_with(claude, config_dir, Map::new())
+fn new_dir(dir: PathBuf) -> PathBuf {
+    fs::create_dir(&dir).unwrap();
+    dir
 }
 
 #[test]
 fn coding_refuses_a_state_directory_it_cannot_deny() {
-    let _scenario = Scenario::enter();
+    let fake = FakeClaude::new();
     let outside = tempdir().unwrap();
-    let state = outside.path().join(OsStr::from_bytes(b"state-\xff"));
-    fs::create_dir(&state).unwrap();
+    let state = new_dir(outside.path().join(OsStr::from_bytes(b"state-\xff")));
     environment::set(XDG_STATE_HOME, &state);
-    let claude = fake_claude(outside.path(), VERSION_ONLY);
     let artifacts = outside.path().join("artifacts");
-    let (reg, _host) = fake_host_with(
-        &claude,
-        outside.path(),
-        Map::from_iter([("artifact_dir".into(), json!(artifacts))]),
-    );
-    let err = reply(
-        &reg,
-        &session_ctx(),
-        TOOL,
-        json!({ "prompt": "anything", "profile": "code" }),
-    )
-    .unwrap_err();
+    let (reg, _host) = load(fake.opts(&[("artifact_dir", json!(artifacts))]));
+    let err = code_with(&reg, &fake.ctx(None, None), NO_SCENARIO, &[]).unwrap_err();
     assert!(err.contains(NO_STATE_DIR), "{err}");
     assert!(artifact_listing(&artifacts).is_empty());
 }
 
-fn fake_host_with(
-    claude: &Path,
-    config_dir: &Path,
-    mut opts: Map<String, Value>,
-) -> (Arc<ToolRegistry>, PluginHost) {
-    opts.insert("executable".into(), json!(claude));
-    opts.insert("config_dir".into(), json!(config_dir));
-    load(opts)
-}
-
-/// A tool context for a session working in these tests' project, which is
-/// the process's working directory here.
-fn session_ctx() -> ToolContext {
-    stub_ctx_in(&env::current_dir().unwrap(), None, None)
-}
-
-fn ask(reg: &ToolRegistry, ctx: &ToolContext) -> Result<String, String> {
-    reply(reg, ctx, TOOL, json!({ "prompt": "anything" }))
-}
-
-#[test_case(false ; "direct_path")]
-#[test_case(true ; "symlink_alias")]
-fn a_temp_dir_that_leads_into_the_project_uses_a_safe_fallback(linked: bool) {
+/// A scratch base must be outside the whole checkout, including siblings of
+/// the session directory, so maki gives way to a safe fallback for a
+/// `TMPDIR` it cannot use.
+#[test_case(|_: &Path, _: &Path| PathBuf::new(), false ; "empty")]
+#[test_case(|_: &Path, outside: &Path| new_dir(outside.join(OsStr::from_bytes(b"scratch-\xff"))), false ; "not_utf8")]
+#[test_case(|project: &Path, _: &Path| project.to_owned(), false ; "the_project")]
+#[test_case(|project: &Path, outside: &Path| { let link = outside.join("tmp"); symlink(project, &link).unwrap(); link }, false ; "a_link_to_the_project")]
+#[test_case(|project: &Path, _: &Path| new_dir(project.join("elsewhere")), true ; "elsewhere_in_the_checkout")]
+fn an_unusable_tmpdir_gets_a_safe_fallback(
+    tmpdir: fn(&Path, &Path) -> PathBuf,
+    from_subdirectory: bool,
+) {
     let fake = FakeClaude::new();
     let project = fake.project.path();
     let outside = tempdir().unwrap();
-    let link = outside.path().join("tmp");
-    symlink(&project, &link).unwrap();
-    let before = listing(&project);
-    environment::set(TMPDIR, if linked { &link } else { &project });
-    assert_eq!(fake.ask(ANSWERS).unwrap(), ANSWER);
-    for tmpdir in fake.log("tmpdirs").lines() {
-        assert!(Path::new(tmpdir).is_absolute());
-        assert!(!Path::new(tmpdir).starts_with(&project));
+    environment::set(TMPDIR, tmpdir(&project, outside.path()));
+    let session = if from_subdirectory {
+        new_dir(project.join("sub"))
+    } else {
+        project.clone()
+    };
+    let before = contents(&project);
+    assert_eq!(fake.ask_in(ANSWERS, &session).unwrap(), ANSWER);
+    let tmpdirs = fake.log("tmpdirs");
+    assert!(!tmpdirs.is_empty());
+    for used in tmpdirs.lines().map(Path::new) {
+        assert!(
+            used.is_absolute() && used.is_dir() && !used.starts_with(&project),
+            "{used:?}"
+        );
     }
-    assert!(!fake.log("tmpdirs").is_empty());
-    assert_eq!(listing(&project), before);
-}
-
-#[test]
-fn an_empty_tmpdir_uses_a_safe_default_for_launch_and_worker_checks() {
-    let fake = FakeClaude::new();
-    environment::set(TMPDIR, "");
-    assert_eq!(fake.ask(ANSWERS).unwrap(), ANSWER);
-    let tmpdirs = fake.log("tmpdirs");
-    assert!(!tmpdirs.is_empty());
-    assert!(
-        tmpdirs
-            .lines()
-            .all(|tmpdir| Path::new(tmpdir).is_absolute())
-    );
-}
-
-#[test]
-fn a_non_utf8_tmpdir_uses_the_validated_default() {
-    let fake = FakeClaude::new();
-    let outside = tempdir().unwrap();
-    let invalid = outside.path().join(OsStr::from_bytes(b"scratch-\xff"));
-    fs::create_dir(&invalid).unwrap();
-    environment::set(TMPDIR, &invalid);
-    assert_eq!(fake.ask(ANSWERS).unwrap(), ANSWER);
-    let tmpdirs = fake.log("tmpdirs");
-    assert!(!tmpdirs.is_empty());
-    assert!(
-        tmpdirs
-            .lines()
-            .all(|tmpdir| { Path::new(tmpdir).is_absolute() && Path::new(tmpdir).is_dir() })
-    );
+    assert_eq!(contents(&project), before);
 }
 
 /// Artifact cleanup can take a long time. It must run outside the Lua thread so subsequent
 /// calls can obtain slots.
 #[test]
 fn a_call_does_not_wait_for_the_sweep() {
-    let _scenario = Scenario::enter();
-    let tools = tempdir().unwrap();
-    let repo = tempdir().unwrap();
+    let fake = FakeClaude::new();
+    commit_repo(&fake.project.path(), &[LIB]);
     let artifacts = tempdir().unwrap();
-    let project = repo.path().canonicalize().unwrap();
-    write(&project.join("src/lib.rs"), "base\n");
-    git(&project, &["init", "-q"]);
-    commit_all(&project);
-    let old = artifacts.path().join("old");
-    fs::create_dir(&old).unwrap();
-    for name in [ARTIFACT_MARKER, MANIFEST] {
-        let file = old.join(name);
-        fs::write(&file, "{}").unwrap();
-        backdate(&file);
-    }
+    let old = old_folder(artifacts.path(), "old", &[ARTIFACT_MARKER, MANIFEST]);
+    let tools = tempdir().unwrap();
     let removing = tools.path().join("removing");
-    let never = tools.path().join("never");
-    hold(tools.path(), "rm", HELD_REMOVAL, &removing, &never);
-    let claude = fake_claude(tools.path(), HANDSHAKE_ONLY);
+    let release = Gate::closed();
+    let held = HELD_REMOVAL
+        .replace("@MARKER@", &removing.to_string_lossy())
+        .replace("@WAIT@", &release.wait());
+    hold(tools.path(), "rm", &held);
 
-    let mut opts = Map::new();
-    opts.insert("artifact_dir".into(), json!(artifacts.path()));
-    let (reg, _host) = fake_host_with(&claude, tools.path(), opts);
-    let input = json!({ "prompt": "anything", "profile": "code" });
-    let _ = reply(&reg, &stub_ctx_in(&project, None, None), TOOL, input);
+    let (reg, _host) = load(fake.opts(&[("artifact_dir", json!(artifacts.path()))]));
+    let _ = code_with(&reg, &fake.ctx(None, None), NO_SCENARIO, &[]);
     assert!(
         wait_until(DEADLINE, || removing.exists()),
         "the sweep did not start"
@@ -303,64 +180,33 @@ fn a_call_does_not_wait_for_the_sweep() {
         artifacts.path().join(SWEEP_TRASH).exists(),
         "the call waited for the sweep"
     );
-    fs::write(&never, "").unwrap();
+    release.release();
     assert!(
         wait_until(DEADLINE, || !artifacts.path().join(SWEEP_TRASH).exists()),
         "the released artifact sweep did not finish"
     );
 }
 
-/// A scratch base must be outside the whole checkout, including siblings
-/// of the session directory.
-#[test]
-fn a_temp_dir_elsewhere_in_the_checkout_uses_a_safe_fallback() {
-    let fake = FakeClaude::new();
-    let project = fake.project.path();
-    let sub = project.join("sub");
-    let elsewhere = project.join("elsewhere");
-    fs::create_dir(&sub).unwrap();
-    fs::create_dir(&elsewhere).unwrap();
-    environment::set(TMPDIR, &elsewhere);
-
-    assert_eq!(fake.ask_in(ANSWERS, &sub).unwrap(), ANSWER);
-    let tmpdirs = fake.log("tmpdirs");
-    assert!(!tmpdirs.is_empty());
-    for tmpdir in tmpdirs.lines() {
-        assert!(Path::new(tmpdir).is_absolute());
-        assert!(!Path::new(tmpdir).starts_with(&project));
-    }
-    assert!(listing(&elsewhere).is_empty());
-}
-
 #[test]
 fn probe_cleanup_needs_no_external_helpers() {
-    let _scenario = Scenario::enter();
-    let tools = tempdir().unwrap();
+    let fake = FakeClaude::running(VERSION_ONLY);
+    let no_helpers = tempdir().unwrap();
     let base = tempdir().unwrap();
-    let claude = fake_claude(tools.path(), VERSION_ONLY);
-    environment::set(PATH, tools.path());
+    environment::set(PATH, no_helpers.path());
     environment::set(TMPDIR, base.path());
-    let (reg, _host) = fake_host(&claude, tools.path());
-    let err = ask(&reg, &session_ctx()).unwrap_err();
+    let err = fake.ask(ANSWERS).unwrap_err();
     assert!(err.contains(NO_EVENT_STOP), "got: {err}");
     assert!(listing(base.path()).is_empty());
 }
 
-const STARTUP_STDERR: &str = "fixture: unsupported startup flag";
-const STARTUP_ERROR_CODE: i32 = 73;
-
 #[test]
 fn a_startup_exit_keeps_its_stderr_and_status() {
-    let _scenario = Scenario::enter();
-    let tools = tempdir().unwrap();
+    let fake = FakeClaude::running(&format!(
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo '@VERSION@ (Claude Code)'; else echo '{STARTUP_STDERR}' >&2; exit {STARTUP_ERROR_CODE}; fi\n"
+    ));
     let base = tempdir().unwrap();
-    let source = format!(
-        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo '{MINIMUM_VERSION} (Claude Code)'; else echo '{STARTUP_STDERR}' >&2; exit {STARTUP_ERROR_CODE}; fi\n"
-    );
-    let claude = fake_claude(tools.path(), &source);
     environment::set(TMPDIR, base.path());
-    let (reg, _host) = fake_host(&claude, tools.path());
-    let error = ask(&reg, &session_ctx()).unwrap_err();
+    let error = fake.ask(ANSWERS).unwrap_err();
     assert!(error.contains(STARTUP_STDERR), "{error}");
     assert!(
         error.contains(&format!("exit status: {STARTUP_ERROR_CODE}")),
@@ -375,8 +221,7 @@ fn a_startup_exit_keeps_its_stderr_and_status() {
 #[test_case(MAKE_EXECUTABLE, "src/lib.rs" ; "an_executable_bit")]
 #[test_case(RETARGET_LINK, "src/link" ; "a_link_target")]
 fn a_change_during_the_copy_is_refused(action: &str, disturbed: &str) {
-    let _scenario = Scenario::enter();
-    let copy = code_while_the_copy_is_disturbed_by(action, "");
+    let copy = code_with_cp(&DISTURBING_CP.replace("@ACTION@", action), "");
     let want = format!("{CHANGED_DURING_COPY}{disturbed}");
     assert!(copy.err.contains(&want), "got: {}", copy.err);
     assert_eq!(
@@ -390,8 +235,10 @@ fn a_change_during_the_copy_is_refused(action: &str, disturbed: &str) {
 /// development server can update its cache without repeated call failures.
 #[test]
 fn a_dependency_changed_during_the_copy_is_reported() {
-    let _scenario = Scenario::enter();
-    let copy = code_while_the_copy_is_disturbed_by(EDIT_DEPENDENCY, DEPENDENCY_DIR);
+    let copy = code_with_cp(
+        &DISTURBING_CP.replace("@ACTION@", EDIT_DEPENDENCY),
+        DEPENDENCY_DIR,
+    );
     assert!(
         copy.err.contains(DEPENDENCY_UNSETTLED) && copy.err.contains(DEPENDENCY_FILE),
         "got: {}",
@@ -412,7 +259,6 @@ fn a_dependency_changed_during_the_copy_is_reported() {
 #[test_case("Invalid cross-device link", FULL_COPY ; "across_filesystems")]
 #[test_case("No space left on device", NO_CLONE ; "on_a_full_disk")]
 fn a_failed_clone_says_why(cause: &str, outcome: &str) {
-    let _scenario = Scenario::enter();
     let copy = code_with_cp(
         &CLONE_REFUSING_CP.replace("@REFUSED@", cause),
         DEPENDENCY_DIR,
@@ -428,61 +274,38 @@ struct DisturbedCopy {
     artifacts_left: Vec<PathBuf>,
 }
 
+/// Claude Code passes its environment to its shell. A read worker keeps the
+/// login variables, and with a login in maki's environment a coding call
+/// stops before Claude Code starts.
 #[test_case(OAUTH_TOKEN, TEST_LOGIN_TOKEN ; "login_token")]
 #[test_case(HTTPS_PROXY, TEST_PROXY_LOGIN ; "proxy_login")]
-fn read_workers_keep_their_login_environment(name: &str, value: &str) {
+fn a_login_in_the_environment_reaches_only_read_workers(name: &str, value: &str) {
     let fake = FakeClaude::new();
     environment::set(name, value);
+    let (reg, _host) = load(fake.opts(&[]));
+    let err = code_with(&reg, &fake.ctx(None, None), NO_SCENARIO, &[]).unwrap_err();
+    assert!(err.contains(name), "got: {err}");
+    assert_eq!(fake.log("calls"), "", "Claude Code started");
+
     assert_eq!(fake.ask(ANSWERS).unwrap(), ANSWER);
     let expected = format!("{name}={value}");
     assert!(fake.log("env").lines().any(|line| line == expected));
-}
-
-/// Claude Code passes its environment to its shell, so with a login token in
-/// maki's environment a coding call stops before Claude Code starts.
-#[test]
-fn a_login_token_in_the_environment_keeps_the_coding_worker_from_starting() {
-    let _scenario = Scenario::enter();
-    let tools = tempdir().unwrap();
-    let repo = tempdir().unwrap();
-    let project = repo.path().canonicalize().unwrap();
-    write(&project.join("src/lib.rs"), "base\n");
-    git(&project, &["init", "-q"]);
-    commit_all(&project);
-    environment::set(OAUTH_TOKEN, TEST_LOGIN_TOKEN);
-    let claude = fake_claude(tools.path(), HANDSHAKE_ONLY);
-
-    let (reg, _host) = fake_host(&claude, tools.path());
-    let input = json!({ "prompt": "anything", "profile": "code" });
-    let err = reply(&reg, &stub_ctx_in(&project, None, None), TOOL, input).unwrap_err();
-
-    assert!(err.contains(OAUTH_TOKEN), "got: {err}");
-    assert!(
-        !tools.path().join("settings").exists(),
-        "Claude Code started"
-    );
 }
 
 /// An API key or another API address would move the requests off the
 /// subscription, so maki gives neither to Claude Code.
 #[test]
 fn an_api_key_and_address_never_reach_claude_code() {
-    let _scenario = Scenario::enter();
-    let tools = tempdir().unwrap();
+    let fake = FakeClaude::new();
     environment::set(API_KEY, "not-a-real-key");
     environment::set(BASE_URL, "http://127.0.0.1:9");
-    let claude = fake_claude(tools.path(), HANDSHAKE_ONLY);
+    let result = fake.ask(ANSWERS);
 
-    let (reg, _host) = fake_host(&claude, tools.path());
-    let result = ask(&reg, &session_ctx());
-
-    let child_env = fs::read_to_string(tools.path().join("env")).unwrap_or_else(|error| {
-        panic!("the worker did not save its environment: {error}; {result:?}")
-    });
     assert!(
-        fs::exists(tools.path().join("prompt")).unwrap(),
+        !fake.log("prompt").is_empty(),
         "the task must reach Claude Code: {result:?}"
     );
+    let child_env = fake.log("envs");
     for name in [API_KEY, BASE_URL] {
         assert!(
             !child_env
@@ -499,15 +322,13 @@ fn an_api_key_and_address_never_reach_claude_code() {
 #[test_case(false ; "physical_home")]
 #[test_case(true ; "linked_home")]
 fn the_default_artifact_root_hides_all_of_makis_state_but_the_workers_artifact(linked_home: bool) {
-    let _scenario = Scenario::enter();
+    let fake = FakeClaude::new();
+    commit_repo(&fake.project.path(), &[LIB]);
+    let maki_dir = tempdir().unwrap();
+    let _in_maki_dir = WorkingDir::enter(maki_dir.path());
     let tools = tempdir().unwrap();
     let home = tempdir().unwrap();
     let state_home = tempdir().unwrap();
-    let repo = tempdir().unwrap();
-    let project = repo.path().canonicalize().unwrap();
-    write(&project.join("src/lib.rs"), "base\n");
-    git(&project, &["init", "-q"]);
-    commit_all(&project);
     let alias = tools.path().join(HOME_LINK);
     symlink(home.path(), &alias).unwrap();
     let visible_home = if linked_home {
@@ -515,7 +336,7 @@ fn the_default_artifact_root_hides_all_of_makis_state_but_the_workers_artifact(l
     } else {
         home.path()
     };
-    environment::set(HOME, visible_home);
+    environment::set(HOME_ENV, visible_home);
     let secrets = tools.path().join(SECRET_DIR);
     for path in HOME_DENY_PATHS {
         let target = secrets.join(path);
@@ -532,7 +353,7 @@ fn the_default_artifact_root_hides_all_of_makis_state_but_the_workers_artifact(l
     let login_target = secrets.join(LOGIN_LINK);
     fs::create_dir(&login_target).unwrap();
     symlink(&login_target, &usual_login).unwrap();
-    environment::set(CONFIG_DIR, LOGIN_LINK);
+    environment::set(CLAUDE_CONFIG_ENV, LOGIN_LINK);
     environment::set(XDG_STATE_HOME, state_home.path());
     let runtime = tempdir().unwrap();
     let agent = home.path().join("agent.sock");
@@ -543,23 +364,13 @@ fn the_default_artifact_root_hides_all_of_makis_state_but_the_workers_artifact(l
         state_dir.starts_with(state_home.path()),
         "maki fixed its paths before this test set them: {state_dir:?}, so the test needs its own process, as nextest gives it"
     );
-    let claude = fake_claude(tools.path(), HANDSHAKE_ONLY);
 
-    let (reg, _host) = fake_host_with(
-        &claude,
-        tools.path(),
-        Map::from_iter([("deny_read_home".into(), json!("custom/token"))]),
-    );
-    let input = json!({ "prompt": "anything", "profile": "code" });
-    let _ = reply(&reg, &stub_ctx_in(&project, None, None), TOOL, input);
+    let (reg, _host) = load(fake.opts(&[("deny_read_home", json!("custom/token"))]));
+    let _ = code_with(&reg, &fake.ctx(None, None), NO_SCENARIO, &[]);
 
-    assert!(
-        tools.path().join("prompt").exists(),
-        "maki did not send the task"
-    );
-    let settings: Value =
-        serde_json::from_str(&fs::read_to_string(tools.path().join("settings")).unwrap()).unwrap();
-    let filesystem = &settings["sandbox"]["filesystem"];
+    assert!(!fake.log("prompt").is_empty(), "maki did not send the task");
+    let filesystem = sandbox_filesystem(&fake);
+    let denied = filesystem["denyRead"].as_array().unwrap();
     let root = state_dir
         .join(DEFAULT_ARTIFACT_ROOT)
         .canonicalize()
@@ -573,10 +384,7 @@ fn the_default_artifact_root_hides_all_of_makis_state_but_the_workers_artifact(l
         &login_target,
     ] {
         assert!(
-            filesystem["denyRead"]
-                .as_array()
-                .unwrap()
-                .contains(&json!(hidden)),
+            denied.contains(&json!(hidden)),
             "the sandbox must deny all of {hidden:?}: {filesystem}"
         );
     }
@@ -590,21 +398,13 @@ fn the_default_artifact_root_hides_all_of_makis_state_but_the_workers_artifact(l
                 continue;
             }
             assert!(
-                filesystem["denyRead"]
-                    .as_array()
-                    .unwrap()
-                    .contains(&json!(hidden)),
+                denied.contains(&json!(hidden)),
                 "{hidden:?} missing from: {filesystem}"
             );
         }
     }
     for home_path in [visible_home, home.path()] {
-        assert!(
-            filesystem["denyRead"]
-                .as_array()
-                .unwrap()
-                .contains(&json!(home_path.join(".claude.json*")))
-        );
+        assert!(denied.contains(&json!(home_path.join(".claude.json*"))));
     }
     let opened = filesystem["allowRead"].as_array().unwrap();
     let in_root = |path: &Value| {
@@ -613,7 +413,7 @@ fn the_default_artifact_root_hides_all_of_makis_state_but_the_workers_artifact(l
             .unwrap()
             .iter()
             .collect();
-        parts.len() == 2 && parts[1] == GIT_DIR
+        parts.len() == 2 && parts[1] == ARTIFACT_GIT
     };
     assert!(
         matches!(opened.as_slice(), [git] if in_root(git)),
@@ -621,39 +421,29 @@ fn the_default_artifact_root_hides_all_of_makis_state_but_the_workers_artifact(l
     );
 }
 
-fn code_while_the_copy_is_disturbed_by(action: &str, dependencies: &str) -> DisturbedCopy {
-    code_with_cp(&DISTURBING_CP.replace("@ACTION@", action), dependencies)
-}
-
 fn code_with_cp(cp: &str, dependencies: &str) -> DisturbedCopy {
-    let tools = tempdir().unwrap();
-    let repo = tempdir().unwrap();
-    let artifacts = tempdir().unwrap();
-    let project = repo.path().canonicalize().unwrap();
-    write(&project.join("src/lib.rs"), "base\n");
+    let fake = FakeClaude::new();
+    let project = fake.project.path();
     write(&project.join("src/other.rs"), "other\n");
     symlink("lib.rs", project.join("src/link")).unwrap();
-    git(&project, &["init", "-q"]);
-    commit_all(&project);
+    commit_repo(&project, &[LIB]);
     write(&project.join(DEPENDENCY_FILE), "module.exports = 1;\n");
+    let tools = tempdir().unwrap();
     hold(
         tools.path(),
         "cp",
-        cp,
-        &project,
-        &tools.path().join("unused"),
+        &cp.replace("@MARKER@", &project.to_string_lossy()),
     );
-    let claude = fake_claude(tools.path(), HANDSHAKE_ONLY);
 
-    let mut opts = Map::new();
-    opts.insert("artifact_dir".into(), json!(artifacts.path()));
-    opts.insert("dependencies".into(), json!(dependencies));
-    let (reg, _host) = fake_host_with(&claude, tools.path(), opts);
-    let input = json!({ "prompt": "anything", "profile": "code" });
-    let err = reply(&reg, &stub_ctx_in(&project, None, None), TOOL, input).unwrap_err();
+    let artifacts = tempdir().unwrap();
+    let (reg, _host) = load(fake.opts(&[
+        ("artifact_dir", json!(artifacts.path())),
+        ("dependencies", json!(dependencies)),
+    ]));
+    let err = code_with(&reg, &fake.ctx(None, None), NO_SCENARIO, &[]).unwrap_err();
     DisturbedCopy {
         err,
-        prompt: fs::read_to_string(tools.path().join("prompt")).unwrap_or_default(),
+        prompt: fake.log("prompt"),
         artifacts_left: artifact_listing(artifacts.path()),
     }
 }

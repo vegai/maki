@@ -13,6 +13,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use maki_storage::sessions::SESSIONS_DIR;
 use serde_json::Value;
 use test_case::test_case;
 
@@ -26,8 +27,8 @@ mod isolation;
 #[path = "support/wire.rs"]
 #[allow(dead_code)]
 mod wire;
-use isolation::Isolation;
-use wire::{INIT, JSON_FORMAT, RESULT, STREAM_FORMAT, SYSTEM};
+use isolation::{CONFIG_DIR, Isolation, STATE_DIR};
+use wire::{INIT, JSON_FORMAT, RESULT, STREAM_FORMAT, SYSTEM, TEXT_FORMAT};
 
 const NO_SCRATCH: &str = "maki cannot create a private scratch directory outside the project";
 const GLOSSARY: &str = "glossary.txt";
@@ -74,6 +75,7 @@ const REVIEW_ALL_TOOLS: [&str; 7] = [
     "read",
 ];
 const UNMATCHED_TOOL_WARNING: &str = "no loaded tool matches";
+const HEADLESS_THINKING: &str = "low";
 const CLAUDE_TOOL_SUGGESTION: &str = "Did you mean 'claude_code'?";
 /// A run's tool calls and their results, from its stream-json.
 struct Run {
@@ -140,7 +142,7 @@ impl Fixture {
         };
         let project = fixture.isolation.dir("project");
         fs::write(project.join(GLOSSARY), format!("alpha: {MEANING}\n")).unwrap();
-        let config = fixture.isolation.dir("config/maki");
+        let config = fixture.isolation.dir(CONFIG_DIR);
         fs::write(config.join("permissions.toml"), DENY_BASH).unwrap();
         fixture
     }
@@ -151,8 +153,16 @@ impl Fixture {
         let options = executable.map_or_else(String::new, |path| {
             format!(", executable = \"{}\"", path.display())
         });
-        let init = PLUGIN_ON.replace("@OPTIONS@", &options);
-        fs::write(self.isolation.dir("config/maki").join("init.lua"), init).unwrap();
+        self.write_init(&PLUGIN_ON.replace("@OPTIONS@", &options));
+    }
+
+    /// Only the read-only tools and the plugin's, with the plugin running `claude`.
+    fn review(&self, claude: &Path) {
+        self.write_init(&REVIEW_INIT.replace("@EXECUTABLE@", &claude.to_string_lossy()));
+    }
+
+    fn write_init(&self, init: &str) {
+        fs::write(self.isolation.dir(CONFIG_DIR).join("init.lua"), init).unwrap();
     }
 
     fn maki(&self, model: &str, prompt: &str, format: &str) -> Command {
@@ -162,13 +172,13 @@ impl Fixture {
     }
 }
 
-fn run_maki(model: &str) -> Run {
+fn run_maki() -> Run {
     let fixture = Fixture::new();
     fixture.enable_plugin(None);
     let real_home = PathBuf::from(env::var_os("HOME").expect("HOME is set"));
     let claude_config =
         env::var_os(CLAUDE_CONFIG_ENV).map_or_else(|| real_home.join(".claude"), PathBuf::from);
-    let mut command = fixture.maki(model, PROMPT, STREAM_FORMAT);
+    let mut command = fixture.maki(MODEL, PROMPT, STREAM_FORMAT);
     command.env(CLAUDE_CONFIG_ENV, claude_config);
     let Output {
         status,
@@ -186,8 +196,7 @@ fn run_maki(model: &str) -> Run {
 fn dry_run_uses_provider_capabilities_and_filters_without_starting_claude() {
     let fixture = Fixture::new();
     let claude = stand_in(&fixture.isolation.dir("bin"));
-    let init = REVIEW_INIT.replace("@EXECUTABLE@", &claude.to_string_lossy());
-    fs::write(fixture.isolation.dir("config/maki").join("init.lua"), init).unwrap();
+    fixture.review(&claude);
     let mut command = fixture.maki(MODEL, PROMPT, STREAM_FORMAT);
     command.args([
         "--dry-run",
@@ -203,17 +212,10 @@ fn dry_run_uses_provider_capabilities_and_filters_without_starting_claude() {
     let init: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(init["subtype"], INIT);
     assert!(init["uuid"].is_string());
-    assert_eq!(init["thinking"], "low");
-    let mut tools: Vec<_> = init["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|name| name.as_str().unwrap())
-        .collect();
-    tools.sort_unstable();
-    assert_eq!(tools, REVIEW_TOOLS);
-    assert!(!claude.with_extension(RAN_EXTENSION).exists());
-    let sessions = fixture.isolation.dir("state/maki").join("sessions");
+    assert_eq!(init["thinking"], HEADLESS_THINKING);
+    assert_eq!(tool_names(&init), REVIEW_TOOLS);
+    assert!(!ran(&claude));
+    let sessions = fixture.isolation.dir(STATE_DIR).join(SESSIONS_DIR);
     assert!(
         !sessions.exists()
             || !fs::read_dir(sessions).unwrap().any(|entry| entry
@@ -239,7 +241,7 @@ fn unavailable_scratch_fails_per_request_without_starting_claude() {
     assert_eq!(result["type"], RESULT);
     assert_eq!(result["is_error"], true);
     assert!(result[RESULT].as_str().unwrap().contains(NO_SCRATCH));
-    assert!(!claude.with_extension(RAN_EXTENSION).exists());
+    assert!(!ran(&claude));
 }
 
 #[test]
@@ -266,18 +268,18 @@ fn request_policy_does_not_prevent_provider_creation_or_dry_run() {
     let init: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(init["subtype"], INIT);
     assert!(init["uuid"].is_string());
-    assert!(!claude.with_extension(RAN_EXTENSION).exists());
+    assert!(!ran(&claude));
     let output = finish(&mut fixture.maki(MODEL, PROMPT, STREAM_FORMAT));
     assert!(!output.status.success());
     let events = ndjson(&output.stdout);
     assert_eq!(events[0]["subtype"], INIT);
     assert_eq!(events.last().unwrap()["is_error"], true);
-    assert!(!claude.with_extension(RAN_EXTENSION).exists());
+    assert!(!ran(&claude));
 }
 
 #[test_case(JSON_FORMAT, false ; "json_object")]
 #[test_case(JSON_FORMAT, true ; "verbose_json_array")]
-#[test_case("text", false ; "text_uses_stderr_only")]
+#[test_case(TEXT_FORMAT, false ; "text_uses_stderr_only")]
 #[test_case(STREAM_FORMAT, false ; "sdk_stream_json")]
 fn startup_errors_keep_the_output_format(format: &str, verbose: bool) {
     let fixture = Fixture::new();
@@ -290,7 +292,7 @@ fn startup_errors_keep_the_output_format(format: &str, verbose: bool) {
     }
     let output = finish(&mut command);
     assert!(!output.status.success());
-    if format == "text" {
+    if format == TEXT_FORMAT {
         assert!(output.stdout.is_empty());
     } else {
         let value: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -326,7 +328,7 @@ fn text_of(result: &Value) -> String {
 #[test]
 #[ignore = "runs the installed claude CLI on the subscription of the caller"]
 fn live_the_agent_runs_its_tools_through_claude_code() {
-    let run = run_maki(MODEL);
+    let run = run_maki();
     let calls = run.calls_made();
 
     let bash = named(&run, "bash", None)
@@ -380,11 +382,7 @@ fn the_provider_is_on_with_the_plugin(plugin: bool, want: &str) {
     command.env(PATH, path);
     let Output { stdout, stderr, .. } = finish(&mut command);
     let stderr = String::from_utf8(stderr).unwrap();
-    assert_eq!(
-        claude.with_extension(RAN_EXTENSION).exists(),
-        plugin,
-        "whether a claude started"
-    );
+    assert_eq!(ran(&claude), plugin, "whether a claude started");
 
     let result: Value =
         serde_json::from_slice(&stdout).unwrap_or_else(|_| panic!("there is no result: {stderr}"));
@@ -407,8 +405,7 @@ fn cli_filters_plugin_tools_in_the_init_event(
 ) {
     let fixture = Fixture::new();
     let claude = stand_in(&fixture.isolation.dir("bin"));
-    let init = REVIEW_INIT.replace("@EXECUTABLE@", &claude.to_string_lossy());
-    fs::write(fixture.isolation.dir("config/maki").join("init.lua"), init).unwrap();
+    fixture.review(&claude);
     let mut command = fixture.maki(MODEL, PROMPT, STREAM_FORMAT);
     command.args([flag, names]);
     let Output { stdout, stderr, .. } = finish(&mut command);
@@ -426,16 +423,9 @@ fn cli_filters_plugin_tools_in_the_init_event(
         .iter()
         .find(|event| event["type"] == SYSTEM && event["subtype"] == INIT)
         .unwrap_or_else(|| panic!("no init event: {events:?}\n{stderr}"));
-    let mut tools: Vec<&str> = init["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|name| name.as_str().unwrap())
-        .collect();
-    tools.sort_unstable();
-    assert_eq!(tools, expected);
+    assert_eq!(tool_names(init), expected);
     assert!(
-        claude.with_extension(RAN_EXTENSION).exists(),
+        ran(&claude),
         "the enabled provider must still run its CLI checks"
     );
 }
@@ -456,9 +446,24 @@ fn a_misspelled_allow_list_stops_before_starting_the_provider() {
         "missing allow-list error: {stderr}"
     );
     assert!(
-        !claude.with_extension(RAN_EXTENSION).exists(),
+        !ran(&claude),
         "the provider started before the invalid allow list was rejected"
     );
+}
+
+fn tool_names(init: &Value) -> Vec<&str> {
+    let mut tools: Vec<&str> = init["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|name| name.as_str().unwrap())
+        .collect();
+    tools.sort_unstable();
+    tools
+}
+
+fn ran(claude: &Path) -> bool {
+    claude.with_extension(RAN_EXTENSION).exists()
 }
 
 fn stand_in(dir: &Path) -> PathBuf {

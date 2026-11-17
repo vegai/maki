@@ -422,10 +422,10 @@ fn error_description(error: &AgentError) -> String {
 #[cfg(test)]
 mod tests {
     use std::iter;
-    use std::path::Path;
     use std::sync::Mutex;
 
     use maki_providers::provider::{BoxFuture, ModelListing};
+    use maki_providers::test_support::detached_scope;
 
     use maki_providers::{
         Effort, KeyHeader, KeyPool, KeyRotation, ModelInfo, ResolvedAuth, Role, ThinkingConfig,
@@ -448,7 +448,6 @@ mod tests {
     /// leaves no prompt small enough for `max` effort to fit beside it.
     const DECLARED_MAX_OUTPUT: u32 = WINDOW / 2;
     const TURN_BUDGET: u32 = 32_768;
-    const ANY_CWD: &str = "/";
     const SMALL_PROMPT: u32 = 1_000;
     const EXPLICIT_THINKING: u32 = 30_000;
     /// Less room than `TURN_BUDGET` wants.
@@ -717,10 +716,7 @@ mod tests {
                 tools: &json!([]),
                 opts: RequestOptions::default(),
                 output_budget: TURN_BUDGET,
-                scope: RequestScope {
-                    session_id: None,
-                    cwd: Path::new(ANY_CWD),
-                },
+                scope: detached_scope(),
                 retry,
             },
             gauge,
@@ -868,10 +864,7 @@ mod tests {
                 tools: &json!([]),
                 opts: RequestOptions::default(),
                 output_budget: TURN_BUDGET,
-                scope: RequestScope {
-                    session_id: None,
-                    cwd: Path::new(ANY_CWD),
-                },
+                scope: detached_scope(),
                 retry: RetryPolicy::default(),
             },
             None,

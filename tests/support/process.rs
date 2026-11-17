@@ -80,10 +80,6 @@ impl Process {
         response[RESULT].clone()
     }
 
-    pub fn finish(&mut self) {
-        self.finish_status(true);
-    }
-
     pub fn finish_status(&mut self, success: bool) {
         self.child.stdin.take();
         let status = self

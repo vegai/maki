@@ -13,7 +13,7 @@ use tracing::debug;
 
 use super::checks::{self, ACCOUNT_ANSWER, HANDSHAKE, HOOKS_ANSWER, InitExpect, SETTINGS_ANSWER};
 use super::error::{
-    Error, Problem, RATE_LIMITED, TOO_MANY_REQUESTS, UNKNOWN_ERROR, preview, shown,
+    Error, Problem, RATE_LIMITED, TOO_MANY_REQUESTS, UNKNOWN_ERROR, Wait, preview, shown,
 };
 use super::mcp::Handoff;
 use super::transcript::{BATCH_TOOL, Catalog, SERVER, USER_ROLE, map_batch_names};
@@ -253,22 +253,13 @@ pub(super) fn generation_model<'a>(
     expected: &str,
 ) -> Result<Option<&'a str>, Error> {
     let model = message["model"].as_str();
-    if let Some(model) = model {
-        check_model(model, expected)?;
-    } else if required {
-        return Err(Error::NoModel);
-    }
-    Ok(model)
-}
-
-pub(crate) fn check_model(ran: &str, expected: &str) -> Result<(), Error> {
-    if is_same_model(ran, expected) {
-        Ok(())
-    } else {
-        Err(Error::OtherModel {
+    match model {
+        Some(ran) if !is_same_model(ran, expected) => Err(Error::OtherModel {
             asked: expected.to_owned(),
             ran: ran.to_owned(),
-        })
+        }),
+        None if required => Err(Error::NoModel),
+        _ => Ok(model),
     }
 }
 
@@ -325,14 +316,6 @@ pub(crate) struct Turn<'a> {
     continued: bool,
     /// Kinds of the latest events, logged when the request fails.
     trace: VecDeque<(String, u32)>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Wait {
-    Startup,
-    Idle,
-    Handoff,
-    Result,
 }
 
 struct StreamedText {
@@ -494,36 +477,40 @@ impl Handshake {
         plan_usage: &Mutex<Option<ProviderUsage>>,
     ) -> Result<Step, Error> {
         let kind = classify(event, StreamMode::Provider, false)?;
-        self.feed_kind(event, &kind, plan_usage)
+        self.feed_kind(event, kind, Some(plan_usage), provider_problem)
     }
 
-    fn feed_kind(
+    /// Feeds an event that can come before the reply. Only the provider keeps
+    /// the plan usage.
+    pub(crate) fn feed_kind(
         &mut self,
         event: &Value,
-        kind: &EventKind,
-        plan_usage: &Mutex<Option<ProviderUsage>>,
+        kind: EventKind,
+        plan_usage: Option<&Mutex<Option<ProviderUsage>>>,
+        problem: impl FnOnce(&Value, &Value, &Value) -> Option<Problem>,
     ) -> Result<Step, Error> {
         Ok(match kind {
             EventKind::ControlResponse => {
-                if self.answer(&event["response"], |account, settings, hooks| {
-                    checks::account_problem(account, &[checks::DEFAULT_MODE])
-                        .or_else(|| checks::policy_problem(settings, hooks, true))
-                })? {
+                if self.answer(&event["response"], problem)? {
                     Step::Ready
                 } else {
                     Step::Nothing
                 }
             }
             EventKind::RateLimit => {
-                if event["rate_limit_info"].is_object() {
-                    self.plan_rejected = event["rate_limit_info"]["status"] == PLAN_REJECTED;
+                let info = &event["rate_limit_info"];
+                if let Some(plan_usage) = plan_usage.filter(|_| info.is_object()) {
+                    self.plan_rejected = info["status"] == PLAN_REJECTED;
                     *plan_usage.lock().unwrap_or_else(PoisonError::into_inner) =
-                        Some(usage_of(&event["rate_limit_info"]));
+                        Some(usage_of(info));
                 }
                 Step::Nothing
             }
             EventKind::Alive => Step::Alive,
             EventKind::System => Step::Nothing,
+            EventKind::Result => {
+                return Err(result_failure(event).unwrap_or(Error::UncheckedStart));
+            }
             _ => return Err(Error::UncheckedStart),
         })
     }
@@ -565,6 +552,11 @@ impl Handshake {
             .insert(id.to_owned(), response["response"].clone());
         Ok(self.complete())
     }
+}
+
+fn provider_problem(account: &Value, settings: &Value, hooks: &Value) -> Option<Problem> {
+    checks::account_problem(account, &[checks::DEFAULT_MODE])
+        .or_else(|| checks::policy_problem(settings, hooks, true))
 }
 
 fn line_preview(line: &str) -> String {
@@ -804,12 +796,19 @@ impl<'a> Turn<'a> {
             EventKind::Stream if event[ABANDONED_BLOCKS].is_object() => Err(Error::Abandoned),
             EventKind::Stream => self.stream_event(&event["event"]),
             EventKind::Assistant => self.assistant(&mut event["message"]),
+            // Claude Code continues by itself after a cut reply or one with no
+            // visible output. No result follows to explain a block still
+            // missing, and otherwise the reply is done as it streamed.
             EventKind::User
                 if self.is_complete()
                     && (self.truncated() || !(self.calls_tools() || self.shows_text()))
                     && continuation(&event) =>
             {
-                self.resumed()
+                if let Some(error) = self.take_refusal() {
+                    return Err(error);
+                }
+                self.continued = true;
+                Ok(Step::Done)
             }
             EventKind::User if self.answers_calls(&event["message"], &REJECTIONS) => {
                 self.rejected = true;
@@ -820,7 +819,10 @@ impl<'a> Turn<'a> {
             EventKind::ControlResponse
             | EventKind::RateLimit
             | EventKind::Alive
-            | EventKind::System => self.handshake.feed_kind(&event, &kind, self.plan_usage),
+            | EventKind::System => {
+                self.handshake
+                    .feed_kind(&event, kind, Some(self.plan_usage), provider_problem)
+            }
         }
     }
 
@@ -832,7 +834,7 @@ impl<'a> Turn<'a> {
             event,
             self.expect.version,
             self.expect.cwd,
-            self.expect.tools.iter().map(String::as_str),
+            self.catalog.exposed(),
             &[checks::DEFAULT_MODE],
             Some(SERVER),
         ) {
@@ -1059,17 +1061,6 @@ impl<'a> Turn<'a> {
         self.refusal.is_some() || self.lost.is_some()
     }
 
-    /// Claude Code continues by itself after a cut reply or one with no
-    /// visible output. No result follows to explain a block still missing,
-    /// and otherwise the reply is done as it streamed.
-    fn resumed(&mut self) -> Result<Step, Error> {
-        if let Some(error) = self.take_refusal() {
-            return Err(error);
-        }
-        self.continued = true;
-        Ok(Step::Done)
-    }
-
     /// The handoff must be a call from the reply, with the same tool and
     /// arguments.
     pub fn park(&mut self, handoff: Handoff) -> Result<Step, Error> {
@@ -1201,6 +1192,7 @@ impl<'a> Turn<'a> {
         } else {
             StopReason::from_anthropic(self.stop_reason.as_deref().unwrap_or_default())
         };
+        let shows_text = self.shows_text();
         let Usage {
             input: Some(input),
             cache_creation: Some(cache_creation),
@@ -1229,7 +1221,10 @@ impl<'a> Turn<'a> {
             content: blocks,
             ..Default::default()
         };
-        if stop_reason == StopReason::MaxTokens && message.first_text_content().is_none() {
+        // Text counts only if Claude Code shows it and the agent keeps it.
+        if stop_reason == StopReason::MaxTokens
+            && !(shows_text && message.first_text_content().is_some())
+        {
             return Err(Error::CutBeforeOutput(output));
         }
         Ok(StreamResponse {
@@ -1324,7 +1319,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::super::checks::{
-        CONNECTED, DEFAULT_MODE, FIRST_PARTY, FLAG_SOURCE, InitExpect, NO_KEY_SOURCE, profile,
+        CONNECTED, DEFAULT_MODE, FIRST_PARTY, FLAG_SOURCE, InitExpect, MINIMUM_VERSION,
+        NO_KEY_SOURCE,
     };
     use super::super::error::Error;
     use super::super::mcp::Handoff;
@@ -1343,7 +1339,6 @@ mod tests {
     use crate::{ContentBlock, StopReason, StreamResponse};
 
     const CWD: &str = "/work";
-    const VERSION: &str = "2.1.284";
     const SERVER: &str = "maki";
     const END_TURN: &str = "end_turn";
     /// The model maki asks for, and the dated snapshot the generation
@@ -1427,7 +1422,7 @@ mod tests {
 
     fn init() -> String {
         json!({
-            "type": "system", "subtype": "init", "apiKeySource": NO_KEY_SOURCE, "claude_code_version": VERSION,
+            "type": "system", "subtype": "init", "apiKeySource": NO_KEY_SOURCE, "claude_code_version": MINIMUM_VERSION,
             "permissionMode": DEFAULT_MODE, "tools": [EXPOSED, EXPOSED_BATCH], "mcp_servers": [{ "name": SERVER, "status": CONNECTED }],
             "plugins": [], "cwd": CWD,
         })
@@ -1510,7 +1505,7 @@ mod tests {
         }
         assert!(
             super::super::worker::WorkerStream::new(
-                VERSION.into(),
+                MINIMUM_VERSION.into(),
                 Path::new(CWD).to_owned(),
                 &serde_json::from_value(json!({"deny": []})).unwrap()
             )
@@ -1562,14 +1557,11 @@ mod tests {
     /// Runs `test` on a turn with the test catalog, as a request for `ASKED`
     /// in `CWD` would build it.
     fn with_turn<T>(test: impl FnOnce(Turn<'_>) -> T) -> T {
-        let profile = profile(VERSION).unwrap();
         let catalog = catalog();
-        let tools = catalog.exposed();
         let expect = InitExpect {
-            version: &profile,
+            version: MINIMUM_VERSION,
             model: ASKED,
             cwd: Path::new(CWD),
-            tools: &tools,
         };
         let plan_usage = Mutex::default();
         test(Turn::new(&catalog, expect, &plan_usage))
@@ -1955,21 +1947,52 @@ mod tests {
 
     /// Claude Code prompts the model again by itself after a reply that shows
     /// nothing. maki ends the reply there, and one the output cap cut before
-    /// it showed anything fails.
-    #[test_case(END_TURN, NO_OUTPUT_NOTE => matches Ok(StreamResponse { stop_reason: Some(StopReason::EndTurn), .. }) ; "only_thinking")]
-    #[test_case(MAX_TOKENS_STOP, OUTPUT_LIMIT_NOTE => matches Err(Error::CutBeforeOutput(FINAL_OUTPUT)) ; "cut_while_thinking")]
+    /// it showed anything fails. Text counts only if JavaScript's trim, which
+    /// Claude Code's filter uses, and Rust's trim, which the agent uses, both
+    /// keep it.
+    #[test_case(streamed(thinking()), END_TURN, NO_OUTPUT_NOTE => matches Ok(StreamResponse { stop_reason: Some(StopReason::EndTurn), .. }) ; "only_thinking")]
+    #[test_case(streamed(thinking()), MAX_TOKENS_STOP, OUTPUT_LIMIT_NOTE => matches Err(Error::CutBeforeOutput(FINAL_OUTPUT)) ; "cut_while_thinking")]
+    #[test_case([streamed(json!({ "type": TEXT_BLOCK, "text": "\u{feff}" })), vec![stream(json!({ "type": BLOCK_START, "content_block": thinking() }))]].concat(), MAX_TOKENS_STOP, OUTPUT_LIMIT_NOTE => matches Err(Error::CutBeforeOutput(FINAL_OUTPUT)) ; "cut_after_a_byte_order_mark")]
+    #[test_case(streamed(json!({ "type": TEXT_BLOCK, "text": "\u{85}" })), MAX_TOKENS_STOP, OUTPUT_LIMIT_NOTE => matches Err(Error::CutBeforeOutput(FINAL_OUTPUT)) ; "cut_after_a_next_line_character")]
     fn a_reply_without_visible_output_ends_at_claude_codes_own_prompt(
+        blocks: Vec<String>,
         reason: &str,
         note: &str,
     ) -> Result<StreamResponse, Error> {
-        let mut lines = reply(
-            &[json!({ "type": THINKING_BLOCK, "thinking": "checking" })],
-            reason,
-        );
+        let mut lines = vec![start()];
+        lines.extend(blocks);
+        lines.extend(stop(reason));
         lines.push(synthetic_note(note));
         let (step, response) = run(&lines, Vec::new(), false);
         assert!(matches!(step, Ok(Step::Done)), "{step:?}");
         response.unwrap()
+    }
+
+    fn thinking() -> Value {
+        json!({ "type": THINKING_BLOCK, "thinking": "checking" })
+    }
+
+    /// After its own prompt to continue, Claude Code's next generation and
+    /// any call it hands over are discarded, and the reply stays as it was.
+    #[test]
+    fn the_generation_after_claude_codes_own_prompt_is_discarded() {
+        with_turn(|mut turn| {
+            started(&mut turn, reply(&[thinking()], END_TURN));
+            assert!(matches!(
+                turn.feed(&synthetic_note(NO_OUTPUT_NOTE)),
+                Ok(Step::Done)
+            ));
+            for line in batch() {
+                assert!(matches!(turn.feed_stopping(&line), Ok(Step::Nothing)));
+            }
+            assert!(matches!(
+                turn.park(parked(Some(FIRST_CALL), "a")),
+                Ok(Step::Nothing)
+            ));
+            let response = turn.response().unwrap();
+            assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
+            assert_eq!(response.message.tool_uses().count(), 0);
+        });
     }
 
     /// The safety classifier's stop ends the request before Claude Code adds
@@ -2529,19 +2552,23 @@ mod tests {
         }
     }
 
-    fn handoff_turn(turn: &mut Turn<'_>, complete: bool, held: bool) {
+    /// Feeds the handshake, the prompt, init and then `lines`.
+    fn started(turn: &mut Turn<'_>, lines: Vec<String>) {
         for line in handshake() {
             turn.feed(&line).unwrap();
         }
         turn.prompted();
-        turn.feed(&init()).unwrap();
+        for line in iter::once(init()).chain(lines) {
+            turn.feed(&line).unwrap();
+        }
+    }
+
+    fn handoff_turn(turn: &mut Turn<'_>, complete: bool, held: bool) {
         let mut lines = batch();
         if !complete {
             lines.pop();
         }
-        for line in lines {
-            turn.feed(&line).unwrap();
-        }
+        started(turn, lines);
         if held {
             turn.park(parked(Some(FIRST_CALL), "a")).unwrap();
         }
