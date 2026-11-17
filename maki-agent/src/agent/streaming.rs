@@ -1,10 +1,11 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use maki_providers::provider::{Provider, RequestScope};
 use maki_providers::retry::{RetryPolicy, RetryState};
 use maki_providers::{
     ContentBlock, ContextGauge, Message, Model, Overflow, ProviderEvent, RequestOptions,
-    StreamResponse, estimate_prompt_tokens,
+    StopReason, StreamResponse, estimate_prompt_tokens,
 };
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -13,7 +14,7 @@ use tokio::time::sleep;
 use tracing::warn;
 
 use crate::cancel::CancelToken;
-use crate::{AgentError, AgentEvent, EventSender};
+use crate::{AgentError, AgentEvent, EventSender, ToolDoneEvent, ToolOutput};
 
 const FUNCTIONS_PREFIX: &str = "functions.";
 /// Floor for the budget below, never applied above the model's own cap.
@@ -29,6 +30,7 @@ const MAX_BUDGET_RETRIES: u32 = 2;
 /// one-line status bar. The only part the user can act on is that the same
 /// turn is on its way back, asking for less.
 const BUDGET_RETRY_MESSAGE: &str = "output budget too large, retrying smaller";
+const DROPPED_CALL_MESSAGE: &str = "The reply left this call out, so it did not run";
 /// GPT models sometimes emit `functions.<name>`, a Codex training habit.
 /// Stripped here at the provider boundary so no raw name enters the agent;
 /// the batch plugin mirrors the rule in Lua.
@@ -44,11 +46,13 @@ fn canonicalize_tool_names(message: &mut Message) {
     }
 }
 
+/// Returns the streamed text and the calls announced, as id and name.
 async fn forward_provider_events(
     mut prx: UnboundedReceiver<ProviderEvent>,
     event_tx: &EventSender,
-) -> String {
+) -> (String, Vec<(String, String)>) {
     let mut streamed = String::new();
+    let mut announced = Vec::new();
     while let Some(pe) = prx.recv().await {
         let ae = match pe {
             ProviderEvent::Waiting { message } => AgentEvent::ProviderWaiting { message },
@@ -57,10 +61,11 @@ async fn forward_provider_events(
                 AgentEvent::TextDelta { text }
             }
             ProviderEvent::ThinkingDelta { text } => AgentEvent::ThinkingDelta { text },
-            ProviderEvent::ToolUseStart { id, name } => AgentEvent::ToolPending {
-                id,
-                name: canonical_tool_name(&name).to_owned(),
-            },
+            ProviderEvent::ToolUseStart { id, name } => {
+                let name = canonical_tool_name(&name).to_owned();
+                announced.push((id.clone(), name.clone()));
+                AgentEvent::ToolPending { id, name }
+            }
             ProviderEvent::PromptProgress {
                 processed,
                 total,
@@ -75,7 +80,33 @@ async fn forward_provider_events(
             break;
         }
     }
-    streamed
+    (streamed, announced)
+}
+
+/// A reply the output cap cut can leave out a call it announced, as the
+/// claude-code provider does with every call of such a reply. Nothing else
+/// would finish the pending row the call opened. Any other reply keeps its
+/// calls, though not always under the announced id (openai_compat, the
+/// Responses API), so it is left alone. The session keeps the settled output
+/// under an id no message holds, until a rewind prunes it.
+fn settle_dropped_calls(
+    announced: Vec<(String, String)>,
+    response: &StreamResponse,
+    event_tx: &EventSender,
+) {
+    if response.stop_reason != Some(StopReason::MaxTokens) {
+        return;
+    }
+    for (id, name) in announced {
+        if response.message.tool_uses().all(|(kept, _, _)| kept != id) {
+            event_tx.try_send(AgentEvent::ToolDone(Box::new(ToolDoneEvent::new(
+                id,
+                Arc::from(name),
+                ToolOutput::Plain(DROPPED_CALL_MESSAGE.into()),
+                true,
+            ))));
+        }
+    }
 }
 
 /// Cancelling mid-stream carries the text the user still sees on screen,
@@ -255,10 +286,11 @@ pub(crate) async fn stream_with_retry(
             .await
             .unwrap_or(Err(AgentError::Cancelled));
         drop(ptx);
-        let streamed = forwarder.await.expect("provider event forwarder panicked");
+        let (streamed, announced) = forwarder.await.expect("provider event forwarder panicked");
         match result {
             Ok(mut r) => {
                 canonicalize_tool_names(&mut r.message);
+                settle_dropped_calls(announced, &r, event_tx);
                 emit_api_request(model, &r, opts, started.elapsed());
                 if let Some(gauge) = gauge.as_deref_mut() {
                     gauge.record(r.usage.total_input().min(u32::MAX as u64) as u32);
@@ -393,10 +425,11 @@ mod tests {
     use std::path::Path;
     use std::sync::Mutex;
 
-    use maki_providers::provider::ModelListing;
+    use maki_providers::provider::{BoxFuture, ModelListing};
 
     use maki_providers::{
-        Effort, KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Role, ThinkingConfig, TokenUsage,
+        Effort, KeyHeader, KeyPool, KeyRotation, ModelInfo, ResolvedAuth, Role, ThinkingConfig,
+        TokenUsage,
     };
     use serde_json::json;
     use test_case::test_case;
@@ -719,6 +752,99 @@ mod tests {
 
     const FIRST_ATTEMPT: u32 = 1;
     const NO_WAIT: u64 = 0;
+    const KEPT_CALL: &str = "call_kept";
+    const LAST_CALL: &str = "call_last";
+    const RENAMED_CALL: &str = "call_renamed";
+    const CALLED_TOOL: &str = "read";
+
+    /// Announces two calls, then replies with the calls in `reply`.
+    struct AnnouncingServer {
+        reply: &'static [&'static str],
+        stop_reason: StopReason,
+    }
+
+    impl Provider for AnnouncingServer {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            events: &'a UnboundedSender<ProviderEvent>,
+            _: RequestOptions,
+            _: RequestScope<'a>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                for id in [KEPT_CALL, LAST_CALL] {
+                    events
+                        .send(ProviderEvent::ToolUseStart {
+                            id: id.into(),
+                            name: CALLED_TOOL.into(),
+                        })
+                        .unwrap();
+                }
+                Ok(StreamResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: self
+                            .reply
+                            .iter()
+                            .map(|&id| ContentBlock::tool_use(id, CALLED_TOOL, json!({})))
+                            .collect(),
+                        ..Default::default()
+                    },
+                    stop_reason: Some(self.stop_reason),
+                    ..Default::default()
+                })
+            })
+        }
+
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    /// Only dispatch finishes a call the reply kept. One a cut reply left out
+    /// would otherwise stay pending until the turn ends and then show as
+    /// failed. A call the reply renamed still runs, under its new id.
+    #[test_case(&[KEPT_CALL], StopReason::MaxTokens, &[LAST_CALL] ; "a_call_the_output_cap_cut")]
+    #[test_case(&[KEPT_CALL, RENAMED_CALL], StopReason::ToolUse, &[] ; "a_call_the_reply_renamed")]
+    #[tokio::test]
+    async fn only_calls_a_cut_reply_left_out_are_settled(
+        reply: &'static [&'static str],
+        stop_reason: StopReason,
+        settled: &[&str],
+    ) {
+        let (result, events) = send(
+            &AnnouncingServer { reply, stop_reason },
+            &strict_model(STRICT_WINDOW),
+            None,
+            RetryPolicy::default(),
+        )
+        .await;
+
+        result.expect("the reply comes back");
+        let done: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolDone(done) => Some((
+                    done.id.as_str(),
+                    &*done.tool,
+                    done.is_error,
+                    done.output.as_text(),
+                )),
+                _ => None,
+            })
+            .collect();
+        let expected: Vec<_> = settled
+            .iter()
+            .map(|&id| (id, CALLED_TOOL, true, DROPPED_CALL_MESSAGE.to_owned()))
+            .collect();
+        assert_eq!(done, expected);
+    }
 
     /// A race wakes from whichever side gets there first, so racing the token
     /// against the request still sent it about half the time. `race` checks the

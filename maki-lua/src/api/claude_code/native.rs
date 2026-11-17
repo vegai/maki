@@ -44,11 +44,13 @@ const VARIATION_SELECTORS: &[RangeInclusive<u32>] = &[
     0xe0100..=0xe01ef,
 ];
 /// Characters that draw nothing although their category usually draws: the
-/// combining grapheme joiner, Khmer inherent vowels and the Hangul fillers.
+/// combining grapheme joiner, Khmer inherent vowels, the Hangul fillers and
+/// the blank Braille pattern.
 const BLANK_CHARACTERS: &[RangeInclusive<u32>] = &[
     0x034f..=0x034f,
     0x115f..=0x1160,
     0x17b4..=0x17b5,
+    0x2800..=0x2800,
     0x3164..=0x3164,
     0xffa0..=0xffa0,
 ];
@@ -801,6 +803,10 @@ mod tests {
     #[test_case('\u{a0}', false ; "no_break_space")]
     #[test_case('\u{34f}', false ; "combining_grapheme_joiner")]
     #[test_case('\u{3164}', false ; "hangul_filler")]
+    #[test_case('\u{115f}', false ; "hangul_choseong_filler")]
+    #[test_case('\u{ffa0}', false ; "halfwidth_hangul_filler")]
+    #[test_case('\u{17b4}', false ; "khmer_inherent_vowel")]
+    #[test_case('\u{2800}', false ; "braille_blank")]
     fn printability_identifies_standalone_visible_characters(character: char, expected: bool) {
         assert_eq!(is_printable(character), expected);
     }

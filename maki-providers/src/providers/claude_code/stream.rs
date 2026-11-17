@@ -650,6 +650,14 @@ impl<'a> Turn<'a> {
         self.calls().next().is_some()
     }
 
+    /// Claude Code prompts again by itself only after a reply that shows
+    /// nothing, so its prompt after one with text means something else.
+    fn shows_text(&self) -> bool {
+        self.blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text { text } if !js_trim(text).is_empty()))
+    }
+
     /// Only the result is missing.
     pub fn awaits_result(&self) -> bool {
         self.is_complete() && !self.received_result && !self.calls_tools()
@@ -798,7 +806,7 @@ impl<'a> Turn<'a> {
             EventKind::Assistant => self.assistant(&mut event["message"]),
             EventKind::User
                 if self.is_complete()
-                    && (self.truncated() || !self.calls_tools())
+                    && (self.truncated() || !(self.calls_tools() || self.shows_text()))
                     && continuation(&event) =>
             {
                 self.resumed()
@@ -1328,7 +1336,7 @@ mod tests {
         MAX_TURNS_ERROR, MCP_CLOSED, MESSAGE_DELTA, MESSAGE_START, MESSAGE_STOP, NO_SUCH_TOOL,
         PLAN_REJECTED, RATE_LIMIT_EVENT, RATE_LIMITED, REFUSAL_STOP, RESULT_EVENT, SETTINGS_ANSWER,
         SHOWN_TOOL_ERROR_CHARS, STREAM_EVENT, SUCCESS, SYNTHETIC_DETAIL, SYSTEM_EVENT, Step,
-        StreamMode, StreamedText, THINKING_BLOCK, THINKING_TOKENS_EVENT, TOOL_RESULT,
+        StreamMode, StreamedText, TEXT_BLOCK, THINKING_BLOCK, THINKING_TOKENS_EVENT, TOOL_RESULT,
         TOOL_USE_STOP, TRACE_LEN, Turn, USER_EVENT, WINDOW_FULL_STOP, answered, classify,
         result_failure, unexpose_batch, usage_of, user_message,
     };
@@ -1346,6 +1354,8 @@ mod tests {
     const MESSAGE_ID: &str = "msg_1";
     const OTHER_MESSAGE_ID: &str = "msg_9";
     const TOO_LONG: &str = "Prompt is too long";
+    /// The output count of every reply's last `message_delta`.
+    const FINAL_OUTPUT: u32 = 42;
     const TOO_MANY: u16 = 429;
     const BAD_REQUEST: u16 = 400;
     /// As 2.1.284 words a used-up plan.
@@ -1468,7 +1478,7 @@ mod tests {
     fn stop(reason: &str) -> Vec<String> {
         vec![
             stream(
-                json!({ "type": "message_delta", "delta": { "stop_reason": reason }, "usage": { "output_tokens": 42 } }),
+                json!({ "type": "message_delta", "delta": { "stop_reason": reason }, "usage": { "output_tokens": FINAL_OUTPUT } }),
             ),
             stream(json!({ "type": "message_stop" })),
         ]
@@ -1909,6 +1919,17 @@ mod tests {
         assert!(matches!(step, Err(Error::AnsweredItself(_))), "{step:?}");
     }
 
+    /// Claude Code prompts again by itself only after a reply that shows
+    /// nothing, so a note after a reply with text is not its own prompt.
+    #[test_case(CLASSIFIER_NOTE ; "a_classifier_note")]
+    #[test_case(NO_OUTPUT_NOTE ; "a_no_output_note")]
+    fn a_note_after_a_reply_with_text_does_not_end_it(note: &str) {
+        let mut lines = reply(&[json!({ "type": TEXT_BLOCK, "text": "Done." })], END_TURN);
+        lines.push(synthetic_note(note));
+        let (step, _) = run(&lines, Vec::new(), false);
+        assert!(matches!(step, Err(Error::AnsweredItself(_))), "{step:?}");
+    }
+
     fn classifier_note() -> String {
         synthetic_note(CLASSIFIER_NOTE)
     }
@@ -1936,7 +1957,7 @@ mod tests {
     /// nothing. maki ends the reply there, and one the output cap cut before
     /// it showed anything fails.
     #[test_case(END_TURN, NO_OUTPUT_NOTE => matches Ok(StreamResponse { stop_reason: Some(StopReason::EndTurn), .. }) ; "only_thinking")]
-    #[test_case(MAX_TOKENS_STOP, OUTPUT_LIMIT_NOTE => matches Err(Error::CutBeforeOutput(42)) ; "cut_while_thinking")]
+    #[test_case(MAX_TOKENS_STOP, OUTPUT_LIMIT_NOTE => matches Err(Error::CutBeforeOutput(FINAL_OUTPUT)) ; "cut_while_thinking")]
     fn a_reply_without_visible_output_ends_at_claude_codes_own_prompt(
         reason: &str,
         note: &str,
@@ -2140,7 +2161,8 @@ mod tests {
         assert_eq!(response.usage.input, 10);
         assert_eq!(response.usage.cache_read, 200);
         assert_eq!(
-            response.usage.output, 42,
+            response.usage.output,
+            u64::from(FINAL_OUTPUT),
             "the last count, and not the placeholder"
         );
     }
@@ -2335,7 +2357,7 @@ mod tests {
         ];
         lines.extend(sent.into_iter().map(assistant));
         lines.push(stream(
-            json!({ "type": "message_delta", "delta": delta, "usage": { "output_tokens": 42 } }),
+            json!({ "type": "message_delta", "delta": delta, "usage": { "output_tokens": FINAL_OUTPUT } }),
         ));
         lines.push(stream(json!({ "type": "message_stop" })));
         run(&finished(lines), Vec::new(), false).0
@@ -2410,7 +2432,7 @@ mod tests {
 
     /// maki needs every count of the reply, and takes the output count only
     /// from the last `message_delta`.
-    #[test_case(json!({}), json!({ "output_tokens": 42 }) => matches Err(Error::NoUsage) ; "a_start_without_usage")]
+    #[test_case(json!({}), json!({ "output_tokens": FINAL_OUTPUT }) => matches Err(Error::NoUsage) ; "a_start_without_usage")]
     #[test_case(json!({ "input_tokens": 10, "cache_read_input_tokens": 200, "cache_creation_input_tokens": 30 }), json!({}) => matches Err(Error::NoFinalOutput) ; "a_last_delta_without_output")]
     fn a_reply_without_all_its_counts_is_refused(
         start_usage: Value,

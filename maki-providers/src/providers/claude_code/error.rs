@@ -236,10 +236,13 @@ pub enum Error {
     NoStopReason,
     #[error("the reply has tool calls but stopped for {0}")]
     StoppedFor(String),
-    /// The model spent the whole output cap before it wrote any text, and a
-    /// cut reply hands over no calls, so a retry with the same cap would end
-    /// the same way.
-    #[error("the reply used its whole output limit ({0} tokens) before it wrote any text")]
+    /// The model spent the whole output cap with no text to keep, and a cut
+    /// reply hands over no calls, so a retry with the same cap would end the
+    /// same way. The agent loop would prompt such a reply to continue, as it
+    /// does for the anthropic provider, and each continuation would spend the
+    /// cap again, so this provider fails instead. The count is the one the API
+    /// reports, since Claude Code may apply its own default cap.
+    #[error("the reply reached its output limit after {0} tokens with no text to keep")]
     CutBeforeOutput(u32),
     #[error("Claude Code reported no usage for its reply")]
     NoUsage,
