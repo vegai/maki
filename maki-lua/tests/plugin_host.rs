@@ -66,6 +66,7 @@ end
 const JOB_THAT_COMPLETES: &str = "true";
 const JOB_THAT_WAITS: &str = "sleep 30";
 /// Generous for a job whose stdin is closed, which exits at once.
+#[cfg(unix)]
 const CLOSED_JOB_WAIT_MS: u64 = 5000;
 const NARGS_ERR: &str = r#"'nargs' must be 0, 1, "?", "*", or "+""#;
 const GLOBAL_PACK_ONLY_ERR: &str = "only available in the global init.lua";
