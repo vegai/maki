@@ -604,7 +604,8 @@ pub async fn run(params: SdkParams, interrupt: &Interrupt) -> Result<()> {
         Ok(started) => started,
         Err(error) => {
             let emitted = writer.emit(WireInner::Result(ResultPayload::error(error.to_string())));
-            finish(handle, &lua_handle, writer, writer_task, None).await?;
+            // Without a pump `finish` cannot fail.
+            let _ = finish(handle, &lua_handle, writer, writer_task, None).await;
             emitted?;
             return Err(error);
         }

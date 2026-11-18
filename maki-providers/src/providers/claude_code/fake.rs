@@ -17,7 +17,7 @@ use tokio::sync::mpsc::unbounded_channel;
 use tokio::time::timeout;
 
 use super::error::Error;
-use super::run::{Exchange, Launch, Limits, Request, Thinking, request};
+use super::run::{Exchange, Launch, Limits, Request, STARTUP, Thinking, request};
 use crate::{Message, ProviderEvent, ProviderUsage, StreamResponse};
 
 /// Generous for a loaded machine: how long a test waits for something that
@@ -64,6 +64,7 @@ pub(super) struct Fake {
     pub(super) dir: TempDir,
     project: TempDir,
     pub(super) plan_usage: Mutex<Option<ProviderUsage>>,
+    pub(super) startup: Duration,
 }
 
 impl Fake {
@@ -83,7 +84,8 @@ impl Fake {
             )
             .replace("@WAIT_SECS@", &(EXIT_LIMIT + WAIT).as_secs().to_string())
             .replace("@VERSION@", MINIMUM_VERSION)
-            .replace("@HAIKU@", HAIKU);
+            .replace("@HAIKU@", HAIKU)
+            .replace("@OPUS@", OPUS);
         let source = dir.path().join("claude.sh");
         fs::write(&source, script).unwrap();
         let installed = process::Command::new("install")
@@ -98,6 +100,7 @@ impl Fake {
             dir,
             project: tempdir().unwrap(),
             plan_usage: Mutex::default(),
+            startup: STARTUP,
         }
     }
 
@@ -162,7 +165,7 @@ impl Fake {
                 project: &project,
                 denied: &[],
                 temp_dir: &self.temp_base(),
-                startup: limits.startup,
+                startup: self.startup,
             },
             limits: &limits,
             model,

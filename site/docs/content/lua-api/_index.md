@@ -2631,13 +2631,18 @@ pipe, or `$(...)`.
 You get back a job id that you can pass to `jobstop` or `jobwait` to
 control the process.
 
-Unread output is bounded to 16 MiB per job. The child blocks on write until
-callbacks or `jobwait` drain it.
+Output nobody has read yet waits in a queue of up to 16 MiB per job.
+Past that the child blocks on write until `on_stdout` / `on_stderr` or
+`jobwait` drain it, so a job started where nothing delivers its events,
+like a tool handler before it returns, pauses there.
 
-`stdout` and `stderr` can append directly to files. Redirected streams
-have no callbacks, tails or events and count as truncated in job reports.
-A redirect conflicts with the corresponding output callback and needs
-`fs_write`. Use separate writer and reader jobs to store and process output.
+`stdout` and `stderr` route a stream to a file instead of into maki. A
+path is opened for append and handed to the child, so nothing is buffered
+here: no callback, no tail, no events for that stream, and it counts as
+truncated everywhere a tail is reported. That makes the two mutually
+exclusive with `on_stdout` / `on_stderr` for the same stream, and a path
+additionally needs the `fs_write` permission. To both persist and react,
+run one job writing the file and a second one tailing it.
 
 Yields while starting the process. Call from a coroutine. Cancel hooks and
 describe callbacks cannot yield.
@@ -2682,7 +2687,7 @@ Requires the `run` [plugin permission](#plugin-permissions).
   - `tail` (`integer?`) trailing lines per stream kept for `jobinfo` and
     `jobwait` (default 20, 0 disables, max 1024).
   - `name` (`string?`) handle for `jobfind`, unique among the live jobs this
-    plugin can see. A second job with the same live name fails.
+    plugin can see. Starting a second job under a live name is an error.
 
 **Returns:** (`integer?`, `string?`) Job id, or nil plus an error message when the
   process could not start (binary not found, bad `cwd`, redirect file not
@@ -2895,8 +2900,10 @@ maki.fn.jobfind({name})
 ```
 
 Find the live job of this plugin that `jobstart` registered under {name}.
-An exited job never answers. The name stays on its `joblist` row so you can inspect
-why it died. Another coroutine may claim the name while `jobstart` yields.
+An exited job never answers, so `jobfind(...) or jobstart(...)` restarts a
+job that died instead of adopting its id. The name stays on the `joblist`
+row, which is where you go to see why it died. Another coroutine may claim
+the name while `jobstart` yields.
 Check for a start error, or look up the winner again.
 
 Requires the `run` [plugin permission](#plugin-permissions).

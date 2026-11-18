@@ -80,6 +80,11 @@ pub async fn run(
         load_env_files(&trust.project_config);
         (plugin_host, config, warnings) = load_stack(cli, &trust).await?;
     }
+    warnings.extend(super::tool_filter_warnings(
+        cli,
+        ToolRegistry::global(),
+        true,
+    )?);
     warnings.extend(provider_scripts::startup_warning());
     warnings.extend(legacy_notice);
     super::report_warnings(warnings);

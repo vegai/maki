@@ -28,7 +28,7 @@ pub const STDERR_TAIL_LINES: usize = 10;
 pub const STDERR_LINE_BYTES: usize = 4096;
 pub const STDERR_TRUNCATED: &str = " [truncated]";
 
-const PATH: &str = "PATH";
+pub const PATH: &str = "PATH";
 #[cfg(windows)]
 const PATHEXT: &str = "PATHEXT";
 const PATHEXT_SEPARATOR: char = ';';

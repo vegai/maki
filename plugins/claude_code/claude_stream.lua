@@ -30,7 +30,7 @@ local function count(n)
   return tostring(n)
 end
 
---- {expect}: `cwd`, `version`, `policy`, and optional `executable`.
+--- {expect}: `cwd`, `version`, `policy` and `executable`.
 function Stream.new(expect)
   return setmetatable({
     expect = expect,
@@ -69,9 +69,6 @@ function Stream:feed(line, handshake)
     return { stop = problem }
   end
   local ev, kind = classified.event, classified.kind
-  if classified.problem then
-    return { stop = classified.problem }
-  end
   if classified.control then
     return { control = true, complete = classified.complete }
   end

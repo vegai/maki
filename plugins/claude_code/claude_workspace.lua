@@ -1,3 +1,4 @@
+local native = require("maki.claude_code.internal")
 local git_utils = require("claude_git")
 local path_utils = require("claude_paths")
 
@@ -12,10 +13,9 @@ M.STATUS_MODE_MISMATCH = "%s: its %s_mode does not agree with its status %s"
 M.OBJECT_MODE_MISMATCH = "%s has a %s object id that does not agree with its %s mode"
 M.KIND_MISMATCH = "%s is a %s change, and not %s"
 M.REPOSITORY_KIND = "repository"
+M.TYPE_KIND = "type"
 M.MANIFEST_VERSION = 1
 
-local TYPE_KIND = "type"
-M.TYPE_KIND = TYPE_KIND
 -- Symlinks, submodules and type changes can affect paths outside an ordinary file import. The
 -- user must apply these changes manually.
 local IMPORTABLE = { text = true, binary = true, mode = true }
@@ -31,7 +31,7 @@ local KNOWN_MODES = {
 }
 -- The snapshot copies neither, and Claude Code config can add hooks.
 local NEVER_COLLECTED = path_utils.set_of(git_utils.NEVER_COLLECTED)
-local OBJECT_ID_LENGTHS = path_utils.set_of(require("maki.claude_code.internal").object_id_lengths)
+local OBJECT_ID_LENGTHS = path_utils.set_of(native.object_id_lengths)
 function M.repository_path(path, repositories)
   for repository in pairs(repositories or {}) do
     if repository == "." or path_utils.within(path, repository) then
@@ -49,7 +49,7 @@ function M.kind(change, binary)
     return "submodule"
   end
   if change.status == git_utils.TYPE_CHANGED then
-    return TYPE_KIND
+    return M.TYPE_KIND
   end
   if binary[change.path] then
     return "binary"
@@ -103,7 +103,7 @@ function M.change_problem(change)
   -- `retyped_paths` can make any change a type change, which is never
   -- imported.
   local kind = M.kind(change, { [change.path] = change.kind == "binary" })
-  if change.kind ~= kind and change.kind ~= TYPE_KIND and change.kind ~= M.REPOSITORY_KIND then
+  if change.kind ~= kind and change.kind ~= M.TYPE_KIND and change.kind ~= M.REPOSITORY_KIND then
     return M.KIND_MISMATCH:format(change.path, kind, tostring(change.kind))
   end
   return nil

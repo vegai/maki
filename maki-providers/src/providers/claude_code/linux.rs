@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::slots::{Permit, Slots};
-use crate::providers::plugin::{native_factory, register_native};
+use arc_swap::ArcSwapOption;
 use maki_storage::auth::now_millis;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -43,7 +43,7 @@ use crate::{
     ThinkingConfig,
 };
 use maki_storage::atomic_write;
-use run::{Exchange, Launch, Limits, Listed, Request, Thinking};
+use run::{Exchange, Launch, Limits, Listed, Request, STARTUP, Thinking};
 
 const PLUGIN_OFF: &str =
     "enable the claude_code plugin in init.lua: `plugins = { claude_code = { enabled = true } }`";
@@ -63,6 +63,15 @@ const CONTEXT_OVERFLOW_STATUS: u16 = 413;
 
 type ListingState = Option<(Instant, Result<Vec<Listed>, String>)>;
 
+static LOGINS: Mutex<BTreeMap<(PathBuf, PathBuf), Arc<LoginState>>> = Mutex::new(BTreeMap::new());
+static SLOTS: Slots = Slots::new(DEFAULT_MAX_CONCURRENT);
+/// The saved model lists, which the first provider reads from its cache
+/// file. Every provider has the same file, and each test runs in its own
+/// process.
+static KNOWN_MODELS: Mutex<Option<Vec<TimedModels>>> = Mutex::new(None);
+/// Set while the plugin is enabled.
+static FACTORY: ArcSwapOption<Factory> = ArcSwapOption::const_empty();
+
 /// What maki keeps for each `claude` and login: the plan usage the last
 /// request reported, and the last listing, whose lock runs one at a time.
 #[derive(Default)]
@@ -70,8 +79,6 @@ struct LoginState {
     usage: Mutex<Option<ProviderUsage>>,
     listing: AsyncMutex<ListingState>,
 }
-
-static LOGINS: Mutex<BTreeMap<(PathBuf, PathBuf), Arc<LoginState>>> = Mutex::new(BTreeMap::new());
 
 #[derive(Debug, Clone, Default, PartialEq)]
 struct PluginOptions {
@@ -117,19 +124,13 @@ fn reusable_listing(
         })
 }
 
-static SLOTS: Slots = Slots::new(DEFAULT_MAX_CONCURRENT);
-/// The saved model lists, which the first provider reads from its cache
-/// file. Every provider has the same file, and each test runs in its own
-/// process.
-static KNOWN_MODELS: Mutex<Option<Vec<TimedModels>>> = Mutex::new(None);
-
-pub(crate) struct Factory {
+struct Factory {
     options: PluginOptions,
     models_cache: Option<PathBuf>,
 }
 
 impl Factory {
-    pub(crate) fn create(&self, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    fn create(&self, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
         let vars = [worker::HOME_ENV, worker::CONFIG_DIR_ENV]
             .into_iter()
             .filter_map(|name| env::var(name).ok().map(|value| (name.to_owned(), value)))
@@ -140,14 +141,15 @@ impl Factory {
 
 pub fn configure_plugin(enabled: bool, options: Option<&Map<String, Value>>) {
     if !enabled {
+        FACTORY.store(None);
         return;
     }
     let options = PluginOptions::from_table(options);
     SLOTS.set_limit(options.max_concurrent.unwrap_or(DEFAULT_MAX_CONCURRENT));
-    register_native(Arc::new(Factory {
+    FACTORY.store(Some(Arc::new(Factory {
         options,
         models_cache: models_cache_path(),
-    }));
+    })));
 }
 
 async fn request_slot<'a>(slots: &'a Slots, events: &UnboundedSender<ProviderEvent>) -> Permit<'a> {
@@ -211,7 +213,9 @@ pub(super) fn agent_error(error: Error) -> AgentError {
 }
 
 pub(super) fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
-    native_factory()
+    FACTORY
+        .load()
+        .as_ref()
         .ok_or_else(|| config_error(PLUGIN_OFF))?
         .create(timeouts)
 }
@@ -250,15 +254,10 @@ fn read_models(path: &Path) -> Vec<TimedModels> {
         .unwrap_or_default()
 }
 
-fn saved_models(
-    path: &Path,
-    max_age: Duration,
-    executable: &Path,
-    config_dir: &Path,
-) -> Option<SavedModels> {
+fn saved_models(path: &Path, executable: &Path, config_dir: &Path) -> Option<SavedModels> {
     let now = now_millis();
     read_models(path).into_iter().find_map(|(at, saved)| {
-        (Duration::from_millis(now.saturating_sub(at)) <= max_age
+        (Duration::from_millis(now.saturating_sub(at)) <= MODELS_CACHE_TTL
             && saved.executable == executable
             && saved.config_dir == config_dir)
             .then_some(saved)
@@ -275,7 +274,7 @@ fn remember_models(entries: &mut Vec<TimedModels>, saved: &SavedModels) {
     entries.truncate(MAX_MODEL_CACHES);
 }
 
-fn save_models(path: &Path, saved: &SavedModels) -> bool {
+fn save_models(path: &Path, saved: &SavedModels) {
     let mut entries = read_models(path);
     remember_models(&mut entries, saved);
     let result = serde_json::to_vec(&entries)
@@ -283,18 +282,7 @@ fn save_models(path: &Path, saved: &SavedModels) -> bool {
         .and_then(|bytes| atomic_write(path, &bytes).map_err(|error| error.to_string()));
     if let Err(error) = result {
         warn!(path = %path.display(), %error, "claude-code: maki cannot save the model list");
-        return false;
     }
-    true
-}
-
-#[cfg(test)]
-fn backdate_models(path: &Path, age: Duration) {
-    let mut entries = read_models(path);
-    for (at, _) in &mut entries {
-        *at = now_millis().saturating_sub(age.as_millis() as u64);
-    }
-    fs::write(path, serde_json::to_vec(&entries).unwrap()).unwrap();
 }
 
 /// Returns true if models.dev gives the model a 1M window.
@@ -350,6 +338,7 @@ pub(super) fn utf8_vars(vars: impl Iterator<Item = (OsString, OsString)>) -> Vec
 struct ClaudeCode {
     executable: PathBuf,
     limits: Limits,
+    startup: Duration,
     login: Option<PathBuf>,
     models_cache: Option<PathBuf>,
     /// Takes precedence over `$CLAUDE_CONFIG_DIR`.
@@ -376,6 +365,7 @@ impl ClaudeCode {
         Ok(Self {
             executable,
             limits: Limits::new(timeouts.stream),
+            startup: STARTUP,
             login,
             models_cache: factory.models_cache.clone(),
             config_dir: options.config_dir.clone(),
@@ -399,7 +389,7 @@ impl ClaudeCode {
             project: cwd,
             denied: &prepared.denied,
             temp_dir: &prepared.temp_dir,
-            startup: self.limits.startup,
+            startup: self.startup,
         }
     }
 
@@ -434,17 +424,15 @@ impl ClaudeCode {
             && let Some(path) = self.models_cache.clone()
         {
             let (executable, dir) = (self.executable.clone(), config_dir.clone());
-            let saved = tokio::task::spawn_blocking(move || {
-                saved_models(&path, MODELS_CACHE_TTL, &executable, &dir)
-            })
-            .await;
+            let saved =
+                tokio::task::spawn_blocking(move || saved_models(&path, &executable, &dir)).await;
             if let Ok(Some(saved)) = saved {
                 self.remember(&saved);
                 return Ok(saved.models);
             }
         }
         let login = self.login_state(&config_dir);
-        let deadline = Instant::now() + self.limits.startup;
+        let deadline = Instant::now() + self.startup;
         let mut state = timeout_at(deadline.into(), login.listing.lock())
             .await
             .map_err(|_| Error::ListingPending)?;
@@ -658,10 +646,10 @@ mod tests {
     use super::super::fake::{HAIKU, OPUS};
     use super::run::Thinking;
     use super::{
-        ClaudeCode, Factory, LONG_CONTEXT_WINDOW, Listed, MAX_MODEL_CACHES, MODELS_CACHE_FILE,
-        MODELS_CACHE_TTL, PLUGIN_OFF, PluginOptions, SLOTS, SUBSIDY, SavedModels, WAITING_FOR_SLOT,
-        agent_error, backdate_models, configure_plugin, create, read_models, request_slot,
-        save_models, saved_models, thinking_for, utf8_vars, with_long_context,
+        ClaudeCode, DEFAULT_MAX_CONCURRENT, Factory, LONG_CONTEXT_WINDOW, Listed, MAX_MODEL_CACHES,
+        MODELS_CACHE_FILE, MODELS_CACHE_TTL, PLUGIN_OFF, PluginOptions, SLOTS, SUBSIDY,
+        SavedModels, WAITING_FOR_SLOT, agent_error, configure_plugin, create, read_models,
+        request_slot, save_models, saved_models, thinking_for, utf8_vars, with_long_context,
     };
     use crate::ThinkingConfig;
     use crate::provider::Provider;
@@ -670,8 +658,17 @@ mod tests {
     use crate::retry::RetryKind;
     use crate::types::Effort::{High, Max, Minimal};
     use crate::{Model, ProviderEvent, TokenUsage};
+    use maki_storage::auth::now_millis;
 
     const ANTHROPIC: &str = "anthropic";
+
+    pub(super) fn backdate_models(path: &Path, age: Duration) {
+        let mut entries = read_models(path);
+        for (at, _) in &mut entries {
+            *at = now_millis().saturating_sub(age.as_millis() as u64);
+        }
+        fs::write(path, serde_json::to_vec(&entries).unwrap()).unwrap();
+    }
 
     #[test]
     fn waiting_for_a_request_slot_is_reported_and_cleared_on_acquisition() {
@@ -904,13 +901,7 @@ mod tests {
             );
         }
         for (executable, config_dir) in keys {
-            let saved = saved_models(
-                &cache,
-                Duration::from_secs(60),
-                Path::new(executable),
-                Path::new(config_dir),
-            )
-            .unwrap();
+            let saved = saved_models(&cache, Path::new(executable), Path::new(config_dir)).unwrap();
             assert_eq!(saved.models[0].id, config_dir);
             assert_eq!(saved.models[0].window, Some(42));
         }
@@ -925,28 +916,28 @@ mod tests {
             config_dir: "old-login".into(),
             models: vec![],
         };
-        assert!(save_models(&base, &saved));
+        save_models(&base, &saved);
         backdate_models(&base, MODELS_CACHE_TTL + Duration::from_secs(1));
-        assert!(save_models(
+        save_models(
             &base,
             &SavedModels {
                 config_dir: "new-login".into(),
                 ..saved.clone()
-            }
-        ));
+            },
+        );
         assert!(
             read_models(&base)
                 .iter()
                 .all(|(_, entry)| entry.config_dir != saved.config_dir)
         );
         for index in 0..=MAX_MODEL_CACHES {
-            assert!(save_models(
+            save_models(
                 &base,
                 &SavedModels {
                     config_dir: format!("login-{index}").into(),
                     ..saved.clone()
-                }
-            ));
+                },
+            );
         }
         let entries = read_models(&base);
         assert!(
@@ -1123,9 +1114,7 @@ mod tests {
         let executable = env::current_exe().unwrap();
         let options = |limit| json!({(super::EXECUTABLE_OPTION):executable, (super::MAX_CONCURRENT_OPTION):limit});
         let load = |limit| {
-            crate::providers::plugin::begin_load();
             configure_plugin(true, options(limit).as_object());
-            crate::providers::plugin::commit_load();
             create(Timeouts::default()).unwrap()
         };
         let first = load(1);
@@ -1145,6 +1134,21 @@ mod tests {
         assert!(SLOTS.try_acquire().is_none());
         drop(additional);
         assert!(SLOTS.try_acquire().is_some());
+        configure_plugin(false, None);
+        SLOTS.set_limit(DEFAULT_MAX_CONCURRENT);
+    }
+
+    /// A reload with the plugin disabled turns the provider off again.
+    #[test]
+    fn a_reload_without_the_plugin_turns_it_off() {
+        let _home = crate::test_support::isolated_home();
+        let executable = env::current_exe().unwrap();
+        let options = json!({ (super::EXECUTABLE_OPTION): executable });
+        configure_plugin(true, options.as_object());
+        assert!(create(Timeouts::default()).is_ok());
+        configure_plugin(false, options.as_object());
+        let err = create(Timeouts::default()).err().unwrap();
+        assert!(err.to_string().contains(PLUGIN_OFF), "got: {err}");
     }
 }
 
@@ -1173,9 +1177,10 @@ mod on_the_fake {
         VERSION_ERROR, VERSION_FILE, VERSIONS, bounded, tools,
     };
     use super::run::{Listed, Thinking};
+    use super::tests::backdate_models;
     use super::{
-        ClaudeCode, Exchange, Factory, PluginOptions, SLOTS, SPEC, SavedModels, backdate_models,
-        save_models,
+        ClaudeCode, DEFAULT_MAX_CONCURRENT, Exchange, Factory, PluginOptions, SLOTS, SPEC,
+        SavedModels, save_models,
     };
     use crate::provider::{ModelListing, Provider};
     use crate::{Message, Model, ProviderUsage, StreamResponse};
@@ -1453,7 +1458,7 @@ mod on_the_fake {
         let login = login.map_or_else(|| home.path().join(CLAUDE_DIR), PathBuf::from);
         let saved = json!({ "executable": fake.executable(), "config_dir": login, "models": [{ "id": SAVED_MODEL, "window": null }] });
         let saved = serde_json::from_value(saved).unwrap();
-        assert!(save_models(&cache, &saved));
+        save_models(&cache, &saved);
         backdate_models(&cache, age);
         let provider = provider_for(&fake, home.path(), &env::temp_dir(), Some(cache.clone()));
 
@@ -1472,13 +1477,8 @@ mod on_the_fake {
             asks,
             "Claude Code started"
         );
-        let saved = super::saved_models(
-            &cache,
-            Duration::MAX,
-            &fake.executable(),
-            &home.path().join(CLAUDE_DIR),
-        )
-        .unwrap();
+        let saved =
+            super::saved_models(&cache, &fake.executable(), &home.path().join(CLAUDE_DIR)).unwrap();
         let saved = serde_json::to_value(saved).unwrap();
         let saved_ids: Vec<&str> = saved["models"]
             .as_array()
@@ -1503,7 +1503,7 @@ mod on_the_fake {
                 window: None,
             }],
         };
-        assert!(save_models(&cache, &saved));
+        save_models(&cache, &saved);
         let provider = provider_for(&fake, home.path(), &env::temp_dir(), Some(cache.clone()));
         let cwd = fake.project();
         let held: Vec<_> = iter::from_fn(|| SLOTS.try_acquire()).collect();
@@ -1532,14 +1532,16 @@ mod on_the_fake {
         let fake = Fake::new("text");
         let home = tempdir().unwrap();
         let mut provider = provider_for(&fake, home.path(), &env::temp_dir(), None);
-        provider.limits.startup = Duration::ZERO;
+        provider.startup = Duration::ZERO;
         SLOTS.set_limit(1);
-        let _held = SLOTS.try_acquire().unwrap();
+        let held = SLOTS.try_acquire().unwrap();
         let error = crate::test_support::runtime()
             .block_on(provider.list(&fake.project(), ModelListing::Cached))
             .unwrap_err();
         assert!(matches!(error, Error::ListingBusy));
         assert!(fake.log(CALLS).is_empty());
+        drop(held);
+        SLOTS.set_limit(DEFAULT_MAX_CONCURRENT);
     }
 
     #[test]
@@ -1579,7 +1581,7 @@ mod on_the_fake {
                 window: Some(SPEC.fallback_context_window),
             }],
         };
-        assert!(save_models(&cache, &saved));
+        save_models(&cache, &saved);
         backdate_models(&cache, STALE_LIST);
         let provider = provider_for(&fake, home.path(), &env::temp_dir(), Some(cache));
         assert_eq!(

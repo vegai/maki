@@ -6,6 +6,8 @@ mod checks;
 mod error;
 #[cfg(all(test, target_os = "linux"))]
 mod fake;
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(all(test, target_os = "linux"))]
 mod live;
 #[cfg(target_os = "linux")]
@@ -20,19 +22,13 @@ mod slots;
 mod stream;
 #[cfg(target_os = "linux")]
 mod transcript;
-#[cfg(target_os = "linux")]
-pub mod worker;
-#[cfg(all(test, target_os = "linux"))]
-use linux::agent_error;
-#[cfg(target_os = "linux")]
-mod linux;
 #[cfg(not(target_os = "linux"))]
 mod unsupported;
+#[cfg(target_os = "linux")]
+pub mod worker;
 
 #[cfg(target_os = "linux")]
 pub use error::Error;
-#[cfg(target_os = "linux")]
-pub(crate) use linux::Factory;
 #[cfg(target_os = "linux")]
 pub use linux::configure_plugin;
 #[cfg(target_os = "linux")]

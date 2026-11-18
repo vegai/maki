@@ -2,6 +2,8 @@
 //! validation, concurrency) lives in the task plugin, not here.
 
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::Result as IoResult;
 use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::{Arc, OnceLock};
@@ -47,7 +49,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::spawn_blocking;
 use tracing::info;
 
-use crate::api::fs::canonical_path;
+use crate::api::fs::{canonical_path, path_text};
 use crate::api::model::stale_tier_err;
 use crate::api::session::{not_live, required_session};
 use crate::api::tool::{audiences_to_lua, format_name, parse_audience};
@@ -68,7 +70,6 @@ const WORKING_STATUS: &str = "working";
 const IDLE_STATUS: &str = "idle";
 const TASK_SCOPE: &str = "task";
 const SESSION_SCOPE: &str = "session";
-const NO_REGISTRY_ERR: &str = "tool registry not available";
 const TOOLS_ARRAY_ERR: &str = "tools must be an array";
 pub const UNPAID_REACH_ERR: &str = "this plugin does not hold what these tools reach";
 pub const UNDECLARED_REACH: &str = "declare no permission and need";
@@ -148,14 +149,20 @@ fn session_opts(
 
 /// The ctx-less form borrows a live chat session's settings by id. We copy
 /// what we need and let the seed go, because holding it would keep an ended
-/// chat session looking live.
+/// chat session looking live. Tools come from this host's registry, the one
+/// its plugins registered into.
 fn seed_ctx(
+    lua: &Lua,
     opts: &Table,
     cancel: CancelToken,
 ) -> LuaResult<Result<(MakiId, AgentContext), String>> {
     Ok(required_session(Some(opts))?.and_then(|session| {
         let seed = AgentSeed::live(session).ok_or_else(|| not_live(session))?;
-        Ok((session, AgentContext::from(&seed.tool_context(cancel))))
+        let mut ctx = seed.tool_context(cancel);
+        if let Some(registry) = lua.app_data_ref::<Arc<ToolRegistry>>() {
+            ctx.registry = Arc::clone(&registry);
+        }
+        Ok((session, AgentContext::from(&ctx)))
     }))
 }
 
@@ -167,14 +174,11 @@ fn seed_ctx(
 /// registry does not know never dispatches, so it is free. The error names
 /// every unpaid tool at once, so the author fixes them in one edit.
 fn delegated_reach(
-    lua: &Lua,
+    registry: &ToolRegistry,
     perms: &PluginPermissions,
     tools: &[JsonValue],
     mcp: bool,
 ) -> Result<(), String> {
-    let registry = lua
-        .app_data_ref::<Arc<ToolRegistry>>()
-        .ok_or(NO_REGISTRY_ERR)?;
     let unpaid = |authority: Authority| -> Vec<Permission> {
         perms
             .lacking()
@@ -604,12 +608,13 @@ async fn instructions(_lua: Lua, ctx: UserDataRef<LuaCtx>) -> LuaResult<Pair<Str
 }
 
 async fn instruction_text(path: PathBuf, config: InstructionsConfig) -> Result<String, String> {
-    let path = canonical_path(path)
-        .await
-        .map_err(|error| error.to_string())?;
-    spawn_blocking(move || load_instruction_text(&path, &config))
-        .await
-        .map_err(|error| error.to_string())
+    spawn_blocking(move || -> IoResult<String> {
+        let path = path_text(fs::canonicalize(path)?)?;
+        Ok(load_instruction_text(&path, &config))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
 }
 
 /// Build a system prompt from the parent's resolved prompt catalogue.
@@ -748,7 +753,10 @@ async fn tools(
             try_pair!(dispatch_ctx(&ctx, "tools")).clone(),
             required_opts(opts)?,
         ),
-        LuaEither::Right(opts) => (try_pair!(seed_ctx(&opts, CancelToken::none())?).1, opts),
+        LuaEither::Right(opts) => (
+            try_pair!(seed_ctx(&lua, &opts, CancelToken::none())?).1,
+            opts,
+        ),
     };
     let audience_str: String = opts.get("audience")?;
     let audience = try_pair!(
@@ -791,7 +799,7 @@ async fn tools(
     // request, so baking them into a tools array would freeze the catalog.
     // A session opened from Lua is a subagent's, and a subagent never moves a
     // call itself, so it is not offered what only that needs.
-    let defs = ToolRegistry::global().definitions_with_background(
+    let defs = agent.registry.definitions_with_background(
         &vars,
         &ctx_desc,
         None,
@@ -1102,7 +1110,7 @@ async fn session(
             // would leak one. The entry keeps this trigger instead, and the
             // entry goes away when the task ends.
             let (cancel, token) = CancelToken::new();
-            let (session, agent_ctx) = try_pair!(seed_ctx(&opts, token)?);
+            let (session, agent_ctx) = try_pair!(seed_ctx(&lua, &opts, token)?);
             (agent_ctx, opts, Some((session, task, cancel)))
         }
     };
@@ -1147,7 +1155,7 @@ async fn session(
     };
     let reaches_mcp = mcp_enabled && agent_ctx.mcp.is_some();
     try_pair!(delegated_reach(
-        &lua,
+        &agent_ctx.registry,
         &perms.now(&lua),
         &tools_json,
         reaches_mcp
@@ -2286,7 +2294,6 @@ mod tests {
     use maki_storage::sessions::Effort;
     use mlua::AnyUserData;
     use serde_json::json;
-    use std::fs;
     use std::iter;
     use std::path::Path;
     use std::sync::mpsc::{Sender, channel};
@@ -2490,7 +2497,6 @@ mod tests {
     }
 
     async fn native_session(lua: &Lua, ctx: &ToolContext) -> AnyUserData {
-        lua.set_app_data(Arc::clone(ToolRegistry::global_arc()));
         let ctx = lua.create_userdata(LuaCtx::handler(ctx)).unwrap();
         let (session, error) = session(
             lua.clone(),
@@ -2731,13 +2737,48 @@ mod tests {
         assert_eq!(system.unwrap().contains(TOOL_HINT), hinted);
     }
 
+    /// Reach is priced against the registry the session admits from, the
+    /// ctx's, whatever registry the Lua host holds.
+    #[tokio::test]
+    async fn a_ctx_session_prices_reach_from_its_own_registry() {
+        let lua = Lua::new();
+        lua.set_app_data(Arc::new(ToolRegistry::new()));
+        let registry = ToolRegistry::new();
+        let source = ToolSource {
+            plugin: PLUGIN.into(),
+        };
+        registry
+            .register(mock_tool(HINTED_TOOL, ToolAudience::all()), source)
+            .unwrap();
+        let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        ctx.registry = Arc::new(registry);
+        let ctx = lua.create_userdata(LuaCtx::handler(&ctx)).unwrap();
+        let opts = lua.create_table().unwrap();
+        let defs = json!([{ "name": HINTED_TOOL }]);
+        opts.set("tools", json_to_lua(&lua, &defs).unwrap())
+            .unwrap();
+
+        let (opened, error) = session(
+            lua.clone(),
+            Arc::from(PLUGIN),
+            PluginPermissions::denied(),
+            LuaEither::Left(ctx.borrow().unwrap()),
+            Some(opts),
+        )
+        .await
+        .unwrap();
+
+        assert!(opened.is_none());
+        let error = error.unwrap();
+        assert!(error.starts_with(UNPAID_REACH_ERR), "{error}");
+    }
+
     #[test_case("research", PromptId::Research ; "research_child")]
     #[test_case("general", PromptId::General ; "general_child")]
     #[tokio::test]
     async fn child_session_receives_the_parent_prompt_policy(name: &str, id: PromptId) {
         let lua = Lua::new();
         lua.set_app_data(SpawnedTasks::default());
-        lua.set_app_data(Arc::new(ToolRegistry::new()));
         let (sent, requests) = channel();
         let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
         ctx.provider = Arc::new(PromptRecorder(sent));

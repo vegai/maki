@@ -164,10 +164,6 @@ fn make_absolute(path: &str) -> Result<PathBuf, String> {
     }
 }
 
-fn path_to_string(p: &Path) -> LuaResult<String> {
-    path_text(p.to_owned()).map_err(mlua::Error::external)
-}
-
 fn filetype_str(ft: &FileType) -> &'static str {
     if ft.is_file() {
         "file"
@@ -354,24 +350,51 @@ impl From<&str> for Line {
     }
 }
 
+/// Longest line [`next_line`] hands on. Either way it is capped at
+/// [`MAX_READ_BYTES`], because this is where the line is buffered.
+#[derive(Clone, Copy)]
+pub(crate) enum LineLimit {
+    /// Cut a longer line, skipping the rest without reading it into memory.
+    Cut(u64),
+    /// Fail on a longer line, without reading on to its end.
+    Stop(u64),
+}
+
+impl LineLimit {
+    pub(crate) fn new(limit: Option<u64>, stop: bool) -> Self {
+        let limit = limit.unwrap_or(MAX_READ_BYTES);
+        if stop {
+            Self::Stop(limit)
+        } else {
+            Self::Cut(limit)
+        }
+    }
+}
+
 /// The next line without its `\n` or `\r\n`, or `None` at the end of the file.
-/// A line over `max_bytes` is cut and gets [`LINE_CUT_MARKER`]. This is where
-/// the line is buffered, so `max_bytes` is capped at [`MAX_READ_BYTES`] here
-/// and no caller can ask for more. The rest of it
-/// is skipped without ever landing in memory, which is how a file that is one
-/// 300 MB line still pages fine. Without `max_bytes`, a line over
-/// [`MAX_READ_BYTES`] fails the read. Bytes that are not UTF-8 fail the read,
-/// or become U+FFFD when `lossy`.
+/// A line over a [`LineLimit::Cut`] is cut and gets [`LINE_CUT_MARKER`]. The
+/// rest of it is skipped without ever landing in memory, which is how a file
+/// that is one 300 MB line still pages fine. Without a `limit`, a line over
+/// [`MAX_READ_BYTES`] fails the read. A line over a [`LineLimit::Stop`] fails
+/// it too, before its end, since skipping blocks on a line that never ends.
+/// Bytes that are not UTF-8 fail the read, or become U+FFFD when `lossy`.
 pub(crate) fn next_line(
     reader: &mut impl BufRead,
-    max_bytes: Option<u64>,
+    limit: Option<LineLimit>,
     lossy: bool,
 ) -> IoResult<Option<Line>> {
-    let keep = max_bytes.map_or(MAX_READ_BYTES, |max| max.min(MAX_READ_BYTES));
-    // The extra 2 bytes let a line of exactly `keep` bytes see its `\r\n`, so it is not cut.
-    let window = keep.saturating_add(2);
+    let keep = match limit {
+        None => MAX_READ_BYTES,
+        Some(LineLimit::Cut(max) | LineLimit::Stop(max)) => max.min(MAX_READ_BYTES),
+    };
+    let mut window = keep + 1;
     let mut line = Vec::new();
-    let read = reader.by_ref().take(window).read_until(b'\n', &mut line)? as u64;
+    let mut read = reader.by_ref().take(window).read_until(b'\n', &mut line)? as u64;
+    // A line of exactly `keep` bytes still has to see its `\r\n`, so it is not cut.
+    if read == window && line.last() == Some(&b'\r') {
+        window += 1;
+        read += reader.by_ref().take(1).read_until(b'\n', &mut line)? as u64;
+    }
     if read == 0 {
         return Ok(None);
     }
@@ -380,6 +403,16 @@ pub(crate) fn next_line(
         line.pop_if(|b| *b == b'\r');
         line.len() as u64
     } else {
+        match limit {
+            Some(LineLimit::Cut(_)) => {}
+            Some(LineLimit::Stop(_)) => {
+                return Err(IoError::new(
+                    ErrorKind::InvalidData,
+                    format!("job: output line exceeds the {keep}-byte limit"),
+                ));
+            }
+            None => return Err(too_large()),
+        }
         let (rest, last) = skip_rest_of_line(reader)?;
         // Stripped like the `\r` of a line that fits: by the last byte before the newline.
         let ends_in_cr = if rest == 0 {
@@ -390,9 +423,6 @@ pub(crate) fn next_line(
         read + rest - u64::from(ends_in_cr)
     };
     if line.len() as u64 > keep {
-        if max_bytes.is_none() {
-            return Err(too_large());
-        }
         line.truncate(keep as usize);
         // An error with no length is a char the cut split in half, so drop what is left of it.
         let split_char = line
@@ -484,7 +514,8 @@ fn read_line_page(
     let mut lines = Vec::new();
     let mut bytes = 0;
     while query.limit.is_none_or(|l| (lines.len() as u64) < l)
-        && let Some(Line { text: line, .. }) = next_line(&mut reader, query.max_line_bytes, false)?
+        && let Some(Line { text: line, .. }) =
+            next_line(&mut reader, query.max_line_bytes.map(LineLimit::Cut), false)?
     {
         // A line costs its `String` here and a string and a table slot in Lua,
         // so even a file of empty lines has to run into the limit.
@@ -709,7 +740,7 @@ fn joinpath(_lua: &Lua, parts: mlua::Variadic<String>) -> LuaResult<String> {
     for part in parts.iter() {
         buf.push(part);
     }
-    path_to_string(&buf)
+    Ok(path_text(buf)?)
 }
 
 /// Clean up `.` and `..` segments and make {path} absolute. Like `vim.fs.normalize`.
@@ -733,7 +764,7 @@ fn normalize(_lua: &Lua, path: String) -> LuaResult<String> {
         }
     }
     let result: PathBuf = components.iter().collect();
-    path_to_string(&result)
+    Ok(path_text(result)?)
 }
 
 /// Make {path} absolute by prepending the current working directory when needed.
@@ -745,7 +776,9 @@ fn normalize(_lua: &Lua, path: String) -> LuaResult<String> {
 /// maki.fs.abspath("src/main.rs") -- "/home/user/project/src/main.rs"
 #[lua_fn]
 fn abspath(_lua: &Lua, path: String) -> LuaResult<String> {
-    path_to_string(&make_absolute(&path).map_err(mlua::Error::runtime)?)
+    Ok(path_text(
+        make_absolute(&path).map_err(mlua::Error::runtime)?,
+    )?)
 }
 
 /// Return all ancestor directories of {path}, from the immediate parent up to the root.
@@ -814,7 +847,7 @@ async fn root(_lua: Lua, source: String, marker: Value) -> LuaResult<Option<Stri
         loop {
             for m in &markers {
                 if dir.join(m).exists() {
-                    return Ok(Some(path_to_string(&dir)?));
+                    return Ok(Some(path_text(dir)?));
                 }
             }
             if !dir.pop() {
@@ -851,7 +884,7 @@ fn relpath(_lua: &Lua, base: String, target: String) -> LuaResult<String> {
     for comp in &target_comps[common..] {
         result.push(comp);
     }
-    path_to_string(&result)
+    Ok(path_text(result)?)
 }
 
 /// Return the file extension of {path}, without the leading dot.
@@ -1659,7 +1692,7 @@ mod tests {
     use super::*;
     use crate::plugin_permissions::PluginPermissions;
     use futures::FutureExt;
-    use mlua::{AnyUserData, Function, Integer, Lua, ObjectLike};
+    use mlua::{AnyUserData, FromLuaMulti, Function, Integer, IntoLuaMulti, Lua, ObjectLike};
     use tempfile::TempDir;
     use test_case::test_case;
     use tokio::runtime::Builder;
@@ -1669,6 +1702,7 @@ mod tests {
     const REPLACEMENT_CONTENT: &str = "replacement";
     const FS_WRITE_PERMISSION: &str = "fs_write";
     const READ_LIMIT_ERROR: &str = "file exceeds the 67108864-byte read limit";
+    const STOP_LIMIT_ERROR: &str = "job: output line exceeds the 67108864-byte limit";
     const TEST_READ_LIMIT: u64 = 4;
     const TEST_PLUGIN: &str = "test";
     const MOVED_DIRECTORY: &str = "moved";
@@ -1732,16 +1766,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn next_line_caps_max_bytes_at_the_read_limit() {
+    #[test_case(LineLimit::Cut(u64::MAX) ; "cut")]
+    #[test_case(LineLimit::Stop(u64::MAX) ; "stop")]
+    fn next_line_caps_max_bytes_at_the_read_limit(limit: LineLimit) {
         let mut huge_line = BufReader::new(repeat(b'x').take(MAX_READ_BYTES + 1));
-        let line = next_line(&mut huge_line, Some(u64::MAX), false)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            line.text.len() as u64,
-            MAX_READ_BYTES + LINE_CUT_MARKER.len() as u64
-        );
+        let line = next_line(&mut huge_line, Some(limit), false);
+        match limit {
+            LineLimit::Cut(_) => assert_eq!(
+                line.unwrap().unwrap().text.len() as u64,
+                MAX_READ_BYTES + LINE_CUT_MARKER.len() as u64
+            ),
+            LineLimit::Stop(_) => assert_eq!(line.unwrap_err().to_string(), STOP_LIMIT_ERROR),
+        }
     }
 
     #[test_case("", &[]; "empty")]
@@ -1802,9 +1838,13 @@ mod tests {
     #[test_case("abcdefgh", 8; "cut_line_at_eof")]
     #[test_case("abc\r\n", 3; "whole_crlf_line")]
     fn next_line_reports_the_uncut_length(content: &str, expected: u64) {
-        let line = next_line(&mut small_reader(content.as_bytes()), Some(4), false)
-            .unwrap()
-            .unwrap();
+        let line = next_line(
+            &mut small_reader(content.as_bytes()),
+            Some(LineLimit::Cut(4)),
+            false,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(line.bytes, expected);
     }
 
@@ -1832,16 +1872,20 @@ mod tests {
             reads: 0,
         };
         let mut reader = BufReader::with_capacity(CHUNK, inner);
-        let cut = next_line(&mut reader, Some(2), false).unwrap().unwrap();
+        let cut = next_line(&mut reader, Some(LineLimit::Cut(2)), false)
+            .unwrap()
+            .unwrap();
         assert_eq!((cut.text.as_str(), cut.bytes), ("ab...", 8));
-        let next = next_line(&mut reader, Some(2), false).unwrap().unwrap();
+        let next = next_line(&mut reader, Some(LineLimit::Cut(2)), false)
+            .unwrap()
+            .unwrap();
         assert_eq!(next.bytes, 4);
     }
 
     #[test_case(b"a\xffb\n", "a\u{FFFD}b"; "whole_line")]
     #[test_case(b"\xffa\xc3\xa9b\n", "\u{FFFD}a..."; "cut_through_a_char")]
     fn next_line_lossy_replaces_non_utf8(content: &[u8], expected: &str) {
-        let line = next_line(&mut small_reader(content), Some(3), true)
+        let line = next_line(&mut small_reader(content), Some(LineLimit::Cut(3)), true)
             .unwrap()
             .unwrap();
         assert_eq!(line.text, expected);
@@ -2216,25 +2260,22 @@ mod tests {
         let target = dir.path().join("target");
         let link = dir.path().join("link");
         std::fs::write(&target, "content").unwrap();
-        std::os::unix::fs::symlink(&target, &link).unwrap();
+        symlink(&target, &link).unwrap();
         let lua = Lua::new();
-        let table =
-            create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
+        let table = fs_table(&lua);
         let metadata: Function = table.get("metadata").unwrap();
         let options = lua.create_table().unwrap();
         options.set("follow", follow).unwrap();
-        let (value, error): (Option<Table>, Option<String>) = crate::test_support::runtime()
-            .block_on(metadata.call_async((link.to_str().unwrap(), options.clone())))
-            .unwrap();
+        let (value, error): (Option<Table>, Option<String>) =
+            block_on_call(&metadata, (link.to_str().unwrap(), options.clone()));
         assert_eq!(error, None);
         let value = value.unwrap();
         assert_eq!(value.get::<bool>("is_file").unwrap(), follow);
         assert_eq!(value.get::<bool>("is_symlink").unwrap(), !follow);
         if !follow {
             std::fs::remove_file(target).unwrap();
-            let (value, error): (Option<Table>, Option<String>) = crate::test_support::runtime()
-                .block_on(metadata.call_async((link.to_str().unwrap(), options)))
-                .unwrap();
+            let (value, error): (Option<Table>, Option<String>) =
+                block_on_call(&metadata, (link.to_str().unwrap(), options));
             assert_eq!(error, None);
             assert!(value.unwrap().get::<bool>("is_symlink").unwrap());
         }
@@ -3338,6 +3379,12 @@ mod tests {
             .collect()
     }
 
+    fn block_on_call<R: FromLuaMulti>(function: &Function, args: impl IntoLuaMulti) -> R {
+        crate::test_support::runtime()
+            .block_on(function.call_async(args))
+            .unwrap()
+    }
+
     fn fs_table(lua: &Lua) -> Table {
         create_fs_table(lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap()
     }
@@ -3866,9 +3913,8 @@ mod tests {
 
         let lua = Lua::new();
         let rename: Function = fs_table(&lua).get("rename").unwrap();
-        let result: (Option<bool>, Option<String>) = crate::test_support::runtime()
-            .block_on(rename.call_async((from.to_str().unwrap(), to.to_str().unwrap())))
-            .unwrap();
+        let result: (Option<bool>, Option<String>) =
+            block_on_call(&rename, (from.to_str().unwrap(), to.to_str().unwrap()));
         assert_eq!(result, (Some(true), None));
         source_index.expire();
         destination_index.expire();
@@ -3908,9 +3954,8 @@ mod tests {
         let operation: Function = fs_table(&lua)
             .get(if remove { "rm" } else { "mkdtemp" })
             .unwrap();
-        let (value, error): (Value, Option<String>) = crate::test_support::runtime()
-            .block_on(operation.call_async(path.to_str().unwrap()))
-            .unwrap();
+        let (value, error): (Value, Option<String>) =
+            block_on_call(&operation, path.to_str().unwrap());
         assert_eq!(error, None);
         assert_ne!(value, Value::Nil);
         index.expire();
@@ -3943,16 +3988,14 @@ mod tests {
         let made = tmp.path().join(NEW_FILE);
         if lock {
             let acquire: Function = tbl.get("try_lock").unwrap();
-            let (held, err): (Option<AnyUserData>, Option<String>) = crate::test_support::runtime()
-                .block_on(acquire.call_async(made.to_str().unwrap()))
-                .unwrap();
+            let (held, err): (Option<AnyUserData>, Option<String>) =
+                block_on_call(&acquire, made.to_str().unwrap());
             assert!(held.is_some());
             assert_eq!(err, None);
         } else {
             let written: Function = tbl.get("write").unwrap();
-            let (ok, err): (Option<bool>, Option<String>) = crate::test_support::runtime()
-                .block_on(written.call_async((made.to_str().unwrap(), "")))
-                .unwrap();
+            let (ok, err): (Option<bool>, Option<String>) =
+                block_on_call(&written, (made.to_str().unwrap(), ""));
             assert_eq!((ok, err), (Some(true), None));
         }
 
@@ -3985,17 +4028,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn file_lock_is_private_and_refuses_symlinks() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("private.lock");
         let link = dir.path().join("link.lock");
         let lua = Lua::new();
-        let table =
-            create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
+        let table = fs_table(&lua);
         let lock: Function = table.get("try_lock").unwrap();
-        let (held, error): (Option<AnyUserData>, Option<String>) = crate::test_support::runtime()
-            .block_on(lock.call_async(path.to_str().unwrap()))
-            .unwrap();
+        let (held, error): (Option<AnyUserData>, Option<String>) =
+            block_on_call(&lock, path.to_str().unwrap());
         assert_eq!(error, None);
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & PERMISSION_BITS,
@@ -4003,9 +4043,8 @@ mod tests {
         );
         held.unwrap().call_method::<()>("close", ()).unwrap();
         symlink(&path, &link).unwrap();
-        let (held, error): (Option<AnyUserData>, Option<String>) = crate::test_support::runtime()
-            .block_on(lock.call_async(link.to_str().unwrap()))
-            .unwrap();
+        let (held, error): (Option<AnyUserData>, Option<String>) =
+            block_on_call(&lock, link.to_str().unwrap());
         assert!(held.is_none());
         assert!(error.is_some());
     }
@@ -4015,29 +4054,24 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("import.lock");
         let lua = Lua::new();
-        let table =
-            create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
+        let table = fs_table(&lua);
         let lock: Function = table.get("try_lock").unwrap();
-        let (first, error): (Option<AnyUserData>, Option<String>) = crate::test_support::runtime()
-            .block_on(lock.call_async(path.to_str().unwrap()))
-            .unwrap();
+        let (first, error): (Option<AnyUserData>, Option<String>) =
+            block_on_call(&lock, path.to_str().unwrap());
         assert_eq!(error, None);
-        let (second, error): (Option<AnyUserData>, Option<String>) = crate::test_support::runtime()
-            .block_on(lock.call_async(path.to_str().unwrap()))
-            .unwrap();
+        let (second, error): (Option<AnyUserData>, Option<String>) =
+            block_on_call(&lock, path.to_str().unwrap());
         assert!(second.is_none());
         assert_eq!(error, Some(table.get::<String>("lock_busy").unwrap()));
         let first = first.unwrap();
         first.call_method::<()>("close", ()).unwrap();
-        let (third, error): (Option<AnyUserData>, Option<String>) = crate::test_support::runtime()
-            .block_on(lock.call_async(path.to_str().unwrap()))
-            .unwrap();
+        let (third, error): (Option<AnyUserData>, Option<String>) =
+            block_on_call(&lock, path.to_str().unwrap());
         assert!(third.is_some());
         assert_eq!(error, None);
         let missing = dir.path().join("absent/import.lock");
-        let (lock, error): (Option<AnyUserData>, Option<String>) = crate::test_support::runtime()
-            .block_on(lock.call_async(missing.to_str().unwrap()))
-            .unwrap();
+        let (lock, error): (Option<AnyUserData>, Option<String>) =
+            block_on_call(&lock, missing.to_str().unwrap());
         assert!(lock.is_none());
         assert!(error.is_some_and(|error| error != LOCK_BUSY));
     }
@@ -4056,12 +4090,10 @@ mod tests {
         let link = root.path().join("alias");
         symlink(&target, &link).unwrap();
         let lua = Lua::new();
-        let table =
-            create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
+        let table = fs_table(&lua);
         let resolve: Function = table.get("realpath").unwrap();
-        let (path, error): (Option<String>, Option<String>) = crate::test_support::runtime()
-            .block_on(resolve.call_async(link.to_str().unwrap()))
-            .unwrap();
+        let (path, error): (Option<String>, Option<String>) =
+            block_on_call(&resolve, link.to_str().unwrap());
         if non_utf8 {
             assert_eq!(path, None);
             assert_eq!(error.as_deref(), Some(INVALID_UTF8_PATH));
@@ -4076,13 +4108,11 @@ mod tests {
     fn mkdtemp_creates_inside_the_template_directory(prefix: &str) {
         let root = TempDir::new().unwrap();
         let lua = Lua::new();
-        let table =
-            create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
+        let table = fs_table(&lua);
         let create: Function = table.get("mkdtemp").unwrap();
         let template = root.path().join(format!("{prefix}{TEMP_SUFFIX}"));
-        let (path, error): (Option<String>, Option<String>) = crate::test_support::runtime()
-            .block_on(create.call_async(template.to_str().unwrap()))
-            .unwrap();
+        let (path, error): (Option<String>, Option<String>) =
+            block_on_call(&create, template.to_str().unwrap());
         assert_eq!(error, None);
         let path = Path::new(path.as_ref().unwrap());
         assert_eq!(path.parent(), Some(root.path()));

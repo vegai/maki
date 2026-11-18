@@ -17,10 +17,10 @@ use test_case::test_case;
 
 use super::policy::{ANSWER, ANSWERS, FakeClaude, NO_SCENARIO, code_with, sandbox_filesystem};
 use super::support::{
-    ARTIFACT_GIT, ARTIFACT_MARKER, CLAUDE_CONFIG_ENV, DEADLINE, DEPENDENCY_DIR, DEPENDENCY_FILE,
-    DEPENDENCY_UNSETTLED, Gate, HOME_ENV, MANIFEST, TOOL, WorkingDir, artifact_listing,
-    commit_repo, contents, environment, executable, listing, load, old_folder, on_path, wait_until,
-    write,
+    ARTIFACT_GIT, ARTIFACT_MARKER, CLAUDE_CONFIG_ENV, DEADLINE, DEPENDENCY_CONTENT, DEPENDENCY_DIR,
+    DEPENDENCY_FILE, DEPENDENCY_UNSETTLED, Gate, HOME_ENV, MANIFEST, TOOL, WorkingDir,
+    artifact_listing, commit_repo, contents, environment, hold, listing, load, old_folder,
+    wait_until, write,
 };
 
 const HELD_REMOVAL: &str = "#!/bin/sh\ntouch \"@MARKER@\"\n@WAIT@\nexec \"@REAL@\" \"$@\"\n";
@@ -86,16 +86,6 @@ fn the_plugin_schema_uses_the_provider_defaults() {
             assert_eq!(option.min, Some(MIN_MAX_CONCURRENT as f64));
         }
     }
-}
-
-/// Puts `script`, wrapping the installed `name`, first on the `PATH`.
-fn hold(dir: &Path, name: &str, script: &str) {
-    executable(
-        dir,
-        name,
-        &script.replace("@REAL@", &on_path(name).to_string_lossy()),
-    );
-    environment::prepend_path(dir)
 }
 
 fn new_dir(dir: PathBuf) -> PathBuf {
@@ -427,7 +417,7 @@ fn code_with_cp(cp: &str, dependencies: &str) -> DisturbedCopy {
     write(&project.join("src/other.rs"), "other\n");
     symlink("lib.rs", project.join("src/link")).unwrap();
     commit_repo(&project, &[LIB]);
-    write(&project.join(DEPENDENCY_FILE), "module.exports = 1;\n");
+    write(&project.join(DEPENDENCY_FILE), DEPENDENCY_CONTENT);
     let tools = tempdir().unwrap();
     hold(
         tools.path(),

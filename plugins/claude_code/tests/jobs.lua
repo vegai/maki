@@ -13,6 +13,11 @@ local CLOSE_ERROR = "stdin close failed"
 local DIRECTORY = "/probe/hook-output"
 local SUCCESS_CODE = 0
 local STOPPED_CODE = 137
+local PRIVATE_DIR = "/tmp/maki_cc_XXXXXX"
+
+local function private_dir()
+  return assert(maki.fs.mkdtemp(PRIVATE_DIR))
+end
 
 local function with_jobs(run)
   local state = { started = {}, stopped = {}, notices = {}, cancel = {}, closes = 0 }
@@ -74,6 +79,13 @@ local function with_jobs(run)
     },
     {
       maki.async,
+      "spawn",
+      function(task)
+        task()
+      end,
+    },
+    {
+      maki.async,
       "await",
       function(_, start)
         local result
@@ -109,7 +121,8 @@ for _, answered in ipairs({ false, true }) do
   case("a_raising_exit_releases_the_slot_answered_" .. tostring(answered), function()
     with_jobs(function(state)
       local releases = 0
-      local call = jobs.new(function()
+      local call = jobs.new()
+      call:on_released(function()
         releases = releases + 1
       end)
       call:start(COMMAND, {}, function()
@@ -131,9 +144,30 @@ for _, answered in ipairs({ false, true }) do
   end)
 end
 
+case("a_raising_wait_frees_its_slot_and_raises_again", function()
+  with_jobs(function()
+    local releases = 0
+    local call = jobs.new()
+    call:on_released(function()
+      releases = releases + 1
+    end)
+    call:answer()
+    local alive_during
+    local ok, err = pcall(call.wait, call, function(message)
+      alive_during = call.alive
+      error(message, 0)
+    end, CALLBACK_ERROR)
+    eq(ok, false)
+    eq(err, CALLBACK_ERROR)
+    eq(alive_during, 1)
+    eq(call.alive, 0)
+    eq(releases, 1)
+  end)
+end)
+
 case("a_native_deadline_reports_a_timeout", function()
   with_jobs(function(state)
-    local call = jobs.new(function() end)
+    local call = jobs.new()
     state.finish = function()
       eq(state.started[1].opts.timeout_ms, TIMEOUT_MS)
       state.started[1].opts.on_exit(1, STOPPED_CODE, "exit", true)
@@ -147,7 +181,7 @@ end)
 
 case("a_completed_job_reports_its_output", function()
   with_jobs(function(state)
-    local call = jobs.new(function() end)
+    local call = jobs.new()
     state.finish = function()
       state.started[1].opts.on_stdout(1, OUTPUT)
       state.started[1].opts.on_exit(1, SUCCESS_CODE)
@@ -248,7 +282,7 @@ for _, failure in ipairs({ "send", "close" }) do
       if failure == "send" then
         state.send_error = SEND_ERROR
       end
-      local call = jobs.new(function() end)
+      local call = jobs.new()
       state.finish = function()
         eq(state.stopped[1], true)
         state.started[1].opts.on_exit(1, SUCCESS_CODE)
@@ -281,7 +315,7 @@ end
 
 case("an_answer_reports_pending_directories_once_and_later_cleanup_notifies", function()
   with_jobs(function(state)
-    local call = jobs.new(function() end)
+    local call = jobs.new()
     call:leave(DIRECTORY)
     eq(#state.notices, 0)
     call:answer()
@@ -298,7 +332,7 @@ end)
 
 case("a_cancel_reports_a_directory_left_before_the_reply", function()
   with_jobs(function(state)
-    local call = jobs.new(function() end)
+    local call = jobs.new()
     maki.async.on_cancel(function()
       call:answer()
     end)
@@ -314,17 +348,18 @@ for _, code in ipairs({ SUCCESS_CODE, STOPPED_CODE }) do
   case("artifact_cleanup_reports_its_exit_" .. code, function()
     with_jobs(function(state)
       local releases = 0
-      local call = jobs.new(function()
+      local call = jobs.new()
+      call:on_released(function()
         releases = releases + 1
       end)
       call:stop()
       local removed = 0
-      artifacts.discard(call, { dir = DIRECTORY, timeout_ms = TIMEOUT_MS }, function()
+      artifacts.remove(call, DIRECTORY, function()
         removed = removed + 1
       end)
       eq(call.alive, 1)
       eq(state.started[1].opts.guard, true)
-      eq(state.started[1].opts.timeout_ms, TIMEOUT_MS)
+      eq(state.started[1].opts.timeout_ms, artifacts.STEP_TIMEOUT_MS)
       eq(state.stopped[1], nil)
       call:answer()
       eq(releases, 0)
@@ -356,7 +391,7 @@ case("artifact_cleanup_reports_a_failed_start", function()
   with_jobs(function(state)
     state.start_error = START_ERROR
     local call = jobs.new()
-    artifacts.discard(call, { dir = DIRECTORY })
+    artifacts.remove(call, DIRECTORY)
     eq(call.alive, 0)
     eq(call.left_behind[1], DIRECTORY)
     call:answer()
@@ -366,16 +401,16 @@ case("artifact_cleanup_reports_a_failed_start", function()
 end)
 
 case("a_sweep_keeps_an_active_coding_artifact_until_its_call_settles", function()
-  local root = t.mktmpdir("cc_active_artifact")
+  local root = private_dir()
   with_jobs(function(state)
     local call = jobs.new()
-    assert(artifacts.allocate(call, root, {}, TIMEOUT_MS))
+    assert(artifacts.allocate(call, root, {}))
     local sweep = jobs.new()
-    artifacts.sweep(sweep, root, -1, TIMEOUT_MS)
+    artifacts.sweep(sweep, root, -1)
     eq(#state.started, 0)
     sweep:answer()
     call:answer()
-    artifacts.sweep(jobs.new(), root, -1, TIMEOUT_MS)
+    artifacts.sweep(jobs.new(), root, -1)
     eq(#state.started, 1)
     state.started[1].opts.on_exit(1, SUCCESS_CODE)
   end)
@@ -383,13 +418,13 @@ case("a_sweep_keeps_an_active_coding_artifact_until_its_call_settles", function(
 end)
 
 case("a_sweep_lock_error_is_reported", function()
-  local root = t.mktmpdir("cc_sweep_error")
+  local root = private_dir()
   local lock_path = maki.fs.joinpath(root, artifacts.SWEEP_LOCK)
   assert(maki.fs.mkdir(lock_path))
   with_jobs(function(state)
     local _, lock_err = maki.fs.try_lock(lock_path)
     assert(lock_err)
-    artifacts.sweep(jobs.new(), root, -1, TIMEOUT_MS)
+    artifacts.sweep(jobs.new(), root, -1)
     eq(#state.started, 0)
     eq(#state.notices, 1)
     eq(state.notices[1].level, "warn")
@@ -399,10 +434,10 @@ case("a_sweep_lock_error_is_reported", function()
 end)
 
 case("a_missing_artifact_root_needs_no_cleanup", function()
-  local parent = t.mktmpdir("cc_sweep_missing")
+  local parent = private_dir()
   local root = maki.fs.joinpath(parent, "missing")
   with_jobs(function(state)
-    artifacts.sweep(jobs.new(), root, -1, TIMEOUT_MS)
+    artifacts.sweep(jobs.new(), root, -1)
     eq(#state.started, 0)
     eq(#state.notices, 0)
     eq(maki.fs.metadata(root), nil)
@@ -412,24 +447,24 @@ end)
 
 for _, trashed in ipairs({ false, true }) do
   case("one_sweep_owns_a_tree_until_deletion_finishes_" .. tostring(trashed), function()
-    local root = t.mktmpdir("cc_sweep")
+    local root = private_dir()
     local trash = artifacts.layout(maki.fs.joinpath(root, artifacts.TRASH_PREFIX .. "old"))
     local artifact = artifacts.layout(trashed and trash.dir or maki.fs.joinpath(root, "old"))
     assert(maki.fs.mkdir(artifact.dir))
     assert(maki.fs.write(artifact.marker, ""))
     with_jobs(function(state)
       local first, second = jobs.new(), jobs.new()
-      artifacts.sweep(first, root, -1, TIMEOUT_MS)
+      artifacts.sweep(first, root, -1)
       eq(#state.started, 1)
       assert(table.find(state.started[1].argv, trash.dir))
       -- The deletion command unlinks the artifact lock before exiting.
       assert(maki.fs.rm(trash.lock))
-      artifacts.sweep(second, root, -1, TIMEOUT_MS)
+      artifacts.sweep(second, root, -1)
       eq(#state.started, 1)
       eq(#second.left_behind, 0)
       eq(#state.notices, 0)
       state.started[1].opts.on_exit(1, SUCCESS_CODE)
-      artifacts.sweep(second, root, -1, TIMEOUT_MS)
+      artifacts.sweep(second, root, -1)
       eq(#state.started, 2)
       state.started[2].opts.on_exit(2, SUCCESS_CODE)
     end)

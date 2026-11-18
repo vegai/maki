@@ -139,6 +139,8 @@ fn is_external_name(name: &str) -> bool {
 }
 
 impl ToolKind {
+    /// The shape-only twin of `resolve`'s precedence (local > registry > MCP):
+    /// a change to one must touch the other.
     pub fn of(name: &str, registered: Option<ToolAudience>, local: Option<&LocalTools>) -> Self {
         if let Some(tool) = local.and_then(|tools| tools.get(name)) {
             Self::Local(tool.audience)
@@ -870,11 +872,20 @@ pub mod test_support {
 
     #[cfg(test)]
     pub(crate) fn assembled_main(definitions: Value, model: &Model) -> RequestTools {
+        assembled_with(&AgentConfig::default(), definitions, model)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assembled_with(
+        config: &AgentConfig,
+        definitions: Value,
+        model: &Model,
+    ) -> RequestTools {
         RequestTools::assembled(
             ToolRegistry::global(),
             definitions,
             &LocalTools::default(),
-            &AgentConfig::default(),
+            config,
             model,
             ToolAudience::MAIN,
         )
@@ -929,7 +940,7 @@ pub mod test_support {
         )
     }
 
-    /// [`stub_ctx_with`] for a session whose working directory is {dir}.
+    /// [`stub_ctx_with`] for a session whose working directory is `dir`.
     pub fn stub_ctx_in(
         dir: &Path,
         event_tx: Option<&EventSender>,
@@ -977,7 +988,6 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::registry::ToolSource;
     use std::fs::{self, File};
 
     use tempfile::TempDir;
@@ -1157,13 +1167,10 @@ mod tests {
             disabled_tools: vec![WRITE_TOOL_NAME.to_owned()],
             ..Default::default()
         };
-        let tools = RequestTools::assembled(
-            ToolRegistry::global(),
-            json!([{ TOOL_NAME_FIELD: WRITE_TOOL_NAME }]),
-            &LocalTools::default(),
+        let tools = test_support::assembled_with(
             &config,
+            json!([{ TOOL_NAME_FIELD: WRITE_TOOL_NAME }]),
             &model,
-            ToolAudience::MAIN,
         );
         assert!(!admits_registry(tools.filter(), WRITE_TOOL_NAME));
         assert!(tools.definitions().as_array().unwrap().is_empty());

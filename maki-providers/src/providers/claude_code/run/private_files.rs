@@ -24,7 +24,7 @@ const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
 pub(in crate::providers::claude_code) struct PrivateDir(Option<TempDir>);
 
 impl PrivateDir {
-    pub(crate) async fn close_empty(mut self) -> Option<PathBuf> {
+    pub(in crate::providers::claude_code) async fn close_empty(mut self) -> Option<PathBuf> {
         let dir = self.0.take()?;
         tokio::task::spawn_blocking(move || {
             let path = dir.keep();
@@ -72,7 +72,7 @@ pub(super) fn private_file(path: &Path, content: &str) -> io::Result<()> {
 /// Private to the user from the moment it exists. Returns the resolved path,
 /// because a link on the way to `base` could make a directory inside
 /// `project` look like it is outside.
-pub(in crate::providers::claude_code) fn private_dir(
+pub(super) fn private_dir(
     base: &Path,
     project: &Path,
     denied: &[PathBuf],
@@ -101,7 +101,7 @@ pub(in crate::providers::claude_code) fn private_dir(
     Ok((PrivateDir(Some(dir)), path))
 }
 
-pub(in crate::providers::claude_code) async fn private_dir_async(
+pub(super) async fn private_dir_async(
     base: &Path,
     project: &Path,
     denied: &[PathBuf],

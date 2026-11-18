@@ -8,8 +8,9 @@ use std::env;
 use std::sync::Arc;
 
 use color_eyre::Result;
-use color_eyre::eyre::Context;
+use color_eyre::eyre::{Context, eyre};
 
+use maki_agent::mcp::{TOOL_SEARCH_TOOL_NAME, is_qualified_name, is_wire_name};
 use maki_agent::tools::ToolRegistry;
 use maki_config::project::{self, TrustMode};
 use maki_config::{Config, load_env_files, load_permissions};
@@ -21,6 +22,8 @@ use crate::cli::{AuthAction, Cli, Command, McpAction, MigrateAction, SessionActi
 use crate::project_trust;
 use crate::setup;
 use crate::update;
+
+const NO_ALLOWED_TOOLS: &str = "--allowed-tools matches no loaded tools or qualified MCP names";
 
 fn sanitize_warnings(warnings: &[String]) -> Vec<String> {
     warnings
@@ -34,6 +37,37 @@ fn report_warnings(warnings: Vec<String>) {
     for warning in sanitize_warnings(&warnings) {
         eprintln!("warning: {warning}");
     }
+}
+
+fn tool_filter_warnings(cli: &Cli, registry: &ToolRegistry, startup: bool) -> Result<Vec<String>> {
+    let known =
+        |name: &str| registry.get(name).is_some() || is_wire_name(name) || is_qualified_name(name);
+    if startup && !cli.allowed_tools.is_empty() && !cli.allowed_tools.iter().any(|name| known(name))
+    {
+        return Err(eyre!(
+            "{NO_ALLOWED_TOOLS}: {}",
+            cli.allowed_tools.join(", ")
+        ));
+    }
+    let mut warnings = Vec::new();
+    for (flag, names) in [
+        ("--allowed-tools", &cli.allowed_tools),
+        ("--disallowed-tools", &cli.disallowed_tools),
+    ] {
+        for name in names
+            .iter()
+            .filter(|name| *name != TOOL_SEARCH_TOOL_NAME && !known(name))
+        {
+            let mut warning = format!("no loaded tool matches '{name}' in {flag}.");
+            let suggestion = name.replace('-', "_");
+            if suggestion != *name && registry.get(&suggestion).is_some() {
+                warning.push_str(&format!(" Did you mean '{suggestion}'?"));
+            }
+            warning.push_str(" The entry remains active for tools that load later.");
+            warnings.push(warning);
+        }
+    }
+    Ok(warnings)
 }
 
 /// What a builtin that fails to load means for the run in progress.
@@ -333,6 +367,8 @@ mod tests {
     use std::env;
     use std::sync::Arc;
 
+    use clap::Parser;
+    use maki_agent::mcp::TOOL_SEARCH_TOOL_NAME;
     use maki_agent::tools::ToolRegistry;
     use maki_config::RawConfig;
     use maki_lua::{Interaction, PluginHost};
@@ -342,12 +378,58 @@ mod tests {
     use test_case::test_case;
     use tokio::sync::Mutex;
 
-    use super::{BuiltinFailure, load_plugins};
+    use super::{BuiltinFailure, NO_ALLOWED_TOOLS, load_plugins, tool_filter_warnings};
+    use crate::cli::Cli;
 
     /// A builtin whose `max_file_size_mb` has a minimum.
     const OTHER_PLUGIN: &str = "index";
     const MODEL: &str = "claude-code/claude-haiku-4-5";
     const EXECUTABLE: &str = "executable";
+
+    #[test_case("srv.probe", true ; "qualified_mcp_tool")]
+    #[test_case("srv__probe", true ; "wire_mcp_tool")]
+    #[test_case("mcp__srv__probe", true ; "claude_mcp_tool")]
+    #[test_case(TOOL_SEARCH_TOOL_NAME, true ; "tool_search")]
+    #[test_case("unloaded_tool", false ; "unknown_registry_tool")]
+    fn tool_filter_warnings_accept_mcp_names(name: &str, accepted: bool) {
+        let cli = Cli::parse_from(["maki", "--disallowed-tools", name]);
+        assert_eq!(
+            tool_filter_warnings(&cli, &ToolRegistry::new(), true)
+                .unwrap()
+                .is_empty(),
+            accepted
+        );
+    }
+
+    #[test_case("raed", false ; "typo")]
+    #[test_case("unloaded_tool", false ; "unknown_plugin_name")]
+    #[test_case("srv.probe", true ; "qualified_mcp")]
+    #[test_case("srv__probe", true ; "wire_mcp")]
+    #[test_case("mcp__srv__probe", true ; "claude_mcp")]
+    #[test_case(TOOL_SEARCH_TOOL_NAME, false ; "tool_search_alone")]
+    #[test_case("tool_search,unloaded_tool", false ; "tool_search_with_unknown_tool")]
+    #[test_case("tool_search,srv.probe", true ; "tool_search_with_mcp_tool")]
+    fn empty_allow_lists_fail_unless_an_mcp_tool_can_load_later(name: &str, accepted: bool) {
+        let cli = Cli::parse_from(["maki", "--allowed-tools", name]);
+        let result = tool_filter_warnings(&cli, &ToolRegistry::new(), true);
+        assert_eq!(result.is_ok(), accepted);
+        if !accepted {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                format!("{NO_ALLOWED_TOOLS}: {}", cli.allowed_tools.join(", "))
+            );
+        }
+    }
+
+    /// The startup case is the `unknown_plugin_name` row above.
+    #[test]
+    fn missing_allowed_plugin_tools_only_warn_on_reload() {
+        const MISSING_TOOL: &str = "unloaded_plugin_tool";
+        let cli = Cli::parse_from(["maki", "--allowed-tools", MISSING_TOOL]);
+        let warnings = tool_filter_warnings(&cli, &ToolRegistry::new(), false).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains(MISSING_TOOL));
+    }
 
     /// Plugin loads publish one registry generation, so the cases take turns under cargo test.
     static PROVIDER_LOADS: Mutex<()> = Mutex::const_new(());

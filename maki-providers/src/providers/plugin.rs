@@ -1,5 +1,3 @@
-#[cfg(target_os = "linux")]
-use super::claude_code::Factory as ClaudeCodeFactory;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
@@ -486,23 +484,8 @@ struct PluginEntry {
     auth: Arc<AuthState>,
 }
 
-#[derive(Default)]
-struct Registry {
-    #[cfg(target_os = "linux")]
-    native: Option<Arc<ClaudeCodeFactory>>,
-    /// Ordered by slug, so every listing comes out the same each run.
-    entries: BTreeMap<Box<str>, Arc<PluginEntry>>,
-}
-
-impl Registry {
-    const fn new() -> Self {
-        Self {
-            #[cfg(target_os = "linux")]
-            native: None,
-            entries: BTreeMap::new(),
-        }
-    }
-}
+/// Ordered by slug, so every listing comes out the same each run.
+type Registry = BTreeMap<Box<str>, Arc<PluginEntry>>;
 
 type AuthCell = (Option<Arc<str>>, Arc<AuthState>);
 
@@ -560,19 +543,6 @@ pub fn keep_legacy_selections() -> Vec<String> {
     warnings
 }
 
-#[cfg(target_os = "linux")]
-pub(crate) fn register_native(factory: Arc<ClaudeCodeFactory>) {
-    let mut staging = STAGING.lock().unwrap();
-    if let Some(staged) = staging.as_mut() {
-        staged.native = Some(factory);
-    }
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn native_factory() -> Option<Arc<ClaudeCodeFactory>> {
-    entries().native.clone()
-}
-
 /// Publishes what this load registered. A load that registered nothing
 /// publishes nothing, which is how a `/reload` drops a plugin that was removed.
 ///
@@ -583,7 +553,7 @@ pub fn commit_load() {
     let Some(staged) = STAGING.lock().unwrap().take() else {
         return;
     };
-    for entry in staged.entries.values() {
+    for entry in staged.values() {
         let slug = &entry.decl.slug;
         let api_key_env = entry.decl.api_key_env.clone().filter(|var| !var.is_empty());
         if let Err(error) = entry.auth.redeclare(
@@ -595,11 +565,7 @@ pub fn commit_load() {
             warn!(slug, %error, "provider credentials were not re-declared");
         }
     }
-    let logins = staged
-        .entries
-        .values()
-        .filter_map(|e| e.built.login)
-        .collect();
+    let logins = staged.values().filter_map(|e| e.built.login).collect();
     maki_config::providers::set_registered_providers(logins);
     PROVIDERS.store(Arc::new(staged));
 }
@@ -613,13 +579,12 @@ pub fn discard(plugin: &str) {
         return;
     };
     let dropped: Vec<Box<str>> = staged
-        .entries
         .iter()
         .filter(|(_, entry)| entry.owner.as_deref() == Some(plugin))
         .map(|(slug, _)| slug.clone())
         .collect();
     for slug in &dropped {
-        staged.entries.remove(slug);
+        staged.remove(slug);
     }
     if !dropped.is_empty() {
         debug!(plugin, slugs = ?dropped, "discarded the declarations of a failed plugin load");
@@ -727,7 +692,7 @@ fn register_owned(
     let Some(staged) = staging.as_mut() else {
         return Err(RegisterError::Closed(slug));
     };
-    let Entry::Vacant(vacant) = staged.entries.entry(slug.as_str().into()) else {
+    let Entry::Vacant(vacant) = staged.entry(slug.as_str().into()) else {
         return Err(RegisterError::DuplicateSlug(slug));
     };
     debug!(
@@ -820,7 +785,7 @@ fn entries() -> Arc<Registry> {
 }
 
 fn entry(slug: &str) -> Option<Arc<PluginEntry>> {
-    entries().entries.get(slug).cloned()
+    entries().get(slug).cloned()
 }
 
 fn unknown(slug: &str) -> AgentError {
@@ -1641,17 +1606,12 @@ pub fn build_with_auth(
 }
 
 pub fn specs() -> Vec<&'static ProviderSpec> {
-    entries()
-        .entries
-        .values()
-        .map(|entry| entry.built.spec)
-        .collect()
+    entries().values().map(|entry| entry.built.spec).collect()
 }
 
 /// The providers whose `maki auth login` runs a `login` hook.
 pub fn auth_providers() -> Vec<(String, String)> {
     entries()
-        .entries
         .values()
         .filter(|entry| entry.hooks.login.is_some())
         .map(|entry| (entry.decl.slug.clone(), entry.decl.display_name.clone()))
@@ -1659,7 +1619,7 @@ pub fn auth_providers() -> Vec<(String, String)> {
 }
 
 pub fn is_registered(slug: &str) -> bool {
-    entries().entries.contains_key(slug)
+    entries().contains_key(slug)
 }
 
 /// Records the slugs granted to an enabled package, so they stay owned even
@@ -1684,7 +1644,7 @@ pub fn release_granted(package: &str) {
 /// package whose load failed. The catalog client must not serve a slug a
 /// package owns, because it would receive the key saved for that name.
 pub fn owns_slug(slug: &str) -> bool {
-    if entries().entries.contains_key(slug) {
+    if entries().contains_key(slug) {
         return true;
     }
     GRANTED
@@ -1723,7 +1683,6 @@ pub async fn logout(slug: &str) -> Result<bool, AgentError> {
 mod tests {
     use crate::test_support::detached_scope;
     use std::borrow::Cow;
-    use std::path::Path;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use tokio::sync::Notify;
@@ -2154,7 +2113,7 @@ mod tests {
             .unwrap();
             commit_load();
             let provider = create(SLUG, Timeouts::default()).unwrap();
-            (provider.list_models(ModelListing::Cached)).await.unwrap();
+            provider.list_models(ModelListing::Cached).await.unwrap();
         }
         assert_eq!(first.calls(), 1);
         assert_eq!(next.calls(), 1);
@@ -2647,7 +2606,7 @@ mod tests {
                 RequestOptions::default(),
                 RequestScope {
                     session_id: Some(&session),
-                    cwd: Path::new("."),
+                    ..detached_scope()
                 },
             )
             .await;

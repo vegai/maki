@@ -206,11 +206,11 @@ impl Chat {
     pub fn handle_event(&mut self, event: AgentEvent, plan_path: Option<&Path>) -> ChatEventResult {
         match event {
             AgentEvent::ThinkingDelta { text } => {
-                self.messages_panel.clear_prompt_progress();
+                self.messages_panel.clear_status();
                 self.messages_panel.thinking_delta(&text);
             }
             AgentEvent::TextDelta { text } => {
-                self.messages_panel.clear_prompt_progress();
+                self.messages_panel.clear_status();
                 self.messages_panel.text_delta(&text);
             }
             AgentEvent::ToolPending { id, name } => self.messages_panel.tool_pending(id, &name),

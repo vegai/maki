@@ -2937,6 +2937,9 @@ struct InflightGate {
     gc: GcPacer,
     /// One permit per coroutine, handed out in the order asked for.
     slots: Arc<Semaphore>,
+    /// The same budget for `maki.defer_fn` bodies, apart from the tool slots
+    /// so tool calls filling every slot cannot hold up a cancellation timer.
+    timer_slots: Arc<Semaphore>,
     /// What [`Self::drain`] waits on: a token per piece of held work, from the
     /// moment it queues for a slot until it gives the slot back. Unlike the
     /// slots, it leaves out work under a `maki.async.spawn` task. Closed from
@@ -2952,6 +2955,7 @@ impl InflightGate {
         Self {
             gc: GcPacer::new(lua, LUA_MEMORY_LIMIT),
             slots: Arc::new(Semaphore::new(MAX_INFLIGHT_TOOLS)),
+            timer_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_TOOLS)),
             held,
         }
     }
@@ -2984,7 +2988,20 @@ impl InflightGate {
     /// The hold is taken before waiting for a slot. Otherwise held work stuck
     /// behind a cap full of detached slots would let the barrier through.
     async fn admit(self: &Rc<Self>, hold: Option<DrainHold>) -> GateGuard {
-        let slot = Arc::clone(&self.slots)
+        self.admit_from(&self.slots, hold).await
+    }
+
+    async fn acquire_timer(self: &Rc<Self>) -> GateGuard {
+        self.admit_from(&self.timer_slots, Some(DrainHold::new(self)))
+            .await
+    }
+
+    async fn admit_from(
+        self: &Rc<Self>,
+        slots: &Arc<Semaphore>,
+        hold: Option<DrainHold>,
+    ) -> GateGuard {
+        let slot = Arc::clone(slots)
             .acquire_owned()
             .await
             .expect(GATE_SLOTS_OPEN);
@@ -3439,20 +3456,16 @@ async fn run_work_fn(
 /// the callback still gets its `on_stdout` and `on_exit`.
 ///
 /// The gate guard comes after the sleep: pending timers should pile up
-/// cheaply, but the bodies compete for `timer_gate`'s `MAX_INFLIGHT_TOOLS`
-/// budget so `for i=1,10000 do maki.defer_fn(f, 0) end` can't run 10k
-/// coroutines at once. That budget is not the tool slots', so tool calls
-/// filling every slot cannot hold up a cancellation timer. Errors are logged
-/// and dropped, nobody is awaiting a result.
+/// cheaply, but the bodies compete for the gate's timer slots so
+/// `for i=1,10000 do maki.defer_fn(f, 0) end` can't run 10k coroutines at
+/// once. Errors are logged and dropped, nobody is awaiting a result.
 fn spawn_deferred_callback(
     lua: &Lua,
     gate: &Rc<InflightGate>,
-    timer_gate: &Arc<Semaphore>,
     cb: DeferredCallback,
 ) -> LocalJoinHandle<()> {
     let lua = lua.clone();
     let gate = Rc::clone(gate);
-    let timer_gate = Arc::clone(timer_gate);
     spawn_local(async move {
         // Biased, so a stop that lands as the gate opens still wins. Once the
         // hold is taken the drain barrier waits for it, and a `clear_plugin`
@@ -3462,9 +3475,7 @@ fn spawn_deferred_callback(
             () = cb.cancel.cancelled() => None,
             guard = async {
                 sleep(cb.delay).await;
-                let hold = DrainHold::new(&gate);
-                let slot = timer_gate.acquire_owned().await.expect(GATE_SLOTS_OPEN);
-                GateGuard::new(&gate, Some(slot), Some(hold))
+                gate.acquire_timer().await
             } => Some(guard),
         };
         let Some(_guard) = fired else {
@@ -5905,7 +5916,6 @@ pub fn spawn(
                 });
             }
             let gate = Rc::new(InflightGate::new(rt.lua.clone()));
-            let timer_gate = Arc::new(Semaphore::new(MAX_INFLIGHT_TOOLS));
             let restores = Rc::new(RestoreTracker::default());
             let (hook_tx, mut hook_rx) = unbounded_channel::<HostHook>();
             {
@@ -5941,7 +5951,7 @@ pub fn spawn(
                         spawn_async_task(&rt.lua, &gate, task);
                     }
                     while let Ok(cb) = defer_rx.try_recv() {
-                        spawn_deferred_callback(&rt.lua, &gate, &timer_gate, cb);
+                        spawn_deferred_callback(&rt.lua, &gate, cb);
                     }
                     // Nothing to serve, so spend the lull on native codegen.
                     // One chunk per pass with a yield in between, so no request
@@ -5969,7 +5979,7 @@ pub fn spawn(
                             Some(None)
                         }
                         Some(cb) = defer_rx.recv() => {
-                            spawn_deferred_callback(&rt.lua, &gate, &timer_gate, cb);
+                            spawn_deferred_callback(&rt.lua, &gate, cb);
                             Some(None)
                         }
                         msg = rx.recv() => msg.map(Some),
@@ -6232,8 +6242,7 @@ pub fn spawn(
                             let _ = reply.send(collect_plugin_options(&rt.lua));
                         }
                         Request::CollectLoadedPlugins { reply } => {
-                            let mut names: Vec<String> = rt.plugins.borrow().keys().map(ToString::to_string).collect();
-                            names.sort_unstable();
+                            let names = rt.plugins.borrow().keys().map(ToString::to_string).collect();
                             let _ = reply.send(names);
                         }
                         Request::CollectPackages { reply } => {
@@ -6393,16 +6402,21 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::{MOVED_CALL_ID, call_scope, moved_home};
     use super::*;
+    #[cfg(unix)]
     use crate::api::r#fn::create_fn_table;
     use crate::api::tool::ToolCallReply;
     use crate::api::util::dispatch::{DepthGuard, MAX_HOOK_DEPTH, Reentry};
-    use crate::jobs::{JobSpec, MAX_STDIN_BYTES};
+    use crate::jobs::JobSpec;
+    #[cfg(unix)]
+    use crate::jobs::MAX_STDIN_BYTES;
     use crate::loader::HOST_RUNTIME;
     use futures::FutureExt;
     use maki_agent::cancel::CancelTrigger;
+    #[cfg(unix)]
     use std::fs::File;
     use std::future::poll_fn;
     use std::iter;
+    #[cfg(unix)]
     use std::process::Command;
     use std::task::{Context, Poll, Wake, Waker};
     use test_case::test_case;
@@ -6523,18 +6537,24 @@ mod tests {
         PendingLoad,
         Waiting,
         /// A named `jobstart` parked in its spawn, holding the start gate.
+        #[cfg(unix)]
         StartGate,
         /// A `chansend` parked on a full queue, holding the write lock.
+        #[cfg(unix)]
         StdinWriter,
     }
 
     const TEST_MODULE: &str = "slow";
     const OUTER_MODULE: &str = "outer";
     const SUSPENDED: &str = "suspended";
+    #[cfg(unix)]
     const EXITING_JOB: &str = "exit 0";
+    #[cfg(unix)]
     const MKFIFO: &str = "mkfifo";
+    #[cfg(unix)]
     const SPAWN_FIFO: &str = "spawn.fifo";
     /// Twice the stdin queue, so the write parks whatever the pipe takes in.
+    #[cfg(unix)]
     const OVERFULL_STDIN: usize = 2 * MAX_STDIN_BYTES;
 
     /// Frees `value` the way the collector frees a coroutine parked on it:
@@ -6554,6 +6574,7 @@ mod tests {
     /// Parks {call} on `f`, the plugin's `maki.fn`, in a coroutine the plugin
     /// made, runs {parked}, then lets the collector free the coroutine, the
     /// only thing that ever does.
+    #[cfg(unix)]
     fn collect_parked_call(lua: &Lua, call: &str, parked: impl FnOnce()) {
         let functions = create_fn_table(
             lua,
@@ -6580,8 +6601,8 @@ mod tests {
     #[test_case(LuaOwned::TaskScope ; "task_scope")]
     #[test_case(LuaOwned::PendingLoad ; "pending_load")]
     #[test_case(LuaOwned::Waiting ; "waiting")]
-    #[test_case(LuaOwned::StartGate ; "start_gate")]
-    #[test_case(LuaOwned::StdinWriter ; "stdin_writer")]
+    #[cfg_attr(unix, test_case(LuaOwned::StartGate ; "start_gate"))]
+    #[cfg_attr(unix, test_case(LuaOwned::StdinWriter ; "stdin_writer"))]
     fn dropped_by_collector_releases_its_hold(owned: LuaOwned) {
         let lua = Lua::new();
         match owned {
@@ -6661,6 +6682,7 @@ mod tests {
                     "the wait must be taken back"
                 );
             }
+            #[cfg(unix)]
             LuaOwned::StartGate => {
                 let dir = tempfile::tempdir().unwrap();
                 let fifo = dir.path().join(SPAWN_FIFO);
@@ -6683,6 +6705,7 @@ mod tests {
                 assert!(gate.try_lock().is_ok(), "the start must leave the gate");
                 drop(File::open(&fifo).unwrap());
             }
+            #[cfg(unix)]
             LuaOwned::StdinWriter => {
                 let owner = JobOwner::Plugin(Arc::from(TEST_PLUGIN));
                 let id = with_jobs(&lua, |store| {
@@ -6810,7 +6833,6 @@ mod tests {
                 let timer = spawn_deferred_callback(
                     &lua,
                     &Rc::new(gate()),
-                    &Arc::new(Semaphore::new(MAX_INFLIGHT_TOOLS)),
                     DeferredCallback {
                         func: lua.create_registry_value(true).unwrap(),
                         delay: Duration::from_secs(3600),

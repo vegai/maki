@@ -529,7 +529,7 @@ impl MessagesPanel {
     }
 
     pub fn stream_reset(&mut self) {
-        self.provider_wait = None;
+        self.clear_status();
         self.streaming_thinking.clear();
         self.streaming_text.clear();
         self.live_thinking_expanded = false;
@@ -688,7 +688,7 @@ impl MessagesPanel {
         self.prompt_progress = progress;
     }
 
-    pub fn clear_prompt_progress(&mut self) {
+    pub fn clear_status(&mut self) {
         self.prompt_progress = None;
         self.provider_wait = None;
     }
@@ -702,9 +702,8 @@ impl MessagesPanel {
     }
 
     pub fn flush(&mut self) {
-        self.provider_wait = None;
+        self.clear_status();
         self.flush_thinking();
-        self.prompt_progress = None;
         if !self.streaming_text.is_empty() {
             self.messages.push(DisplayMessage::new(
                 DisplayRole::Assistant,

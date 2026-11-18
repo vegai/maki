@@ -5,7 +5,9 @@
 //! is JSONL with the same shape, `Text` prints the raw response only.
 //!
 //! Keep Claude Code fields compatible with its wire format. Maki adds `thinking` to init
-//! metadata so scripted callers can inspect the effective, model-clamped setting.
+//! metadata so scripted callers can inspect the effective, model-clamped setting,
+//! and the `system` subtypes `notice` and `notification` (`provider_waiting`),
+//! which Claude Code does not define.
 
 use std::io::{self, Read};
 use std::mem;
@@ -242,12 +244,14 @@ pub fn read_prompt(prompt: Option<String>, dry_run: bool) -> Result<String> {
     match prompt {
         Some(p) => Ok(p),
         None if dry_run => Ok(String::new()),
-        None => {
-            let mut buf = String::new();
-            io::stdin().read_to_string(&mut buf).context("read stdin")?;
-            Ok(buf)
-        }
+        None => read_stdin(),
     }
+}
+
+pub fn read_stdin() -> Result<String> {
+    let mut buf = String::new();
+    io::stdin().read_to_string(&mut buf).context("read stdin")?;
+    Ok(buf)
 }
 
 pub async fn run(params: PrintParams, interrupt: &Interrupt) -> Result<()> {

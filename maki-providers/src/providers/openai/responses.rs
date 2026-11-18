@@ -548,7 +548,7 @@ mod tests {
     use test_case::test_case;
     use tokio::sync::mpsc::unbounded_channel;
 
-    use crate::test_support::{Canned, runtime, serve, sse_body, sse_event};
+    use crate::test_support::{Canned, serve, sse_body, sse_event};
 
     const OVERLOAD_MESSAGE: &str = "Our servers are currently overloaded. Please try again later.";
     const BAD_REQUEST_MESSAGE: &str = "Invalid value for 'model'";
@@ -565,7 +565,8 @@ mod tests {
 
     #[test_case(false ; "without_trailing_slash")]
     #[test_case(true ; "with_trailing_slash")]
-    fn responses_normalizes_the_base_url(trailing_slash: bool) {
+    #[tokio::test]
+    async fn responses_normalizes_the_base_url(trailing_slash: bool) {
         let (mut base, requests) = serve(RESPONSE);
         if trailing_slash {
             base.push('/');
@@ -573,17 +574,17 @@ mod tests {
         let auth = ResolvedAuth::for_test(Some(base), Vec::new());
         let model = crate::Model::from_spec("openai/gpt-6").unwrap();
         let (events, _) = unbounded_channel();
-        runtime()
-            .block_on(do_stream(
-                &Client::new(),
-                &model,
-                &HeaderMap::new(),
-                &json!({}),
-                &events,
-                &auth,
-                TEST_STREAM_TIMEOUT,
-            ))
-            .unwrap();
+        do_stream(
+            &Client::new(),
+            &model,
+            &HeaderMap::new(),
+            &json!({}),
+            &events,
+            &auth,
+            TEST_STREAM_TIMEOUT,
+        )
+        .await
+        .unwrap();
         assert_eq!(requests.lock().unwrap()[0].path, RESPONSE_PATH);
     }
 

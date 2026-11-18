@@ -93,11 +93,15 @@ function M.snapshot_git_env(env, git_dir, snapshot)
   return git_env
 end
 
+local function exclude_glob(specs, pattern)
+  specs[#specs + 1] = ":(exclude,icase,glob)" .. pattern
+  specs[#specs + 1] = ":(exclude,icase,glob)" .. pattern .. "/**"
+end
+
 function M.collection_pathspecs(dependencies)
   local specs = {}
   for _, pattern in ipairs(ALSO_EXCLUDED) do
-    specs[#specs + 1] = ":(exclude,icase,glob)" .. pattern
-    specs[#specs + 1] = ":(exclude,icase,glob)" .. pattern .. "/**"
+    exclude_glob(specs, pattern)
   end
   for _, dir in ipairs(dependencies) do
     specs[#specs + 1] = ":(exclude,literal)" .. dir
@@ -108,8 +112,7 @@ end
 function M.excluded_pathspecs(deny_read)
   local specs = M.collection_pathspecs({})
   for _, pattern in ipairs(deny_read) do
-    specs[#specs + 1] = ":(exclude,icase,glob)" .. pattern
-    specs[#specs + 1] = ":(exclude,icase,glob)" .. pattern .. "/**"
+    exclude_glob(specs, pattern)
   end
   return specs
 end

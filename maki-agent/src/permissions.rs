@@ -484,8 +484,8 @@ impl PermissionManager {
         })
     }
 
-    /// The session's working directory, which an ACP client picks per
-    /// session.
+    /// The working directory every fork of this manager follows; the TUI
+    /// `/cd` moves it. File-write auto-allow stays on the startup dir.
     pub fn cwd(&self) -> Arc<PathBuf> {
         self.cwd.load_full()
     }

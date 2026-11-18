@@ -128,7 +128,7 @@ because every turn after the first reads the prompt from cache.
 
 Add `--verbose` to include full turn-by-turn messages in the output.
 
-Provider queue waits go to stderr in text output. `stream-json` and SDK output use `system` events with `subtype: "notification"` and a stable `key`. An empty `text` clears the wait. ACP sends notices when the client supports them, or thought chunks otherwise.
+Without `--verbose`, `text` and `json` output send provider queue waits to stderr. `stream-json`, SDK and `--verbose` output carry them as `system` events with `subtype: "notification"` and a stable `key`. An empty `text` clears the wait. ACP sends notices when the client supports them, or thought chunks otherwise.
 
 ## Sessions
 

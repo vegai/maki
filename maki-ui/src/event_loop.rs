@@ -8,7 +8,6 @@
 //! it wakes the moment any of them has something and never blocks a worker:
 //! it runs under `block_on` on the main thread.
 
-use std::env;
 use std::future::{pending, ready};
 use std::mem;
 use std::sync::Arc;
@@ -482,8 +481,6 @@ impl SpawnCtx {
         let session = &open.session;
         let resumed = !session.messages().is_empty();
         let permissions = Arc::new(self.permissions.fork());
-        permissions
-            .set_cwd(env::current_dir().unwrap_or_else(|_| self.permissions.cwd().to_path_buf()));
         let cell = Arc::new(ArcSwap::from(Arc::clone(&slot)));
         let handles = AgentHandles::spawn(
             &cell,
@@ -591,7 +588,7 @@ enum Wake {
     Warn(String),
     Pack(Box<PackPreparation>),
     ModelsDiscovered {
-        warning: Option<&'static str>,
+        panicked: bool,
         next: Option<ModelListing>,
     },
 }
@@ -676,16 +673,16 @@ impl ModelFetch {
     }
 
     /// Never while idle. Once the running discovery ends, a panic included,
-    /// the warning for a panic and the refresh queued behind it. The task is
+    /// whether it panicked and the refresh queued behind it. The task is
     /// only cleared once it has answered, so a `select!` that drops this
     /// future for another wake leaves it running.
-    async fn finished(&mut self) -> (Option<&'static str>, Option<ModelListing>) {
+    async fn finished(&mut self) -> (bool, Option<ModelListing>) {
         let Some(task) = &mut self.task else {
             return pending().await;
         };
-        let warning = task.await.is_err().then_some(MODEL_FETCH_PANIC_ERR);
+        let panicked = task.await.is_err();
         self.task = None;
-        (warning, self.pending.take())
+        (panicked, self.pending.take())
     }
 }
 
@@ -1007,7 +1004,7 @@ impl<'t> EventLoop<'t> {
             () = decor_worker::wakes().woken() => Wake::Decor,
             Some(warning) = self.warn_rx.recv() => Wake::Warn(warning),
             preparation = pack_done(&mut self.pack) => Wake::Pack(Box::new(preparation)),
-            (warning, next) = self.model_fetch.finished() => Wake::ModelsDiscovered { warning, next },
+            (panicked, next) = self.model_fetch.finished() => Wake::ModelsDiscovered { panicked, next },
             wake = session_wake(&mut self.sessions) => wake,
         }
     }
@@ -1022,9 +1019,9 @@ impl<'t> EventLoop<'t> {
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
             Wake::Warn(warning) => self.focused_app().flash(warning),
             Wake::Pack(preparation) => self.finish_pack(*preparation),
-            Wake::ModelsDiscovered { warning, next } => {
-                if let Some(warning) = warning {
-                    self.focused_app().flash(warning.to_owned());
+            Wake::ModelsDiscovered { panicked, next } => {
+                if panicked {
+                    self.focused_app().flash(MODEL_FETCH_PANIC_ERR.to_owned());
                 }
                 self.rebuild_models();
                 if let Some(listing) = next {
@@ -2371,6 +2368,8 @@ fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+
     use crate::app::tests::{MOVED_ID, WorkingDir, app_with_moved_call, end_turn};
     use crate::components::{BackgroundOutcome, key};
     use crossterm::event::KeyCode;
@@ -2394,10 +2393,11 @@ mod tests {
         let current = tempdir().unwrap();
         let target = tempdir().unwrap();
         let _cwd = WorkingDir::enter(current.path());
+        let current = env::current_dir().unwrap();
         let storage = StateDir::from_path(root.path().to_owned());
         let prototype = Arc::new(PermissionManager::new(
             PermissionsConfig::default(),
-            root.path().to_owned(),
+            current.clone(),
             project::resolve_noninteractive(root.path(), TrustMode::Session).project_config,
             Arc::default(),
         ));
@@ -2439,7 +2439,6 @@ mod tests {
                 &slot.model,
             );
         }
-        let current = env::current_dir().unwrap();
         assert_ne!(first.app.state.session.cwd, current.to_string_lossy());
         assert_eq!(*first.app.permissions.cwd(), current);
         assert_eq!(*second.app.permissions.cwd(), current);
@@ -2481,17 +2480,14 @@ mod tests {
         assert_eq!(started, [ModelListing::Cached]);
         assert_eq!(
             runtime.block_on(fetch.finished()),
-            (
-                panics.then_some(MODEL_FETCH_PANIC_ERR),
-                Some(ModelListing::Refresh)
-            )
+            (panics, Some(ModelListing::Refresh))
         );
         fetch.request(ModelListing::Refresh, |listing| {
             started.push(listing);
             runtime.spawn(async {})
         });
         assert_eq!(started, [ModelListing::Cached, ModelListing::Refresh]);
-        assert_eq!(runtime.block_on(fetch.finished()), (None, None));
+        assert_eq!(runtime.block_on(fetch.finished()), (false, None));
     }
 
     fn done_event() -> AgentEvent {

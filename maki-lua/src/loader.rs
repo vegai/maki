@@ -666,6 +666,8 @@ impl PluginHost {
     }
 
     /// Runs trusted test source with a bundled plugin's permissions and private API.
+    /// For tests only: it grants bundled authority to any source string.
+    #[doc(hidden)]
     pub fn load_bundled_source(
         &self,
         name: &str,

@@ -7,6 +7,9 @@ use tempfile::{TempDir, tempdir};
 
 pub const CONFIG_DIR: &str = "config/maki";
 pub const STATE_DIR: &str = "state/maki";
+pub const PROJECT_DIR: &str = "project";
+pub const INIT_LUA: &str = "init.lua";
+pub const PLUGIN_TOML: &str = "plugin.toml";
 const PASSED: &[&str] = &["PATH", "USER", "LANG", "TERM"];
 const USER_DIRS: &[(&str, &str)] = &[
     ("HOME", "home"),
@@ -31,7 +34,7 @@ impl Isolation {
 
     pub fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_maki"));
-        command.current_dir(self.dir("project")).env_clear();
+        command.current_dir(self.dir(PROJECT_DIR)).env_clear();
         for &(name, directory) in USER_DIRS {
             command.env(name, self.dir(directory));
         }

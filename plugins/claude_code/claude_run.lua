@@ -61,8 +61,9 @@ function Run.new(ctx, call, spec: { version: string, [string]: any }, timeout_se
   }, Run)
   self.max_lines, self.max_bytes = output_limits.resolve(opts, ctx)
   local buf = maki.ui.buf()
-  self.view = ToolView.new(buf, view_opts(ctx, "tail"))
-  self.view:set_header(dim_lines(self:header_lines()))
+  local opts = view_opts(ctx, "tail")
+  opts.header = dim_lines(self:header_lines())
+  self.view = ToolView.new(buf, opts)
   buf:on("click", function()
     self.view:toggle()
   end)
@@ -115,7 +116,7 @@ function Run:build(outcome)
   }
 end
 
-function Run:finish(outcome)
+function Run:finish_with(text, is_error)
   if self.finished then
     return
   end
@@ -123,11 +124,7 @@ function Run:finish(outcome)
   if self.clock then
     self.clock:stop()
   end
-  self.resolve(outcome)
-end
-
-function Run:finish_with(text, is_error)
-  self:finish({ llm_output = truncate(text, self.max_lines, self.max_bytes), is_error = is_error, shown = text })
+  self.resolve({ llm_output = truncate(text, self.max_lines, self.max_bytes), is_error = is_error, shown = text })
 end
 
 -- The run ends after the process exits, so the usage it prints on the way
@@ -139,14 +136,6 @@ function Run:stop(reason)
   self.stopped = reason
   self.route = ROUTE_UNCONFIRMED:format(self.spec.version)
   maki.fn.jobstop(self.job_id)
-end
-
-function Run:send(data)
-  local sent, err = maki.fn.chansend(self.job_id, data)
-  if not sent then
-    self:stop("maki cannot write to Claude Code: " .. tostring(err))
-  end
-  return sent
 end
 
 --- Sent on stdin, so the process list never shows the task.
@@ -304,7 +293,10 @@ function Run:start(argv, cwd, env, task)
   -- managed policy included.
   return maki.async.await(1, function(done)
     self.resolve = done
-    self:send(native.handshake_input)
+    local sent, err = maki.fn.chansend(self.job_id, native.handshake_input)
+    if not sent then
+      self:stop("maki cannot write to Claude Code: " .. tostring(err))
+    end
   end)
 end
 

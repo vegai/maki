@@ -90,14 +90,12 @@ impl Listing {
         self.degraded |= failed;
         if failed && batch.models.is_empty() && !refused_by_catalog(&batch.provider) {
             let provider = batch.provider.as_str();
-            self.retained |= self
-                .replayed
-                .iter()
-                .any(|spec| provider_of(spec) == provider);
+            let before = self.live.len();
             self.live.extend(
                 self.replayed
                     .extract_if(.., |spec| provider_of(spec) == provider),
             );
+            self.retained |= self.live.len() > before;
         }
         self.replayed
             .retain(|old| provider_of(old) != batch.provider);

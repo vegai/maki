@@ -1,6 +1,6 @@
 //! Launch policy shared by the provider and plugin, and the plugin worker protocol.
 
-use super::run::{Launch, command, private_dir_async, probe_with, supervised};
+use super::run::{probe_with, unprompted_in};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder};
@@ -11,9 +11,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf, absolute};
 use std::process::ExitStatus;
 use std::sync::Arc;
-use std::time::Duration;
 
-use futures::FutureExt;
 use maki_storage::permissions::{PERMISSION_BITS, PRIVATE_DIR_MODE};
 use rustix::process::geteuid;
 use serde::Deserialize;
@@ -27,19 +25,18 @@ use super::checks::{self, DISABLED, EFFECTIVE, PERMISSIONS_KEY};
 use super::error::{Error, Problem, Wait};
 use super::stream::{
     self, API_ERROR_MARK, CACHE_CREATION_INPUT_TOKENS, CACHE_READ_INPUT_TOKENS, Handshake,
-    INPUT_TOKENS, OUTPUT_TOKENS, StreamMode, count,
+    INPUT_TOKENS, OUTPUT_TOKENS, StreamMode, Usage,
 };
 
-pub use super::MAX_EVENT_BYTES;
+use super::MAX_EVENT_BYTES;
 pub use super::checks::{
     COMMONDIR, GIT_ENTRY, GITDIR_PREFIX, MINIMUM_VERSION, git_directory, handshake_input,
 };
-use super::run::invalidate_version;
+pub use super::run::{Launch, checked_profile, invalidate_on_error};
 use super::settings::{self, base_settings};
 use super::stream::usage_of as plan_usage;
 pub use super::stream::{EventKind, TOOL_USE_BLOCK, user_message};
 
-pub use super::{DEFAULT_EXECUTABLE, DEFAULT_MAX_CONCURRENT, MIN_MAX_CONCURRENT};
 const EXIT_CODE_SHIFT: u32 = 8;
 
 pub(super) const CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
@@ -49,6 +46,7 @@ const CACHE_HOME_ENV: &str = "XDG_CACHE_HOME";
 const FALLBACK_TEMP_DIR: &str = "/var/tmp";
 const DEFAULT_CACHE_DIR: &str = ".cache";
 const SCRATCH_DIRECTORY: &str = "maki/claude-code";
+const FALLBACK_SCRATCH_PREFIX: &str = "maki-claude-code-";
 pub(super) const TMPDIR_ENV: &str = "TMPDIR";
 const UNIX_TEMP_DIR: &str = "/tmp";
 const LINK_TO_NOWHERE: &str = "is a link to a missing target";
@@ -106,7 +104,7 @@ enum WorkerProfile {
 }
 
 impl WorkerProfile {
-    pub fn tools(&self) -> &'static [&'static str] {
+    fn tools(&self) -> &'static [&'static str] {
         match self {
             Self::Read => &["Read", "Glob", "Grep"],
             Self::Code => &["Read", "Glob", "Grep", "Edit", "Write", "Bash"],
@@ -252,49 +250,27 @@ pub fn worker_exit(code: i32, after_result: bool) -> Error {
     }
 }
 
-pub fn invalidate_on_error(executable: &Path, error: &Error) {
-    if error.invalidates_version() {
-        invalidate_version(executable);
-    }
-}
-
-pub struct WorkerProbe {
-    pub executable: PathBuf,
-    pub env: Vec<(String, String)>,
-    pub project: PathBuf,
-    pub denied: Vec<PathBuf>,
-    /// Outside the artifact so hook output survives artifact cleanup.
-    pub temp_dir: PathBuf,
-    pub policy: Arc<WorkerPolicy>,
-    pub model: String,
-    pub startup: Duration,
-}
-
-impl WorkerProbe {
-    pub async fn run(
-        self,
-        cancel: impl Future<Output = ()> + Send,
-    ) -> (Result<(), Error>, Option<PathBuf>) {
-        let (dir, path) = match private_dir_async(&self.temp_dir, &self.project, &self.denied).await
-        {
-            Ok(directory) => directory,
-            Err(error) => return (Err(error), None),
-        };
-        tokio::pin!(cancel);
-        if cancel.as_mut().now_or_never().is_some() {
-            return (Err(Error::Cancelled), dir.close_empty().await);
-        }
-        let args = self.policy.args(&self.model);
-        let mut handshake = WorkerHandshake::new(self.policy);
-        let result = supervised(command(&self.executable, &self.env, &path, &args), async |group| {
-            tokio::select! {
-                biased;
-                _ = cancel => Err(Error::Cancelled),
-                result = probe_with(group, self.startup, |event| handshake.feed(event)) => result,
-            }
-        }).await.inspect_err(|error| invalidate_on_error(&self.executable, error));
-        (result, dir.close_empty().await)
-    }
+/// Runs the unprompted worker checks. `launch.temp_dir` lies outside the
+/// artifact, so hook output survives artifact cleanup. Also returns the probe
+/// directory when something left files in it.
+pub async fn probe(
+    launch: &Launch<'_>,
+    policy: Arc<WorkerPolicy>,
+    model: &str,
+    cancel: impl Future<Output = ()> + Send,
+) -> (Result<(), Error>, Option<PathBuf>) {
+    let args = policy.args(model);
+    let mut handshake = WorkerHandshake::new(policy);
+    let ran = unprompted_in(launch, &args, cancel, async |group| {
+        probe_with(group, launch.startup, |event| handshake.feed(event)).await
+    })
+    .await;
+    let (result, dir) = match ran {
+        Ok(ran) => ran,
+        Err(error) => return (Err(error), None),
+    };
+    let result = result.inspect_err(|error| invalidate_on_error(launch.executable, error));
+    (result, dir.close_empty().await)
 }
 
 pub struct WorkerHandshake {
@@ -366,9 +342,8 @@ pub fn prepare_launch(
     .into_iter()
     .flatten()
     .map(|root| root.join(SCRATCH_DIRECTORY))
-    .chain([
-        PathBuf::from(FALLBACK_TEMP_DIR).join(format!("maki-claude-code-{}", geteuid().as_raw()))
-    ])
+    .chain([PathBuf::from(FALLBACK_TEMP_DIR)
+        .join(format!("{FALLBACK_SCRATCH_PREFIX}{}", geteuid().as_raw()))])
     .collect::<Vec<_>>();
     let (mut env, withheld) = checks::launch_env(vars);
     env.retain(|(name, value)| {
@@ -501,8 +476,8 @@ pub struct WorkerStream {
     model_checked: bool,
     prompted: bool,
     accepted: bool,
-    messages: HashMap<String, Value>,
-    result_usage: Option<Value>,
+    messages: HashMap<String, Usage>,
+    result_usage: Option<Usage>,
 }
 
 impl WorkerStream {
@@ -536,16 +511,15 @@ impl WorkerStream {
         }
         let mut totals = Map::new();
         let mut partial = false;
-        for key in [
-            INPUT_TOKENS,
-            CACHE_READ_INPUT_TOKENS,
-            CACHE_CREATION_INPUT_TOKENS,
-            OUTPUT_TOKENS,
-        ] {
-            let reported = self
-                .result_usage
-                .as_ref()
-                .and_then(|usage| usage[key].as_u64());
+        type Field = fn(&Usage) -> Option<u32>;
+        let fields: [(&str, Field); 4] = [
+            (INPUT_TOKENS, |usage| usage.input),
+            (CACHE_READ_INPUT_TOKENS, |usage| usage.cache_read),
+            (CACHE_CREATION_INPUT_TOKENS, |usage| usage.cache_creation),
+            (OUTPUT_TOKENS, |usage| usage.output),
+        ];
+        for (key, field) in fields {
+            let reported = self.result_usage.as_ref().and_then(field).map(u64::from);
             partial |= reported.is_none();
             let measured = || {
                 if key == OUTPUT_TOKENS || self.messages.is_empty() {
@@ -553,7 +527,7 @@ impl WorkerStream {
                 }
                 self.messages
                     .values()
-                    .try_fold(0_u64, |sum, usage| sum.checked_add(usage[key].as_u64()?))
+                    .try_fold(0_u64, |sum, usage| sum.checked_add(field(usage)?.into()))
             };
             if let Some(value) = reported.or_else(measured) {
                 totals.insert(key.into(), value.into());
@@ -620,19 +594,17 @@ impl WorkerStream {
             }
             self.accepted = problem.is_none();
         }
-        let usage = if kind == Some(EventKind::Assistant) {
-            &event["message"]["usage"]
-        } else {
-            &event["usage"]
-        };
-        let usage = usage.is_object().then(|| usage_counts(usage));
-        if kind == Some(EventKind::Assistant)
-            && let (Some(id), Some(usage)) = (event["message"]["id"].as_str(), &usage)
-        {
-            self.messages.insert(id.to_owned(), usage.clone());
-        }
-        if kind == Some(EventKind::Result) {
-            self.result_usage = Some(usage.clone().unwrap_or_default());
+        match kind {
+            Some(EventKind::Assistant) => {
+                let usage = &event["message"]["usage"];
+                if let Some(id) = event["message"]["id"].as_str()
+                    && usage.is_object()
+                {
+                    self.messages.insert(id.to_owned(), Usage::read(usage));
+                }
+            }
+            Some(EventKind::Result) => self.result_usage = Some(Usage::read(&event["usage"])),
+            _ => {}
         }
         let rate_limit = (kind == Some(EventKind::RateLimit)
             && event["rate_limit_info"].is_object())
@@ -659,16 +631,7 @@ pub struct WorkerEvent {
     pub failure: Option<String>,
 }
 
-fn usage_counts(usage: &Value) -> Value {
-    json!({
-        INPUT_TOKENS: count(usage, INPUT_TOKENS),
-        CACHE_READ_INPUT_TOKENS: count(usage, CACHE_READ_INPUT_TOKENS),
-        CACHE_CREATION_INPUT_TOKENS: count(usage, CACHE_CREATION_INPUT_TOKENS),
-        OUTPUT_TOKENS: count(usage, OUTPUT_TOKENS),
-    })
-}
-
-pub fn checkout_root(cwd: &Path) -> Result<PathBuf, Error> {
+pub fn canonical_checkout_root(cwd: &Path) -> Result<PathBuf, Error> {
     let resolved = cwd.canonicalize().map_err(Error::path("resolve", cwd))?;
     checks::checkout_root(&resolved)
 }
@@ -823,39 +786,20 @@ fn worker_problem(effective: &Value, expected: &Value) -> Option<Problem> {
         .and_then(|sandbox| sandbox_problem(&effective[SANDBOX], sandbox))
 }
 
-pub async fn checked_profile(
-    executable: &Path,
-    env: &[(String, String)],
-    cwd: &Path,
-    denied: &[PathBuf],
-    temp_dir: &Path,
-    startup_secs: u64,
-    cancel: impl Future<Output = ()> + Send,
-) -> Result<String, Error> {
-    super::run::checked_profile(
-        &Launch {
-            executable,
-            env,
-            project: cwd,
-            denied,
-            temp_dir,
-            startup: Duration::from_secs(startup_secs),
-        },
-        cancel,
-    )
-    .await
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        Error, PolicyInput, Problem, WorkerEvent, WorkerHandshake, WorkerProbe, WorkerProfile,
-        WorkerStream, checks, stream,
+        CACHE_CREATION_INPUT_TOKENS, CACHE_READ_INPUT_TOKENS, INPUT_TOKENS, OUTPUT_TOKENS,
+    };
+    use super::{
+        Error, Launch, PolicyInput, Problem, WorkerEvent, WorkerHandshake, WorkerProfile,
+        WorkerStream, checks, probe, stream,
     };
     use super::{
         SANDBOX, TMPDIR_ENV, WorkerPaths, WorkerPolicy, prepare_launch, sandbox_problem,
         scratch_base, worker_problem,
     };
+    use maki_storage::permissions::PRIVATE_DIR_MODE;
     use serde_json::{Value, json};
     use std::collections::HashMap;
     use std::env;
@@ -864,7 +808,7 @@ mod tests {
     use std::future::ready;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{PermissionsExt, symlink};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::tempdir;
@@ -876,28 +820,27 @@ mod tests {
     const OUTSIDE: &str = "/outside";
     const RELATIVE_TEMP: &str = "relative-temp";
     const SCRATCH_FALLBACK: &str = "fallback";
-    const PRIVATE_SCRATCH_MODE: u32 = 0o700;
     const UNSAFE_SCRATCH_MODE: u32 = 0o755;
 
     const MODEL: &str = "claude-test-model";
     const SUBSCRIPTION: &str = "Claude Pro";
     const OTHER_MODEL: &str = "claude-other-model";
+    const BASH_TOOL: &str = "Bash";
+    const EDIT_TOOL: &str = "Edit";
 
     #[tokio::test]
     async fn a_probe_cancelled_during_preparation_never_launches() {
         let scratch = tempdir().unwrap();
         let project = tempdir().unwrap();
-        let probe = WorkerProbe {
-            executable: scratch.path().join("missing-executable"),
-            env: Vec::new(),
-            project: project.path().to_owned(),
-            denied: Vec::new(),
-            temp_dir: scratch.path().to_owned(),
-            policy: Arc::new(read_policy()),
-            model: MODEL.into(),
+        let launch = Launch {
+            executable: &scratch.path().join("missing-executable"),
+            env: &[],
+            project: project.path(),
+            denied: &[],
+            temp_dir: scratch.path(),
             startup: Duration::ZERO,
         };
-        let (result, kept) = probe.run(ready(())).await;
+        let (result, kept) = probe(&launch, Arc::new(read_policy()), MODEL, ready(())).await;
         assert!(matches!(result, Err(Error::Cancelled)));
         assert!(kept.is_none());
         assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
@@ -965,6 +908,69 @@ mod tests {
         assert!(init.problem.is_none());
         stream.set_model(MODEL.into());
         stream
+    }
+
+    #[test_case(checks::DEFAULT_MODE, None => matches Some(Problem::RunMode(_)) ; "coding_requires_accept_edits")]
+    #[test_case(WorkerProfile::Code.mode(), Some(BASH_TOOL) => Some(Problem::MissingTool(BASH_TOOL.into())) ; "coding_requires_bash")]
+    #[test_case(WorkerProfile::Code.mode(), Some(EDIT_TOOL) => Some(Problem::MissingTool(EDIT_TOOL.into())) ; "coding_requires_edit")]
+    #[test_case(WorkerProfile::Code.mode(), None => None ; "coding_profile")]
+    fn coding_init_requires_its_permission_mode_and_tools(
+        mode: &str,
+        missing: Option<&str>,
+    ) -> Option<Problem> {
+        let profile = WorkerProfile::Code;
+        let tools: Vec<_> = profile
+            .tools()
+            .iter()
+            .filter(|tool| Some(**tool) != missing)
+            .collect();
+        let version = checks::MINIMUM_VERSION;
+        let init = json!({"type":"system", "subtype":"init", "apiKeySource":checks::NO_KEY_SOURCE, "claude_code_version":version, "permissionMode":mode, "tools":tools, "mcp_servers":[], "plugins":[], "cwd":DENIED});
+        checks::init_problem(
+            &init,
+            version,
+            Path::new(DENIED),
+            profile.tools().iter().copied(),
+            profile.modes(),
+            None,
+        )
+    }
+
+    /// A message's or the result's usage, scaled by `scale`, without `missing`.
+    fn usage(scale: u64, missing: Option<&str>) -> Value {
+        let mut usage = json!({
+            INPUT_TOKENS: scale,
+            CACHE_READ_INPUT_TOKENS: 2 * scale,
+            CACHE_CREATION_INPUT_TOKENS: 3 * scale,
+            OUTPUT_TOKENS: 4 * scale,
+        });
+        if let Some(key) = missing {
+            usage.as_object_mut().unwrap().remove(key);
+        }
+        usage
+    }
+
+    #[test_case(None, None => (json!({INPUT_TOKENS: 2, CACHE_READ_INPUT_TOKENS: 4, CACHE_CREATION_INPUT_TOKENS: 6}), true) ; "no_result")]
+    #[test_case(Some(Value::Null), None => (json!({INPUT_TOKENS: 2, CACHE_READ_INPUT_TOKENS: 4, CACHE_CREATION_INPUT_TOKENS: 6}), true) ; "a_result_without_usage")]
+    #[test_case(None, Some(CACHE_READ_INPUT_TOKENS) => (json!({INPUT_TOKENS: 2, CACHE_CREATION_INPUT_TOKENS: 6}), true) ; "a_message_missing_a_key")]
+    #[test_case(Some(usage(10, None)), None => (usage(10, None), false) ; "a_result_with_usage")]
+    fn usage_totals_fall_back_to_the_messages(
+        result_usage: Option<Value>,
+        missing: Option<&str>,
+    ) -> (Value, bool) {
+        let mut worker = read_stream();
+        for (id, missing) in [("m1", None), ("m2", missing)] {
+            let event = json!({"type":"assistant", "message":{"id":id, "usage":usage(1, missing)}});
+            worker.feed(&event.to_string()).unwrap();
+        }
+        if let Some(result_usage) = result_usage {
+            let mut event = json!({"type":"result", "subtype":"success", "result":"done"});
+            if !result_usage.is_null() {
+                event["usage"] = result_usage;
+            }
+            worker.feed(&event.to_string()).unwrap();
+        }
+        worker.usage_totals().unwrap()
     }
 
     #[test_case(None => matches Some(Error::NoModel) ; "message_start_without_model")]
@@ -1057,7 +1063,7 @@ mod tests {
         assert_eq!(given, expected.to_str().unwrap());
     }
 
-    #[test_case(PRIVATE_SCRATCH_MODE, true ; "private_fallback")]
+    #[test_case(PRIVATE_DIR_MODE, true ; "private_fallback")]
     #[test_case(UNSAFE_SCRATCH_MODE, false ; "shared_fallback_is_refused")]
     fn scratch_fallback_requires_private_permissions(mode: u32, accepted: bool) {
         let project = tempdir().unwrap();
@@ -1084,7 +1090,7 @@ mod tests {
         let outside = tempdir().unwrap();
         let invalid = outside.path().join(OsStr::from_bytes(b"scratch-\xff"));
         fs::create_dir(&invalid).unwrap();
-        fs::set_permissions(&invalid, fs::Permissions::from_mode(PRIVATE_SCRATCH_MODE)).unwrap();
+        fs::set_permissions(&invalid, fs::Permissions::from_mode(PRIVATE_DIR_MODE)).unwrap();
         let alias = outside.path().join("alias");
         symlink(&invalid, &alias).unwrap();
         let safe = outside.path().join(SCRATCH_FALLBACK);

@@ -30,7 +30,7 @@ mod isolation;
 #[path = "support/wire.rs"]
 #[allow(dead_code)]
 mod wire;
-use isolation::{CONFIG_DIR, Isolation, STATE_DIR};
+use isolation::{CONFIG_DIR, INIT_LUA, Isolation, PLUGIN_TOML, PROJECT_DIR, STATE_DIR};
 use wire::{INIT, RESULT, STREAM_FORMAT, SYSTEM};
 
 const TOOL_USE_ID: &str = "call1";
@@ -124,7 +124,7 @@ impl Fixture {
         let settings =
             configured.map_or_else(String::new, |value| format!("always_thinking = {value:?}"));
         fs::write(
-            config.join("init.lua"),
+            config.join(INIT_LUA),
             format!("maki.setup({{ {settings} }})"),
         )
         .unwrap();
@@ -149,13 +149,23 @@ models = [{{ id = "fixture-model", max_output_tokens = {OUTPUT_CAP}, supports_th
         fixture
     }
 
+    /// A `plugin.toml` that grants plugins nothing.
+    fn deny_plugin_permissions(&self) {
+        fs::write(
+            self.isolation.dir(CONFIG_DIR).join(PLUGIN_TOML),
+            "[permissions]\n",
+        )
+        .unwrap();
+    }
+
     fn storage(&self) -> StateDir {
         StateDir::from_path(self.isolation.dir(STATE_DIR))
     }
 
     /// `maki -p` printing stream-json, or SDK mode with the prompt sent as its
-    /// first message.
-    fn print(&self, sdk: bool, flags: &[&str]) -> Process {
+    /// first message, and the `init` event, which SDK mode sends before any
+    /// input arrives.
+    fn print(&self, sdk: bool, flags: &[&str]) -> (Process, Value) {
         let mut command = self.isolation.command();
         command.args(["-p", "--model", MODEL, "--output-format", STREAM_FORMAT]);
         command.args(flags);
@@ -165,10 +175,11 @@ models = [{{ id = "fixture-model", max_output_tokens = {OUTPUT_CAP}, supports_th
             command.arg(PROMPT);
         }
         let mut process = Process::start(command);
+        let init = process.until(|event| event["type"] == SYSTEM && event["subtype"] == INIT);
         if sdk {
             process.send(json!({"type": "user", "message": {"role": "user", "content": PROMPT}}));
         }
-        process
+        (process, init)
     }
 
     /// The stored session an event names.
@@ -209,8 +220,7 @@ fn headless_thinking_reaches_the_request_and_init(
     budget: Option<u64>,
 ) {
     let fixture = Fixture::new(configured, support);
-    let mut process = fixture.print(sdk, flags);
-    let init = process.until(|event| event["type"] == SYSTEM && event["subtype"] == INIT);
+    let (mut process, init) = fixture.print(sdk, flags);
     assert_eq!(init["thinking"], expected);
     let result = process.until(|event| event["type"] == RESULT);
     assert_eq!(result["is_error"], false, "{result}");
@@ -228,7 +238,7 @@ fn acp_launch_thinking_reaches_the_request(flags: &[&str], budget: Option<u64>) 
     let mut process = Process::start(command);
     process.send(json!({"jsonrpc": "2.0", "id": INITIALIZE_ID, "method": "initialize", "params": {"protocolVersion": 1, "clientCapabilities": {}}}));
     process.response(INITIALIZE_ID);
-    process.send(json!({"jsonrpc": "2.0", "id": NEW_SESSION_ID, "method": "session/new", "params": {"cwd": fixture.isolation.dir("project"), "mcpServers": []}}));
+    process.send(json!({"jsonrpc": "2.0", "id": NEW_SESSION_ID, "method": "session/new", "params": {"cwd": fixture.isolation.dir(PROJECT_DIR), "mcpServers": []}}));
     let session = process.response(NEW_SESSION_ID);
     process.send(json!({"jsonrpc": "2.0", "id": PROMPT_ID, "method": "session/prompt", "params": {"sessionId": session["sessionId"], "prompt": [{"type": "text", "text": PROMPT}]}}));
     process.response(PROMPT_ID);
@@ -270,7 +280,7 @@ fn thinking_flags_require_a_session(flags: &[&str]) {
 fn max_turns_limits_requests_and_returns_a_failure(sdk: bool) {
     let (url, requests) = serve(TOOL_STREAM);
     let fixture = Fixture::at(None, Yes, url, requests);
-    let mut process = fixture.print(sdk, &["--max-turns", "1"]);
+    let (mut process, _) = fixture.print(sdk, &["--max-turns", "1"]);
     let result = process.until(|event| event["type"] == RESULT);
     assert_eq!(result["subtype"], MAX_TURNS_ERROR, "{result}");
     assert_eq!(result["is_error"], true);
@@ -354,10 +364,10 @@ fn interrupted_print_leaves_a_resumable_prefix(signal: Option<Signal>, sdk: bool
     let config = fixture.isolation.dir(CONFIG_DIR);
     let pid_path = config.join(PLUGIN_PID);
     if signal != Some(Signal::KILL) {
-        let init_path = config.join("init.lua");
+        let init_path = config.join(INIT_LUA);
         let init = fs::read_to_string(&init_path).unwrap();
         fs::write(
-            config.join("plugin.toml"),
+            config.join(PLUGIN_TOML),
             "[permissions]\nrun = true\nfs_read = true\nfs_write = true\n",
         )
         .unwrap();
@@ -367,8 +377,7 @@ fn interrupted_print_leaves_a_resumable_prefix(signal: Option<Signal>, sdk: bool
         )
         .unwrap();
     }
-    let mut process = fixture.print(sdk, &[]);
-    let init = process.until(|event| event["subtype"] == INIT);
+    let (mut process, init) = fixture.print(sdk, &[]);
     let plugin_job = (signal != Some(Signal::KILL)).then(|| {
         let pid = Pid::from_raw(fs::read_to_string(&pid_path).unwrap().parse().unwrap()).unwrap();
         PluginJob(pidfd_open(pid, PidfdFlags::empty()).unwrap())
@@ -426,7 +435,7 @@ fn interrupted_print_leaves_a_resumable_prefix(signal: Option<Signal>, sdk: bool
 fn provider_failure_is_nonzero_and_stays_outside_the_transcript() {
     let (url, requests) = serve(ERROR_STREAM);
     let fixture = Fixture::at(None, Yes, url, requests);
-    let mut process = fixture.print(false, &[]);
+    let (mut process, _) = fixture.print(false, &[]);
     let result = process.until(|event| event["type"] == RESULT);
     assert_eq!(result["is_error"], true);
     assert!(result[RESULT].as_str().unwrap().contains(PROVIDER_FAILURE));
@@ -464,12 +473,11 @@ fn model_refresh_failure_still_lists_configured_models() {
 #[test_case(true ; "sdk")]
 fn a_dropped_prompt_fails_the_process(sdk: bool) {
     let fixture = Fixture::new(None, No);
-    let config = fixture.isolation.dir(CONFIG_DIR);
-    fs::write(config.join("plugin.toml"), "[permissions]\n").unwrap();
-    fs::write(config.join("init.lua"), format!(
+    fixture.deny_plugin_permissions();
+    fs::write(fixture.isolation.dir(CONFIG_DIR).join(INIT_LUA), format!(
         "maki.setup({{}})\nmaki.api.set_slot('agent.user_message', function() return nil, {DROPPED_PROMPT:?} end)"
     )).unwrap();
-    let mut process = fixture.print(sdk, &[]);
+    let (mut process, _) = fixture.print(sdk, &[]);
     let result = process.until(|event| event["type"] == RESULT);
     assert_eq!(result["is_error"], true, "{result}");
     assert!(result.to_string().contains(DROPPED_PROMPT), "{result}");
@@ -481,12 +489,12 @@ fn a_dropped_prompt_fails_the_process(sdk: bool) {
 fn checkpoints_precede_provider_requests_and_tool_dispatch() {
     let (url, waiting_rx, release_tx, server) = held_server(0);
     let fixture = Fixture::at(None, No, url, Requests::default());
+    fixture.deny_plugin_permissions();
     let config = fixture.isolation.dir(CONFIG_DIR);
-    fs::write(config.join("plugin.toml"), "[permissions]\n").unwrap();
     let sessions = fixture.storage().path().join(SESSIONS_DIR);
     let observed = config.join("checkpoint.jsonl");
     fs::write(
-        config.join("init.lua"),
+        config.join(INIT_LUA),
         format!(
             r#"
 maki.setup({{}})
@@ -501,8 +509,7 @@ end)
         ),
     )
     .unwrap();
-    let mut process = fixture.print(false, &["--max-turns", "1"]);
-    let init = process.until(|event| event["subtype"] == INIT);
+    let (mut process, init) = fixture.print(false, &["--max-turns", "1"]);
     waiting_rx.recv_timeout(PROTOCOL_TIMEOUT).unwrap();
     assert!(
         fixture

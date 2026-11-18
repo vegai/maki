@@ -550,6 +550,7 @@ impl<'h> Agent<'h> {
             self.follow_served_window().await?;
             self.try_auto_compact().await?;
             let outcome = self.turn().await;
+            // Tool results reach disk before the window probe and compaction.
             self.history.checkpoint(self.gauge.size()).await;
             match outcome? {
                 TurnOutcome::Continue => {}
@@ -1483,6 +1484,22 @@ mod tests {
     }
 
     impl CapturedRequest {
+        fn new(
+            model: &Model,
+            system: &str,
+            tools: &Value,
+            messages: impl Iterator<Item = Message>,
+            opts: RequestOptions,
+        ) -> Self {
+            Self {
+                model: model.id.clone(),
+                system: system.to_owned(),
+                tools: tools.clone(),
+                messages: messages.map(|m| serde_json::to_value(m).unwrap()).collect(),
+                opts,
+            }
+        }
+
         fn thinking(&self) -> Vec<ContentBlock> {
             self.messages
                 .iter()
@@ -1540,16 +1557,13 @@ mod tests {
             _scope: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
-                self.requests.lock().unwrap().push(CapturedRequest {
-                    model: model.id.clone(),
-                    system: system.to_owned(),
-                    tools: tools.clone(),
-                    messages: messages
-                        .iter()
-                        .map(|m| serde_json::to_value(m).unwrap())
-                        .collect(),
+                self.requests.lock().unwrap().push(CapturedRequest::new(
+                    model,
+                    system,
+                    tools,
+                    messages.iter().cloned(),
                     opts,
-                });
+                ));
                 let mut responses = self.responses.lock().unwrap();
                 assert!(!responses.is_empty(), "MockProvider: no more responses");
                 Ok(responses.remove(0))
@@ -4005,22 +4019,19 @@ mod tests {
             opts: RequestOptions,
             _scope: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-            self.requests.lock().unwrap().push(CapturedRequest {
-                model: model.id.clone(),
-                system: system.to_owned(),
-                tools: tools.clone(),
-                // Recovery intentionally removes invalid thinking. Everything else must
-                // remain append-only across the retry.
-                messages: messages
-                    .iter()
-                    .cloned()
-                    .map(|mut message| {
-                        message.content.retain(|block| !block.is_thinking());
-                        serde_json::to_value(message).unwrap()
-                    })
-                    .collect(),
-                opts,
+            // Recovery intentionally removes invalid thinking. Everything else must
+            // remain append-only across the retry.
+            let without_thinking = messages.iter().cloned().map(|mut message| {
+                message.content.retain(|block| !block.is_thinking());
+                message
             });
+            self.requests.lock().unwrap().push(CapturedRequest::new(
+                model,
+                system,
+                tools,
+                without_thinking,
+                opts,
+            ));
             let thinking = messages
                 .iter()
                 .flat_map(|m| &m.content)
@@ -4044,6 +4055,8 @@ mod tests {
 
     #[test_case(false, true, UNBOUND_RECOVER_MSG, false ; "drops_thinking_and_retries")]
     #[test_case(true, false, UNBOUND_GIVE_UP_MSG, false ; "nothing_left_to_drop_surfaces_the_error")]
+    // Beyond the `prepare_request` unit test: a real failed request reruns
+    // preparation, and Plan mode puts a context update in the note's span.
     #[test_case(false, true, UNBOUND_RECOVER_MSG, true ; "final_answer_note_is_not_duplicated_on_retry")]
     #[tokio::test]
     async fn unbound_thinking_recovery(always: bool, expected: bool, message: &str, bounded: bool) {

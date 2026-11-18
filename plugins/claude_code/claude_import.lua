@@ -205,7 +205,7 @@ local function stage_blobs(call, artifact, todo, stage, timeout)
     return true
   end
   local batch = maki.fs.joinpath(stage, "batch")
-  local output, err = call:run_lines(git_utils.git({ "--git-dir=" .. artifact.git, "cat-file", "--batch" }), {
+  local output, err = call:run_lines(git_utils.git({ "cat-file", "--batch" }), {
     cwd = artifact.manifest.project,
     env = git_utils.snapshot_git_env({}, artifact.git, artifact.manifest.project),
     stdin = table.concat(hashes, "\n") .. "\n",
@@ -224,23 +224,23 @@ end
 local function apply_import(ctx, call, artifact, todo)
   local project = artifact.manifest.project
   local made = missing_folders(project, todo)
-  local stage, stage_err = maki.fs.mkdtemp(artifact.stage_template)
-  if not stage then
+  local dir, stage_err = maki.fs.mkdtemp(artifact.stage_template)
+  if not dir then
     return nil, "maki cannot make a stage folder in the artifact: " .. stage_err
   end
-  local script = import_scripts.import_script(todo, project, artifact.git, artifact.dir, stage)
+  local stage = import_scripts.stage(artifact, dir)
+  local script = import_scripts.import_script(todo, project, artifact.git, stage)
   local timeout = import_scripts.import_timeout(todo)
   local staged, blob_err
   if #script > MAX_IMPORT_SCRIPT_BYTES then
     blob_err = IMPORT_TOO_LARGE
   else
-    staged, blob_err = stage_blobs(call, artifact, todo, stage, timeout)
+    staged, blob_err = stage_blobs(call, artifact, todo, dir, timeout)
   end
   if not staged then
-    maki.fs.rm(stage, { recursive = true, force = true })
+    maki.fs.rm(dir, { recursive = true, force = true })
     return nil, blob_err
   end
-  local receipt = import_scripts.receipt_path(artifact.dir, stage)
   local _, err = maki.agent.call_tool(ctx, "bash", {
     command = script,
     workdir = project,
@@ -248,7 +248,7 @@ local function apply_import(ctx, call, artifact, todo)
     description = "Import " .. #todo .. " changes from Claude Code",
   })
   if not err then
-    maki.fs.rm(receipt)
+    maki.fs.rm(stage.receipt)
     return todo, nil, {}
   end
   -- This also runs after a cancel, so the cleanup and the read must survive
@@ -264,7 +264,7 @@ local function apply_import(ctx, call, artifact, todo)
     err = err:sub(1, first - 1) .. IMPORT_COMMAND .. err:sub(last + 1)
   end
   if not cleaned then
-    err = err .. "\n" .. LEFTOVERS_REMAIN:format(import_scripts.temp_name(stage))
+    err = err .. "\n" .. LEFTOVERS_REMAIN:format(stage.temp)
   end
   local now, now_err = checkout_state(call, artifact, todo, true)
   if not now then
@@ -274,8 +274,8 @@ local function apply_import(ctx, call, artifact, todo)
     end
     return nil, err .. "\nmaki cannot read the checkout (" .. now_err .. "). Examine " .. path_utils.shown(paths) .. "."
   end
-  local written = maki.split(maki.fs.read(receipt) or "", "\0")
-  maki.fs.rm(receipt)
+  local written = maki.split(maki.fs.read(stage.receipt) or "", "\0")
+  maki.fs.rm(stage.receipt)
   local landed, matched = workspace.landed(todo, now, path_utils.set_of(written))
   return landed, err, matched
 end

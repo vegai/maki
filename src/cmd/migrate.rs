@@ -12,11 +12,11 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use color_eyre::Result;
 use color_eyre::eyre::{Context, bail};
 use maki_storage::paths::{self, tilde};
+#[cfg(unix)]
+use maki_storage::permissions::PRIVATE_FILE_MODE;
 
 use crate::provider_scripts::{self, MIGRATE_COMMAND, Reference, Script};
 
-#[cfg(unix)]
-const AUTH_FILE_MODE: u32 = 0o600;
 #[cfg(unix)]
 const AUTH_DIR: &str = "auth";
 const WAYLAND_DISPLAY_ENV: &str = "WAYLAND_DISPLAY";
@@ -247,7 +247,7 @@ fn remove_entry(path: &Path) {
 fn restrict_auth(dir: &Path) {
     for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
         if entry.file_type().is_ok_and(|t| t.is_file()) {
-            fs::set_permissions(entry.path(), fs::Permissions::from_mode(AUTH_FILE_MODE)).ok();
+            fs::set_permissions(entry.path(), fs::Permissions::from_mode(PRIVATE_FILE_MODE)).ok();
         }
     }
 }
@@ -673,6 +673,8 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, UNIX_EPOCH};
 
+    #[cfg(unix)]
+    use maki_storage::permissions::PERMISSION_BITS;
     use test_case::test_case;
 
     use super::*;
@@ -694,8 +696,6 @@ mod tests {
     const LONG_AGO: Duration = Duration::from_secs(86_400);
     #[cfg(unix)]
     const PLUGIN_AUTH: &str = "plugins";
-    #[cfg(unix)]
-    const PERMISSION_BITS: u32 = 0o777;
     #[cfg(unix)]
     const OWNER_EXEC: u32 = 0o100;
 
@@ -1088,7 +1088,7 @@ mod tests {
         let mode =
             |path: PathBuf| fs::metadata(path).unwrap().permissions().mode() & PERMISSION_BITS;
         let auth = xdg[2].join(AUTH);
-        assert_eq!(mode(auth.join("anthropic")), AUTH_FILE_MODE);
+        assert_eq!(mode(auth.join("anthropic")), PRIVATE_FILE_MODE);
         assert_ne!(
             mode(auth.join(PLUGIN_AUTH)) & OWNER_EXEC,
             0,

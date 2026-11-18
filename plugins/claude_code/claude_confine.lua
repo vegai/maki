@@ -72,6 +72,20 @@ local HOME_CREDENTIALS = {
 M.NO_HOME = "maki cannot find your home directory, so it cannot keep the coding worker's shell away from "
   .. "the logins and keys there. Set HOME, or use the read profile."
 
+-- Adds {path} and its realpath to {list} once each. A seen path already
+-- brought its realpath.
+local function add_resolved(list, seen, path)
+  if not path or seen[path] then
+    return
+  end
+  for _, entry in ipairs({ path, (maki.fs.realpath(path)) }) do
+    if not seen[entry] then
+      seen[entry] = true
+      list[#list + 1] = entry
+    end
+  end
+end
+
 function M.denied_home_paths(extra)
   return path_utils.comma_list(extra, function(path)
     if path:sub(1, 1) == "/" or path:sub(1, 1) == "~" or path_utils.climbs(path) then
@@ -93,20 +107,9 @@ function M.home_credentials(home, extra, environ)
   end
   local paths, seen = {}, {}
   local resolved_home = maki.fs.realpath(home) or home
-  local function add(path)
-    if not seen[path] then
-      seen[path] = true
-      paths[#paths + 1] = path
-    end
-  end
   local function deny(path)
-    add(maki.fs.joinpath(home, path))
-    local absolute = maki.fs.joinpath(resolved_home, path)
-    add(absolute)
-    local resolved = maki.fs.realpath(absolute)
-    if resolved then
-      add(resolved)
-    end
+    add_resolved(paths, seen, maki.fs.joinpath(home, path))
+    add_resolved(paths, seen, maki.fs.joinpath(resolved_home, path))
   end
   for _, path in ipairs(HOME_CREDENTIALS) do
     deny(path)
@@ -115,12 +118,11 @@ function M.home_credentials(home, extra, environ)
   if not state_files then
     return nil, "maki cannot inspect Claude Code state copies: " .. tostring(state_err)
   end
-  add(maki.fs.joinpath(home, native.home_state_prefix .. "*"))
-  add(maki.fs.joinpath(resolved_home, native.home_state_prefix .. "*"))
+  deny(native.home_state_prefix .. "*")
   for _, path in ipairs(state_files) do
     local resolved = maki.fs.realpath(maki.fs.joinpath(resolved_home, path))
     if resolved and not path_utils.within(resolved, resolved_home) then
-      add(resolved)
+      add_resolved(paths, seen, resolved)
     end
   end
   for _, path in ipairs(extra or {}) do
@@ -129,14 +131,7 @@ function M.home_credentials(home, extra, environ)
   local env = environ or {}
   local function relocated(path: string?)
     if path and path ~= "" then
-      if path:sub(1, 1) ~= "/" then
-        path = maki.fs.joinpath(cwd, path)
-      end
-      add(path)
-      local resolved = maki.fs.realpath(path)
-      if resolved then
-        add(resolved)
-      end
+      add_resolved(paths, seen, path:sub(1, 1) == "/" and path or maki.fs.joinpath(cwd, path))
     end
   end
   for _, location in ipairs({ { "%.config", env.XDG_CONFIG_HOME }, { "%.local/share", env.XDG_DATA_HOME } }) do
@@ -191,25 +186,16 @@ function M.coding(spec, artifact)
   if not state_dir then
     return nil, NO_STATE_DIR
   end
-  local deny = table.clone(spec.denied)
-  local function hide(path)
-    if path then
-      deny[#deny + 1] = path
-      local resolved = maki.fs.realpath(path)
-      if resolved and resolved ~= path then
-        deny[#deny + 1] = resolved
-      end
-    end
-  end
-  hide(spec.config_dir)
-  hide(maki.fs.dirname(artifact.dir))
-  hide(state_dir)
-  hide(maki.env.config_dir())
-  hide(maki.env.logs_dir())
+  local deny, seen = table.clone(spec.denied), {}
+  add_resolved(deny, seen, spec.config_dir)
+  add_resolved(deny, seen, maki.fs.dirname(artifact.dir))
+  add_resolved(deny, seen, state_dir)
+  add_resolved(deny, seen, maki.env.config_dir())
+  add_resolved(deny, seen, maki.env.logs_dir())
   for _, name in ipairs({ "XDG_RUNTIME_DIR", "SSH_AUTH_SOCK" }) do
     local path = spec.environ[name]
     if path and path:sub(1, 1) == "/" then
-      hide(path)
+      add_resolved(deny, seen, path)
     end
   end
   table.move(spec.home_credentials, 1, #spec.home_credentials, #deny + 1, deny)

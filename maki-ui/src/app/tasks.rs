@@ -1272,7 +1272,7 @@ mod tests {
         let listed = app
             .tasks()
             .into_iter()
-            .filter(|task| task.status == Some(TaskStatus::Working) && !task.wrapper)
+            .filter(|task| task.status.is_some_and(TaskStatus::is_running) && !task.wrapper)
             .count();
         assert_eq!(listed, expected, "/tasks lists what the flash counts");
 

@@ -70,8 +70,7 @@ impl<'a> ProviderNotice<'a> {
     }
 }
 
-/// Claude Code has no event for this, so it takes the SDK's shape. Without it
-/// a woken turn's assistant messages follow the last turn's with nothing
+/// A `system` event with no Claude Code equivalent. Without it a woken turn's assistant messages follow the last turn's with nothing
 /// between them that says what woke it.
 #[derive(Serialize)]
 pub struct NoticeEvent<'a> {

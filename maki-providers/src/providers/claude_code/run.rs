@@ -3,13 +3,11 @@ mod launch;
 mod private_files;
 mod supervision;
 
-pub(crate) use self::launch::{Launch, models};
-use self::launch::{base_args, request_checks};
-pub(crate) use self::launch::{checked_profile, command, invalidate_version, probe_with};
-pub(super) use self::private_files::private_dir_async;
+pub use self::launch::{Launch, checked_profile, invalidate_on_error};
+use self::launch::{command, provider_args, request_checks};
+pub(super) use self::launch::{models, probe_with, unprompted_in};
 use self::private_files::{PrivateDir, private_dir, private_file};
-pub(super) use self::supervision::supervised;
-use self::supervision::{Group, Next, ReadDeadline, SHUTDOWN_GRACE, send, unreadable};
+use self::supervision::{Group, Next, ReadDeadline, SHUTDOWN_GRACE, send, supervised, unreadable};
 use super::STARTUP_TIMEOUT_SECS;
 use super::checks::{InitExpect, handshake_input};
 use super::error::{Error, Wait};
@@ -36,7 +34,7 @@ use tracing::{debug, info, warn};
 const PROMPT_FILE: &str = "system-prompt.md";
 const MCP_FILE: &str = "mcp.json";
 const LONG_CONTEXT_NAME: &str = "[1m]";
-const STARTUP: Duration = Duration::from_secs(STARTUP_TIMEOUT_SECS);
+pub(super) const STARTUP: Duration = Duration::from_secs(STARTUP_TIMEOUT_SECS);
 const MCP_READ: Duration = Duration::from_secs(60);
 const HANDOFF: Duration = Duration::from_secs(30);
 const EXIT: Duration = Duration::from_secs(10);
@@ -56,9 +54,6 @@ const NO_MID_CONVERSATION_SYSTEM: (&str, &str) =
 const HELD_CALL_TIMEOUT_MS: u64 = i32::MAX as u64;
 
 pub(crate) struct Limits {
-    /// Time for Claude Code to start, answer the handshake and send its init
-    /// event, and also for each write to its stdin.
-    pub startup: Duration,
     /// Time between two events of a reply: maki's stream timeout.
     pub idle: Duration,
     /// Time from the end of a tool-calling reply to its held call.
@@ -67,18 +62,8 @@ pub(crate) struct Limits {
 }
 
 impl Limits {
-    fn for_wait(&self, wait: Wait) -> Duration {
-        match wait {
-            Wait::Startup => self.startup,
-            Wait::Idle => self.idle,
-            Wait::Handoff => self.handoff,
-            Wait::Result => self.exit,
-        }
-    }
-
     pub(crate) fn new(idle: Duration) -> Self {
         Self {
-            startup: STARTUP,
             idle,
             handoff: HANDOFF,
             exit: EXIT,
@@ -180,6 +165,7 @@ pub(crate) async fn request(req: Request<'_>) -> Result<StreamResponse, Error> {
         handoffs,
         events: req.exchange.events,
         limits,
+        startup: launch.startup,
     };
     let ran = Instant::now();
     let result = supervised(
@@ -244,7 +230,7 @@ fn run_args(
     mcp_file: &Path,
     prompt_file: &Path,
 ) -> (Vec<OsString>, Vec<(String, String)>) {
-    let mut args: Vec<OsString> = base_args(model_arg)
+    let mut args: Vec<OsString> = provider_args(model_arg)
         .into_iter()
         .map(OsString::from)
         .collect();
@@ -283,6 +269,7 @@ struct Run<'a> {
     handoffs: UnboundedReceiver<Handoff>,
     events: &'a UnboundedSender<ProviderEvent>,
     limits: &'a Limits,
+    startup: Duration,
 }
 
 /// Sends the handshake and the conversation, reads the reply until it is
@@ -315,26 +302,32 @@ async fn exchange_reply(
         handoffs,
         events,
         limits,
+        startup,
     } = run;
     let mut prompted = Instant::now();
     let (mut stdin, mut lines) = group.pipes()?;
-    let mut startup = Instant::now() + limits.startup;
-    send(&mut stdin, &handshake_input(), startup).await?;
+    let mut started_by = Instant::now() + *startup;
+    send(&mut stdin, &handshake_input(), started_by).await?;
     let mut last_event = Instant::now();
     // Set when the reply is complete, and keep-alives must not move it.
     let mut finish_by = None;
     let mut result_late = false;
-    let mut timer = ReadDeadline::new(startup);
+    let mut timer = ReadDeadline::new(started_by);
     loop {
         let waiting = turn.waiting();
         let complete = turn.awaits_result() && turn.has_stream_usage();
+        let limit = match waiting {
+            Wait::Startup => *startup,
+            Wait::Idle => limits.idle,
+            Wait::Handoff => limits.handoff,
+            Wait::Result => limits.exit,
+        };
         let deadline = match waiting {
-            Wait::Startup => startup,
-            Wait::Handoff => {
-                finish_deadline(&mut finish_by, waiting, Instant::now() + limits.handoff)
+            Wait::Startup => started_by,
+            Wait::Idle => last_event + limit,
+            Wait::Handoff | Wait::Result => {
+                finish_deadline(&mut finish_by, waiting, Instant::now() + limit)
             }
-            Wait::Result => finish_deadline(&mut finish_by, waiting, Instant::now() + limits.exit),
-            Wait::Idle => last_event + limits.idle,
         };
         let step = match timer.next(&mut lines, Some(&mut *handoffs), deadline).await {
             Next::Line(Some(Ok(line))) => turn.feed(&line),
@@ -361,10 +354,7 @@ async fn exchange_reply(
                 result_late = true;
                 Ok(Step::Done)
             }
-            Next::Late => {
-                let limit = limits.for_wait(waiting);
-                Err(Error::Late(waiting, limit.as_secs()))
-            }
+            Next::Late => Err(Error::Late(waiting, limit.as_secs())),
         };
         // Keep-alives come from a timer, so they do not restart the clock.
         if !matches!(step, Ok(Step::Alive)) {
@@ -377,8 +367,8 @@ async fn exchange_reply(
                 // during the write, but Claude Code answers nothing before
                 // the write ends.
                 prompted = Instant::now();
-                startup = prompted + limits.startup;
-                send(&mut stdin, conversation, startup).await?;
+                started_by = prompted + *startup;
+                send(&mut stdin, conversation, started_by).await?;
                 turn.prompted();
                 stdin = None;
             }
@@ -544,12 +534,13 @@ mod tests {
         POLICY_HOOK, POLL, SHELL, STDIN_PROMPT, TEMP_BASE, TOOL, VERSION_ERROR, VERSION_FILE,
         VERSIONS, WAIT, wait_until,
     };
+    use super::super::linux::agent_error;
     use super::super::mcp::Handoff;
     use super::super::stream::Turn;
     use super::super::transcript::{Catalog, SERVER};
     use super::private_files::{DIR_PREFIX, OWNER_SEPARATOR, owner_namespace, sweep_dead_owners};
     use super::{
-        EFFORT_FLAG, Exchange, Group, HANDOFF, HELD_CALL_TIMEOUT_MS, Launch, Limits, Listed,
+        EFFORT_FLAG, Exchange, Group, HELD_CALL_TIMEOUT_MS, Launch, Limits, Listed,
         MCP_CONFIG_FLAG, NO_AUTO_COMPACT, NO_CLI_RETRIES, NO_MID_CONVERSATION_SYSTEM,
         NO_NONSTREAMING_FALLBACK, NO_THINKING, Request, SHOWN_THINKING, STARTUP,
         SYSTEM_PROMPT_FILE_FLAG, Thinking, Wait, command, finish_deadline, models, queued_handoffs,
@@ -632,7 +623,7 @@ mod tests {
                 project: root,
                 denied: &[],
                 temp_dir: root,
-                startup: limits.startup,
+                startup: STARTUP,
             },
             limits: &limits,
             model: ALIAS,
@@ -744,7 +735,14 @@ mod tests {
     fn stopping_a_tool_reply_keeps_calls_parked_during_cleanup(scenario: &str, cleans: bool) {
         let fake = Fake::new(scenario);
         fs::write(fake.dir.path().join(TRACK_SESSIONS), "").unwrap();
-        let reply = through_keep_alives(&fake, limits(STARTUP, IDLE, HANDOFF, SHORT_EXIT)).unwrap();
+        let reply = through_keep_alives(
+            &fake,
+            Limits {
+                exit: SHORT_EXIT,
+                ..Limits::new(IDLE)
+            },
+        )
+        .unwrap();
         assert_eq!(reply.stop_reason, Some(StopReason::ToolUse));
         assert_eq!(reply.message.tool_uses().count(), 2);
         assert!(fake.log(ANSWERED_CALL).is_empty());
@@ -820,7 +818,14 @@ mod tests {
     #[test_case("complete_output" ; "eof_after_complete_reply")]
     fn a_missing_result_after_a_complete_reply_keeps_the_reply(scenario: &str) {
         let fake = Fake::new(scenario);
-        let result = through_keep_alives(&fake, limits(STARTUP, IDLE, SHORT_HANDOFF, SHORT_EXIT));
+        let result = through_keep_alives(
+            &fake,
+            Limits {
+                handoff: SHORT_HANDOFF,
+                exit: SHORT_EXIT,
+                ..Limits::new(IDLE)
+            },
+        );
 
         let response = result.unwrap();
         assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
@@ -868,7 +873,7 @@ mod tests {
         let (result, _) = crate::test_support::runtime().block_on(fake.request());
         let error = result.unwrap_err();
         assert!(matches!(error.cause(), Error::MalformedArguments(_)));
-        assert!(super::super::agent_error(error).is_retryable());
+        assert!(agent_error(error).is_retryable());
         assert!(fake.group_gone());
         assert!(fake.leader_reaped());
         assert!(fake.log("mcp_status").is_empty());
@@ -882,7 +887,11 @@ mod tests {
         let (result, _) = crate::test_support::runtime().block_on(fake.request_with(
             MARKER,
             ALIAS,
-            limits(STARTUP, IDLE, SHORT_HANDOFF, SHORT_EXIT),
+            Limits {
+                handoff: SHORT_HANDOFF,
+                exit: SHORT_EXIT,
+                ..Limits::new(IDLE)
+            },
         ));
         let error = result.unwrap_err();
         assert_eq!(error.temporary().is_some(), retryable, "{error:?}");
@@ -920,7 +929,10 @@ mod tests {
         let (result, _) = crate::test_support::runtime().block_on(fake.request_with(
             &format!("find {MARKER}"),
             ALIAS,
-            limits(STARTUP, IDLE, HANDOFF, SHORT_EXIT),
+            Limits {
+                exit: SHORT_EXIT,
+                ..Limits::new(IDLE)
+            },
         ));
         assert!(
             matches!(
@@ -939,7 +951,10 @@ mod tests {
         let fake = Fake::new("text");
         let image = ImageSource::new(ImageMediaType::Png, "AAAA".into());
         let messages = [Message::user_with_images("look".into(), vec![image])];
-        let limits = limits(STARTUP, IDLE, HANDOFF, EXIT_LIMIT);
+        let limits = Limits {
+            exit: EXIT_LIMIT,
+            ..Limits::new(IDLE)
+        };
         let (result, _) = crate::test_support::runtime().block_on(fake.send_messages(
             &messages,
             ALIAS,
@@ -969,7 +984,10 @@ mod tests {
         let (result, _) = crate::test_support::runtime().block_on(fake.request_with(
             &format!("find {MARKER}"),
             ALIAS,
-            limits(STARTUP, IDLE, HANDOFF, SHORT_EXIT),
+            Limits {
+                exit: SHORT_EXIT,
+                ..Limits::new(IDLE)
+            },
         ));
         assert!(
             fake.group_gone(),
@@ -985,12 +1003,16 @@ mod tests {
     /// A process that ignores stdin after its checks must not hold a request indefinitely.
     #[test]
     fn a_prompt_nobody_reads_times_out() {
-        let fake = Fake::new("stops_reading");
+        let mut fake = Fake::new("stops_reading");
+        fake.startup = UNREAD_STARTUP;
         let prompt = "x".repeat(UNREAD_PROMPT_BYTES);
         let (result, _) = crate::test_support::runtime().block_on(fake.request_with(
             &prompt,
             ALIAS,
-            limits(UNREAD_STARTUP, IDLE, HANDOFF, EXIT_LIMIT),
+            Limits {
+                exit: EXIT_LIMIT,
+                ..Limits::new(IDLE)
+            },
         ));
         let err = result.unwrap_err();
         assert!(matches!(err.cause(), Error::InputNotTaken), "{err}");
@@ -1011,7 +1033,14 @@ mod tests {
     #[test_case("stalled_result_without_usage", IDLE => matches Error::Late(Wait::Result, _) ; "a_finished_reply_without_its_final_count")]
     fn keep_alives_cannot_hold_a_reply_open(scenario: &str, idle: Duration) -> Error {
         let fake = Fake::new(scenario);
-        let result = through_keep_alives(&fake, limits(STARTUP, idle, SHORT_HANDOFF, SHORT_EXIT));
+        let result = through_keep_alives(
+            &fake,
+            Limits {
+                handoff: SHORT_HANDOFF,
+                exit: SHORT_EXIT,
+                ..Limits::new(idle)
+            },
+        );
 
         assert!(
             fake.group_gone(),
@@ -1071,15 +1100,6 @@ mod tests {
         assert!(fake.group_gone());
     }
 
-    fn limits(startup: Duration, idle: Duration, handoff: Duration, exit: Duration) -> Limits {
-        Limits {
-            startup,
-            idle,
-            handoff,
-            exit,
-        }
-    }
-
     /// A call can reach the server just as the output ends. stdout is read
     /// first, so the call is still queued then.
     #[test]
@@ -1096,7 +1116,7 @@ mod tests {
         let (sender, mut handoffs) = unbounded_channel();
         sender
             .send(Handoff::Parked {
-                tool_use_id: Some(MARKER.into()),
+                tool_use_id: MARKER.into(),
                 name: UNKNOWN_TOOL.into(),
                 arguments: json!({}),
             })
@@ -1190,7 +1210,10 @@ mod tests {
         let (result, _) = crate::test_support::runtime().block_on(fake.request_with(
             &format!("find {MARKER}"),
             ALIAS,
-            limits(STARTUP, IDLE, HANDOFF, SHORT_EXIT),
+            Limits {
+                exit: SHORT_EXIT,
+                ..Limits::new(IDLE)
+            },
         ));
         assert!(
             matches!(result.as_ref().map_err(Error::cause), Err(Error::WentQuiet)),
@@ -1217,7 +1240,10 @@ mod tests {
                 &[Message::user(format!("find {MARKER}"))],
                 ALIAS,
                 thinking,
-                limits(STARTUP, IDLE, HANDOFF, EXIT_LIMIT),
+                Limits {
+                    exit: EXIT_LIMIT,
+                    ..Limits::new(IDLE)
+                },
             ))
             .0
             .unwrap();
@@ -1432,7 +1458,10 @@ mod tests {
         let (result, _) = crate::test_support::runtime().block_on(fake.request_with(
             &format!("find {MARKER}"),
             LONG_CONTEXT_ID,
-            limits(STARTUP, IDLE, HANDOFF, EXIT_LIMIT),
+            Limits {
+                exit: EXIT_LIMIT,
+                ..Limits::new(IDLE)
+            },
         ));
 
         result.unwrap();
@@ -1452,7 +1481,10 @@ mod tests {
         let (result, _) = crate::test_support::runtime().block_on(fake.request_with(
             &format!("find {MARKER}"),
             OTHER_MODEL,
-            limits(STARTUP, IDLE, HANDOFF, EXIT_LIMIT),
+            Limits {
+                exit: EXIT_LIMIT,
+                ..Limits::new(IDLE)
+            },
         ));
 
         assert!(
