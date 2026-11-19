@@ -17,7 +17,6 @@ use aws_credential_types::provider::error::CredentialsError;
 use aws_sigv4::http_request::{self as sigv4, SignableBody, SignableRequest, SigningSettings};
 use aws_sigv4::sign::v4;
 use base64::Engine;
-use maki_storage::id::SessionRef;
 use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::{Client, Request};
 use serde_json::{Value, json};
@@ -28,7 +27,7 @@ use tracing::{debug, warn};
 
 use crate::headers::header_pairs;
 use crate::model::Model;
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::shared;
@@ -430,7 +429,7 @@ impl Provider for Bedrock {
         tools: &'a Value,
         event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let region = self.region().await;
@@ -531,7 +530,10 @@ impl Provider for Bedrock {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async {
             let models: Vec<crate::model::ModelInfo> = super::SPEC
                 .models()

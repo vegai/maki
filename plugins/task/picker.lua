@@ -16,6 +16,7 @@ local TICK_MS = 100
 -- A placeholder frame. The host swaps "spinner:*" spans for the live one, so
 -- running rows spin without this plugin redrawing.
 local RUNNING_ICON = "· "
+local QUEUED_ICON = "… "
 local MAIN_ICON = "● "
 -- The footer counts never animate, so they get a real bullet.
 local RUNNING_COUNT_ICON = "● "
@@ -32,6 +33,7 @@ local HINT_KEY = "Ctrl+X"
 -- The main chat has no status, so it falls through to MAIN.
 local ICONS = {
   working = { RUNNING_ICON, "accent", true },
+  queued = { QUEUED_ICON, "dim" },
   done = { DONE_ICON, "success" },
   error = { ERROR_ICON, "error" },
   cancelled = { CANCELLED_ICON, "dim" },

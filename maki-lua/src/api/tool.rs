@@ -15,7 +15,7 @@ use maki_agent::tools::registry::{RegisteredTool, ToolRegistry};
 use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
 use maki_agent::tools::{
     BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, MovedCall, ParseError,
-    PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation,
+    PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolInvocation, ToolKind,
     ToolReach, is_tool_enabled, timeout_annotation,
 };
 use maki_agent::{
@@ -102,10 +102,24 @@ fn dctx_json(ctx: &DescriptionContext) -> Value {
         "workflow": ctx.workflow,
         "mcp": ctx.mcp,
     });
-    match ctx.filter {
-        ToolFilter::All => {}
-        ToolFilter::Only(names) => obj["only"] = json!(names),
-        ToolFilter::AllExcept(names) => obj["except"] = json!(names),
+    if let Some(names) = ctx
+        .filter
+        .published
+        .as_ref()
+        .or(ctx.filter.allowed.as_ref())
+    {
+        obj["only"] = json!(
+            names
+                .iter()
+                .filter(|name| ctx.filter.admits(
+                    name,
+                    ToolKind::Registry(ToolAudience::all()),
+                    ToolAudience::MAIN
+                ))
+                .collect::<Vec<_>>()
+        );
+    } else if !ctx.filter.excluded.is_empty() {
+        obj["except"] = json!(ctx.filter.excluded);
     }
     obj
 }
@@ -2263,7 +2277,7 @@ mod tests {
         let mut tool = make_lua_tool(None);
         tool.has_describe_fn = true;
         let ctx = DescriptionContext {
-            filter: &ToolFilter::All,
+            filter: &ToolFilter::default(),
             audience: ToolAudience::MAIN,
             workflow: false,
             mcp: false,

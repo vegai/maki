@@ -1,0 +1,990 @@
+use super::fd::directory;
+use super::{blobs, snapshot};
+
+use std::collections::HashMap;
+use std::fmt::{self, Write};
+use std::fs;
+use std::io::{Error as IoError, ErrorKind};
+use std::ops::RangeInclusive;
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use maki_lua_macro::{lua_fn, lua_table, lua_value};
+use maki_providers::claude_code::worker::{
+    self, EventKind, WorkerHandshake as NativeHandshake, WorkerPolicy,
+};
+use maki_providers::claude_code::{Error as WorkerError, HOME_STATE_PREFIX};
+use mlua::{
+    Error as LuaError, Lua, LuaSerdeExt, LuaString, Result as LuaResult, Table, UserData,
+    UserDataMethods, UserDataRef, UserDataRefMut, Value as LuaValue,
+};
+use rustix::fs::{AtFlags, CWD, FileType, statat};
+use rustix::io::Errno;
+use serde_json::Value;
+use tokio::task::spawn_blocking;
+use unicode_general_category::{GeneralCategory, get_general_category};
+
+use crate::api::fs::path_text;
+use crate::api::util::convert::json_to_lua;
+use crate::api::util::ctx::LuaCtx;
+use crate::api::util::pair::{Pair, pair, try_pair};
+use crate::plugin_permissions::PluginPermissions;
+
+const OWNER_EXECUTE: u32 = 0o100;
+const BMP_LIMIT: u32 = 0xffff;
+const MAX_UTF8_BYTES: usize = 4;
+// Fields consumed by claude_stream.tool_line; the bundled progress-line spec checks this boundary.
+const TOOL_PROGRESS_FIELDS: &[&str] = &["file_path", "path", "pattern"];
+const VARIATION_SELECTORS: &[RangeInclusive<u32>] = &[
+    0x180b..=0x180d,
+    0x180f..=0x180f,
+    0xfe00..=0xfe0f,
+    0xe0100..=0xe01ef,
+];
+/// Characters that draw nothing although their category usually draws: the
+/// combining grapheme joiner, Khmer inherent vowels, the Hangul fillers and
+/// the blank Braille pattern.
+const BLANK_CHARACTERS: &[RangeInclusive<u32>] = &[
+    0x034f..=0x034f,
+    0x115f..=0x1160,
+    0x17b4..=0x17b5,
+    0x2800..=0x2800,
+    0x3164..=0x3164,
+    0xffa0..=0xffa0,
+];
+
+fn is_printable(character: char) -> bool {
+    if character.is_ascii() {
+        return !character.is_control();
+    }
+    let code = u32::from(character);
+    !matches!(
+        get_general_category(character),
+        GeneralCategory::Control
+            | GeneralCategory::Format
+            | GeneralCategory::Surrogate
+            | GeneralCategory::PrivateUse
+            | GeneralCategory::Unassigned
+            | GeneralCategory::LineSeparator
+            | GeneralCategory::ParagraphSeparator
+            | GeneralCategory::SpaceSeparator
+    ) && !BLANK_CHARACTERS
+        .iter()
+        .chain(VARIATION_SELECTORS)
+        .any(|range| range.contains(&code))
+}
+
+fn escape_bytes(escaped: &mut String, bytes: &[u8], shell: bool) -> fmt::Result {
+    if shell {
+        escaped.push_str("'$'");
+    }
+    for byte in bytes {
+        write!(escaped, "\\{byte:03o}")?;
+    }
+    if shell {
+        escaped.push_str("''");
+    }
+    Ok(())
+}
+
+/// Quote a path for Bash or escape invisible characters for display.
+/// @param text string Raw path bytes.
+/// @param shell boolean? Emit a Bash-quoted path.
+/// @return (string) Escaped path.
+#[lua_fn]
+fn escape_path(lua: &Lua, text: LuaString, shell: Option<bool>) -> LuaResult<LuaString> {
+    let shell = shell == Some(true);
+    let bytes = text.as_bytes();
+    let mut escaped = String::with_capacity(bytes.len());
+    if shell {
+        escaped.push('\'');
+    }
+    let mut previous: Option<char> = None;
+    for chunk in bytes.utf8_chunks() {
+        for character in chunk.valid().chars() {
+            let visible = is_printable(character);
+            if character.is_ascii() && character.is_control() {
+                escape_bytes(&mut escaped, &[character as u8], shell)
+                    .map_err(LuaError::external)?;
+            } else if visible
+                || previous.is_some_and(|base| !base.is_ascii())
+                    && VARIATION_SELECTORS
+                        .iter()
+                        .any(|range| range.contains(&u32::from(character)))
+            {
+                match (character, shell) {
+                    ('\'', true) => escaped.push_str("'\\''"),
+                    ('\\', false) => escaped.push_str("\\\\"),
+                    _ => escaped.push(character),
+                }
+            } else if shell {
+                escape_bytes(
+                    &mut escaped,
+                    character.encode_utf8(&mut [0; MAX_UTF8_BYTES]).as_bytes(),
+                    true,
+                )
+                .map_err(LuaError::external)?;
+            } else {
+                let code = u32::from(character);
+                if code <= BMP_LIMIT {
+                    write!(escaped, "\\u{code:04x}")
+                } else {
+                    write!(escaped, "\\U{code:08x}")
+                }
+                .map_err(LuaError::external)?;
+            }
+            previous = visible.then_some(character);
+        }
+        if !chunk.invalid().is_empty() {
+            escape_bytes(&mut escaped, chunk.invalid(), shell).map_err(LuaError::external)?;
+            previous = None;
+        }
+    }
+    if shell {
+        escaped.push('\'');
+    }
+    lua.create_string(escaped)
+}
+
+/// Report credentials that a coding worker could read from its shell environment.
+/// @param env table Child environment.
+/// @return (string?) Reason to refuse the coding call.
+#[lua_fn]
+fn shell_secret_problem(_lua: &Lua, env: HashMap<String, String>) -> LuaResult<Option<String>> {
+    Ok(worker::shell_secret_problem(&env))
+}
+
+/// Resolve the checkout's Git directory for the shared import lock.
+/// @param project string Checkout directory or one of its subdirectories.
+/// @return (string?, string?) Git directory, or nil and the error.
+#[lua_fn(guard = FsRead)]
+async fn project_git_dir(_lua: Lua, project: PathBuf) -> LuaResult<Pair<String>> {
+    Ok(pair(
+        spawn_blocking(move || {
+            let project = worker::canonical_checkout_root(&project).map_err(IoError::other)?;
+            worker::git_directory(&project.join(worker::GIT_ENTRY)).and_then(path_text)
+        })
+        .await
+        .map_err(LuaError::external)?,
+    ))
+}
+
+/// Existing home state and temporary copies that must be hidden from workers.
+/// @param home string Home directory.
+/// @return (table?, string?) State filenames, or nil and the error.
+#[lua_fn(guard = FsRead)]
+async fn home_state_files(_lua: Lua, home: PathBuf) -> LuaResult<Pair<Vec<String>>> {
+    Ok(pair(
+        spawn_blocking(move || {
+            let entries = match fs::read_dir(home) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(error) => return Err(error),
+            };
+            let mut files = Vec::new();
+            for entry in entries {
+                let name = entry?.file_name();
+                if name
+                    .as_encoded_bytes()
+                    .starts_with(HOME_STATE_PREFIX.as_bytes())
+                {
+                    files.push(path_text(name.into())?);
+                }
+            }
+            Ok(files)
+        })
+        .await
+        .map_err(LuaError::external)?,
+    ))
+}
+
+struct Policy(Arc<WorkerPolicy>);
+
+impl UserData for Policy {}
+
+/// Parse the immutable worker policy once for argv and handshake validation.
+/// @param policy table Deny rules and optional sandbox paths.
+/// @return (userdata) Shared policy.
+#[lua_fn]
+fn worker_policy(lua: &Lua, policy: Table) -> LuaResult<Policy> {
+    Ok(Policy(Arc::new(lua.from_value(LuaValue::Table(policy))?)))
+}
+
+struct WorkerHandshake(NativeHandshake);
+
+impl UserData for WorkerHandshake {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("resolved_model", |_, this, requested: String| {
+            Ok(pair(this.0.resolved_model(&requested).map(str::to_owned)))
+        });
+        methods.add_method("subscription_type", |_, this, ()| {
+            Ok(this.0.subscription_type().map(str::to_owned))
+        });
+    }
+}
+
+/// Collect and validate worker control responses with the provider's handshake rules.
+/// @param policy userdata Shared worker policy.
+/// @return (userdata) Handshake with resolved_model and subscription_type methods.
+#[lua_fn]
+fn worker_handshake(_lua: &Lua, policy: UserDataRef<Policy>) -> LuaResult<WorkerHandshake> {
+    Ok(WorkerHandshake(NativeHandshake::new(Arc::clone(&policy.0))))
+}
+
+/// Build worker arguments without serializing launch settings through Lua.
+/// @param executable string Absolute worker executable.
+/// @param model string Model name.
+/// @param policy userdata Shared worker policy.
+/// @return (table) Command-line arguments.
+#[lua_fn]
+fn worker_args(
+    _lua: &Lua,
+    executable: String,
+    model: String,
+    policy: UserDataRef<Policy>,
+) -> LuaResult<Vec<String>> {
+    let mut args = policy.0.args(&model);
+    args.insert(0, executable);
+    Ok(args)
+}
+
+/// Encode prompt blocks in the shared worker protocol.
+/// @param blocks table Prompt text blocks in order.
+/// @return (string) NDJSON user message.
+#[lua_fn]
+fn user_message(_lua: &Lua, blocks: Vec<String>) -> LuaResult<String> {
+    worker::user_message(&blocks).map_err(LuaError::external)
+}
+
+/// Prepare the login environment and validate every skipped settings file.
+/// @param environ table Parent environment variables.
+/// @param configured string? Explicit config directory.
+/// @param cwd string Session directory.
+/// @return (table?, string?) Validated preparation, or nil and the error.
+#[lua_fn(guard = FsWrite)]
+async fn prepare_launch(
+    lua: Lua,
+    environ: HashMap<String, String>,
+    configured: Option<PathBuf>,
+    cwd: PathBuf,
+) -> LuaResult<Pair<Table>> {
+    let prepared = try_pair!(
+        spawn_blocking(move || worker::prepare_launch(
+            environ.into_iter().collect(),
+            configured,
+            &cwd
+        ))
+        .await
+        .map_err(LuaError::external)?
+    );
+    let result = lua.create_table()?;
+    result.set("env", lua.create_table_from(prepared.env)?)?;
+    result.set("withheld", prepared.withheld)?;
+    result.set(
+        "denied",
+        try_pair!(
+            prepared
+                .denied
+                .into_iter()
+                .map(path_text)
+                .collect::<Result<Vec<_>, _>>()
+        ),
+    )?;
+    result.set("config_dir", try_pair!(path_text(prepared.config_dir)))?;
+    result.set("temp_dir", try_pair!(path_text(prepared.temp_dir)))?;
+    Ok((Some(result), None))
+}
+
+/// Validate the executable version with the shared process supervisor and cache.
+/// @param ctx LuaCtx Calling handler context.
+/// @param executable string Absolute CLI path.
+/// @param prepared table Validated launch preparation.
+/// @param cwd string Session directory.
+/// @param startup_secs integer Startup timeout.
+/// @return (string?, string?) Validated version, or nil and the error.
+#[lua_fn(guard = [FsWrite, Run])]
+async fn checked_profile(
+    _lua: Lua,
+    ctx: UserDataRef<LuaCtx>,
+    executable: PathBuf,
+    prepared: Table,
+    cwd: PathBuf,
+    startup_secs: u64,
+) -> LuaResult<Pair<String>> {
+    let cancel = ctx.cancel.clone();
+    drop(ctx);
+    let env = prepared
+        .get::<Table>("env")?
+        .pairs::<String, String>()
+        .collect::<LuaResult<Vec<_>>>()?;
+    let denied = prepared.get::<Vec<PathBuf>>("denied")?;
+    let temp_dir = prepared.get::<PathBuf>("temp_dir")?;
+    let launch = worker::Launch {
+        executable: &executable,
+        env: &env,
+        project: &cwd,
+        denied: &denied,
+        temp_dir: &temp_dir,
+        startup: Duration::from_secs(startup_secs),
+    };
+    Ok(pair(
+        worker::checked_profile(&launch, cancel.cancelled()).await,
+    ))
+}
+
+/// Run the unprompted worker checks under the shared process supervisor.
+/// @param ctx LuaCtx Calling context.
+/// @param spec table Prepared worker launch and immutable policy.
+/// @param env table Child environment.
+/// @param startup_secs integer Startup deadline in seconds.
+/// @return (boolean?, string?, string?) Result, error, and any probe directory kept for its contents.
+#[lua_fn(guard = [FsWrite, Run])]
+async fn worker_probe(
+    _lua: Lua,
+    ctx: UserDataRef<LuaCtx>,
+    spec: Table,
+    env: HashMap<String, String>,
+    startup_secs: u64,
+) -> LuaResult<(Option<bool>, Option<String>, Option<String>)> {
+    let cancel = ctx.cancel.clone();
+    drop(ctx);
+    let policy = Arc::clone(&spec.get::<UserDataRef<Policy>>("policy")?.0);
+    let executable = spec.get::<PathBuf>("executable")?;
+    let env: Vec<_> = env.into_iter().collect();
+    let project = spec.get::<PathBuf>("cwd")?;
+    let denied = spec.get::<Vec<PathBuf>>("denied")?;
+    let temp_dir = spec.get::<PathBuf>("temp_dir")?;
+    let model = spec.get::<String>("model")?;
+    let launch = worker::Launch {
+        executable: &executable,
+        env: &env,
+        project: &project,
+        denied: &denied,
+        temp_dir: &temp_dir,
+        startup: Duration::from_secs(startup_secs),
+    };
+    let (result, kept) = worker::probe(&launch, policy, &model, cancel.cancelled()).await;
+    let kept = kept
+        .map(path_text)
+        .transpose()
+        .map_err(LuaError::external)?;
+    let (ok, error) = pair(result.map(|()| true));
+    Ok((ok, error, kept))
+}
+
+/// Move Git metadata out of a stopped worker's snapshot and restore its trusted root pointer.
+/// Embedded repositories are quarantined with their configs disabled. Directory links are not followed.
+/// @param snapshot string Snapshot directory.
+/// @param quarantine string Private directory for preserved metadata.
+/// @param git string Trusted artifact repository.
+/// @param prune_links boolean Remove escaping links before the worker starts.
+/// @return (table?, string?) Metadata and repository paths, or nil and the error.
+#[lua_fn(guard = FsWrite)]
+async fn sanitize_git(
+    lua: Lua,
+    snapshot: PathBuf,
+    quarantine: PathBuf,
+    git: PathBuf,
+    prune_links: bool,
+) -> LuaResult<Pair<Table>> {
+    let result = spawn_blocking(move || {
+        snapshot::sanitize_snapshot(&snapshot, &quarantine, &git, prune_links)
+    })
+    .await
+    .map_err(LuaError::external)?;
+    let paths = try_pair!(result);
+    let result = lua.create_table()?;
+    result.set("git_metadata", paths.git_metadata)?;
+    result.set("repositories", paths.repositories)?;
+    result.set("private_files", paths.private_files)?;
+    result.set("dropped_links", paths.dropped_links)?;
+    Ok((Some(result), None))
+}
+
+/// Unpack a supervised git cat-file batch into private stage files.
+/// @param batch string Batch output file.
+/// @param stage string Stage directory.
+/// @param hashes table Requested object ids in batch order.
+/// @return (boolean?, string?) True, or nil and the error.
+#[lua_fn(guard = FsWrite)]
+async fn unpack_blobs(
+    _lua: Lua,
+    batch: PathBuf,
+    stage: PathBuf,
+    hashes: Vec<String>,
+) -> LuaResult<Pair<bool>> {
+    Ok(pair(
+        spawn_blocking(move || blobs::unpack(&batch, &stage, &hashes).map(|()| true))
+            .await
+            .map_err(LuaError::external)?,
+    ))
+}
+
+/// Resolve an artifact root, including a missing tail, outside the checkout.
+/// @param root string Artifact root.
+/// @param cwd string Session directory.
+/// @param denied table Protected checkout directories.
+/// @return (string?, string?) Resolved path, or nil and the error.
+#[lua_fn(guard = FsRead)]
+async fn resolve_root(
+    _lua: Lua,
+    root: PathBuf,
+    cwd: PathBuf,
+    denied: Vec<PathBuf>,
+) -> LuaResult<Pair<String>> {
+    Ok(pair(
+        spawn_blocking(move || {
+            worker::artifact_root(&root, &cwd, &denied)
+                .map_err(IoError::other)
+                .and_then(path_text)
+        })
+        .await
+        .map_err(LuaError::external)?,
+    ))
+}
+
+/// Inspect import targets in one filesystem operation. Missing entries are false.
+/// @param paths table Checkout file paths.
+/// @return (table?, string?) Regular and owner-executable flags, or nil and an I/O error.
+#[lua_fn(guard = FsRead)]
+async fn checkout_files(lua: Lua, paths: Vec<PathBuf>) -> LuaResult<Pair<Table>> {
+    let values = try_pair!(
+        spawn_blocking(move || paths
+            .iter()
+            .map(|path| match checkout_file(path) {
+                Ok(meta) => Ok(Some(meta)),
+                Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+                Err(error)
+                    if error.kind() == ErrorKind::NotADirectory
+                        || error.raw_os_error() == Some(Errno::LOOP.raw_os_error()) =>
+                {
+                    Ok(Some((false, false)))
+                }
+                Err(error) => Err(error),
+            })
+            .collect::<Result<Vec<_>, IoError>>())
+        .await
+        .map_err(LuaError::external)?
+    );
+    let values = values
+        .into_iter()
+        .map(|meta| match meta {
+            Some((regular, executable)) => lua
+                .create_table_from([("regular", regular), ("executable", executable)])
+                .map(LuaValue::Table),
+            None => Ok(LuaValue::Boolean(false)),
+        })
+        .collect::<LuaResult<Vec<_>>>()?;
+    Ok((Some(lua.create_sequence_from(values)?), None))
+}
+
+/// The regular and owner-executable flags of {path}. Its parents are opened
+/// without following links, so a linked parent fails with `ELOOP` instead of
+/// reporting a file outside the checkout.
+fn checkout_file(path: &Path) -> Result<(bool, bool), IoError> {
+    let name = path.file_name().ok_or(Errno::INVAL)?;
+    let mut dir = directory(&CWD, if path.has_root() { "/" } else { "." })?;
+    for component in path.parent().into_iter().flat_map(Path::components) {
+        if component != Component::RootDir {
+            dir = directory(&dir, component.as_os_str())?;
+        }
+    }
+    let stat = statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    Ok((
+        FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile,
+        stat.st_mode & OWNER_EXECUTE != 0,
+    ))
+}
+
+struct WorkerStream {
+    stream: worker::WorkerStream,
+    executable: PathBuf,
+}
+
+impl WorkerStream {
+    fn invalidate(&self, error: &WorkerError) {
+        worker::invalidate_on_error(&self.executable, error);
+    }
+}
+
+impl UserData for WorkerStream {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("usage_totals", |lua, this, ()| {
+            match this.stream.usage_totals() {
+                Some((totals, partial)) => Ok((json_to_lua(lua, &totals)?, partial)),
+                None => Ok((LuaValue::Nil, false)),
+            }
+        });
+        methods.add_method_mut("set_model", |_, this, model: String| {
+            this.stream.set_model(model);
+            Ok(())
+        });
+        methods.add_method_mut("mark_prompted", |_, this, ()| {
+            this.stream.mark_prompted();
+            Ok(())
+        });
+        methods.add_method("accepted", |_, this, ()| Ok(this.stream.accepted()));
+        methods.add_method_mut(
+            "feed",
+            |lua, this, (line, handshake): (LuaString, Option<UserDataRefMut<WorkerHandshake>>)| {
+                let line = line.to_str()?;
+                let mut classified = try_pair!(
+                    this.stream
+                        .feed(&line)
+                        .and_then(|mut event| match event.problem.take() {
+                            Some(problem) => Err(problem),
+                            None => Ok(event),
+                        })
+                        .inspect_err(|error| this.invalidate(error))
+                );
+                let control = classified.kind == Some(EventKind::ControlResponse)
+                    && classified.event["response"].is_object();
+                let complete = if control {
+                    try_pair!(
+                        handshake
+                            .map(|mut handshake| handshake.0.answer(&classified.event["response"]))
+                            .transpose()
+                            .inspect_err(|error| this.invalidate(error))
+                    )
+                } else {
+                    None
+                };
+                event_table(lua, &mut classified, control, complete)
+            },
+        );
+    }
+}
+
+/// Own worker init and model checks for one process.
+/// @param expect table Expected cwd, CLI version, executable and immutable worker policy.
+/// @return (userdata) Stateful event classifier. Its `feed` answers a stop reason as the pair error.
+#[lua_fn]
+fn worker_stream(_lua: &Lua, expect: Table) -> LuaResult<WorkerStream> {
+    let policy: UserDataRef<Policy> = expect.get("policy")?;
+    Ok(WorkerStream {
+        executable: expect.get::<PathBuf>("executable")?,
+        stream: worker::WorkerStream::new(
+            expect.get::<String>("version")?,
+            expect.get::<PathBuf>("cwd")?,
+            &policy.0,
+        ),
+    })
+}
+
+fn event_table(
+    lua: &Lua,
+    classified: &mut worker::WorkerEvent,
+    control: bool,
+    complete: Option<bool>,
+) -> LuaResult<Pair<Table>> {
+    let event = &mut classified.event;
+    match classified.kind {
+        Some(EventKind::Assistant) => {
+            if let Some(content) = event["message"]
+                .get_mut("content")
+                .and_then(Value::as_array_mut)
+            {
+                content.retain(|block| block["type"] == worker::TOOL_USE_BLOCK);
+                for block in content {
+                    if let Some(input) = block.get_mut("input").and_then(Value::as_object_mut) {
+                        input.retain(|key, _| TOOL_PROGRESS_FIELDS.contains(&key.as_str()));
+                    }
+                }
+            }
+        }
+        Some(EventKind::Result) => {}
+        _ => {
+            if let Some(object) = event.as_object_mut() {
+                object.retain(|key, _| key == "type" || key == "subtype");
+            }
+        }
+    }
+    let result = lua.create_table()?;
+    result.set(
+        "kind",
+        classified
+            .kind
+            .map(|kind| lua.to_value(&kind))
+            .transpose()?,
+    )?;
+    result.set("event", json_to_lua(lua, event)?)?;
+    result.set("control", control)?;
+    result.set("complete", complete)?;
+    result.set("failure", classified.failure.as_deref())?;
+    if let Some(rate_limit) = &classified.rate_limit {
+        result.set("rate_limit", lua.to_value(rate_limit)?)?;
+    }
+    Ok((Some(result), None))
+}
+
+/// Find the configured worker executable.
+/// @param name string Executable name or path.
+#[lua_fn(guard = FsRead)]
+async fn executable(_lua: Lua, name: String) -> LuaResult<Pair<String>> {
+    let path = try_pair!(
+        spawn_blocking(move || worker::executable(&name))
+            .await
+            .map_err(LuaError::external)?
+    );
+    Ok(pair(path_text(path)))
+}
+
+/// Control requests that open every worker's handshake.
+#[lua_value]
+fn handshake_input(_lua: &Lua) -> LuaResult<String> {
+    Ok(worker::handshake_input())
+}
+
+/// Startup deadline diagnostic shared with the provider.
+/// @param seconds integer Startup time limit.
+#[lua_fn]
+fn startup_late(_lua: &Lua, seconds: u64) -> LuaResult<String> {
+    Ok(worker::startup_late(seconds))
+}
+
+/// Worker exit diagnostic shared with the provider.
+/// @param code integer Exit code.
+/// @param after_result boolean Whether the result arrived.
+#[lua_fn]
+fn worker_exit(_lua: &Lua, code: i32, after_result: bool) -> LuaResult<String> {
+    Ok(worker::worker_exit(code, after_result).to_string())
+}
+
+lua_table! {
+    /// Private helpers for the bundled Claude Code plugin. JSON inputs retain
+    /// the distinction between null, objects and arrays.
+    "maki.claude_code.internal" => pub(crate) fn create_claude_code_table(perms: &PluginPermissions), DOCS [
+        executable(perms), handshake_input, startup_late, worker_exit, shell_secret_problem, escape_path, worker_policy, worker_handshake, worker_args, worker_probe(perms), user_message, prepare_launch(perms), resolve_root(perms), home_state_files(perms),
+        worker_stream, checkout_files(perms), checked_profile(perms), sanitize_git(perms), project_git_dir(perms), unpack_blobs(perms),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::{OsStr, OsString};
+    use std::fs::{self, Permissions};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    use maki_agent::AgentMode;
+    use maki_agent::tools::test_support::stub_ctx;
+    use maki_providers::claude_code::MAX_EVENT_BYTES;
+    use maki_providers::claude_code::worker::{GIT_ENTRY, MINIMUM_VERSION};
+    use maki_providers::claude_code::{Error as WorkerError, HOME_STATE_PREFIX};
+    use mlua::{
+        AnyUserData, FromLuaMulti, IntoLuaMulti, Lua, ObjectLike, Table, Value as LuaValue,
+    };
+    use serde_json::{Value, json};
+    use tempfile::tempdir;
+    use test_case::test_case;
+
+    use super::{create_claude_code_table, is_printable};
+    use crate::api::util::convert::json_to_lua;
+    use crate::api::util::ctx::LuaCtx;
+    use crate::plugin_permissions::{Permission, PluginPermissions};
+
+    const LINKED: &str = "linked";
+    const NESTED: &str = "src";
+    const FILE_CONTENT: &str = "file";
+    const PRINT_PATH: &str = "printf %s ";
+    const NON_UTF8_DIR: &[u8] = b"nested\xff";
+
+    enum BlockedParent {
+        File,
+        Looping,
+        Symlinked,
+    }
+
+    fn native() -> (Lua, Table) {
+        let lua = Lua::new();
+        let table = create_claude_code_table(&lua, &PluginPermissions::trusted()).unwrap();
+        (lua, table)
+    }
+
+    fn call_async<R: FromLuaMulti>(table: &Table, name: &str, args: impl IntoLuaMulti) -> R {
+        crate::test_support::runtime()
+            .block_on(table.call_async_function(name, args))
+            .unwrap()
+    }
+
+    fn policy(lua: &Lua, table: &Table) -> AnyUserData {
+        let input = json_to_lua(lua, &json!({"deny": []})).unwrap();
+        table.call_function("worker_policy", input).unwrap()
+    }
+
+    fn worker_stream() -> (Lua, AnyUserData) {
+        let (lua, table) = native();
+        let expect = lua
+            .create_table_from([
+                ("cwd", "/workspace"),
+                ("version", MINIMUM_VERSION),
+                ("executable", "claude"),
+            ])
+            .unwrap();
+        expect.set("policy", policy(&lua, &table)).unwrap();
+        let stream: AnyUserData = table.call_function("worker_stream", expect).unwrap();
+        stream.call_method::<()>("mark_prompted", ()).unwrap();
+        (lua, stream)
+    }
+
+    #[test_case("checked_profile", Permission::Run ; "version_check_requires_run")]
+    #[test_case("checked_profile", Permission::FsWrite ; "version_check_requires_temporary_files")]
+    #[test_case("worker_probe", Permission::Run ; "probe_requires_run")]
+    #[test_case("worker_probe", Permission::FsWrite ; "probe_requires_temporary_files")]
+    #[test_case("executable", Permission::FsRead ; "executable_lookup_requires_read")]
+    fn native_launch_helpers_enforce_permissions(name: &str, permission: Permission) {
+        let lua = Lua::new();
+        let mut permissions = PluginPermissions::trusted();
+        permissions.set(permission, false);
+        let table = create_claude_code_table(&lua, &permissions).unwrap();
+        let error = crate::test_support::runtime()
+            .block_on(table.call_async_function::<LuaValue>(name, ()))
+            .unwrap_err();
+        assert!(error.to_string().contains(permission.manifest_key()));
+    }
+
+    #[test_case(false ; "git_metadata")]
+    #[test_case(true ; "repository")]
+    fn quarantined_paths_keep_their_filename_bytes_in_lua(repository: bool) {
+        let root = tempdir().unwrap();
+        let snapshot = root.path().join("snapshot");
+        let relative = PathBuf::from(OsStr::from_bytes(NON_UTF8_DIR));
+        let directory = snapshot.join(&relative);
+        fs::create_dir_all(&directory).unwrap();
+        let (field, expected) = if repository {
+            fs::create_dir(directory.join("objects")).unwrap();
+            fs::write(directory.join("HEAD"), FILE_CONTENT).unwrap();
+            ("repositories", relative)
+        } else {
+            fs::write(directory.join(GIT_ENTRY), FILE_CONTENT).unwrap();
+            ("git_metadata", relative.join(GIT_ENTRY))
+        };
+        let (_lua, table) = native();
+        let (result, error): (Option<Table>, Option<String>) = call_async(
+            &table,
+            "sanitize_git",
+            (
+                snapshot,
+                root.path().join("quarantine"),
+                root.path().join("git"),
+                true,
+            ),
+        );
+        assert_eq!(error, None);
+        let paths: Vec<OsString> = result.unwrap().get(field).unwrap();
+        assert_eq!(paths, [expected.into_os_string()]);
+    }
+
+    #[test]
+    fn worker_probe_reads_its_paths_as_bytes() {
+        let root = tempdir().unwrap();
+        let missing = root.path().join(OsStr::from_bytes(NON_UTF8_DIR));
+        let (lua, table) = native();
+        let spec = lua
+            .create_table_from(
+                ["executable", "cwd", "temp_dir"].map(|key| (key, missing.as_path())),
+            )
+            .unwrap();
+        spec.set("denied", [missing.as_path()]).unwrap();
+        spec.set("policy", policy(&lua, &table)).unwrap();
+        spec.set("model", "model").unwrap();
+        let ctx = LuaCtx::handler(&stub_ctx(&AgentMode::Build));
+        let (ok, error, kept): (Option<bool>, Option<String>, Option<String>) = call_async(
+            &table,
+            "worker_probe",
+            (ctx, spec, lua.create_table().unwrap(), 1),
+        );
+        assert_eq!((ok, kept), (None, None));
+        assert!(error.unwrap().contains(&missing.display().to_string()));
+    }
+
+    #[test_case(b"a'\\\n\xff\xc3\xa9", "a'\\\\\\012\\377é" ; "mixed_valid_and_invalid_utf8")]
+    #[test_case(b"a\xe2\x80\xae\xff", "a\\u202e\\377" ; "bidi_and_invalid_byte")]
+    fn path_escaping_preserves_shell_bytes_and_printable_unicode(bytes: &[u8], display: &str) {
+        let (lua, table) = native();
+        let input = lua.create_string(bytes).unwrap();
+        let shown: String = table.call_function("escape_path", (&input, false)).unwrap();
+        assert_eq!(shown, display);
+        let quoted: String = table.call_function("escape_path", (input, true)).unwrap();
+        let output = Command::new("bash")
+            .args(["-c", &format!("{PRINT_PATH}{quoted}")])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, bytes);
+    }
+
+    #[test_case('é', true ; "accented_letter")]
+    #[test_case('\u{301}', true ; "combining_accent")]
+    #[test_case('\u{94d}', true ; "virama")]
+    #[test_case('\u{fe0f}', false ; "emoji_variation_selector")]
+    #[test_case('\u{e0100}', false ; "supplemental_variation_selector")]
+    #[test_case('\u{180b}', false ; "mongolian_variation_selector")]
+    #[test_case('\u{200b}', false ; "zero_width_space")]
+    #[test_case('\u{202e}', false ; "bidi_override")]
+    #[test_case('\u{2028}', false ; "line_separator")]
+    #[test_case('\u{80}', false ; "control")]
+    #[test_case('\u{a0}', false ; "no_break_space")]
+    #[test_case('\u{34f}', false ; "combining_grapheme_joiner")]
+    #[test_case('\u{3164}', false ; "hangul_filler")]
+    #[test_case('\u{115f}', false ; "hangul_choseong_filler")]
+    #[test_case('\u{ffa0}', false ; "halfwidth_hangul_filler")]
+    #[test_case('\u{17b4}', false ; "khmer_inherent_vowel")]
+    #[test_case('\u{2800}', false ; "braille_blank")]
+    fn printability_identifies_standalone_visible_characters(character: char, expected: bool) {
+        assert_eq!(is_printable(character), expected);
+    }
+
+    #[test_case(0x180b ; "mongolian")]
+    #[test_case(0x180f ; "fourth_mongolian")]
+    #[test_case(0xfe0f ; "emoji")]
+    #[test_case(0xe0100 ; "supplemental")]
+    fn variation_selectors_need_a_non_ascii_predecessor(code: u32) {
+        let (_lua, table) = native();
+        for previous in [None, Some('n')] {
+            let input = format!(
+                "{}{}",
+                previous.map(String::from).unwrap_or_default(),
+                char::from_u32(code).unwrap()
+            );
+            let escaped: String = table.call_function("escape_path", input.clone()).unwrap();
+            assert_ne!(escaped, input);
+        }
+    }
+
+    #[test]
+    fn malformed_worker_json_returns_errors_without_throwing() {
+        const INVALID_JSON: &str = "{";
+        let expected = serde_json::from_str::<Value>(INVALID_JSON)
+            .unwrap_err()
+            .to_string();
+        let (_lua, stream) = worker_stream();
+        let (event, error): (Option<Table>, Option<String>) =
+            stream.call_method("feed", INVALID_JSON).unwrap();
+        assert!(event.is_none());
+        assert!(error.unwrap().contains(&expected));
+    }
+
+    #[test_case(BlockedParent::File ; "file_parent")]
+    #[test_case(BlockedParent::Looping ; "looping_parent")]
+    #[test_case(BlockedParent::Symlinked ; "symlinked_parent")]
+    fn checkout_targets_with_blocked_parents_are_conflicts(blocked: BlockedParent) {
+        let (root, outside) = (tempdir().unwrap(), tempdir().unwrap());
+        let parent = root.path().join(NESTED);
+        match blocked {
+            BlockedParent::File => fs::write(&parent, FILE_CONTENT).unwrap(),
+            BlockedParent::Looping => symlink(NESTED, &parent).unwrap(),
+            BlockedParent::Symlinked => {
+                fs::write(outside.path().join(LINKED), FILE_CONTENT).unwrap();
+                symlink(outside.path(), &parent).unwrap();
+            }
+        }
+        let (_lua, table) = native();
+        let (meta, error): (Option<Table>, Option<String>) =
+            call_async(&table, "checkout_files", vec![parent.join(LINKED)]);
+        let meta: Table = meta.unwrap().get(1).unwrap();
+        assert!(!meta.get::<bool>("regular").unwrap());
+        assert_eq!(error, None);
+    }
+
+    #[test_case(0o700, true ; "owner_execute")]
+    #[test_case(0o750, true ; "owner_and_group_execute")]
+    #[test_case(0o650, false ; "group_execute_only")]
+    #[test_case(0o4600, false ; "setuid_without_execute")]
+    fn checkout_metadata_uses_the_owners_execute_bit(mode: u32, executable: bool) {
+        let root = tempdir().unwrap();
+        let path = root.path().join(LINKED);
+        fs::write(&path, FILE_CONTENT).unwrap();
+        fs::set_permissions(&path, Permissions::from_mode(mode)).unwrap();
+        let (_lua, table) = native();
+        let (meta, error): (Option<Table>, Option<String>) =
+            call_async(&table, "checkout_files", vec![path]);
+        assert_eq!(error, None);
+        let meta: Table = meta.unwrap().get(1).unwrap();
+        assert!(meta.get::<bool>("regular").unwrap());
+        assert_eq!(meta.get::<bool>("executable").unwrap(), executable);
+    }
+
+    #[test]
+    fn ignored_worker_events_do_not_copy_payloads_into_lua() {
+        let (_lua, stream) = worker_stream();
+        let input = json!({ "type": "system", "subtype": "status", "message": {"content": "x".repeat(4096)} })
+            .to_string();
+        let (result, error): (Option<Table>, Option<String>) =
+            stream.call_method("feed", input).unwrap();
+        assert_eq!(error, None);
+        let event: Table = result.unwrap().get("event").unwrap();
+        assert_eq!(event.get::<String>("type").unwrap(), "system");
+        assert!(event.get::<Option<Table>>("message").unwrap().is_none());
+    }
+
+    #[test]
+    fn oversized_worker_events_return_a_bounded_error() {
+        let (_lua, stream) = worker_stream();
+        let (result, error): (Option<Table>, Option<String>) = stream
+            .call_method("feed", "x".repeat(MAX_EVENT_BYTES + 1))
+            .unwrap();
+        assert!(result.is_none());
+        let expected = WorkerError::EventTooLarge {
+            limit: MAX_EVENT_BYTES,
+        };
+        assert_eq!(error, Some(expected.to_string()));
+    }
+
+    #[test]
+    fn home_state_files_include_temporary_copies() {
+        let home = tempdir().unwrap();
+        let names =
+            ["", ".backup", ".tmp.42.random"].map(|suffix| format!("{HOME_STATE_PREFIX}{suffix}"));
+        for name in &names {
+            fs::write(home.path().join(name), "state").unwrap();
+        }
+        fs::write(home.path().join("unrelated"), "other").unwrap();
+        let (_lua, table) = native();
+        let (found, error): (Option<Vec<String>>, Option<String>) =
+            call_async(&table, "home_state_files", home.path());
+        assert_eq!(error, None);
+        let mut found = found.unwrap();
+        found.sort();
+        assert_eq!(found, names);
+    }
+
+    #[test_case(json!({}), "`deny`" ; "missing_deny_rules")]
+    #[test_case(json!({ "deny": [], "sandbox": {} }), "`deny_read`" ; "missing_sandbox_paths")]
+    #[test_case(json!({ "deny": [], "sandbox": { "deny_read": [], "allow_read": [], "allow_write": [], "disabled": true } }), "`disabled`" ; "unknown_sandbox_policy")]
+    fn worker_policy_requires_valid_input(policy: Value, field: &str) {
+        let (lua, table) = native();
+        let policy = json_to_lua(&lua, &policy).unwrap();
+        let error = table
+            .call_function::<LuaValue>("worker_policy", policy)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(field), "{error}");
+    }
+
+    #[test_case("" ; "checkout")]
+    #[test_case(NESTED ; "subdirectory")]
+    #[test_case(LINKED ; "symlink")]
+    fn checkout_git_directory_is_shared_across_spellings(path: &str) {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join(GIT_ENTRY)).unwrap();
+        fs::create_dir(root.path().join(NESTED)).unwrap();
+        symlink(root.path(), root.path().join(LINKED)).unwrap();
+        let (_lua, table) = native();
+        let (directory, error): (Option<String>, Option<String>) =
+            call_async(&table, "project_git_dir", root.path().join(path));
+        assert_eq!(error, None);
+        assert_eq!(
+            directory.unwrap(),
+            root.path()
+                .canonicalize()
+                .unwrap()
+                .join(GIT_ENTRY)
+                .to_str()
+                .unwrap()
+        );
+    }
+}

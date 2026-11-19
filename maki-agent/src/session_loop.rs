@@ -154,12 +154,12 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    use maki_providers::provider::{BoxFuture, Provider};
+    use maki_providers::provider::{BoxFuture, ModelListing, Provider, RequestScope};
     use maki_providers::{
         ContentBlock, ContextGauge, Model, ModelInfo, ProviderEvent, Role, StopReason,
         StreamResponse, TaskEnd,
     };
-    use maki_storage::id::{MakiId, SessionRef};
+    use maki_storage::id::MakiId;
     use serde_json::Value;
     use test_case::test_case;
     use tokio::sync::Notify;
@@ -210,7 +210,7 @@ mod tests {
             _: &'a Value,
             events: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 self.requests.lock().unwrap().push(messages.to_vec());
@@ -238,7 +238,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
     }

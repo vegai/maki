@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
 use std::time::{Duration, Instant};
 
-use common::{end_session, poll_until};
+use common::{WAIT, assistant_reply, end_session, environment, no_models, poll_until};
+#[cfg(unix)]
+use common::{group_gone, read_pid};
 use maki_agent::live_session::BACKGROUND_PLAN_WRITE_DENIED;
 use maki_agent::template::Vars;
 use maki_agent::tools::test_support::stub_seed;
@@ -36,15 +38,14 @@ use maki_lua::{
     PluginError, PluginHost, PluginPermissions, SKIPPED_PLUGIN_WARNING, SessionEndReason,
     UNDECLARED_REACH, UNPAID_REACH_ERR, WARM_TOOL_CAP, set_allowed_private_hosts,
 };
-use maki_providers::provider::{BoxFuture, Provider};
+use maki_providers::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use maki_providers::{
     AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
     StopReason, StreamResponse, ThinkingConfig, TokenUsage,
 };
 use maki_storage::id::{MakiId, SessionRef};
-#[cfg(unix)]
-use rustix::process::{Pid, test_kill_process_group};
 use serde_json::{Value, json};
+use test_case::test_case;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::unbounded_channel;
@@ -61,6 +62,15 @@ maki.ui.highlight = function()
     held:release()
 end
 "#;
+#[cfg(unix)]
+const JOB_THAT_COMPLETES: &str = "true";
+const JOB_THAT_WAITS: &str = "sleep 30";
+/// Generous for a job whose stdin is closed, which exits at once.
+#[cfg(unix)]
+const CLOSED_JOB_WAIT_MS: u64 = 5000;
+/// `chanclose` returned 1 and `cat` then exited 0 on EOF.
+#[cfg(unix)]
+const CLOSED_AND_EXITED: &str = "1:0";
 const NARGS_ERR: &str = r#"'nargs' must be 0, 1, "?", "*", or "+""#;
 const GLOBAL_PACK_ONLY_ERR: &str = "only available in the global init.lua";
 const USAGE_TOOL_NAME: &str = "usage_child";
@@ -310,6 +320,13 @@ const ALREADY_CALLED_ERR: &str = "already called";
 const UNKNOWN_FIELD_ERR: &str = "unknown field";
 const PERMISSION_DENIED_MSG: &str = "permission denied";
 const NOT_GRANTED: &str = "not granted for this plugin";
+const STDIN_MODE_ERR: &str = "jobstart: stdin must be \"pipe\" or \"null\"";
+const CHANCLOSE_STREAM_ERR: &str = "chanclose: you can close only \"stdin\"";
+const CHANSEND_DATA_ERR: &str = "chansend: data must be a string or a list";
+const GOT_BOOLEAN: &str = "boolean";
+const GOT_TABLE: &str = "table";
+const WANTS_FUNCTION: &str = "function";
+const OUT_OF_RANGE: &str = "out of range";
 
 #[test]
 fn stdlib_globals_accessible() {
@@ -329,7 +346,7 @@ fn dangerous_globals_blocked() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
-    for global in &["io", "package"] {
+    for global in &["io", "package", "getfenv", "setfenv"] {
         let source =
             format!(r#"if {global} ~= nil then error("sandbox leak: {global} is not nil") end"#);
         host.load_source(&format!("sandbox_check_{global}"), &source)
@@ -2280,7 +2297,7 @@ fn live_click_reaches_running_tool() {
                 buf:on("click", function()
                     ctx:finish("{CLICKED_MSG}")
                 end)
-                maki.fn.jobstart("sleep 30", {{}})
+                maki.fn.jobstart("{JOB_THAT_WAITS}", {{}})
             end
         }})"#,
     );
@@ -2312,7 +2329,7 @@ fn live_click_routes_to_root_buf_among_many() {
                 local root = maki.ui.buf()
                 root:on("click", function() ctx:finish("{ROOT_MSG}") end)
                 ctx:live_buf(root)
-                maki.fn.jobstart("sleep 30", {{}})
+                maki.fn.jobstart("{JOB_THAT_WAITS}", {{}})
             end
         }})"#,
     );
@@ -2956,18 +2973,9 @@ maki.api.register_tool({{
     );
     std::fs::write(&gate, "").unwrap();
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let state = exec_tool(&reg, "plugin_job_state", json!({})).unwrap();
-        if state == "plugin-output/7" {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "plugin-owned callbacks did not run: {state}"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    poll_until("plugin-owned callbacks did not run", || {
+        (exec_tool(&reg, "plugin_job_state", json!({})).unwrap() == "plugin-output/7").then_some(())
+    });
 }
 
 #[cfg(unix)]
@@ -2977,42 +2985,22 @@ fn unloading_plugin_kills_its_jobs() {
     let dir = tempfile::tempdir().unwrap();
     let pid_path = dir.path().join("job.pid");
     let src = format!(
-        r#"maki.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{
+        r#"maki.fn.jobstart("printf %s $$ > '{}'; exec {JOB_THAT_WAITS}", {{
             scope = "plugin",
         }})"#,
         pid_path.display()
     );
     host.load_source("plugin_job", &src).unwrap();
 
-    // The shell creates the redirect target before printf writes to it,
-    // so poll until the file holds a parseable pid, not until it exists.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let pid = loop {
-        if let Ok(pid) = std::fs::read_to_string(&pid_path)
-            .unwrap_or_default()
-            .parse::<i32>()
-        {
-            break pid;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "plugin job did not publish its process id"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let pid = Pid::from_raw(pid).unwrap();
-    assert!(test_kill_process_group(pid).is_ok());
+    let pid = read_pid(&pid_path);
+    assert!(!group_gone(pid, Duration::ZERO));
 
     host.unload("plugin_job").unwrap();
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while test_kill_process_group(pid).is_ok() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "plugin process group survived unload"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    assert!(
+        group_gone(pid, WAIT),
+        "plugin process group survived unload"
+    );
 }
 
 /// The shell exits at once and leaves `sleep` holding the pipe, so the direct
@@ -3025,38 +3013,21 @@ fn unloading_plugin_kills_a_job_whose_shell_already_exited() {
     let dir = tempfile::tempdir().unwrap();
     let pid_path = dir.path().join("group.pid");
     let src = format!(
-        r#"maki.fn.jobstart("sleep 30 & printf %s $$ > '{}'", {{
+        r#"maki.fn.jobstart("{JOB_THAT_WAITS} & printf %s $$ > '{}'", {{
             scope = "plugin",
         }})"#,
         pid_path.display()
     );
     host.load_source("plugin_job", &src).unwrap();
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let pid = loop {
-        if let Ok(pid) = std::fs::read_to_string(&pid_path)
-            .unwrap_or_default()
-            .parse::<i32>()
-        {
-            break Pid::from_raw(pid).unwrap();
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "plugin job did not publish its process group"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    };
+    let pid = read_pid(&pid_path);
 
     host.unload("plugin_job").unwrap();
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while test_kill_process_group(pid).is_ok() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "backgrounded process survived unload"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    assert!(
+        group_gone(pid, WAIT),
+        "backgrounded process survived unload"
+    );
 }
 
 #[test]
@@ -3072,7 +3043,7 @@ maki.api.register_tool({{
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function()
-        job_id = maki.fn.jobstart("printf 'hello-tail\n'; exec sleep 30", {{
+        job_id = maki.fn.jobstart("printf 'hello-tail\n'; exec {JOB_THAT_WAITS}", {{
             scope = "plugin",
             tail = 8,
         }})
@@ -3114,18 +3085,10 @@ maki.api.register_tool({{
     host.load_source("job_inspect", &src).unwrap();
     let _id = exec_tool(&reg, "start_listed_job", json!({})).unwrap();
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let state = loop {
+    let state = poll_until("jobinfo never saw the live job", || {
         let state = exec_tool(&reg, "inspect_listed_job", json!({})).unwrap();
-        if state.starts_with("running|") && state.contains("hello-tail") {
-            break state;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "jobinfo never saw the live job: {state}"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    };
+        (state.starts_with("running|") && state.contains("hello-tail")).then_some(state)
+    });
     assert!(
         state.contains("|true|"),
         "joblist should include the live job, got {state}"
@@ -3152,7 +3115,7 @@ maki.api.register_tool({{
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function()
-        local id = maki.fn.jobstart("printf %s $$ > '{pid}'; exec sleep 30", {{
+        local id = maki.fn.jobstart("printf %s $$ > '{pid}'; exec {JOB_THAT_WAITS}", {{
             scope = {{ session = "{sid}" }},
         }})
         return tostring(id)
@@ -3164,29 +3127,10 @@ maki.api.register_tool({{
     );
     host.load_source("session_job", &src).unwrap();
     let id = exec_tool(&reg, "start_session_job", json!({})).unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let pid = loop {
-        if let Ok(pid) = std::fs::read_to_string(&pid_path)
-            .unwrap_or_default()
-            .parse::<i32>()
-        {
-            break pid;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "session job did not publish its process id"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let pid = Pid::from_raw(pid).unwrap();
-    assert!(test_kill_process_group(pid).is_ok());
+    let pid = read_pid(&pid_path);
+    assert!(!group_gone(pid, Duration::ZERO));
 
     host.unload("session_job").unwrap();
-    std::thread::sleep(Duration::from_millis(50));
-    assert!(
-        test_kill_process_group(pid).is_ok(),
-        "session-owned job must survive plugin unload"
-    );
 
     let inspect = format!(
         r#"
@@ -3211,14 +3155,10 @@ maki.api.register_tool({{
     );
 
     end_session(&host, session, SessionEndReason::Shutdown);
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while test_kill_process_group(pid).is_ok() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "end_session must kill the session job"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    assert!(
+        group_gone(pid, WAIT),
+        "end_session must kill the session job"
+    );
 }
 
 #[cfg(unix)]
@@ -3470,7 +3410,9 @@ maki.api.register_tool({{
             }}
         )
         maki.fn.jobwait(first)
-        maki.fn.jobstart("echo > '{gate}'")
+        maki.async.spawn(function()
+            maki.fn.jobstart("echo > '{gate}'", {{ scope = "plugin" }})
+        end)
         local got = maki.fn.jobwait(second)
         return got.stdout .. ":" .. tostring(got.truncated)
     end,
@@ -3483,6 +3425,98 @@ maki.api.register_tool({{
         exec_tool(&reg, "wait_in_turn", json!({})).unwrap(),
         expected
     );
+}
+
+#[cfg(unix)]
+#[test_case(false ; "completed")]
+#[test_case(true ; "timed_out")]
+fn jobwait_and_reattached_callbacks_preserve_timeout_status(timed_out: bool) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let session = MakiId::generate();
+    let _mailbox = SessionMailbox::register(session);
+    let command = if timed_out {
+        JOB_THAT_WAITS
+    } else {
+        JOB_THAT_COMPLETES
+    };
+    let timeout = if timed_out { "0" } else { "nil" };
+    let source = format!(
+        r#"
+maki.api.register_tool({{
+    name = "wait_timeout",
+    description = "timeout status survives waiting and reattachment",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local original
+        local id = maki.fn.jobstart("{command}", {{
+            scope = {{ session = "{session}" }},
+            timeout_ms = {timeout},
+            on_exit = function(_, _, _, expired) original = expired end,
+        }})
+        local first = assert(maki.fn.jobwait(id))
+        local second = assert(maki.fn.jobwait(id))
+        local replay = maki.async.await(1, function(done)
+            assert(maki.fn.jobattach(id, {{
+                on_exit = function(_, _, _, expired) done(expired) end,
+            }}))
+        end)
+        return table.concat({{
+            tostring(first.timed_out), tostring(second.timed_out),
+            tostring(original), tostring(replay),
+            tostring(assert(maki.fn.jobinfo(id)).timed_out),
+            tostring(assert(maki.fn.joblist("{session}"))[1].timed_out),
+        }}, ":")
+    end,
+}})
+"#
+    );
+    host.load_source("deadline", &source).unwrap();
+    let expected = [timed_out; 6].map(|expired| expired.to_string()).join(":");
+    assert_eq!(
+        exec_tool(&reg, "wait_timeout", json!({})).unwrap(),
+        expected
+    );
+    end_session(&host, session, SessionEndReason::Shutdown);
+}
+
+/// A stdin mode, stream, payload or job option that a job cannot use is an
+/// error, and valid options pass.
+#[test_case(r#"maki.fn.jobstart("true", { stdin = "file" })"#, Some(STDIN_MODE_ERR) ; "an_unknown_stdin_mode")]
+#[test_case(r#"maki.fn.chanclose(1, "stdout")"#, Some(CHANCLOSE_STREAM_ERR) ; "closing_stdout")]
+#[test_case("maki.fn.chansend(1, 42)", Some(CHANSEND_DATA_ERR) ; "a_number_to_send")]
+#[test_case(r#"maki.fn.jobstart("true", { env = false })"#, Some(GOT_BOOLEAN) ; "boolean_env")]
+#[test_case(r#"maki.fn.jobstart("true", { env = { SECRET = {} } })"#, Some(GOT_TABLE) ; "table_value")]
+#[test_case(r#"maki.fn.jobstart("true", { env = { SECRET = false } })"#, Some(GOT_BOOLEAN) ; "boolean_value")]
+#[test_case(r#"maki.fn.jobstart("true", { cwd = false })"#, Some(GOT_BOOLEAN) ; "boolean_cwd")]
+#[test_case(r#"maki.fn.jobstart("true", { cwd = {} })"#, Some(GOT_TABLE) ; "table_cwd")]
+#[test_case(r#"maki.fn.jobstart("true", { tail = false })"#, Some(GOT_BOOLEAN) ; "boolean_tail")]
+#[test_case(r#"maki.fn.jobstart("true", { tail = {} })"#, Some(GOT_TABLE) ; "table_tail")]
+#[test_case(r#"maki.fn.jobstart("true", { tail = -1 })"#, Some(OUT_OF_RANGE) ; "negative_tail")]
+#[test_case(r#"maki.fn.jobstart("true", { tail = 1.5 })"#, Some(OUT_OF_RANGE) ; "fractional_tail")]
+#[test_case(r#"maki.fn.jobstart("true", { on_stdout = false })"#, Some(GOT_BOOLEAN) ; "boolean_stdout_callback")]
+#[test_case(r#"maki.fn.jobstart("true", { on_stderr = {} })"#, Some(GOT_TABLE) ; "table_stderr_callback")]
+#[test_case(r#"maki.fn.jobstart("true", { on_exit = 42 })"#, Some(WANTS_FUNCTION) ; "numeric_exit_callback")]
+#[test_case(r#"maki.fn.jobstart("true", { env = {}, tail = 0, on_exit = function() end })"#, None ; "valid_options")]
+fn job_input_is_checked(call: &str, expected: Option<&str>) {
+    const TOOL: &str = "job_input";
+    let mut perms = PluginPermissions::denied();
+    perms.set(Permission::Run, true);
+    let source = perm_tool_src(
+        TOOL,
+        &format!(
+            r#"local ok, err = pcall(function() return assert({call}) end)
+        return tostring(ok) .. ":" .. tostring(err)"#,
+        ),
+    );
+    let result = exec_tool_with_perms(perms, &source, TOOL, json!({})).unwrap();
+    if let Some(expected) = expected {
+        assert!(result.starts_with("false:"), "{result}");
+        assert!(result.contains(expected), "{result}");
+    } else {
+        assert!(result.starts_with("true:"), "{result}");
+    }
 }
 
 /// `run` on its own is enough to start a job, but pointing a stream at a path
@@ -3523,8 +3557,16 @@ maki.api.register_tool({{
     audiences = {{ "main" }},
     handler = function()
         local opts = {{ scope = {{ session = "{sid}" }}, name = "{JOB_NAME}" }}
-        local id = maki.fn.jobstart("exec sleep 30", opts)
-        local _, err = pcall(maki.fn.jobstart, "exec sleep 30", opts)
+        local function start()
+            local id, err = maki.fn.jobstart("exec {JOB_THAT_WAITS}", opts)
+            return {{ id = id, err = err }}
+        end
+        local results = maki.async.gather({{ start, start }})
+        local id, err
+        for _, result in ipairs(results) do
+            assert(result.ok, result.err)
+            if result.value.id then id = result.value.id else err = result.value.err end
+        end
         return tostring(id) .. "|" .. tostring(err)
     end,
 }})
@@ -3577,7 +3619,7 @@ maki.api.register_tool({{
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function()
-        job_id = maki.fn.jobstart("printf %s $$ > '{pid}'; exec sleep 30", {{
+        job_id = maki.fn.jobstart("printf %s $$ > '{pid}'; exec {JOB_THAT_WAITS}", {{
             scope = {{ session = "{sid}" }},
         }})
         return tostring(job_id)
@@ -3611,22 +3653,8 @@ local seen
     host.load_source("order_probe", &src).unwrap();
     exec_tool(&reg, "start_order_job", json!({})).unwrap();
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let pid = loop {
-        if let Ok(pid) = std::fs::read_to_string(&pid_path)
-            .unwrap_or_default()
-            .parse::<i32>()
-        {
-            break pid;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "session job did not publish its process id"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let pid = Pid::from_raw(pid).unwrap();
-    assert!(test_kill_process_group(pid).is_ok());
+    let pid = read_pid(&pid_path);
+    assert!(!group_gone(pid, Duration::ZERO));
 
     end_session(&host, session, SessionEndReason::Shutdown);
 
@@ -3638,14 +3666,10 @@ local seen
         "SessionEnd handler should see the live job, got {seen}"
     );
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while test_kill_process_group(pid).is_ok() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "end_session must reap the job after dispatching SessionEnd"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    assert!(
+        group_gone(pid, WAIT),
+        "end_session must reap the job after dispatching SessionEnd"
+    );
 }
 
 #[test]
@@ -3658,13 +3682,14 @@ local job
 seen = "unset"
 maki.api.create_autocmd("ProbeIsolation", {{
     callback = function()
-        job = maki.fn.jobstart("sleep 30")
+        job = maki.fn.jobstart("{JOB_THAT_WAITS}")
     end,
 }})
 maki.api.create_autocmd("ProbeIsolation", {{
     callback = function()
         local info = job and maki.fn.jobinfo(job) or nil
         seen = info and ("alive:" .. info.status) or "{GONE}"
+        maki.ui.flash("{GONE}")
     end,
 }})
 maki.api.register_tool({{
@@ -3682,9 +3707,11 @@ maki.api.register_tool({{
 
     fire_autocmd(&host.event_handle(), "ProbeIsolation", json!({}));
 
-    // FireAutocmd and CallTool queue on the same channel and dispatch is
-    // awaited in order, so the second handler has already run here. A shared
-    // batch scope would report the first handler's job as alive.
+    let mut ui = host.take_ui_action_rx().unwrap();
+    while !matches!(
+        wait_next(&mut ui, WAIT).expect("the second autocmd callback did not finish"),
+        maki_lua::UiAction::Flash(msg) if msg == GONE
+    ) {}
     assert_eq!(exec_tool(&reg, "probe_isolation", json!({})).unwrap(), GONE);
 }
 
@@ -4240,6 +4267,22 @@ fn register_options_rejects_bad_spec(src: &str, expected: &str) {
     assert!(err.to_string().contains(expected), "got: {err}");
 }
 
+/// A failed plugin load must remove its registered options so the provider cannot mistake it
+/// for a loaded plugin. The same options without the error are listed.
+#[test_case("", true ; "a_loaded_plugin_is_listed")]
+#[test_case(r#"error("an error after the options")"#, false ; "a_failed_plugin_is_not")]
+fn a_plugin_that_fails_after_declaring_options_is_not_listed(tail: &str, listed: bool) {
+    const PLUGIN: &str = "fails_late";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let loaded = host.load_source(
+        PLUGIN,
+        &format!(r#"maki.api.register_options({{ a = {{ default = 1, desc = "A." }} }}) {tail}"#),
+    );
+    assert_eq!(loaded.is_ok(), listed, "{loaded:?}");
+    assert_eq!(host.plugin_options().unwrap().contains_key(PLUGIN), listed);
+}
+
 #[test]
 fn builtin_opts_flow_from_setup_plugins() {
     let reg = fresh_registry();
@@ -4294,7 +4337,7 @@ fn websearch_provider_option_selects_the_backend(provider: &str, expected: &str)
 /// model guessing, so the missing key is named before anything goes out.
 #[test]
 fn websearch_kagi_without_key_names_the_env_var() {
-    unsafe { std::env::remove_var(KAGI_KEY_ENV) };
+    environment::remove(KAGI_KEY_ENV);
     let (reg, _host) = builtins_host_with(&websearch_config("kagi"));
     let err = exec_tool(&reg, "websearch", json!({ "query": "rust" }))
         .expect_err("a keyless kagi search must fail");
@@ -5701,7 +5744,7 @@ fn ctx_set_deadline_times_out() {
             audiences = {{ "main" }},
             handler = function(input, ctx)
                 ctx:set_deadline(2)
-                maki.fn.jobstart("sleep 30", {{
+                maki.fn.jobstart("{JOB_THAT_WAITS}", {{
                     on_exit = function(_, _) ctx:finish("should-not-reach") end,
                 }})
                 return nil
@@ -5765,22 +5808,6 @@ fn ctx_set_deadline_twice_errors() {
 const CANCEL_TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 const PARKED_DEADLINE_REPLY: &str = "partial: timeout";
-const PARKED_DEADLINE_PLUGIN: &str = r#"
-maki.api.register_tool({
-    name = "parked_deadline",
-    description = "parks past its deadline, finishing from its cancel hook",
-    schema = { type = "object", properties = {}, additionalProperties = false },
-    audiences = { "main" },
-    handler = function(input, ctx)
-        ctx:set_deadline(1)
-        maki.async.on_cancel(function(reason)
-            ctx:finish({ llm_output = "partial: " .. reason, is_error = true })
-        end)
-        maki.fn.jobwait(maki.fn.jobstart("sleep 30"))
-        return "unreachable"
-    end,
-})
-"#;
 
 /// A handler parked in an await runs no Lua when its deadline lapses, so the
 /// host is what ends it, by raising inside the await. Its cancel hooks still
@@ -5791,8 +5818,25 @@ maki.api.register_tool({
 fn parked_handler_reports_its_hook_finish_reply_on_deadline() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_source("parked_deadline_plugin", PARKED_DEADLINE_PLUGIN)
-        .unwrap();
+    let source = format!(
+        r#"
+maki.api.register_tool({{
+    name = "parked_deadline",
+    description = "parks past its deadline, finishing from its cancel hook",
+    schema = {{ type = "object", properties = {{}}, additionalProperties = false }},
+    audiences = {{ "main" }},
+    handler = function(input, ctx)
+        ctx:set_deadline(1)
+        maki.async.on_cancel(function(reason)
+            ctx:finish({{ llm_output = "partial: " .. reason, is_error = true }})
+        end)
+        maki.fn.jobwait(maki.fn.jobstart("{JOB_THAT_WAITS}"))
+        return "unreachable"
+    end,
+}})
+"#
+    );
+    host.load_source("parked_deadline_plugin", &source).unwrap();
 
     let result = exec_tool(&reg, "parked_deadline", json!({}));
 
@@ -6141,6 +6185,20 @@ fn perm_tool_src(name: &str, handler_body: &str) -> String {
     "agent"
     ; "agent_denied_for_session_prompt"
 )]
+#[test_case::test_case(
+    "chansend_deny",
+    r#"local ok, err = pcall(function() maki.fn.chansend(1, "x") end)
+                return tostring(err)"#,
+    "run"
+    ; "chansend_denied"
+)]
+#[test_case::test_case(
+    "chanclose_deny",
+    r#"local ok, err = pcall(function() maki.fn.chanclose(1) end)
+                return tostring(err)"#,
+    "run"
+    ; "chanclose_denied"
+)]
 fn denied_permission_blocks_api(tool_name: &str, handler_body: &str, expected_perm: &str) {
     let src = perm_tool_src(tool_name, handler_body);
     let result = exec_tool_with_perms(
@@ -6213,6 +6271,26 @@ fn session_metadata_needs_no_permission(call: &str) {
     assert!(result.starts_with("true:"), "got: {result}");
 }
 
+/// `chanclose` returns what `vim.fn.chanclose` returns, so a call written for
+/// Neovim can check it.
+#[cfg(unix)]
+#[test]
+fn chanclose_returns_one_like_neovim() {
+    let src = perm_tool_src(
+        "chanclose_value",
+        &format!(
+            r#"local id = maki.fn.jobstart({{ "cat" }}, {{ stdin = "pipe" }})
+                local closed = maki.fn.chanclose(id, "stdin")
+                local res = maki.fn.jobwait(id, {CLOSED_JOB_WAIT_MS})
+                return tostring(closed) .. ":" .. tostring(res and res.exit_code)"#
+        ),
+    );
+    let mut perms = PluginPermissions::denied();
+    perms.set(Permission::Run, true);
+    let result = exec_tool_with_perms(perms, &src, "chanclose_value", json!({})).unwrap();
+    assert_eq!(result, CLOSED_AND_EXITED);
+}
+
 #[test]
 fn user_plugin_with_fs_read_can_read_but_not_write() {
     let src = perm_tool_src(
@@ -6228,12 +6306,15 @@ fn user_plugin_with_fs_read_can_read_but_not_write() {
     assert!(result.contains("write=false"), "got: {result}");
 }
 
-/// Locating maki's own directories, or a program on `$PATH`, answers where a
-/// file lives and never what the environment holds. `fs_read` is what these
-/// cost, and it is also what they need, so `env` stays the key to the process
-/// environment alone.
+/// These calls locate maki's directories, a program on `$PATH` or the
+/// session's directory, or read the instruction files there. They reveal
+/// file locations or contents rather than the environment, so they need
+/// `fs_read`, and `env` stays reserved for the process environment.
 #[test_case::test_case("maki.env.state_dir()" ; "state_dir")]
 #[test_case::test_case(r#"maki.fn.executable("ls")"# ; "executable")]
+#[test_case::test_case("maki.agent.cwd(ctx)" ; "session_dir")]
+#[test_case::test_case("maki.agent.instructions(ctx)" ; "session_instructions")]
+#[test_case::test_case(r#"maki.agent.system_prompt(ctx, { prompt_id = "research", instructions = true })"# ; "system_prompt_instructions")]
 fn location_queries_cost_fs_read(call: &str) {
     const TOOL: &str = "location_test";
     let src = perm_tool_src(
@@ -6258,6 +6339,23 @@ fn location_queries_cost_fs_read(call: &str) {
     .unwrap();
     assert!(refused.contains(PERMISSION_DENIED_MSG), "got: {refused}");
     assert!(refused.contains("fs_read"), "got: {refused}");
+}
+
+#[test_case("nil" ; "omitted_instructions")]
+#[test_case("false" ; "no_instructions")]
+#[test_case(r#""supplied instructions""# ; "provided_text")]
+fn system_prompts_without_file_reads_do_not_need_fs_read(instructions: &str) {
+    const TOOL: &str = "prompt_test";
+    let src = perm_tool_src(
+        TOOL,
+        &format!(
+            r#"return assert(maki.agent.system_prompt(ctx, {{ prompt_id = "research", instructions = {instructions} }}))"#
+        ),
+    );
+    let mut perms = PluginPermissions::denied();
+    perms.set(Permission::Agent, true);
+    let prompt = exec_tool_with_perms(perms, &src, TOOL, json!({})).unwrap();
+    assert!(!prompt.trim().is_empty());
 }
 
 const PATH_FIELD_SCHEMA: &str = r#"{
@@ -7490,7 +7588,7 @@ maki.api.register_tool({{
         -- jobwait checks the job's output channel out of the store, so only
         -- a parked jobwait can run this callback. The marker is proof the
         -- wait is really parked, where a sleep would just be a guess.
-        local id = maki.fn.jobstart("echo parked; exec sleep 30", {{
+        local id = maki.fn.jobstart("echo parked; exec {JOB_THAT_WAITS}", {{
             scope = {{ session = "{session}" }},
             on_stdout = function() maki.fs.write("{parked}", "parked") end,
         }})
@@ -8217,7 +8315,7 @@ impl Provider for TurnThenPark {
         _: &'a Value,
         _: &'a UnboundedSender<ProviderEvent>,
         _: RequestOptions,
-        _: Option<&'a SessionRef>,
+        _: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         if self.billed.swap(true, Ordering::SeqCst) {
             let _ = self.parked.send(());
@@ -8225,27 +8323,23 @@ impl Provider for TurnThenPark {
         }
         Box::pin(async {
             Ok(StreamResponse {
-                message: Message {
-                    role: Role::Assistant,
-                    content: vec![ContentBlock::tool_use(
-                        PAID_TOOL_USE_ID,
-                        PAID_TOOL_NAME,
-                        json!({}),
-                    )],
-                    ..Default::default()
-                },
                 usage: TokenUsage {
                     input: PAID_TURN_INPUT,
                     ..Default::default()
                 },
-                stop_reason: Some(StopReason::ToolUse),
-                input_transformations: Vec::new(),
+                ..assistant_reply(
+                    ContentBlock::tool_use(PAID_TOOL_USE_ID, PAID_TOOL_NAME, json!({})),
+                    StopReason::ToolUse,
+                )
             })
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { Ok(Vec::new()) })
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        no_models()
     }
 }
 
@@ -8612,7 +8706,7 @@ impl Provider for OptsRecorder {
         _: &'a Value,
         _: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
-        _: Option<&'a SessionRef>,
+        _: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         let _ = self.0.send(opts);
         Box::pin(async {
@@ -8623,8 +8717,11 @@ impl Provider for OptsRecorder {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { Ok(Vec::new()) })
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        no_models()
     }
 }
 
@@ -8746,7 +8843,7 @@ impl Provider for CallOnce {
         _: &'a Value,
         _: &'a UnboundedSender<ProviderEvent>,
         _: RequestOptions,
-        _: Option<&'a SessionRef>,
+        _: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         let _ = self.requests.send(messages.to_vec());
         let (block, stop) = if self.asked.swap(true, Ordering::SeqCst) {
@@ -8762,22 +8859,14 @@ impl Provider for CallOnce {
                 StopReason::ToolUse,
             )
         };
-        Box::pin(async move {
-            Ok(StreamResponse {
-                message: Message {
-                    role: Role::Assistant,
-                    content: vec![block],
-                    ..Default::default()
-                },
-                usage: TokenUsage::default(),
-                stop_reason: Some(stop),
-                input_transformations: Vec::new(),
-            })
-        })
+        Box::pin(async move { Ok(assistant_reply(block, stop)) })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { Ok(Vec::new()) })
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        no_models()
     }
 }
 
@@ -8795,15 +8884,21 @@ fn tool_result_text(request: &[Message]) -> &str {
 /// Plan mode used to reach background sessions as is. The plan prompt landed in
 /// a monitor's history, and the plan file was the one file it could write
 /// without asking. We aim at the plan file because that was the hole.
-#[test]
-fn background_session_never_plans_and_cannot_write_while_the_chat_does() {
+#[test_case(false ; "ordinary_parent")]
+#[test_case(true ; "capped_parent_does_not_cap_child")]
+fn background_session_never_plans_and_cannot_write_while_the_chat_does(capped: bool) {
     let dir = tempfile::TempDir::new().unwrap();
     let plan = dir.path().join(PLAN_FILE);
     let reg = Arc::clone(ToolRegistry::global_arc());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let session = MakiId::generate();
     let mailbox = SessionMailbox::register(session);
-    let seed = mailbox.publish_seed(stub_seed(session));
+    let mut seed = stub_seed(session);
+    if capped {
+        seed.config.max_turns = Some(1);
+        seed.config.final_answer = true;
+    }
+    let seed = mailbox.publish_seed(seed);
     let requests = CallOnce::install(
         &seed,
         SCRIBBLE_TOOL,
@@ -9097,6 +9192,7 @@ fn a_ctx_session_pays_for_reach_whoever_could_answer(answerable: bool) {
         .parse(&json!({}))
         .unwrap();
     let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.registry = Arc::clone(&reg);
     let (_answer_tx, answer_rx) = unbounded_channel::<String>();
     ctx.user_response_rx = answerable.then(|| Arc::new(tokio::sync::Mutex::new(answer_rx)));
 

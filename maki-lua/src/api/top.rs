@@ -7,14 +7,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use maki_lua_macro::{lua_class, lua_fn, lua_table};
+use maki_lua_macro::{lua_class, lua_fn, lua_table, lua_value};
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
+use crate::api::util::callback::call_inline;
 use crate::api::util::command::{UiAction, ui_send};
 use crate::api::util::convert::TableExt;
-use crate::docs::FnDoc;
 use crate::plugin_permissions::Ceiling;
 use crate::runtime::{DeferQueue, DeferredCallback};
 
@@ -144,7 +144,7 @@ fn notify(
     });
     if let Some(func) = handler_fn {
         // A broken override must not swallow the message, so fall through.
-        match func.call::<()>((msg.clone(), level.clone(), opts)) {
+        match call_inline(lua, func, (msg.clone(), level.clone(), opts)) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 tracing::warn!(error = %e, "maki.notify handler failed; falling through to flash");
@@ -275,28 +275,26 @@ impl DeepCopy<'_> {
     }
 }
 
-#[allow(non_upper_case_globals)]
-const NIL__doc: FnDoc = FnDoc {
-    name: "NIL",
-    args: "",
-    desc: "`maki.NIL` is a value that stands for JSON null, like `vim.NIL`. \
-`maki.json.decode` returns it for every null unless `luanil` says otherwise. \
-Every conversion to JSON turns it back into null. So a decode, change, \
-encode pass loses no key. It is truthy and not equal to nil, so test \
-`x == maki.NIL` for null. Tool handler arguments and event payloads use nil \
-for null instead, never `maki.NIL`.",
-    params: &[],
-    returns: "",
-    guard: None,
-    value: true,
-    example: "local t = maki.json.decode('{\"a\": null}')\nassert(t.a == maki.NIL)\nprint(maki.json.encode(t)) -- {\"a\":null}",
-};
+/// `maki.NIL` is a value that stands for JSON null, like `vim.NIL`.
+/// `maki.json.decode` returns it for every null unless `luanil` says otherwise.
+/// Every conversion to JSON turns it back into null. So a decode, change,
+/// encode pass loses no key. It is truthy and not equal to nil, so test
+/// `x == maki.NIL` for null. Tool handler arguments and event payloads use nil
+/// for null instead, never `maki.NIL`.
+/// @example
+/// local t = maki.json.decode('{"a": null}')
+/// assert(t.a == maki.NIL)
+/// print(maki.json.encode(t)) -- {"a":null}
+#[lua_value(name = "NIL")]
+fn nil(_lua: &Lua) -> LuaResult<Value> {
+    Ok(Value::NULL)
+}
 
 lua_table! {
     extend "maki" => pub(crate) fn add_top_methods(
         plugin: Arc<str>,
     ), DOCS [
-        defer_fn(plugin), manual notify, set_notify_handler(plugin), deepcopy, manual NIL,
+        defer_fn(plugin), manual notify, set_notify_handler(plugin), deepcopy, nil,
     ]
 }
 
@@ -311,6 +309,8 @@ mod tests {
 
     const BY_FUNCTION: &str = "maki.set_notify_handler(function(msg) seen = msg end)";
     const BY_ASSIGNMENT: &str = "maki.notify = function(msg) seen = msg end";
+    const CALLER_SECRET: &str = "private-table";
+    const STACK_LEVELS: usize = 8;
 
     /// Builds one plugin's `maki` table under the global {plugin}, wired the
     /// way `create_maki_global` wires it: `notify` on the metatable's
@@ -349,6 +349,8 @@ mod tests {
 
     #[test_case("" ; "no handler installed")]
     #[test_case("maki.set_notify_handler(function() end) maki.set_notify_handler(nil)" ; "handler removed again")]
+    #[test_case("maki.set_notify_handler(function() error('broken handler') end)" ; "a_broken_handler")]
+    #[test_case("maki.set_notify_handler(function() coroutine.yield() end)" ; "a_yielding_handler")]
     fn notify_falls_back_to_flash(prelude: &str) {
         let lua = Lua::new();
         let (tx, mut rx) = unbounded_channel();
@@ -402,6 +404,45 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!(seen, "from the other plugin");
+    }
+
+    #[test]
+    fn notify_handlers_cannot_read_the_callers_environment() {
+        let lua = Lua::new();
+        lua.sandbox(true).unwrap();
+        install(&lua, None, "maki");
+        let observer = lua.create_table().unwrap();
+        let meta = lua.create_table().unwrap();
+        meta.set("__index", lua.globals()).unwrap();
+        observer.set_metatable(Some(meta.clone())).unwrap();
+        lua.load(format!(
+            r#"
+            maki.set_notify_handler(function()
+                for level = 1, {STACK_LEVELS} do
+                    local ok, env = pcall(getfenv, level)
+                    if ok and env.secret then stolen = env.secret end
+                end
+                notified = true
+            end)
+        "#
+        ))
+        .set_environment(observer.clone())
+        .exec()
+        .unwrap();
+        let caller = lua.create_table().unwrap();
+        caller.set_metatable(Some(meta)).unwrap();
+        caller.set("secret", CALLER_SECRET).unwrap();
+        let function = lua
+            .load(r#"maki.notify("hello")"#)
+            .set_environment(caller)
+            .into_function()
+            .unwrap();
+        lua.create_thread(function)
+            .unwrap()
+            .resume::<()>(())
+            .unwrap();
+        assert!(observer.get::<bool>("notified").unwrap());
+        assert!(observer.get::<Option<String>>("stolen").unwrap().is_none());
     }
 
     /// The handler closes over an env that dies with its plugin, so unloading

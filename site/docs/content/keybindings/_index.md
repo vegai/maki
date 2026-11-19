@@ -91,6 +91,7 @@ Some pickers add extra bindings on top of the defaults:
 | Model Picker | `!/@/#/$` | Set tier (strong/medium/weak/compaction) |
 | Model Picker | `%` | Fold or unfold provider |
 | Model Picker | `*` | Fold or unfold all providers |
+| Model Picker | `Ctrl+R` | Refresh available models |
 | Session Picker | `Ctrl+N` | New session |
 | Session Picker | `Ctrl+R` | Rename session |
 | Session Picker | `Ctrl+D` | Delete session (press twice) |

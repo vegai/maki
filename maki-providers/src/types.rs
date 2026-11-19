@@ -853,6 +853,9 @@ impl TitleSource for Message {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum ProviderEvent {
+    Waiting {
+        message: Option<String>,
+    },
     TextDelta {
         text: String,
     },
@@ -966,7 +969,7 @@ fn version_number(token: &str) -> Option<u32> {
 /// version check, not an allowlist, so future releases and new families work
 /// automatically. Reads the id, not the provider, so a gateway serving Claude
 /// is covered too.
-fn requires_adaptive(model_id: &str) -> bool {
+pub(crate) fn requires_adaptive(model_id: &str) -> bool {
     claude_version(model_id).is_some_and(|(family, version)| {
         let since = if family == OPUS {
             ADAPTIVE_SINCE_OPUS

@@ -2,7 +2,6 @@ use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
 use futures::future::join_all;
-use maki_storage::id::SessionRef;
 use reqwest::header::HeaderMap;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -13,7 +12,7 @@ use maki_config::providers::{Protocol, ProvidersConfig};
 
 use crate::model::{Model, ModelEffort, ModelInfo, ModelPricing};
 use crate::model_registry;
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use crate::types::ThinkingFallback;
 use crate::{
     AgentError, Effort, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
@@ -156,7 +155,7 @@ impl Provider for LocalEndpoint {
         tools: &'a Value,
         event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
@@ -194,7 +193,10 @@ impl Provider for LocalEndpoint {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
             match self.discovery_mode {
@@ -862,6 +864,8 @@ mod tests {
         use test_case::test_case;
         use tokio::sync::mpsc::unbounded_channel;
 
+        use crate::test_support::detached_scope;
+
         use super::super::*;
         use crate::Timeouts;
         use crate::test_support::{Canned, serve};
@@ -888,7 +892,7 @@ mod tests {
                     &json!([]),
                     &tx,
                     RequestOptions::default(),
-                    None,
+                    detached_scope(),
                 )
                 .await;
 
@@ -1366,7 +1370,7 @@ mod tests {
         #[tokio::test]
         async fn discovery_prefers_the_served_window(script: &'static [Canned], expected: u32) {
             let (ep, _) = endpoint(&OLLAMA, script);
-            let models = ep.list_models().await.unwrap();
+            let models = ep.list_models(ModelListing::Cached).await.unwrap();
 
             assert_eq!(models[0].context_window, Some(expected));
         }

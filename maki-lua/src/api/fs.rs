@@ -1,18 +1,30 @@
 use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, FileType};
+#[cfg(unix)]
+use std::fs::Permissions;
+use std::fs::{self, File, FileType, TryLockError};
 use std::io::{
     BufRead, BufReader, Error as IoError, ErrorKind, Read, Result as IoResult, Seek, SeekFrom,
+    Write,
 };
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::UNIX_EPOCH;
 
+#[cfg(unix)]
+use maki_storage::permissions::{PRIVATE_DIR_MODE, PRIVATE_FILE_MODE};
+
 use maki_agent::{FileQuery, FileReader, Ranked};
-use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{Buffer, Lua, Result as LuaResult, Table, Value};
+use maki_lua_macro::{lua_fn, lua_table, lua_value};
+use mlua::{Buffer, Lua, Result as LuaResult, Table, UserData, UserDataMethods, Value};
+#[cfg(unix)]
+use rustix::fs::OFlags;
 use tokio::task::spawn_blocking;
 
 use crate::agent_autocmd::HostEvent;
@@ -30,9 +42,112 @@ const _: () = assert!(
     MAX_READ_BYTES == 64 * 1024 * 1024,
     "the Lua API docs and plugin option descs say 64 MiB, change them too"
 );
+const LOCK_BUSY: &str = "lock is held";
 const NON_UTF8_CONTENT_ERR: &str = "non-utf8 content; use read_bytes";
 const SCAN_CHUNK: usize = 64 * 1024;
 pub(crate) const LINE_CUT_MARKER: &str = "...";
+
+const INVALID_UTF8_PATH: &str = "path is not valid UTF-8";
+const INVALID_TEMPLATE: &str = "temporary directory template must end in XXXXXX";
+const TEMP_SUFFIX: &str = "XXXXXX";
+
+pub(super) fn path_text(path: PathBuf) -> IoResult<String> {
+    path.into_os_string()
+        .into_string()
+        .map_err(|_| IoError::new(ErrorKind::InvalidData, INVALID_UTF8_PATH))
+}
+
+/// Resolve a path to its canonical absolute name.
+/// @param path string Existing path.
+/// @return (string?, string?) Physical path, or nil and the error.
+#[lua_fn(guard = FsRead)]
+async fn realpath(_lua: Lua, path: String) -> LuaResult<Pair<String>> {
+    Ok(pair(canonical_path(expand_tilde(&path)).await))
+}
+
+pub(super) async fn canonical_path(path: PathBuf) -> IoResult<String> {
+    spawn_blocking(move || fs::canonicalize(path).and_then(path_text)).await?
+}
+
+/// Create a private temporary directory. The caller owns its cleanup.
+/// @param template string Path ending in XXXXXX.
+/// @return (string?, string?) Created directory, or nil and the error.
+#[lua_fn(guard = FsWrite)]
+async fn mkdtemp(_lua: Lua, template: String) -> LuaResult<Pair<String>> {
+    if !template.ends_with(TEMP_SUFFIX) {
+        return Ok((None, Some(INVALID_TEMPLATE.into())));
+    }
+    let path = try_pair!(make_absolute(&template));
+    let directory = try_pair!(
+        spawn_blocking(move || -> IoResult<String> {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let prefix = name.strip_suffix(TEMP_SUFFIX).unwrap_or_default();
+            let mut builder = tempfile::Builder::new();
+            builder.prefix(prefix);
+            builder.rand_bytes(TEMP_SUFFIX.len());
+            #[cfg(unix)]
+            builder.permissions(Permissions::from_mode(PRIVATE_DIR_MODE));
+            let dir = builder.tempdir_in(path.parent().unwrap_or_else(|| Path::new(".")))?;
+            let name = path_text(dir.path().to_owned())?;
+            touched(dir.path(), true);
+            let _ = dir.keep();
+            Ok(name)
+        })
+        .await
+        .map_err(mlua::Error::external)?
+    );
+    Ok((Some(directory), None))
+}
+
+struct FileLock(Option<File>);
+
+impl FileLock {
+    fn try_lock(file: File) -> IoResult<Self> {
+        file.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => IoError::new(ErrorKind::WouldBlock, LOCK_BUSY),
+            TryLockError::Error(error) => error,
+        })?;
+        Ok(Self(Some(file)))
+    }
+}
+
+impl UserData for FileLock {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method_mut("close", |_, this, ()| {
+            this.0.take();
+            Ok(())
+        });
+    }
+}
+
+/// Try to hold an exclusive file lock. Closing or dropping the handle releases it.
+/// @param path string Lock file, created privately if absent. Symlinks are refused on Unix.
+/// @return (userdata?, string?) Lock with close(), nil and `maki.fs.lock_busy` if busy, or nil and an I/O error.
+#[lua_fn(guard = FsWrite)]
+async fn try_lock(_lua: Lua, path: String) -> LuaResult<Pair<FileLock>> {
+    let path = try_pair!(make_absolute(&path));
+    let result = spawn_blocking(move || {
+        let mut options = File::options();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        options
+            .mode(PRIVATE_FILE_MODE)
+            .custom_flags(OFlags::NOFOLLOW.bits() as i32);
+        let (file, created) = match options.open(&path) {
+            Ok(file) => (file, true),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                (options.create_new(false).open(&path)?, false)
+            }
+            Err(error) => return Err(error),
+        };
+        let lock = FileLock::try_lock(file)?;
+        touched(&path, created);
+        Ok(lock)
+    })
+    .await
+    .map_err(mlua::Error::external)?;
+    Ok(pair(result))
+}
 
 pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     maki_storage::paths::expand_tilde(Path::new(path))
@@ -47,12 +162,6 @@ fn make_absolute(path: &str) -> Result<PathBuf, String> {
             .map(|cwd| cwd.join(&p))
             .map_err(|e| format!("cannot resolve cwd: {e}"))
     }
-}
-
-fn path_to_string(p: &Path) -> LuaResult<String> {
-    p.to_str()
-        .map(|s| s.to_owned())
-        .ok_or_else(|| mlua::Error::runtime("non-utf8 path"))
 }
 
 fn filetype_str(ft: &FileType) -> &'static str {
@@ -220,7 +329,7 @@ fn skip_lines(reader: &mut impl BufRead, n: u64) -> IoResult<u64> {
     Ok(skipped)
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct Line {
     pub text: String,
     /// Its length before any cut, so a caller can say how much was dropped.
@@ -241,24 +350,51 @@ impl From<&str> for Line {
     }
 }
 
+/// Longest line [`next_line`] hands on. Either way it is capped at
+/// [`MAX_READ_BYTES`], because this is where the line is buffered.
+#[derive(Clone, Copy)]
+pub(crate) enum LineLimit {
+    /// Cut a longer line, skipping the rest without reading it into memory.
+    Cut(u64),
+    /// Fail on a longer line, without reading on to its end.
+    Stop(u64),
+}
+
+impl LineLimit {
+    pub(crate) fn new(limit: Option<u64>, stop: bool) -> Self {
+        let limit = limit.unwrap_or(MAX_READ_BYTES);
+        if stop {
+            Self::Stop(limit)
+        } else {
+            Self::Cut(limit)
+        }
+    }
+}
+
 /// The next line without its `\n` or `\r\n`, or `None` at the end of the file.
-/// A line over `max_bytes` is cut and gets [`LINE_CUT_MARKER`]. This is where
-/// the line is buffered, so `max_bytes` is capped at [`MAX_READ_BYTES`] here
-/// and no caller can ask for more. The rest of it
-/// is skipped without ever landing in memory, which is how a file that is one
-/// 300 MB line still pages fine. Without `max_bytes`, a line over
-/// [`MAX_READ_BYTES`] fails the read. Bytes that are not UTF-8 fail the read,
-/// or become U+FFFD when `lossy`.
+/// A line over a [`LineLimit::Cut`] is cut and gets [`LINE_CUT_MARKER`]. The
+/// rest of it is skipped without ever landing in memory, which is how a file
+/// that is one 300 MB line still pages fine. Without a `limit`, a line over
+/// [`MAX_READ_BYTES`] fails the read. A line over a [`LineLimit::Stop`] fails
+/// it too, before its end, since skipping blocks on a line that never ends.
+/// Bytes that are not UTF-8 fail the read, or become U+FFFD when `lossy`.
 pub(crate) fn next_line(
     reader: &mut impl BufRead,
-    max_bytes: Option<u64>,
+    limit: Option<LineLimit>,
     lossy: bool,
 ) -> IoResult<Option<Line>> {
-    let keep = max_bytes.map_or(MAX_READ_BYTES, |max| max.min(MAX_READ_BYTES));
-    // The extra 2 bytes let a line of exactly `keep` bytes see its `\r\n`, so it is not cut.
-    let window = keep + 2;
+    let keep = match limit {
+        None => MAX_READ_BYTES,
+        Some(LineLimit::Cut(max) | LineLimit::Stop(max)) => max.min(MAX_READ_BYTES),
+    };
+    let mut window = keep + 1;
     let mut line = Vec::new();
-    let read = reader.by_ref().take(window).read_until(b'\n', &mut line)? as u64;
+    let mut read = reader.by_ref().take(window).read_until(b'\n', &mut line)? as u64;
+    // A line of exactly `keep` bytes still has to see its `\r\n`, so it is not cut.
+    if read == window && line.last() == Some(&b'\r') {
+        window += 1;
+        read += reader.by_ref().take(1).read_until(b'\n', &mut line)? as u64;
+    }
     if read == 0 {
         return Ok(None);
     }
@@ -267,6 +403,16 @@ pub(crate) fn next_line(
         line.pop_if(|b| *b == b'\r');
         line.len() as u64
     } else {
+        match limit {
+            Some(LineLimit::Cut(_)) => {}
+            Some(LineLimit::Stop(_)) => {
+                return Err(IoError::new(
+                    ErrorKind::InvalidData,
+                    format!("job: output line exceeds the {keep}-byte limit"),
+                ));
+            }
+            None => return Err(too_large()),
+        }
         let (rest, last) = skip_rest_of_line(reader)?;
         // Stripped like the `\r` of a line that fits: by the last byte before the newline.
         let ends_in_cr = if rest == 0 {
@@ -277,9 +423,6 @@ pub(crate) fn next_line(
         read + rest - u64::from(ends_in_cr)
     };
     if line.len() as u64 > keep {
-        if max_bytes.is_none() {
-            return Err(too_large());
-        }
         line.truncate(keep as usize);
         // An error with no length is a char the cut split in half, so drop what is left of it.
         let split_char = line
@@ -371,7 +514,8 @@ fn read_line_page(
     let mut lines = Vec::new();
     let mut bytes = 0;
     while query.limit.is_none_or(|l| (lines.len() as u64) < l)
-        && let Some(Line { text: line, .. }) = next_line(&mut reader, query.max_line_bytes, false)?
+        && let Some(Line { text: line, .. }) =
+            next_line(&mut reader, query.max_line_bytes.map(LineLimit::Cut), false)?
     {
         // A line costs its `String` here and a string and a table slot in Lua,
         // so even a file of empty lines has to run into the limit.
@@ -514,10 +658,11 @@ async fn read_lines(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pa
 /// Get metadata for the file or directory at {path}.
 /// Returns a table with `size` (integer), `is_file` (boolean), `is_dir` (boolean),
 /// and `mtime` (number, fractional seconds since the Unix epoch; absent when the
-/// filesystem does not report a modification time).
+/// filesystem does not report a modification time). `is_symlink` is true for an unfollowed link.
 /// If {path} does not exist, returns nil with no error.
 ///
 /// @param path string Absolute or relative path.
+/// @param opts table? `follow` (boolean, default true): follow symlinks.
 /// @return (table?, string?) Metadata table, nil if missing, or nil plus an error message.
 /// @example
 /// local meta = maki.fs.metadata("src/main.rs")
@@ -525,14 +670,24 @@ async fn read_lines(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pa
 ///   print("size: " .. meta.size)
 /// end
 #[lua_fn(guard = FsRead)]
-async fn metadata(lua: Lua, path: String) -> LuaResult<Pair<Table>> {
+async fn metadata(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Table>> {
     let abs = try_pair!(make_absolute(&path));
-    match tokio::fs::metadata(&abs).await {
+    let follow = opts
+        .as_ref()
+        .and_then(|opts| opts.opt_bool("follow"))
+        .unwrap_or(true);
+    let metadata = if follow {
+        tokio::fs::metadata(&abs).await
+    } else {
+        tokio::fs::symlink_metadata(&abs).await
+    };
+    match metadata {
         Ok(meta) => {
             let tbl = lua.create_table()?;
             tbl.set("size", meta.len())?;
             tbl.set("is_file", meta.is_file())?;
             tbl.set("is_dir", meta.is_dir())?;
+            tbl.set("is_symlink", meta.is_symlink())?;
             if let Ok(modified) = meta.modified()
                 && let Ok(dur) = modified.duration_since(UNIX_EPOCH)
             {
@@ -585,7 +740,7 @@ fn joinpath(_lua: &Lua, parts: mlua::Variadic<String>) -> LuaResult<String> {
     for part in parts.iter() {
         buf.push(part);
     }
-    path_to_string(&buf)
+    Ok(path_text(buf)?)
 }
 
 /// Clean up `.` and `..` segments and make {path} absolute. Like `vim.fs.normalize`.
@@ -609,7 +764,7 @@ fn normalize(_lua: &Lua, path: String) -> LuaResult<String> {
         }
     }
     let result: PathBuf = components.iter().collect();
-    path_to_string(&result)
+    Ok(path_text(result)?)
 }
 
 /// Make {path} absolute by prepending the current working directory when needed.
@@ -621,7 +776,9 @@ fn normalize(_lua: &Lua, path: String) -> LuaResult<String> {
 /// maki.fs.abspath("src/main.rs") -- "/home/user/project/src/main.rs"
 #[lua_fn]
 fn abspath(_lua: &Lua, path: String) -> LuaResult<String> {
-    path_to_string(&make_absolute(&path).map_err(mlua::Error::runtime)?)
+    Ok(path_text(
+        make_absolute(&path).map_err(mlua::Error::runtime)?,
+    )?)
 }
 
 /// Return all ancestor directories of {path}, from the immediate parent up to the root.
@@ -690,7 +847,7 @@ async fn root(_lua: Lua, source: String, marker: Value) -> LuaResult<Option<Stri
         loop {
             for m in &markers {
                 if dir.join(m).exists() {
-                    return Ok(Some(path_to_string(&dir)?));
+                    return Ok(Some(path_text(dir)?));
                 }
             }
             if !dir.pop() {
@@ -727,7 +884,7 @@ fn relpath(_lua: &Lua, base: String, target: String) -> LuaResult<String> {
     for comp in &target_comps[common..] {
         result.push(comp);
     }
-    path_to_string(&result)
+    Ok(path_text(result)?)
 }
 
 /// Return the file extension of {path}, without the leading dot.
@@ -807,8 +964,14 @@ async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Tabl
 async fn write(_lua: Lua, path: String, content: Value) -> LuaResult<Pair<bool>> {
     let content = bytes_arg(&content, "fs.write")?;
     let abs = try_pair!(make_absolute(&path));
-    let result = tokio::fs::write(&abs, content).await;
-    Ok(pair(touched(abs, result).await.map(|()| true)))
+    let result = spawn_blocking(move || {
+        let result = fs::write(&abs, content);
+        touched(&abs, result.is_ok());
+        result
+    })
+    .await
+    .map_err(mlua::Error::external)?;
+    Ok(pair(result.map(|()| true)))
 }
 
 /// Append {content} to the file at {path}, creating it (but not its parent
@@ -824,18 +987,20 @@ async fn write(_lua: Lua, path: String, content: Value) -> LuaResult<Pair<bool>>
 async fn append(_lua: Lua, path: String, content: Value) -> LuaResult<Pair<bool>> {
     let content = bytes_arg(&content, "fs.append")?;
     let abs = try_pair!(make_absolute(&path));
-    let appended = abs.clone();
+    // `tokio::fs::File` writes through a background task and answers before
+    // the bytes reach the file, so a single blocking task keeps append ordered.
     let result = spawn_blocking(move || {
-        use std::io::Write;
-        std::fs::OpenOptions::new()
+        let result = File::options()
             .create(true)
             .append(true)
             .open(&abs)
-            .and_then(|mut f| f.write_all(&content))
+            .and_then(|mut f| f.write_all(&content));
+        touched(&abs, result.is_ok());
+        result
     })
     .await
     .map_err(mlua::Error::external)?;
-    Ok(pair(touched(appended, result).await.map(|()| true)))
+    Ok(pair(result.map(|()| true)))
 }
 
 /// Atomically replace {path} with {content}. The parent directory must exist.
@@ -852,11 +1017,14 @@ async fn append(_lua: Lua, path: String, content: Value) -> LuaResult<Pair<bool>
 async fn atomic_write(_lua: Lua, path: String, content: Value) -> LuaResult<Pair<bool>> {
     let content = bytes_arg(&content, "fs.atomic_write")?;
     let abs = try_pair!(make_absolute(&path));
-    let written = abs.clone();
-    let result = spawn_blocking(move || maki_storage::atomic_write(&abs, &content))
-        .await
-        .map_err(mlua::Error::external)?;
-    Ok(pair(touched(written, result).await.map(|()| true)))
+    let result = spawn_blocking(move || {
+        let result = maki_storage::atomic_write(&abs, &content);
+        touched(&abs, result.is_ok());
+        result
+    })
+    .await
+    .map_err(mlua::Error::external)?;
+    Ok(pair(result.map(|()| true)))
 }
 
 /// Delete the file, symlink, or directory at {path}.
@@ -882,14 +1050,16 @@ async fn rm(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool
         .as_ref()
         .and_then(|t| t.opt_bool("force"))
         .unwrap_or(false);
-    let removed = abs.clone();
     let result = spawn_blocking(move || -> IoResult<()> {
         let meta = match std::fs::symlink_metadata(&abs) {
             Ok(m) => m,
-            Err(e) if force && e.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(e) if force && e.kind() == ErrorKind::NotFound => {
+                touched(&abs, true);
+                return Ok(());
+            }
             Err(e) => return Err(e),
         };
-        if meta.is_dir() {
+        let result = if meta.is_dir() {
             if recursive {
                 std::fs::remove_dir_all(&abs)
             } else {
@@ -901,11 +1071,13 @@ async fn rm(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool
                 Err(e) if meta.file_type().is_symlink() => std::fs::remove_dir(&abs).map_err(|_| e),
                 Err(e) => Err(e),
             }
-        }
+        };
+        touched(&abs, result.is_ok());
+        result
     })
     .await
     .map_err(mlua::Error::external)?;
-    Ok(pair(touched(removed, result).await.map(|()| true)))
+    Ok(pair(result.map(|()| true)))
 }
 
 /// Move the file or directory at {from} to {to}, replacing {to} if it is an
@@ -920,11 +1092,17 @@ async fn rm(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool
 /// if err then print("rename failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
 async fn rename(_lua: Lua, from: String, to: String) -> LuaResult<Pair<bool>> {
-    let from = try_pair!(make_absolute(&from));
-    let to = try_pair!(make_absolute(&to));
-    let result = tokio::fs::rename(&from, &to).await;
-    let result = touched(from, result).await;
-    Ok(pair(touched(to, result).await.map(|()| true)))
+    let path = try_pair!(make_absolute(&from));
+    let new_path = try_pair!(make_absolute(&to));
+    let result = spawn_blocking(move || -> IoResult<()> {
+        fs::rename(&path, &new_path)?;
+        touched(&path, true);
+        touched(&new_path, true);
+        Ok(())
+    })
+    .await
+    .map_err(mlua::Error::external)?;
+    Ok(pair(result.map(|()| true)))
 }
 
 /// Create the directory at {path}. Set `parents = true` to create
@@ -942,12 +1120,18 @@ async fn mkdir(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<b
         .as_ref()
         .and_then(|t| t.opt_bool("parents"))
         .unwrap_or(false);
-    let result = if parents {
-        tokio::fs::create_dir_all(&abs).await
-    } else {
-        tokio::fs::create_dir(&abs).await
-    };
-    Ok(pair(touched(abs, result).await.map(|()| true)))
+    let result = spawn_blocking(move || {
+        let result = if parents {
+            fs::create_dir_all(&abs)
+        } else {
+            fs::create_dir(&abs)
+        };
+        touched(&abs, result.is_ok());
+        result
+    })
+    .await
+    .map_err(mlua::Error::external)?;
+    Ok(pair(result.map(|()| true)))
 }
 
 /// The path {path} really names, for the prefix match the file index picks
@@ -1007,24 +1191,19 @@ fn descend(mut base: PathBuf, component: &Component<'_>) -> PathBuf {
     base
 }
 
-/// Passes {result} through, telling the file index that {path} came or went
-/// when it says the call worked.
+/// Tells the file index that {path} came or went after a successful mutation.
 ///
 /// The write and edit tools are the reason the tree moves while maki runs,
 /// and the index is otherwise the tree as it was up to twenty seconds ago:
 /// the picker would not offer a file the agent just wrote, and would offer
 /// one it just deleted. A failed call changed nothing, so it says nothing.
 ///
-/// Resolving the path is a realpath per ancestor and one more per `..` left
-/// in the tail, and this runs on the one executor every plugin shares, so it
-/// waits for a blocking thread the way the call it follows did.
-async fn touched<E>(path: PathBuf, result: Result<(), E>) -> Result<(), E> {
-    if result.is_ok() {
-        spawn_blocking(move || maki_agent::invalidate_for(&resolved(&path)))
-            .await
-            .expect("file index invalidation panicked");
+/// Resolving the path reads the filesystem, so callers run this with the
+/// mutation on a blocking thread.
+fn touched(path: &Path, succeeded: bool) {
+    if succeeded {
+        maki_agent::invalidate_for(&resolved(path));
     }
-    result
 }
 
 /// Find files matching one or more glob patterns, walked fresh on every call.
@@ -1471,6 +1650,12 @@ async fn fuzzy_files(
     Ok((Some(tbl), None))
 }
 
+/// The error string returned by `try_lock` while another caller holds the lock.
+#[lua_value]
+fn lock_busy(_lua: &Lua) -> LuaResult<&'static str> {
+    Ok(LOCK_BUSY)
+}
+
 lua_table! {
     /// File-system utilities, modelled after `vim.fs` and `vim.uv`.
     ///
@@ -1482,26 +1667,32 @@ lua_table! {
     /// if err then return end
     /// ```
     "maki.fs" => pub(crate) fn create_fs_table(perms: &PluginPermissions, plugin: Arc<str>), DOCS [
-        read(perms), read_bytes(perms), read_lines(perms), metadata(perms), dirname, basename,
+        read(perms), read_bytes(perms), read_lines(perms), metadata(perms), realpath(perms), mkdtemp(perms), dirname, basename,
         joinpath, normalize, abspath, parents, root(perms), relpath, ext,
-        dir(perms), write(perms), append(perms), atomic_write(perms), rename(perms),
-        rm(perms), mkdir(perms), glob(perms), grep(perms), fuzzy_files(perms, plugin),
+        dir(perms), try_lock(perms), lock_busy, write(perms), append(perms), atomic_write(perms), rename(perms), rm(perms), mkdir(perms),
+        glob(perms), grep(perms), fuzzy_files(perms, plugin),
     ]
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use maki_storage::permissions::PERMISSION_BITS;
+    #[cfg(unix)]
+    use std::ffi::OsStr;
     use std::fs::OpenOptions;
     #[cfg(unix)]
     use std::io::Write;
     use std::io::repeat;
+    #[cfg(unix)]
+    use std::os::unix::{ffi::OsStrExt, fs::symlink};
     use std::sync::mpsc;
     use std::time::{Duration, Instant, SystemTime};
 
     use super::*;
     use crate::plugin_permissions::PluginPermissions;
     use futures::FutureExt;
-    use mlua::{Integer, Lua};
+    use mlua::{AnyUserData, FromLuaMulti, Function, Integer, IntoLuaMulti, Lua, ObjectLike};
     use tempfile::TempDir;
     use test_case::test_case;
     use tokio::runtime::Builder;
@@ -1511,8 +1702,10 @@ mod tests {
     const REPLACEMENT_CONTENT: &str = "replacement";
     const FS_WRITE_PERMISSION: &str = "fs_write";
     const READ_LIMIT_ERROR: &str = "file exceeds the 67108864-byte read limit";
+    const STOP_LIMIT_ERROR: &str = "job: output line exceeds the 67108864-byte limit";
     const TEST_READ_LIMIT: u64 = 4;
     const TEST_PLUGIN: &str = "test";
+    const MOVED_DIRECTORY: &str = "moved";
 
     const OUTPUT_LIMITS_SRC: &str = include_str!("../../../plugins/lib/maki/output_limits.lua");
 
@@ -1573,16 +1766,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn next_line_caps_max_bytes_at_the_read_limit() {
+    #[test_case(LineLimit::Cut(u64::MAX) ; "cut")]
+    #[test_case(LineLimit::Stop(u64::MAX) ; "stop")]
+    fn next_line_caps_max_bytes_at_the_read_limit(limit: LineLimit) {
         let mut huge_line = BufReader::new(repeat(b'x').take(MAX_READ_BYTES + 1));
-        let line = next_line(&mut huge_line, Some(u64::MAX), false)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            line.text.len() as u64,
-            MAX_READ_BYTES + LINE_CUT_MARKER.len() as u64
-        );
+        let line = next_line(&mut huge_line, Some(limit), false);
+        match limit {
+            LineLimit::Cut(_) => assert_eq!(
+                line.unwrap().unwrap().text.len() as u64,
+                MAX_READ_BYTES + LINE_CUT_MARKER.len() as u64
+            ),
+            LineLimit::Stop(_) => assert_eq!(line.unwrap_err().to_string(), STOP_LIMIT_ERROR),
+        }
     }
 
     #[test_case("", &[]; "empty")]
@@ -1643,9 +1838,13 @@ mod tests {
     #[test_case("abcdefgh", 8; "cut_line_at_eof")]
     #[test_case("abc\r\n", 3; "whole_crlf_line")]
     fn next_line_reports_the_uncut_length(content: &str, expected: u64) {
-        let line = next_line(&mut small_reader(content.as_bytes()), Some(4), false)
-            .unwrap()
-            .unwrap();
+        let line = next_line(
+            &mut small_reader(content.as_bytes()),
+            Some(LineLimit::Cut(4)),
+            false,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(line.bytes, expected);
     }
 
@@ -1673,16 +1872,20 @@ mod tests {
             reads: 0,
         };
         let mut reader = BufReader::with_capacity(CHUNK, inner);
-        let cut = next_line(&mut reader, Some(2), false).unwrap().unwrap();
+        let cut = next_line(&mut reader, Some(LineLimit::Cut(2)), false)
+            .unwrap()
+            .unwrap();
         assert_eq!((cut.text.as_str(), cut.bytes), ("ab...", 8));
-        let next = next_line(&mut reader, Some(2), false).unwrap().unwrap();
+        let next = next_line(&mut reader, Some(LineLimit::Cut(2)), false)
+            .unwrap()
+            .unwrap();
         assert_eq!(next.bytes, 4);
     }
 
     #[test_case(b"a\xffb\n", "a\u{FFFD}b"; "whole_line")]
     #[test_case(b"\xffa\xc3\xa9b\n", "\u{FFFD}a..."; "cut_through_a_char")]
     fn next_line_lossy_replaces_non_utf8(content: &[u8], expected: &str) {
-        let line = next_line(&mut small_reader(content), Some(3), true)
+        let line = next_line(&mut small_reader(content), Some(LineLimit::Cut(3)), true)
             .unwrap()
             .unwrap();
         assert_eq!(line.text, expected);
@@ -2047,6 +2250,35 @@ mod tests {
             matches!(err, mlua::Value::String(_)),
             "dir should return error for nonexistent path"
         );
+    }
+
+    #[cfg(unix)]
+    #[test_case(true ; "followed_link")]
+    #[test_case(false ; "unfollowed_link")]
+    fn metadata_can_classify_a_link_without_following_it(follow: bool) {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        std::fs::write(&target, "content").unwrap();
+        symlink(&target, &link).unwrap();
+        let lua = Lua::new();
+        let table = fs_table(&lua);
+        let metadata: Function = table.get("metadata").unwrap();
+        let options = lua.create_table().unwrap();
+        options.set("follow", follow).unwrap();
+        let (value, error): (Option<Table>, Option<String>) =
+            block_on_call(&metadata, (link.to_str().unwrap(), options.clone()));
+        assert_eq!(error, None);
+        let value = value.unwrap();
+        assert_eq!(value.get::<bool>("is_file").unwrap(), follow);
+        assert_eq!(value.get::<bool>("is_symlink").unwrap(), !follow);
+        if !follow {
+            std::fs::remove_file(target).unwrap();
+            let (value, error): (Option<Table>, Option<String>) =
+                block_on_call(&metadata, (link.to_str().unwrap(), options));
+            assert_eq!(error, None);
+            assert!(value.unwrap().get::<bool>("is_symlink").unwrap());
+        }
     }
 
     #[tokio::test]
@@ -3147,6 +3379,12 @@ mod tests {
             .collect()
     }
 
+    fn block_on_call<R: FromLuaMulti>(function: &Function, args: impl IntoLuaMulti) -> R {
+        crate::test_support::runtime()
+            .block_on(function.call_async(args))
+            .unwrap()
+    }
+
     fn fs_table(lua: &Lua) -> Table {
         create_fs_table(lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap()
     }
@@ -3645,10 +3883,99 @@ mod tests {
         );
     }
 
+    #[test_case(false ; "file")]
+    #[test_case(true ; "directory")]
+    fn a_rename_refreshes_both_indexed_trees(directory: bool) {
+        let root = TempDir::new().unwrap();
+        let source = TempDir::new_in(root.path()).unwrap();
+        let destination = TempDir::new_in(root.path()).unwrap();
+        let name = if directory { MOVED_DIRECTORY } else { NEW_FILE };
+        let from = source.path().join(name);
+        let to = destination.path().join(name);
+        let file = if directory {
+            fs::create_dir(&from).unwrap();
+            from.join(NEW_FILE)
+        } else {
+            from.clone()
+        };
+        fs::write(file, FIRST_CONTENT).unwrap();
+        walked(source.path());
+        walked(destination.path());
+        let source_index = maki_agent::file_index(source.path());
+        let destination_index = maki_agent::file_index(destination.path());
+        assert!(
+            source_index
+                .corpus()
+                .iter()
+                .any(|path| path.ends_with(NEW_FILE))
+        );
+        assert!(destination_index.corpus().is_empty());
+
+        let lua = Lua::new();
+        let rename: Function = fs_table(&lua).get("rename").unwrap();
+        let result: (Option<bool>, Option<String>) =
+            block_on_call(&rename, (from.to_str().unwrap(), to.to_str().unwrap()));
+        assert_eq!(result, (Some(true), None));
+        source_index.expire();
+        destination_index.expire();
+        let deadline = Instant::now() + WALK_TIMEOUT;
+        loop {
+            source_index.refresh();
+            destination_index.refresh();
+            let source = source_index.corpus();
+            let destination = destination_index.corpus();
+            if source.complete
+                && source.is_empty()
+                && destination.complete
+                && destination.iter().any(|path| path.ends_with(NEW_FILE))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{NEVER_WALKED}");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test_case(false ; "mkdtemp")]
+    #[test_case(true ; "rm")]
+    fn directory_mutations_refresh_the_index(remove: bool) {
+        let root = TempDir::new().unwrap();
+        let path = root
+            .path()
+            .join(if remove { MOVED_DIRECTORY } else { TEMP_SUFFIX });
+        if remove {
+            fs::create_dir(&path).unwrap();
+        }
+        walked(root.path());
+        let index = maki_agent::file_index(root.path());
+        assert_eq!(index.corpus().is_empty(), !remove);
+
+        let lua = Lua::new();
+        let operation: Function = fs_table(&lua)
+            .get(if remove { "rm" } else { "mkdtemp" })
+            .unwrap();
+        let (value, error): (Value, Option<String>) =
+            block_on_call(&operation, path.to_str().unwrap());
+        assert_eq!(error, None);
+        assert_ne!(value, Value::Nil);
+        index.expire();
+        let deadline = Instant::now() + WALK_TIMEOUT;
+        loop {
+            index.refresh();
+            let corpus = index.corpus();
+            if corpus.complete && corpus.is_empty() == remove {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{NEVER_WALKED}");
+            std::thread::yield_now();
+        }
+    }
+
     /// A file the agent has just written is a file the user is about to ask
     /// for, and the walk behind the answer can be twenty seconds old.
-    #[tokio::test]
-    async fn a_written_file_is_findable_before_the_index_goes_stale() {
+    #[test_case(false ; "written_file")]
+    #[test_case(true ; "created_lock")]
+    fn a_created_file_is_findable_before_the_index_goes_stale(lock: bool) {
         let base = cwd_root().unwrap();
         let tmp = small_tree(&base);
         let lua = Lua::new();
@@ -3658,13 +3985,19 @@ mod tests {
         // would then spin out the whole debounce waiting for one.
         walked(tmp.path());
 
-        let written: mlua::Function = tbl.get("write").unwrap();
         let made = tmp.path().join(NEW_FILE);
-        let (ok, err): (Option<bool>, Option<String>) = written
-            .call_async((made.to_str().unwrap(), ""))
-            .await
-            .unwrap();
-        assert_eq!((ok, err), (Some(true), None));
+        if lock {
+            let acquire: Function = tbl.get("try_lock").unwrap();
+            let (held, err): (Option<AnyUserData>, Option<String>) =
+                block_on_call(&acquire, made.to_str().unwrap());
+            assert!(held.is_some());
+            assert_eq!(err, None);
+        } else {
+            let written: Function = tbl.get("write").unwrap();
+            let (ok, err): (Option<bool>, Option<String>) =
+                block_on_call(&written, (made.to_str().unwrap(), ""));
+            assert_eq!((ok, err), (Some(true), None));
+        }
 
         // The write left a mark on the index rather than a walk, and the
         // mark is the whole of what makes the file findable: `expire` brings
@@ -3680,10 +4013,117 @@ mod tests {
         }
 
         assert!(
-            found_paths(&files_call(&lua, &tbl, tmp.path(), NEW_FILE, SMALL_LIMIT).await)
-                .iter()
-                .any(|p| p == NEW_FILE),
+            found_paths(&crate::test_support::runtime().block_on(files_call(
+                &lua,
+                &tbl,
+                tmp.path(),
+                NEW_FILE,
+                SMALL_LIMIT
+            )))
+            .iter()
+            .any(|p| p == NEW_FILE),
             "the plugin's own call finds it too"
         );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn file_lock_is_private_and_refuses_symlinks() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("private.lock");
+        let link = dir.path().join("link.lock");
+        let lua = Lua::new();
+        let table = fs_table(&lua);
+        let lock: Function = table.get("try_lock").unwrap();
+        let (held, error): (Option<AnyUserData>, Option<String>) =
+            block_on_call(&lock, path.to_str().unwrap());
+        assert_eq!(error, None);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & PERMISSION_BITS,
+            PRIVATE_FILE_MODE
+        );
+        held.unwrap().call_method::<()>("close", ()).unwrap();
+        symlink(&path, &link).unwrap();
+        let (held, error): (Option<AnyUserData>, Option<String>) =
+            block_on_call(&lock, link.to_str().unwrap());
+        assert!(held.is_none());
+        assert!(error.is_some());
+    }
+
+    #[test]
+    fn file_lock_reports_contention_and_releases_on_close() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("import.lock");
+        let lua = Lua::new();
+        let table = fs_table(&lua);
+        let lock: Function = table.get("try_lock").unwrap();
+        let (first, error): (Option<AnyUserData>, Option<String>) =
+            block_on_call(&lock, path.to_str().unwrap());
+        assert_eq!(error, None);
+        let (second, error): (Option<AnyUserData>, Option<String>) =
+            block_on_call(&lock, path.to_str().unwrap());
+        assert!(second.is_none());
+        assert_eq!(error, Some(table.get::<String>("lock_busy").unwrap()));
+        let first = first.unwrap();
+        first.call_method::<()>("close", ()).unwrap();
+        let (third, error): (Option<AnyUserData>, Option<String>) =
+            block_on_call(&lock, path.to_str().unwrap());
+        assert!(third.is_some());
+        assert_eq!(error, None);
+        let missing = dir.path().join("absent/import.lock");
+        let (lock, error): (Option<AnyUserData>, Option<String>) =
+            block_on_call(&lock, missing.to_str().unwrap());
+        assert!(lock.is_none());
+        assert!(error.is_some_and(|error| error != LOCK_BUSY));
+    }
+
+    #[cfg(unix)]
+    #[test_case(false ; "utf8_target")]
+    #[test_case(true ; "non_utf8_target")]
+    fn realpath_resolves_links_without_lossy_names(non_utf8: bool) {
+        let root = TempDir::new().unwrap();
+        let target = root.path().join(if non_utf8 {
+            OsStr::from_bytes(b"invalid\xff")
+        } else {
+            OsStr::new("target")
+        });
+        fs::create_dir(&target).unwrap();
+        let link = root.path().join("alias");
+        symlink(&target, &link).unwrap();
+        let lua = Lua::new();
+        let table = fs_table(&lua);
+        let resolve: Function = table.get("realpath").unwrap();
+        let (path, error): (Option<String>, Option<String>) =
+            block_on_call(&resolve, link.to_str().unwrap());
+        if non_utf8 {
+            assert_eq!(path, None);
+            assert_eq!(error.as_deref(), Some(INVALID_UTF8_PATH));
+        } else {
+            assert_eq!(path.as_deref(), target.canonicalize().unwrap().to_str());
+            assert_eq!(error, None);
+        }
+    }
+
+    #[test_case("" ; "unprefixed_template")]
+    #[test_case("artifact." ; "prefixed_template")]
+    fn mkdtemp_creates_inside_the_template_directory(prefix: &str) {
+        let root = TempDir::new().unwrap();
+        let lua = Lua::new();
+        let table = fs_table(&lua);
+        let create: Function = table.get("mkdtemp").unwrap();
+        let template = root.path().join(format!("{prefix}{TEMP_SUFFIX}"));
+        let (path, error): (Option<String>, Option<String>) =
+            block_on_call(&create, template.to_str().unwrap());
+        assert_eq!(error, None);
+        let path = Path::new(path.as_ref().unwrap());
+        assert_eq!(path.parent(), Some(root.path()));
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with(prefix));
+        assert_eq!(name.len(), prefix.len() + TEMP_SUFFIX.len());
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & PERMISSION_BITS,
+            PRIVATE_DIR_MODE
+        );
+        fs::remove_dir(path).unwrap();
     }
 }

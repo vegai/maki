@@ -9,6 +9,7 @@ use maki_config::project::{self, ProjectDecision, TrustAnswer, TrustMode, policy
 use maki_config::{Config, load_env_files};
 use maki_lua::{InitFiles, Interaction, PluginHost};
 use maki_storage::StateDir;
+use maki_storage::model::read_thinking;
 
 use crate::cli::Cli;
 use crate::interrupt::Interrupt;
@@ -42,7 +43,7 @@ async fn load_stack(
                 .unwrap_or_default()
                 .into_config(&names(host)?)
                 .context("invalid config")?;
-            cli.apply_tool_flags(&mut config.agent)?;
+            cli.apply_tool_flags(&mut config.agent);
             config.validate()?;
             Ok(config)
         },
@@ -79,6 +80,11 @@ pub async fn run(
         load_env_files(&trust.project_config);
         (plugin_host, config, warnings) = load_stack(cli, &trust).await?;
     }
+    warnings.extend(super::tool_filter_warnings(
+        cli,
+        ToolRegistry::global(),
+        true,
+    )?);
     warnings.extend(provider_scripts::startup_warning());
     warnings.extend(legacy_notice);
     super::report_warnings(warnings);
@@ -88,7 +94,11 @@ pub async fn run(
     let (model, warning) =
         setup::resolve_model(model_arg.as_deref(), &config.provider, &storage).await?;
     super::report_warnings(Vec::from_iter(warning));
-    setup::remember_thinking(&mut config.session_defaults, &storage);
+    setup::resolve_thinking(
+        &mut config.session_defaults,
+        cli.thinking_override(),
+        read_thinking(&storage),
+    );
 
     setup::init_logging(&config.storage, trust.project_config.config_root());
     setup::init_telemetry(&config.telemetry);

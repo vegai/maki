@@ -1,5 +1,5 @@
 use std::env;
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -15,18 +15,21 @@ use maki_config::{Config, ProjectConfig, load_env_files, load_permissions};
 use maki_lua::{InitFiles, Interaction, PackPlan, PackReport, PluginHost};
 use maki_providers::model::Model;
 use maki_storage::StateDir;
+use maki_storage::model::read_thinking;
+use maki_storage::sessions::StoredThinking;
 use maki_ui::{OpenSession, RunOutcome};
 
 use crate::cli::Cli;
-use crate::provider_scripts;
+use crate::interrupt::Interrupt;
+use crate::print::{self, PrintParams};
 use crate::resume::{self, Resolved};
-use crate::setup;
+use crate::sdk_mode::{self, SdkParams};
+use crate::{provider_scripts, setup};
 
 const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
 const MODEL_FALLBACK_WARNING: &str = "model resolution failed, keeping previous model";
 const POLICY_GRANT_NOTICE: &str = "folder trusted by trust.paths pattern";
-
 /// One generation of the app: everything torn down and rebuilt on `/reload`.
 /// Dropping it joins the Lua thread via `PluginHost::drop`.
 struct Stack {
@@ -100,10 +103,11 @@ fn load_config(
     if cli.yolo || config.always_yolo {
         config.permissions.yolo = true;
     }
-    cli.apply_tool_flags(&mut config.agent)?;
+    cli.apply_tool_flags(&mut config.agent);
     // A turn cap would cut an interactive session short, so
     // `Cli::check_run_path_flags` already refused it outside `-p` and SDK mode.
     config.agent.max_turns = cli.max_turns;
+    config.agent.final_answer = cli.final_answer;
     config.validate()?;
     Ok(config)
 }
@@ -171,9 +175,23 @@ async fn build_stack(
     )
     .await?;
 
+    warnings.extend(super::tool_filter_warnings(
+        cli,
+        ToolRegistry::global(),
+        fallback_model.is_none(),
+    )?);
     let commands = discover_commands(cli.no_commands, launch.cwd);
 
-    setup::remember_thinking(&mut config.session_defaults, launch.storage);
+    let fallback_thinking = if cli.print {
+        setup::HEADLESS_THINKING
+    } else {
+        read_thinking(launch.storage)
+    };
+    setup::resolve_thinking(
+        &mut config.session_defaults,
+        cli.thinking_override(),
+        fallback_thinking,
+    );
     let model_result =
         setup::resolve_model(cli.model.as_deref(), &config.provider, launch.storage).await;
     let (model, needs_login) = match (model_result, fallback_model) {
@@ -205,13 +223,20 @@ async fn build_stack(
 }
 
 /// The tab a run opens on. Which session that is lives in [`crate::resume`],
-/// and the only step left here is the TUI-only one: an explicit `--model` is a
-/// choice about the session being opened, and a session's own spec is what
-/// every later switch reads.
-fn open_tab(resolved: Resolved, model: &str, explicit_model: bool, cwd: &str) -> OpenSession {
+/// and explicit launch flags override the saved model and thinking level.
+fn open_tab(
+    resolved: Resolved,
+    model: &str,
+    explicit_model: bool,
+    thinking: Option<StoredThinking>,
+    cwd: &str,
+) -> OpenSession {
     let mut tab = resolved.into_session(model, cwd);
     if explicit_model {
         tab.session.set_model(model.to_owned());
+    }
+    if let Some(thinking) = thinking {
+        tab.session.meta.thinking = Some(thinking);
     }
     tab
 }
@@ -219,11 +244,7 @@ fn open_tab(resolved: Resolved, model: &str, explicit_model: bool, cwd: &str) ->
 fn read_initial_prompt(cli_prompt: Option<String>) -> Result<Option<String>> {
     match cli_prompt {
         Some(p) => Ok(Some(p)),
-        None if !io::stdin().is_terminal() => {
-            let mut buf = String::new();
-            io::stdin().read_to_string(&mut buf).context("read stdin")?;
-            Ok(Some(buf))
-        }
+        None if !io::stdin().is_terminal() => print::read_stdin().map(Some),
         None => Ok(None),
     }
 }
@@ -386,75 +407,76 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
     let resolved = resume::resolve(&cli, &cwd_str, &storage)?;
     setup::report_session_start(resolved.start_type, Some(&resolved.id));
 
-    if cli.is_sdk_mode() {
-        let prompt_slots = stack
-            .plugin_host
-            .event_handle()
-            .collect_prompt_slots(Some(resolved.id.as_str()))
-            .await;
+    if headless {
         let (resumed, claim) = resolved.into_resumed();
         let timeouts = stack.timeouts();
-        let interrupt = crate::sdk_mode::run(crate::sdk_mode::SdkParams {
-            cli,
-            resumed,
-            claim,
-            storage: storage.clone(),
-            model: stack.model,
-            config: stack.config.agent,
-            permissions_config: stack.config.permissions,
-            timeouts,
-            prompt_slots,
-            defaults: stack.config.session_defaults,
-            model_policy: Arc::new(stack.config.provider.model_policy.clone()),
-            plugin_rules: stack.plugin_host.plugin_rules(),
-            lua_handle: stack.plugin_host.event_handle(),
-            project_config: trust.project_config.clone(),
-        })
-        .await
-        .context("run sdk mode")?;
+        let lua_handle = stack.plugin_host.event_handle();
+        let plugin_rules = stack.plugin_host.plugin_rules();
+        let model_policy = Arc::new(stack.config.provider.model_policy.clone());
+        let project_config = trust.project_config.clone();
+        let interrupt;
+        let result = if cli.is_sdk_mode() {
+            let prompt_slots = lua_handle
+                .collect_prompt_slots(Some(resumed.id.as_str()))
+                .await;
+            interrupt = Interrupt::install();
+            let params = SdkParams {
+                cli,
+                resumed,
+                claim,
+                model: stack.model,
+                config: stack.config.agent,
+                permissions_config: stack.config.permissions,
+                timeouts,
+                prompt_slots,
+                defaults: stack.config.session_defaults,
+                model_policy,
+                plugin_rules,
+                lua_handle,
+                project_config,
+            };
+            sdk_mode::run(params, &interrupt)
+                .await
+                .context("run sdk mode")
+        } else {
+            let prompt = print::read_prompt(cli.initial_prompt.take(), cli.dry_run)?;
+            // After the prompt is read, so a signal still ends a stdin read at once.
+            interrupt = Interrupt::install();
+            let params = PrintParams {
+                host_prompt: cli.host_prompt(),
+                background_wait: cli.background_wait(),
+                dry_run: cli.dry_run,
+                model: stack.model,
+                prompt,
+                image_paths: cli.images,
+                format: cli.output_format,
+                verbose: cli.verbose,
+                config: stack.config.agent,
+                permissions_config: stack.config.permissions,
+                timeouts,
+                lua_handle,
+                defaults: stack.config.session_defaults,
+                model_policy,
+                plugin_rules,
+                project_config,
+                resumed,
+                claim,
+            };
+            print::run(params, &interrupt)
+                .await
+                .context("run print mode")
+        };
         drop(stack.plugin_host);
         teardown.join();
         interrupt.exit_if_caught();
-        return Ok(());
-    }
-
-    if cli.print {
-        let (resumed, claim) = resolved.into_resumed();
-        let timeouts = stack.timeouts();
-        let background_wait = cli.background_wait();
-        let host_prompt = cli.host_prompt();
-        let interrupt = crate::print::run(crate::print::PrintParams {
-            model: stack.model,
-            prompt: cli.initial_prompt,
-            image_paths: cli.images,
-            format: cli.output_format,
-            verbose: cli.verbose,
-            config: stack.config.agent,
-            permissions_config: stack.config.permissions,
-            timeouts,
-            lua_handle: stack.plugin_host.event_handle(),
-            defaults: stack.config.session_defaults,
-            model_policy: Arc::new(stack.config.provider.model_policy.clone()),
-            plugin_rules: stack.plugin_host.plugin_rules(),
-            project_config: trust.project_config.clone(),
-            host_prompt,
-            resumed,
-            claim,
-            storage: storage.clone(),
-            background_wait,
-        })
-        .await
-        .context("run print mode")?;
-        drop(stack.plugin_host);
-        teardown.join();
-        interrupt.exit_if_caught();
-        return Ok(());
+        return result;
     }
 
     let mut tabs = vec![open_tab(
         resolved,
         &stack.model.spec(),
         cli.model.is_some(),
+        cli.thinking_override(),
         &cwd_str,
     )];
     let mut focused = 0;
@@ -502,7 +524,9 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
                 input_history_size: stack.config.storage.input_history_size,
                 permissions: Arc::new(maki_agent::permissions::PermissionManager::new(
                     stack.config.permissions.clone(),
-                    cwd.clone(),
+                    // After `/cd` the process directory, which a `/reload`
+                    // has to keep, is no longer the launch one.
+                    env::current_dir().unwrap_or_else(|_| cwd.clone()),
                     trust.project_config.clone(),
                     stack.plugin_host.plugin_rules(),
                 )),
@@ -610,7 +634,7 @@ mod tests {
     use maki_agent::tools::ToolRegistry;
     use maki_config::RawConfig;
     use maki_providers::Message;
-    use maki_storage::sessions::SessionClaim;
+    use maki_storage::sessions::{Effort, SessionClaim};
     use maki_ui::AppSession;
     use std::fs;
     use std::path::PathBuf;
@@ -782,18 +806,24 @@ mod tests {
         plugin_host.begin_shutdown();
     }
 
-    /// A session's recorded spec is the single source of truth for the model
-    /// its tab runs on, so both directions matter. An explicit `--model` used
-    /// to be ignored on a resumed session, and without one the startup default
-    /// must not overwrite the recorded spec, or per tab models die on every
-    /// restart.
-    #[test_case(false, STORED_SPEC ; "a resumed tab keeps its own spec")]
-    #[test_case(true, STARTUP_SPEC ; "explicit model wins over a resumed spec")]
-    fn explicit_model_overrides_only_a_resumed_spec(explicit_model: bool, expected_spec: &str) {
+    /// Explicit launch flags replace saved settings. Startup defaults leave
+    /// those settings intact when the flags are absent.
+    #[test_case(&[], STORED_SPEC, None ; "a resumed tab keeps its saved settings")]
+    #[test_case(&["--model", STARTUP_SPEC], STARTUP_SPEC, None ; "explicit model wins")]
+    #[test_case(&["--thinking", "off"], STORED_SPEC, Some(StoredThinking::Off) ; "explicit thinking wins")]
+    #[test_case(&["--effort", "low"], STORED_SPEC, Some(StoredThinking::Effort { level: Effort::Low }) ; "explicit effort wins")]
+    #[test_case(&["--max-thinking-tokens", "2048"], STORED_SPEC, Some(StoredThinking::Budget { tokens: 2048 }) ; "explicit budget wins")]
+    fn launch_flags_override_resumed_settings(
+        flags: &[&str],
+        expected_spec: &str,
+        thinking: Option<StoredThinking>,
+    ) {
+        const SAVED_THINKING: StoredThinking = StoredThinking::Effort { level: Effort::Max };
         let dir = tempdir().expect("tempdir");
         let storage = StateDir::from_path(dir.path().join("state"));
         let cwd = dir.path().to_string_lossy().into_owned();
         let mut stored = AppSession::new(STORED_SPEC, &cwd);
+        stored.meta.thinking = Some(SAVED_THINKING);
         stored.push_message(Message::user(STORED_MESSAGE.to_owned()));
         let stored_id = stored.id;
         stored
@@ -802,10 +832,17 @@ mod tests {
                 &storage,
             )
             .expect("write session to disk");
-        let resolved = resume::resolve(&Cli::parse_from(["maki", "-c"]), &cwd, &storage)
-            .expect("continue resolves");
+        let cli = Cli::parse_from(["maki", "-c"].into_iter().chain(flags.iter().copied()));
+        let resolved = resume::resolve(&cli, &cwd, &storage).expect("continue resolves");
 
-        let session = open_tab(resolved, STARTUP_SPEC, explicit_model, &cwd).session;
+        let session = open_tab(
+            resolved,
+            STARTUP_SPEC,
+            cli.model.is_some(),
+            cli.thinking_override(),
+            &cwd,
+        )
+        .session;
 
         assert_eq!(session.id, stored_id);
         assert_eq!(
@@ -817,6 +854,10 @@ mod tests {
             vec![STORED_MESSAGE]
         );
         assert_eq!(session.model, expected_spec);
+        assert_eq!(
+            session.meta.thinking,
+            Some(thinking.unwrap_or(SAVED_THINKING))
+        );
     }
 
     /// A fresh tab opens on the startup spec, which already folded in
@@ -828,7 +869,7 @@ mod tests {
         let storage = StateDir::from_path(dir.path().join("state"));
         let resolved = Resolved::fresh(&storage);
         let id = resolved.id.id();
-        let session = open_tab(resolved, STARTUP_SPEC, false, CWD).session;
+        let session = open_tab(resolved, STARTUP_SPEC, false, None, CWD).session;
 
         assert_eq!(session.id, id);
         assert!(session.messages().is_empty());

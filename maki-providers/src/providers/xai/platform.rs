@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::headers::parse_headers;
-use crate::model::Model;
-use crate::provider::{BoxFuture, Provider};
+use crate::model::{Model, ModelInfo};
+use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use crate::providers::ResolvedAuth;
 use crate::providers::managed_auth::ManagedAuth;
 use crate::providers::openai::responses;
@@ -112,8 +112,9 @@ impl Provider for Xai {
         tools: &'a Value,
         event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        let session_id = scope.session_id;
         Box::pin(async move {
             self.auth.refresh_if_stale().await?;
             let mut buf = String::new();
@@ -161,8 +162,11 @@ impl Provider for Xai {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
-        Box::pin(async {
+    fn list_models(
+        &self,
+        listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async move {
             self.auth.refresh_if_stale().await?;
             if self.auth.is_oauth() {
                 return self
@@ -172,7 +176,7 @@ impl Provider for Xai {
                         let access = bearer_token(&auth).ok_or_else(|| AgentError::Config {
                             message: "xAI OAuth token missing from resolved auth".into(),
                         })?;
-                        catalog::list_models(&access, false).await
+                        catalog::list_models(&access, listing == ModelListing::Refresh).await
                     })
                     .await;
             }

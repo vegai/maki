@@ -15,7 +15,7 @@ use super::{KeyPool, ResolvedAuth};
 use crate::AgentError;
 use crate::model::{FastPricing, Model, ModelEntry, ModelInfo, ModelPricing, ModelTier};
 use crate::model_registry::{self, DeclaredTiers};
-use crate::provider::{ModelBatch, Provider, ProviderStatus};
+use crate::provider::{ModelBatch, ModelListing, Provider, ProviderStatus};
 use crate::providers::Timeouts;
 use crate::spec::{ProviderRegistry, ProviderSpec};
 
@@ -403,7 +403,9 @@ async fn probe(
     def: &ProviderDef,
     timeouts: Timeouts,
 ) -> Result<Vec<String>, AgentError> {
-    let mut models = create(slug, timeouts)?.list_models().await?;
+    let mut models = create(slug, timeouts)?
+        .list_models(ModelListing::Cached)
+        .await?;
     overlay_declared_tiers(def, &mut models);
     model_registry::set_known_models(slug, models.clone());
     Ok(models
@@ -427,8 +429,10 @@ fn overlay_declared_tiers(def: &ProviderDef, models: &mut [ModelInfo]) {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+
     use tokio::sync::mpsc::unbounded_channel;
 
+    use crate::test_support::detached_scope;
     use maki_storage::sessions::Effort::High;
     use test_case::test_case;
 
@@ -714,7 +718,7 @@ mod tests {
                     &json!([]),
                     &tx,
                     RequestOptions::default(),
-                    None,
+                    detached_scope(),
                 )
                 .await
         }

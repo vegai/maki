@@ -15,7 +15,8 @@ use std::io::Cursor;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::ops::Index;
-use std::sync::{Arc, Mutex};
+use std::path::Path;
+use std::sync::{Arc, LazyLock, Mutex};
 #[cfg(test)]
 use std::time::Duration;
 
@@ -25,7 +26,9 @@ use futures::stream;
 use maki_config::providers::BASE_URL_ENV_SUFFIX;
 use serde_json::Value;
 use tempfile::TempDir;
+use tokio::runtime::{Builder, Runtime};
 
+use crate::provider::RequestScope;
 use crate::providers::plugin::{self, DeclAuthority, ProviderDecl, ProviderHooks, Registration};
 #[cfg(test)]
 use crate::providers::{SseBody, sse_events};
@@ -56,6 +59,7 @@ const USER_DIRS: &[(&str, &str)] = &[
 ];
 const MIXED_SCRIPT: &str =
     "a script is either all routed with `Canned::at` or all sequential, never a mix";
+const DETACHED_CWD: &str = ".";
 
 /// The answer to a routed request no entry is left for. It is written and
 /// recorded rather than dropped, so a stray request shows up in the
@@ -67,6 +71,19 @@ const NO_ROUTE: Canned = Canned::json(
 
 pub const SSE_HEADERS: &[(&str, &str)] = &[("content-type", "text/event-stream")];
 pub const JSON_HEADERS: &[(&str, &str)] = &[("content-type", "application/json")];
+
+const TEST_RUNTIME_WORKERS: usize = 2;
+static TEST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+    Builder::new_multi_thread()
+        .worker_threads(TEST_RUNTIME_WORKERS)
+        .enable_all()
+        .build()
+        .expect("test runtime")
+});
+
+pub fn runtime() -> &'static Runtime {
+    &TEST_RUNTIME
+}
 
 /// One recorded response, replayed in script order unless it is routed.
 pub struct Canned {
@@ -391,6 +408,14 @@ pub fn isolated_home() -> TempDir {
         }
     }
     home
+}
+
+/// The scope of a request made outside any session.
+pub fn detached_scope() -> RequestScope<'static> {
+    RequestScope {
+        session_id: None,
+        cwd: Path::new(DETACHED_CWD),
+    }
 }
 
 #[cfg(test)]

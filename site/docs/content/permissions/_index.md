@@ -12,6 +12,8 @@ Maki uses a permission system to decide what each tool is allowed to do and when
 Whether a project's `.maki` configuration loads at all is a separate question,
 answered once per folder. See [folder trust](/docs/folder-trust/).
 
+CLI [tool name lists](/docs/cli/#tool-name-lists) control which tools are available before permission rules run.
+
 ## Rule Layers
 
 Rules come from four layers, combined for resolution:
@@ -53,7 +55,7 @@ Deny rules are checked across all layers before anything else, so a deny cannot 
 
 ## Builtin Defaults
 
-File-write tools are pre-allowed inside the project working directory (cwd at session start, canonicalized). Paths outside that tree still need a prompt or an explicit allow rule:
+File-write tools are pre-allowed inside the original project directory (canonicalized). Changing the working directory with `/cd` does not expand these grants. Paths outside the original tree still need a prompt or an explicit allow rule:
 
 | Tool | Scope | Notes |
 |------|-------|-------|

@@ -186,7 +186,7 @@ jobs:
 
   # Lint and build share little beyond build scripts, so they run as separate jobs.
   windows:
-    name: ${{ matrix.recipe == 'lint' && 'Lint' || 'Build' }} (Windows)
+    name: ${{ matrix.recipe == 'lint' && 'Lint' || 'Build + Child Cancellation Test' }} (Windows)
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: windows-latest
@@ -206,6 +206,12 @@ jobs:
         with:
           tool: just
       - run: just ${{ matrix.recipe }}
+      # libtest exits 0 when the filter matches nothing, so check that the test ran.
+      - if: matrix.recipe == 'build'
+        shell: bash
+        run: |
+          cargo test -p maki-providers --lib process::child::tests::cancelling_status_keeps_child_killable -- --exact | tee child-test.log
+          grep -q 'test result: ok. 1 passed' child-test.log
 
   ci-pass:
     name: CI

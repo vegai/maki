@@ -19,7 +19,7 @@ use crate::{BufferSnapshot, ToolDoneEvent, ToolOutput};
 
 use super::hook::ToolHook;
 use super::schema::sanitize_tool_input_schema;
-use super::{DescriptionContext, ToolContext, ToolFilter};
+use super::{DescriptionContext, LocalTools, ToolContext, ToolFilter, ToolKind};
 use crate::agent::AgentHook;
 
 bitflags! {
@@ -482,7 +482,11 @@ impl ToolRegistry {
         let tools = self.tools.load();
         let mut visible: BTreeMap<&Arc<str>, bool> = BTreeMap::new();
         for tool in tools.iter() {
-            *visible.entry(&tool.source.plugin).or_default() |= filter.matches(tool.name());
+            *visible.entry(&tool.source.plugin).or_default() |= filter.admits(
+                tool.name(),
+                ToolKind::Registry(ToolAudience::all()),
+                ToolAudience::all(),
+            );
         }
         visible
             .into_iter()
@@ -505,7 +509,7 @@ impl ToolRegistry {
         ctx: &DescriptionContext,
         supports_examples: bool,
     ) -> Value {
-        self.definitions_with_background(vars, ctx, supports_examples, true)
+        self.definitions_with_background(vars, ctx, None, supports_examples, true)
     }
 
     /// `background` is whether the session can move calls to the background.
@@ -515,6 +519,7 @@ impl ToolRegistry {
         &self,
         vars: &Vars,
         ctx: &DescriptionContext,
+        local_tools: Option<&LocalTools>,
         supports_examples: bool,
         background: bool,
     ) -> Value {
@@ -522,10 +527,12 @@ impl ToolRegistry {
         let snapshot = self.tools.load();
         let mut out = Vec::with_capacity(snapshot.len());
         for entry in snapshot.iter() {
-            if !entry.tool.audience().contains(ctx.audience) {
-                continue;
-            }
-            if !ctx.filter.matches(entry.name()) {
+            let admitted = ctx.filter.admits(
+                entry.name(),
+                ToolKind::of(entry.name(), Some(entry.tool.audience()), local_tools),
+                ctx.audience,
+            );
+            if !admitted {
                 continue;
             }
             let Some(schema) = entry.tool.offered_schema(background) else {
@@ -592,6 +599,7 @@ fn format_examples_as_text(examples: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use crate::template::Vars;
+    use std::sync::Weak;
     use test_case::test_case;
 
     use crate::tools::test_support::{mock_tool, mock_tool_with_schema};
@@ -608,6 +616,85 @@ mod tests {
         ToolSource {
             plugin: plugin.into(),
         }
+    }
+
+    #[test_case(None, Some(vec![]), vec![], true ; "unpublished")]
+    #[test_case(Some(vec!["custom__tool".into()]), None, vec![], false ; "allowed_exactly")]
+    #[test_case(Some(vec!["custom.tool".into()]), None, vec![], true ; "allow_is_not_an_mcp_alias")]
+    #[test_case(None, None, vec!["custom__tool".into()], true ; "excluded_exactly")]
+    #[test_case(None, None, vec!["custom.tool".into()], false ; "exclude_is_not_an_mcp_alias")]
+    fn lua_tool_names_keep_registry_filtering(
+        allowed: Option<Vec<String>>,
+        published: Option<Vec<String>>,
+        excluded: Vec<String>,
+        hidden: bool,
+    ) {
+        const PLUGIN: &str = "custom";
+        const TOOL: &str = "custom__tool";
+        let registry = ToolRegistry::new();
+        registry.register(mock(TOOL), lua_source(PLUGIN)).unwrap();
+        let filter = ToolFilter {
+            allowed,
+            published,
+            excluded,
+        };
+        let expected: Vec<Arc<str>> = if hidden {
+            vec![PLUGIN.into()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(registry.plugins_filtered_out(&filter), expected);
+    }
+
+    struct ReloadDuringDescription {
+        registry: Weak<ToolRegistry>,
+        tool: Arc<dyn Tool>,
+    }
+
+    impl Tool for ReloadDuringDescription {
+        fn name(&self) -> &str {
+            self.tool.name()
+        }
+        fn description(&self, ctx: &DescriptionContext) -> Cow<'_, str> {
+            self.registry.upgrade().unwrap().clear_lua();
+            self.tool.description(ctx)
+        }
+        fn schema(&self) -> Value {
+            self.tool.schema()
+        }
+        fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            self.tool.parse(input)
+        }
+    }
+
+    #[test]
+    fn definition_audiences_come_from_the_captured_registry_snapshot() {
+        const MAIN: &str = "first_main";
+        const SUB: &str = "second_sub";
+        let registry = Arc::new(ToolRegistry::new());
+        registry
+            .register(
+                Arc::new(ReloadDuringDescription {
+                    registry: Arc::downgrade(&registry),
+                    tool: mock_tool(MAIN, ToolAudience::MAIN),
+                }),
+                lua_source(MAIN),
+            )
+            .unwrap();
+        registry
+            .register(mock_tool(SUB, ToolAudience::RESEARCH_SUB), lua_source(SUB))
+            .unwrap();
+        let filter = crate::tools::ToolFilter::default();
+        let context = DescriptionContext {
+            filter: &filter,
+            audience: ToolAudience::MAIN,
+            workflow: false,
+            mcp: false,
+        };
+        let definitions = registry.definitions(&Vars::new(), &context, false);
+        assert_eq!(definitions.as_array().unwrap().len(), 1);
+        assert_eq!(definitions[0]["name"], MAIN);
+        assert!(registry.iter().iter().next().is_none());
     }
 
     #[test]
@@ -627,7 +714,7 @@ mod tests {
         )
         .unwrap();
 
-        let filter = crate::tools::ToolFilter::All;
+        let filter = crate::tools::ToolFilter::default();
         let ctx = DescriptionContext {
             filter: &filter,
             audience: ToolAudience::MAIN,
@@ -648,7 +735,7 @@ mod tests {
         reg.register(mock("late_plugin.probe"), lua_source("late_plugin"))
             .unwrap();
 
-        let filter = crate::tools::ToolFilter::All;
+        let filter = crate::tools::ToolFilter::default();
         let ctx = DescriptionContext {
             filter: &filter,
             audience: ToolAudience::MAIN,
@@ -750,7 +837,7 @@ mod tests {
         reg.register(mock("everywhere"), lua_source("p")).unwrap();
 
         let vars = Vars::new();
-        let filter = crate::tools::ToolFilter::All;
+        let filter = crate::tools::ToolFilter::default();
         let names_for = |audience: ToolAudience| -> Vec<String> {
             let ctx = DescriptionContext {
                 filter: &filter,

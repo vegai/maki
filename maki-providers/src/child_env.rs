@@ -5,6 +5,7 @@ use maki_config::{PROVIDER_BUILTINS, ShellPreference, env_var_refs};
 
 use crate::providers::anthropic::bedrock;
 use crate::providers::catalog;
+use crate::providers::claude_code;
 use crate::providers::copilot::auth as copilot_auth;
 use crate::spec::ProviderRegistry;
 
@@ -49,7 +50,7 @@ fn provider_key_vars(config: &ProvidersConfig, catalog_vars: Vec<String>) -> Vec
         .into_iter()
         .map(|spec| spec.api_key_env)
         .chain(copilot_auth::TOKEN_ENV_VARS.iter().copied())
-        .chain([bedrock::BEARER_TOKEN_ENV])
+        .chain([bedrock::BEARER_TOKEN_ENV, claude_code::OAUTH_TOKEN_ENV])
         .filter(|var| !var.is_empty())
         .map(str::to_owned);
     // The key stays the user's secret even while its plugin is off or still
@@ -248,6 +249,7 @@ mod tests {
     #[test_case(anthropic::SPEC.api_key_env, true ; "builtin_key")]
     #[test_case(copilot_auth::TOKEN_ENV_VARS[1], true ; "copilot_fallback_token")]
     #[test_case(bedrock::BEARER_TOKEN_ENV, true ; "bedrock_bearer_token")]
+    #[test_case(claude_code::OAUTH_TOKEN_ENV, true ; "claude_code_oauth_token")]
     #[test_case(CUSTOM_KEY_ENV, true ; "custom_api_key_env")]
     #[test_case(DEFAULT_KEY_ENV, true ; "custom_default_slug_key")]
     #[test_case(IGNORED_KEY_ENV, false ; "builtin_api_key_env_override_ignored")]
@@ -268,9 +270,9 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn child_sees_only_keys_set_after_strip() {
-        let inherited = anthropic::SPEC.api_key_env;
+    #[test_case(anthropic::SPEC.api_key_env ; "api_key")]
+    #[test_case(claude_code::OAUTH_TOKEN_ENV ; "claude_code_oauth_token")]
+    fn child_sees_only_keys_set_after_strip(inherited: &str) {
         let explicit = bedrock::BEARER_TOKEN_ENV;
         let mut cmd = Command::new("env");
         cmd.env(inherited, SECRET);

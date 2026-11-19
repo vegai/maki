@@ -320,6 +320,7 @@ fn spawn_agent_internal(
 mod tests {
     mod background_e2e;
 
+    use std::iter;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::{Receiver, Sender, channel};
     use std::time::Instant;
@@ -329,7 +330,7 @@ mod tests {
     use maki_config::PermissionsConfig;
     use maki_config::project::{self, TrustMode};
     use maki_lua::test_support::wait_next;
-    use maki_providers::provider::{BoxFuture, Provider};
+    use maki_providers::provider::{BoxFuture, ModelListing, Provider, RequestScope};
     use maki_providers::{
         AgentError, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse, TaskEnd,
         ThinkingConfig,
@@ -347,6 +348,7 @@ mod tests {
     const SHORT_TIMEOUT: Duration = Duration::from_millis(50);
     const PROBE_TEXT: &str = "probe-through-old-sender";
     const RESTORED_TEXT: &str = "restored-queued-message";
+    const DUPLICATE_CONSUMPTION: &str = "the restored item must be consumed once";
     const RESUMED_HISTORY_TEXT: &str = "resumed-conversation";
     const MODEL_A: &str = "model-a";
     const MODEL_B: &str = "model-b";
@@ -376,12 +378,15 @@ mod tests {
             _tools: &'a serde_json::Value,
             _event_tx: &'a UnboundedSender<ProviderEvent>,
             _opts: RequestOptions,
-            _session_id: Option<&'a SessionRef>,
+            _scope: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(std::future::pending())
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
 
@@ -487,7 +492,7 @@ mod tests {
             _tools: &'a serde_json::Value,
             _event_tx: &'a UnboundedSender<ProviderEvent>,
             _opts: RequestOptions,
-            _session_id: Option<&'a SessionRef>,
+            _scope: RequestScope<'a>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             let id = model.id.clone();
             Box::pin(async move {
@@ -502,7 +507,10 @@ mod tests {
             })
         }
 
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        fn list_models(
+            &self,
+            _listing: ModelListing,
+        ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
     }
@@ -703,11 +711,20 @@ mod tests {
                 AgentEvent::QueueItemConsumed { ref text, .. } => {
                     assert_eq!(text, RESTORED_TEXT);
                     assert_eq!(envelope.run_id, app.run_id);
+                    assert!(!consumed_seen, "{DUPLICATE_CONSUMPTION}");
                     consumed_seen = true;
                 }
                 _ => {}
             }
         }
+        handles.task.abort();
+        let _ = maki_lua::test_support::runtime().block_on(handles.task);
+        assert!(
+            !iter::from_fn(|| handles.agent_rx.try_recv().ok())
+                .any(|envelope| matches!(envelope.event, AgentEvent::QueueItemConsumed { .. })),
+            "{DUPLICATE_CONSUMPTION}"
+        );
+        assert!(app.queue.text_messages().is_empty());
     }
 
     /// If the seeded empty snapshot ever outlived `spawn`, the next checkpoint

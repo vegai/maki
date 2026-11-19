@@ -20,6 +20,8 @@ pub mod error;
 pub mod oauth;
 pub mod transport;
 
+#[cfg(unix)]
+use maki_providers::process::kill_group;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::future::pending;
@@ -44,12 +46,12 @@ use self::config::{
 };
 use self::error::McpError;
 use self::transport::{McpTransport, PromptMessage};
-use crate::tools::CallOrigin;
 use crate::tools::schema::sanitize_tool_input_schema;
+use crate::tools::{CallOrigin, ToolFilter};
 use crate::types::TextOutput;
 
 const SEPARATOR: &str = ".";
-const WIRE_SEPARATOR: &str = "__";
+pub const WIRE_SEPARATOR: &str = "__";
 pub const UNKNOWN_MCP: &str = "unknown_mcp";
 pub const TOOL_SEARCH_TOOL_NAME: &str = "tool_search";
 /// Below this many deferrable tools, a search round-trip plus its
@@ -87,10 +89,27 @@ pub fn internal_tool_name(wire: &str) -> String {
     wire.replacen(WIRE_SEPARATOR, SEPARATOR, 1)
 }
 
+pub(crate) fn same_tool_name(name: &str, candidate: &str) -> bool {
+    let same_parts = |qualified: &str, wire: &str| {
+        qualified
+            .split_once(SEPARATOR)
+            .zip(wire.split_once(WIRE_SEPARATOR))
+            .is_some_and(|(qualified, wire)| qualified == wire)
+    };
+    name == candidate || same_parts(name, candidate) || same_parts(candidate, name)
+}
+
 /// Shaped like an MCP tool's wire name, whether or not a server publishes it.
 pub fn is_wire_name(name: &str) -> bool {
     name.contains(WIRE_SEPARATOR)
 }
+
+/// Shaped like a qualified MCP tool name. A shape test only: a dotted name
+/// that no server publishes yet (or one that loads later) also counts.
+pub fn is_qualified_name(name: &str) -> bool {
+    name.contains(SEPARATOR)
+}
+
 const MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct McpToolDef {
@@ -392,15 +411,20 @@ impl McpSession {
     /// Append a frame's MCP definitions: `always_load` tools in full, the rest
     /// deferred behind one `tool_search` catalog of names. Names already in
     /// the array are skipped.
-    pub fn extend_tools(&self, tools: &mut Value, deferral: ToolDeferral) {
-        self.add_missing(tools, deferral, Arrival::WithFrame);
+    pub fn extend_tools(&self, tools: &mut Value, deferral: ToolDeferral, filter: &ToolFilter) {
+        self.add_missing(tools, deferral, Arrival::WithFrame, filter);
     }
 
     /// Adds published tools the frame's array lacks, after everything it has,
     /// so every request stays a prefix of the next. Nothing is ever removed,
     /// and a tool whose server went away fails at dispatch.
-    pub fn append_late_tools(&self, tools: &mut Value, deferral: ToolDeferral) {
-        self.add_missing(tools, deferral, Arrival::Late);
+    pub fn append_late_tools(
+        &self,
+        tools: &mut Value,
+        deferral: ToolDeferral,
+        filter: &ToolFilter,
+    ) {
+        self.add_missing(tools, deferral, Arrival::Late, filter);
     }
 
     /// The one place MCP definitions enter a tool array, so a frame grows by
@@ -414,7 +438,13 @@ impl McpSession {
     /// as deferred entries, the only addition that keeps the cache and the
     /// thinking bound to the prefix. A late `always_load` tool joins that way
     /// too: in full it would cost both.
-    fn add_missing(&self, tools: &mut Value, deferral: ToolDeferral, arrival: Arrival) {
+    fn add_missing(
+        &self,
+        tools: &mut Value,
+        deferral: ToolDeferral,
+        arrival: Arrival,
+        filter: &ToolFilter,
+    ) {
         let Some(arr) = tools.as_array_mut() else {
             debug_assert!(false, "tools must be a JSON array");
             return;
@@ -422,14 +452,21 @@ impl McpSession {
         let existing = wire_names(arr);
         let searchable = existing.contains(TOOL_SEARCH_TOOL_NAME);
         let idx = self.handle.index.load();
-        let defer = self.deferring(&idx, deferral);
+        // Without tool_search, deferred definitions would have no discovery path.
+        let defer = filter.admits_external(TOOL_SEARCH_TOOL_NAME) && self.deferring(&idx, deferral);
+        if deferral == ToolDeferral::Native && !defer {
+            if arrival == Arrival::Late {
+                return;
+            }
+            warn!(
+                "tool_search is excluded; late MCP tools can only be called through code_execution"
+            );
+        }
         let loaded = self.lock_loaded();
         let mut cataloged: Vec<&ToolDescriptor> = Vec::new();
-        for d in idx
-            .descriptors
-            .iter()
-            .filter(|d| !existing.contains(d.wire_name()))
-        {
+        for d in idx.descriptors.iter().filter(|d| {
+            !existing.contains(d.wire_name()) && filter.admits_external(&d.qualified_name)
+        }) {
             let eager =
                 d.always_load && !(arrival == Arrival::Late && deferral == ToolDeferral::Native);
             if !defer || eager {
@@ -496,6 +533,7 @@ impl McpSession {
         query: &str,
         origin: CallOrigin,
         deferral: ToolDeferral,
+        filter: &ToolFilter,
     ) -> Result<TextOutput, String> {
         let q = query.trim().to_lowercase();
         let tokens: Vec<&str> = q
@@ -510,6 +548,7 @@ impl McpSession {
             .descriptors
             .iter()
             .filter(|d| loadable(d, deferral))
+            .filter(|d| filter.admits_external(&d.qualified_name))
             .filter_map(|d| {
                 let name = d.wire_name().to_lowercase();
                 let haystack = build_haystack(&d.definition);
@@ -1203,8 +1242,15 @@ pub mod test_support {
     use super::transport::{BoxFuture, McpTransport, PromptMessage};
     use super::{
         McpHandle, McpManagerInner, McpSession, McpSnapshot, McpToolDef, SEPARATOR, ServerEntry,
-        ToolIndex, publish,
+        ToolDeferral, ToolFilter, ToolIndex, publish,
     };
+
+    /// What `session` adds to an empty tool array under no filter.
+    pub fn extended(session: &McpSession, deferral: ToolDeferral) -> Value {
+        let mut tools = json!([]);
+        session.extend_tools(&mut tools, deferral, &ToolFilter::default());
+        tools
+    }
 
     /// Goes through the real `publish` path, so it cannot drift from how the
     /// index is built in production. Tools are named `server.tool`.
@@ -1370,9 +1416,7 @@ fn spawn_persist_enabled(path: PathBuf, name: String, enabled: bool) {
 
 #[cfg(unix)]
 pub fn kill_process_groups(pids: &[u32]) {
-    use crate::child_guard::sigkill_process_group;
-
-    pids.iter().copied().for_each(sigkill_process_group);
+    pids.iter().copied().for_each(kill_group);
 }
 
 #[cfg(not(unix))]
@@ -1393,6 +1437,7 @@ fn intern(name: String) -> Arc<str> {
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::extended;
     use super::*;
     use config::{RawHttpFields, RawServerConfig, RawStdioFields, RawTransport};
     use maki_providers::Role;
@@ -1519,6 +1564,17 @@ mod tests {
         }
     }
 
+    fn search(
+        session: &McpSession,
+        query: &str,
+        origin: CallOrigin,
+        deferral: ToolDeferral,
+    ) -> TextOutput {
+        session
+            .search_tools(query, origin, deferral, &ToolFilter::default())
+            .unwrap()
+    }
+
     /// Build `inner`, publish it into fresh `ArcSwap`s, and return a live `McpSession` pointing
     /// at the same state so tests can hit both the mutation and the read path.
     fn setup(entries: Vec<ServerEntry>) -> (McpManagerInner, McpSession) {
@@ -1544,6 +1600,17 @@ mod tests {
             ready_rx: watch::channel(()).1,
         };
         (inner, McpSession::new(handle, &[]))
+    }
+
+    #[test_case("srv.tool", "srv__tool", true ; "simple")]
+    #[test_case("srv.tool__part", "srv__tool__part", true ; "tool_underscores")]
+    #[test_case("my-server.tool__part", "my-server__tool__part", true ; "server_hyphens")]
+    #[test_case("srv.tool__part", "srv__other__part", false ; "different_tool")]
+    #[test_case("srv.tool.part", "srv__tool__part", false ; "multiple_boundaries_differ")]
+    #[test_case("srv.tool", "srv2__tool", false ; "different_server")]
+    fn tool_aliases_change_one_separator(name: &str, candidate: &str, expected: bool) {
+        assert_eq!(super::same_tool_name(name, candidate), expected);
+        assert_eq!(super::same_tool_name(candidate, name), expected);
     }
 
     #[test]
@@ -1582,8 +1649,7 @@ mod tests {
     #[test]
     fn client_deferral_skips_at_or_below_threshold() {
         let (_inner, handle) = setup_with_defer(vec![fake_entry("srv", FakeTransport::new())], 1);
-        let mut tools = json!([]);
-        handle.extend_tools(&mut tools, ToolDeferral::Client);
+        let tools = extended(&handle, ToolDeferral::Client);
         assert_eq!(tool_names(&tools), vec![WIRE_TOOL_NAME]);
         assert!(!maki_providers::is_deferred_tool(&tools[0]));
     }
@@ -1594,8 +1660,7 @@ mod tests {
     #[test]
     fn native_deferral_always_ships_tool_search() {
         let (_inner, handle) = setup_with_defer(vec![fake_entry("srv", FakeTransport::new())], 1);
-        let mut tools = json!([]);
-        handle.extend_tools(&mut tools, ToolDeferral::Native);
+        let tools = extended(&handle, ToolDeferral::Native);
         assert_eq!(
             tool_names(&tools),
             vec![WIRE_TOOL_NAME, TOOL_SEARCH_TOOL_NAME]
@@ -1603,9 +1668,70 @@ mod tests {
         assert!(maki_providers::is_deferred_tool(&tools[0]));
 
         let (_inner, empty) = setup(Vec::new());
-        let mut tools = json!([]);
-        empty.extend_tools(&mut tools, ToolDeferral::Native);
+        let tools = extended(&empty, ToolDeferral::Native);
         assert_eq!(tool_names(&tools), vec![TOOL_SEARCH_TOOL_NAME]);
+    }
+
+    #[test_case(ToolDeferral::Native, false ; "native_deny_list")]
+    #[test_case(ToolDeferral::Native, true ; "native_allow_list")]
+    #[test_case(ToolDeferral::Client, false ; "client_deny_list")]
+    #[test_case(ToolDeferral::Client, true ; "client_allow_list")]
+    fn filtered_late_tools_stay_out_of_the_frame_and_search(
+        deferral: ToolDeferral,
+        allow_list: bool,
+    ) {
+        let filter = if allow_list {
+            ToolFilter {
+                allowed: Some(vec![ALPHA_WIRE.into(), TOOL_SEARCH_TOOL_NAME.into()]),
+                ..Default::default()
+            }
+        } else {
+            ToolFilter {
+                excluded: vec![LATE_WIRE.into()],
+                ..Default::default()
+            }
+        };
+        let srv = entry_with_tools("srv", vec![tool_def("srv", "alpha", "", json!({}))]);
+        let (mut inner, session) = setup_with_defer(vec![srv], 0);
+        let mut tools = json!([]);
+        session.extend_tools(&mut tools, deferral, &filter);
+        let initial = tools.clone();
+        inner.entries.push(entry_with_tools(
+            "late",
+            vec![tool_def("late", "beta", "", json!({}))],
+        ));
+        publish(&inner, &session.index, &session.snapshot);
+
+        let found = session
+            .search_tools(LATE_WIRE, CallOrigin::Model, deferral, &filter)
+            .unwrap();
+        assert!(found.loaded_tools.is_empty());
+        assert!(found.text.starts_with(SEARCH_NO_MATCH));
+        session.append_late_tools(&mut tools, deferral, &filter);
+        assert_eq!(tools, initial);
+    }
+
+    #[test]
+    fn native_late_tools_without_search_preserve_the_prefix() {
+        let filter = ToolFilter {
+            allowed: Some(vec![ALPHA_WIRE.into(), LATE_WIRE.into()]),
+            ..Default::default()
+        };
+        let srv = entry_with_tools("srv", vec![tool_def("srv", "alpha", "", json!({}))]);
+        let (mut inner, session) = setup_with_defer(vec![srv], 0);
+        let mut tools = json!([]);
+        session.extend_tools(&mut tools, ToolDeferral::Native, &filter);
+        let initial = tools.clone();
+        assert_eq!(tool_names(&initial), vec![ALPHA_WIRE]);
+        inner.entries.push(entry_with_tools(
+            "late",
+            vec![tool_def("late", "beta", "", json!({}))],
+        ));
+        publish(&inner, &session.index, &session.snapshot);
+        session.append_late_tools(&mut tools, ToolDeferral::Native, &filter);
+        assert_eq!(tools, initial);
+        session.append_late_tools(&mut tools, ToolDeferral::Native, &filter);
+        assert_eq!(tools, initial);
     }
 
     /// It runs before every request, and a name sent twice is a 400, so a
@@ -1632,8 +1758,9 @@ mod tests {
     ) {
         let srv = entry_with_tools("srv", vec![tool_def("srv", "alpha", "", json!({}))]);
         let (mut inner, handle) = setup_with_defer(vec![srv], defer_tools);
+        let unfiltered = ToolFilter::default();
         let mut frozen = json!([{ "name": "read" }]);
-        handle.extend_tools(&mut frozen, deferral);
+        handle.extend_tools(&mut frozen, deferral, &unfiltered);
         let mut late = entry_with_tools("late", vec![tool_def("late", "beta", "", json!({}))]);
         if late_always_load {
             let mut raw = stdio_raw(&["echo"]);
@@ -1643,15 +1770,13 @@ mod tests {
         inner.entries.push(late);
         publish(&inner, &handle.index, &handle.snapshot);
         if let Some(query) = load {
-            handle
-                .search_tools(query, CallOrigin::Model, deferral)
-                .unwrap();
+            search(&handle, query, CallOrigin::Model, deferral);
         }
 
         let mut tools = frozen.clone();
-        handle.append_late_tools(&mut tools, deferral);
+        handle.append_late_tools(&mut tools, deferral, &unfiltered);
         let once = tools.clone();
-        handle.append_late_tools(&mut tools, deferral);
+        handle.append_late_tools(&mut tools, deferral, &unfiltered);
 
         assert_eq!(tools, once, "a second call must append nothing");
         let (head, tail) = once
@@ -1687,8 +1812,7 @@ mod tests {
             ],
             1,
         );
-        let mut tools = json!([]);
-        handle.extend_tools(&mut tools, ToolDeferral::Client);
+        let tools = extended(&handle, ToolDeferral::Client);
         assert_eq!(tool_names(&tools), vec!["eager__tool", "lazy__tool"]);
     }
 
@@ -1697,8 +1821,7 @@ mod tests {
     #[test]
     fn extend_tools_defers_behind_tool_search_by_default() {
         let (_inner, handle) = setup(vec![fake_entry("srv", FakeTransport::new())]);
-        let mut tools = json!([]);
-        handle.extend_tools(&mut tools, ToolDeferral::Client);
+        let tools = extended(&handle, ToolDeferral::Client);
         assert_eq!(tool_names(&tools), vec![TOOL_SEARCH_TOOL_NAME]);
         let catalog = tools[0]["description"].as_str().unwrap();
         assert!(catalog.contains("srv: tool"), "catalog groups by server");
@@ -1735,8 +1858,7 @@ mod tests {
             always_load_entry("eager", FakeTransport::new()),
             fake_entry("lazy", FakeTransport::new()),
         ]);
-        let mut tools = json!([]);
-        handle.extend_tools(&mut tools, ToolDeferral::Client);
+        let tools = extended(&handle, ToolDeferral::Client);
         let names = tool_names(&tools);
         assert!(names.contains(&"eager__tool"));
         assert!(names.contains(&TOOL_SEARCH_TOOL_NAME));
@@ -1746,31 +1868,26 @@ mod tests {
     #[test]
     fn search_loads_tools_into_next_extend() {
         let (_inner, handle) = setup(vec![fake_entry("srv", FakeTransport::new())]);
-        let result = handle
-            .search_tools("TOOL", CallOrigin::Model, ToolDeferral::Client)
-            .unwrap();
+        let result = search(&handle, "TOOL", CallOrigin::Model, ToolDeferral::Client);
         assert_eq!(result.loaded_tools, vec![WIRE_TOOL_NAME]);
         assert!(result.text.contains(WIRE_TOOL_NAME), "got: {}", result.text);
 
-        let mut tools = json!([]);
-        handle.extend_tools(&mut tools, ToolDeferral::Client);
+        let tools = extended(&handle, ToolDeferral::Client);
         assert_eq!(tool_names(&tools), vec![WIRE_TOOL_NAME]);
     }
 
     #[test]
     fn search_reports_no_match_without_loading() {
         let (_inner, handle) = setup(vec![fake_entry("srv", FakeTransport::new())]);
-        let result = handle
-            .search_tools(
-                "nonexistent-capability",
-                CallOrigin::Model,
-                ToolDeferral::Client,
-            )
-            .unwrap()
-            .text;
+        let result = search(
+            &handle,
+            "nonexistent-capability",
+            CallOrigin::Model,
+            ToolDeferral::Client,
+        )
+        .text;
         assert!(result.contains(SEARCH_NO_MATCH), "got: {result}");
-        let mut tools = json!([]);
-        handle.extend_tools(&mut tools, ToolDeferral::Client);
+        let tools = extended(&handle, ToolDeferral::Client);
         assert_eq!(tool_names(&tools), vec![TOOL_SEARCH_TOOL_NAME]);
     }
 
@@ -1788,10 +1905,7 @@ mod tests {
             .collect();
         let (_inner, handle) = setup(vec![entry]);
 
-        let result = handle
-            .search_tools("tool", CallOrigin::Model, ToolDeferral::Client)
-            .unwrap()
-            .text;
+        let result = search(&handle, "tool", CallOrigin::Model, ToolDeferral::Client).text;
         let expected = format!(
             "{SEARCH_OVERFLOW_PREFIX}`srv__tool-{}`, `srv__tool-{}`",
             MAX_SEARCH_LOADS,
@@ -1801,8 +1915,7 @@ mod tests {
             result.contains(&expected),
             "overflow must list names: {result}"
         );
-        let mut tools = json!([]);
-        handle.extend_tools(&mut tools, ToolDeferral::Client);
+        let tools = extended(&handle, ToolDeferral::Client);
         // Loaded cap plus the search tool for the remaining deferred ones.
         assert_eq!(tools.as_array().unwrap().len(), MAX_SEARCH_LOADS + 1);
     }
@@ -1831,10 +1944,7 @@ mod tests {
         let (_inner, handle) = setup(vec![entry_with_tools("srv", tools)]);
         // Alphabetical tie-break alone would leave the last tool in overflow.
         let last = format!("{prefix}{MAX_SEARCH_LOADS}");
-        let result = handle
-            .search_tools(&last, CallOrigin::Model, ToolDeferral::Client)
-            .unwrap()
-            .text;
+        let result = search(&handle, &last, CallOrigin::Model, ToolDeferral::Client).text;
         let overflow = result
             .lines()
             .find(|l| l.starts_with(SEARCH_OVERFLOW_PREFIX))
@@ -1853,10 +1963,7 @@ mod tests {
             tool_def("srv", "create_issue", "Open a ticket", json!({})),
         ];
         let (_inner, handle) = setup(vec![entry_with_tools("srv", tools)]);
-        let result = handle
-            .search_tools("issue", CallOrigin::Model, ToolDeferral::Client)
-            .unwrap()
-            .text;
+        let result = search(&handle, "issue", CallOrigin::Model, ToolDeferral::Client).text;
         let pos = |name: &str| {
             result
                 .find(name)
@@ -1877,10 +1984,13 @@ mod tests {
             json!({}),
         )];
         let (_inner, handle) = setup(vec![entry_with_tools("srv", tools)]);
-        let result = handle
-            .search_tools("pull request", CallOrigin::Model, ToolDeferral::Client)
-            .unwrap()
-            .text;
+        let result = search(
+            &handle,
+            "pull request",
+            CallOrigin::Model,
+            ToolDeferral::Client,
+        )
+        .text;
         assert!(result.contains("srv__create_pr"), "got: {result}");
     }
 
@@ -1889,19 +1999,15 @@ mod tests {
         let schema = json!({"type": "object", "properties": {"labels": {"type": "array"}}});
         let tools = vec![tool_def("srv", "update", "Update a thing", schema)];
         let (_inner, handle) = setup(vec![entry_with_tools("srv", tools)]);
-        let result = handle
-            .search_tools("labels", CallOrigin::Model, ToolDeferral::Client)
-            .unwrap()
-            .text;
+        let result = search(&handle, "labels", CallOrigin::Model, ToolDeferral::Client).text;
         assert!(result.contains("srv__update"), "got: {result}");
     }
 
     #[test]
     fn extend_tools_never_duplicates_existing_names() {
         let (_inner, handle) = setup(vec![always_load_entry("eager", FakeTransport::new())]);
-        let mut tools = json!([]);
-        handle.extend_tools(&mut tools, ToolDeferral::Client);
-        handle.extend_tools(&mut tools, ToolDeferral::Client);
+        let mut tools = extended(&handle, ToolDeferral::Client);
+        handle.extend_tools(&mut tools, ToolDeferral::Client, &ToolFilter::default());
         assert_eq!(tool_names(&tools), vec!["eager__tool"]);
     }
 
@@ -1923,8 +2029,7 @@ mod tests {
             ..Default::default()
         }];
         let restored = McpSession::new(session.handle.clone(), &history);
-        let mut tools = json!([]);
-        restored.extend_tools(&mut tools, ToolDeferral::Client);
+        let tools = extended(&restored, ToolDeferral::Client);
         assert_eq!(
             tool_names(&tools),
             vec![WIRE_TOOL_NAME],
@@ -1938,13 +2043,9 @@ mod tests {
             always_load_entry("eager", FakeTransport::new()),
             fake_entry("lazy", FakeTransport::new()),
         ]);
-        let mut before = json!([]);
-        handle.extend_tools(&mut before, ToolDeferral::Native);
-        handle
-            .search_tools("tool", CallOrigin::Model, ToolDeferral::Client)
-            .unwrap();
-        let mut after = json!([]);
-        handle.extend_tools(&mut after, ToolDeferral::Native);
+        let before = extended(&handle, ToolDeferral::Native);
+        search(&handle, "tool", CallOrigin::Model, ToolDeferral::Client);
+        let after = extended(&handle, ToolDeferral::Native);
         assert_eq!(before, after);
 
         let by_name = |name: &str| {
@@ -1972,9 +2073,7 @@ mod tests {
     #[test]
     fn load_called_names_a_tool_that_is_already_loaded() {
         let (_inner, handle) = setup(vec![fake_entry("srv", FakeTransport::new())]);
-        handle
-            .search_tools("tool", CallOrigin::Model, ToolDeferral::Client)
-            .unwrap();
+        search(&handle, "tool", CallOrigin::Model, ToolDeferral::Client);
         assert_eq!(
             handle.load_called(TOOL_NAME, CallOrigin::Model, ToolDeferral::Client),
             vec![WIRE_TOOL_NAME]
@@ -1991,8 +2090,7 @@ mod tests {
         let (_inner, handle) = setup_with_defer(vec![entry_with_tools("srv", defs)], 2);
         handle.load_called("srv.alpha", CallOrigin::Model, ToolDeferral::Client);
         handle.load_called("srv.beta", CallOrigin::Model, ToolDeferral::Client);
-        let mut tools = json!([]);
-        handle.extend_tools(&mut tools, ToolDeferral::Client);
+        let tools = extended(&handle, ToolDeferral::Client);
         let names = tool_names(&tools);
         assert!(names.contains(&"srv__alpha") && names.contains(&"srv__beta"));
         assert!(
@@ -2016,8 +2114,7 @@ mod tests {
             handle.load_called(TOOL_NAME, CallOrigin::Model, ToolDeferral::Client),
             vec![WIRE_TOOL_NAME]
         );
-        let mut tools = json!([]);
-        handle.extend_tools(&mut tools, ToolDeferral::Client);
+        let tools = extended(&handle, ToolDeferral::Client);
         assert_eq!(
             tool_names(&tools),
             vec![WIRE_TOOL_NAME],
@@ -2048,9 +2145,7 @@ mod tests {
     #[test]
     fn nested_search_names_matches_without_promising_a_next_request() {
         let (_inner, handle) = setup(vec![fake_entry("srv", FakeTransport::new())]);
-        let result = handle
-            .search_tools("tool", CallOrigin::Nested, ToolDeferral::Client)
-            .unwrap();
+        let result = search(&handle, "tool", CallOrigin::Nested, ToolDeferral::Client);
         assert!(result.loaded_tools.is_empty());
         let text = result.text;
         assert!(text.contains(WIRE_TOOL_NAME), "got: {text}");
@@ -2065,7 +2160,7 @@ mod tests {
         ];
         let (_inner, handle) = setup(vec![entry_with_tools("srv", defs)]);
         let mut tools = json!([{ "name": "srv__alpha" }]);
-        handle.extend_tools(&mut tools, ToolDeferral::Client);
+        handle.extend_tools(&mut tools, ToolDeferral::Client, &ToolFilter::default());
         assert_eq!(
             tool_names(&tools),
             vec!["srv__alpha", TOOL_SEARCH_TOOL_NAME],
@@ -2087,8 +2182,7 @@ mod tests {
             ..Default::default()
         }];
         let restored = McpSession::new(session.handle.clone(), &history);
-        let mut tools = json!([]);
-        restored.extend_tools(&mut tools, ToolDeferral::Client);
+        let tools = extended(&restored, ToolDeferral::Client);
         assert_eq!(
             tool_names(&tools),
             vec!["srv__do__thing"],
@@ -2099,10 +2193,7 @@ mod tests {
     #[test]
     fn client_search_ignores_always_load_tools() {
         let (_inner, handle) = setup(vec![always_load_entry("eager", FakeTransport::new())]);
-        let result = handle
-            .search_tools("tool", CallOrigin::Model, ToolDeferral::Client)
-            .unwrap()
-            .text;
+        let result = search(&handle, "tool", CallOrigin::Model, ToolDeferral::Client).text;
         assert!(
             result.contains(SEARCH_NO_MATCH),
             "always_load tools are already declared: {result}"
@@ -2114,9 +2205,7 @@ mod tests {
     #[test]
     fn native_late_always_load_tool_is_loadable() {
         let (_inner, handle) = setup(vec![always_load_entry("srv", FakeTransport::new())]);
-        let searched = handle
-            .search_tools("tool", CallOrigin::Model, ToolDeferral::Native)
-            .unwrap();
+        let searched = search(&handle, "tool", CallOrigin::Model, ToolDeferral::Native);
         assert_eq!(searched.loaded_tools, vec![WIRE_TOOL_NAME]);
         assert_eq!(
             handle.load_called(TOOL_NAME, CallOrigin::Model, ToolDeferral::Native),
@@ -2128,16 +2217,12 @@ mod tests {
     fn search_loads_stay_scoped_to_their_session() {
         let (_inner, session_a) = setup(vec![fake_entry("srv", FakeTransport::new())]);
         let session_b = session_a.fresh();
-        session_a
-            .search_tools("tool", CallOrigin::Model, ToolDeferral::Client)
-            .unwrap();
+        search(&session_a, "tool", CallOrigin::Model, ToolDeferral::Client);
 
-        let mut tools_a = json!([]);
-        session_a.extend_tools(&mut tools_a, ToolDeferral::Client);
+        let tools_a = extended(&session_a, ToolDeferral::Client);
         assert_eq!(tool_names(&tools_a), vec![WIRE_TOOL_NAME]);
 
-        let mut tools_b = json!([]);
-        session_b.extend_tools(&mut tools_b, ToolDeferral::Client);
+        let tools_b = extended(&session_b, ToolDeferral::Client);
         assert_eq!(tool_names(&tools_b), vec![TOOL_SEARCH_TOOL_NAME]);
     }
 
@@ -2209,8 +2294,7 @@ mod tests {
         let (mut inner, handle) = setup(vec![fake_entry("srv", Arc::clone(&t) as _)]);
 
         assert!(handle.resolve(TOOL_NAME).is_some());
-        let mut tools = json!([]);
-        handle.extend_tools(&mut tools, ToolDeferral::Client);
+        let tools = extended(&handle, ToolDeferral::Client);
         assert_eq!(tools[0]["name"], TOOL_SEARCH_TOOL_NAME);
 
         handle_toggle(&mut inner, "srv", false).await;
@@ -2222,8 +2306,7 @@ mod tests {
         assert!(entry.transport.is_none());
         assert_eq!(entry.status, McpServerStatus::Disabled);
         assert!(handle.resolve(TOOL_NAME).is_none());
-        let mut tools = json!([]);
-        handle.extend_tools(&mut tools, ToolDeferral::Client);
+        let tools = extended(&handle, ToolDeferral::Client);
         assert!(tools.as_array().unwrap().is_empty());
     }
 

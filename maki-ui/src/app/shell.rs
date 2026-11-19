@@ -11,6 +11,7 @@ use maki_agent::{
     AgentConfig, CancelToken, CancelTrigger, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
 };
 use maki_config::ShellPreference;
+use maki_providers::process::ChildGuard;
 use maki_providers::{Message, shell_command, strip_provider_keys};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
@@ -244,7 +245,7 @@ async fn run_command(
     if let Some(stderr) = child.stderr.take() {
         spawn_line_reader(BufReader::new(stderr), line_tx.clone());
     }
-    let mut guard = maki_agent::ChildGuard::new(child);
+    let mut guard = ChildGuard::new(child).map_err(|e| format!("cannot supervise process: {e}"))?;
     drop(line_tx);
 
     let mut output = String::new();

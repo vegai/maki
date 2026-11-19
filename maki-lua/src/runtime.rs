@@ -307,6 +307,8 @@ fn load_user_source<'a>(lua: &'a Lua, name: &str, source: &'a str) -> Chunk<'a> 
     lua.load(source).set_name(name)
 }
 
+pub(crate) type PrivateApi = fn(&Lua, &PluginPermissions) -> mlua::Result<(&'static str, Table)>;
+
 /// Everything a load needs besides the code itself.
 ///
 /// One value rather than a row of positional arguments: it travels unchanged
@@ -334,6 +336,7 @@ pub struct LoadContext {
     /// [`PluginHost::load_builtins`] leaves this at the answer that grants
     /// nothing.
     pub authority: DeclAuthority,
+    pub(crate) private_api: Option<PrivateApi>,
 }
 
 impl LoadContext {
@@ -348,6 +351,7 @@ impl LoadContext {
             revision_guard: None,
             package: false,
             authority: DeclAuthority::ThirdParty,
+            private_api: None,
         }
     }
 
@@ -363,6 +367,7 @@ impl LoadContext {
             revision_guard: None,
             package: false,
             authority: DeclAuthority::Config,
+            private_api: None,
         }
     }
 }
@@ -571,6 +576,9 @@ pub enum Request {
     },
     CollectPluginOptions {
         reply: SyncSender<PluginOptionSpecs>,
+    },
+    CollectLoadedPlugins {
+        reply: SyncSender<Vec<String>>,
     },
     /// Packages `init.lua` declared. Read after the init files have run, since
     /// that is when the declared set is complete.
@@ -2719,6 +2727,10 @@ pub(crate) fn active_task_cancel(lua: &Lua) -> Option<(u64, CancelToken)> {
     Some((cell.id, cell.cancel.clone()))
 }
 
+pub(crate) fn task_cancel(lua: &Lua) -> CancelToken {
+    active_task_cancel(lua).map_or_else(CancelToken::none, |(_, cancel)| cancel)
+}
+
 pub(crate) fn is_user_action(lua: &Lua) -> bool {
     lua.app_data_ref::<TaskHandle>()
         .is_some_and(|handle| lock_cell(&handle).user_action)
@@ -2925,6 +2937,9 @@ struct InflightGate {
     gc: GcPacer,
     /// One permit per coroutine, handed out in the order asked for.
     slots: Arc<Semaphore>,
+    /// The same budget for `maki.defer_fn` bodies, apart from the tool slots
+    /// so tool calls filling every slot cannot hold up a cancellation timer.
+    timer_slots: Arc<Semaphore>,
     /// What [`Self::drain`] waits on: a token per piece of held work, from the
     /// moment it queues for a slot until it gives the slot back. Unlike the
     /// slots, it leaves out work under a `maki.async.spawn` task. Closed from
@@ -2940,6 +2955,7 @@ impl InflightGate {
         Self {
             gc: GcPacer::new(lua, LUA_MEMORY_LIMIT),
             slots: Arc::new(Semaphore::new(MAX_INFLIGHT_TOOLS)),
+            timer_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_TOOLS)),
             held,
         }
     }
@@ -2972,7 +2988,20 @@ impl InflightGate {
     /// The hold is taken before waiting for a slot. Otherwise held work stuck
     /// behind a cap full of detached slots would let the barrier through.
     async fn admit(self: &Rc<Self>, hold: Option<DrainHold>) -> GateGuard {
-        let slot = Arc::clone(&self.slots)
+        self.admit_from(&self.slots, hold).await
+    }
+
+    async fn acquire_timer(self: &Rc<Self>) -> GateGuard {
+        self.admit_from(&self.timer_slots, Some(DrainHold::new(self)))
+            .await
+    }
+
+    async fn admit_from(
+        self: &Rc<Self>,
+        slots: &Arc<Semaphore>,
+        hold: Option<DrainHold>,
+    ) -> GateGuard {
+        let slot = Arc::clone(slots)
             .acquire_owned()
             .await
             .expect(GATE_SLOTS_OPEN);
@@ -3427,7 +3456,7 @@ async fn run_work_fn(
 /// the callback still gets its `on_stdout` and `on_exit`.
 ///
 /// The gate guard comes after the sleep: pending timers should pile up
-/// cheaply, but the bodies compete for the `MAX_INFLIGHT_TOOLS` budget so
+/// cheaply, but the bodies compete for the gate's timer slots so
 /// `for i=1,10000 do maki.defer_fn(f, 0) end` can't run 10k coroutines at
 /// once. Errors are logged and dropped, nobody is awaiting a result.
 fn spawn_deferred_callback(
@@ -3439,14 +3468,14 @@ fn spawn_deferred_callback(
     let gate = Rc::clone(gate);
     spawn_local(async move {
         // Biased, so a stop that lands as the gate opens still wins. Once the
-        // guard is held the drain barrier waits for it, and a `clear_plugin`
+        // hold is taken the drain barrier waits for it, and a `clear_plugin`
         // cannot reach the callback any more.
         let fired = tokio::select! {
             biased;
             () = cb.cancel.cancelled() => None,
             guard = async {
                 sleep(cb.delay).await;
-                gate.acquire().await
+                gate.acquire_timer().await
             } => Some(guard),
         };
         let Some(_guard) = fired else {
@@ -3813,7 +3842,7 @@ impl LuaRuntime {
         let watchdog = Watchdog::spawn(&lua, Arc::clone(&shutdown));
 
         let globals = lua.globals();
-        for name in &["require", "io", "package"] {
+        for name in &["require", "io", "package", "getfenv", "setfenv"] {
             globals
                 .set(*name, LuaValue::Nil)
                 .map_err(|e| PluginError::Lua {
@@ -4133,12 +4162,13 @@ impl LuaRuntime {
         &self,
         maki: mlua::Table,
         require_root: Option<RequireRoot>,
+        private: Option<(&'static str, Table)>,
     ) -> Result<mlua::Table, mlua::Error> {
         let env = self.lua.create_table()?;
         env.set("maki", maki)?;
 
         if require_root.is_some() || !self.bundled.dirs.is_empty() {
-            let require_fn = self.create_require_fn(&env, require_root)?;
+            let require_fn = self.create_require_fn(&env, require_root, private)?;
             env.set("require", require_fn)?;
         }
 
@@ -4155,6 +4185,7 @@ impl LuaRuntime {
         &self,
         env: &mlua::Table,
         require_root: Option<RequireRoot>,
+        private: Option<(&'static str, Table)>,
     ) -> Result<Function, mlua::Error> {
         let loader = Arc::new(ModuleLoader {
             bundled: self.bundled.clone(),
@@ -4165,6 +4196,9 @@ impl LuaRuntime {
             loads: Arc::default(),
         });
 
+        if let Some((module, private)) = private {
+            loader.loaded.set(module, private)?;
+        }
         self.lua.create_async_function(move |lua, modname: String| {
             let loader = Arc::clone(&loader);
             async move { loader.require(&lua, &modname).await }
@@ -4205,6 +4239,7 @@ impl LuaRuntime {
             revision_guard,
             package,
             authority,
+            private_api,
         } = context;
         let map_err = |e: mlua::Error| PluginError::Lua {
             plugin: name.to_string(),
@@ -4255,7 +4290,17 @@ impl LuaRuntime {
             .map_err(map_err)?;
             maki.set("pack", pack).map_err(map_err)?;
         }
-        let env = self.build_env(maki, require_root).map_err(map_err)?;
+        let private = if authority == DeclAuthority::Bundled && !package {
+            private_api
+                .map(|create| create(&self.lua, &permissions))
+                .transpose()
+                .map_err(map_err)?
+        } else {
+            None
+        };
+        let env = self
+            .build_env(maki, require_root, private)
+            .map_err(map_err)?;
         if let Some(mut envs) = self.lua.app_data_mut::<PluginEnvs>() {
             envs.0.insert(Arc::clone(&name), env.to_pointer() as usize);
         }
@@ -6196,6 +6241,10 @@ pub fn spawn(
                         Request::CollectPluginOptions { reply } => {
                             let _ = reply.send(collect_plugin_options(&rt.lua));
                         }
+                        Request::CollectLoadedPlugins { reply } => {
+                            let names = rt.plugins.borrow().keys().map(ToString::to_string).collect();
+                            let _ = reply.send(names);
+                        }
                         Request::CollectPackages { reply } => {
                             let declared = with_packs(&rt.lua, |packs| packs.specs.clone());
                             let _ = reply.send(declared);
@@ -6353,14 +6402,22 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::{MOVED_CALL_ID, call_scope, moved_home};
     use super::*;
+    #[cfg(unix)]
+    use crate::api::r#fn::create_fn_table;
     use crate::api::tool::ToolCallReply;
     use crate::api::util::dispatch::{DepthGuard, MAX_HOOK_DEPTH, Reentry};
     use crate::jobs::JobSpec;
+    #[cfg(unix)]
+    use crate::jobs::MAX_STDIN_BYTES;
     use crate::loader::HOST_RUNTIME;
     use futures::FutureExt;
     use maki_agent::cancel::CancelTrigger;
+    #[cfg(unix)]
+    use std::fs::File;
     use std::future::poll_fn;
     use std::iter;
+    #[cfg(unix)]
+    use std::process::Command;
     use std::task::{Context, Poll, Wake, Waker};
     use test_case::test_case;
     use tokio::sync::Notify;
@@ -6479,10 +6536,26 @@ mod tests {
         TaskScope,
         PendingLoad,
         Waiting,
+        /// A named `jobstart` parked in its spawn, holding the start gate.
+        #[cfg(unix)]
+        StartGate,
+        /// A `chansend` parked on a full queue, holding the write lock.
+        #[cfg(unix)]
+        StdinWriter,
     }
 
     const TEST_MODULE: &str = "slow";
     const OUTER_MODULE: &str = "outer";
+    const SUSPENDED: &str = "suspended";
+    #[cfg(unix)]
+    const EXITING_JOB: &str = "exit 0";
+    #[cfg(unix)]
+    const MKFIFO: &str = "mkfifo";
+    #[cfg(unix)]
+    const SPAWN_FIFO: &str = "spawn.fifo";
+    /// Twice the stdin queue, so the write parks whatever the pipe takes in.
+    #[cfg(unix)]
+    const OVERFULL_STDIN: usize = 2 * MAX_STDIN_BYTES;
 
     /// Frees `value` the way the collector frees a coroutine parked on it:
     /// inside `collect_userdata`, where any VM call aborts the process.
@@ -6498,11 +6571,38 @@ mod tests {
         lua.gc_collect().unwrap();
     }
 
+    /// Parks {call} on `f`, the plugin's `maki.fn`, in a coroutine the plugin
+    /// made, runs {parked}, then lets the collector free the coroutine, the
+    /// only thing that ever does.
+    #[cfg(unix)]
+    fn collect_parked_call(lua: &Lua, call: &str, parked: impl FnOnce()) {
+        let functions = create_fn_table(
+            lua,
+            TEST_PLUGIN.into(),
+            &PluginPermissions::trusted(),
+            PluginPermissions::trusted(),
+            None,
+        );
+        lua.globals().set("f", functions.unwrap()).unwrap();
+        let park = lua.load(format!(
+            "local co = coroutine.create(function() {call} end)
+             assert(coroutine.resume(co))
+             return coroutine.status(co)"
+        ));
+        let status: String = HOST_RUNTIME.block_on(park.eval_async()).unwrap();
+        assert_eq!(status, SUSPENDED, "the call must park");
+        parked();
+        lua.gc_collect().unwrap();
+        lua.gc_collect().unwrap();
+    }
+
     #[test_case(LuaOwned::WaitLease ; "wait_lease")]
     #[test_case(LuaOwned::DepthGuard ; "depth_guard")]
     #[test_case(LuaOwned::TaskScope ; "task_scope")]
     #[test_case(LuaOwned::PendingLoad ; "pending_load")]
     #[test_case(LuaOwned::Waiting ; "waiting")]
+    #[cfg_attr(unix, test_case(LuaOwned::StartGate ; "start_gate"))]
+    #[cfg_attr(unix, test_case(LuaOwned::StdinWriter ; "stdin_writer"))]
     fn dropped_by_collector_releases_its_hold(owned: LuaOwned) {
         let lua = Lua::new();
         match owned {
@@ -6581,6 +6681,52 @@ mod tests {
                     loads.lock_pending()[OUTER_MODULE].waits_for.is_empty(),
                     "the wait must be taken back"
                 );
+            }
+            #[cfg(unix)]
+            LuaOwned::StartGate => {
+                let dir = tempfile::tempdir().unwrap();
+                let fifo = dir.path().join(SPAWN_FIFO);
+                assert!(Command::new(MKFIFO).arg(&fifo).status().unwrap().success());
+                let gate = with_jobs(&lua, |store| Arc::clone(&store.start_gate));
+                // Opening the redirect blocks until the FIFO has a reader, so
+                // the start parks in its spawn holding the gate.
+                let start = format!(
+                    r#"f.jobstart("{EXITING_JOB}", {{
+                        scope = "plugin", name = "{TEST_PLUGIN}", stdout = "{}",
+                        on_exit = function() end,
+                    }})"#,
+                    fifo.display()
+                );
+
+                collect_parked_call(&lua, &start, || {
+                    assert!(gate.try_lock().is_err(), "the start must hold the gate");
+                });
+
+                assert!(gate.try_lock().is_ok(), "the start must leave the gate");
+                drop(File::open(&fifo).unwrap());
+            }
+            #[cfg(unix)]
+            LuaOwned::StdinWriter => {
+                let owner = JobOwner::Plugin(Arc::from(TEST_PLUGIN));
+                let id = with_jobs(&lua, |store| {
+                    store.start(JobSpec {
+                        pipe_stdin: true,
+                        ..JobSpec::new(owner.clone(), SLEEPING_JOB)
+                    })
+                })
+                .unwrap();
+                let writer =
+                    with_jobs(&lua, |store| store.stdin_writer(id, None, TEST_PLUGIN)).unwrap();
+                let lock_free = || writer.send(&[]).now_or_never().is_some();
+
+                collect_parked_call(
+                    &lua,
+                    &format!(r#"f.chansend({id}, string.rep("x", {OVERFULL_STDIN}))"#),
+                    || assert!(!lock_free(), "the write must hold the lock"),
+                );
+
+                assert!(lock_free(), "the write lock must be given back");
+                with_jobs(&lua, |store| store.kill_owner(&lua, &owner));
             }
         }
     }

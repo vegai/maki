@@ -9,7 +9,7 @@ use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::model::{Model, ModelFamily, ModelInfo};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, ModelListing, Provider, RequestScope};
 use crate::providers::catalog::{
     CatalogMeta, CatalogTransport, EndpointType, FreeTier, ProviderQuirks, UsageEndpoint,
     sends_if_available, shared_catalog,
@@ -66,10 +66,11 @@ pub(crate) const ZEN_SPEC: ProviderSpec = ProviderSpec {
     fallback_max_output: Some(128_000),
     fallback_context_window: 256_000,
     models_toml: NO_CURATED_MODELS,
+    models_of: None,
     pricing_schedule: None,
     build: Build::Native(Native {
         new: create,
-        with_auth: create_with_auth,
+        with_auth: Some(create_with_auth),
     }),
     aperture: None,
     login: None,
@@ -96,6 +97,7 @@ pub(crate) const GO_SPEC: ProviderSpec = ProviderSpec {
     fallback_max_output: Some(64_000),
     fallback_context_window: 128_000,
     models_toml: NO_CURATED_MODELS,
+    models_of: None,
     pricing_schedule: None,
     build: Build::Catalog,
     aperture: None,
@@ -276,8 +278,9 @@ impl Provider for Opencode {
         tools: &'a Value,
         event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        scope: RequestScope<'a>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        let session_id = scope.session_id;
         Box::pin(async move {
             let (sub_provider, actual_id) =
                 model.id.split_once('/').unwrap_or((ZEN_SLUG, &model.id));
@@ -311,7 +314,10 @@ impl Provider for Opencode {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+    fn list_models(
+        &self,
+        _listing: ModelListing,
+    ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(self.do_list_models())
     }
 
