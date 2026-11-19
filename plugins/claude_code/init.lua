@@ -16,8 +16,6 @@ local path_utils = require("claude_paths")
 
 local MODELS = launch.MODELS
 local MS_PER_SEC = jobs.MS_PER_SEC
--- Each step of a coding snapshot, such as the copy, must finish in this time.
-local SNAPSHOT_TIMEOUT_MS = 120 * MS_PER_SEC
 local MAX_SHOWN_CHANGES = 50
 local ARTIFACTS_SUBDIR = "claude_code"
 local ARTIFACTS_LEAF = "changes"
@@ -130,7 +128,7 @@ if opts.artifact_dir ~= "" then
     error("the `artifact_dir` option must not contain `..`")
   end
 end
-local dependencies, dependencies_err = path_utils.dependency_dirs(opts.dependencies)
+local dependencies, dependencies_err = path_utils.comma_list(opts.dependencies, path_utils.relative_path)
 if not dependencies then
   error("the `dependencies` option: " .. dependencies_err)
 end
@@ -157,13 +155,23 @@ local function artifacts_root()
   return maki.fs.joinpath(state_dir, ARTIFACTS_SUBDIR, ARTIFACTS_LEAF)
 end
 
+-- The run and the import resolve the root the same way, so the approved
+-- command names the same paths.
+local function resolved_root(cwd, denied)
+  local root, root_err = artifacts_root()
+  if not root then
+    return nil, root_err
+  end
+  return native.resolve_root(root, cwd, denied)
+end
+
 local semaphore = maki.async.semaphore(opts.max_concurrent)
 
 local function refuse(msg)
   return { llm_output = ERROR_PREFIX .. truncate(msg, nil, jobs.ERROR_BYTES), is_error = true }
 end
 
-local function snapshot_plan(input)
+local function snapshot_include(input)
   local include = {}
   for _, path in ipairs(input.include or {}) do
     local spelled, problem = path_utils.relative_path(path)
@@ -172,21 +180,19 @@ local function snapshot_plan(input)
     end
     include[#include + 1] = spelled
   end
+  -- Refuse before any process starts.
   local root, root_err = artifacts_root()
-  if not root then
-    return nil, root_err
-  end
-  return { include = include, dependencies = dependencies, root = root }
+  return root and include, root_err
 end
 
-local function fill_snapshot(call, view, plan, artifact, cwd, env)
+local function fill_snapshot(call, view, include, artifact, cwd, env)
   view:append({ { SNAPSHOTTING, "dim" } })
   local err = snapshot.fill(call, artifact, {
     cwd = cwd,
     env = env,
     deny_read = opts.deny_read,
-    include = plan.include,
-    dependencies = plan.dependencies,
+    include = include,
+    dependencies = dependencies,
   })
   if err then
     return "maki cannot make a snapshot of the project: " .. err
@@ -232,8 +238,8 @@ local function change_report(call, artifact, project)
   return table.concat(lines, "\n")
 end
 
-local function open_artifact(call, spec, root)
-  local root, root_err = native.resolve_root(root, spec.cwd, spec.denied)
+local function open_artifact(call, spec)
+  local root, root_err = resolved_root(spec.cwd, spec.denied)
   if not root then
     return nil, "maki cannot make a coding artifact: " .. root_err
   end
@@ -241,10 +247,10 @@ local function open_artifact(call, spec, root)
   -- allocation, whose directory {call} removes once it is idle.
   local sweep = jobs.new()
   sweep:wait(function()
-    artifacts.sweep(sweep, root, opts.artifact_ttl_hours, SNAPSHOT_TIMEOUT_MS)
+    artifacts.sweep(sweep, root, opts.artifact_ttl_hours)
     sweep:answer()
   end)
-  local artifact, allocate_err = call:wait(artifacts.allocate, call, root, spec.env, SNAPSHOT_TIMEOUT_MS)
+  local artifact, allocate_err = call:wait(artifacts.allocate, call, root, spec.env)
   if not artifact then
     return nil, "maki cannot make a coding artifact: " .. allocate_err
   end
@@ -252,12 +258,12 @@ local function open_artifact(call, spec, root)
 end
 
 local function run(input, ctx, call, timeout_secs)
-  local plan
+  local include
   if input.profile == CODE_PROFILE then
-    local plan_err
-    plan, plan_err = snapshot_plan(input)
-    if not plan then
-      return refuse(plan_err)
+    local include_err
+    include, include_err = snapshot_include(input)
+    if not include then
+      return refuse(include_err)
     end
   end
   local spec, spec_err = launch.preflight(input, ctx, call, opts)
@@ -269,9 +275,9 @@ local function run(input, ctx, call, timeout_secs)
   -- first.
   local artifact
   local env = spec.env
-  if plan then
+  if include then
     local artifact_err
-    artifact, artifact_err = open_artifact(call, spec, plan.root)
+    artifact, artifact_err = open_artifact(call, spec)
     if not artifact then
       return refuse(artifact_err)
     end
@@ -301,7 +307,7 @@ local function run(input, ctx, call, timeout_secs)
     claude.view:append({ { STARTING, "dim" } })
     return claude:build(claude:start(argv, spec.cwd, env, input.prompt))
   end
-  local fill_err = fill_snapshot(call, claude.view, plan, artifact, spec.cwd, env)
+  local fill_err = fill_snapshot(call, claude.view, include, artifact, spec.cwd, env)
   if fill_err then
     return refuse(fill_err)
   end
@@ -334,7 +340,7 @@ local function discard_unkept(call, removed)
     local artifact = call.artifact
     call.artifact = nil
     if artifact then
-      artifacts.discard(call, artifact, removed)
+      artifacts.remove(call, artifact.dir, removed)
     elseif removed then
       removed()
     end
@@ -352,7 +358,8 @@ local function handler(input, ctx)
   local timeout_secs = launch.task_timeout(input.timeout, opts.timeout_secs)
 
   local permit = semaphore:try_acquire()
-  local call = jobs.new(function()
+  local call = jobs.new()
+  call:on_released(function()
     if permit then
       permit:release()
     end
@@ -451,16 +458,11 @@ local function import_handler(input, ctx)
   if native.unsupported then
     return refuse(native.unsupported)
   end
-  local root, root_err = artifacts_root()
-  if not root then
-    return refuse(root_err)
-  end
   local project, project_err = maki.agent.cwd(ctx)
   if not project then
     return refuse(launch.NO_SESSION_DIR .. tostring(project_err))
   end
-  -- The run resolves the root the same way, so the approved command names the same paths.
-  root, root_err = native.resolve_root(root, project, {})
+  local root, root_err = resolved_root(project, {})
   if not root then
     return refuse(root_err)
   end

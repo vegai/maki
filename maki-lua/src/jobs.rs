@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Error as IoError, ErrorKind, Read, Result as IoResult, Write};
+use std::io::{BufReader, Read, Write};
 use std::mem;
 #[cfg(target_os = "linux")]
 use std::os::unix::net::UnixStream;
@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use maki_config::ShellPreference;
-use maki_providers::process::{GroupSignals, STDERR_TAIL_LINES, cap_stderr_line};
+use maki_providers::process::{GroupSignals, PATH, STDERR_TAIL_LINES, cap_stderr_line};
 use maki_providers::{process, shell_command, strip_provider_keys};
 use maki_storage::id::MakiId;
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult};
@@ -29,7 +29,7 @@ use tokio::sync::{
 };
 use tokio_util::task::AbortOnDropHandle;
 
-use crate::api::fs::{Line, MAX_READ_BYTES, expand_tilde, next_line};
+use crate::api::fs::{Line, LineLimit, expand_tilde, next_line};
 use crate::plugin_permissions::Ceiling;
 use crate::runtime::{Narrowed, with_jobs};
 
@@ -57,7 +57,7 @@ const STDOUT_STREAM: &str = "stdout";
 const STDERR_STREAM: &str = "stderr";
 const EXIT_EVENT: &str = "exit";
 const CWD_NOT_DIRECTORY: &str = "cwd is not a directory";
-const PATH: &str = "PATH";
+const UNWATCHED_HOLDS_CHILD: &str = "an unwatched job holds its child until dropped";
 
 /// `agent.shell`, set once from config at startup. Jobs get built far away
 /// from any config, on whatever Lua thread runs the plugin, so they read it here.
@@ -294,7 +294,7 @@ impl JobSpec {
             guard: false,
             timeout: None,
             tail: DEFAULT_TAIL,
-            line_limit: LineLimit::Cut(MAX_READ_BYTES),
+            line_limit: LineLimit::new(None, false),
             ceiling: None,
             stdout: Redirect::Capture,
             stderr: Redirect::Capture,
@@ -303,53 +303,6 @@ impl JobSpec {
             on_exit: None,
         }
     }
-}
-
-/// Longest line a reader hands on.
-#[derive(Clone, Copy)]
-pub(crate) enum LineLimit {
-    /// Cut a longer line, skipping the rest without reading it into memory.
-    Cut(u64),
-    /// Stop the job on a longer line.
-    Stop(u64),
-}
-
-impl LineLimit {
-    fn read(self, reader: &mut impl BufRead) -> IoResult<Option<Line>> {
-        match self {
-            Self::Cut(limit) => next_line(reader, Some(limit), true),
-            Self::Stop(limit) => next_output_line(reader, limit),
-        }
-    }
-}
-
-fn next_output_line(reader: &mut impl BufRead, limit: u64) -> IoResult<Option<Line>> {
-    let mut window = limit.saturating_add(1);
-    let mut line = Vec::new();
-    let mut read = reader.by_ref().take(window).read_until(b'\n', &mut line)? as u64;
-    if read == window && line.last() == Some(&b'\r') {
-        window = window.saturating_add(1);
-        read += reader.by_ref().take(1).read_until(b'\n', &mut line)? as u64;
-    }
-    if read == 0 {
-        return Ok(None);
-    }
-    if line.ends_with(b"\n") || read < window {
-        line.pop_if(|b| *b == b'\n');
-        line.pop_if(|b| *b == b'\r');
-    }
-    if line.len() as u64 > limit {
-        return Err(IoError::new(
-            ErrorKind::InvalidData,
-            format!("job: output line exceeds the {limit}-byte limit"),
-        ));
-    }
-    let bytes = line.len() as u64;
-    Ok(Some(Line {
-        text: String::from_utf8(line)
-            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()),
-        bytes,
-    }))
 }
 
 struct JobMeta {
@@ -546,7 +499,7 @@ impl JobStore {
 
     pub(crate) fn register(&mut self, spawned: SpawnedJob) -> Result<u32, String> {
         let SpawnedJob {
-            mut child,
+            child,
             pid,
             pipes: (stdin_pipe, stdout_pipe, stderr_pipe),
             #[cfg(target_os = "linux")]
@@ -601,9 +554,7 @@ impl JobStore {
         thread::Builder::new()
             .name("job-wait".into())
             .spawn(move || {
-                let Some(child) = child.0.take() else {
-                    return;
-                };
+                let child = child.take();
                 // The closure owns the guard's `lifetime` until the job is reaped.
                 #[cfg(target_os = "linux")]
                 if lifetime.is_some() {
@@ -797,7 +748,7 @@ impl JobStore {
         drop_callbacks(lua, job);
         match session_plugin {
             Some(plugin) => self.evict_completed(lua, &plugin),
-            None => self.finish(lua, job_id),
+            None => self.remove(lua, job_id, false),
         }
     }
 
@@ -979,11 +930,7 @@ impl JobStore {
         ids
     }
 
-    pub fn finish(&mut self, lua: &Lua, job_id: u32) {
-        self.remove(lua, job_id, false);
-    }
-
-    fn remove(&mut self, lua: &Lua, job_id: u32, kill: bool) {
+    pub(crate) fn remove(&mut self, lua: &Lua, job_id: u32, kill: bool) {
         if let Some(job) = self.jobs.remove(&job_id) {
             if kill {
                 kill_job(&job);
@@ -1284,7 +1231,7 @@ fn spawn_reader(
         .spawn(move || {
             let mut reader = BufReader::with_capacity(READER_BUF_SIZE, stream);
             loop {
-                match line_limit.read(&mut reader) {
+                match next_line(&mut reader, Some(line_limit), true) {
                     Ok(Some(line)) => {
                         if !events.send(event(line)) {
                             break;
@@ -1462,6 +1409,13 @@ fn off_thread(work: impl FnOnce() + Send + 'static) {
 /// still identifies the group.
 struct Unwatched(Option<Child>);
 
+impl Unwatched {
+    /// Hands the child to the wait thread. Only `Drop` ever leaves `None`.
+    fn take(mut self) -> Child {
+        self.0.take().expect(UNWATCHED_HOLDS_CHILD)
+    }
+}
+
 impl Drop for Unwatched {
     fn drop(&mut self) {
         if let Some(mut child) = self.0.take() {
@@ -1579,7 +1533,7 @@ mod tests {
     #[cfg(unix)]
     use crate::api::r#fn::create_fn_table;
     #[cfg(unix)]
-    use crate::api::fs::LINE_CUT_MARKER;
+    use crate::api::fs::{LINE_CUT_MARKER, MAX_READ_BYTES};
     #[cfg(unix)]
     use crate::plugin_permissions::PluginPermissions;
     use crate::test_support::runtime;
@@ -1647,7 +1601,7 @@ mod tests {
     #[test_case(b"tests", true ; "unterminated_over_limit")]
     fn output_line_limits_bound_the_read(bytes: &[u8], too_large: bool) {
         let mut reader = Cursor::new(bytes);
-        let line = next_output_line(&mut reader, LINE_LIMIT as u64);
+        let line = next_line(&mut reader, Some(LineLimit::Stop(LINE_LIMIT as u64)), true);
         if too_large {
             assert_eq!(line.unwrap_err().to_string(), LINE_LIMIT_ERROR);
         } else {
@@ -1761,7 +1715,7 @@ mod tests {
     #[test_case(false ; "running_leader_times_out")]
     #[test_case(true ; "exited_leader_waiting_for_readers_does_not_time_out")]
     fn a_deadline_checks_the_leaders_exit_before_reporting_a_timeout(exited: bool) {
-        let mut child = Unwatched(Some(
+        let child = Unwatched(Some(
             Command::new("sh")
                 .args(["-c", if exited { "exit 0" } else { NEVER_ENDS }])
                 .process_group(0)
@@ -1778,7 +1732,7 @@ mod tests {
         }
         kill_unreaped(&state, true);
         assert_eq!(state.timed_out.load(Ordering::Acquire), !exited);
-        reap(child.0.take().unwrap(), &state);
+        reap(child.take(), &state);
         assert!(!state.lock().is_enabled());
     }
 
@@ -2006,7 +1960,7 @@ mod tests {
             JobEvent::Exit(..)
         ) {}
 
-        store.finish(&lua, id);
+        store.remove(&lua, id, false);
         assert!(store.is_empty(&owner));
     }
 
@@ -2070,7 +2024,7 @@ mod tests {
         store.kill(id, Some(1), TEST_PLUGIN);
         assert!(store.jobs[&id].deadline.is_none());
         wait_until(GROUP_SURVIVED, || !group_alive(pid));
-        store.finish(&lua, id);
+        store.remove(&lua, id, false);
     }
 
     #[cfg(unix)]
@@ -2215,7 +2169,7 @@ mod tests {
             .insert(1, stub_job(task_owner(1), Some(callback_key), None));
         assert_eq!(Arc::strong_count(&capture), 2);
 
-        store.finish(&lua, 1);
+        store.remove(&lua, 1, false);
         lua.gc_collect().unwrap();
 
         assert_eq!(Arc::strong_count(&capture), 1);
@@ -2286,7 +2240,7 @@ mod tests {
             .collect();
         assert!(from_other.is_empty());
 
-        store.finish(&lua, task);
+        store.remove(&lua, task, false);
         let live: Vec<u32> = store
             .list(None, Some(1), TEST_PLUGIN)
             .iter()
@@ -2922,7 +2876,7 @@ mod tests {
         assert!(store.attach(&lua, 1, None, TEST_PLUGIN, exit_updates(&lua)));
         assert!(woke(), "an exit replayed to a new on_exit");
 
-        store.finish(&lua, 1);
+        store.remove(&lua, 1, false);
         assert!(woke(), "a job leaving is what ends a dispatch");
     }
 

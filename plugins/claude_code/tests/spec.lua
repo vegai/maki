@@ -7,6 +7,7 @@ local importer = require("claude_import")
 local workspace = require("claude_workspace")
 local git_utils = require("claude_git")
 local import_scripts = require("claude_import_script")
+local artifacts = require("claude_artifact")
 local path_utils = require("claude_paths")
 local Run = require("claude_run")
 
@@ -37,7 +38,11 @@ local PROMPT = "--explain the parser"
 local ANSWER = "The parser lives in src/parse.rs:10."
 local OK_VERSION = "2.1.284"
 local JOB_WAIT_MS = 5000
+local BASH_DEFAULT_TIMEOUT_SECS = 120
+local REQUESTED_TIMEOUT_SECS = 90
+local CONFIGURED_TIMEOUT_SECS = 600
 local OUTSIDE = "/home/u/.ssh/config"
+local PRIVATE_DIR = "/tmp/maki_cc_XXXXXX"
 -- What 2.1.280 sends with every setting source off.
 local BUILTIN_PLUGINS = {
   { name = "agents-md", path = "builtin", source = "agents-md@builtin" },
@@ -51,8 +56,12 @@ local CONFINE = {
   allow_write = { "/artifacts/a1/tmp" },
 }
 
+local function private_dir()
+  return assert(maki.fs.mkdtemp(PRIVATE_DIR))
+end
+
 local function launch_denied_dirs(cwd)
-  local home = t.mktmpdir("cc_launch_home")
+  local home = private_dir()
   local paths, err = native.prepare_launch({ HOME = home }, nil, cwd)
   t.rmtree(home)
   if not paths then
@@ -84,8 +93,12 @@ local function assistant(id, content, usage)
 end
 
 local function fresh()
-  local stream =
-    Stream.new({ cwd = CWD, policy = native.worker_policy({ deny = DEFAULT_DENY_RULES }), version = OK_VERSION })
+  local stream = Stream.new({
+    cwd = CWD,
+    policy = native.worker_policy({ deny = DEFAULT_DENY_RULES }),
+    version = OK_VERSION,
+    executable = "claude",
+  })
   stream.native:mark_prompted()
   return stream
 end
@@ -94,15 +107,6 @@ local function started()
   local stream = fresh()
   assert(stream:feed(init_event()).init, "the checks must accept a clean init")
   return stream
-end
-
-local function contains(list, value)
-  for _, v in ipairs(list) do
-    if v == value then
-      return true
-    end
-  end
-  return false
 end
 
 local function account_answer(mode)
@@ -204,9 +208,12 @@ end
 -- with a `/` is anchored at the project.
 case("denied_paths_twin_a_pattern_without_a_slash", function()
   local patterns = assert(path_utils.denied_paths("*.pem, certs/key.pem, ./local.txt"))
-  assert(contains(patterns, "*.pem") and contains(patterns, "**/*.pem"), "*.pem must match at any depth")
-  assert(contains(patterns, "certs/key.pem") and not contains(patterns, "**/certs/key.pem"), "a path stays anchored")
-  assert(contains(patterns, "**/local.txt"), "a leading ./ goes")
+  assert(table.find(patterns, "*.pem") and table.find(patterns, "**/*.pem"), "*.pem must match at any depth")
+  assert(
+    table.find(patterns, "certs/key.pem") and not table.find(patterns, "**/certs/key.pem"),
+    "a path stays anchored"
+  )
+  assert(table.find(patterns, "**/local.txt"), "a leading ./ goes")
 end)
 
 for _, pattern in ipairs({ "/etc/passwd", "../secret", "a/../b", "x)" }) do
@@ -221,14 +228,14 @@ end
 -- `config_dir` names another login.
 case("home_credentials_include_the_default_claude_login", function()
   local paths = assert(confine.home_credentials("/home/u"))
-  assert(contains(paths, "/home/u/.claude"), "~/.claude must be denied")
-  assert(contains(paths, "/home/u/.ssh"), "~/.ssh must be denied")
+  assert(table.find(paths, "/home/u/.claude"), "~/.claude must be denied")
+  assert(table.find(paths, "/home/u/.ssh"), "~/.ssh must be denied")
 end)
 
 case("home_credentials_follow_xdg_data_home", function()
   local paths = assert(confine.home_credentials("/home/u", nil, { XDG_DATA_HOME = "/data" }))
-  assert(contains(paths, "/data/keyrings"))
-  assert(contains(paths, "/data/fish/fish_history"))
+  assert(table.find(paths, "/data/keyrings"))
+  assert(table.find(paths, "/data/fish/fish_history"))
 end)
 
 for _, name in ipairs({
@@ -248,7 +255,7 @@ for _, name in ipairs({
     for _, path in ipairs({ absolute, relative }) do
       local paths = assert(confine.home_credentials("/home/u", nil, { [name] = path }))
       local expected = path == absolute and absolute or maki.fs.joinpath(assert(maki.uv.cwd()), relative)
-      assert(contains(paths, expected), expected)
+      assert(table.find(paths, expected), expected)
     end
   end)
 end
@@ -281,7 +288,7 @@ case("home_credentials_cover_standard_stores_and_user_paths", function()
     "custom/login.json",
     "tool/credentials",
   }) do
-    assert(contains(paths, home .. "/" .. path), path)
+    assert(table.find(paths, home .. "/" .. path), path)
   end
   for _, path in ipairs({ "/etc/passwd", "../outside", "nested/../../outside" }) do
     local denied, problem = confine.denied_home_paths(path)
@@ -463,23 +470,14 @@ case("a_coding_handshake_checks_the_sandbox_and_a_read_one_does_not", function()
     sources = { { source = "flagSettings", settings = {} } },
     effective = worker_settings(worker_spec()),
   }
-  local hooks = { hooks = maki.json.decode("[]"), policy = { allDisabled = true } }
-  eq(handshake_problem({ settings = settings, hooks = hooks }), nil)
-  has(handshake_problem({ settings = settings, hooks = hooks }, CONFINE) or "", "outside its sandbox")
+  eq(handshake_problem({ settings = settings }), nil)
+  has(handshake_problem({ settings = settings }, CONFINE) or "", "outside its sandbox")
   settings.effective = worker_settings(worker_spec(CONFINE))
-  eq(handshake_problem({ settings = settings, hooks = hooks }, CONFINE), nil)
+  eq(handshake_problem({ settings = settings }, CONFINE), nil)
 end)
 
-local function read_argv()
-  return worker_argv({
-    executable = "claude",
-    model = "haiku",
-    policy = native.worker_policy({ deny = DEFAULT_DENY_RULES }),
-  })
-end
-
 case("argv_for_a_reader_never_widens_its_reach", function()
-  local joined = table.concat(read_argv(), " ")
+  local joined = table.concat(worker_argv(worker_spec()), " ")
   for _, forbidden in ipairs({ "--add-dir", "--allowedTools", "--allowed-tools", "bypassPermissions", "--dangerously" }) do
     eq(joined:find(forbidden, 1, true), nil, "the argv must not contain " .. forbidden)
   end
@@ -500,7 +498,7 @@ end)
 -- The switches that keep a reader's tools, permissions, settings and MCP
 -- servers closed. They are literal here, so the test notices a missing one.
 case("argv_carries_every_security_switch", function()
-  local argv = read_argv()
+  local argv = worker_argv(worker_spec())
   for _, c in ipairs({
     { "--tools", "Read,Glob,Grep" },
     { "--permission-mode", "manual" },
@@ -511,7 +509,7 @@ case("argv_carries_every_security_switch", function()
     assert(has_pair(argv, c[1], c[2]), c[1] .. " must be " .. c[2])
   end
   for _, flag in ipairs({ "--restricted", "--strict-mcp-config", "--no-session-persistence" }) do
-    assert(contains(argv, flag), flag .. " missing")
+    assert(table.find(argv, flag), flag .. " missing")
   end
 end)
 
@@ -523,18 +521,14 @@ case("instructions_come_before_the_prompt", function()
 end)
 
 -- Returns the `get_settings` response when only maki's flags and {policy}
--- apply, after {edit} changes the merged result.
-local function settings_answer(policy, edit)
+-- apply.
+local function settings_answer(policy)
   local flags = maki.json.decode(maki.json.encode(worker_settings(worker_spec())))
   local sources = { { source = "flagSettings", settings = flags } }
   if policy then
     sources[#sources + 1] = { source = "policySettings", settings = policy }
   end
-  local effective = maki.json.decode(maki.json.encode(flags))
-  if edit then
-    edit(effective, sources)
-  end
-  return { effective = effective, sources = sources }
+  return { effective = maki.json.decode(maki.json.encode(flags)), sources = sources }
 end
 
 case("our_settings_alone_pass", function()
@@ -607,7 +601,7 @@ for _, c in ipairs({
   },
 }) do
   case("launch_denied_dirs_" .. c.name, function()
-    local root = t.mktmpdir("cc_layout")
+    local root = private_dir()
     for _, dir in ipairs(c.dirs) do
       maki.fs.mkdir(maki.fs.joinpath(root, dir), { parents = true })
     end
@@ -645,7 +639,7 @@ for _, c in ipairs({
   },
 }) do
   case("launch_denied_dirs_refuse_" .. c.name, function()
-    local root = t.mktmpdir("cc_layout")
+    local root = private_dir()
     for _, dir in ipairs(c.dirs) do
       maki.fs.mkdir(maki.fs.joinpath(root, dir), { parents = true })
     end
@@ -946,14 +940,14 @@ case("no_usage_before_anything_was_counted", function()
 end)
 
 for _, c in ipairs({
-  { name = "the_callers_own", requested = 120, want = 120 },
-  { name = "the_option_when_none_is_asked", requested = nil, want = 600 },
+  { name = "the_callers_own", requested = REQUESTED_TIMEOUT_SECS, want = REQUESTED_TIMEOUT_SECS },
+  { name = "the_option_when_none_is_asked", requested = nil, want = CONFIGURED_TIMEOUT_SECS },
   { name = "raised_to_the_least", requested = 5, want = launch.MIN_TIMEOUT_SECS },
   { name = "lowered_to_the_most", requested = 5000, want = launch.MAX_TIMEOUT_SECS },
   { name = "whole_seconds", requested = 90.7, want = 90 },
 }) do
   case("a_task_timeout_is_" .. c.name, function()
-    eq(launch.task_timeout(c.requested, 600), c.want)
+    eq(launch.task_timeout(c.requested, CONFIGURED_TIMEOUT_SECS), c.want)
   end)
 end
 
@@ -1043,7 +1037,7 @@ end
 
 case("a_larger_import_gets_more_time_than_the_bash_default", function()
   local one = import_scripts.import_timeout({ {} })
-  assert(one >= 120, "less than the bash default: " .. one)
+  assert(one >= BASH_DEFAULT_TIMEOUT_SECS, "less than the bash default: " .. one)
   assert(import_scripts.import_timeout({ {}, {}, {} }) > one, "a larger import does not receive more time")
 end)
 
@@ -1068,15 +1062,16 @@ end)
 case("import_approval_lists_escaped_paths_before_the_script", function()
   local path = "src/a\n$(touch pwned).rs"
   local changes = { { path = path, status = "A", new_sha = SHA_A, new_mode = git_utils.REGULAR_MODE } }
-  local script = import_scripts.import_script(changes, "/project", "/git", "/artifacts/a1", "/artifacts/a1/stage.z9")
+  local stage = import_scripts.stage(artifacts.layout("/artifacts/a1"), "/artifacts/a1/stage.z9")
+  local script = import_scripts.import_script(changes, "/project", "/git", stage)
   local heading = "# Import changes into /project\n# A " .. path_utils.printable(path) .. "\n\nset -e\n"
   eq(script:sub(1, #heading), heading)
 end)
 
 case("dependency_dirs_are_project_relative", function()
-  local dirs = assert(path_utils.dependency_dirs(" node_modules/ , ./web//./node_modules,"))
+  local dirs = assert(path_utils.comma_list(" node_modules/ , ./web//./node_modules,", path_utils.relative_path))
   eq(table.concat(dirs, "|"), "node_modules|web/node_modules")
-  local dirs_none, err = path_utils.dependency_dirs("../shared")
+  local dirs_none, err = path_utils.comma_list("../shared", path_utils.relative_path)
   eq(dirs_none, nil)
   eq(err, "../shared" .. path_utils.OUTSIDE_PROJECT)
 end)

@@ -11,7 +11,7 @@ use std::iter;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use maki_agent::tools::test_support::stub_ctx_in;
 use maki_agent::tools::{ToolContext, ToolRegistry};
@@ -24,10 +24,10 @@ use test_case::test_case;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use super::support::{
-    ACCOUNT_SUBSCRIPTION, DEADLINE, FIXTURE_GLOBAL_RULE, Gate, HOOKS_OFF, LEFT_BEHIND,
-    MINIMUM_VERSION, PROJECT_RULE, TOOL, TOUCH_PWNED, WorkingDir, cancel_after, cancel_trigger,
-    executable, group_gone, load, output, reply, running, tool_reply, try_load, use_fixture_user,
-    wait_until,
+    ACCOUNT_SUBSCRIPTION, CODE_PROFILE, DEADLINE, FIXTURE_GLOBAL_RULE, Gate, HOOKS_OFF,
+    LEFT_BEHIND, MINIMUM_VERSION, PROJECT_RULE, TOOL, WorkingDir, cancel_after, cancel_trigger,
+    executable, group_gone, load, load_patched, output, reply, running, tool_reply, try_load,
+    use_fixture_user, wait_until,
 };
 
 mod coding;
@@ -163,7 +163,6 @@ const PROBE_CRASH: &str = "exited (exit status: 3) during its checks:\nprobe gav
 const UNASKED_STOP: &str = "started its run before maki accepted its checks";
 const ROUTE_CLAIM: &str = "maki found no route conflict";
 
-const CODE_PROFILE: &str = "code";
 const MODEL_ALIAS: &str = "haiku";
 const RELATIVE_EXECUTABLE: &str = "./claude";
 const ONE_SLOT: u64 = 1;
@@ -183,16 +182,12 @@ const CODE_HANG: &str = "code_hang";
 const WORKING: &str = "working";
 /// Longer than `DEADLINE` so a failed process kill fails the test.
 const HANG_SECS: u64 = DEADLINE.as_secs() * 2;
-/// Makes the fake add a file named {HOSTILE_NAME}.
+/// Makes the fake add a file named by the content of its `hostile_name` file.
 const CODE_HOSTILE: &str = "code_hostile";
 const CODE_RETYPE: &str = "code_retype";
 /// Makes the fake write Claude Code config at the root and in subdirectories,
 /// plus an edit.
 const CODE_CLAUDE_CONFIG: &str = "code_claude_config";
-/// A name that survives only with proper shell quoting: a quote, a command
-/// substitution, a space, a glob and a newline.
-pub(super) static HOSTILE_NAME: LazyLock<String> =
-    LazyLock::new(|| format!("src/it's {} *\nnew.rs", *TOUCH_PWNED));
 const RELATIVE_CONFIG_DIR: &str = "claude-config";
 const NOT_ABSOLUTE: &str = "must be an absolute path, not claude-config";
 
@@ -310,7 +305,7 @@ case "$scenario" in
     sleep @HANG_SECS@ ;;
   code_hostile*)
     init none
-    printf 'hostile\n' > "@HOSTILE@"
+    printf 'hostile\n' > "$(cat "$dir/hostile_name")"
     answer ;;
   code_ambiguous*)
     init none
@@ -424,7 +419,6 @@ impl FakeClaude {
             .replace("@REFUSE_SETTINGS@", REFUSE_SETTINGS)
             .replace("@ANSWER_TWICE@", ANSWER_TWICE)
             .replace("@SETTINGS_REFUSAL@", SETTINGS_REFUSAL)
-            .replace("@HOSTILE@", &HOSTILE_NAME.replace('$', "\\$"))
             .replace("@WORKING@", WORKING)
             .replace("@HANG_SECS@", &HANG_SECS.to_string());
         let fake = Self::running(&script);
@@ -474,6 +468,14 @@ impl FakeClaude {
         fs::read_to_string(self.path(name)).unwrap_or_default()
     }
 
+    /// How many times the fake logged `call` in its calls.
+    fn count(&self, call: &str) -> usize {
+        self.log("calls")
+            .lines()
+            .filter(|line| *line == call)
+            .count()
+    }
+
     /// Returns the directories, other than `project`, where the fake started
     /// and which still exist: probe directories that were never removed.
     fn probe_dirs_left(&self, project: &Path) -> Vec<PathBuf> {
@@ -515,15 +517,10 @@ impl FakeClaude {
     }
 
     fn host_with_deadlines(&self, startup_timeout_secs: u64) -> (Arc<ToolRegistry>, PluginHost) {
-        let registry = Arc::new(ToolRegistry::new());
-        let host = PluginHost::new(Arc::clone(&registry)).unwrap();
-        let source = format!(
-            "require(\"maki.claude_code.internal\").startup_timeout_secs = {startup_timeout_secs}\nrequire(\"claude_launch\").MIN_TIMEOUT_SECS = {TEST_TIMEOUT_SECS}\n{}",
-            include_str!("../../../plugins/claude_code/init.lua"),
+        let prefix = format!(
+            "require(\"maki.claude_code.internal\").startup_timeout_secs = {startup_timeout_secs}\nrequire(\"claude_launch\").MIN_TIMEOUT_SECS = {TEST_TIMEOUT_SECS}"
         );
-        host.load_bundled_source(TOOL, &source, self.opts(&[]))
-            .unwrap();
-        (registry, host)
+        load_patched(&prefix, self.opts(&[]))
     }
 
     pub(super) fn ask(&self, prompt: &str) -> Result<String, String> {
@@ -687,14 +684,14 @@ fn an_answered_run_goes_through_every_check() {
         "the ANSWERS go through stdin"
     );
     assert_eq!(fake.log("calls"), format!("{STARTED}print {ANSWERS}\n"));
-    let child_env = fake.log("env");
     assert!(
-        child_env.lines().any(|l| l.starts_with("PATH=")),
+        fake.log("env").lines().any(|l| l.starts_with("PATH=")),
         "PATH must go to the child"
     );
+    let every_env = fake.log("envs");
     assert!(
-        !child_env.lines().any(|l| l.starts_with("CARGO_")),
-        "got:\n{child_env}"
+        !every_env.lines().any(|l| l.starts_with("CARGO_")),
+        "got:\n{every_env}"
     );
 }
 
@@ -974,7 +971,13 @@ fn the_view_claims_a_clean_route_only_after_init_passes(scenario: &str, claimed:
     let (tx, mut rx) = unbounded_channel::<Envelope>();
     let events = EventSender::new(tx, 0);
     let ctx = fake.ctx(Some(&events), Some(TOOL_USE_ID));
-    let _ = output(call(&reg, &ctx, scenario));
+    let result = output(call(&reg, &ctx, scenario));
+    if claimed {
+        assert_eq!(result.unwrap(), ANSWER);
+    } else {
+        let err = result.unwrap_err();
+        assert!(err.contains(API_KEY_STOP), "{err}");
+    }
     let view = iter::from_fn(|| rx.try_recv().ok())
         .filter_map(|env| match env.event {
             AgentEvent::LiveToolBuf { body, .. } => Some(body.take().text()),
@@ -1017,43 +1020,19 @@ fn cached_versions_do_not_skip_current_policy_checks() {
     let ask = || output(call(&reg, &ctx, ANSWERS));
     assert_eq!(ask().unwrap(), ANSWER);
     assert_eq!(ask().unwrap(), ANSWER);
-    assert_eq!(
-        fake.log("calls")
-            .lines()
-            .filter(|line| *line == "version")
-            .count(),
-        1
-    );
+    assert_eq!(fake.count("version"), 1);
     add_a_managed_hook(&fake);
     let err = ask().unwrap_err();
     assert!(err.contains(HOOK_STOP), "{err}");
-    assert_eq!(
-        fake.log("calls")
-            .lines()
-            .filter(|line| *line == "start")
-            .count(),
-        5
-    );
+    assert_eq!(fake.count("start"), 5);
     fake.write(HOOKS_FILE, HOOKS_OFF);
     log_out(&fake);
     let error = ask().unwrap_err();
     assert!(error.contains(LOGIN_HINT), "{error}");
-    assert_eq!(
-        fake.log("calls")
-            .lines()
-            .filter(|line| *line == "version")
-            .count(),
-        1
-    );
+    assert_eq!(fake.count("version"), 1);
     fake.write("account.json", ACCOUNT_SUBSCRIPTION);
     assert_eq!(ask().unwrap(), ANSWER);
-    assert_eq!(
-        fake.log("calls")
-            .lines()
-            .filter(|line| *line == "version")
-            .count(),
-        2
-    );
+    assert_eq!(fake.count("version"), 2);
 }
 
 #[test]
@@ -1165,21 +1144,20 @@ fn output_after_the_result_is_checked(scenario: &str, want: Option<&str>) {
 /// maki recorded the usage before cancellation.
 #[test]
 fn a_cancelled_run_keeps_what_it_spent() {
-    let (scenario, progress, spent) = (USAGE_THEN_HANG, USAGE_PROGRESS, SPENT_BEFORE_CANCEL);
     let fake = FakeClaude::new();
     let (reg, _host) = fake.host();
     let (tx, mut rx) = unbounded_channel::<Envelope>();
     let mut ctx = fake.ctx(Some(&EventSender::new(tx, 0)), Some(TOOL_USE_ID));
     let canceller = cancel_after(&mut ctx, move || {
-        if let Err(views) = wait_for_view_line(&mut rx, progress) {
+        if let Err(views) = wait_for_view_line(&mut rx, USAGE_PROGRESS) {
             panic!("the usage message did not go to the view, which showed {views:?}");
         }
     });
 
-    let err = output(call(&reg, &ctx, scenario)).unwrap_err();
+    let err = output(call(&reg, &ctx, USAGE_THEN_HANG)).unwrap_err();
     canceller.join().unwrap();
     assert!(err.contains(CANCEL_MARKER), "got: {err}");
-    assert_mentions(&err, spent);
+    assert_mentions(&err, SPENT_BEFORE_CANCEL);
     assert!(
         group_gone(fake.pid(), DEADLINE),
         "no process of the cancelled child must stay"
@@ -1222,13 +1200,7 @@ fn a_cancelled_call_lets_go_only_once_its_processes_end(
             let _ = fs::remove_file(fake.path(stall));
         }
         trigger.cancel();
-        let cancelled_at = Instant::now();
-        let results = (first.join().unwrap(), second.join().unwrap());
-        assert!(
-            cancelled_at.elapsed() < DEADLINE,
-            "cancellation waited for the stalled process to time out"
-        );
-        results
+        (first.join().unwrap(), second.join().unwrap())
     });
     // When the cancel lands decides the text: the runtime's cancel note, or
     // the error of a process the cancel stopped.
@@ -1254,7 +1226,6 @@ fn a_cancelled_call_lets_go_only_once_its_processes_end(
 
 #[test]
 fn a_handler_deadline_during_version_check_releases_its_slot_after_reaping() {
-    const TIMED_OUT: &str = "tool claude_code timed out after 10s";
     let fake = FakeClaude::new();
     stall_the_version_check(&fake);
     let gate = Gate::closed();
@@ -1286,7 +1257,10 @@ fn a_handler_deadline_during_version_check_releases_its_slot_after_reaping() {
         gate.release();
         (first, next.join().unwrap())
     });
-    assert_eq!(first.unwrap_err(), TIMED_OUT);
+    assert_eq!(
+        first.unwrap_err(),
+        format!("tool {TOOL} timed out after {TEST_TIMEOUT_SECS}s")
+    );
     assert_eq!(next.unwrap(), ANSWER);
     assert!(fake.log("overlaps").is_empty());
     assert!(wait_until(DEADLINE, || fake

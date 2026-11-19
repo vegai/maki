@@ -6,6 +6,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
+use maki_providers::claude_code::worker::{COMMONDIR, GIT_ENTRY, GITDIR_PREFIX};
 use maki_storage::id::MakiId;
 use maki_storage::permissions::PERMISSION_BITS;
 use rustix::fd::{AsFd, BorrowedFd};
@@ -14,7 +15,6 @@ use rustix::io::Errno;
 use rustix::path::Arg;
 
 use super::fd::{create_private, directory, open_regular};
-use maki_providers::claude_code::worker::{COMMONDIR, GIT_ENTRY, GITDIR_PREFIX};
 
 const MAX_DEPTH: usize = 64;
 const BASE_RESOLUTION_STEPS: usize = 64 * 1024;
@@ -413,6 +413,9 @@ mod tests {
     const LINK_CHAIN_LENGTH: usize = 64;
     const RESOLUTION_LINK: &str = "link";
     const REALPATH: &str = "realpath";
+    /// The permission bits plus setuid, setgid and sticky, so a copy that
+    /// kept any of those fails the comparison.
+    const MODE_BITS: u32 = 0o7777;
 
     /// An existing snapshot, with its quarantine and trusted repository beside it.
     struct Fixture {
@@ -701,7 +704,7 @@ mod tests {
         let after = fs::metadata(&copied).unwrap();
         assert_eq!(after.nlink(), 1);
         assert_eq!(
-            after.permissions().mode() & 0o7777,
+            after.permissions().mode() & MODE_BITS,
             mode & super::PERMISSION_BITS
         );
         assert_eq!(after.modified().unwrap(), before.modified().unwrap());
@@ -922,7 +925,7 @@ mod tests {
     }
 
     #[test]
-    fn a_large_root_pointer_is_preserved_without_reading_it() {
+    fn a_large_root_pointer_is_quarantined_intact() {
         let fixture = Fixture::new();
         let pointer = fixture.snapshot.join(GIT_ENTRY);
         File::create(&pointer)

@@ -40,7 +40,9 @@ use maki_providers::model::ModelInfo;
 use maki_providers::model_registry;
 use maki_providers::plugin;
 use maki_providers::provider::{ModelListing, Provider, RequestScope};
-use maki_providers::test_support::{Canned, Recorded, Requests, is_routed, isolated_home, serve};
+use maki_providers::test_support::{
+    Canned, Recorded, Requests, detached_scope, is_routed, isolated_home, serve,
+};
 use maki_providers::{
     AgentError, Message, Model, ProviderEvent, RequestOptions, StreamResponse, ThinkingSupport,
     Timeouts,
@@ -439,7 +441,7 @@ impl Replay {
             },
             RequestScope {
                 session_id: turn.session.as_ref(),
-                cwd: Path::new("."),
+                ..detached_scope()
             },
         ));
         drop(tx);

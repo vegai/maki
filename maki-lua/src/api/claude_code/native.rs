@@ -1,3 +1,4 @@
+use super::fd::directory;
 use super::{blobs, snapshot};
 
 use std::collections::HashMap;
@@ -5,8 +6,7 @@ use std::fmt::{self, Write};
 use std::fs;
 use std::io::{Error as IoError, ErrorKind};
 use std::ops::RangeInclusive;
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,13 +19,14 @@ use mlua::{
     Error as LuaError, Lua, LuaSerdeExt, LuaString, Result as LuaResult, Table, UserData,
     UserDataMethods, UserDataRef, UserDataRefMut, Value as LuaValue,
 };
+use rustix::fs::{AtFlags, CWD, FileType, statat};
 use rustix::io::Errno;
 use serde_json::Value;
 use tokio::task::spawn_blocking;
 use unicode_general_category::{GeneralCategory, get_general_category};
 
 use crate::api::fs::path_text;
-use crate::api::util::convert::{TableExt, json_to_lua};
+use crate::api::util::convert::json_to_lua;
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::pair::{Pair, pair, try_pair};
 use crate::plugin_permissions::PluginPermissions;
@@ -161,7 +162,7 @@ fn shell_secret_problem(_lua: &Lua, env: HashMap<String, String>) -> LuaResult<O
 async fn project_git_dir(_lua: Lua, project: PathBuf) -> LuaResult<Pair<String>> {
     Ok(pair(
         spawn_blocking(move || {
-            let project = worker::checkout_root(&project).map_err(IoError::other)?;
+            let project = worker::canonical_checkout_root(&project).map_err(IoError::other)?;
             worker::git_directory(&project.join(worker::GIT_ENTRY)).and_then(path_text)
         })
         .await
@@ -188,7 +189,7 @@ async fn home_state_files(_lua: Lua, home: PathBuf) -> LuaResult<Pair<Vec<String
                     .as_encoded_bytes()
                     .starts_with(HOME_STATE_PREFIX.as_bytes())
                 {
-                    files.push(path_text(PathBuf::from(name))?);
+                    files.push(path_text(name.into())?);
                 }
             }
             Ok(files)
@@ -319,17 +320,16 @@ async fn checked_profile(
         .collect::<LuaResult<Vec<_>>>()?;
     let denied = prepared.get::<Vec<PathBuf>>("denied")?;
     let temp_dir = prepared.get::<PathBuf>("temp_dir")?;
+    let launch = worker::Launch {
+        executable: &executable,
+        env: &env,
+        project: &cwd,
+        denied: &denied,
+        temp_dir: &temp_dir,
+        startup: Duration::from_secs(startup_secs),
+    };
     Ok(pair(
-        worker::checked_profile(
-            &executable,
-            &env,
-            &cwd,
-            &denied,
-            &temp_dir,
-            startup_secs,
-            cancel.cancelled(),
-        )
-        .await,
+        worker::checked_profile(&launch, cancel.cancelled()).await,
     ))
 }
 
@@ -349,19 +349,22 @@ async fn worker_probe(
 ) -> LuaResult<(Option<bool>, Option<String>, Option<String>)> {
     let cancel = ctx.cancel.clone();
     drop(ctx);
-    let policy: UserDataRef<Policy> = spec.get("policy")?;
-    let probe = worker::WorkerProbe {
-        executable: spec.get::<PathBuf>("executable")?,
-        env: env.into_iter().collect(),
-        project: spec.get::<PathBuf>("cwd")?,
-        denied: spec.get::<Vec<PathBuf>>("denied")?,
-        temp_dir: spec.get::<PathBuf>("temp_dir")?,
-        policy: Arc::clone(&policy.0),
-        model: spec.get::<String>("model")?,
+    let policy = Arc::clone(&spec.get::<UserDataRef<Policy>>("policy")?.0);
+    let executable = spec.get::<PathBuf>("executable")?;
+    let env: Vec<_> = env.into_iter().collect();
+    let project = spec.get::<PathBuf>("cwd")?;
+    let denied = spec.get::<Vec<PathBuf>>("denied")?;
+    let temp_dir = spec.get::<PathBuf>("temp_dir")?;
+    let model = spec.get::<String>("model")?;
+    let launch = worker::Launch {
+        executable: &executable,
+        env: &env,
+        project: &project,
+        denied: &denied,
+        temp_dir: &temp_dir,
         startup: Duration::from_secs(startup_secs),
     };
-    drop(policy);
-    let (result, kept) = probe.run(cancel.cancelled()).await;
+    let (result, kept) = worker::probe(&launch, policy, &model, cancel.cancelled()).await;
     let kept = kept
         .map(path_text)
         .transpose()
@@ -432,9 +435,9 @@ async fn resolve_root(
 ) -> LuaResult<Pair<String>> {
     Ok(pair(
         spawn_blocking(move || {
-            let resolved =
-                worker::artifact_root(&root, &cwd, &denied).map_err(|error| error.to_string())?;
-            path_text(resolved).map_err(|error| error.to_string())
+            worker::artifact_root(&root, &cwd, &denied)
+                .map_err(IoError::other)
+                .and_then(path_text)
         })
         .await
         .map_err(LuaError::external)?,
@@ -448,22 +451,17 @@ async fn resolve_root(
 async fn checkout_files(lua: Lua, paths: Vec<PathBuf>) -> LuaResult<Pair<Table>> {
     let values = try_pair!(
         spawn_blocking(move || paths
-            .into_iter()
-            .map(|path| {
-                match fs::symlink_metadata(path) {
-                    Ok(meta) => Ok(Some((
-                        meta.is_file(),
-                        meta.permissions().mode() & OWNER_EXECUTE != 0,
-                    ))),
-                    Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-                    Err(error)
-                        if error.kind() == ErrorKind::NotADirectory
-                            || error.raw_os_error() == Some(Errno::LOOP.raw_os_error()) =>
-                    {
-                        Ok(Some((false, false)))
-                    }
-                    Err(error) => Err(error),
+            .iter()
+            .map(|path| match checkout_file(path) {
+                Ok(meta) => Ok(Some(meta)),
+                Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+                Err(error)
+                    if error.kind() == ErrorKind::NotADirectory
+                        || error.raw_os_error() == Some(Errno::LOOP.raw_os_error()) =>
+                {
+                    Ok(Some((false, false)))
                 }
+                Err(error) => Err(error),
             })
             .collect::<Result<Vec<_>, IoError>>())
         .await
@@ -481,16 +479,32 @@ async fn checkout_files(lua: Lua, paths: Vec<PathBuf>) -> LuaResult<Pair<Table>>
     Ok((Some(lua.create_sequence_from(values)?), None))
 }
 
+/// The regular and owner-executable flags of {path}. Its parents are opened
+/// without following links, so a linked parent fails with `ELOOP` instead of
+/// reporting a file outside the checkout.
+fn checkout_file(path: &Path) -> Result<(bool, bool), IoError> {
+    let name = path.file_name().ok_or(Errno::INVAL)?;
+    let mut dir = directory(&CWD, if path.has_root() { "/" } else { "." })?;
+    for component in path.parent().into_iter().flat_map(Path::components) {
+        if component != Component::RootDir {
+            dir = directory(&dir, component.as_os_str())?;
+        }
+    }
+    let stat = statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    Ok((
+        FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile,
+        stat.st_mode & OWNER_EXECUTE != 0,
+    ))
+}
+
 struct WorkerStream {
     stream: worker::WorkerStream,
-    executable: Option<PathBuf>,
+    executable: PathBuf,
 }
 
 impl WorkerStream {
     fn invalidate(&self, error: &WorkerError) {
-        if let Some(executable) = &self.executable {
-            worker::invalidate_on_error(executable, error);
-        }
+        worker::invalidate_on_error(&self.executable, error);
     }
 }
 
@@ -518,11 +532,12 @@ impl UserData for WorkerStream {
                 let mut classified = try_pair!(
                     this.stream
                         .feed(&line)
+                        .and_then(|mut event| match event.problem.take() {
+                            Some(problem) => Err(problem),
+                            None => Ok(event),
+                        })
                         .inspect_err(|error| this.invalidate(error))
                 );
-                if let Some(error) = &classified.problem {
-                    this.invalidate(error);
-                }
                 let control = classified.kind == Some(EventKind::ControlResponse)
                     && classified.event["response"].is_object();
                 let complete = if control {
@@ -542,13 +557,13 @@ impl UserData for WorkerStream {
 }
 
 /// Own worker init and model checks for one process.
-/// @param expect table Expected cwd, CLI version and immutable worker policy.
-/// @return (userdata) Stateful event classifier.
+/// @param expect table Expected cwd, CLI version, executable and immutable worker policy.
+/// @return (userdata) Stateful event classifier. Its `feed` answers a stop reason as the pair error.
 #[lua_fn]
 fn worker_stream(_lua: &Lua, expect: Table) -> LuaResult<WorkerStream> {
     let policy: UserDataRef<Policy> = expect.get("policy")?;
     Ok(WorkerStream {
-        executable: expect.opt("executable")?,
+        executable: expect.get::<PathBuf>("executable")?,
         stream: worker::WorkerStream::new(
             expect.get::<String>("version")?,
             expect.get::<PathBuf>("cwd")?,
@@ -596,10 +611,6 @@ fn event_table(
     result.set("event", json_to_lua(lua, event)?)?;
     result.set("control", control)?;
     result.set("complete", complete)?;
-    result.set(
-        "problem",
-        classified.problem.as_ref().map(|error| error.to_string()),
-    )?;
     result.set("failure", classified.failure.as_deref())?;
     if let Some(rate_limit) = &classified.rate_limit {
         result.set("rate_limit", lua.to_value(rate_limit)?)?;
@@ -660,7 +671,8 @@ mod tests {
 
     use maki_agent::AgentMode;
     use maki_agent::tools::test_support::stub_ctx;
-    use maki_providers::claude_code::worker::{GIT_ENTRY, MAX_EVENT_BYTES, MINIMUM_VERSION};
+    use maki_providers::claude_code::MAX_EVENT_BYTES;
+    use maki_providers::claude_code::worker::{GIT_ENTRY, MINIMUM_VERSION};
     use maki_providers::claude_code::{Error as WorkerError, HOME_STATE_PREFIX};
     use mlua::{
         AnyUserData, FromLuaMulti, IntoLuaMulti, Lua, ObjectLike, Table, Value as LuaValue,
@@ -679,6 +691,12 @@ mod tests {
     const FILE_CONTENT: &str = "file";
     const PRINT_PATH: &str = "printf %s ";
     const NON_UTF8_DIR: &[u8] = b"nested\xff";
+
+    enum BlockedParent {
+        File,
+        Looping,
+        Symlinked,
+    }
 
     fn native() -> (Lua, Table) {
         let lua = Lua::new();
@@ -700,7 +718,11 @@ mod tests {
     fn worker_stream() -> (Lua, AnyUserData) {
         let (lua, table) = native();
         let expect = lua
-            .create_table_from([("cwd", "/workspace"), ("version", MINIMUM_VERSION)])
+            .create_table_from([
+                ("cwd", "/workspace"),
+                ("version", MINIMUM_VERSION),
+                ("executable", "claude"),
+            ])
             .unwrap();
         expect.set("policy", policy(&lua, &table)).unwrap();
         let stream: AnyUserData = table.call_function("worker_stream", expect).unwrap();
@@ -846,15 +868,19 @@ mod tests {
         assert!(error.unwrap().contains(&expected));
     }
 
-    #[test_case(false ; "file_parent")]
-    #[test_case(true ; "looping_parent")]
-    fn checkout_targets_with_blocked_parents_are_conflicts(looping: bool) {
-        let root = tempdir().unwrap();
+    #[test_case(BlockedParent::File ; "file_parent")]
+    #[test_case(BlockedParent::Looping ; "looping_parent")]
+    #[test_case(BlockedParent::Symlinked ; "symlinked_parent")]
+    fn checkout_targets_with_blocked_parents_are_conflicts(blocked: BlockedParent) {
+        let (root, outside) = (tempdir().unwrap(), tempdir().unwrap());
         let parent = root.path().join(NESTED);
-        if looping {
-            symlink(NESTED, &parent).unwrap();
-        } else {
-            fs::write(&parent, FILE_CONTENT).unwrap();
+        match blocked {
+            BlockedParent::File => fs::write(&parent, FILE_CONTENT).unwrap(),
+            BlockedParent::Looping => symlink(NESTED, &parent).unwrap(),
+            BlockedParent::Symlinked => {
+                fs::write(outside.path().join(LINKED), FILE_CONTENT).unwrap();
+                symlink(outside.path(), &parent).unwrap();
+            }
         }
         let (_lua, table) = native();
         let (meta, error): (Option<Table>, Option<String>) =
@@ -885,12 +911,13 @@ mod tests {
     #[test]
     fn ignored_worker_events_do_not_copy_payloads_into_lua() {
         let (_lua, stream) = worker_stream();
-        let input = json!({ "type": "user", "message": {"content": "x".repeat(4096)} }).to_string();
+        let input = json!({ "type": "system", "subtype": "status", "message": {"content": "x".repeat(4096)} })
+            .to_string();
         let (result, error): (Option<Table>, Option<String>) =
             stream.call_method("feed", input).unwrap();
         assert_eq!(error, None);
         let event: Table = result.unwrap().get("event").unwrap();
-        assert_eq!(event.get::<String>("type").unwrap(), "user");
+        assert_eq!(event.get::<String>("type").unwrap(), "system");
         assert!(event.get::<Option<Table>>("message").unwrap().is_none());
     }
 
@@ -925,17 +952,17 @@ mod tests {
         assert_eq!(found, names);
     }
 
-    #[test_case(json!({}) ; "missing_deny_rules")]
-    #[test_case(json!({ "deny": [], "sandbox": {} }) ; "missing_sandbox_paths")]
-    #[test_case(json!({ "deny": [], "sandbox": { "deny_read": [], "allow_read": [], "allow_write": [], "disabled": true } }) ; "unknown_sandbox_policy")]
-    fn worker_policy_requires_valid_input(policy: Value) {
+    #[test_case(json!({}), "`deny`" ; "missing_deny_rules")]
+    #[test_case(json!({ "deny": [], "sandbox": {} }), "`deny_read`" ; "missing_sandbox_paths")]
+    #[test_case(json!({ "deny": [], "sandbox": { "deny_read": [], "allow_read": [], "allow_write": [], "disabled": true } }), "`disabled`" ; "unknown_sandbox_policy")]
+    fn worker_policy_requires_valid_input(policy: Value, field: &str) {
         let (lua, table) = native();
         let policy = json_to_lua(&lua, &policy).unwrap();
-        assert!(
-            table
-                .call_function::<LuaValue>("worker_policy", policy)
-                .is_err()
-        );
+        let error = table
+            .call_function::<LuaValue>("worker_policy", policy)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(field), "{error}");
     }
 
     #[test_case("" ; "checkout")]

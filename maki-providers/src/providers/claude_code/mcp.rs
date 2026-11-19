@@ -70,7 +70,7 @@ pub(crate) struct McpTool {
 pub(crate) enum Handoff {
     /// `tool_use_id` links Claude Code's call to the model's `tool_use`.
     Parked {
-        tool_use_id: Option<String>,
+        tool_use_id: String,
         name: String,
         arguments: Value,
     },
@@ -427,7 +427,9 @@ fn answer(shared: &Shared, body: &[u8]) -> Reply {
         // would continue without maki's result, and the call stops the
         // request.
         if method == TOOLS_CALL && !shared.invalid_notification.swap(true, Ordering::Relaxed) {
-            let _ = shared.handoffs.send(Handoff::Invalid(Error::NoCallId));
+            let _ = shared
+                .handoffs
+                .send(Handoff::Invalid(Error::CallNotification));
         }
         return plain(ACCEPTED);
     };
@@ -470,12 +472,13 @@ fn park(shared: &Shared, mut params: Value) -> Reply {
         .map(Value::take)
         .unwrap_or_default()
     {
-        arguments @ Value::Object(_) => Handoff::Parked {
-            tool_use_id: params["_meta"][TOOL_USE_ID_META]
-                .as_str()
-                .map(str::to_owned),
-            name,
-            arguments,
+        arguments @ Value::Object(_) => match params["_meta"][TOOL_USE_ID_META].as_str() {
+            Some(id) => Handoff::Parked {
+                tool_use_id: id.to_owned(),
+                name,
+                arguments,
+            },
+            None => Handoff::Invalid(Error::NoCallId),
         },
         other => Handoff::Invalid(Error::NotArguments { name, input: other }),
     };
@@ -822,7 +825,7 @@ mod tests {
                 name,
                 arguments,
             } => {
-                assert_eq!(tool_use_id.as_deref(), Some(TOOL_USE_ID));
+                assert_eq!(tool_use_id, TOOL_USE_ID);
                 assert_eq!(name, TOOL);
                 assert_eq!(arguments, json!({ "path": "a" }));
             }
@@ -830,7 +833,8 @@ mod tests {
         }
     }
 
-    #[test_case(json!({ "name": "bash", "arguments": {} }) => matches Handoff::Parked { .. } ; "an_unknown_tool")]
+    #[test_case(json!({ "name": "bash", "arguments": {}, "_meta": { TOOL_USE_ID_META: TOOL_USE_ID } }) => matches Handoff::Parked { .. } ; "an_unknown_tool")]
+    #[test_case(json!({ "name": TOOL, "arguments": {} }) => matches Handoff::Invalid(Error::NoCallId) ; "no_tool_use_id")]
     #[test_case(json!({ "name": TOOL, "arguments": "rm -rf /" }) => matches Handoff::Invalid(Error::NotArguments { .. }) ; "arguments_that_are_no_object")]
     #[test_case(json!(42) => matches Handoff::Invalid(Error::NotArguments { .. }) ; "scalar_params")]
     #[test_case(json!([]) => matches Handoff::Invalid(Error::NotArguments { .. }) ; "array_params")]
@@ -905,7 +909,10 @@ mod tests {
         let (reply, handoffs) = reply_to(&post(&call, TOKEN));
         assert!(reply.contains(ACCEPTED), "{reply}");
         assert!(
-            matches!(handoffs.as_slice(), [Handoff::Invalid(Error::NoCallId)]),
+            matches!(
+                handoffs.as_slice(),
+                [Handoff::Invalid(Error::CallNotification)]
+            ),
             "{handoffs:?}"
         );
     }
@@ -927,7 +934,10 @@ mod tests {
         }
         let handoffs: Vec<_> = iter::from_fn(|| handoffs.try_recv().ok()).collect();
         assert!(
-            matches!(handoffs.as_slice(), [Handoff::Invalid(Error::NoCallId)]),
+            matches!(
+                handoffs.as_slice(),
+                [Handoff::Invalid(Error::CallNotification)]
+            ),
             "{handoffs:?}"
         );
     }

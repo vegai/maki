@@ -158,18 +158,19 @@ pub(super) fn event_kind(event: &Value, mode: StreamMode) -> Result<EventKind, E
             return Err(Error::Asked(event["request"]["subtype"].clone()));
         }
         (Some(SYSTEM_EVENT), Some(HOOK_STARTED_EVENT)) => {
-            return Err(Error::HookStarted(
-                event["hook_event"]
-                    .as_str()
-                    .unwrap_or(UNNAMED_HOOK)
-                    .to_owned(),
-            ));
+            return Err(Error::HookStarted(preview(
+                event["hook_event"].as_str().unwrap_or(UNNAMED_HOOK),
+                SHOWN_LINE_CHARS,
+            )));
         }
         (Some(RATE_LIMIT_EVENT), _) => EventKind::RateLimit,
         (Some(KEEP_ALIVE_EVENT | TOOL_PROGRESS_EVENT), _) => EventKind::Alive,
         (Some(SYSTEM_EVENT), Some(API_RETRY_EVENT)) if mode == StreamMode::Provider => {
             return Err(Error::CliRetry {
-                kind: event["error"].as_str().unwrap_or_default().to_owned(),
+                kind: preview(
+                    event["error"].as_str().unwrap_or_default(),
+                    SHOWN_LINE_CHARS,
+                ),
                 status: status_of(&event["error_status"]),
                 delay: event["retry_delay_ms"].as_u64().map(Duration::from_millis),
             });
@@ -195,9 +196,11 @@ pub(super) fn check_start(
     accepted: bool,
 ) -> Result<(), Error> {
     if !accepted {
-        if kind == EventKind::Result && failed_result(event) {
+        if kind == EventKind::Result
+            && let Some(failure) = result_failure(event)
+        {
             if mode == StreamMode::Provider {
-                return Err(Error::Failed(result_message(event)));
+                return Err(failure);
             }
         } else if matches!(
             kind,
@@ -265,11 +268,22 @@ pub(super) fn generation_model<'a>(
 
 /// `None` until Claude Code measures it.
 #[derive(Default)]
-struct Usage {
-    input: Option<u32>,
-    cache_creation: Option<u32>,
-    cache_read: Option<u32>,
-    output: Option<u32>,
+pub(super) struct Usage {
+    pub(super) input: Option<u32>,
+    pub(super) cache_creation: Option<u32>,
+    pub(super) cache_read: Option<u32>,
+    pub(super) output: Option<u32>,
+}
+
+impl Usage {
+    pub(super) fn read(usage: &Value) -> Self {
+        Self {
+            input: count(usage, INPUT_TOKENS),
+            cache_creation: count(usage, CACHE_CREATION_INPUT_TOKENS),
+            cache_read: count(usage, CACHE_READ_INPUT_TOKENS),
+            output: count(usage, OUTPUT_TOKENS),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -296,7 +310,7 @@ pub(crate) struct Turn<'a> {
     handshake: Handshake,
     phase: Phase,
     message_id: Option<String>,
-    started: Vec<Option<StreamedText>>,
+    started: Vec<Started>,
     blocks: Vec<ContentBlock>,
     usage: Usage,
     stop_reason: Option<String>,
@@ -314,8 +328,18 @@ pub(crate) struct Turn<'a> {
     /// Claude Code prompted the model again by itself, so the rest of its
     /// output is a generation maki discards.
     continued: bool,
+    /// The plan's latest report said its limit is used up.
+    plan_rejected: bool,
     /// Kinds of the latest events, logged when the request fails.
     trace: VecDeque<(String, u32)>,
+}
+
+/// A block of the reply as its start showed it.
+enum Started {
+    Text(StreamedText),
+    /// Keeps the id the user saw, which the whole call must repeat.
+    Call(String),
+    Other,
 }
 
 struct StreamedText {
@@ -353,10 +377,6 @@ impl StreamedText {
                 .zip(DROPPED_TEXTS)
                 .any(|(matches, placeholder)| *matches && self.bytes == placeholder.len())
     }
-}
-
-fn answered(message: &Value) -> String {
-    preview(&message_text(message), SHOWN_TOOL_ERROR_CHARS)
 }
 
 fn message_text(message: &Value) -> String {
@@ -429,14 +449,13 @@ pub fn user_message(blocks: &[String]) -> Result<String, Error> {
     Ok(line)
 }
 
-pub(super) fn count(usage: &Value, key: &str) -> Option<u32> {
+fn count(usage: &Value, key: &str) -> Option<u32> {
     usage[key].as_u64().and_then(|n| u32::try_from(n).ok())
 }
 
 #[derive(Default)]
 pub(crate) struct Handshake {
     answers: HashMap<String, Value>,
-    plan_rejected: bool,
 }
 
 impl Handshake {
@@ -500,7 +519,6 @@ impl Handshake {
             EventKind::RateLimit => {
                 let info = &event["rate_limit_info"];
                 if let Some(plan_usage) = plan_usage.filter(|_| info.is_object()) {
-                    self.plan_rejected = info["status"] == PLAN_REJECTED;
                     *plan_usage.lock().unwrap_or_else(PoisonError::into_inner) =
                         Some(usage_of(info));
                 }
@@ -508,6 +526,7 @@ impl Handshake {
             }
             EventKind::Alive => Step::Alive,
             EventKind::System => Step::Nothing,
+            // Only a worker's `check_start` lets a failed result reach this.
             EventKind::Result => {
                 return Err(result_failure(event).unwrap_or(Error::UncheckedStart));
             }
@@ -540,7 +559,7 @@ impl Handshake {
     fn record(&mut self, response: &Value) -> Result<bool, Error> {
         let id = response["request_id"].as_str().unwrap_or_default();
         if !HANDSHAKE.iter().any(|step| step.id == id) || self.answers.contains_key(id) {
-            return Err(Error::StrayAnswer(id.to_owned()));
+            return Err(Error::StrayAnswer(preview(id, SHOWN_LINE_CHARS)));
         }
         if response["subtype"] != SUCCESS {
             return Err(Error::RequestRefused {
@@ -559,12 +578,11 @@ fn provider_problem(account: &Value, settings: &Value, hooks: &Value) -> Option<
         .or_else(|| checks::policy_problem(settings, hooks, true))
 }
 
-fn line_preview(line: &str) -> String {
-    preview(line, SHOWN_LINE_CHARS)
-}
-
-fn text_field(value: &Value, key: &str) -> String {
-    value[key].as_str().unwrap_or_default().to_owned()
+fn take_text(value: &mut Value, key: &str) -> String {
+    match value.get_mut(key).map(Value::take) {
+        Some(Value::String(text)) => text,
+        _ => String::new(),
+    }
 }
 
 fn call_id(block: &Value) -> Result<&str, Error> {
@@ -576,12 +594,12 @@ fn call_id(block: &Value) -> Result<&str, Error> {
 
 pub(crate) fn parse_event(line: &str) -> Result<Value, Error> {
     let event = serde_json::from_str::<Value>(line).map_err(|source| Error::NotAnEvent {
-        preview: line_preview(line),
+        preview: preview(line, SHOWN_LINE_CHARS),
         bytes: line.len(),
         source,
     })?;
     if !event.is_object() || !event["type"].is_string() {
-        return Err(Error::InvalidEvent(line_preview(line)));
+        return Err(Error::InvalidEvent(preview(line, SHOWN_LINE_CHARS)));
     }
     Ok(event)
 }
@@ -609,6 +627,7 @@ impl<'a> Turn<'a> {
             refusal: None,
             lost: None,
             continued: false,
+            plan_rejected: false,
             trace: VecDeque::with_capacity(TRACE_LEN),
         }
     }
@@ -747,7 +766,11 @@ impl<'a> Turn<'a> {
         if self.trace.len() == TRACE_LEN {
             self.trace.pop_front();
         }
-        let kind = detail.map_or_else(|| kind.to_owned(), |detail| format!("{kind}/{detail}"));
+        let kind = preview(kind, SHOWN_LINE_CHARS);
+        let kind = match detail {
+            Some(detail) => format!("{kind}/{}", preview(detail, SHOWN_LINE_CHARS)),
+            None => kind,
+        };
         self.trace.push_back((kind, 1));
     }
 
@@ -794,7 +817,7 @@ impl<'a> Turn<'a> {
                 Ok(Step::Nothing)
             }
             EventKind::Stream if event[ABANDONED_BLOCKS].is_object() => Err(Error::Abandoned),
-            EventKind::Stream => self.stream_event(&event["event"]),
+            EventKind::Stream => self.stream_event(&mut event["event"]),
             EventKind::Assistant => self.assistant(&mut event["message"]),
             // Claude Code continues by itself after a cut reply or one with no
             // visible output. No result follows to explain a block still
@@ -814,12 +837,19 @@ impl<'a> Turn<'a> {
                 self.rejected = true;
                 self.settle()
             }
-            EventKind::User => Err(Error::AnsweredItself(answered(&event["message"]))),
+            EventKind::User => Err(Error::AnsweredItself(preview(
+                &message_text(&event["message"]),
+                SHOWN_TOOL_ERROR_CHARS,
+            ))),
             EventKind::Result => self.finish_result(&event),
             EventKind::ControlResponse
             | EventKind::RateLimit
             | EventKind::Alive
             | EventKind::System => {
+                let info = &event["rate_limit_info"];
+                if kind == EventKind::RateLimit && info.is_object() {
+                    self.plan_rejected = info["status"] == PLAN_REJECTED;
+                }
                 self.handshake
                     .feed_kind(&event, kind, Some(self.plan_usage), provider_problem)
             }
@@ -847,7 +877,7 @@ impl<'a> Turn<'a> {
         Ok(Step::Nothing)
     }
 
-    fn stream_event(&mut self, event: &Value) -> Result<Step, Error> {
+    fn stream_event(&mut self, event: &mut Value) -> Result<Step, Error> {
         let kind = event["type"].as_str();
         if self.is_complete() && kind != Some(MESSAGE_START) {
             return Err(Error::LateContent);
@@ -873,32 +903,38 @@ impl<'a> Turn<'a> {
             }
             Some(BLOCK_START) => {
                 let block = &event["content_block"];
-                self.started.push(
-                    (block["type"] == TEXT_BLOCK)
-                        .then(|| StreamedText::new(block["text"].as_str().unwrap_or_default())),
-                );
-                if block["type"] != TOOL_USE_BLOCK {
-                    return Ok(Step::Nothing);
-                }
-                let id = call_id(block)?;
-                let name = self.maki_name(&block["name"])?;
-                Ok(Step::Event(ProviderEvent::ToolUseStart {
-                    id: id.to_owned(),
-                    name,
-                }))
+                let (started, step) = match block["type"].as_str() {
+                    Some(TEXT_BLOCK) => (
+                        Started::Text(StreamedText::new(
+                            block["text"].as_str().unwrap_or_default(),
+                        )),
+                        Step::Nothing,
+                    ),
+                    Some(TOOL_USE_BLOCK) => {
+                        let id = call_id(block)?.to_owned();
+                        let name = self.maki_name(&block["name"])?;
+                        (
+                            Started::Call(id.clone()),
+                            Step::Event(ProviderEvent::ToolUseStart { id, name }),
+                        )
+                    }
+                    _ => (Started::Other, Step::Nothing),
+                };
+                self.started.push(started);
+                Ok(step)
             }
             Some(BLOCK_DELTA) => {
-                let delta = &event["delta"];
+                let delta = &mut event["delta"];
                 Ok(match delta["type"].as_str() {
                     Some(TEXT_DELTA) => {
-                        let text = text_field(delta, TEXT_BLOCK);
-                        if let Some(Some(streamed)) = self.started.last_mut() {
+                        let text = take_text(delta, TEXT_BLOCK);
+                        if let Some(Started::Text(streamed)) = self.started.last_mut() {
                             streamed.push(&text);
                         }
                         Step::Event(ProviderEvent::TextDelta { text })
                     }
                     Some(THINKING_DELTA) => Step::Event(ProviderEvent::ThinkingDelta {
-                        text: text_field(delta, THINKING_BLOCK),
+                        text: take_text(delta, THINKING_BLOCK),
                     }),
                     _ => Step::Nothing,
                 })
@@ -923,18 +959,13 @@ impl<'a> Turn<'a> {
 
     /// Only the last `message_delta` has the real output count.
     fn take_usage(&mut self, usage: &Value, is_final: bool) {
-        let fields = [
-            (INPUT_TOKENS, &mut self.usage.input),
-            (CACHE_CREATION_INPUT_TOKENS, &mut self.usage.cache_creation),
-            (CACHE_READ_INPUT_TOKENS, &mut self.usage.cache_read),
-        ];
-        for (key, field) in fields {
-            if let Some(n) = count(usage, key) {
-                *field = Some(n);
-            }
-        }
+        let read = Usage::read(usage);
+        let usage = &mut self.usage;
+        usage.input = read.input.or(usage.input);
+        usage.cache_creation = read.cache_creation.or(usage.cache_creation);
+        usage.cache_read = read.cache_read.or(usage.cache_read);
         if is_final {
-            self.usage.output = count(usage, OUTPUT_TOKENS);
+            usage.output = read.output;
         }
     }
 
@@ -966,15 +997,15 @@ impl<'a> Turn<'a> {
         for block in message["content"].as_array_mut().into_iter().flatten() {
             let parsed = match block["type"].as_str() {
                 Some(TEXT_BLOCK) => ContentBlock::Text {
-                    text: text_field(block, TEXT_BLOCK),
+                    text: take_text(block, TEXT_BLOCK),
                 },
                 Some(THINKING_BLOCK) => ContentBlock::Thinking {
-                    thinking: text_field(block, THINKING_BLOCK),
+                    thinking: take_text(block, THINKING_BLOCK),
                     signature: None,
                     reasoning_id: None,
                 },
                 Some(REDACTED_THINKING_BLOCK) => ContentBlock::RedactedThinking {
-                    data: text_field(block, "data"),
+                    data: take_text(block, "data"),
                 },
                 Some(TOOL_USE_BLOCK) => {
                     let id = call_id(block)?.to_owned();
@@ -987,7 +1018,18 @@ impl<'a> Turn<'a> {
                         return Err(Error::NotArguments { name, input });
                     }
                     if self.calls().any(|(known, _, _)| known == id) {
-                        return Err(Error::RepeatedCall(id));
+                        return Err(Error::RepeatedCall(preview(&id, SHOWN_LINE_CHARS)));
+                    }
+                    let shown = self
+                        .started
+                        .iter()
+                        .filter_map(|started| match started {
+                            Started::Call(shown) => Some(shown),
+                            _ => None,
+                        })
+                        .nth(self.calls().count());
+                    if shown != Some(&id) {
+                        return Err(Error::UnstartedCall(preview(&id, SHOWN_LINE_CHARS)));
                     }
                     ContentBlock::tool_use(id, name, input)
                 }
@@ -1041,9 +1083,7 @@ impl<'a> Turn<'a> {
     fn refused(&self, refusal: Refusal, result_status: Option<u16>) -> Error {
         let Refusal { kind, text, status } = refusal;
         let status = status.or(result_status);
-        if self.handshake.plan_rejected
-            && (kind == RATE_LIMITED || status == Some(TOO_MANY_REQUESTS))
-        {
+        if self.plan_rejected && (kind == RATE_LIMITED || status == Some(TOO_MANY_REQUESTS)) {
             Error::PlanLimit(text)
         } else {
             Error::ApiRefused { kind, text, status }
@@ -1069,11 +1109,10 @@ impl<'a> Turn<'a> {
         }
         let (tool_use_id, name, arguments) = match handoff {
             Handoff::Parked {
-                tool_use_id: Some(id),
+                tool_use_id,
                 name,
                 arguments,
-            } => (id, name, arguments),
-            Handoff::Parked { .. } => return Err(Error::NoCallId),
+            } => (tool_use_id, name, arguments),
             Handoff::Invalid(error) => return Err(error),
         };
         let name = self
@@ -1108,11 +1147,11 @@ impl<'a> Turn<'a> {
         let sendable = self
             .started
             .iter()
-            .filter(|text| !text.as_ref().is_some_and(StreamedText::dropped))
+            .filter(|started| !matches!(started, Started::Text(text) if text.dropped()))
             .count();
         let cut = self.truncated()
             && self.blocks.len() + 1 == sendable
-            && matches!(self.started.last(), Some(None));
+            && matches!(self.started.last(), Some(Started::Call(_) | Started::Other));
         if self.blocks.len() != sendable && !cut {
             self.lost.get_or_insert(Error::BlockCount {
                 started: self.started.len(),
@@ -1153,7 +1192,7 @@ impl<'a> Turn<'a> {
             return Ok(Step::Done);
         }
         if stop_reason != TOOL_USE_STOP {
-            return Err(Error::StoppedFor(stop_reason));
+            return Err(Error::StoppedFor(preview(&stop_reason, SHOWN_LINE_CHARS)));
         }
         Ok(if self.handed_over() {
             Step::Done
@@ -1213,7 +1252,9 @@ impl<'a> Turn<'a> {
             if let ContentBlock::ToolUse { name, input, .. } = block
                 && name == BATCH_TOOL
             {
-                unexpose_batch(self.catalog, input);
+                map_batch_names(input, |name| {
+                    self.catalog.maki_name_or_made_up(name).to_owned()
+                });
             }
         }
         let message = Message {
@@ -1240,12 +1281,6 @@ impl<'a> Turn<'a> {
             stop_reason: Some(stop_reason),
         })
     }
-}
-
-/// The model names a batch's calls as Claude Code shows the tools, but maki
-/// runs them by its own names. An unknown name stays, so maki reports it.
-fn unexpose_batch(catalog: &Catalog, input: &mut Value) {
-    map_batch_names(input, |name| catalog.maki_name_or_made_up(name).to_owned());
 }
 
 struct Refusal {
@@ -1323,23 +1358,24 @@ mod tests {
         NO_KEY_SOURCE,
     };
     use super::super::error::Error;
+    use super::super::linux::agent_error;
     use super::super::mcp::Handoff;
     use super::super::transcript::{BATCH_CALL_TOOL, BATCH_CALLS, Catalog};
     use super::{
         ABANDONED_BLOCKS, ACCOUNT_ANSWER, API_ERROR_MARK, API_ERROR_STATUS, ASSISTANT_EVENT,
-        BATCH_TOOL, BLOCK_DELTA, BLOCK_START, BLOCK_STOP, EXTRA_USAGE, EXTRA_USAGE_IN_USE,
-        EventKind, HOOKS_ANSWER, Handshake, INIT_EVENT, INPUT_REJECTED, MAX_TOKENS_STOP,
-        MAX_TURNS_ERROR, MCP_CLOSED, MESSAGE_DELTA, MESSAGE_START, MESSAGE_STOP, NO_SUCH_TOOL,
-        PLAN_REJECTED, RATE_LIMIT_EVENT, RATE_LIMITED, REFUSAL_STOP, RESULT_EVENT, SETTINGS_ANSWER,
-        SHOWN_TOOL_ERROR_CHARS, STREAM_EVENT, SUCCESS, SYNTHETIC_DETAIL, SYSTEM_EVENT, Step,
-        StreamMode, StreamedText, TEXT_BLOCK, THINKING_BLOCK, THINKING_TOKENS_EVENT, TOOL_RESULT,
-        TOOL_USE_STOP, TRACE_LEN, Turn, USER_EVENT, WINDOW_FULL_STOP, answered, classify,
-        result_failure, unexpose_batch, usage_of, user_message,
+        BATCH_TOOL, BLOCK_DELTA, BLOCK_START, BLOCK_STOP, CONTROL_RESPONSE, DROPPED_TEXTS,
+        EXTRA_USAGE, EXTRA_USAGE_IN_USE, EventKind, HOOKS_ANSWER, Handshake, INIT_EVENT,
+        INPUT_REJECTED, MAX_TOKENS_STOP, MAX_TURNS_ERROR, MCP_CLOSED, MESSAGE_DELTA, MESSAGE_START,
+        MESSAGE_STOP, NO_SUCH_TOOL, PLAN_REJECTED, RATE_LIMIT_EVENT, RATE_LIMITED, REFUSAL_STOP,
+        RESULT_EVENT, SERVER, SETTINGS_ANSWER, SHOWN_LINE_CHARS, SHOWN_TOOL_ERROR_CHARS,
+        STREAM_EVENT, SUCCESS, SYNTHETIC_DETAIL, SYSTEM_EVENT, Step, StreamMode, StreamedText,
+        TEXT_BLOCK, THINKING_BLOCK, THINKING_TOKENS_EVENT, TOO_MANY_REQUESTS, TOOL_RESULT,
+        TOOL_USE_STOP, TRACE_LEN, Turn, USER_EVENT, WINDOW_FULL_STOP, classify, map_batch_names,
+        result_failure, usage_of, user_message,
     };
     use crate::{ContentBlock, StopReason, StreamResponse};
 
     const CWD: &str = "/work";
-    const SERVER: &str = "maki";
     const END_TURN: &str = "end_turn";
     /// The model maki asks for, and the dated snapshot the generation
     /// reports.
@@ -1351,7 +1387,6 @@ mod tests {
     const TOO_LONG: &str = "Prompt is too long";
     /// The output count of every reply's last `message_delta`.
     const FINAL_OUTPUT: u32 = 42;
-    const TOO_MANY: u16 = 429;
     const BAD_REQUEST: u16 = 400;
     /// As 2.1.284 words a used-up plan.
     const SESSION_LIMIT: &str = "You've hit your session limit · resets 12:10pm (Europe/Helsinki)";
@@ -1375,9 +1410,8 @@ mod tests {
     const GARBLED_TOOL: &str = "mcp__maki__grmc__grep";
     const GARBLED_MAKI_NAME: &str = "grmc__grep";
     const CLAUDE_CODE_TOOL: &str = "Bash";
-    /// Claude Code's placeholders, as its output filter spells them.
-    const NO_CONTENT: &str = "(no content)";
-    const INTERRUPTED: &str = "[Request interrupted by user for tool use]";
+    const NO_CONTENT: &str = DROPPED_TEXTS[0];
+    const INTERRUPTED: &str = DROPPED_TEXTS[1];
     const EXECUTION_ERROR: &str = "error_during_execution";
     const FAILURE_DETAIL: &str = "socat not installed";
     const FAILURE_WITH_RESULT: &str = "error_during_execution: socat not installed";
@@ -1392,7 +1426,7 @@ mod tests {
     }
 
     fn control(id: &str, response: Value) -> String {
-        json!({ "type": "control_response", "response": { "subtype": SUCCESS, "request_id": id, "response": response } }).to_string()
+        json!({ "type": CONTROL_RESPONSE, "response": { "subtype": SUCCESS, "request_id": id, "response": response } }).to_string()
     }
 
     fn handshake() -> Vec<String> {
@@ -1479,9 +1513,9 @@ mod tests {
         ]
     }
 
-    fn parked(id: Option<&str>, path: &str) -> Handoff {
+    fn parked(id: &str, path: &str) -> Handoff {
         Handoff::Parked {
-            tool_use_id: id.map(str::to_owned),
+            tool_use_id: id.to_owned(),
             name: TOOL.into(),
             arguments: json!({ "path": path }),
         }
@@ -1498,10 +1532,12 @@ mod tests {
     #[test_case(r#"{"type":null}"# ; "null_type")]
     #[test_case(r#"{"type":false}"# ; "boolean_type")]
     fn invalid_event_envelopes_are_terminal_before_and_after_init(line: &str) {
-        for accepted in [false, true] {
-            let error = super::parse_event(line).unwrap_err();
+        let before_init = with_turn(|mut turn| turn.feed(line));
+        let after_init = run(&[line.to_owned()], Vec::new(), false).0;
+        for (accepted, step) in [(false, before_init), (true, after_init)] {
+            let error = step.unwrap_err();
             assert!(matches!(&error, Error::InvalidEvent(preview) if preview == line));
-            assert!(!super::super::agent_error(error.after_start(accepted)).is_retryable());
+            assert!(!agent_error(error.after_start(accepted)).is_retryable());
         }
         assert!(
             super::super::worker::WorkerStream::new(
@@ -1648,7 +1684,7 @@ mod tests {
         reason: &str,
         held: bool,
     ) -> Result<Step, Error> {
-        let handoffs = held.then(|| parked(Some(FIRST_CALL), "a"));
+        let handoffs = held.then(|| parked(FIRST_CALL, "a"));
         run(
             &reply(&[block], reason),
             handoffs.into_iter().collect(),
@@ -1685,7 +1721,7 @@ mod tests {
     #[test_case(call(FIRST_CALL, "a") => matches Err(Error::RepeatedCall(_)) ; "an_unchanged_repeat")]
     fn a_malformed_call_in_a_batch_is_refused(bad: Value) -> Result<Step, Error> {
         let lines = reply(&[call(FIRST_CALL, "a"), bad], TOOL_USE_STOP);
-        run(&lines, vec![parked(Some(FIRST_CALL), "a")], false).0
+        run(&lines, vec![parked(FIRST_CALL, "a")], false).0
     }
 
     /// Claude Code sends each block once, after its start, so a repeated or
@@ -1715,14 +1751,14 @@ mod tests {
     }
 
     /// The id the start showed must be the id of the whole call.
-    #[test_case(json!({ "type": "tool_use", "name": EXPOSED, "input": {} }) ; "no_id")]
-    #[test_case(json!({ "type": "tool_use", "id": "", "name": EXPOSED, "input": {} }) ; "an_empty_id")]
-    fn a_call_that_loses_its_id_is_refused(whole: Value) {
+    #[test_case(json!({ "type": "tool_use", "name": EXPOSED, "input": {} }) => matches Err(Error::NoCallId) ; "no_id")]
+    #[test_case(json!({ "type": "tool_use", "id": "", "name": EXPOSED, "input": {} }) => matches Err(Error::NoCallId) ; "an_empty_id")]
+    #[test_case(call(SECOND_CALL, "a") => matches Err(Error::UnstartedCall(_)) ; "different_id")]
+    fn a_call_that_loses_its_id_is_refused(whole: Value) -> Result<Step, Error> {
         let started = stream(
             json!({ "type": "content_block_start", "index": 0, "content_block": call(FIRST_CALL, "a") }),
         );
-        let (step, _) = run(&[start(), started, assistant(whole)], Vec::new(), false);
-        assert!(matches!(step, Err(Error::NoCallId)), "{step:?}");
+        run(&[start(), started, assistant(whole)], Vec::new(), false).0
     }
 
     /// The model may call a tool twice with the same arguments, and maki runs
@@ -1733,15 +1769,13 @@ mod tests {
             &[call(FIRST_CALL, "a"), call(SECOND_CALL, "a")],
             TOOL_USE_STOP,
         );
-        let (step, response) = run(&lines, vec![parked(Some(FIRST_CALL), "a")], false);
+        let (step, response) = run(&lines, vec![parked(FIRST_CALL, "a")], false);
         assert!(matches!(step, Ok(Step::Done)), "{step:?}");
         let response = response.unwrap().unwrap();
         let ids: Vec<_> = response.message.tool_uses().map(|(id, _, _)| id).collect();
         assert_eq!(ids, [FIRST_CALL, SECOND_CALL]);
     }
 
-    /// Each transcript block must retain its bytes and position so later requests can reuse
-    /// the cached prefix.
     #[test]
     fn an_overflowing_limit_reset_is_ignored() {
         let usage = usage_of(
@@ -1848,9 +1882,9 @@ mod tests {
 
     #[test_case(false, true, None, false ; "without_a_tool_rejection_or_handoff")]
     #[test_case(true, false, None, false ; "before_the_rejected_reply_is_complete")]
-    #[test_case(true, true, Some(TOO_MANY), false ; "with_an_api_error")]
+    #[test_case(true, true, Some(TOO_MANY_REQUESTS), false ; "with_an_api_error")]
     #[test_case(false, false, None, true ; "before_the_held_reply_is_complete")]
-    #[test_case(false, true, Some(TOO_MANY), true ; "an_api_error_after_handoff")]
+    #[test_case(false, true, Some(TOO_MANY_REQUESTS), true ; "an_api_error_after_handoff")]
     fn a_turn_limit_preserves_unresolved_failures(
         rejected_call: bool,
         complete: bool,
@@ -1865,7 +1899,7 @@ mod tests {
             lines.push(rejected(FIRST_CALL));
         }
         lines.push(json!({ "type": RESULT_EVENT, "subtype": MAX_TURNS_ERROR, "is_error": true, API_ERROR_STATUS: status }).to_string());
-        let handoffs = held.then(|| parked(Some(FIRST_CALL), "a"));
+        let handoffs = held.then(|| parked(FIRST_CALL, "a"));
         let (step, response) = run(&lines, handoffs.into_iter().collect(), true);
         assert!(response.is_none());
         match status {
@@ -1893,7 +1927,7 @@ mod tests {
         ));
         lines.push(stream(json!({ "type": "message_stop" })));
         lines.push(max_turns_result());
-        let handoffs = held.then(|| parked(Some(FIRST_CALL), "a"));
+        let handoffs = held.then(|| parked(FIRST_CALL, "a"));
         let (step, response) = run(&lines, handoffs.into_iter().collect(), true);
         assert!(matches!(step, Ok(Step::Done)), "{step:?}");
         assert!(matches!(response, Some(Err(Error::NoFinalOutput))));
@@ -1986,7 +2020,7 @@ mod tests {
                 assert!(matches!(turn.feed_stopping(&line), Ok(Step::Nothing)));
             }
             assert!(matches!(
-                turn.park(parked(Some(FIRST_CALL), "a")),
+                turn.park(parked(FIRST_CALL, "a")),
                 Ok(Step::Nothing)
             ));
             let response = turn.response().unwrap();
@@ -2081,6 +2115,23 @@ mod tests {
         });
     }
 
+    /// Claude Code chooses the strings the trace keeps, so each is cut.
+    #[test_case(|huge| json!({ "type": huge, "subtype": huge }) ; "an_unknown_type_and_subtype")]
+    #[test_case(|huge| json!({ "type": STREAM_EVENT, "event": { "type": huge } }) ; "an_unknown_api_event")]
+    #[test_case(|huge| json!({ "type": STREAM_EVENT, "event": { "type": MESSAGE_START, "message": { "id": huge } } }) ; "a_generation_id")]
+    fn event_trace_keeps_only_the_start_of_a_huge_string(event: fn(&str) -> Value) {
+        let huge = "x".repeat(SHOWN_LINE_CHARS * TRACE_LEN);
+        with_turn(|mut turn| {
+            turn.record_event(&event(&huge));
+            let trace = turn.trace();
+            assert!(
+                trace.chars().count() <= 2 * (SHOWN_LINE_CHARS + 1) + 1,
+                "{trace}"
+            );
+            assert!(trace.ends_with('…'), "{trace}");
+        });
+    }
+
     #[test_case(json!({}) ; "missing_info")]
     #[test_case(json!({"rate_limit_info": null}) ; "null_info")]
     #[test_case(json!({"rate_limit_info": []}) ; "array_info")]
@@ -2094,7 +2145,7 @@ mod tests {
             event["type"] = RATE_LIMIT_EVENT.into();
             turn.feed(&event.to_string()).unwrap();
             assert_eq!(*turn.plan_usage.lock().unwrap(), previous);
-            assert!(turn.handshake.plan_rejected);
+            assert!(turn.plan_rejected);
         });
     }
 
@@ -2107,7 +2158,7 @@ mod tests {
             "message": { "model": "<synthetic>", "content": [{ "type": "text", "text": text }] },
         });
         let result = json!({
-            "type": "result", "subtype": SUCCESS, "is_error": true, API_ERROR_STATUS: status.unwrap_or(TOO_MANY), "result": text,
+            "type": "result", "subtype": SUCCESS, "is_error": true, API_ERROR_STATUS: status.unwrap_or(TOO_MANY_REQUESTS), "result": text,
         });
         [reply.to_string(), result.to_string()]
     }
@@ -2118,7 +2169,11 @@ mod tests {
     #[test_case("allowed", false ; "a_plan_with_room_left")]
     fn a_used_up_plan_is_not_retried(status: &str, used_up: bool) {
         let mut lines = vec![plan_report(status)];
-        lines.extend(refused(RATE_LIMITED, Some(TOO_MANY), SESSION_LIMIT));
+        lines.extend(refused(
+            RATE_LIMITED,
+            Some(TOO_MANY_REQUESTS),
+            SESSION_LIMIT,
+        ));
         let (step, _) = run(&lines, Vec::new(), false);
         let error = step.unwrap_err();
         assert_eq!(
@@ -2165,7 +2220,7 @@ mod tests {
     #[test_case(false ; "the_generation_before_the_parked_call")]
     #[test_case(true ; "the_parked_call_before_the_generation")]
     fn a_batch_hands_off_whole_in_either_order(handoff_first: bool) {
-        let (step, response) = run(&batch(), vec![parked(Some(FIRST_CALL), "a")], handoff_first);
+        let (step, response) = run(&batch(), vec![parked(FIRST_CALL, "a")], handoff_first);
         assert!(matches!(step, Ok(Step::Done)), "{step:?}");
         let response = response.unwrap().unwrap();
         let calls: Vec<_> = response
@@ -2205,7 +2260,7 @@ mod tests {
     #[test_case(r#"[{"tool":"mcp__maki__read","parameters":{"path":"\q"}}]"# ; "invalid_escape")]
     fn malformed_batches_are_left_for_tool_validation(encoded: &str) {
         let mut input = json!({ BATCH_CALLS: encoded });
-        unexpose_batch(&catalog(), &mut input);
+        map_batch_names(&mut input, str::to_owned);
         assert_eq!(input[BATCH_CALLS], encoded);
     }
 
@@ -2221,7 +2276,7 @@ mod tests {
     fn malformed_batch_tails_stay_unmodified(tail: &str) {
         let encoded = format!("{}{tail}", json!([{ BATCH_CALL_TOOL: EXPOSED }]));
         let mut input = json!({ BATCH_CALLS: encoded });
-        unexpose_batch(&catalog(), &mut input);
+        map_batch_names(&mut input, str::to_owned);
         assert_eq!(input[BATCH_CALLS], encoded);
     }
 
@@ -2230,7 +2285,7 @@ mod tests {
     fn batch_decoding_requires_a_json_container_prefix(prefix: &str) {
         let encoded = format!("{prefix}{}", json!([{ BATCH_CALL_TOOL: EXPOSED }]));
         let mut input = json!({ BATCH_CALLS: encoded });
-        unexpose_batch(&catalog(), &mut input);
+        map_batch_names(&mut input, str::to_owned);
         assert_eq!(input[BATCH_CALLS], encoded);
     }
 
@@ -2255,7 +2310,7 @@ mod tests {
         let call =
             json!({ "type": "tool_use", "id": FIRST_CALL, "name": EXPOSED_BATCH, "input": input });
         let handoff = Handoff::Parked {
-            tool_use_id: Some(FIRST_CALL.to_owned()),
+            tool_use_id: FIRST_CALL.to_owned(),
             name: BATCH_TOOL.into(),
             arguments: input,
         };
@@ -2271,7 +2326,7 @@ mod tests {
     /// A batch reaches maki once its generation is complete and its call is
     /// held, in either order.
     #[test_case(None, Vec::new() ; "a_generation_waits_for_its_parked_call")]
-    #[test_case(Some(5), vec![parked(Some(FIRST_CALL), "a")] ; "a_parked_call_waits_for_the_whole_generation")]
+    #[test_case(Some(5), vec![parked(FIRST_CALL, "a")] ; "a_parked_call_waits_for_the_whole_generation")]
     fn a_batch_waits_for_its_generation_and_its_call(
         streamed: Option<usize>,
         handoffs: Vec<Handoff>,
@@ -2282,10 +2337,9 @@ mod tests {
         assert!(response.is_none());
     }
 
-    #[test_case(parked(Some("toolu_other"), "a") => matches Err(Error::NotInReply(_)) ; "a_call_the_reply_lacks")]
-    #[test_case(parked(Some(FIRST_CALL), "changed") => matches Err(Error::CallDiffers(_)) ; "other_arguments")]
-    #[test_case(parked(None, "a") => matches Err(Error::NoCallId) ; "no_tool_use_id")]
-    #[test_case(Handoff::Parked { tool_use_id: Some(FIRST_CALL.into()), name: CLAUDE_CODE_TOOL.into(), arguments: json!({}) } => matches Err(Error::NotOffered(_)) ; "an_unknown_tool")]
+    #[test_case(parked("toolu_other", "a") => matches Err(Error::NotInReply(_)) ; "a_call_the_reply_lacks")]
+    #[test_case(parked(FIRST_CALL, "changed") => matches Err(Error::CallDiffers(_)) ; "other_arguments")]
+    #[test_case(Handoff::Parked { tool_use_id: FIRST_CALL.into(), name: CLAUDE_CODE_TOOL.into(), arguments: json!({}) } => matches Err(Error::NotOffered(_)) ; "an_unknown_tool")]
     fn a_handoff_that_does_not_match_the_reply_stops_the_request(
         handoff: Handoff,
     ) -> Result<Step, Error> {
@@ -2419,7 +2473,7 @@ mod tests {
         lines.extend(streamed(call(FIRST_CALL, "a")));
         lines.extend(stop(TOOL_USE_STOP));
 
-        let (step, response) = run(&lines, vec![parked(Some(FIRST_CALL), "a")], false);
+        let (step, response) = run(&lines, vec![parked(FIRST_CALL, "a")], false);
 
         assert!(matches!(step, Ok(Step::Done)), "{step:?}");
         let response = response.unwrap().unwrap();
@@ -2570,7 +2624,7 @@ mod tests {
         }
         started(turn, lines);
         if held {
-            turn.park(parked(Some(FIRST_CALL), "a")).unwrap();
+            turn.park(parked(FIRST_CALL, "a")).unwrap();
         }
     }
 
@@ -2677,12 +2731,16 @@ mod tests {
     #[test_case(1 ; "past_the_limit")]
     fn oversized_tool_errors_mark_their_truncation(extra: usize) {
         let text = ERROR_CHARACTER.repeat(SHOWN_TOOL_ERROR_CHARS + extra);
-        let shown = answered(&json!({ "content": text }));
+        let line = json!({ "type": "user", "message": { "content": text } }).to_string();
+        let (step, _) = run(&[start(), line], Vec::new(), false);
         let mut expected = ERROR_CHARACTER.repeat(SHOWN_TOOL_ERROR_CHARS);
         if extra > 0 {
             expected.push('…');
         }
-        assert_eq!(shown, expected);
+        assert!(
+            matches!(&step, Err(Error::AnsweredItself(shown)) if *shown == expected),
+            "{step:?}"
+        );
     }
 
     /// A block after the reply could add a call that Claude Code never hands
@@ -2716,7 +2774,7 @@ mod tests {
     /// it.
     #[test]
     fn a_refused_handshake_request_stops_the_request() {
-        let refused = json!({ "type": "control_response", "response": { "subtype": "error", "request_id": SETTINGS_ANSWER, "error": "no" } });
+        let refused = json!({ "type": CONTROL_RESPONSE, "response": { "subtype": "error", "request_id": SETTINGS_ANSWER, "error": "no" } });
         let step = with_turn(|mut turn| turn.feed(&refused.to_string()));
         assert!(
             matches!(&step, Err(Error::RequestRefused { id, .. }) if id == SETTINGS_ANSWER),
@@ -2771,7 +2829,6 @@ mod tests {
                 json!({ "models": [{ "value": name, "resolvedModel": model }] }),
             )]
             .into(),
-            ..Handshake::default()
         };
         assert_eq!(
             handshake.models().collect::<Vec<_>>(),

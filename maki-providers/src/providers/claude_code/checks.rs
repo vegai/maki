@@ -1086,28 +1086,4 @@ mod tests {
         );
         assert!(matches!(problem, Some(Problem::HandoffServer(_))));
     }
-
-    #[test_case(DEFAULT_MODE, json!(["Read", "Edit", "Write", "Bash"]) => matches Some(Problem::RunMode(_)) ; "coding_requires_accept_edits")]
-    #[test_case(EDITS_MODE, json!(["Read", "Edit", "Write"]) => matches Some(Problem::MissingTool(_)) ; "coding_requires_bash")]
-    #[test_case(EDITS_MODE, json!(["Read", "Write", "Bash"]) => matches Some(Problem::MissingTool(_)) ; "coding_requires_edit")]
-    #[test_case(EDITS_MODE, json!(["Read", "Edit", "Write", "Bash"]) => matches None ; "coding_profile")]
-    fn coding_init_requires_its_permission_mode_and_tools(
-        mode: &str,
-        tools: Value,
-    ) -> Option<Problem> {
-        let event = init(|event| {
-            event["permissionMode"] = mode.into();
-            event["tools"] = tools;
-            event["mcp_servers"] = json!([]);
-        });
-        let expected = ["Read", "Edit", "Write", "Bash"];
-        init_problem(
-            &event,
-            VERSION,
-            Path::new(CWD),
-            expected.into_iter(),
-            &[EDITS_MODE],
-            None,
-        )
-    }
 }

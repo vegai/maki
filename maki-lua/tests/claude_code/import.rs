@@ -9,18 +9,18 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use maki_agent::tools::ToolRegistry;
 use maki_lua::PluginHost;
-use maki_storage::permissions::PERMISSION_BITS;
+use maki_storage::permissions::{PERMISSION_BITS, PRIVATE_FILE_MODE};
 use rustix::process::{Pid, Signal, kill_process_group};
 use tempfile::{TempDir, tempdir};
 use test_case::test_case;
 
 use super::support::{
-    DEADLINE, Gate, IMPORT_TEMP, NOTHING_IMPORTED, ORIGINALS, PWNED, TOUCH_PWNED, executable, git,
-    listing, on_path, wait_until,
+    DEADLINE, DISPLACED, EXECUTE_BITS, Gate, IMPORT_TEMP, NEWER_WORK, NOTHING_IMPORTED, ORIGINALS,
+    PWNED, git, listing, touch_pwned, wait_until, wrap,
 };
 
 const HELD: &str = r#"#!/bin/sh
@@ -36,9 +36,9 @@ case " $* " in
 *) exec "@REAL@" "$@" ;;
 esac
 "#;
-/// The tool that holds, and the arguments that trigger the hold.
-type Hold = (&'static str, &'static str);
-const WITHOUT_HOLD: Hold = ("stat", "");
+/// The tool that holds, and the arguments that trigger the hold, if any.
+type Hold = Option<(&'static str, &'static str)>;
+const WITHOUT_HOLD: Hold = None;
 const USER_GIT_CONFIG: &str = "gitconfig";
 const REVIEW_SCRIPT: &str = "review.sh";
 const INVALID_GIT_SETTING: &str = "invalid-git-setting";
@@ -48,20 +48,20 @@ const BROKEN_GIT_CONFIG: &str = "[core\n";
 /// `mktemp` would.
 const STAGE: &str = "stage.a1b2c3";
 /// Pause after the batch has hashed every original and staged blob.
-const LAST_CHECK: Hold = ("git", " --stdin-paths ");
-const AFTER_KEEP: Hold = ("ln", " ./src/lib.rs ");
-const AFTER_MOVE: Hold = ("mv", " ./src/lib.rs ");
-const DISPLACED: &str = "displaced";
+const LAST_CHECK: Hold = Some(("git", " --stdin-paths "));
+const AFTER_KEEP: Hold = Some(("ln", " ./src/lib.rs "));
+const AFTER_MOVE: Hold = Some(("mv", " ./src/lib.rs "));
 const EDITOR_SAVE: &str = "editor-save";
 const CANNOT_PRESERVE: &str = "cannot preserve open-file writes";
 /// The last new file gets its mode, in the folder the command made for it,
 /// after the file beside the edited one was written.
-const WRITING: Hold = ("chmod", " ./src/new/");
+const WRITING: Hold = Some(("chmod", " ./src/new/"));
 /// Shell paths can contain arbitrary bytes. Long Lua strings preserve them in the generated
 /// import and cleanup commands.
 const GENERATE: &str = r#"
 local git_utils = require("claude_git")
 local import_scripts = require("claude_import_script")
+local artifacts = require("claude_artifact")
 local path_utils = require("claude_paths")
 local changes = ({
   edit_and_add = {
@@ -82,8 +82,9 @@ local changes = ({
     { path = [==[@PATH@]==], status = "M", old_sha = "@OLD@", new_sha = "@OLD@", old_mode = "100755", new_mode = "100644" },
   },
 })["@CHANGES@"]
-maki.fs.write("@OUT@", import_scripts.import_script(changes, "@PROJECT@", "@GIT@", "@ARTIFACT@", "@STAGE@"))
-maki.fs.write("@LEFTOVERS@", import_scripts.leftovers_script(changes, "@PROJECT@", "@STAGE@", { [==[@MADE@]==] }))
+local stage = import_scripts.stage(artifacts.layout("@ARTIFACT@"), "@STAGE@")
+maki.fs.write("@OUT@", import_scripts.import_script(changes, "@PROJECT@", "@GIT@", stage))
+maki.fs.write("@LEFTOVERS@", import_scripts.leftovers_script(changes, "@PROJECT@", stage, { [==[@MADE@]==] }))
 maki.fs.write("@REVIEW@", git_utils.diff_command({ git = "@GIT@", snapshot = "@PROJECT@", base = "@OLD@", tree = "@NEW@" }))
 "#;
 /// The changes an import applies, by their name in `GENERATE`.
@@ -95,10 +96,8 @@ const TARGET: &str = "src/lib.rs";
 const ADDED: &str = "src/new/added.rs";
 /// Names that survive only with proper shell quoting: a quote, a command
 /// substitution, a space, a newline and a glob.
-static HOSTILE_EDITED: LazyLock<String> =
-    LazyLock::new(|| format!("src/it's {} *\nlib.rs", *TOUCH_PWNED));
-static HOSTILE_ADDED: LazyLock<String> =
-    LazyLock::new(|| format!("src/a 'b' {}/*\nadded.rs", *TOUCH_PWNED));
+const HOSTILE_EDITED: &str = "src/it's @TOUCH_PWNED@ *\nlib.rs";
+const HOSTILE_ADDED: &str = "src/a 'b' @TOUCH_PWNED@/*\nadded.rs";
 const BIDI_EDITED: &str = "src/a\u{202e}b\u{200b}.rs";
 const BIDI_ADDED: &str = "src/c\u{2066}d\u{e0061}.rs";
 const LINK_FAILURE: &str = "ln: fixture preservation failure";
@@ -106,12 +105,12 @@ const LINK_FAILURE: &str = "ln: fixture preservation failure";
 /// target.
 const OTHER_IMPORTS_TEMP: &str = ".maki-import-artifact.x9y8z7.q1w2e3";
 const ORIGINAL: &str = "the checkout as the snapshot saw it\n";
-const NEWER: &str = "the user's newer work\n";
 const RECORDED: &str = "the worker's change\n";
 const CHANGED_EXIT: i32 = 3;
+/// The cleanup's exit code when it could not clear a folder.
+const CLEANUP_FAILED_EXIT: i32 = 1;
 /// The import names each file relative to the checkout, starting here.
 const CURRENT_DIR: &str = ".";
-const PRIVATE_MODE: u32 = 0o600;
 const GROUP_READ_MODE: u32 = 0o640;
 const PUBLIC_READ_MODE: u32 = 0o644;
 const PRIVATE_EXECUTE_MODE: u32 = 0o700;
@@ -122,12 +121,13 @@ const SAME_FOLDER_ADDED: &str = "src/added.rs";
 const TWO_EDITS: &str = "two_edits";
 const COUNTED: &str = "#!/bin/sh\nprintf '%s\\n' '@TOOL@' >> '@LOG@'\nexec '@REAL@' \"$@\"\n";
 const OWNER_EXECUTE: u32 = 0o100;
+const RETRY_STAGE: &str = "stage.d4e5f6";
 
 /// A checkout with one file, an artifact whose repository holds the worker's
 /// version, and the command importing that change.
 struct Import {
     root: TempDir,
-    edited: &'static str,
+    edited: String,
     project: PathBuf,
     artifact: PathBuf,
     temp: PathBuf,
@@ -145,16 +145,11 @@ impl Import {
 
     /// Like `new`, with the edited file at `edited` and the added file at
     /// `added`, whose folder the command creates.
-    fn named(hold: Hold, edited: &'static str, added: &'static str) -> Self {
+    fn named(hold: Hold, edited: &str, added: &str) -> Self {
         Self::with(hold, EDIT_AND_ADD, edited, added)
     }
 
-    fn with(
-        (tool, hold_on): Hold,
-        changes: &str,
-        edited: &'static str,
-        added: &'static str,
-    ) -> Self {
+    fn with(hold: Hold, changes: &str, edited: &str, added: &str) -> Self {
         let root = tempdir().unwrap();
         let base = root.path().canonicalize().unwrap();
         let (project, artifact, temp, tools) = (
@@ -216,15 +211,16 @@ impl Import {
         let script = fs::read_to_string(&out).unwrap();
         let leftovers = fs::read_to_string(&leftovers).unwrap();
         let gate = Gate::closed();
-        let held = HELD
-            .replace("@HOLD_ON@", hold_on)
-            .replace("@REAL@", &on_path(tool).to_string_lossy())
-            .replace("@HELD@", &base.join("held").to_string_lossy())
-            .replace("@WAIT@", &gate.wait());
-        executable(&tools, tool, &held);
+        if let Some((tool, hold_on)) = hold {
+            let held = HELD
+                .replace("@HOLD_ON@", hold_on)
+                .replace("@HELD@", &base.join("held").to_string_lossy())
+                .replace("@WAIT@", &gate.wait());
+            wrap(&tools, tool, &held);
+        }
         let import = Self {
             root,
-            edited,
+            edited: edited.to_owned(),
             project,
             artifact,
             temp,
@@ -247,7 +243,7 @@ impl Import {
     }
 
     fn target(&self) -> PathBuf {
-        self.project.join(self.edited)
+        self.project.join(&self.edited)
     }
 
     /// Puts a `tool` first on the command's `PATH` that fails when its
@@ -255,9 +251,8 @@ impl Import {
     fn failing(&self, tool: &str, fail_on: &Path) {
         let script = FAILS
             .replace("@FAIL_ON@", &fail_on.to_string_lossy())
-            .replace("@CAUSE@", LINK_FAILURE)
-            .replace("@REAL@", &on_path(tool).to_string_lossy());
-        executable(&self.tools, tool, &script);
+            .replace("@CAUSE@", LINK_FAILURE);
+        wrap(&self.tools, tool, &script);
     }
 
     fn marker(&self, name: &str) -> PathBuf {
@@ -304,7 +299,6 @@ impl Import {
     }
 
     fn run(&self, script: &str) -> Output {
-        self.gate.release();
         self.command(script).output().unwrap()
     }
 
@@ -352,7 +346,7 @@ fn a_change_before_import_is_refused(link: bool) {
     if link {
         swap_for_a_link(&import.target(), &outside);
     } else {
-        fs::write(import.target(), NEWER).unwrap();
+        fs::write(import.target(), NEWER_WORK).unwrap();
     }
     let output = import.run(&import.script);
 
@@ -362,7 +356,7 @@ fn a_change_before_import_is_refused(link: bool) {
     if link {
         assert_eq!(fs::read_to_string(&outside).unwrap(), ORIGINAL);
     } else {
-        assert_eq!(fs::read_to_string(import.target()).unwrap(), NEWER);
+        assert_eq!(fs::read_to_string(import.target()).unwrap(), NEWER_WORK);
     }
 }
 
@@ -426,7 +420,6 @@ fn a_mode_change_lands_with_the_same_bytes() {
 #[test_case(0o750, "077" ; "group_execute_private_umask")]
 #[test_case(0o4755, "077" ; "special_bits_are_cleared")]
 fn an_import_clears_execute_bits_regardless_of_umask(mode: u32, umask: &str) {
-    const EXECUTE_BITS: u32 = 0o111;
     let import = Import::with(WITHOUT_HOLD, MODE_CLEARED, TARGET, ADDED);
     fs::set_permissions(import.target(), fs::Permissions::from_mode(mode)).unwrap();
     let output = import.run(&format!("umask {umask}\n{}", import.script));
@@ -442,7 +435,7 @@ fn an_import_clears_execute_bits_regardless_of_umask(mode: u32, umask: &str) {
     );
 }
 
-#[test_case(PRIVATE_MODE ; "owner_only")]
+#[test_case(PRIVATE_FILE_MODE ; "owner_only")]
 #[test_case(GROUP_READ_MODE ; "group_read")]
 #[test_case(PUBLIC_READ_MODE ; "public_read")]
 #[test_case(PRIVATE_EXECUTE_MODE ; "owner_execute")]
@@ -471,9 +464,8 @@ fn an_import_batches_metadata_permissions_and_folder_staging() {
     for tool in ["stat", "mktemp", "chmod", "cat"] {
         let script = COUNTED
             .replace("@TOOL@", tool)
-            .replace("@LOG@", &log.to_string_lossy())
-            .replace("@REAL@", &on_path(tool).to_string_lossy());
-        executable(&import.tools, tool, &script);
+            .replace("@LOG@", &log.to_string_lossy());
+        wrap(&import.tools, tool, &script);
     }
     let output = import.run(&import.script);
     assert_status(&output, true);
@@ -519,15 +511,15 @@ fn a_write_through_a_descriptor_opened_before_is_kept_in_the_artifact(hold: Hold
         .open(import.target())
         .unwrap();
     let child = import.start_held();
-    writer.write_all(NEWER.as_bytes()).unwrap();
-    writer.set_len(NEWER.len() as u64).unwrap();
+    writer.write_all(NEWER_WORK.as_bytes()).unwrap();
+    writer.set_len(NEWER_WORK.len() as u64).unwrap();
     let output = import.release(child);
 
     assert_status(&output, true);
     assert_eq!(fs::read_to_string(import.target()).unwrap(), RECORDED);
     assert_eq!(
         fs::read_to_string(import.artifact.join(ORIGINALS).join(STAGE).join(TARGET)).unwrap(),
-        NEWER
+        NEWER_WORK
     );
 }
 
@@ -537,7 +529,7 @@ fn an_atomic_editor_save_survives_import(hold: Hold, succeeds: bool) {
     let import = Import::new(hold);
     let child = import.start_held();
     let replacement = import.project.join(EDITOR_SAVE);
-    fs::write(&replacement, NEWER).unwrap();
+    fs::write(&replacement, NEWER_WORK).unwrap();
     fs::rename(replacement, import.target()).unwrap();
     let output = import.release(child);
 
@@ -547,7 +539,7 @@ fn an_atomic_editor_save_survives_import(hold: Hold, succeeds: bool) {
     } else {
         import.target()
     };
-    assert_eq!(fs::read_to_string(saved).unwrap(), NEWER);
+    assert_eq!(fs::read_to_string(saved).unwrap(), NEWER_WORK);
     assert_eq!(
         fs::read_to_string(import.artifact.join(ORIGINALS).join(STAGE).join(TARGET)).unwrap(),
         ORIGINAL
@@ -567,9 +559,9 @@ fn a_failed_hard_link_stops_before_any_checkout_write() {
     assert_status(&output, false);
     assert!(String::from_utf8_lossy(&output.stderr).contains(CANNOT_PRESERVE));
     assert!(String::from_utf8_lossy(&output.stderr).contains(LINK_FAILURE));
-    writer.write_all(NEWER.as_bytes()).unwrap();
-    writer.set_len(NEWER.len() as u64).unwrap();
-    assert_eq!(fs::read_to_string(import.target()).unwrap(), NEWER);
+    writer.write_all(NEWER_WORK.as_bytes()).unwrap();
+    writer.set_len(NEWER_WORK.len() as u64).unwrap();
+    assert_eq!(fs::read_to_string(import.target()).unwrap(), NEWER_WORK);
     assert!(!import.project.join(ADDED).exists());
 }
 
@@ -577,7 +569,7 @@ fn failed_attempt() -> Import {
     let import = Import::new(LAST_CHECK);
     import.failing("ln", Path::new(IMPORT_TEMP));
     let child = import.start_held();
-    fs::write(import.target(), NEWER).unwrap();
+    fs::write(import.target(), NEWER_WORK).unwrap();
     let output = import.release(child);
     assert_status(&output, false);
     assert!(!import.target().exists());
@@ -588,19 +580,24 @@ fn failed_attempt() -> Import {
 #[test]
 fn a_retry_cannot_overwrite_a_preserved_save() {
     let import = failed_attempt();
+    fs::remove_file(import.tools.join("ln")).unwrap();
     import.stage_blobs(STAGE);
     let output = import.run(&import.script);
     assert_status(&output, false);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let backup = import.artifact.join(ORIGINALS).join(STAGE);
+    assert!(
+        stderr.contains(&*backup.to_string_lossy()) && stderr.contains(CANNOT_PRESERVE),
+        "{stderr}"
+    );
     assert_eq!(fs::read_to_string(import.target()).unwrap(), ORIGINAL);
     for saved in [
         import.artifact.join(ORIGINALS).join(STAGE).join(TARGET),
         import.artifact.join(DISPLACED).join(STAGE).join(TARGET),
     ] {
-        assert_eq!(fs::read_to_string(saved).unwrap(), NEWER);
+        assert_eq!(fs::read_to_string(saved).unwrap(), NEWER_WORK);
     }
 }
-
-const RETRY_STAGE: &str = "stage.d4e5f6";
 
 #[test]
 fn a_new_attempt_can_import_without_overwriting_earlier_backups() {
@@ -612,7 +609,7 @@ fn a_new_attempt_can_import_without_overwriting_earlier_backups() {
     assert_eq!(fs::read_to_string(import.target()).unwrap(), RECORDED);
     assert_eq!(
         fs::read_to_string(import.artifact.join(ORIGINALS).join(STAGE).join(TARGET)).unwrap(),
-        NEWER
+        NEWER_WORK
     );
     assert_eq!(
         fs::read_to_string(
@@ -633,7 +630,6 @@ fn invisible_names_are_visible_in_approval_and_keep_their_bytes_in_a_c_locale() 
     for hidden in ['\u{202e}', '\u{200b}', '\u{2066}', '\u{e0061}'] {
         assert!(!import.script.contains(hidden));
     }
-    import.gate.release();
     let output = import
         .command(&import.script)
         .env("LC_ALL", "C")
@@ -684,15 +680,24 @@ fn a_cleanup_that_cannot_clear_a_folder_fails() {
     drop(import.start_held());
     let src = import.project.join("src");
     let moved = import.project.join("moved");
+    let names = |dir: &Path| -> Vec<OsString> {
+        listing(dir)
+            .into_iter()
+            .map(|path| path.file_name().unwrap().to_owned())
+            .collect()
+    };
+    let written = names(&src);
     fs::rename(&src, &moved).unwrap();
     symlink(&moved, &src).unwrap();
 
     let output = import.run(&import.leftovers);
-    assert_status(&output, false);
-    assert!(
-        listing(&moved).len() > 1,
-        "the cleanup removed the temporary files through the link: {:?}",
-        listing(&moved)
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(CLEANUP_FAILED_EXIT), "{stderr}");
+    assert_eq!(stderr, "");
+    assert_eq!(
+        names(&moved),
+        written,
+        "the cleanup removed the temporary files through the link"
     );
 }
 
@@ -703,7 +708,6 @@ fn a_cleanup_that_cannot_clear_a_folder_fails() {
 fn generated_git_commands_ignore_shell_only_variables(variable: &str) {
     let import = Import::new(WITHOUT_HOLD);
     let review = fs::read_to_string(import.marker(REVIEW_SCRIPT)).unwrap();
-    import.gate.release();
     for script in [&review, &import.script] {
         let output = import
             .command(script)
@@ -721,7 +725,6 @@ fn an_import_runs_git_without_the_users_config() {
     let import = Import::new(WITHOUT_HOLD);
     let config = import.root.path().join(USER_GIT_CONFIG);
     fs::write(&config, BROKEN_GIT_CONFIG).unwrap();
-    import.gate.release();
     let output = import
         .command(&import.script)
         .env("GIT_CONFIG_GLOBAL", &config)
@@ -736,7 +739,11 @@ fn an_import_runs_git_without_the_users_config() {
 /// without execution.
 #[test]
 fn a_hostile_file_name_lands_as_it_is_and_runs_nothing() {
-    let import = Import::named(WITHOUT_HOLD, &HOSTILE_EDITED, &HOSTILE_ADDED);
+    let scratch = tempdir().unwrap();
+    let pwned = scratch.path().join(PWNED);
+    let [edited, added] = [HOSTILE_EDITED, HOSTILE_ADDED]
+        .map(|name| name.replace("@TOUCH_PWNED@", &touch_pwned(&pwned)));
+    let import = Import::named(WITHOUT_HOLD, &edited, &added);
     for script in [&import.script, &import.leftovers] {
         let output = import.run(script);
         assert_status(&output, true);
@@ -744,8 +751,8 @@ fn a_hostile_file_name_lands_as_it_is_and_runs_nothing() {
 
     assert_eq!(fs::read_to_string(import.target()).unwrap(), RECORDED);
     assert_eq!(
-        fs::read_to_string(import.project.join(&*HOSTILE_ADDED)).unwrap(),
+        fs::read_to_string(import.project.join(&added)).unwrap(),
         RECORDED
     );
-    assert!(!Path::new(PWNED).exists(), "a name ran a command: {PWNED}");
+    assert!(!pwned.exists(), "a name ran a command: {pwned:?}");
 }

@@ -1,6 +1,5 @@
 local git_utils = require("claude_git")
 local path_utils = require("claude_paths")
-local artifacts = require("claude_artifact")
 
 local M = {}
 
@@ -91,13 +90,17 @@ function M.import_timeout(changes)
   return IMPORT_TIMEOUT_SECS + #changes * IMPORT_SECS_PER_FILE
 end
 
-function M.temp_name(stage)
-  local artifact, name = stage:match("([^/]+)/([^/]+)$")
-  return TEMP_PREFIX .. artifact .. "." .. name:match("[^.]+$") .. "."
-end
-
-function M.receipt_path(artifact, stage)
-  return artifact .. "/receipt." .. stage:match("[^/]+$")
+--- The paths of one import attempt that stages its blobs in {dir}, a
+--- `stage_template` folder of {artifact}. Each attempt keeps its own files.
+function M.stage(artifact, dir)
+  local name = maki.fs.basename(dir)
+  return {
+    dir = dir,
+    originals = maki.fs.joinpath(artifact.originals, name),
+    displaced = maki.fs.joinpath(artifact.displaced, name),
+    receipt = artifact.receipt .. "." .. name,
+    temp = TEMP_PREFIX .. artifact.id .. "." .. name:match("[^.]+$") .. ".",
+  }
 end
 
 --- Validates pre-staged blobs and the checkout before any write.
@@ -106,14 +109,14 @@ end
 --- also preserve atomic editor saves that replace those inodes. New files
 --- use links that cannot overwrite a save made after the original moved.
 --- A failed import runs `leftovers_script` to remove its temporary files.
---- Each change must first pass `claude_workspace.change_problem`.
-function M.import_script(changes, project, git_dir, artifact, stage)
+--- Each change must first pass `claude_workspace.change_problem`. {stage}
+--- comes from `stage`.
+function M.import_script(changes, project, git_dir, stage)
   local words = git_utils.shell_environment()
   for _, word in ipairs(git_utils.git({ "--git-dir=" .. git_dir })) do
     words[#words + 1] = path_utils.shell_quote(word)
   end
   local quoted_project = path_utils.shell_quote(project)
-  local layout, stage_name = artifacts.layout(artifact), maki.fs.basename(stage)
   local lines = { "# Import changes into " .. path_utils.printable(project) }
   for _, change in ipairs(changes) do
     lines[#lines + 1] = "# " .. change.status .. " " .. path_utils.printable(change.path)
@@ -128,11 +131,11 @@ function M.import_script(changes, project, git_dir, artifact, stage)
     "hash_note=" .. path_utils.shell_quote(HASH_FAILED),
     "checkout_note=" .. path_utils.shell_quote(CHECKOUT_GONE),
     "changed_exit=" .. IMPORT_CHANGED_EXIT,
-    "originals=" .. path_utils.shell_quote(maki.fs.joinpath(layout.originals, stage_name)),
-    "displaced=" .. path_utils.shell_quote(maki.fs.joinpath(layout.displaced, stage_name)),
-    "stage=" .. path_utils.shell_quote(stage),
-    "receipt=" .. path_utils.shell_quote(M.receipt_path(artifact, stage)),
-    "temp_template=" .. path_utils.shell_quote(M.temp_name(stage) .. TEMP_RANDOM),
+    "originals=" .. path_utils.shell_quote(stage.originals),
+    "displaced=" .. path_utils.shell_quote(stage.displaced),
+    "stage=" .. path_utils.shell_quote(stage.dir),
+    "receipt=" .. path_utils.shell_quote(stage.receipt),
+    "temp_template=" .. path_utils.shell_quote(stage.temp .. TEMP_RANDOM),
     GIT_FUNCTION:format(table.concat(words, " ")),
     IMPORT_FUNCTIONS,
     "cd -P -- " .. quoted_project .. ' && [ "$(pwd -P)" = ' .. quoted_project .. " ] || checkout_gone",
@@ -191,7 +194,7 @@ function M.import_script(changes, project, git_dir, artifact, stage)
       if not staged[change.new_sha] then
         staged[change.new_sha] = true
         stages[#stages + 1] = "staged " .. path_utils.shell_quote(change.new_sha)
-        hash_path(stage .. "/" .. change.new_sha, change.new_sha, "gone " .. path_utils.shell_quote(change.new_sha))
+        hash_path(stage.dir .. "/" .. change.new_sha, change.new_sha, "gone " .. path_utils.shell_quote(change.new_sha))
       end
       local flag = "keep"
       if change.status == git_utils.ADDED or change.old_mode ~= change.new_mode then
@@ -249,9 +252,9 @@ function M.import_script(changes, project, git_dir, artifact, stage)
 end
 
 --- Cleans up after a failed import: its temporary files, each empty folder
---- in {made}, and {stage}. It enters each folder by its resolved path. The
---- import follows a folder that became a link, as maki's write tool does,
---- but the cleanup does not. It exits with an error when it cannot enter an
+--- in {made}, and the folder of {stage}. It enters each folder by its
+--- resolved path. The import follows a folder that became a link, as maki's
+--- write tool does, but the cleanup does not. It exits with an error when it cannot enter an
 --- existing folder or remove its files, because temporary files may remain.
 function M.leftovers_script(changes, project, stage, made)
   local lines = { 'into() { cd -P -- "$1" 2>/dev/null && [ "$(pwd -P)" = "$1" ]; }', "status=0" }
@@ -264,7 +267,7 @@ function M.leftovers_script(changes, project, stage, made)
       lines[#lines + 1] = "if into "
         .. quoted
         .. "; then rm -rf -- "
-        .. path_utils.shell_quote(M.temp_name(stage))
+        .. path_utils.shell_quote(stage.temp)
         .. "* || status=1; elif [ -e "
         .. quoted
         .. " ] || [ -L "
@@ -280,7 +283,7 @@ function M.leftovers_script(changes, project, stage, made)
       .. path_utils.shell_quote(name)
       .. " 2>/dev/null"
   end
-  lines[#lines + 1] = "rm -rf -- " .. path_utils.shell_quote(stage) .. " || status=1"
+  lines[#lines + 1] = "rm -rf -- " .. path_utils.shell_quote(stage.dir) .. " || status=1"
   lines[#lines + 1] = "exit $status"
   return table.concat(lines, "\n")
 end

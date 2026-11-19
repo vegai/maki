@@ -5,6 +5,9 @@ local M = {}
 M.TRASH_PREFIX = ".trash-"
 M.SWEEP_LOCK = ".sweep.lock"
 M.CANNOT_SWEEP = jobs.ERROR_PREFIX .. "maki cannot lock artifact cleanup in "
+-- Each step of a coding snapshot, such as the copy, and each artifact removal
+-- must finish in this time.
+M.STEP_TIMEOUT_MS = 120 * jobs.MS_PER_SEC
 local SWEEP_CONTENTS = [[
 set -e
 cd -P -- "$1"
@@ -31,10 +34,13 @@ local LAYOUT = {
   copy_started = "copy-started",
   -- A unique stage keeps retries from removing another attempt's files.
   stage_template = "stage.XXXXXX",
+  receipt = "receipt",
 }
 local SECS_PER_HOUR = 3600
 
-local function remove_artifact(call, dir, timeout_ms, released)
+--- Removes the artifact {dir}, then runs {released}. The removal outlives a
+--- cancel of {call}.
+function M.remove(call, dir, released)
   local function finished(_, code)
     if code ~= 0 then
       call:leave(dir)
@@ -44,7 +50,7 @@ local function remove_artifact(call, dir, timeout_ms, released)
     end
   end
   local argv = { "sh", "-c", SWEEP_CONTENTS, "sh", dir, LAYOUT.marker }
-  if not call:start(argv, { timeout_ms = timeout_ms }, finished, true) then
+  if not call:start(argv, { timeout_ms = M.STEP_TIMEOUT_MS }, finished, true) then
     finished()
   end
 end
@@ -60,7 +66,7 @@ end
 --- An import rewrites the manifest, so the sweep keeps the artifact of an
 --- unfinished import. An artifact that stopped before the collect step is
 --- dated by its marker.
-function M.sweep(call, root, ttl_hours, timeout_ms)
+function M.sweep(call, root, ttl_hours)
   -- Artifact locks are unlinked during deletion. Keep this lock outside the deleted tree.
   local sweep_lock, lock_err = maki.fs.try_lock(maki.fs.joinpath(root, M.SWEEP_LOCK))
   if not sweep_lock then
@@ -92,7 +98,7 @@ function M.sweep(call, root, ttl_hours, timeout_ms)
             trash = artifact.dir
           end
           if renamed then
-            remove_artifact(call, trash, timeout_ms, function()
+            M.remove(call, trash, function()
               lock:close()
             end)
           else
@@ -112,7 +118,7 @@ end
 
 --- The artifact belongs to {call} from its creation, so the call removes it after
 --- a failed allocation too.
-function M.allocate(call, root, env, timeout_ms)
+function M.allocate(call, root, env)
   local _, root_err = maki.fs.mkdir(root, { parents = true })
   if root_err then
     return nil, "maki cannot make " .. root .. ": " .. root_err
@@ -123,7 +129,6 @@ function M.allocate(call, root, env, timeout_ms)
   end
   local artifact = M.layout(dir)
   artifact.git_env = git_utils.snapshot_git_env(env, artifact.git, artifact.snapshot)
-  artifact.timeout_ms = timeout_ms
   artifact.notes = {}
   call.artifact = artifact
   local _, mark_err = maki.fs.write(artifact.marker, "")
@@ -144,10 +149,6 @@ function M.allocate(call, root, env, timeout_ms)
     end
   end
   return artifact
-end
-
-function M.discard(call, artifact, removed)
-  remove_artifact(call, artifact.dir, artifact.timeout_ms, removed)
 end
 
 return M

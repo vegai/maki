@@ -10,8 +10,6 @@ use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
 use maki_providers::{Message, RequestOptions, ThinkingConfig, Timeouts};
-#[cfg(test)]
-use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
 use serde_json::Value;
@@ -431,7 +429,7 @@ impl ContextSpec {
 /// `tool_search`). Probed as [`ToolDeferral::Client`] because the native
 /// array lists every deferred definition too.
 fn advertised_tool_names(tools: &RequestTools, mcp: Option<&McpSession>) -> Vec<String> {
-    extract_tool_names(&agent::request_tools(tools, mcp, ToolDeferral::Client))
+    extract_tool_names(&agent::wire_tools(tools, mcp, ToolDeferral::Client))
 }
 
 pub struct InteractiveParams {
@@ -782,6 +780,7 @@ mod tests {
     };
     use maki_providers::provider::{BoxFuture, ModelListing, RequestScope};
     use maki_providers::{AgentError, ModelInfo, ProviderEvent, StreamResponse};
+    use maki_storage::StateDir;
     use maki_storage::id::MakiId;
     use tempfile::TempDir;
     use test_case::test_case;

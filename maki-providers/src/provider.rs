@@ -159,8 +159,11 @@ struct UnconfiguredProvider;
 const STATIC_FALLBACK: &str = "using static fallback";
 const NO_FALLBACK: &str = "no static fallback";
 
+/// A source provider's table can contain models unavailable on this route, so
+/// discovery is left to the route provider.
 fn curated_specs(spec: &ProviderSpec) -> impl Iterator<Item = String> + '_ {
-    spec.listed_rows()
+    spec.models_of
+        .map_or(spec.models(), |_| &[])
         .iter()
         .flat_map(|entry| entry.prefixes.iter())
         .map(move |prefix| format!("{}/{prefix}", spec.slug))
@@ -438,6 +441,8 @@ mod tests {
     use super::*;
     use crate::providers::{anthropic, claude_code};
 
+    const LISTING_DOWN: &str = "down";
+
     /// Only a provider with its own rows falls back to them after an error.
     #[test_case(&anthropic::SPEC => (false, STATIC_FALLBACK) ; "a_provider_with_its_own_rows")]
     #[test_case(&claude_code::SPEC => (true, NO_FALLBACK) ; "one_that_runs_anothers_models")]
@@ -445,7 +450,7 @@ mod tests {
         let batch = failed_listing(
             spec,
             &AgentError::Config {
-                message: "down".into(),
+                message: LISTING_DOWN.into(),
             },
         );
         assert_eq!(batch.provider, spec.slug);

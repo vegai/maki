@@ -367,10 +367,7 @@ mod tests {
 
     use super::{DEFAULT_LOG_LEVEL, ProjectJson, build_log_filter, resolve_thinking};
     use maki_config::SessionDefaults;
-    use maki_storage::StateDir;
-    use maki_storage::model::{persist_thinking, read_thinking};
     use maki_storage::sessions::{Effort, StoredThinking};
-    use tempfile::tempdir;
 
     const FOREIGN: &str = "other_crate=debug";
     const FOREIGN_EMPTY_PIECES: &str = ",other_crate=debug,,";
@@ -445,24 +442,18 @@ mod tests {
     #[test_case(None, Some(CONFIGURED), Some(SAVED), Some(CONFIGURED) ; "config_overrides_state")]
     #[test_case(None, None, Some(SAVED), Some(SAVED) ; "state_is_the_fallback")]
     #[test_case(None, None, None, None ; "no_saved_choice")]
-    fn launch_thinking_precedence_does_not_change_saved_state(
+    fn launch_thinking_precedence(
         explicit: Option<StoredThinking>,
         configured: Option<StoredThinking>,
         saved: Option<StoredThinking>,
         expected: Option<StoredThinking>,
     ) {
-        let root = tempdir().unwrap();
-        let storage = StateDir::from_path(root.path().to_path_buf());
-        if let Some(saved) = saved {
-            persist_thinking(&storage, saved);
-        }
         let mut defaults = SessionDefaults {
             thinking: configured,
             ..SessionDefaults::default()
         };
-        resolve_thinking(&mut defaults, explicit, read_thinking(&storage));
+        resolve_thinking(&mut defaults, explicit, saved);
         assert_eq!(defaults.thinking, expected);
-        assert_eq!(read_thinking(&storage), saved);
     }
 
     #[test_case(None, None, "info" ; "nothing_set_logs_at_info")]

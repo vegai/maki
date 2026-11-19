@@ -147,10 +147,6 @@ function M.path_problem(path)
   return nil
 end
 
-function M.dependency_dirs(option)
-  return M.comma_list(option, M.relative_path)
-end
-
 --- Escapes only ASCII pattern characters, so non-ASCII names pass unchanged.
 function M.exclude_rule(dir)
   return "/" .. dir:gsub("[%*%?%[%]\\!# ]", "\\%0") .. "/\n"
@@ -160,9 +156,7 @@ function M.shell_quote(text)
   return native.escape_path(text, true)
 end
 
-function M.printable(path)
-  return native.escape_path(path, false)
-end
+M.printable = native.escape_path
 
 function M.shown(paths)
   local listed, more = M.first(paths, SHOWN_PATHS)

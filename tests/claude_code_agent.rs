@@ -23,11 +23,12 @@ mod process;
 use process::{finish, ndjson};
 
 #[path = "support/isolation.rs"]
+#[allow(dead_code)]
 mod isolation;
 #[path = "support/wire.rs"]
 #[allow(dead_code)]
 mod wire;
-use isolation::{CONFIG_DIR, Isolation, STATE_DIR};
+use isolation::{CONFIG_DIR, INIT_LUA, Isolation, PROJECT_DIR, STATE_DIR};
 use wire::{INIT, JSON_FORMAT, RESULT, STREAM_FORMAT, SYSTEM, TEXT_FORMAT};
 
 const NO_SCRATCH: &str = "maki cannot create a private scratch directory outside the project";
@@ -77,6 +78,8 @@ const REVIEW_ALL_TOOLS: [&str; 7] = [
 const UNMATCHED_TOOL_WARNING: &str = "no loaded tool matches";
 const HEADLESS_THINKING: &str = "low";
 const CLAUDE_TOOL_SUGGESTION: &str = "Did you mean 'claude_code'?";
+const API_KEY_HELPER: &str = "apiKeyHelper";
+const HELPER_SETTINGS: &str = r#"{"apiKeyHelper":"secret-command"}"#;
 /// A run's tool calls and their results, from its stream-json.
 struct Run {
     events: Vec<Value>,
@@ -140,7 +143,7 @@ impl Fixture {
         let fixture = Self {
             isolation: Isolation::new(),
         };
-        let project = fixture.isolation.dir("project");
+        let project = fixture.isolation.dir(PROJECT_DIR);
         fs::write(project.join(GLOSSARY), format!("alpha: {MEANING}\n")).unwrap();
         let config = fixture.isolation.dir(CONFIG_DIR);
         fs::write(config.join("permissions.toml"), DENY_BASH).unwrap();
@@ -162,12 +165,12 @@ impl Fixture {
     }
 
     fn write_init(&self, init: &str) {
-        fs::write(self.isolation.dir(CONFIG_DIR).join("init.lua"), init).unwrap();
+        fs::write(self.isolation.dir(CONFIG_DIR).join(INIT_LUA), init).unwrap();
     }
 
-    fn maki(&self, model: &str, prompt: &str, format: &str) -> Command {
+    fn maki(&self, format: &str) -> Command {
         let mut command = self.isolation.command();
-        command.args(["-p", "--model", model, "--output-format", format, prompt]);
+        command.args(["-p", "--model", MODEL, "--output-format", format, PROMPT]);
         command
     }
 }
@@ -178,7 +181,7 @@ fn run_maki() -> Run {
     let real_home = PathBuf::from(env::var_os("HOME").expect("HOME is set"));
     let claude_config =
         env::var_os(CLAUDE_CONFIG_ENV).map_or_else(|| real_home.join(".claude"), PathBuf::from);
-    let mut command = fixture.maki(MODEL, PROMPT, STREAM_FORMAT);
+    let mut command = fixture.maki(STREAM_FORMAT);
     command.env(CLAUDE_CONFIG_ENV, claude_config);
     let Output {
         status,
@@ -197,7 +200,7 @@ fn dry_run_uses_provider_capabilities_and_filters_without_starting_claude() {
     let fixture = Fixture::new();
     let claude = stand_in(&fixture.isolation.dir("bin"));
     fixture.review(&claude);
-    let mut command = fixture.maki(MODEL, PROMPT, STREAM_FORMAT);
+    let mut command = fixture.maki(STREAM_FORMAT);
     command.args([
         "--dry-run",
         "--disallowed-tools",
@@ -231,7 +234,7 @@ fn unavailable_scratch_fails_per_request_without_starting_claude() {
     let fixture = Fixture::new();
     let claude = stand_in(&fixture.isolation.dir("bin"));
     fixture.enable_plugin(Some(&claude));
-    let mut command = fixture.maki(MODEL, PROMPT, STREAM_FORMAT);
+    let mut command = fixture.maki(STREAM_FORMAT);
     command.current_dir("/");
     let output = finish(&mut command);
     assert!(!output.status.success());
@@ -254,10 +257,10 @@ fn request_policy_does_not_prevent_provider_creation_or_dry_run() {
             .isolation
             .dir("project/.claude")
             .join("settings.json"),
-        r#"{"apiKeyHelper":"secret-command"}"#,
+        HELPER_SETTINGS,
     )
     .unwrap();
-    let mut command = fixture.maki(MODEL, PROMPT, STREAM_FORMAT);
+    let mut command = fixture.maki(STREAM_FORMAT);
     command.arg("--dry-run");
     let output = finish(&mut command);
     assert!(
@@ -269,11 +272,16 @@ fn request_policy_does_not_prevent_provider_creation_or_dry_run() {
     assert_eq!(init["subtype"], INIT);
     assert!(init["uuid"].is_string());
     assert!(!ran(&claude));
-    let output = finish(&mut fixture.maki(MODEL, PROMPT, STREAM_FORMAT));
+    let output = finish(&mut fixture.maki(STREAM_FORMAT));
     assert!(!output.status.success());
     let events = ndjson(&output.stdout);
     assert_eq!(events[0]["subtype"], INIT);
-    assert_eq!(events.last().unwrap()["is_error"], true);
+    let result = events.last().unwrap();
+    assert_eq!(result["is_error"], true);
+    assert!(
+        result[RESULT].as_str().unwrap().contains(API_KEY_HELPER),
+        "{result}"
+    );
     assert!(!ran(&claude));
 }
 
@@ -283,7 +291,7 @@ fn request_policy_does_not_prevent_provider_creation_or_dry_run() {
 #[test_case(STREAM_FORMAT, false ; "sdk_stream_json")]
 fn startup_errors_keep_the_output_format(format: &str, verbose: bool) {
     let fixture = Fixture::new();
-    let mut command = fixture.maki(MODEL, PROMPT, format);
+    let mut command = fixture.maki(format);
     if verbose {
         command.arg("--verbose");
     }
@@ -378,7 +386,7 @@ fn the_provider_is_on_with_the_plugin(plugin: bool, want: &str) {
     }
     let caller_path = env::var_os(PATH).unwrap_or_default();
     let path = env::join_paths(iter::once(bin).chain(env::split_paths(&caller_path))).unwrap();
-    let mut command = fixture.maki(MODEL, PROMPT, JSON_FORMAT);
+    let mut command = fixture.maki(JSON_FORMAT);
     command.env(PATH, path);
     let Output { stdout, stderr, .. } = finish(&mut command);
     let stderr = String::from_utf8(stderr).unwrap();
@@ -406,7 +414,7 @@ fn cli_filters_plugin_tools_in_the_init_event(
     let fixture = Fixture::new();
     let claude = stand_in(&fixture.isolation.dir("bin"));
     fixture.review(&claude);
-    let mut command = fixture.maki(MODEL, PROMPT, STREAM_FORMAT);
+    let mut command = fixture.maki(STREAM_FORMAT);
     command.args([flag, names]);
     let Output { stdout, stderr, .. } = finish(&mut command);
     let stderr = String::from_utf8(stderr).unwrap();
@@ -436,7 +444,7 @@ fn a_misspelled_allow_list_stops_before_starting_the_provider() {
     let fixture = Fixture::new();
     let claude = stand_in(&fixture.isolation.dir("bin"));
     fixture.enable_plugin(Some(&claude));
-    let mut command = fixture.maki(MODEL, PROMPT, STREAM_FORMAT);
+    let mut command = fixture.maki(STREAM_FORMAT);
     command.args(["--allowed-tools", "raed"]);
     let output = finish(&mut command);
     let stderr = String::from_utf8(output.stderr).unwrap();

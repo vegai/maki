@@ -136,7 +136,7 @@ impl Stderr {
 }
 
 /// Stops the group and bounds cleanup before attaching stderr to an error.
-pub(in crate::providers::claude_code) async fn supervised<T>(
+pub(super) async fn supervised<T>(
     command: process::Command,
     work: impl AsyncFnOnce(&mut Group) -> Result<T, Error>,
 ) -> Result<T, Error> {
@@ -469,6 +469,7 @@ mod process_tests {
     use test_case::test_case;
 
     use super::{Error, SHUTDOWN_GRACE, supervised};
+    use crate::providers::claude_code::fake::SHELL;
 
     const PROCESS_ERROR: &str = "protocol failure";
     const PROCESS_STDERR: &str = "diagnostic stderr";
@@ -479,7 +480,7 @@ mod process_tests {
     #[test_case(true, false ; "requested_shutdown_has_no_status")]
     #[test_case(true, true ; "deadline_kill_has_no_status")]
     fn protocol_errors_keep_only_natural_process_status(shutdown: bool, deadline: bool) {
-        let mut command = Command::new("/bin/sh");
+        let mut command = Command::new(SHELL);
         command.args([
             "-c",
             if shutdown {
@@ -522,7 +523,7 @@ mod process_tests {
 
     #[test]
     fn an_interrupted_exit_reports_the_process_status_once() {
-        let mut command = Command::new("/bin/sh");
+        let mut command = Command::new(SHELL);
         command.args(["-c", FAIL_COMMAND]);
         let error = crate::test_support::runtime()
             .block_on(supervised::<()>(command, async |group| {
@@ -540,7 +541,7 @@ mod process_tests {
     #[test_case(false ; "sigkill")]
     #[test_case(true ; "sigterm")]
     fn errors_after_an_explicit_stop_omit_process_status(graceful: bool) {
-        let mut command = Command::new("/bin/sh");
+        let mut command = Command::new(SHELL);
         command.args(["-c", "printf 'ready\n'; read reply"]);
         let error = crate::test_support::runtime()
             .block_on(supervised::<()>(command, async |group| {

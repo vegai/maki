@@ -6,7 +6,7 @@
 pub mod environment;
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -27,6 +27,8 @@ use maki_providers::{
     StopReason, StreamResponse,
 };
 use maki_storage::id::{MakiId, SessionRef};
+#[cfg(unix)]
+use rustix::process::{Pid, test_kill_process_group};
 use serde_json::Value;
 use tempfile::TempDir;
 use tokio::sync::Mutex as AsyncMutex;
@@ -187,6 +189,23 @@ pub fn poll_until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
     got.unwrap()
 }
 
+/// Returns true if leader `pid`'s process group, including whatever the
+/// leader left behind, stopped within `limit`.
+#[cfg(unix)]
+pub fn group_gone(pid: i32, limit: Duration) -> bool {
+    let pid = Pid::from_raw(pid).expect("valid pid");
+    wait_until(limit, || test_kill_process_group(pid).is_err())
+}
+
+/// The pid a job's shell wrote to `path`. The shell creates the redirect
+/// target before printf writes to it, so this waits for a parseable pid, not
+/// for the file.
+pub fn read_pid(path: &Path) -> i32 {
+    poll_until("the job did not publish its process id", || {
+        fs::read_to_string(path).ok()?.parse().ok()
+    })
+}
+
 /// A one-block assistant reply that ends with `stop`.
 pub fn assistant_reply(block: ContentBlock, stop: StopReason) -> StreamResponse {
     StreamResponse {
@@ -200,8 +219,8 @@ pub fn assistant_reply(block: ContentBlock, stop: StopReason) -> StreamResponse 
     }
 }
 
-/// Holds a shell command until released, and lets it finish whatever happens
-/// to the test.
+/// Holds a shell command until released, or until the gate drops with the
+/// test, so the command finishes whatever happens to the test.
 pub struct Gate(TempDir);
 
 impl Gate {
@@ -229,12 +248,6 @@ impl Gate {
 
     fn file(&self) -> PathBuf {
         self.0.path().join(GATE_FILE)
-    }
-}
-
-impl Drop for Gate {
-    fn drop(&mut self) {
-        fs::write(self.file(), "").ok();
     }
 }
 
@@ -279,8 +292,13 @@ impl Provider for ParkedProvider {
     }
 
     fn list_models(&self, _: ModelListing) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { Ok(Vec::new()) })
+        no_models()
     }
+}
+
+/// A `list_models` for a stub provider that lists nothing.
+pub fn no_models<'a>() -> BoxFuture<'a, Result<Vec<ModelInfo>, AgentError>> {
+    Box::pin(async { Ok(Vec::new()) })
 }
 
 /// The texts of the user messages that close {messages}, oldest first.

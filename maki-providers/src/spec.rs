@@ -206,15 +206,6 @@ impl ProviderSpec {
         self.models_of.unwrap_or(self.slug)
     }
 
-    /// A source provider's table can contain models unavailable on this route. Leave
-    /// discovery to the route provider.
-    pub fn listed_rows(&self) -> &'static [ModelEntry] {
-        match self.models_of {
-            Some(_) => &[],
-            None => self.models(),
-        }
-    }
-
     pub const fn native(&self) -> Option<Native> {
         match self.build {
             Build::Native(native) => Some(native),

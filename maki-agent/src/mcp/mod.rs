@@ -103,6 +103,9 @@ pub(crate) fn same_tool_name(name: &str, candidate: &str) -> bool {
 pub fn is_wire_name(name: &str) -> bool {
     name.contains(WIRE_SEPARATOR)
 }
+
+/// Shaped like a qualified MCP tool name. A shape test only: a dotted name
+/// that no server publishes yet (or one that loads later) also counts.
 pub fn is_qualified_name(name: &str) -> bool {
     name.contains(SEPARATOR)
 }
@@ -1239,8 +1242,15 @@ pub mod test_support {
     use super::transport::{BoxFuture, McpTransport, PromptMessage};
     use super::{
         McpHandle, McpManagerInner, McpSession, McpSnapshot, McpToolDef, SEPARATOR, ServerEntry,
-        ToolIndex, publish,
+        ToolDeferral, ToolFilter, ToolIndex, publish,
     };
+
+    /// What `session` adds to an empty tool array under no filter.
+    pub fn extended(session: &McpSession, deferral: ToolDeferral) -> Value {
+        let mut tools = json!([]);
+        session.extend_tools(&mut tools, deferral, &ToolFilter::default());
+        tools
+    }
 
     /// Goes through the real `publish` path, so it cannot drift from how the
     /// index is built in production. Tools are named `server.tool`.
@@ -1406,9 +1416,7 @@ fn spawn_persist_enabled(path: PathBuf, name: String, enabled: bool) {
 
 #[cfg(unix)]
 pub fn kill_process_groups(pids: &[u32]) {
-    for &pid in pids {
-        kill_group(pid);
-    }
+    pids.iter().copied().for_each(kill_group);
 }
 
 #[cfg(not(unix))]
@@ -1429,6 +1437,7 @@ fn intern(name: String) -> Arc<str> {
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::extended;
     use super::*;
     use config::{RawHttpFields, RawServerConfig, RawStdioFields, RawTransport};
     use maki_providers::Role;
@@ -1555,8 +1564,6 @@ mod tests {
         }
     }
 
-    /// Build `inner`, publish it into fresh `ArcSwap`s, and return a live `McpSession` pointing
-    /// at the same state so tests can hit both the mutation and the read path.
     fn search(
         session: &McpSession,
         query: &str,
@@ -1568,12 +1575,8 @@ mod tests {
             .unwrap()
     }
 
-    fn extended(session: &McpSession, deferral: ToolDeferral) -> Value {
-        let mut tools = json!([]);
-        session.extend_tools(&mut tools, deferral, &ToolFilter::default());
-        tools
-    }
-
+    /// Build `inner`, publish it into fresh `ArcSwap`s, and return a live `McpSession` pointing
+    /// at the same state so tests can hit both the mutation and the read path.
     fn setup(entries: Vec<ServerEntry>) -> (McpManagerInner, McpSession) {
         setup_with_defer(entries, 0)
     }

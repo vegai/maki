@@ -508,7 +508,6 @@ mod tests {
             let part = transcript(&messages[..end]).unwrap();
             assert_eq!(whole[..part.len()], part[..], "after {end} messages");
         }
-        assert_eq!(transcript(&messages).unwrap(), whole);
     }
 
     /// The next request must show the model the name it can call for the

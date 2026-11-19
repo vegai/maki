@@ -203,7 +203,7 @@ pub(crate) fn fingerprint(context: &RunContext, mcp: Option<&McpSession>, model:
         .collect()
 }
 
-pub(crate) fn request_tools<'t>(
+pub(crate) fn wire_tools<'t>(
     tools: &'t RequestTools,
     mcp: Option<&McpSession>,
     deferral: ToolDeferral,
@@ -233,7 +233,7 @@ pub(crate) struct LiveFrame {
 
 impl LiveFrame {
     pub(crate) fn build(tools: RequestTools, mcp: Option<&McpSession>, model: &Model) -> Self {
-        let wire = request_tools(&tools, mcp, ToolDeferral::for_model(model)).into_owned();
+        let wire = wire_tools(&tools, mcp, ToolDeferral::for_model(model)).into_owned();
         Self {
             tools,
             wire: Arc::new(wire),
@@ -423,21 +423,18 @@ pub(crate) fn context_update(
 
 #[cfg(test)]
 mod tests {
-    use crate::tools::ToolAudience;
-    use crate::tools::ToolRegistry;
     use std::path::PathBuf;
 
+    use arc_swap::ArcSwap;
     use maki_providers::test_support::isolated_home;
+    use serde_json::json;
+    use test_case::test_case;
 
     use super::super::history::{HistorySnapshot, SharedMessages};
     use super::*;
     use crate::AgentConfig;
     use crate::mcp::test_support::stub_session;
-    use crate::tools::LocalTools;
-    use crate::tools::test_support::assembled_main;
-    use arc_swap::ArcSwap;
-    use serde_json::json;
-    use test_case::test_case;
+    use crate::tools::test_support::{assembled_main, assembled_with};
 
     const DATE: &str = "2026-10-02";
     const NEXT_DATE: &str = "2026-10-03";
@@ -573,16 +570,13 @@ mod tests {
         let initial = context("a", "");
         let context = RunContext::fixed(
             String::new(),
-            RequestTools::assembled(
-                ToolRegistry::global(),
-                initial.tools.definitions().clone(),
-                &LocalTools::default(),
+            assembled_with(
                 &AgentConfig {
                     disabled_tools: vec!["question".into()],
                     ..Default::default()
                 },
+                initial.tools.definitions().clone(),
                 &model,
-                ToolAudience::MAIN,
             ),
         );
         assert_eq!(
@@ -591,7 +585,7 @@ mod tests {
         );
     }
 
-    #[test_case(false, false ; "native_exclusions_are_already_in_definitions")]
+    #[test_case(false, false ; "external_exclusion_without_mcp_keeps_the_frame")]
     #[test_case(true, false ; "external_exclusions_change_the_frame")]
     #[test_case(true, true ; "external_allow_list_changes_the_frame")]
     fn changed_policy_rebuilds_a_restored_frame_with_the_same_base_tools(
@@ -627,17 +621,14 @@ mod tests {
         };
         let restricted = RunContext::fixed(
             String::new(),
-            RequestTools::assembled(
-                ToolRegistry::global(),
-                base_tools.clone(),
-                &LocalTools::default(),
+            assembled_with(
                 &AgentConfig {
                     allowed_tools,
                     disabled_tools,
                     ..Default::default()
                 },
+                base_tools.clone(),
                 &model,
-                ToolAudience::MAIN,
             ),
         );
         assert_eq!(restricted.tools.definitions(), &base_tools);

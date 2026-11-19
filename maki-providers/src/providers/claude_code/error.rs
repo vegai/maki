@@ -156,7 +156,9 @@ pub enum Error {
     },
     #[error("Claude Code printed an event exceeding the {limit}-byte limit")]
     EventTooLarge { limit: usize },
-    #[error("Claude Code printed a line that is not an event: {0}")]
+    #[error(
+        "Claude Code printed a line that is not an event: {0}, which is not an object with a type"
+    )]
     InvalidEvent(String),
     #[error("Claude Code did not resolve the requested model {0}")]
     UnresolvedModel(String),
@@ -229,6 +231,10 @@ pub enum Error {
     NotOffered(Value),
     #[error("a tool call without an id")]
     NoCallId,
+    #[error("Claude Code sent a tool call as a notification")]
+    CallNotification,
+    #[error("the model's call {0} is not the call its start showed")]
+    UnstartedCall(String),
     #[error("the model called {name} with {}, which is not an arguments object", shown(.input))]
     NotArguments { name: String, input: Value },
     #[error("Claude Code produced malformed JSON for the {0} tool call")]
@@ -381,9 +387,11 @@ impl Error {
                 let status = status.unwrap_or(SERVER_ERROR);
                 is_temporary_status(status).then_some((status, *delay))
             }
-            Self::NoCallsToRun | Self::StoppedFor(_) | Self::SecondGeneration | Self::Abandoned => {
-                Some((SERVER_ERROR, None))
-            }
+            Self::NoCallsToRun
+            | Self::StoppedFor(_)
+            | Self::MalformedArguments(_)
+            | Self::SecondGeneration
+            | Self::Abandoned => Some((SERVER_ERROR, None)),
             _ => None,
         }
     }
@@ -397,7 +405,6 @@ impl Error {
                 | Self::EventTooLarge { .. }
                 | Self::Io { .. }
                 | Self::ExitLate
-                | Self::MalformedArguments(_)
         );
         if accepted && interrupted {
             let mut failure = self.into_failure();
@@ -577,11 +584,11 @@ mod tests {
         assert_eq!(error.to_string(), EVENT_LIMIT_ERROR);
     }
 
-    #[test_case(true ; "after_init")]
-    #[test_case(false ; "before_init")]
-    fn malformed_tool_json_retries_only_after_init(accepted: bool) {
-        let error = Error::MalformedArguments(TOOL.into()).after_start(accepted);
-        assert_eq!(error.temporary().is_some(), accepted);
+    /// Only a generation that passed init has a call to parse.
+    #[test]
+    fn malformed_tool_json_retries() {
+        let error = Error::MalformedArguments(TOOL.into()).after_start(true);
+        assert!(error.temporary().is_some());
     }
 
     /// A huge value from Claude Code shows only its start, cut as its whole

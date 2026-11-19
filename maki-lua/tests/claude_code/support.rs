@@ -15,12 +15,12 @@ use maki_agent::tools::{ToolContext, ToolRegistry};
 use maki_agent::{CancelToken, CancelTrigger, ToolOutput};
 use maki_config::PluginsConfig;
 use maki_lua::PluginHost;
-use rustix::process::{Pid, geteuid, test_kill_process_group};
+use rustix::process::geteuid;
 use serde_json::{Map, Value};
 
 pub use maki_providers::claude_code::worker::MINIMUM_VERSION;
 
-pub use super::common::{Gate, environment, wait_until};
+pub use super::common::{Gate, environment, group_gone, wait_until};
 
 pub const DEPENDENCY_DIR: &str = "node_modules";
 pub const DEPENDENCY_FILE: &str = "node_modules/pkg/index.js";
@@ -32,43 +32,22 @@ pub const CONTROL_REPLY: &str = r#"reply() { printf '{"type":"control_response",
 pub const ACCOUNT_SUBSCRIPTION: &str = r#"{"current_permission_mode":"default","account":{"apiProvider":"firstParty","subscriptionType":"Claude Pro"},"models":[{"value":"sonnet","resolvedModel":"claude-sonnet-5"},{"value":"opus","resolvedModel":"claude-opus-5-5"},{"value":"haiku","resolvedModel":"claude-haiku-4-5-20251001"}]}"#;
 pub const HOOKS_OFF: &str =
     r#"{"hooks":[],"events":[],"policy":{"allDisabled":true,"policyHookCount":0}}"#;
-
-pub fn cancel_trigger(ctx: &mut ToolContext) -> CancelTrigger {
-    let (trigger, token) = CancelToken::new();
-    ctx.cancel = token;
-    trigger
-}
-
-pub fn cancel_after<T: Send + 'static>(
-    ctx: &mut ToolContext,
-    work: impl FnOnce() -> T + Send + 'static,
-) -> JoinHandle<T> {
-    let trigger = cancel_trigger(ctx);
-    thread::spawn(move || {
-        let result = work();
-        trigger.cancel();
-        result
-    })
-}
-
-pub fn backdate(path: &Path) {
-    File::open(path)
-        .unwrap()
-        .set_modified(SystemTime::now() - STALE_AGE)
-        .unwrap();
-}
-
-const SWEEP_LOCK: &str = ".sweep.lock";
-
+pub const SWEEP_LOCK: &str = ".sweep.lock";
 pub const TOOL: &str = "claude_code";
+pub const CODE_PROFILE: &str = "code";
 pub const WRITE_SRC: &str = include_str!("../../../plugins/write/init.lua");
 pub const BASH_SRC: &str = include_str!("../../../plugins/bash/init.lua");
+const PLUGIN_SRC: &str = include_str!("../../../plugins/claude_code/init.lua");
 /// The artifact folder where an import keeps the files it replaced.
 pub const ORIGINALS: &str = "originals";
+/// The artifact folder where an import moves each file it replaced.
+pub const DISPLACED: &str = "displaced";
 /// The artifact folder holding the worker's copy of the project.
 pub const SNAPSHOT_DIR: &str = "snapshot";
 /// An artifact's repository, next to its snapshot.
 pub const ARTIFACT_GIT: &str = "git";
+/// An artifact's temporary folder, the worker's `TMPDIR`.
+pub const ARTIFACT_TMP: &str = "tmp";
 /// The prefix of every temporary file an import writes.
 pub const IMPORT_TEMP: &str = ".maki-import-";
 pub const NOTHING_IMPORTED: &str = "maki imported no changes";
@@ -77,9 +56,14 @@ pub const IMPORT_TOOL: &str = "claude_code_import";
 pub const ARTIFACT_LINE: &str = "Changes in artifact ";
 pub const PROJECT_RULE: &str = "Run the linter before every commit.";
 pub const LEFT_BEHIND: &str = "maki did not remove: ";
-/// The file the command substitution in a hostile name creates if a shell
-/// runs it. It is absolute, so it shows wherever the command ran.
-pub const PWNED: &str = concat!(env!("CARGO_TARGET_TMPDIR"), "/pwned");
+/// What a test writes into the checkout over a file an import is about to
+/// replace.
+pub const NEWER_WORK: &str = "the user's newer work\n";
+/// The file the command substitution in a hostile name creates, in the
+/// test's own folder, if a shell runs it.
+pub const PWNED: &str = "pwned";
+pub const DEPENDENCY_CONTENT: &str = "module.exports = 1;\n";
+pub const EXECUTE_BITS: u32 = 0o111;
 pub const OWNER_ONLY: u32 = 0o700;
 /// How long a test waits for an event before it counts as hung. Only a hung
 /// test waits this long. CI runs 64 tests at once on 4 cores, where a single
@@ -109,11 +93,6 @@ const GLOBAL_INSTRUCTIONS: &str = "maki/AGENTS.md";
 /// avoid test labels so the model treats them as ordinary instructions.
 pub const FIXTURE_GLOBAL_RULE: &str = "Write the replies in English.";
 
-/// Runs `touch PWNED` when a shell expands it. `printf` writes each `/`,
-/// which a file name cannot hold.
-pub static TOUCH_PWNED: LazyLock<String> =
-    LazyLock::new(|| format!("$(touch $(printf '{}'))", PWNED.replace('/', "\\057")));
-
 /// Keep only the developer's Claude Code login. Fixture home and XDG directories isolate maki
 /// config and instruction files.
 static DEVELOPER_LOGIN: LazyLock<PathBuf> = LazyLock::new(|| {
@@ -139,6 +118,39 @@ static DEVELOPER_LOGIN: LazyLock<PathBuf> = LazyLock::new(|| {
     fs::rename(&staged, &global).unwrap();
     login
 });
+
+pub fn cancel_trigger(ctx: &mut ToolContext) -> CancelTrigger {
+    let (trigger, token) = CancelToken::new();
+    ctx.cancel = token;
+    trigger
+}
+
+pub fn cancel_after<T: Send + 'static>(
+    ctx: &mut ToolContext,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> JoinHandle<T> {
+    let trigger = cancel_trigger(ctx);
+    thread::spawn(move || {
+        let result = work();
+        trigger.cancel();
+        result
+    })
+}
+
+pub fn backdate(path: &Path) {
+    File::open(path)
+        .unwrap()
+        .set_modified(SystemTime::now() - STALE_AGE)
+        .unwrap();
+}
+
+/// Runs `touch pwned` when a shell expands it. `printf` writes each `/`,
+/// which a file name cannot hold. `pwned` is absolute, so the file shows
+/// wherever the command ran.
+pub fn touch_pwned(pwned: &Path) -> String {
+    let escaped = pwned.to_string_lossy().replace('/', "\\057");
+    format!("$(touch $(printf '{escaped}'))")
+}
 
 /// Moves the process's working directory into a test's directory, and back
 /// on drop.
@@ -242,6 +254,22 @@ pub fn executable(dir: &Path, name: &str, script: &str) -> PathBuf {
     path
 }
 
+/// Writes `script` to `dir`/`name` like [`executable`], with `@REAL@` as the
+/// installed `name`.
+pub fn wrap(dir: &Path, name: &str, script: &str) {
+    executable(
+        dir,
+        name,
+        &script.replace("@REAL@", &on_path(name).to_string_lossy()),
+    );
+}
+
+/// Puts `script`, wrapping the installed `name`, first on the `PATH`.
+pub fn hold(dir: &Path, name: &str, script: &str) {
+    wrap(dir, name, script);
+    environment::prepend_path(dir);
+}
+
 pub fn on_path(name: &str) -> PathBuf {
     env::split_paths(&env::var_os("PATH").unwrap())
         .map(|dir| dir.join(name))
@@ -290,13 +318,6 @@ pub fn contents(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         }
     }
     found
-}
-
-/// Returns true if leader `pid`'s process group, including whatever the
-/// leader left behind, stopped within `limit`.
-pub fn group_gone(pid: i32, limit: Duration) -> bool {
-    let pid = Pid::from_raw(pid).expect("valid pid");
-    wait_until(limit, || test_kill_process_group(pid).is_err())
 }
 
 /// A killed process stays a zombie until its new parent reaps it, and a
@@ -353,6 +374,17 @@ pub fn developer_login() -> &'static Path {
 /// Returns a host with the claude_code plugin loaded with `opts`.
 pub fn load(opts: Map<String, Value>) -> (Arc<ToolRegistry>, PluginHost) {
     try_load(opts).unwrap()
+}
+
+/// Returns a host with the claude_code plugin loaded with `opts`, after
+/// `prefix` ran in the plugin's environment.
+pub fn load_patched(prefix: &str, opts: Map<String, Value>) -> (Arc<ToolRegistry>, PluginHost) {
+    use_fixture_user();
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_bundled_source(TOOL, &format!("{prefix}\n{PLUGIN_SRC}"), opts)
+        .unwrap();
+    (reg, host)
 }
 
 /// Loads the plugin, or returns the error of an option it refuses.

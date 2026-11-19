@@ -172,12 +172,12 @@ pub fn now_epoch() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::permissions::PERMISSION_BITS;
+    use crate::permissions::PRIVATE_FILE_MODE;
 
     const ORIGINAL: &[u8] = b"original";
-    const OWNER_ONLY_FILE_MODE: u32 = 0o600;
     const REPLACEMENT: &[u8] = b"replacement";
-    #[cfg(unix)]
-    const FILE_MODE_MASK: u32 = 0o777;
 
     #[test]
     fn atomic_write_replaces_existing_file() {
@@ -196,7 +196,7 @@ mod tests {
         let path = dir.path().join("state");
         fs::write(&path, ORIGINAL).unwrap();
 
-        atomic_write_permissions(&path, REPLACEMENT, OWNER_ONLY_FILE_MODE).unwrap();
+        atomic_write_permissions(&path, REPLACEMENT, PRIVATE_FILE_MODE).unwrap();
 
         assert_eq!(fs::read(path).unwrap(), REPLACEMENT);
     }
@@ -210,8 +210,8 @@ mod tests {
         atomic_write(&path, ORIGINAL).unwrap();
 
         assert_eq!(
-            fs::metadata(path).unwrap().permissions().mode() & FILE_MODE_MASK,
-            OWNER_ONLY_FILE_MODE
+            fs::metadata(path).unwrap().permissions().mode() & PERMISSION_BITS,
+            PRIVATE_FILE_MODE
         );
     }
 
@@ -228,7 +228,7 @@ mod tests {
         atomic_write(&path, REPLACEMENT).unwrap();
 
         assert_eq!(
-            fs::metadata(path).unwrap().permissions().mode() & FILE_MODE_MASK,
+            fs::metadata(path).unwrap().permissions().mode() & PERMISSION_BITS,
             MODE
         );
     }

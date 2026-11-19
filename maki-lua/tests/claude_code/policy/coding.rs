@@ -7,8 +7,7 @@ use std::iter;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::thread;
 
 use maki_agent::permissions::{PermissionAnswer, PermissionManager, TaggedAnswer};
@@ -24,17 +23,19 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc::unbounded_channel;
 
 use super::super::support::{
-    ARTIFACT_GIT, ARTIFACT_LINE, ARTIFACT_MARKER, BASH_SRC, DEADLINE, DEPENDENCY_DIR,
-    DEPENDENCY_FILE, DEPENDENCY_UNSETTLED, IMPORT_TEMP, IMPORT_TOOL, LEFT_BEHIND, MANIFEST,
-    NOTHING_IMPORTED, ORIGINALS, PWNED, SNAPSHOT_DIR, TOOL, WRITE_SRC, artifact_id,
-    artifact_listing, backdate, cancel_after, commit_all, contents, environment, executable, git,
-    listing, load, mode_bits_hold, old_folder, on_path, reply, try_load, wait_until, write,
+    ARTIFACT_GIT, ARTIFACT_LINE, ARTIFACT_MARKER, ARTIFACT_TMP, BASH_SRC, CODE_PROFILE, DEADLINE,
+    DEPENDENCY_CONTENT, DEPENDENCY_DIR, DEPENDENCY_FILE, DEPENDENCY_UNSETTLED, DISPLACED,
+    EXECUTE_BITS, Gate, IMPORT_TEMP, IMPORT_TOOL, LEFT_BEHIND, MANIFEST, NEWER_WORK,
+    NOTHING_IMPORTED, ORIGINALS, PWNED, SNAPSHOT_DIR, SWEEP_LOCK, TOOL, WRITE_SRC, artifact_id,
+    artifact_listing, backdate, cancel_after, commit_all, contents, environment, git, hold,
+    listing, load, load_patched, mode_bits_hold, old_folder, output, reply, touch_pwned, try_load,
+    wait_until, write,
 };
 use super::{
-    ANSWERS, CODE_CLAUDE_CONFIG, CODE_EDIT, CODE_HANG, CODE_HOSTILE, CODE_LONG, CODE_PROFILE,
-    CODE_RETYPE, FakeClaude, HOOK_SENTINEL, HOOKS_FILE, HOOKS_OFF, HOSTILE_NAME, MODEL_ALIAS,
-    NO_ANSWER_IN_TIME, STOPPED_EXIT, WORKING, add_a_managed_hook, code_with, denied_reads,
-    sandbox_filesystem, session_ctx,
+    ANSWERS, CODE_CLAUDE_CONFIG, CODE_EDIT, CODE_HANG, CODE_HOSTILE, CODE_LONG, CODE_RETYPE,
+    CUSTOM_DENIED, FakeClaude, HANG_SECS, HOOK_SENTINEL, HOOKS_FILE, HOOKS_OFF, NO_ANSWER_IN_TIME,
+    STOPPED_EXIT, WORKING, add_a_managed_hook, call, code_with, denied_reads, sandbox_filesystem,
+    session_ctx,
 };
 
 const LARGE_IMPORT_CHANGES: usize = 1024;
@@ -88,9 +89,6 @@ const DEPENDENCIES_WITH_A_VENV: &str = "node_modules,.venv";
 /// the live checkout, then edit a file.
 const CODE_REDIRECT: &str = "code_redirect";
 const DEPENDENCY_SECRET: &str = "node_modules/.env";
-/// The test writes this into the checkout while an import waits for
-/// approval.
-const NEWER_WORK: &str = "the user's newer work\n";
 const DEPENDENCY_DENIED: &str = "node_modules/pkg/private.key";
 const BASE_LIB: &str = "base\n";
 const DIRTY_LIB: &str = "base\ndirty\n";
@@ -105,7 +103,6 @@ const DELETION_IMPORTED: &str = "src/old.rs: imported before";
 const OUTSIDE_COPY: &str = "copy";
 const WORKER_NEW: &str = "fresh\n";
 const NEWER_LIB: &str = "newer\n";
-const DEPENDENCY_CONTENT: &str = "module.exports = 1;\n";
 const EXPRESSION_NAMED_DIR: &str = "-print";
 const EXPRESSION_NAMED_DEPENDENCY: &str = "-print/index.js";
 const UNICODE_DEPENDENCY_DIR: &str = "d\u{e9}ps";
@@ -120,7 +117,6 @@ const REPORTED_CHANGES: [&str; 5] = [
     "A run.sh",
 ];
 const BINARY_BYTES: [u8; 2] = [0, 1];
-const EXECUTABLE_BITS: u32 = 0o111;
 const ALREADY_IMPORTED: &str = "src/lib.rs: imported before";
 /// What both checks say about a changed file, before and after approval.
 const CHANGED_IN_CHECKOUT: &str = "changed in the checkout after the snapshot";
@@ -144,9 +140,6 @@ const UNRECORDED: &str = "maki could not record this in the artifact";
 const EXECUTABLE_MODE: u32 = 0o755;
 const PREPARE_FAILED: &str = "the prepare command stopped with an error";
 const GIT_ENV_RESET: &str = "unset GIT_";
-/// Longer than `DEADLINE`, so a stop that fails makes the test fail while it
-/// waits.
-const PREPARE_NEVER_ENDS: &str = "sleep 240";
 const PREPARE_LOCKS_DIRECTORIES: &str =
     "mkdir -p locked/nested; touch locked/nested/file; chmod a-rwx locked/nested locked;";
 const LOCKED_SNAPSHOT_FILE: &str = "locked/nested/file";
@@ -235,20 +228,53 @@ maki.api.register_tool({
 })
 "#;
 const FAILED_AFTER_WRITES: &str = "killed after its last write";
-/// Set for every test process and never passed to Claude Code.
 const HOLD_IMPORT: &str = r#"
 local jobstart = maki.fn.jobstart
 maki.fn.jobstart = function(command, opts)
-  return jobstart([==[xargs() { if [ "$1" = -0 ] && [ "$2" = ln ]; then touch '@HELD@'; : > '@PIPE@'; fi; command xargs "$@"; }
+  return jobstart([==[xargs() { if [ "$1" = -0 ] && [ "$2" = ln ]; then touch '@HELD@'; @WAIT@; fi; command xargs "$@"; }
 ]==] .. command, opts)
 end
 "#;
 const IMPORT_HELD: &str = "import-held";
-const IMPORT_RELEASE: &str = "import-release";
+/// Set for every test process and never passed to Claude Code.
 const USER_ONLY_VARIABLE: &str = "CARGO_MANIFEST_DIR";
 const PREPARED_ENV: &str = "prepared_env.txt";
 const PREPARED_TMP: &str = "prepared_tmp.txt";
 const APPLY_MANUALLY: &str = "Apply it manually";
+/// The checkout's lock, in its git directory, which every import holds.
+const CHECKOUT_LOCK: &str = ".git/maki-import.lock";
+/// A name that survives only with proper shell quoting: a quote, a command
+/// substitution, a space, a glob and a newline.
+const HOSTILE_NAME: &str = "src/it's @TOUCH_PWNED@ *\nnew.rs";
+/// Makes the first `maki.fs.@FN@` call do its work, write `@STARTED@`, and
+/// wait until `@HELD_WHILE@` is gone before it returns.
+const HOLD_FS: &str = r#"
+local held = maki.fs.@FN@
+local waited = false
+maki.fs.@FN@ = function(...)
+  local result = table.pack(held(...))
+  if not waited then
+    waited = true
+    assert(maki.fs.write(@STARTED@, ""))
+    while maki.fs.metadata(@HELD_WHILE@) do
+      maki.async.sleep(@POLL_MS@)
+    end
+  end
+  return table.unpack(result, 1, result.n)
+end
+"#;
+const HOLD_POLL_MS: u64 = 20;
+/// The fake's file naming the file `CODE_HOSTILE` adds.
+const HOSTILE_NAME_FILE: &str = "hostile_name";
+const LINKED_ARTIFACTS: &str = "linked-artifacts";
+const FIND_FAILING: &str = "#!/bin/sh\nprintf '%s\\n' '@CAUSE@' >&2\nexit 1\n";
+const COUNTED_REALPATH: &str = "#!/bin/sh\necho call >> '@LOG@'\nexec '@REAL@' \"$@\"\n";
+/// A link the worker makes in `code_edit_link`.
+const CREATED_LINK: &str = "created_link";
+const STARTED: &str = "started";
+/// Longer than `DEADLINE`, so a stop that fails makes the test fail while it
+/// waits.
+static PREPARE_NEVER_ENDS: LazyLock<String> = LazyLock::new(|| format!("sleep {HANG_SECS}"));
 
 fn coding_repo(project: &Path, object_format: &str) {
     fs::remove_dir(project.join(".git")).unwrap();
@@ -354,6 +380,27 @@ impl Coding {
         session_ctx(reg, &self.project())
     }
 
+    /// A session context whose permission manager asks before an import.
+    fn approval_ctx(&self, reg: &Arc<ToolRegistry>) -> ToolContext {
+        let project = self.project();
+        let mut ctx = self.ctx(reg);
+        ctx.permissions = Arc::new(PermissionManager::new(
+            PermissionsConfig::default(),
+            project.clone(),
+            ProjectConfig::discover(&project),
+            Arc::default(),
+        ));
+        ctx
+    }
+
+    /// Whether the worker found `path` in its snapshot when it started.
+    fn in_snapshot(&self, path: &str) -> bool {
+        self.fake
+            .log("snapshot_listing")
+            .lines()
+            .any(|line| line.strip_prefix("./") == Some(path))
+    }
+
     fn code(
         &self,
         reg: &Arc<ToolRegistry>,
@@ -405,14 +452,7 @@ impl Coding {
         answer: PermissionAnswer,
         meanwhile: impl FnOnce() + Send + 'static,
     ) -> Result<String, String> {
-        let project = self.project();
-        let mut ctx = self.ctx(reg);
-        ctx.permissions = Arc::new(PermissionManager::new(
-            PermissionsConfig::default(),
-            project.clone(),
-            ProjectConfig::discover(&project),
-            Arc::default(),
-        ));
+        let mut ctx = self.approval_ctx(reg);
         let (event_tx, mut events) = unbounded_channel();
         let (answer_tx, answers) = unbounded_channel();
         ctx.event_tx = EventSender::new(event_tx, 0);
@@ -552,30 +592,38 @@ fn sparse_checkout_omissions_stay_out_of_the_snapshot() {
     assert_eq!(coding.read(IMPORTED_LIB), WORKER_LIB);
 }
 
-#[test_case(".env/prod" ; "an_env_directory")]
-#[test_case(".ENV/prod" ; "an_uppercase_env_directory")]
-#[test_case("Secrets/key" ; "a_casefolded_secret_directory")]
-#[test_case("deep/.env/prod" ; "a_nested_env_directory")]
-#[test_case(".maki/init.lua" ; "maki_configuration")]
-#[test_case("deep/.MaKi/permissions.toml" ; "casefolded_maki_configuration")]
-#[test_case(".Claude/settings.json" ; "casefolded_claude_configuration")]
-fn protected_directory_contents_never_enter_the_snapshot(path: &str) {
+/// Every call here also denies `CUSTOM_DENIED` through the `deny_read`
+/// option, which none of the default rules cover.
+#[test_case(".env/prod", true ; "an_env_directory")]
+#[test_case(".ENV/prod", true ; "an_uppercase_env_directory")]
+#[test_case("Secrets/key", true ; "a_casefolded_secret_directory")]
+#[test_case("deep/.env/prod", true ; "a_nested_env_directory")]
+#[test_case(".maki/init.lua", true ; "maki_configuration")]
+#[test_case("deep/.MaKi/permissions.toml", true ; "casefolded_maki_configuration")]
+#[test_case(".Claude/settings.json", true ; "casefolded_claude_configuration")]
+#[test_case(CUSTOM_DENIED, true ; "a_custom_denied_file")]
+#[test_case("nested/.env.local/prod", false ; "nested_env_directory")]
+#[test_case("secrets", false ; "root_secrets_file")]
+#[test_case("nested/secrets", false ; "nested_secrets_file")]
+fn denied_paths_never_enter_the_snapshot(path: &str, commit: bool) {
     let coding = Coding::new();
     let project = coding.project();
-    if project.join(".env").is_file() && path.starts_with(".env/") {
-        fs::remove_file(project.join(".env")).unwrap();
-    }
+    fs::remove_file(project.join(".env")).unwrap();
+    fs::remove_dir_all(project.join("secrets")).unwrap();
     write(&project.join(path), DENIED_CONTENT);
-    git(&project, &["add", "-f", path]);
-    git(&project, &["commit", "-qm", "protected"]);
-    let (reg, _host) = coding.host(&[]);
+    git(&project, &["add", "-A", "-f"]);
+    if commit {
+        git(&project, &["commit", "-qm", "protected"]);
+    }
+    let (reg, _host) = coding.host(&[("deny_read", json!(CUSTOM_DENIED))]);
     let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
-    let id = artifact_id(&reply);
-    assert!(!coding.snapshot(&id).join(path).exists());
+    assert!(!coding.in_snapshot(path), "{path} entered the snapshot");
+    assert!(!coding.snapshot(&artifact_id(&reply)).join(path).exists());
+    assert_eq!(coding.read(path), DENIED_CONTENT);
 }
 
-/// The checkout's files, and what git keeps of it: its status, its commit
-/// and its index.
+/// The checkout's files, and what git keeps of it: its status, its commit,
+/// its index, its refs and its object store.
 #[test]
 fn a_coding_run_changes_a_snapshot_and_never_the_checkout() {
     let include = &[UNTRACKED_INPUT];
@@ -589,6 +637,8 @@ fn a_coding_run_changes_a_snapshot_and_never_the_checkout() {
             ),
             git(&project, &["rev-parse", "HEAD"]),
             git(&project, &["hash-object", ".git/index"]),
+            git(&project, &["for-each-ref"]),
+            git(&project, &["count-objects", "-v"]),
         ];
         (contents(&project), git_state)
     };
@@ -599,24 +649,22 @@ fn a_coding_run_changes_a_snapshot_and_never_the_checkout() {
     for change in REPORTED_CHANGES {
         assert!(reply.contains(change), "{change} missing from: {reply}");
     }
-    let listing = coding.fake.log("snapshot_listing");
-    let listed = |path: &str| listing.lines().any(|line| line == path);
-    for taken in ["./src/lib.rs", "./src/inner", "./fixtures/in.json"] {
+    for taken in [IMPORTED_LIB, "src/inner", "fixtures/in.json"] {
         assert!(
-            listed(taken),
-            "{taken} missing from the snapshot:\n{listing}"
+            coding.in_snapshot(taken),
+            "{taken} missing from the snapshot"
         );
     }
     for left_out in [
-        "./.env",
-        "./secrets",
-        "./.claude",
-        "./docs/.claude",
-        "./notes.txt",
-        "./out",
+        ".env",
+        "secrets",
+        ".claude",
+        "docs/.claude",
+        "notes.txt",
+        "out",
     ] {
         assert!(
-            !listed(left_out),
+            !coding.in_snapshot(left_out),
             "{left_out} must stay out of the snapshot"
         );
     }
@@ -662,7 +710,7 @@ fn a_coding_run_changes_a_snapshot_and_never_the_checkout() {
         json!([artifact.join(ARTIFACT_GIT)]),
         "of the paths that the sandbox does not show, the worker must read only its git directory"
     );
-    let temp = artifact.join("tmp");
+    let temp = artifact.join(ARTIFACT_TMP);
     assert_eq!(filesystem["allowWrite"], json!([temp]));
     let child_env = coding.fake.log("env");
     assert!(
@@ -850,8 +898,8 @@ fn an_import_lands_what_the_artifact_recorded(object_format: &str) {
         .permissions()
         .mode();
     assert_eq!(
-        mode & EXECUTABLE_BITS,
-        EXECUTABLE_BITS,
+        mode & EXECUTE_BITS,
+        EXECUTE_BITS,
         "the executable bit is missing"
     );
 
@@ -913,13 +961,7 @@ fn an_import_refuses_symlink_targets_before_approval(dangling: bool) {
         fs::remove_file(&saved).unwrap();
     }
     symlink(&saved, &target).unwrap();
-    let mut ctx = coding.ctx(&reg);
-    ctx.permissions = Arc::new(PermissionManager::new(
-        PermissionsConfig::default(),
-        project.clone(),
-        ProjectConfig::discover(&project),
-        Arc::default(),
-    ));
+    let mut ctx = coding.approval_ctx(&reg);
     let (events_tx, mut events) = unbounded_channel();
     ctx.event_tx = EventSender::new(events_tx, 0);
     let error = reply(
@@ -1085,7 +1127,7 @@ fn a_partial_import_reports_originals_for_an_unfinished_replacement() {
         .unwrap_err();
     assert!(coding.project().join("logo.bin").is_file());
     assert!(!coding.project().join(IMPORTED_LIB).exists());
-    for directory in [ORIGINALS, "displaced"] {
+    for directory in [ORIGINALS, DISPLACED] {
         let preserved = coding.artifact(&id).join(directory);
         assert!(error.contains(preserved.to_str().unwrap()), "{error}");
         assert!(listing(&preserved).iter().any(|attempt| {
@@ -1257,16 +1299,10 @@ fn a_denied_import_passes_on_the_guidance_and_not_its_command() {
 fn a_cancelled_import_leaves_the_checkout_as_it_was() {
     let coding = Coding::new();
     let held = coding.artifacts.path().join(IMPORT_HELD);
-    let pipe = coding.artifacts.path().join(IMPORT_RELEASE);
-    let output = Command::new("mkfifo").arg(&pipe).output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let gate = Gate::closed();
     let prefix = HOLD_IMPORT
         .replace("@HELD@", held.to_str().unwrap())
-        .replace("@PIPE@", pipe.to_str().unwrap());
+        .replace("@WAIT@", &gate.wait());
     let (reg, _host) = coding.host_with(&[], &(prefix + BASH_SRC));
     let id = artifact_id(&coding.code(&reg, CODE_EDIT, &[]).unwrap());
     let project = coding.project();
@@ -1318,11 +1354,16 @@ fn a_cancelled_import_leaves_the_checkout_as_it_was() {
     );
     let cancelled = result.unwrap_err();
     assert!(cancelled.contains(CANCELLED), "{cancelled}");
-    let lock = File::open(coding.artifact(&id).join(IMPORT_LOCK)).unwrap();
-    assert!(
-        wait_until(DEADLINE, || lock.try_lock().is_ok()),
-        "import cleanup did not release its lock"
-    );
+    for lock in [
+        coding.artifact(&id).join(IMPORT_LOCK),
+        project.join(CHECKOUT_LOCK),
+    ] {
+        let file = File::open(&lock).unwrap();
+        assert!(
+            wait_until(DEADLINE, || file.try_lock().is_ok()),
+            "import cleanup did not release {lock:?}"
+        );
+    }
     assert_eq!(contents(&project), before);
     assert!(temp_files(&project).is_empty());
 }
@@ -1339,7 +1380,11 @@ fn a_cancel_while_the_snapshot_is_made_discards_it(locked: bool) {
     } else {
         ""
     };
-    let prepare = format!("{setup} touch '{}'; {PREPARE_NEVER_ENDS}", marker.display());
+    let prepare = format!(
+        "{setup} touch '{}'; {}",
+        marker.display(),
+        *PREPARE_NEVER_ENDS
+    );
     let (reg, _host) = coding.host(&[("prepare", json!(prepare))]);
     let mut ctx = coding.ctx(&reg);
     let canceller = cancel_after(&mut ctx, move || wait_until(DEADLINE, || marker.exists()));
@@ -1364,12 +1409,11 @@ fn a_failed_dependency_scan_stops_the_worker() {
     let coding = Coding::new();
     write(&coding.project().join("deps/file"), BASE_LIB);
     let tools = tempdir().unwrap();
-    executable(
+    hold(
         tools.path(),
         "find",
-        &format!("#!/bin/sh\nprintf '%s\\n' '{SCAN_FAILURE}' >&2\nexit 1\n"),
+        &FIND_FAILING.replace("@CAUSE@", SCAN_FAILURE),
     );
-    environment::prepend_path(tools.path());
     let (reg, _host) = coding.host(&[("dependencies", json!("deps"))]);
     let error = coding.code(&reg, CODE_EDIT, &[]).unwrap_err();
     assert!(
@@ -1384,20 +1428,16 @@ fn a_cancel_during_sanitization_discards_the_idle_artifact() {
     let coding = Coding::new();
     let started = tempdir().unwrap();
     let marker = started.path().join(SANITIZE_STARTED);
-    let (reg, host) = coding.host(&[]);
-    let source = format!(
+    let prefix = format!(
         r#"local native = require("maki.claude_code.internal")
         local pending
         native.sanitize_git = function()
             assert(maki.fs.write({marker}, ""))
             maki.async.await(1, function(done) pending = done end)
-        end
-        {plugin}"#,
+        end"#,
         marker = json!(marker),
-        plugin = include_str!("../../../../plugins/claude_code/init.lua"),
     );
-    host.load_bundled_source(TOOL, &source, coding.opts(&[]))
-        .unwrap();
+    let (reg, _host) = load_patched(&prefix, coding.opts(&[]));
     let mut ctx = coding.ctx(&reg);
     let canceller = cancel_after(&mut ctx, move || wait_until(DEADLINE, || marker.exists()));
     let result = code_with(&reg, &ctx, CODE_EDIT, &[]);
@@ -1408,6 +1448,85 @@ fn a_cancel_during_sanitization_discards_the_idle_artifact() {
         wait_until(DEADLINE, || artifact_listing(coding.artifacts.path())
             .is_empty()),
         "cancelled artifact remains"
+    );
+}
+
+/// Holds the first `maki.fs.{function}` call of a coding call, cancels the
+/// call there, runs `while_held`, and releases the hold by removing its
+/// folder, which a panic removes too. Returns the call's error and the host,
+/// which must outlive the work the hold delayed.
+fn cancel_while_held(
+    coding: &Coding,
+    function: &str,
+    while_held: impl FnOnce(),
+) -> (String, PluginHost) {
+    let hold = tempdir().unwrap();
+    let started = hold.path().join(STARTED);
+    let prefix = HOLD_FS
+        .replace("@FN@", function)
+        .replace("@STARTED@", &json!(started).to_string())
+        .replace("@HELD_WHILE@", &json!(hold.path()).to_string())
+        .replace("@POLL_MS@", &HOLD_POLL_MS.to_string());
+    let (reg, host) = load_patched(&prefix, coding.opts(&[]));
+    let mut ctx = coding.ctx(&reg);
+    let canceller = cancel_after(&mut ctx, move || wait_until(DEADLINE, || started.exists()));
+    let result = code_with(&reg, &ctx, CODE_EDIT, &[]);
+    assert!(canceller.join().unwrap(), "{function} was not called");
+    while_held();
+    drop(hold);
+    (result.unwrap_err(), host)
+}
+
+/// The artifact belongs to the call from the moment its folder exists, so a
+/// cancel during the allocation removes it.
+#[test]
+fn a_cancel_during_the_allocation_discards_the_artifact() {
+    let coding = Coding::new();
+    let (error, _host) = cancel_while_held(&coding, "mkdtemp", || {});
+    assert!(error.contains(CANCELLED), "{error}");
+    assert!(
+        wait_until(DEADLINE, || artifact_listing(coding.artifacts.path())
+            .is_empty()),
+        "these files stay: {:?}",
+        listing(coding.artifacts.path())
+    );
+}
+
+/// The sweep finishes after a cancel of the call that started it, and lets
+/// go of its lock, so later calls can sweep.
+#[test]
+fn a_cancel_during_the_sweep_releases_the_sweep_lock() {
+    let coding = Coding::new();
+    let lock = coding.artifacts.path().join(SWEEP_LOCK);
+    let (error, _host) = cancel_while_held(&coding, "dir", || {
+        let held = File::open(&lock).unwrap().try_lock().is_err();
+        assert!(held, "the sweep did not hold its lock");
+    });
+    assert!(error.contains(CANCELLED), "{error}");
+    let file = File::open(&lock).unwrap();
+    assert!(
+        wait_until(DEADLINE, || file.try_lock().is_ok()),
+        "the sweep kept its lock"
+    );
+}
+
+/// The import resolves a linked `artifact_dir` as the run did, so the
+/// command and the reply name the artifact's real folders.
+#[test]
+fn an_import_through_a_linked_artifact_dir_uses_its_target() {
+    let coding = Coding::new();
+    let links = tempdir().unwrap();
+    let linked = links.path().join(LINKED_ARTIFACTS);
+    symlink(coding.artifacts.path(), &linked).unwrap();
+    let (reg, _host) = coding.host(&[("artifact_dir", json!(linked))]);
+    let id = artifact_id(&coding.code(&reg, CODE_EDIT, &[]).unwrap());
+
+    let reply = coding.import(&reg, json!({ "id": id })).unwrap();
+    assert_eq!(coding.read(IMPORTED_LIB), WORKER_LIB);
+    let originals = coding.artifact(&id).canonicalize().unwrap().join(ORIGINALS);
+    assert!(
+        reply.contains(&format!("{ORIGINALS_KEPT} {}", originals.display())),
+        "{reply}"
     );
 }
 
@@ -1427,9 +1546,8 @@ fn a_refused_coding_call_keeps_what_a_policy_hook_wrote() {
         .lines()
         .map(PathBuf::from)
         .collect();
-    let next = json!({ "prompt": ANSWERS, "model": MODEL_ALIAS });
     coding.fake.write(HOOKS_FILE, HOOKS_OFF);
-    reply(&reg, &coding.ctx(&reg), TOOL, next).unwrap();
+    output(call(&reg, &coding.ctx(&reg), ANSWERS)).unwrap();
 
     let kept = ran_in.iter().all(|dir| dir.join(HOOK_SENTINEL).exists());
     for dir in coding.fake.log("hook_ran_in").lines().map(Path::new) {
@@ -1478,8 +1596,7 @@ fn a_cancel_during_the_run_keeps_the_workers_snapshot(prompt: &str) {
     let err = code_with(&reg, &ctx, prompt, &[]).unwrap_err();
     assert!(canceller.join().unwrap(), "the worker did not start");
     assert!(err.contains(SNAPSHOT_STAYS), "got: {err}");
-    let next = json!({ "prompt": ANSWERS, "model": MODEL_ALIAS });
-    reply(&reg, &coding.ctx(&reg), TOOL, next).unwrap();
+    output(call(&reg, &coding.ctx(&reg), ANSWERS)).unwrap();
     let kept = artifact_listing(coding.artifacts.path());
     let [artifact] = kept.as_slice() else {
         panic!("kept {kept:?}");
@@ -1567,8 +1684,8 @@ fn an_import_refuses_a_file_made_executable_during_approval() {
     assert_eq!(fs::read_to_string(&target).unwrap(), DIRTY_LIB);
     let mode = fs::metadata(&target).unwrap().permissions().mode();
     assert_eq!(
-        mode & EXECUTABLE_BITS,
-        EXECUTABLE_BITS,
+        mode & EXECUTE_BITS,
+        EXECUTE_BITS,
         "the import changed the mode back"
     );
 }
@@ -1626,19 +1743,29 @@ fn an_unsafe_link_prepare_makes_is_dropped() {
     );
 }
 
-#[test_case("created_link", "A" ; "a_new_external_link")]
+/// The import leaves a link change to the user and changes nothing.
+#[test_case(CREATED_LINK, "A" ; "a_new_external_link")]
 #[test_case("src/inner", "M" ; "a_retargeted_tracked_link")]
 fn collection_preserves_worker_links_for_manual_application(path: &str, status: &str) {
     const SCENARIO: &str = "code_edit_link";
     let coding = Coding::new();
+    let project = coding.project();
     let (reg, _host) = coding.host(&[]);
     let reply = coding.code(&reg, SCENARIO, &[]).unwrap();
-    let snapshot = coding.snapshot(&artifact_id(&reply));
+    let id = artifact_id(&reply);
     assert_eq!(
-        fs::read_link(snapshot.join(path)).unwrap(),
+        fs::read_link(coding.snapshot(&id).join(path)).unwrap(),
         Path::new(OUTSIDE_TARGET)
     );
     assert!(reply.contains(&format!("{status} {path}")), "{reply}");
+
+    let before = contents(&project);
+    let imported = coding
+        .import(&reg, json!({ "id": id, "paths": [path] }))
+        .unwrap();
+    assert!(imported.contains(APPLY_MANUALLY), "{imported}");
+    assert_eq!(contents(&project), before);
+    assert!(fs::symlink_metadata(project.join(CREATED_LINK)).is_err());
 }
 
 #[test]
@@ -1668,18 +1795,12 @@ fn escaping_links_are_removed_without_shell_resolution() {
     const LINK_COUNT: usize = 256;
     let coding = Coding::new();
     let tools = tempdir().unwrap();
-    let realpath = on_path("realpath");
     let log = tools.path().join("realpath_calls");
-    executable(
+    hold(
         tools.path(),
         "realpath",
-        &format!(
-            "#!/bin/sh\necho call >> '{}'\nexec '{}' \"$@\"\n",
-            log.display(),
-            realpath.display()
-        ),
+        &COUNTED_REALPATH.replace("@LOG@", &log.to_string_lossy()),
     );
-    environment::prepend_path(tools.path());
     let prepare = format!(
         "i=0; while [ \"$i\" -lt {LINK_COUNT} ]; do ln -s lib.rs src/link_$i; i=$((i + 1)); done; ln -s {OUTSIDE_TARGET} {PREPARED_LINK}"
     );
@@ -1718,22 +1839,6 @@ fn ambiguous_import_paths_are_refused_and_unique_display_names_still_work() {
     assert_eq!(coding.read(NEWLINE_PATH), "newline\n");
 }
 
-#[test_case("nested/.env.local/prod" ; "nested_env_directory")]
-#[test_case("secrets" ; "root_secrets_file")]
-#[test_case("nested/secrets" ; "nested_secrets_file")]
-fn denied_files_and_directories_stay_out_of_the_snapshot(path: &str) {
-    let coding = Coding::new();
-    let project = coding.project();
-    fs::remove_file(project.join(".env")).unwrap();
-    fs::remove_dir_all(project.join("secrets")).unwrap();
-    write(&project.join(path), DENIED_CONTENT);
-    git(&project, &["add", "-A"]);
-    let (reg, _host) = coding.host(&[]);
-    let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
-    assert!(!coding.snapshot(&artifact_id(&reply)).join(path).exists());
-    assert_eq!(coding.read(path), DENIED_CONTENT);
-}
-
 #[test_case(false ; "external_inode")]
 #[test_case(true ; "snapshot_inode")]
 fn prepared_hard_links_become_private_copies_before_the_worker_starts(internal: bool) {
@@ -1758,7 +1863,7 @@ fn prepared_hard_links_become_private_copies_before_the_worker_starts(internal: 
         fs::read_to_string(snapshot.join(IMPORTED_LIB)).unwrap(),
         WORKER_LIB
     );
-    assert!(coding.fake.log("snapshot_listing").contains(PREPARED_LINK));
+    assert!(coding.in_snapshot(PREPARED_LINK));
     assert!(reply.contains(PRIVATE_COPIES), "{reply}");
     fs::write(copied, TAMPERED).unwrap();
     assert_eq!(
@@ -1821,7 +1926,7 @@ fn prepare_runs_with_the_users_environment() {
     let snapshot = coding.snapshot(&id);
     assert_eq!(
         fs::read_to_string(snapshot.join(PREPARED_TMP)).unwrap(),
-        coding.artifact(&id).join("tmp").to_string_lossy()
+        coding.artifact(&id).join(ARTIFACT_TMP).to_string_lossy()
     );
 
     let seen = fs::read_to_string(snapshot.join(PREPARED_ENV)).unwrap();
@@ -1875,7 +1980,7 @@ fn prepare_git_commands_use_the_snapshot(variable: &str, git_directory: bool) {
 #[test_case("", PREPARE_LIMIT_SECS, None ; "that_succeeds")]
 #[test_case("echo broken >&2; exit 7", PREPARE_LIMIT_SECS, Some("exited with code 7:\nbroken") ; "that_fails")]
 #[test_case(EXITS_AS_A_TIMEOUT_WOULD, PREPARE_LIMIT_SECS, Some(EXITED_WITH_124) ; "that_exits_as_a_timeout_would")]
-#[test_case(PREPARE_NEVER_ENDS, PREPARE_TIMEOUT_SECS, Some(NO_ANSWER_IN_TIME) ; "that_times_out")]
+#[test_case(&PREPARE_NEVER_ENDS, PREPARE_TIMEOUT_SECS, Some(NO_ANSWER_IN_TIME) ; "that_times_out")]
 fn what_prepare_did_reaches_the_worker_and_the_reply(
     then: &str,
     limit_secs: u64,
@@ -1961,12 +2066,7 @@ fn dependency_exclusions_do_not_depend_on_copying(prepared: bool) {
     };
     let reply = coding.code(&reg, CODE_EDIT, included).unwrap();
 
-    assert!(
-        coding
-            .fake
-            .log("snapshot_listing")
-            .contains(DEPENDENCY_FILE)
-    );
+    assert!(coding.in_snapshot(DEPENDENCY_FILE));
     assert!(!reply.contains(&format!("M {DEPENDENCY_FILE}")), "{reply}");
     assert!(!reply.contains(&format!("A {DEPENDENCY_FILE}")), "{reply}");
 }
@@ -1988,13 +2088,8 @@ fn dependencies_come_along_but_never_as_changes(subdir: bool) {
     let (reg, _host) = coding.host(&[("dependencies", json!(DEPENDENCIES_WITH_A_VENV))]);
     let reply = code_with(&reg, &session_ctx(&reg, &session), CODE_EDIT, &[]).unwrap();
 
+    assert!(coding.in_snapshot(DEPENDENCY_FILE));
     let listing = coding.fake.log("snapshot_listing");
-    assert!(
-        listing
-            .lines()
-            .any(|line| line == format!("./{DEPENDENCY_FILE}")),
-        "{listing}"
-    );
     assert!(
         !listing.lines().any(|line| line.starts_with("./.venv")),
         "{listing}"
@@ -2030,24 +2125,21 @@ fn collecting_changes_never_follows_the_workers_links() {
 /// secret in it never reaches the worker's shell.
 #[test]
 fn dependency_copies_keep_the_snapshot_exclusions() {
-    let (dependencies, deny_read) = (DEPENDENCY_DIR, DEPENDENCY_DENIED);
     let coding = Coding::new();
     let project = coding.project();
     write(&project.join(DEPENDENCY_FILE), DEPENDENCY_CONTENT);
     write(&project.join(DEPENDENCY_SECRET), "SECRET=1\n");
     write(&project.join(DEPENDENCY_DENIED), "key\n");
     let (reg, _host) = coding.host(&[
-        ("dependencies", json!(dependencies)),
-        ("deny_read", json!(deny_read)),
+        ("dependencies", json!(DEPENDENCY_DIR)),
+        ("deny_read", json!(DEPENDENCY_DENIED)),
     ]);
     coding.code(&reg, CODE_EDIT, &[]).unwrap();
 
-    let listing = coding.fake.log("snapshot_listing");
-    let listed = |path: &str| listing.lines().any(|line| line == format!("./{path}"));
-    assert!(listed(DEPENDENCY_FILE), "{listing}");
+    assert!(coding.in_snapshot(DEPENDENCY_FILE));
     for left_out in [DEPENDENCY_SECRET, DEPENDENCY_DENIED] {
         assert!(
-            !listed(left_out),
+            !coding.in_snapshot(left_out),
             "{left_out} must stay out of the snapshot"
         );
     }
@@ -2063,11 +2155,7 @@ fn a_dependency_dir_is_copied_and_never_a_change(dir: &str, file: &str) {
     let (reg, _host) = coding.host(&[("dependencies", json!(dir))]);
     let reply = coding.code(&reg, CODE_EDIT, &[]).unwrap();
 
-    let listing = coding.fake.log("snapshot_listing");
-    assert!(
-        listing.lines().any(|line| line == format!("./{file}")),
-        "{listing}"
-    );
+    assert!(coding.in_snapshot(file), "{file} missing from the snapshot");
     assert!(reply.contains(REPORTED_CHANGES[0]), "got: {reply}");
     assert!(!reply.contains(file), "got: {reply}");
     assert!(!reply.contains(DEPENDENCY_UNSETTLED), "got: {reply}");
@@ -2470,11 +2558,16 @@ fn changes_the_import_cannot_apply_are_left_to_the_user() {
 /// validation and import without execution.
 #[test]
 fn a_hostile_file_name_lands_through_the_whole_import() {
-    let (coding, reg, _host, id) = Coding::coded(CODE_HOSTILE);
+    let coding = Coding::new();
+    let pwned = coding.artifacts.path().join(PWNED);
+    let name = HOSTILE_NAME.replace("@TOUCH_PWNED@", &touch_pwned(&pwned));
+    coding.fake.write(HOSTILE_NAME_FILE, &name);
+    let (reg, _host) = coding.host(&[]);
+    let id = artifact_id(&coding.code(&reg, CODE_HOSTILE, &[]).unwrap());
     coding.import(&reg, json!({ "id": id })).unwrap();
 
-    assert_eq!(coding.read(&HOSTILE_NAME), HOSTILE_CONTENT);
-    assert!(!Path::new(PWNED).exists(), "a name ran a command: {PWNED}");
+    assert_eq!(coding.read(&name), HOSTILE_CONTENT);
+    assert!(!pwned.exists(), "a name ran a command: {pwned:?}");
 }
 
 #[test]

@@ -46,7 +46,7 @@ A call needs the `run` [permission](/docs/permissions/), like `bash`. Its scope 
 
 ## What happens in a call
 
-Before maki sends a prompt, it validates the Claude Code version and your settings. It starts `claude -p` in an empty directory. That process answers requests about its login, settings and hooks. The run in the session's directory answers the same requests again. maki sends the prompt only when:
+Before maki sends a prompt, it validates the Claude Code version and your settings. It starts `claude -p` in an empty directory. That process answers requests about its login, settings and hooks. The run, in the session's directory or the coding snapshot, answers the same requests again. maki sends the prompt only when:
 
 - The login is a claude.ai subscription.
 - There is no API key.
@@ -66,7 +66,7 @@ The tool view of a finished call shows the login and the token usage. It also sh
 - **Environment**: only a short list of variables reaches Claude Code, such as `PATH`, `HOME`, the locale and the proxy variables. A key you export for maki, such as `ANTHROPIC_API_KEY`, stays in maki, and the tool view names it.
 - **Settings**: maki ignores your user, project and local Claude Code settings. Hooks, auto memory and connectors are off, and Claude Code loads no `CLAUDE.md` or `AGENTS.md` itself. maki sends the instructions its own prompt uses: the project's files and your global `AGENTS.md`. If an ignored file can change the login, the call stops. The error names the file and key without the value.
 - **Organization policy**: managed settings still apply. maki accepts keys that only restrict Claude Code or inform it, such as `availableModels` or extra `deny` rules. Any other policy key stops the call.
-- **Files**: the read profile uses Claude Code permission rules to restrict access to the session's directory. These rules deny `.env*`, files and directories named `secrets`, `.git/config`, `.maki/**`, `.claude/settings*.json`, and the paths you add with `deny_read`. The defaults apply at any depth. Protection for `Glob` and `Grep` is best effort. Claude Code cannot fully enforce these rules for those tools. A secret under another name remains readable. Add it to `deny_read`.
+- **Files**: the read profile uses Claude Code permission rules to restrict access to the session's directory. In both profiles, these rules deny `.env*`, files and directories named `secrets`, `.git/config`, `.maki/**`, `.claude/settings*.json`, and the paths you add with `deny_read`. The defaults apply at any depth. Protection for `Glob` and `Grep` is best effort. Claude Code cannot fully enforce these rules for those tools. A secret under another name remains readable. Add it to `deny_read`.
 
 To keep the ignored settings for your everyday Claude Code, give maki a separate Claude login with `config_dir`:
 
@@ -84,7 +84,7 @@ claude_code = { enabled = true, config_dir = "/home/me/.claude-maki" },
 checkout --snapshot--> artifact --claude -p--> changes --claude_code_import--> checkout
 ```
 
-1. maki snapshots the session directory, including uncommitted edits to tracked files. Use `include` to add untracked paths. The snapshot excludes `.env*`, `secrets`, `deny_read` paths, agent configuration, sparse-checkout omissions, submodules, untracked nested repositories and external links. The reply names skipped repositories. A change during the copy stops the call. A secret under another name, such as a tracked `.npmrc`, must be added to `deny_read`.
+1. maki snapshots the session directory, including uncommitted edits to tracked files. Use `include` to add untracked paths. The snapshot excludes `.git`, `.env*`, `secrets`, `deny_read` paths, agent configuration, sparse-checkout omissions, submodules, untracked nested repositories and external links. The reply names skipped repositories. A change to a copied project file during the copy stops the call. A change in `dependencies` during their copy only adds a note to the reply. A secret under another name, such as a tracked `.npmrc`, must be added to `deny_read`.
 
 2. maki copies untracked `dependencies`, such as `node_modules`, then runs your `prepare` command. Recreate Python virtual environments with `python3 -m venv --copies .venv && .venv/bin/pip install -e .`. External interpreter links are removed before the worker starts. Symlink resolution has a shared work limit that grows with the number of links in the snapshot. Every queued path component counts toward it. If it is exhausted, unchecked links are removed too. Start uv environments from a venv made with `--copies` too. Untracked dependency files remain outside the import. Tracked dependency files remain editable and importable. Preparation changes become the worker baseline, even if the command fails or times out. The worker receives notes about removed links and other preparation gaps.
 
@@ -98,7 +98,7 @@ checkout --snapshot--> artifact --claude -p--> changes --claude_code_import--> c
 
 Approval, import and manifest updates hold locks on the artifact and checkout. Concurrent imports into the same checkout refuse to start across maki sessions and artifact directories. Expiry skips an artifact while it is locked.
 
-Artifacts live in the maki state directory, or in `artifact_dir`, which must be an absolute path outside the checkout. To import replacements or deletions, choose an artifact directory on the checkout's filesystem. If maki cannot make hard links, the import stops before any checkout change. The next coding call starts background removal of artifacts that have not been written for `artifact_ttl_hours`. Coding calls can continue while expiry cleanup runs. Failed deletion produces a warning.
+Artifacts live in the maki state directory, or in `artifact_dir`, which must be an absolute path outside the checkout. To import replacements or deletions, choose an artifact directory on the checkout's filesystem. If maki cannot make hard links, the import stops before any checkout change. Each coding call first looks for artifacts that have not been written for `artifact_ttl_hours`, then removes them in the background. Coding calls can continue while the removal runs. Failed deletion produces a warning.
 
 To prevent Git from opening embedded bare repositories implicitly, set this global option:
 

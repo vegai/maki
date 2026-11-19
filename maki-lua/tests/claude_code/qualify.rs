@@ -21,8 +21,9 @@ use serde_json::{Map, Value, json};
 use tempfile::{tempdir, tempdir_in};
 
 use super::support::{
-    BASH_SRC, CLAUDE_CONFIG_ENV, HOME_ENV, IMPORT_TOOL, SNAPSHOT_DIR, TOOL, WRITE_SRC, artifact_id,
-    commit_repo, contents, developer_login, executable, load, on_path, tool_reply, write,
+    BASH_SRC, CLAUDE_CONFIG_ENV, CODE_PROFILE, HOME_ENV, IMPORT_TOOL, SNAPSHOT_DIR, TOOL,
+    WRITE_SRC, artifact_id, commit_repo, contents, developer_login, executable, load, on_path,
+    tool_reply, write,
 };
 
 const RUNTIME_ENV: &str = "XDG_RUNTIME_DIR";
@@ -528,12 +529,21 @@ fn recording_claude(root: &Path) -> PathBuf {
     executable(root, CLAUDE, &script)
 }
 
+/// The plugin's options for a live run of `executable` with the developer's
+/// login, and then `extra`.
+fn live_opts<const N: usize>(executable: &Path, extra: [(&str, Value); N]) -> Map<String, Value> {
+    [
+        ("executable", json!(executable)),
+        ("config_dir", json!(developer_login())),
+    ]
+    .into_iter()
+    .chain(extra)
+    .map(|(name, value)| (name.to_owned(), value))
+    .collect()
+}
+
 fn ask(executable: &Path, project: &Path, prompt: &str) -> Result<String, String> {
-    let mut opts = Map::new();
-    opts.insert("executable".into(), json!(executable));
-    opts.insert("config_dir".into(), json!(developer_login()));
-    opts.insert("deny_read".into(), json!(CUSTOM_DENIED));
-    let (reg, _host) = load(opts);
+    let (reg, _host) = load(live_opts(executable, [("deny_read", json!(CUSTOM_DENIED))]));
     let session = stub_ctx_in(project, None, None);
     let input = json!({ "prompt": prompt, "model": READ_MODEL });
     maki_lua::test_support::runtime().block_on(tool_reply(&reg, &session, TOOL, input))
@@ -680,7 +690,6 @@ fn live_reads_are_refused_and_instructions_stay_out() {
 #[test]
 #[ignore = "runs the installed claude CLI on the subscription of the caller"]
 fn live_a_coding_worker_changes_only_its_snapshot() {
-    let login = developer_login();
     let home = env::var_os(HOME_ENV).expect("the qualification needs HOME");
     let home_fixture = tempdir_in(home).unwrap();
     let home_file = home_fixture.path().canonicalize().unwrap().join(HOME_FILE);
@@ -703,12 +712,13 @@ fn live_a_coding_worker_changes_only_its_snapshot() {
         later.parent().unwrap().display(),
         later.display()
     );
-    let mut opts = Map::new();
-    opts.insert("executable".into(), json!(recording_claude(&root)));
-    opts.insert("config_dir".into(), json!(login));
-    opts.insert("artifact_dir".into(), json!(root.join(ARTIFACTS_DIR)));
-    opts.insert("prepare".into(), json!(plant_later));
-    let (reg, host) = load(opts);
+    let (reg, host) = load(live_opts(
+        &recording_claude(&root),
+        [
+            ("artifact_dir", json!(root.join(ARTIFACTS_DIR))),
+            ("prepare", json!(plant_later)),
+        ],
+    ));
     host.load_source_with_opts("write", WRITE_SRC, Map::new())
         .unwrap();
     host.load_source_with_opts("bash", BASH_SRC, Map::new())
@@ -720,7 +730,7 @@ fn live_a_coding_worker_changes_only_its_snapshot() {
         .replace("@PROJECT@", &project.to_string_lossy())
         .replace("@HOME_FILE@", &home_file.to_string_lossy())
         .replace("@LATER@", &later.to_string_lossy());
-    let input = json!({ "prompt": prompt, "model": LIVE_MODEL, "profile": "code" });
+    let input = json!({ "prompt": prompt, "model": LIVE_MODEL, "profile": CODE_PROFILE });
     let reply = maki_lua::test_support::runtime()
         .block_on(tool_reply(&reg, &ctx, TOOL, input))
         .expect("the run must give a reply");
@@ -902,12 +912,10 @@ fn live_coding_worker_cannot_connect_to_runtime_sockets() {
     let root = fixture.path().canonicalize().unwrap();
     let project = root.join(PROJECT_DIR);
     commit_repo(&project, &[(NOTES, NOTES_BEFORE)]);
-    let opts = Map::from_iter([
-        ("executable".into(), json!(recording_claude(&root))),
-        ("config_dir".into(), json!(developer_login())),
-        ("artifact_dir".into(), json!(root.join(ARTIFACTS_DIR))),
-    ]);
-    let (reg, _host) = load(opts);
+    let (reg, _host) = load(live_opts(
+        &recording_claude(&root),
+        [("artifact_dir", json!(root.join(ARTIFACTS_DIR)))],
+    ));
     let ctx = stub_ctx_in(&project, None, None);
     let prompt = format!("{CONNECT_PROMPT}{}", commands.join("\n"));
     let reply = maki_lua::test_support::runtime()
@@ -916,7 +924,7 @@ fn live_coding_worker_cannot_connect_to_runtime_sockets() {
             &ctx,
             TOOL,
             json!({
-                "prompt": prompt, "profile": "code", "model": LIVE_MODEL,
+                "prompt": prompt, "profile": CODE_PROFILE, "model": LIVE_MODEL,
             }),
         ))
         .unwrap();

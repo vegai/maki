@@ -6,11 +6,11 @@ use super::super::stream::{
 };
 use super::super::transcript::SERVER;
 use super::Listed;
-use super::private_files::private_dir_async;
+use super::private_files::{PrivateDir, private_dir_async};
 use super::supervision::{Group, Next, ReadDeadline, send, supervised, unreadable};
 use crate::ProviderUsage;
 use futures::future::join_all;
-use futures::{Stream, future};
+use futures::{FutureExt, Stream, future};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsStr;
@@ -20,7 +20,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, ExitStatus};
 use std::sync::{Mutex, PoisonError};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use tokio::process::ChildStdin;
 use tracing::warn;
 
@@ -33,20 +33,20 @@ const MAX_TURNS_FLAG: &str = "--max-turns";
 const TURN_LIMIT: &str = "1";
 const PARTIAL_MESSAGES_FLAG: &str = "--include-partial-messages";
 
-pub(crate) struct Launch<'a> {
+pub struct Launch<'a> {
     pub executable: &'a Path,
     pub env: &'a [(String, String)],
     pub project: &'a Path,
     pub denied: &'a [PathBuf],
     pub temp_dir: &'a Path,
-    /// Time for each check process to start and answer.
+    /// Time for a process to start and answer, and for a request to send its
+    /// init event and each write to its stdin.
     pub startup: Duration,
 }
 
+/// Any write or rename of the executable changes its inode, device or ctime.
 #[derive(PartialEq)]
 struct ExecutableIdentity {
-    length: u64,
-    modified: Option<SystemTime>,
     inode: u64,
     device: u64,
     changed: (i64, i64),
@@ -55,8 +55,6 @@ struct ExecutableIdentity {
 impl ExecutableIdentity {
     fn new(metadata: &Metadata) -> Self {
         Self {
-            length: metadata.len(),
-            modified: metadata.modified().ok(),
             inode: metadata.ino(),
             device: metadata.dev(),
             changed: (metadata.ctime(), metadata.ctime_nsec()),
@@ -67,14 +65,16 @@ impl ExecutableIdentity {
 static VERSION_CACHE: Mutex<BTreeMap<PathBuf, (ExecutableIdentity, String)>> =
     Mutex::new(BTreeMap::new());
 
-pub(crate) fn invalidate_version(executable: &Path) {
-    VERSION_CACHE
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .remove(executable);
+pub fn invalidate_on_error(executable: &Path, error: &Error) {
+    if error.invalidates_version() {
+        VERSION_CACHE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(executable);
+    }
 }
 
-pub(super) fn base_args(model: &str) -> Vec<String> {
+pub(super) fn provider_args(model: &str) -> Vec<String> {
     let mut settings = settings::base_settings();
     settings[checks::AUTO_COMPACT] = json!(false);
     settings[checks::PERMISSIONS_KEY] = json!({ "allow": [format!("mcp__{SERVER}")] });
@@ -83,7 +83,7 @@ pub(super) fn base_args(model: &str) -> Vec<String> {
     args
 }
 
-pub(crate) fn command(
+pub(super) fn command(
     executable: &Path,
     env: &[(String, String)],
     cwd: &Path,
@@ -98,25 +98,44 @@ pub(crate) fn command(
     command
 }
 
-/// Runs `work` on a Claude Code with no prompt and no MCP server, in an empty
-/// directory checked to be outside the project.
 async fn unprompted<T>(
     launch: &Launch<'_>,
     args: &[String],
     work: impl AsyncFnOnce(&mut Group) -> Result<T, Error>,
 ) -> Result<T, Error> {
-    let (dir, dir_path) = private_dir_async(launch.temp_dir, launch.project, launch.denied).await?;
-    let result = supervised(
-        command(launch.executable, launch.env, &dir_path, args),
-        work,
-    )
-    .await;
+    let (result, dir) = unprompted_in(launch, args, future::pending(), work).await?;
     dir.close().await;
     result
 }
 
+/// Runs `work` on a Claude Code with no prompt and no MCP server, in an empty
+/// directory checked to be outside the project. Nothing starts once `cancel`
+/// is done. The directory comes back with the result, for the caller to close.
+pub(in crate::providers::claude_code) async fn unprompted_in<T>(
+    launch: &Launch<'_>,
+    args: &[String],
+    cancel: impl Future<Output = ()>,
+    work: impl AsyncFnOnce(&mut Group) -> Result<T, Error>,
+) -> Result<(Result<T, Error>, PrivateDir), Error> {
+    let (dir, dir_path) = private_dir_async(launch.temp_dir, launch.project, launch.denied).await?;
+    tokio::pin!(cancel);
+    if cancel.as_mut().now_or_never().is_some() {
+        return Ok((Err(Error::Cancelled), dir));
+    }
+    let command = command(launch.executable, launch.env, &dir_path, args);
+    let result = supervised(command, async |group| {
+        tokio::select! {
+            biased;
+            () = cancel => Err(Error::Cancelled),
+            result = work(group) => result,
+        }
+    })
+    .await;
+    Ok((result, dir))
+}
+
 fn probe_args() -> Vec<String> {
-    let mut args = base_args(PROBE_MODEL);
+    let mut args = provider_args(PROBE_MODEL);
     args.extend([
         MCP_CONFIG_FLAG.to_owned(),
         settings::EMPTY_MCP_CONFIG.to_owned(),
@@ -124,7 +143,7 @@ fn probe_args() -> Vec<String> {
     args
 }
 
-pub(crate) async fn probe_with(
+pub(in crate::providers::claude_code) async fn probe_with(
     group: &mut Group,
     startup: Duration,
     mut feed: impl FnMut(&Value) -> Result<Step, Error>,
@@ -194,7 +213,7 @@ async fn executable_identity(executable: &Path) -> Result<ExecutableIdentity, Er
     Ok(ExecutableIdentity::new(&metadata))
 }
 
-pub(crate) async fn checked_profile(
+pub async fn checked_profile(
     launch: &Launch<'_>,
     cancel: impl Future<Output = ()> + Send,
 ) -> Result<String, Error> {
@@ -226,7 +245,7 @@ pub(crate) async fn checked_profile(
 
 /// Returns the models by the ids they run, after the same checks a request
 /// must pass.
-pub(crate) async fn models(
+pub(in crate::providers::claude_code) async fn models(
     launch: &Launch<'_>,
     plan_usage: &Mutex<Option<ProviderUsage>>,
 ) -> Result<Vec<Listed>, Error> {

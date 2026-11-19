@@ -15,8 +15,7 @@ function M.with_stderr(head, stderr_tail)
   return #stderr_tail > 0 and head .. ":\n" .. table.concat(stderr_tail, "\n") or head
 end
 
---- {released} runs once the call has replied and all its processes exited.
-function M.new(released)
+function M.new()
   return setmetatable({
     alive = 0,
     -- Jobs a cancel stops. The rest must outlive the cancel, because they
@@ -26,7 +25,7 @@ function M.new(released)
     idle = {},
     answered = false,
     left_behind = {},
-    release_hooks = released and { released } or {},
+    release_hooks = {},
   }, Call)
 end
 
@@ -75,6 +74,7 @@ function Call:wait(operation, ...)
   return table.unpack(result, 2, result.n)
 end
 
+--- {hook} runs once the call has replied and all its processes exited.
 function Call:on_released(hook)
   self.release_hooks[#self.release_hooks + 1] = hook
 end

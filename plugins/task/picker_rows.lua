@@ -18,7 +18,7 @@ local function alive(status)
 end
 
 local function running(task)
-  return task.status == "working" or task.status == "queued"
+  return alive(task.status) and task.status ~= "idle"
 end
 
 local function index_by_id(tasks)

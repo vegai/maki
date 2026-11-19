@@ -1,6 +1,6 @@
 use serde_json::{Value, json};
 
-pub const EMPTY_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
+pub(super) const EMPTY_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
 pub(super) const MCP_CONFIG_FLAG: &str = "--mcp-config";
 pub(super) const APPEND_SYSTEM_PROMPT_FLAG: &str = "--append-system-prompt";
 const BASE_ARGS: &[&str] = &[

@@ -306,7 +306,7 @@ impl SessionCheckpoint {
         unsaved: bool,
     ) -> bool {
         if let Ok(store) = self.0.try_lock()
-            && !store.needs_save(&snapshot, unsaved, store.current_usage())
+            && store.unsaved_usage(&snapshot, unsaved).is_none()
         {
             return true;
         }
@@ -366,12 +366,6 @@ impl SessionStore {
         }
     }
 
-    fn current_usage(&self) -> TokenUsage {
-        let mut usage = self.opened_usage;
-        usage += self.spend.totals().usage;
-        usage
-    }
-
     fn publish_header(&self, working: bool) {
         self.header.store(Arc::new(SessionHeader {
             working,
@@ -384,8 +378,13 @@ impl SessionStore {
     /// resolves to, so a run killed before its first turn would leave a dead
     /// entry behind for good. The same guard stops a history that sanitized
     /// down to nothing from replacing the copy it was restored from.
-    fn needs_save(&self, snapshot: &HistorySnapshot, unsaved: bool, usage: TokenUsage) -> bool {
-        !snapshot.messages.is_empty() && (unsaved || self.session.token_usage != usage)
+    ///
+    /// The usage to store, or `None` when there is nothing to write.
+    fn unsaved_usage(&self, snapshot: &HistorySnapshot, unsaved: bool) -> Option<TokenUsage> {
+        let mut usage = self.opened_usage;
+        usage += self.spend.totals().usage;
+        (!snapshot.messages.is_empty() && (unsaved || self.session.token_usage != usage))
+            .then_some(usage)
     }
 
     /// `context_size` travels with the messages, since a resumed session seeds
@@ -404,10 +403,9 @@ impl SessionStore {
         fn tool_call_ids(m: &Message) -> Vec<String> {
             m.tool_uses().map(|(id, _, _)| id.to_owned()).collect()
         }
-        let usage = self.current_usage();
-        if !self.needs_save(snapshot, unsaved, usage) {
+        let Some(usage) = self.unsaved_usage(snapshot, unsaved) else {
             return true;
-        }
+        };
         let dropped = self
             .session
             .dropped_tool_ids(&snapshot.messages, tool_call_ids);
@@ -467,6 +465,8 @@ mod tests {
     const NO_EMPTY_LATEST: &str = "an empty session must not be what --continue resolves to";
     const NOT_WIPED: &str = "an empty history must not replace the transcript it came from";
     const UNTOUCHED: &str = "a run that changed nothing must not rewrite the log";
+    /// Where a rewrite stages the log before it renames it into place.
+    const TEMP_EXTENSION: &str = "jsonl.tmp";
     const RETRIED: &str = "a turn a failed write dropped has to reach disk on the next one";
     const REPAIRED: &str = "a turn that ran on the repaired transcript has to store it repaired";
     const ORPHAN_TOOL_ID: &str = "tool-nobody-called";
@@ -613,6 +613,9 @@ mod tests {
         drop(turn);
         assert_eq!(load(&tmp).token_usage.input, TURN_INPUT_TOKENS);
         assert_eq!(load(&tmp).messages().len(), 1);
+        let saved = fs::read(log_path(&tmp)).unwrap();
+        drop(track);
+        assert_eq!(fs::read(log_path(&tmp)).unwrap(), saved, "{UNTOUCHED}");
     }
 
     #[tokio::test]
@@ -623,7 +626,7 @@ mod tests {
             Resumed::stored(SessionRef::from(session_id()), load(&tmp)),
             claim(&tmp),
         );
-        let blocker = log_path(&tmp).with_extension("jsonl.tmp");
+        let blocker = log_path(&tmp).with_extension(TEMP_EXTENSION);
         fs::create_dir(&blocker).unwrap();
         let mut turn = track.turn(MODEL_SPEC.into(), &input(AgentMode::Build));
         turn.ledger().add(
@@ -658,10 +661,7 @@ mod tests {
         params.history.push(Message::user(PROMPT.into()));
         params.history.checkpoint(CONTEXT_SIZE).await;
         assert_eq!(load(&tmp).messages().len(), 1);
-        let path = tmp
-            .path()
-            .join(SESSIONS_DIR)
-            .join(format!("{}.jsonl", session_id()));
+        let path = log_path(&tmp);
         let prefix = fs::read(&path).unwrap();
         assert!(!params.history.has_unsaved());
         params.history.checkpoint(CONTEXT_SIZE).await;
@@ -844,7 +844,7 @@ mod tests {
         let mut track = track_on(&tmp);
         // A directory where the rewrite puts its temp file: `File::create`
         // cannot replace it, so the save fails before anything lands.
-        let blocker = log_path(&tmp).with_extension("jsonl.tmp");
+        let blocker = log_path(&tmp).with_extension(TEMP_EXTENSION);
         std::fs::create_dir(&blocker).unwrap();
         push_prompt(&mut track, MODEL_SPEC, PROMPT);
         assert!(

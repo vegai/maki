@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use common::{
-    Chat, WAIT, assistant_reply, call_ctx, done_text, exec, next_event, next_task_done,
+    Chat, WAIT, assistant_reply, call_ctx, done_text, exec, next_event, next_task_done, no_models,
     request_move, wait_live_buf, wait_movable,
 };
 use maki_agent::agent::tool_dispatch;
@@ -970,7 +970,7 @@ impl Provider for StructuredOutputProvider {
         &self,
         _listing: ModelListing,
     ) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async { Ok(Vec::new()) })
+        no_models()
     }
 }
 

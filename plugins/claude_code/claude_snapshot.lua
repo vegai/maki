@@ -3,6 +3,7 @@ local native = require("maki.claude_code.internal")
 -- Builds the private snapshot and records the worker's changes.
 
 local jobs = require("claude_jobs")
+local artifacts = require("claude_artifact")
 local workspace = require("claude_workspace")
 local git_utils = require("claude_git")
 local path_utils = require("claude_paths")
@@ -47,18 +48,14 @@ local function note(artifact, format, ...)
   artifact.notes[#artifact.notes + 1] = format:format(...)
 end
 
-local function checkout_git(call, artifact, spec, args)
-  return call:run_lines(git_utils.git(args), { env = spec.env, cwd = spec.cwd, timeout_ms = artifact.timeout_ms })
-end
-
-local function list_files(call, artifact, spec, args, pathspecs)
+local function list_files(call, spec, args, pathspecs)
   for _, pathspec in ipairs(pathspecs) do
     args[#args + 1] = pathspec
   end
   for _, pathspec in ipairs(spec.denied_pathspecs) do
     args[#args + 1] = pathspec
   end
-  return checkout_git(call, artifact, spec, args)
+  return call:run_lines(git_utils.git(args), { env = spec.env, cwd = spec.cwd, timeout_ms = artifacts.STEP_TIMEOUT_MS })
 end
 
 -- Copies links as links. {reflink} is a `--reflink` flag, or nil. `cp`
@@ -73,7 +70,7 @@ local function copy_into(call, artifact, spec, paths, reflink)
     env = env,
     cwd = spec.cwd,
     stdin = table.concat(paths, "\0"),
-    timeout_ms = artifact.timeout_ms,
+    timeout_ms = artifacts.STEP_TIMEOUT_MS,
   })
 end
 
@@ -95,7 +92,7 @@ end
 local function snapshot_git(call, artifact, args, stdin)
   return call:run_lines(
     git_utils.git(args),
-    { env = artifact.git_env, cwd = artifact.snapshot, stdin = stdin, timeout_ms = artifact.timeout_ms }
+    { env = artifact.git_env, cwd = artifact.snapshot, stdin = stdin, timeout_ms = artifacts.STEP_TIMEOUT_MS }
   )
 end
 
@@ -142,13 +139,12 @@ end
 -- Returns the tracked files as they are on disk, plus the untracked files
 -- under {spec.include}. Submodules are left out, with a note in {artifact}.
 local function snapshot_paths(call, artifact, spec)
-  local tracked, tracked_err = list_files(call, artifact, spec, { "ls-files", "-t", "-s", "--" }, { "." })
+  local tracked, tracked_err = list_files(call, spec, { "ls-files", "-t", "-s", "--" }, { "." })
   if not tracked then
     return nil, tracked_err
   end
   local deleted, deleted_err = list_files(
     call,
-    artifact,
     spec,
     { "diff-files", "--relative", "--name-only", "--diff-filter=D", "--" },
     { "." }
@@ -183,7 +179,7 @@ local function snapshot_paths(call, artifact, spec)
       end
       specs[#specs + 1] = ":(literal)" .. path
     end
-    local untracked, untracked_err = list_files(call, artifact, spec, { "ls-files", "-o", "--" }, specs)
+    local untracked, untracked_err = list_files(call, spec, { "ls-files", "-o", "--" }, specs)
     if not untracked then
       return nil, untracked_err
     end
@@ -240,7 +236,7 @@ local function copy_dependencies(call, artifact, spec, paths)
     elseif maki.fs.metadata(maki.fs.joinpath(source, VENV_MARKER)) then
       note(artifact, VIRTUAL_ENVIRONMENT, dir)
     else
-      local listed, list_err = list_files(call, artifact, spec, { "ls-files", "-o", "--" }, { ":(literal)" .. dir })
+      local listed, list_err = list_files(call, spec, { "ls-files", "-o", "--" }, { ":(literal)" .. dir })
       if not listed then
         return nil, "maki cannot list the dependency " .. dir .. ": " .. list_err
       end
@@ -329,7 +325,8 @@ local function consistency_problem(call, artifact, spec)
     { "update-index", "-q", "--refresh" },
     { "diff-files", "--name-only" },
   }) do
-    changed, err = call:run_lines(git_utils.git(args), { env = env, cwd = spec.cwd, timeout_ms = artifact.timeout_ms })
+    changed, err =
+      call:run_lines(git_utils.git(args), { env = env, cwd = spec.cwd, timeout_ms = artifacts.STEP_TIMEOUT_MS })
     if not changed then
       break
     end
@@ -368,7 +365,7 @@ local function unsettled_dependencies(call, artifact, spec, dependencies)
   for _, arg in ipairs({ "-cnewer", artifact.copy_started, "-print" }) do
     argv[#argv + 1] = arg
   end
-  local out, err = call:run_lines(argv, { env = spec.env, cwd = spec.cwd, timeout_ms = artifact.timeout_ms })
+  local out, err = call:run_lines(argv, { env = spec.env, cwd = spec.cwd, timeout_ms = artifacts.STEP_TIMEOUT_MS })
   if not out then
     return nil, "maki cannot examine the dependencies: " .. err
   end
@@ -528,9 +525,9 @@ function M.collect(call, artifact, project)
   if not ignored then
     return nil, add_err
   end
-  local unrecorded = {}
+  local unrecorded, prepared_ignored = {}, artifact.prepared_ignored or {}
   for _, path in ipairs(ignored) do
-    if not (artifact.prepared_ignored or {})[path] then
+    if not prepared_ignored[path] then
       unrecorded[#unrecorded + 1] = path
     end
   end
